@@ -11,6 +11,9 @@
         th, td { border: 1px solid #ddd; padding: 0.5rem; }
         th { background: #f4f4f4; text-align: left; }
         .badge { padding: 0.2rem 0.5rem; border-radius: 0.25rem; background: #eef; }
+        .alert { padding: 0.5rem 0.75rem; border-radius: 0.25rem; margin: 0.5rem 0; }
+        .alert-success { background: #e8f7e8; border: 1px solid #b6e2b6; color: #275427; }
+        .alert-error { background: #fbeaea; border: 1px solid #f2b8b5; color: #7c1f1a; }
     </style>
 </head>
 <body>
@@ -22,6 +25,8 @@
     <a href="/auth/logout">Logout</a>
 </nav>
 <hr>
+{{if .FlashMessage}}<div class="alert alert-success">{{.FlashMessage}}</div>{{end}}
+{{if .FlashError}}<div class="alert alert-error">{{.FlashError}}</div>{{end}}
 {{block "content" .}}{{end}}
 </body>
 </html>

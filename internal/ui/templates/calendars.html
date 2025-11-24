@@ -1,23 +1,33 @@
 {{define "content"}}
 <h1>Calendars</h1>
-<p>Manage CalDAV collections. POST/PUT/DELETE routes are TODO but the UI reflects current state.</p>
+<p>Manage CalDAV collections.</p>
 <table>
-    <tr><th>Name</th><th>Color</th><th>Created</th></tr>
+    <tr><th>Name</th><th>Color</th><th>Created</th><th>Actions</th></tr>
     {{range .Calendars}}
     <tr>
         <td>{{.Name}}</td>
         <td>{{if .Color}}{{.Color}}{{else}}default{{end}}</td>
         <td>{{formatTime .CreatedAt}}</td>
+        <td>
+            <form method="post" action="/calendars/{{.ID}}" style="display:inline">
+                <input type="hidden" name="_method" value="PUT">
+                <input name="name" placeholder="Rename" required>
+                <button type="submit">Rename</button>
+            </form>
+            <form method="post" action="/calendars/{{.ID}}" style="display:inline" onsubmit="return confirm('Delete calendar?')">
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit">Delete</button>
+            </form>
+        </td>
     </tr>
     {{else}}
-    <tr><td colspan="3">No calendars yet.</td></tr>
+    <tr><td colspan="4">No calendars yet.</td></tr>
     {{end}}
 </table>
 <form method="post" action="/calendars">
     <h3>Create calendar</h3>
     <label>Name <input name="name" required></label>
     <button type="submit">Create</button>
-    <p><small>Server-side handler is TODO; this shows intended UX.</small></p>
 </form>
 {{end}}
 {{template "base" .}}
