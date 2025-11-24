@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/example/calcard/internal/auth"
 	"github.com/example/calcard/internal/config"
 	"github.com/example/calcard/internal/store"
+	"github.com/go-chi/chi/v5"
 )
 
 // Handler serves server-rendered HTML pages.
@@ -72,31 +74,109 @@ func (h *Handler) AddressBooks(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) AppPasswords(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
+
+	switch r.Method {
+	case http.MethodPost:
+		h.createAppPassword(w, r, user)
+	default:
+		h.renderAppPasswords(w, r, user, "")
+	}
+}
+
+func (h *Handler) createAppPassword(w http.ResponseWriter, r *http.Request, user *store.User) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	label := r.FormValue("label")
+	if label == "" {
+		http.Error(w, "label is required", http.StatusBadRequest)
+		return
+	}
+	expiresAtStr := r.FormValue("expires_at")
+
+	var expiresAt *time.Time
+	if expiresAtStr != "" {
+		t, err := time.Parse(time.RFC3339, expiresAtStr)
+		if err != nil {
+			http.Error(w, "invalid expires_at format", http.StatusBadRequest)
+			return
+		}
+		expiresAt = &t
+	}
+
+	plaintext, _, err := h.authService.CreateAppPassword(r.Context(), user.ID, label, expiresAt)
+	if err != nil {
+		http.Error(w, "failed to create app password", http.StatusInternalServerError)
+		return
+	}
+
+	h.renderAppPasswords(w, r, user, plaintext)
+}
+
+func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid token id", http.StatusBadRequest)
+		return
+	}
+
+	token, err := h.store.AppPasswords.GetByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "failed to load app password", http.StatusInternalServerError)
+		return
+	}
+	if token == nil || token.UserID != user.ID {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if token.RevokedAt == nil {
+		if err := h.store.AppPasswords.Revoke(r.Context(), id); err != nil {
+			http.Error(w, "failed to revoke app password", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	http.Redirect(w, r, "/app-passwords", http.StatusFound)
+}
+
+func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, user *store.User, plaintext string) {
 	passwords, err := h.store.AppPasswords.ListByUser(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "failed to load app passwords", http.StatusInternalServerError)
 		return
 	}
+
 	var view []map[string]any
+	now := time.Now()
 	for _, p := range passwords {
 		status := "active"
-		if p.RevokedAt != nil {
+		revoked := p.RevokedAt != nil
+		expired := p.ExpiresAt != nil && p.ExpiresAt.Before(now)
+		if revoked {
 			status = "revoked"
-		} else if p.ExpiresAt != nil && p.ExpiresAt.Before(time.Now()) {
+		} else if expired {
 			status = "expired"
 		}
 		view = append(view, map[string]any{
+			"id":         p.ID,
 			"label":      p.Label,
 			"created_at": p.CreatedAt,
 			"expires_at": p.ExpiresAt,
 			"last_used":  p.LastUsedAt,
 			"status":     status,
+			"revoked":    revoked,
+			"expired":    expired,
 		})
 	}
 	data := map[string]any{
 		"Title":        "App Passwords",
 		"User":         user,
 		"AppPasswords": view,
+		"Plaintext":    plaintext,
 	}
 	h.render(w, "app_passwords.html", data)
 }

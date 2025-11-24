@@ -41,7 +41,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Get("/calendars", uiHandler.Calendars)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
-		// TODO: add POST/PUT/DELETE for UI forms.
+		r.Post("/app-passwords", uiHandler.AppPasswords)
+		r.Post("/app-passwords/{id}/revoke", uiHandler.RevokeAppPassword)
 	})
 
 	r.Route("/dav", func(r chi.Router) {
