@@ -17,7 +17,7 @@ Environment variables (prefix `APP_`):
 - `APP_OAUTH_CLIENT_ID`, `APP_OAUTH_CLIENT_SECRET`, `APP_OAUTH_ISSUER_URL`, `APP_OAUTH_REDIRECT_PATH`
 - `APP_SESSION_SECRET` (signing key for sessions)
 
-Database migrations live in `internal/migrations/001_init.sql`.
+Database migrations live in `internal/migrations/001_init.sql` and are embedded alongside the HTML templates, so the compiled binary ships with everything it needs.
 
 ## Status
 The server focuses on clear structure and extensibility. OAuth token exchange, CSRF, and DAV REPORT depth semantics are stubbed for follow-up work, but interfaces and storage primitives are ready for integration.

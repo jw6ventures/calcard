@@ -53,6 +53,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		r.Post("/app-passwords", uiHandler.CreateAppPassword)
 		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)
+		r.Post("/app-passwords/{id}/revoke", uiHandler.RevokeAppPassword)
 	})
 
 	r.Route("/dav", func(r chi.Router) {
