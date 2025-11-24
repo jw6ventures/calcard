@@ -1,0 +1,28 @@
+{{define "base"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{.Title}} - CalCard</title>
+    <style>
+        body { font-family: sans-serif; margin: 2rem; }
+        nav a { margin-right: 1rem; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+        th, td { border: 1px solid #ddd; padding: 0.5rem; }
+        th { background: #f4f4f4; text-align: left; }
+        .badge { padding: 0.2rem 0.5rem; border-radius: 0.25rem; background: #eef; }
+    </style>
+</head>
+<body>
+<nav>
+    <a href="/">Dashboard</a>
+    <a href="/calendars">Calendars</a>
+    <a href="/addressbooks">Address Books</a>
+    <a href="/app-passwords">App Passwords</a>
+    <a href="/auth/logout">Logout</a>
+</nav>
+<hr>
+{{block "content" .}}{{end}}
+</body>
+</html>
+{{end}}

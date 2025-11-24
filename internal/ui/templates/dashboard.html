@@ -1,0 +1,11 @@
+{{define "content"}}
+<h1>Dashboard</h1>
+<p>Welcome, {{.User.PrimaryEmail}}</p>
+<ul>
+    <li>Calendars: <span class="badge">{{.CalendarCount}}</span></li>
+    <li>Address books: <span class="badge">{{.BookCount}}</span></li>
+    <li>App passwords: <span class="badge">{{.AppPwdCount}}</span></li>
+</ul>
+<p>This is a minimal, server-rendered dashboard. Future iterations will show recent activity and OAuth session details.</p>
+{{end}}
+{{template "base" .}}

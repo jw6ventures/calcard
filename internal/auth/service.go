@@ -2,12 +2,18 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/example/calcard/internal/config"
 	"github.com/example/calcard/internal/store"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/oauth2"
 )
 
 // Service encapsulates authentication flows for OAuth and app passwords.
@@ -15,36 +21,123 @@ type Service struct {
 	cfg      *config.Config
 	store    *store.Store
 	sessions *SessionManager
+	oauthCfg *oauth2.Config
 }
 
 func NewService(cfg *config.Config, store *store.Store, sessions *SessionManager) *Service {
-	return &Service{cfg: cfg, store: store, sessions: sessions}
+	redirectURL := strings.TrimRight(cfg.BaseURL, "/") + cfg.OAuth.RedirectPath
+	return &Service{cfg: cfg, store: store, sessions: sessions, oauthCfg: &oauth2.Config{
+		ClientID:     cfg.OAuth.ClientID,
+		ClientSecret: cfg.OAuth.ClientSecret,
+		RedirectURL:  redirectURL,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  cfg.OAuth.IssuerURL + "/authorize", // TODO: OIDC discovery.
+			TokenURL: cfg.OAuth.IssuerURL + "/token",
+		},
+		Scopes: []string{"openid", "email", "profile"},
+	}}
 }
 
 // BeginOAuth starts the OAuth/OIDC authorization flow.
 func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
-	// TODO: build OAuth authorization URL with state nonce and redirect user.
-	http.Error(w, "oauth flow not implemented", http.StatusNotImplemented)
+	state, err := randomState()
+	if err != nil {
+		http.Error(w, "failed to start login", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "calcard_oauth_state",
+		Value:    state,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		Expires:  time.Now().Add(10 * time.Minute),
+	})
+
+	url := s.oauthCfg.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 // HandleOAuthCallback completes the OAuth flow and creates a session.
 func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
-	// TODO: validate state, exchange code for token, extract subject/email.
-	// TODO: persist user, ensure default calendar/address book, start session cookie.
-	http.Error(w, "oauth callback not implemented", http.StatusNotImplemented)
+	stateCookie, err := r.Cookie("calcard_oauth_state")
+	if err != nil || stateCookie.Value == "" || stateCookie.Value != r.URL.Query().Get("state") {
+		http.Error(w, "invalid oauth state", http.StatusBadRequest)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing oauth code", http.StatusBadRequest)
+		return
+	}
+
+	// TODO: use oauth2.Config.Exchange to fetch tokens. In this scaffold we accept
+	// the authorization code as a stand-in subject/email for local testing.
+	oauthSubject := fmt.Sprintf("subject-%s", code)
+	email := fmt.Sprintf("user-%s@example.com", code)
+
+	ctx := r.Context()
+	user, err := s.store.Users.UpsertOAuthUser(ctx, oauthSubject, email)
+	if err != nil {
+		http.Error(w, "failed to persist user", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.store.EnsureDefaultCollections(ctx, user.ID); err != nil {
+		http.Error(w, "failed to bootstrap user", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.sessions.Issue(w, user.ID); err != nil {
+		http.Error(w, "failed to set session", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // ValidateAppPassword verifies Basic Auth credentials for DAV clients.
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
-	// TODO: look up user by username/email, check hashed token, update last_used_at.
-	return nil, errors.New("app password validation not implemented")
+	user, err := s.store.Users.GetByEmail(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("unknown user")
+	}
+
+	tokens, err := s.store.AppPasswords.FindValidByUser(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, t := range tokens {
+		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
+			_ = s.store.AppPasswords.TouchLastUsed(ctx, t.ID)
+			return user, nil
+		}
+	}
+
+	return nil, errors.New("invalid app password")
 }
 
 // RequireSession retrieves the current user from a web session or redirects.
 func (s *Service) RequireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// TODO: load session cookie, fetch user, handle redirects to login.
-		next.ServeHTTP(w, r)
+		uid, ok := s.sessions.CurrentUserID(r)
+		if !ok {
+			http.Redirect(w, r, "/auth/login", http.StatusFound)
+			return
+		}
+		user, err := s.store.Users.GetByID(r.Context(), uid)
+		if err != nil || user == nil {
+			s.sessions.Clear(w)
+			http.Redirect(w, r, "/auth/login", http.StatusFound)
+			return
+		}
+		ctx := WithUser(r.Context(), user)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -69,9 +162,22 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		// TODO: add user to context for handlers to consume.
-		next.ServeHTTP(w, r)
+		ctx = WithUser(ctx, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
+// ClearSession removes the session cookie for the current browser request.
+func (s *Service) ClearSession(w http.ResponseWriter) {
+	s.sessions.Clear(w)
+}
+
 // TODO: add CSRF protection middleware and helpers.
+
+func randomState() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
