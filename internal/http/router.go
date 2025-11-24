@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -21,6 +22,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(overrideMethod)
 	// TODO: add CSRF middleware for UI.
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +43,16 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Get("/calendars", uiHandler.Calendars)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
-		// TODO: add POST/PUT/DELETE for UI forms.
+		r.Post("/calendars", uiHandler.CreateCalendar)
+		r.Put("/calendars/{id}", uiHandler.RenameCalendar)
+		r.Delete("/calendars/{id}", uiHandler.DeleteCalendar)
+
+		r.Post("/addressbooks", uiHandler.CreateAddressBook)
+		r.Put("/addressbooks/{id}", uiHandler.RenameAddressBook)
+		r.Delete("/addressbooks/{id}", uiHandler.DeleteAddressBook)
+
+		r.Post("/app-passwords", uiHandler.CreateAppPassword)
+		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)
 	})
 
 	r.Route("/dav", func(r chi.Router) {
@@ -58,4 +69,22 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	})
 
 	return r
+}
+
+func overrideMethod(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.Method
+		if r.Method == http.MethodPost {
+			if m := strings.TrimSpace(r.PostFormValue("_method")); m != "" {
+				method = m
+			} else if m := strings.TrimSpace(r.URL.Query().Get("_method")); m != "" {
+				method = m
+			}
+		}
+		switch strings.ToUpper(method) {
+		case http.MethodPut, http.MethodDelete:
+			r.Method = strings.ToUpper(method)
+		}
+		next.ServeHTTP(w, r)
+	})
 }

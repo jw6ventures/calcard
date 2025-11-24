@@ -2,21 +2,31 @@
 <h1>Address Books</h1>
 <p>CardDAV collections per user.</p>
 <table>
-    <tr><th>Name</th><th>Created</th></tr>
+    <tr><th>Name</th><th>Created</th><th>Actions</th></tr>
     {{range .Books}}
     <tr>
         <td>{{.Name}}</td>
         <td>{{formatTime .CreatedAt}}</td>
+        <td>
+            <form method="post" action="/addressbooks/{{.ID}}" style="display:inline">
+                <input type="hidden" name="_method" value="PUT">
+                <input name="name" placeholder="Rename" required>
+                <button type="submit">Rename</button>
+            </form>
+            <form method="post" action="/addressbooks/{{.ID}}" style="display:inline" onsubmit="return confirm('Delete book?')">
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit">Delete</button>
+            </form>
+        </td>
     </tr>
     {{else}}
-    <tr><td colspan="2">No address books yet.</td></tr>
+    <tr><td colspan="3">No address books yet.</td></tr>
     {{end}}
 </table>
 <form method="post" action="/addressbooks">
     <h3>Create address book</h3>
     <label>Name <input name="name" required></label>
     <button type="submit">Create</button>
-    <p><small>Endpoint wiring is pending; the UI illustrates intent.</small></p>
 </form>
 {{end}}
 {{template "base" .}}
