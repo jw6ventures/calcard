@@ -44,8 +44,9 @@ type ContactRepository interface {
 // AppPasswordRepository handles Basic Auth token storage.
 type AppPasswordRepository interface {
 	Create(ctx context.Context, token AppPassword) (*AppPassword, error)
-	FindActive(ctx context.Context, userID int64, hash string) (*AppPassword, error)
+	FindValidByUser(ctx context.Context, userID int64) ([]AppPassword, error)
 	ListByUser(ctx context.Context, userID int64) ([]AppPassword, error)
+	GetByID(ctx context.Context, id int64) (*AppPassword, error)
 	Revoke(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error
 }
