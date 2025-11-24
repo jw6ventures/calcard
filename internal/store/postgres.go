@@ -142,6 +142,28 @@ func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) 
 	return &ev, nil
 }
 
+func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error) {
+	if len(uids) == 0 {
+		return []Event{}, nil
+	}
+	const q = `SELECT id, calendar_id, uid, raw_ical, etag, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
+	rows, err := r.pool.Query(ctx, q, calendarID, uids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Event
+	for rows.Next() {
+		var ev Event
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.LastModified); err != nil {
+			return nil, err
+		}
+		result = append(result, ev)
+	}
+	return result, rows.Err()
+}
+
 func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error) {
 	const q = `SELECT id, calendar_id, uid, raw_ical, etag, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
 	rows, err := r.pool.Query(ctx, q, calendarID)
@@ -246,6 +268,28 @@ func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid str
 		return nil, err
 	}
 	return &c, nil
+}
+
+func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error) {
+	if len(uids) == 0 {
+		return []Contact{}, nil
+	}
+	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`
+	rows, err := r.pool.Query(ctx, q, addressBookID, uids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Contact
+	for rows.Next() {
+		var c Contact
+		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.LastModified); err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
 }
 
 func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error) {

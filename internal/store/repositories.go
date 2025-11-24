@@ -23,6 +23,7 @@ type EventRepository interface {
 	DeleteByUID(ctx context.Context, calendarID int64, uid string) error
 	GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error)
 	ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error)
+	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)
 }
 
 // AddressBookRepository manages address books.
@@ -39,6 +40,7 @@ type ContactRepository interface {
 	DeleteByUID(ctx context.Context, addressBookID int64, uid string) error
 	GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error)
 	ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error)
+	ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error)
 }
 
 // AppPasswordRepository handles Basic Auth token storage.
