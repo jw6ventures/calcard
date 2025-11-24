@@ -32,7 +32,10 @@ func main() {
 
 	stor := store.New(pool)
 	sessionManager := appauth.NewSessionManager(cfg)
-	authService := appauth.NewService(cfg, stor, sessionManager)
+	authService, err := appauth.NewService(cfg, stor, sessionManager)
+	if err != nil {
+		log.Fatalf("failed to initialize auth service: %v", err)
+	}
 
 	r := httpserver.NewRouter(cfg, stor, authService, sessionManager)
 

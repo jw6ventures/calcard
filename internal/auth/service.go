@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,20 +23,31 @@ type Service struct {
 	store    *store.Store
 	sessions *SessionManager
 	oauthCfg *oauth2.Config
+	userinfo string
 }
 
-func NewService(cfg *config.Config, store *store.Store, sessions *SessionManager) *Service {
+func NewService(cfg *config.Config, store *store.Store, sessions *SessionManager) (*Service, error) {
 	redirectURL := strings.TrimRight(cfg.BaseURL, "/") + cfg.OAuth.RedirectPath
-	return &Service{cfg: cfg, store: store, sessions: sessions, oauthCfg: &oauth2.Config{
+	discoveryURL := cfg.OAuth.DiscoveryURL
+	if discoveryURL == "" {
+		discoveryURL = cfg.OAuth.IssuerURL
+	}
+
+	oidc, err := discoverOIDC(discoveryURL)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Service{cfg: cfg, store: store, sessions: sessions, userinfo: oidc.UserinfoEndpoint, oauthCfg: &oauth2.Config{
 		ClientID:     cfg.OAuth.ClientID,
 		ClientSecret: cfg.OAuth.ClientSecret,
 		RedirectURL:  redirectURL,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  cfg.OAuth.IssuerURL + "/authorize", // TODO: OIDC discovery.
-			TokenURL: cfg.OAuth.IssuerURL + "/token",
+			AuthURL:  oidc.AuthorizationEndpoint,
+			TokenURL: oidc.TokenEndpoint,
 		},
 		Scopes: []string{"openid", "email", "profile"},
-	}}
+	}}, nil
 }
 
 // BeginOAuth starts the OAuth/OIDC authorization flow.
@@ -72,12 +84,19 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: use oauth2.Config.Exchange to fetch tokens. In this scaffold we accept
-	// the authorization code as a stand-in subject/email for local testing.
-	oauthSubject := fmt.Sprintf("subject-%s", code)
-	email := fmt.Sprintf("user-%s@example.com", code)
-
 	ctx := r.Context()
+	token, err := s.oauthCfg.Exchange(ctx, code)
+	if err != nil {
+		http.Error(w, "failed to exchange oauth code", http.StatusBadRequest)
+		return
+	}
+
+	oauthSubject, email, err := s.userIdentity(ctx, token)
+	if err != nil {
+		http.Error(w, "failed to fetch user identity", http.StatusBadRequest)
+		return
+	}
+
 	user, err := s.store.Users.UpsertOAuthUser(ctx, oauthSubject, email)
 	if err != nil {
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
@@ -216,4 +235,99 @@ func randomState() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+type oidcConfiguration struct {
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	TokenEndpoint         string `json:"token_endpoint"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
+}
+
+func discoverOIDC(issuerOrDiscovery string) (*oidcConfiguration, error) {
+	trimmed := strings.TrimRight(issuerOrDiscovery, "/")
+	wellKnown := "/.well-known/openid-configuration"
+	configURL := trimmed
+	if !strings.HasSuffix(trimmed, wellKnown) {
+		configURL = trimmed + wellKnown
+	}
+	resp, err := http.Get(configURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch oidc discovery: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("oidc discovery responded with %s", resp.Status)
+	}
+
+	var doc oidcConfiguration
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("failed to decode oidc discovery: %w", err)
+	}
+
+	if doc.AuthorizationEndpoint == "" || doc.TokenEndpoint == "" {
+		return nil, errors.New("oidc discovery missing required endpoints")
+	}
+
+	return &doc, nil
+}
+
+type userInfo struct {
+	Subject string `json:"sub"`
+	Email   string `json:"email"`
+}
+
+func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string, string, error) {
+	if s.userinfo != "" {
+		client := s.oauthCfg.Client(ctx, token)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.userinfo, nil)
+		if err != nil {
+			return "", "", err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", "", err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return "", "", fmt.Errorf("userinfo responded with %s", resp.Status)
+		}
+
+		var info userInfo
+		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+			return "", "", err
+		}
+
+		if info.Subject != "" && info.Email != "" {
+			return info.Subject, info.Email, nil
+		}
+	}
+
+	rawIDToken, _ := token.Extra("id_token").(string)
+	if rawIDToken == "" {
+		return "", "", errors.New("no userinfo or id_token available")
+	}
+
+	parts := strings.Split(rawIDToken, ".")
+	if len(parts) < 2 {
+		return "", "", errors.New("invalid id_token format")
+	}
+
+	claimsJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", "", err
+	}
+
+	var claims userInfo
+	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
+		return "", "", err
+	}
+
+	if claims.Subject == "" || claims.Email == "" {
+		return "", "", errors.New("id_token missing subject or email")
+	}
+
+	return claims.Subject, claims.Email, nil
 }
