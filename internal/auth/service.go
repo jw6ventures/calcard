@@ -97,6 +97,36 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+// CreateAppPassword generates a random token, hashes it, stores it, and returns the plaintext.
+func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label string, expiresAt *time.Time) (string, *store.AppPassword, error) {
+	if label == "" {
+		return "", nil, errors.New("label required")
+	}
+
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", nil, err
+	}
+	plaintext := base64.RawURLEncoding.EncodeToString(buf)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return "", nil, err
+	}
+
+	created, err := s.store.AppPasswords.Create(ctx, store.AppPassword{
+		UserID:    userID,
+		Label:     label,
+		TokenHash: string(hash),
+		ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+
+	return plaintext, created, nil
+}
+
 // ValidateAppPassword verifies Basic Auth credentials for DAV clients.
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
 	user, err := s.store.Users.GetByEmail(ctx, username)
@@ -113,6 +143,12 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 	}
 
 	for _, t := range tokens {
+		if t.RevokedAt != nil {
+			continue
+		}
+		if t.ExpiresAt != nil && t.ExpiresAt.Before(time.Now()) {
+			continue
+		}
 		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
 			_ = s.store.AppPasswords.TouchLastUsed(ctx, t.ID)
 			return user, nil
