@@ -10,6 +10,7 @@ import (
 	"github.com/example/calcard/internal/auth"
 	"github.com/example/calcard/internal/config"
 	"github.com/example/calcard/internal/dav"
+	"github.com/example/calcard/internal/metrics"
 	"github.com/example/calcard/internal/store"
 	"github.com/example/calcard/internal/ui"
 )
@@ -23,11 +24,16 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(overrideMethod)
+	r.Use(metrics.Middleware())
 	// TODO: add CSRF middleware for UI.
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metrics.Handler().ServeHTTP(w, r)
 	})
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
