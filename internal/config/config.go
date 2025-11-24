@@ -19,6 +19,7 @@ type Config struct {
 		ClientID     string
 		ClientSecret string
 		IssuerURL    string
+		DiscoveryURL string
 		RedirectPath string
 	}
 
@@ -38,14 +39,18 @@ func Load() (*Config, error) {
 	cfg.OAuth.ClientID = os.Getenv("APP_OAUTH_CLIENT_ID")
 	cfg.OAuth.ClientSecret = os.Getenv("APP_OAUTH_CLIENT_SECRET")
 	cfg.OAuth.IssuerURL = os.Getenv("APP_OAUTH_ISSUER_URL")
+	cfg.OAuth.DiscoveryURL = os.Getenv("APP_OAUTH_DISCOVERY_URL")
 	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 
 	if cfg.DB.DSN == "" {
 		return nil, errors.New("APP_DB_DSN is required")
 	}
-	if cfg.OAuth.ClientID == "" || cfg.OAuth.ClientSecret == "" || cfg.OAuth.IssuerURL == "" {
-		return nil, fmt.Errorf("oauth configuration is required: client id, secret, issuer url")
+	if cfg.OAuth.ClientID == "" || cfg.OAuth.ClientSecret == "" {
+		return nil, fmt.Errorf("oauth configuration is required: client id and secret")
+	}
+	if cfg.OAuth.DiscoveryURL == "" && cfg.OAuth.IssuerURL == "" {
+		return nil, errors.New("APP_OAUTH_DISCOVERY_URL or APP_OAUTH_ISSUER_URL is required")
 	}
 	if cfg.Session.Secret == "" {
 		return nil, errors.New("APP_SESSION_SECRET is required")
