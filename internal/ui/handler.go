@@ -23,7 +23,7 @@ type Handler struct {
 	cfg         *config.Config
 	store       *store.Store
 	authService *auth.Service
-	templates   *template.Template
+	templates   map[string]*template.Template
 }
 
 func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service) *Handler {
@@ -384,7 +384,13 @@ func generateToken() (string, error) {
 }
 
 func (h *Handler) render(w http.ResponseWriter, name string, data any) {
-	if err := h.templates.ExecuteTemplate(w, name, data); err != nil {
+	tmpl, ok := h.templates[name]
+	if !ok {
+		http.Error(w, fmt.Sprintf("template %q not found", name), http.StatusInternalServerError)
+		return
+	}
+
+	if err := tmpl.ExecuteTemplate(w, name, data); err != nil {
 		http.Error(w, fmt.Sprintf("template error: %v", err), http.StatusInternalServerError)
 	}
 }
