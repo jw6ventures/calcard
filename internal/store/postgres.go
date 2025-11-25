@@ -23,6 +23,7 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
         last_login_at = NOW()
 RETURNING id, oauth_subject, primary_email, created_at, last_login_at
 `
+	defer observeDB(ctx, "users.upsert_oauth")()
 	row := r.pool.QueryRow(ctx, q, subject, email)
 	var u User
 	if err := row.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
@@ -33,6 +34,7 @@ RETURNING id, oauth_subject, primary_email, created_at, last_login_at
 
 func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
 	const q = `SELECT id, oauth_subject, primary_email, created_at, last_login_at FROM users WHERE id=$1`
+	defer observeDB(ctx, "users.get_by_id")()
 	var u User
 	if err := r.pool.QueryRow(ctx, q, id).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -45,6 +47,7 @@ func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
 
 func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) {
 	const q = `SELECT id, oauth_subject, primary_email, created_at, last_login_at FROM users WHERE primary_email=$1`
+	defer observeDB(ctx, "users.get_by_email")()
 	var u User
 	if err := r.pool.QueryRow(ctx, q, email).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -62,6 +65,7 @@ type calendarRepo struct {
 
 func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar, error) {
 	const q = `SELECT id, user_id, name, color, created_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
+	defer observeDB(ctx, "calendars.list_by_user")()
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, err
@@ -81,6 +85,7 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 
 func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, error) {
 	const q = `INSERT INTO calendars (user_id, name, color) VALUES ($1, $2, $3) RETURNING id, user_id, name, color, created_at`
+	defer observeDB(ctx, "calendars.create")()
 	row := r.pool.QueryRow(ctx, q, cal.UserID, cal.Name, cal.Color)
 	var created Calendar
 	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.Color, &created.CreatedAt); err != nil {
@@ -91,12 +96,14 @@ func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, err
 
 func (r *calendarRepo) Rename(ctx context.Context, id int64, name string) error {
 	const q = `UPDATE calendars SET name=$1 WHERE id=$2`
+	defer observeDB(ctx, "calendars.rename")()
 	_, err := r.pool.Exec(ctx, q, name, id)
 	return err
 }
 
 func (r *calendarRepo) Delete(ctx context.Context, id int64) error {
 	const q = `DELETE FROM calendars WHERE id=$1`
+	defer observeDB(ctx, "calendars.delete")()
 	_, err := r.pool.Exec(ctx, q, id)
 	return err
 }
@@ -116,6 +123,7 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         last_modified = NOW()
 RETURNING id, calendar_id, uid, raw_ical, etag, last_modified
 `
+	defer observeDB(ctx, "events.upsert")()
 	row := r.pool.QueryRow(ctx, q, event.CalendarID, event.UID, event.RawICAL, event.ETag)
 	var ev Event
 	if err := row.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.LastModified); err != nil {
@@ -126,12 +134,14 @@ RETURNING id, calendar_id, uid, raw_ical, etag, last_modified
 
 func (r *eventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid string) error {
 	const q = `DELETE FROM events WHERE calendar_id=$1 AND uid=$2`
+	defer observeDB(ctx, "events.delete_by_uid")()
 	_, err := r.pool.Exec(ctx, q, calendarID, uid)
 	return err
 }
 
 func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error) {
 	const q = `SELECT id, calendar_id, uid, raw_ical, etag, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
+	defer observeDB(ctx, "events.get_by_uid")()
 	var ev Event
 	if err := r.pool.QueryRow(ctx, q, calendarID, uid).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.LastModified); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -147,6 +157,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 		return []Event{}, nil
 	}
 	const q = `SELECT id, calendar_id, uid, raw_ical, etag, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
+	defer observeDB(ctx, "events.list_by_uids")()
 	rows, err := r.pool.Query(ctx, q, calendarID, uids)
 	if err != nil {
 		return nil, err
@@ -166,6 +177,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 
 func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error) {
 	const q = `SELECT id, calendar_id, uid, raw_ical, etag, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
+	defer observeDB(ctx, "events.list_for_calendar")()
 	rows, err := r.pool.Query(ctx, q, calendarID)
 	if err != nil {
 		return nil, err
@@ -190,6 +202,7 @@ type addressBookRepo struct {
 
 func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]AddressBook, error) {
 	const q = `SELECT id, user_id, name, created_at FROM address_books WHERE user_id=$1 ORDER BY created_at`
+	defer observeDB(ctx, "address_books.list_by_user")()
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, err
@@ -209,6 +222,7 @@ func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]Addre
 
 func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*AddressBook, error) {
 	const q = `INSERT INTO address_books (user_id, name) VALUES ($1, $2) RETURNING id, user_id, name, created_at`
+	defer observeDB(ctx, "address_books.create")()
 	row := r.pool.QueryRow(ctx, q, book.UserID, book.Name)
 	var created AddressBook
 	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.CreatedAt); err != nil {
@@ -219,12 +233,14 @@ func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*Addres
 
 func (r *addressBookRepo) Rename(ctx context.Context, id int64, name string) error {
 	const q = `UPDATE address_books SET name=$1 WHERE id=$2`
+	defer observeDB(ctx, "address_books.rename")()
 	_, err := r.pool.Exec(ctx, q, name, id)
 	return err
 }
 
 func (r *addressBookRepo) Delete(ctx context.Context, id int64) error {
 	const q = `DELETE FROM address_books WHERE id=$1`
+	defer observeDB(ctx, "address_books.delete")()
 	_, err := r.pool.Exec(ctx, q, id)
 	return err
 }
@@ -244,6 +260,7 @@ ON CONFLICT (address_book_id, uid) DO UPDATE SET
         last_modified = NOW()
 RETURNING id, address_book_id, uid, raw_vcard, etag, last_modified
 `
+	defer observeDB(ctx, "contacts.upsert")()
 	row := r.pool.QueryRow(ctx, q, contact.AddressBookID, contact.UID, contact.RawVCard, contact.ETag)
 	var c Contact
 	if err := row.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.LastModified); err != nil {
@@ -254,12 +271,14 @@ RETURNING id, address_book_id, uid, raw_vcard, etag, last_modified
 
 func (r *contactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
 	const q = `DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	defer observeDB(ctx, "contacts.delete_by_uid")()
 	_, err := r.pool.Exec(ctx, q, addressBookID, uid)
 	return err
 }
 
 func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	defer observeDB(ctx, "contacts.get_by_uid")()
 	var c Contact
 	if err := r.pool.QueryRow(ctx, q, addressBookID, uid).Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.LastModified); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -275,6 +294,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 		return []Contact{}, nil
 	}
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`
+	defer observeDB(ctx, "contacts.list_by_uids")()
 	rows, err := r.pool.Query(ctx, q, addressBookID, uids)
 	if err != nil {
 		return nil, err
@@ -294,6 +314,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 
 func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`
+	defer observeDB(ctx, "contacts.list_for_book")()
 	rows, err := r.pool.Query(ctx, q, addressBookID)
 	if err != nil {
 		return nil, err
@@ -322,6 +343,7 @@ INSERT INTO app_passwords (user_id, label, token_hash, expires_at)
 VALUES ($1, $2, $3, $4)
 RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
 `
+	defer observeDB(ctx, "app_passwords.create")()
 	row := r.pool.QueryRow(ctx, q, token.UserID, token.Label, token.TokenHash, token.ExpiresAt)
 	var t AppPassword
 	if err := row.Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
@@ -337,6 +359,7 @@ FROM app_passwords
 WHERE user_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
 ORDER BY created_at DESC
 `
+	defer observeDB(ctx, "app_passwords.find_valid_by_user")()
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, err
@@ -356,6 +379,7 @@ ORDER BY created_at DESC
 
 func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPassword, error) {
 	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE user_id=$1 ORDER BY created_at DESC`
+	defer observeDB(ctx, "app_passwords.list_by_user")()
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, err
@@ -375,6 +399,7 @@ func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPa
 
 func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, error) {
 	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`
+	defer observeDB(ctx, "app_passwords.get_by_id")()
 	var t AppPassword
 	if err := r.pool.QueryRow(ctx, q, id).Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -387,12 +412,14 @@ func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, 
 
 func (r *appPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET revoked_at = NOW() WHERE id=$1`
+	defer observeDB(ctx, "app_passwords.revoke")()
 	_, err := r.pool.Exec(ctx, q, id)
 	return err
 }
 
 func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET last_used_at = NOW() WHERE id=$1`
+	defer observeDB(ctx, "app_passwords.touch_last_used")()
 	_, err := r.pool.Exec(ctx, q, id)
 	return err
 }
@@ -410,6 +437,7 @@ func (s *Store) EnsureDefaultCollections(ctx context.Context, userID int64) erro
 
 func (s *Store) ensureDefaultCalendar(ctx context.Context, userID int64) error {
 	const countQuery = `SELECT COUNT(1) FROM calendars WHERE user_id=$1`
+	defer observeDB(ctx, "calendars.ensure_default")()
 	var count int
 	if err := s.pool.QueryRow(ctx, countQuery, userID).Scan(&count); err != nil {
 		return err
@@ -423,6 +451,7 @@ func (s *Store) ensureDefaultCalendar(ctx context.Context, userID int64) error {
 
 func (s *Store) ensureDefaultAddressBook(ctx context.Context, userID int64) error {
 	const countQuery = `SELECT COUNT(1) FROM address_books WHERE user_id=$1`
+	defer observeDB(ctx, "address_books.ensure_default")()
 	var count int
 	if err := s.pool.QueryRow(ctx, countQuery, userID).Scan(&count); err != nil {
 		return err

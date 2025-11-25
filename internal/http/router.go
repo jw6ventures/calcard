@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"time"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -11,6 +12,7 @@ import (
 	"github.com/example/calcard/internal/auth"
 	"github.com/example/calcard/internal/config"
 	"github.com/example/calcard/internal/dav"
+	"github.com/example/calcard/internal/metrics"
 	"github.com/example/calcard/internal/store"
 	"github.com/example/calcard/internal/ui"
 )
@@ -23,6 +25,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(overrideMethod)
+	r.Use(metrics.Middleware())
 	// TODO: add CSRF middleware for UI.
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -41,6 +45,10 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+  })
+  
+	r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metrics.Handler().ServeHTTP(w, r)
 	})
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
@@ -56,7 +64,17 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Get("/calendars", uiHandler.Calendars)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
-		// TODO: add POST/PUT/DELETE for UI forms.
+		r.Post("/calendars", uiHandler.CreateCalendar)
+		r.Put("/calendars/{id}", uiHandler.RenameCalendar)
+		r.Delete("/calendars/{id}", uiHandler.DeleteCalendar)
+
+		r.Post("/addressbooks", uiHandler.CreateAddressBook)
+		r.Put("/addressbooks/{id}", uiHandler.RenameAddressBook)
+		r.Delete("/addressbooks/{id}", uiHandler.DeleteAddressBook)
+
+		r.Post("/app-passwords", uiHandler.CreateAppPassword)
+		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)
+		r.Post("/app-passwords/{id}/revoke", uiHandler.RevokeAppPassword)
 	})
 
 	r.Route("/dav", func(r chi.Router) {
@@ -73,4 +91,22 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	})
 
 	return r
+}
+
+func overrideMethod(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.Method
+		if r.Method == http.MethodPost {
+			if m := strings.TrimSpace(r.PostFormValue("_method")); m != "" {
+				method = m
+			} else if m := strings.TrimSpace(r.URL.Query().Get("_method")); m != "" {
+				method = m
+			}
+		}
+		switch strings.ToUpper(method) {
+		case http.MethodPut, http.MethodDelete:
+			r.Method = strings.ToUpper(method)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
