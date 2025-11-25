@@ -131,13 +131,13 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	switch {
 	case len(segments) == 0 || segments[0] == "":
 		base := ensureCollectionHref("/dav/calendars")
-		res := []response{collectionResponse(base, "Calendars")}
-		if depth == "1" {
-			cals, err := h.store.Calendars.ListByUser(ctx, user.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range cals {
+                res := []response{collectionResponse(base, "Calendars")}
+                if depth == "1" || depth == "0" {
+                        cals, err := h.store.Calendars.ListByUser(ctx, user.ID)
+                        if err != nil {
+                                return nil, err
+                        }
+                        for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				res = append(res, calendarCollectionResponse(href, c.Name))
 			}
@@ -156,13 +156,13 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 	switch {
 	case len(segments) == 0 || segments[0] == "":
 		base := ensureCollectionHref("/dav/addressbooks")
-		res := []response{collectionResponse(base, "Address Books")}
-		if depth == "1" {
-			books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, b := range books {
+                res := []response{collectionResponse(base, "Address Books")}
+                if depth == "1" || depth == "0" {
+                        books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
+                        if err != nil {
+                                return nil, err
+                        }
+                        for _, b := range books {
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
 				res = append(res, addressBookCollectionResponse(href, b.Name))
 			}
