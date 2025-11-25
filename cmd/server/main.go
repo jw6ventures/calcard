@@ -16,6 +16,7 @@ import (
 )
 
 func main() {
+	log.Println("Starting CalCard server...")
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)

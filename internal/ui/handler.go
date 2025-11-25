@@ -169,7 +169,6 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		view = append(view, map[string]any{
 			"id":         p.ID,
 			"label":      p.Label,
-			"id":         p.ID,
 			"created_at": p.CreatedAt,
 			"expires_at": p.ExpiresAt,
 			"last_used":  p.LastUsedAt,
@@ -339,19 +338,6 @@ func (h *Handler) CreateAppPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.redirect(w, r, "/app-passwords", map[string]string{"status": "created", "token": token})
-}
-
-func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "invalid id"})
-		return
-	}
-	if err := h.store.AppPasswords.Revoke(r.Context(), id); err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "revoke failed"})
-		return
-	}
-	h.redirect(w, r, "/app-passwords", map[string]string{"status": "revoked"})
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
