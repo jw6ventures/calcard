@@ -3,8 +3,8 @@ package httpserver
 import (
 	"context"
 	"net/http"
-	"time"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -16,6 +16,18 @@ import (
 	"github.com/example/calcard/internal/store"
 	"github.com/example/calcard/internal/ui"
 )
+
+func init() {
+	for _, method := range []string{
+		"PROPFIND",
+		"PROPPATCH",
+		"MKCOL",
+		"MKCALENDAR",
+		"REPORT",
+	} {
+		chi.RegisterMethod(method)
+	}
+}
 
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
 func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service, sessions *auth.SessionManager) http.Handler {
@@ -45,8 +57,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
-  })
-  
+	})
+
 	r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metrics.Handler().ServeHTTP(w, r)
 	})
