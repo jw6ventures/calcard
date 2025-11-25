@@ -31,6 +31,10 @@ func main() {
 	}
 	defer pool.Close()
 
+	if err := store.ApplyMigrations(ctx, pool); err != nil {
+		log.Fatalf("failed to apply migrations: %v", err)
+	}
+
 	stor := store.New(pool)
 	sessionManager := appauth.NewSessionManager(cfg)
 	authService, err := appauth.NewService(cfg, stor, sessionManager)
