@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"log"
 
 	"github.com/example/calcard/internal/auth"
 	"github.com/example/calcard/internal/config"
@@ -106,6 +107,12 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		return p
 	}
 
+	log.Println("reqPath", reqPath)
+	log.Println("cleanPath", cleanPath)
+	log.Println("depth", depth)
+	log.Println("user", user)
+	log.Println("ctx", ctx)
+
 	switch {
 	case cleanPath == "/dav" || cleanPath == "/dav/":
 		href := ensureCollectionHref(cleanPath)
@@ -116,6 +123,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 				collectionResponse(ensureCollectionHref("/dav/addressbooks"), "Address Books"),
 			)
 		}
+		log.Println("res", res)
 		return res, nil
 	case strings.HasPrefix(cleanPath, "/dav/calendars"):
 		return h.calendarResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
