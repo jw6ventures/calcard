@@ -22,6 +22,13 @@ Database migrations live in `internal/migrations/001_init.sql` and are embedded 
 ## Status
 The server focuses on clear structure and extensibility. OAuth token exchange, CSRF, and DAV REPORT depth semantics are stubbed for follow-up work, but interfaces and storage primitives are ready for integration.
 
+## Connecting a CalDAV/CardDAV client
+- Sign in to the web UI once (via OAuth) before configuring a DAV client so the server can bootstrap your default calendar and address book.
+- Start service discovery from the DAV root at `<base-url>/dav` (recommended) or from the collection homes at `/dav/calendars/` and `/dav/addressbooks/`. Calendar collections live at `/dav/calendars/<calendar-id>/` (numeric IDs are visible in the web UI and PROPFIND responses).
+- Authenticate with HTTP Basic Auth using your **primary email address** as the username and the generated **App Password** as the password. Other identifiers (display names, OAuth subject, etc.) are not accepted.
+- If a client reports no calendars, manually issue a PROPFIND to `/dav/calendars/` (Depth: 0 or 1) to confirm your calendar collections appear; use those numeric IDs in the client configuration.
+- Create and manage App Passwords from the web UI at `/app-passwords` after signing in through OAuth. Passwords can be revoked at any time; make sure the one you use is not expired or revoked.
+
 ## Health probes
 - Liveness: `GET /healthz` returns immediately when the HTTP server is running, without touching dependencies.
 - Readiness: `GET /readyz` checks connectivity to critical dependencies (currently PostgreSQL via `Store.HealthCheck`) and returns `503 Service Unavailable` until they are reachable.
