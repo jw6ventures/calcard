@@ -1,7 +1,9 @@
 package httpserver
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -24,6 +26,19 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	// TODO: add CSRF middleware for UI.
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := store.HealthCheck(ctx); err != nil {
+			http.Error(w, "unready", http.StatusServiceUnavailable)
+			return
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})

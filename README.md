@@ -21,3 +21,7 @@ Database migrations live in `internal/migrations/001_init.sql`.
 
 ## Status
 The server focuses on clear structure and extensibility. OAuth token exchange, CSRF, and DAV REPORT depth semantics are stubbed for follow-up work, but interfaces and storage primitives are ready for integration.
+
+## Health probes
+- Liveness: `GET /healthz` returns immediately when the HTTP server is running, without touching dependencies.
+- Readiness: `GET /readyz` checks connectivity to critical dependencies (currently PostgreSQL via `Store.HealthCheck`) and returns `503 Service Unavailable` until they are reachable.
