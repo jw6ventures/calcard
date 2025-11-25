@@ -64,7 +64,6 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	})
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
-	r.Get("/", uiHandler.Dashboard)
 	r.Route("/auth", func(r chi.Router) {
 		r.Get("/login", authService.BeginOAuth)
 		r.Get("/callback", authService.HandleOAuthCallback)
@@ -73,6 +72,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 	r.Group(func(r chi.Router) {
 		r.Use(authService.RequireSession)
+		r.Get("/", uiHandler.Dashboard)
 		r.Get("/calendars", uiHandler.Calendars)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
