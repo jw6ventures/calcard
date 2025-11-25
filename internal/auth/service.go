@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -99,6 +100,7 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.store.Users.UpsertOAuthUser(ctx, oauthSubject, email)
 	if err != nil {
+		log.Printf("failed to persist user for subject %q: %v", oauthSubject, err)
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
 		return
 	}
