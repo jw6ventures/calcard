@@ -25,10 +25,25 @@ func NewHandler(cfg *config.Config, store *store.Store) *Handler {
 }
 
 func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Allow", "OPTIONS, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, PUT, DELETE, REPORT")
+	w.Header().Set("Allow", "OPTIONS, HEAD, GET, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, PUT, DELETE, REPORT")
 	w.Header().Set("DAV", "1, 2, calendar-access, addressbook")
 	w.Header().Set("Accept-Patch", "application/xml")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
+	h.Get(w, r)
+}
+
+func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	cleanPath := path.Clean(r.URL.Path)
+	if !strings.HasPrefix(cleanPath, "/dav") {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("DAV", "1, 2, calendar-access, addressbook")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +132,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 	case cleanPath == "/dav" || cleanPath == "/dav/":
 		href := ensureCollectionHref(cleanPath)
 		res := []response{collectionResponse(href, "CalCard DAV")}
-		if depth == "1" {
+		if depth == "1" || depth == "0" {
 			res = append(res,
 				collectionResponse(ensureCollectionHref("/dav/calendars"), "Calendars"),
 				collectionResponse(ensureCollectionHref("/dav/addressbooks"), "Address Books"),
@@ -139,13 +154,13 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	switch {
 	case len(segments) == 0 || segments[0] == "":
 		base := ensureCollectionHref("/dav/calendars")
-                res := []response{collectionResponse(base, "Calendars")}
-                if depth == "1" || depth == "0" {
-                        cals, err := h.store.Calendars.ListByUser(ctx, user.ID)
-                        if err != nil {
-                                return nil, err
-                        }
-                        for _, c := range cals {
+		res := []response{collectionResponse(base, "Calendars")}
+		if depth == "1" || depth == "0" {
+			cals, err := h.store.Calendars.ListByUser(ctx, user.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				res = append(res, calendarCollectionResponse(href, c.Name))
 			}
@@ -164,13 +179,13 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 	switch {
 	case len(segments) == 0 || segments[0] == "":
 		base := ensureCollectionHref("/dav/addressbooks")
-                res := []response{collectionResponse(base, "Address Books")}
-                if depth == "1" || depth == "0" {
-                        books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
-                        if err != nil {
-                                return nil, err
-                        }
-                        for _, b := range books {
+		res := []response{collectionResponse(base, "Address Books")}
+		if depth == "1" || depth == "0" {
+			books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, b := range books {
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
 				res = append(res, addressBookCollectionResponse(href, b.Name))
 			}

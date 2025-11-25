@@ -63,6 +63,14 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		metrics.Handler().ServeHTTP(w, r)
 	})
 
+	r.Get("/.well-known/caldav", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
+	})
+
+	r.Get("/.well-known/carddav", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
+	})
+
 	uiHandler := ui.NewHandler(cfg, store, authService)
 	r.Route("/auth", func(r chi.Router) {
 		r.Get("/login", authService.BeginOAuth)
@@ -92,6 +100,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	r.Route("/dav", func(r chi.Router) {
 		r.Use(authService.RequireDAVAuth)
 		davHandler := dav.NewHandler(cfg, store)
+		r.MethodFunc("HEAD", "/*", davHandler.Head)
+		r.MethodFunc("GET", "/*", davHandler.Get)
 		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
 		r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
 		r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
