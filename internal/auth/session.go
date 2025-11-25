@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/example/calcard/internal/config"
@@ -13,19 +15,29 @@ type SessionManager struct {
 	cfg        *config.Config
 	cookieName string
 	codec      *securecookie.SecureCookie
+	secure     bool
 }
 
 func NewSessionManager(cfg *config.Config) *SessionManager {
-	hashKey := []byte(cfg.Session.Secret)
-	blockKey := hashKey
+	hash := sha256.Sum256([]byte(cfg.Session.Secret))
+	hashKey := hash[:]
+
+	// Derive an AES-256 sized block key to avoid invalid key length errors.
+	blockKey := hash[:]
 	sc := securecookie.New(hashKey, blockKey)
 	sc.MaxAge(86400 * 7)
 	sc.SetSerializer(securecookie.JSONEncoder{})
+
+	secure := true
+	if base, err := url.Parse(cfg.BaseURL); err == nil && base.Scheme != "https" {
+		secure = false
+	}
 
 	return &SessionManager{
 		cfg:        cfg,
 		cookieName: "calcard_session",
 		codec:      sc,
+		secure:     secure,
 	}
 }
 
@@ -47,7 +59,7 @@ func (m *SessionManager) Issue(w http.ResponseWriter, userID int64) error {
 		Path:     "/",
 		Expires:  time.Now().Add(24 * time.Hour),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   m.secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	return nil
@@ -60,6 +72,7 @@ func (m *SessionManager) Clear(w http.ResponseWriter) {
 		Value:   "",
 		Path:    "/",
 		Expires: time.Unix(0, 0),
+		Secure:  m.secure,
 	})
 }
 
