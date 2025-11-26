@@ -1,8 +1,6 @@
 package ui
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -13,9 +11,9 @@ import (
 
 	"github.com/example/calcard/internal/auth"
 	"github.com/example/calcard/internal/config"
+	"github.com/example/calcard/internal/http/csrf"
 	"github.com/example/calcard/internal/store"
 	"github.com/go-chi/chi/v5"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // Handler serves server-rendered HTML pages.
@@ -32,9 +30,21 @@ func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Servic
 
 func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
-	calendars, _ := h.store.Calendars.ListByUser(r.Context(), user.ID)
-	books, _ := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
-	passwords, _ := h.store.AppPasswords.ListByUser(r.Context(), user.ID)
+	calendars, err := h.store.Calendars.ListByUser(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "failed to load calendars", http.StatusInternalServerError)
+		return
+	}
+	books, err := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		return
+	}
+	passwords, err := h.store.AppPasswords.ListByUser(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "failed to load app passwords", http.StatusInternalServerError)
+		return
+	}
 
 	data := h.withFlash(r, map[string]any{
 		"Title":         "Dashboard",
@@ -182,6 +192,10 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		"User":         user,
 		"AppPasswords": view,
 	})
+	if plaintext != "" {
+		data["PlainToken"] = plaintext
+		data["FlashMessage"] = "created"
+	}
 	h.render(w, "app_passwords.html", data)
 }
 
@@ -215,12 +229,22 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "name is required"})
 		return
 	}
+	user, _ := auth.UserFromContext(r.Context())
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "invalid id"})
 		return
 	}
-	if err := h.store.Calendars.Rename(r.Context(), id, name); err != nil {
+	cal, err := h.store.Calendars.GetByID(r.Context(), id)
+	if err != nil {
+		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
+		return
+	}
+	if cal == nil || cal.UserID != user.ID {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err := h.store.Calendars.Rename(r.Context(), user.ID, id, name); err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
 	}
@@ -233,7 +257,8 @@ func (h *Handler) DeleteCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "invalid id"})
 		return
 	}
-	if err := h.store.Calendars.Delete(r.Context(), id); err != nil {
+	user, _ := auth.UserFromContext(r.Context())
+	if err := h.store.Calendars.Delete(r.Context(), user.ID, id); err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
 		return
 	}
@@ -274,7 +299,17 @@ func (h *Handler) RenameAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid id"})
 		return
 	}
-	if err := h.store.AddressBooks.Rename(r.Context(), id, name); err != nil {
+	user, _ := auth.UserFromContext(r.Context())
+	book, err := h.store.AddressBooks.GetByID(r.Context(), id)
+	if err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "rename failed"})
+		return
+	}
+	if book == nil || book.UserID != user.ID {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err := h.store.AddressBooks.Rename(r.Context(), user.ID, id, name); err != nil {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "rename failed"})
 		return
 	}
@@ -287,7 +322,8 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid id"})
 		return
 	}
-	if err := h.store.AddressBooks.Delete(r.Context(), id); err != nil {
+	user, _ := auth.UserFromContext(r.Context())
+	if err := h.store.AddressBooks.Delete(r.Context(), user.ID, id); err != nil {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "delete failed"})
 		return
 	}
@@ -296,48 +332,32 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) CreateAppPassword(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "invalid form"})
+		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
 	label := strings.TrimSpace(r.FormValue("label"))
 	if label == "" {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "label is required"})
+		http.Error(w, "label is required", http.StatusBadRequest)
 		return
 	}
 	var expiresAt *time.Time
 	if exp := strings.TrimSpace(r.FormValue("expires_at")); exp != "" {
 		parsed, err := time.Parse(time.RFC3339, exp)
 		if err != nil {
-			h.redirect(w, r, "/app-passwords", map[string]string{"error": "invalid expiry"})
+			http.Error(w, "invalid expiry", http.StatusBadRequest)
 			return
 		}
 		expiresAt = &parsed
 	}
 
-	token, err := generateToken()
-	if err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "token generation failed"})
-		return
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(token), bcrypt.DefaultCost)
-	if err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "hashing failed"})
-		return
-	}
-
 	user, _ := auth.UserFromContext(r.Context())
-	_, err = h.store.AppPasswords.Create(r.Context(), store.AppPassword{
-		UserID:    user.ID,
-		Label:     label,
-		TokenHash: string(hash),
-		ExpiresAt: expiresAt,
-	})
+	token, _, err := h.authService.CreateAppPassword(r.Context(), user.ID, label, expiresAt)
 	if err != nil {
-		h.redirect(w, r, "/app-passwords", map[string]string{"error": "create failed"})
+		http.Error(w, "create failed", http.StatusInternalServerError)
 		return
 	}
 
-	h.redirect(w, r, "/app-passwords", map[string]string{"status": "created", "token": token})
+	h.renderAppPasswords(w, r, user, token)
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
@@ -358,6 +378,9 @@ func (h *Handler) withFlash(r *http.Request, data map[string]any) map[string]any
 	if token := q.Get("token"); token != "" {
 		data["PlainToken"] = token
 	}
+	if csrfToken := csrf.TokenFromContext(r.Context()); csrfToken != "" {
+		data["CSRFToken"] = csrfToken
+	}
 	return data
 }
 
@@ -373,14 +396,6 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request, path string, 
 		location += "?" + encoded
 	}
 	http.Redirect(w, r, location, http.StatusFound)
-}
-
-func generateToken() (string, error) {
-	buf := make([]byte, 18)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func (h *Handler) render(w http.ResponseWriter, name string, data any) {

@@ -11,10 +11,11 @@ type UserRepository interface {
 
 // CalendarRepository handles calendars lifecycle.
 type CalendarRepository interface {
+	GetByID(ctx context.Context, id int64) (*Calendar, error)
 	ListByUser(ctx context.Context, userID int64) ([]Calendar, error)
 	Create(ctx context.Context, cal Calendar) (*Calendar, error)
-	Rename(ctx context.Context, id int64, name string) error
-	Delete(ctx context.Context, id int64) error
+	Rename(ctx context.Context, userID, id int64, name string) error
+	Delete(ctx context.Context, userID, id int64) error
 }
 
 // EventRepository handles event storage.
@@ -28,10 +29,11 @@ type EventRepository interface {
 
 // AddressBookRepository manages address books.
 type AddressBookRepository interface {
+	GetByID(ctx context.Context, id int64) (*AddressBook, error)
 	ListByUser(ctx context.Context, userID int64) ([]AddressBook, error)
 	Create(ctx context.Context, book AddressBook) (*AddressBook, error)
-	Rename(ctx context.Context, id int64, name string) error
-	Delete(ctx context.Context, id int64) error
+	Rename(ctx context.Context, userID, id int64, name string) error
+	Delete(ctx context.Context, userID, id int64) error
 }
 
 // ContactRepository handles vCard storage.

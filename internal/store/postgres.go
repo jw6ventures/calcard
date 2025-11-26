@@ -83,6 +83,19 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 	return result, rows.Err()
 }
 
+func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error) {
+	const q = `SELECT id, user_id, name, color, created_at FROM calendars WHERE id=$1`
+	defer observeDB(ctx, "calendars.get_by_id")()
+	var c Calendar
+	if err := r.pool.QueryRow(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &c.Color, &c.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
 func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, error) {
 	const q = `INSERT INTO calendars (user_id, name, color) VALUES ($1, $2, $3) RETURNING id, user_id, name, color, created_at`
 	defer observeDB(ctx, "calendars.create")()
@@ -94,18 +107,30 @@ func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, err
 	return &created, nil
 }
 
-func (r *calendarRepo) Rename(ctx context.Context, id int64, name string) error {
-	const q = `UPDATE calendars SET name=$1 WHERE id=$2`
+func (r *calendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {
+	const q = `UPDATE calendars SET name=$1 WHERE id=$2 AND user_id=$3`
 	defer observeDB(ctx, "calendars.rename")()
-	_, err := r.pool.Exec(ctx, q, name, id)
-	return err
+	res, err := r.pool.Exec(ctx, q, name, id, userID)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
-func (r *calendarRepo) Delete(ctx context.Context, id int64) error {
-	const q = `DELETE FROM calendars WHERE id=$1`
+func (r *calendarRepo) Delete(ctx context.Context, userID, id int64) error {
+	const q = `DELETE FROM calendars WHERE id=$1 AND user_id=$2`
 	defer observeDB(ctx, "calendars.delete")()
-	_, err := r.pool.Exec(ctx, q, id)
-	return err
+	res, err := r.pool.Exec(ctx, q, id, userID)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // eventRepo implements EventRepository.
@@ -220,6 +245,19 @@ func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]Addre
 	return result, rows.Err()
 }
 
+func (r *addressBookRepo) GetByID(ctx context.Context, id int64) (*AddressBook, error) {
+	const q = `SELECT id, user_id, name, created_at FROM address_books WHERE id=$1`
+	defer observeDB(ctx, "address_books.get_by_id")()
+	var book AddressBook
+	if err := r.pool.QueryRow(ctx, q, id).Scan(&book.ID, &book.UserID, &book.Name, &book.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &book, nil
+}
+
 func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*AddressBook, error) {
 	const q = `INSERT INTO address_books (user_id, name) VALUES ($1, $2) RETURNING id, user_id, name, created_at`
 	defer observeDB(ctx, "address_books.create")()
@@ -231,18 +269,30 @@ func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*Addres
 	return &created, nil
 }
 
-func (r *addressBookRepo) Rename(ctx context.Context, id int64, name string) error {
-	const q = `UPDATE address_books SET name=$1 WHERE id=$2`
+func (r *addressBookRepo) Rename(ctx context.Context, userID, id int64, name string) error {
+	const q = `UPDATE address_books SET name=$1 WHERE id=$2 AND user_id=$3`
 	defer observeDB(ctx, "address_books.rename")()
-	_, err := r.pool.Exec(ctx, q, name, id)
-	return err
+	res, err := r.pool.Exec(ctx, q, name, id, userID)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
-func (r *addressBookRepo) Delete(ctx context.Context, id int64) error {
-	const q = `DELETE FROM address_books WHERE id=$1`
+func (r *addressBookRepo) Delete(ctx context.Context, userID, id int64) error {
+	const q = `DELETE FROM address_books WHERE id=$1 AND user_id=$2`
 	defer observeDB(ctx, "address_books.delete")()
-	_, err := r.pool.Exec(ctx, q, id)
-	return err
+	res, err := r.pool.Exec(ctx, q, id, userID)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // contactRepo implements ContactRepository.
