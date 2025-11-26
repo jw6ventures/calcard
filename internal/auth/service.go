@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/example/calcard/internal/config"
 	"github.com/example/calcard/internal/store"
 	"golang.org/x/crypto/bcrypt"
@@ -25,6 +27,8 @@ type Service struct {
 	sessions *SessionManager
 	oauthCfg *oauth2.Config
 	userinfo string
+	provider *oidc.Provider
+	verifier *oidc.IDTokenVerifier
 }
 
 func NewService(cfg *config.Config, store *store.Store, sessions *SessionManager) (*Service, error) {
@@ -34,20 +38,24 @@ func NewService(cfg *config.Config, store *store.Store, sessions *SessionManager
 		discoveryURL = cfg.OAuth.IssuerURL
 	}
 
-	oidc, err := discoverOIDC(discoveryURL)
+	oidcConfig, err := discoverOIDC(discoveryURL)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Service{cfg: cfg, store: store, sessions: sessions, userinfo: oidc.UserinfoEndpoint, oauthCfg: &oauth2.Config{
+	provider, err := oidc.NewProvider(context.Background(), discoveryURL)
+	if err != nil {
+		return nil, err
+	}
+
+	verifier := provider.Verifier(&oidc.Config{ClientID: cfg.OAuth.ClientID})
+
+	return &Service{cfg: cfg, store: store, sessions: sessions, userinfo: oidcConfig.UserinfoEndpoint, provider: provider, verifier: verifier, oauthCfg: &oauth2.Config{
 		ClientID:     cfg.OAuth.ClientID,
 		ClientSecret: cfg.OAuth.ClientSecret,
 		RedirectURL:  redirectURL,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  oidc.AuthorizationEndpoint,
-			TokenURL: oidc.TokenEndpoint,
-		},
-		Scopes: []string{"openid", "email", "profile"},
+		Endpoint:     provider.Endpoint(),
+		Scopes:       []string{"openid", "email", "profile"},
 	}}, nil
 }
 
@@ -58,12 +66,14 @@ func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to start login", http.StatusInternalServerError)
 		return
 	}
+	secure := s.cookieSecure(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "calcard_oauth_state",
 		Value:    state,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(10 * time.Minute),
 	})
 
@@ -231,6 +241,16 @@ func (s *Service) ClearSession(w http.ResponseWriter) {
 
 // TODO: add CSRF protection middleware and helpers.
 
+func (s *Service) cookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if base, err := url.Parse(s.cfg.BaseURL); err == nil && base.Scheme == "https" {
+		return true
+	}
+	return false
+}
+
 func randomState() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -280,30 +300,15 @@ type userInfo struct {
 }
 
 func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string, string, error) {
-	if s.userinfo != "" {
-		client := s.oauthCfg.Client(ctx, token)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.userinfo, nil)
-		if err != nil {
-			return "", "", err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return "", "", err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return "", "", fmt.Errorf("userinfo responded with %s", resp.Status)
-		}
-
-		var info userInfo
-		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-			return "", "", err
-		}
-
-		if info.Subject != "" && info.Email != "" {
-			return info.Subject, info.Email, nil
+	if s.provider != nil {
+		info, err := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
+		if err == nil {
+			var claims userInfo
+			if err := info.Claims(&claims); err == nil {
+				if claims.Subject != "" && claims.Email != "" {
+					return claims.Subject, claims.Email, nil
+				}
+			}
 		}
 	}
 
@@ -312,18 +317,17 @@ func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string
 		return "", "", errors.New("no userinfo or id_token available")
 	}
 
-	parts := strings.Split(rawIDToken, ".")
-	if len(parts) < 2 {
-		return "", "", errors.New("invalid id_token format")
+	if s.verifier == nil {
+		return "", "", errors.New("id_token verification unavailable")
 	}
 
-	claimsJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	idToken, err := s.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		return "", "", err
 	}
 
 	var claims userInfo
-	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
+	if err := idToken.Claims(&claims); err != nil {
 		return "", "", err
 	}
 

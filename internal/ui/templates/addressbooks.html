@@ -9,11 +9,13 @@
         <td>{{formatTime .CreatedAt}}</td>
         <td>
             <form method="post" action="/addressbooks/{{.ID}}" style="display:inline">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                 <input type="hidden" name="_method" value="PUT">
                 <input name="name" placeholder="Rename" required>
                 <button type="submit">Rename</button>
             </form>
             <form method="post" action="/addressbooks/{{.ID}}" style="display:inline" onsubmit="return confirm('Delete book?')">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                 <input type="hidden" name="_method" value="DELETE">
                 <button type="submit">Delete</button>
             </form>
@@ -25,6 +27,7 @@
 </table>
 <form method="post" action="/addressbooks">
     <h3>Create address book</h3>
+    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <label>Name <input name="name" required></label>
     <button type="submit">Create</button>
 </form>
