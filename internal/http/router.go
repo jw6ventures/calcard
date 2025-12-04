@@ -1,0 +1,158 @@
+package httpserver
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"gitea.jw6.us/james/calcard/internal/auth"
+	"gitea.jw6.us/james/calcard/internal/config"
+	"gitea.jw6.us/james/calcard/internal/dav"
+	"gitea.jw6.us/james/calcard/internal/http/csrf"
+	"gitea.jw6.us/james/calcard/internal/metrics"
+	"gitea.jw6.us/james/calcard/internal/store"
+	"gitea.jw6.us/james/calcard/internal/ui"
+)
+
+func init() {
+	for _, method := range []string{
+		"PROPFIND",
+		"PROPPATCH",
+		"MKCOL",
+		"MKCALENDAR",
+		"REPORT",
+	} {
+		chi.RegisterMethod(method)
+	}
+}
+
+// NewRouter wires all HTTP routes for UI and DAV endpoints.
+func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service) http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(overrideMethod)
+	r.Use(metrics.Middleware())
+
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := store.HealthCheck(ctx); err != nil {
+			http.Error(w, "unready", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metrics.Handler().ServeHTTP(w, r)
+	})
+
+	r.Get("/.well-known/caldav", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
+	})
+
+	r.Get("/.well-known/carddav", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
+	})
+
+	uiHandler := ui.NewHandler(cfg, store, authService)
+	r.Route("/auth", func(r chi.Router) {
+		r.Get("/login", authService.BeginOAuth)
+		r.Get("/callback", authService.HandleOAuthCallback)
+		r.Get("/logout", uiHandler.Logout)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(authService.RequireSession)
+		r.Use(csrf.Middleware(cfg))
+		r.Get("/", uiHandler.Dashboard)
+		r.Get("/calendars", uiHandler.Calendars)
+		r.Get("/calendars/{id}", uiHandler.ViewCalendar)
+		r.Get("/addressbooks", uiHandler.AddressBooks)
+		r.Get("/addressbooks/{id}", uiHandler.ViewAddressBook)
+		r.Get("/app-passwords", uiHandler.AppPasswords)
+		r.Get("/sessions", uiHandler.Sessions)
+		r.Get("/birthdays", uiHandler.ViewBirthdays)
+
+		r.Post("/calendars", uiHandler.CreateCalendar)
+		r.Put("/calendars/{id}", uiHandler.RenameCalendar)
+		r.Delete("/calendars/{id}", uiHandler.DeleteCalendar)
+		r.Post("/calendars/{id}/shares", uiHandler.ShareCalendar)
+		r.Delete("/calendars/{id}/shares/{userId}", uiHandler.UnshareCalendar)
+		r.Post("/calendars/{id}/shares/{userId}/delete", uiHandler.UnshareCalendar) // HTML form fallback
+
+		// Event CRUD
+		r.Post("/calendars/{id}/events", uiHandler.CreateEvent)
+		r.Put("/calendars/{id}/events/{uid}", uiHandler.UpdateEvent)
+		r.Delete("/calendars/{id}/events/{uid}", uiHandler.DeleteEvent)
+		r.Post("/calendars/{id}/events/{uid}/delete", uiHandler.DeleteEvent) // HTML form fallback
+
+		r.Post("/addressbooks", uiHandler.CreateAddressBook)
+		r.Put("/addressbooks/{id}", uiHandler.RenameAddressBook)
+		r.Delete("/addressbooks/{id}", uiHandler.DeleteAddressBook)
+
+		// Contact CRUD
+		r.Post("/addressbooks/{id}/contacts", uiHandler.CreateContact)
+		r.Put("/addressbooks/{id}/contacts/{uid}", uiHandler.UpdateContact)
+		r.Delete("/addressbooks/{id}/contacts/{uid}", uiHandler.DeleteContact)
+		r.Post("/addressbooks/{id}/contacts/{uid}/delete", uiHandler.DeleteContact) // HTML form fallback
+
+		r.Post("/app-passwords", uiHandler.CreateAppPassword)
+		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)
+		r.Post("/app-passwords/{id}/revoke", uiHandler.RevokeAppPassword)
+
+		r.Post("/sessions/{id}/revoke", uiHandler.RevokeSession)
+		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)
+	})
+
+	r.Route("/dav", func(r chi.Router) {
+		r.Use(authService.RequireDAVAuth)
+		davHandler := dav.NewHandler(cfg, store)
+		r.MethodFunc("HEAD", "/*", davHandler.Head)
+		r.MethodFunc("GET", "/*", davHandler.Get)
+		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
+		r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
+		r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
+		r.MethodFunc("MKCOL", "/*", davHandler.Mkcol)
+		r.MethodFunc("MKCALENDAR", "/*", davHandler.Mkcalendar)
+		r.MethodFunc("PUT", "/*", davHandler.Put)
+		r.MethodFunc("DELETE", "/*", davHandler.Delete)
+		r.MethodFunc("REPORT", "/*", davHandler.Report)
+	})
+
+	return r
+}
+
+func overrideMethod(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.Method
+		if r.Method == http.MethodPost {
+			if m := strings.TrimSpace(r.PostFormValue("_method")); m != "" {
+				method = m
+			} else if m := strings.TrimSpace(r.URL.Query().Get("_method")); m != "" {
+				method = m
+			}
+		}
+		switch strings.ToUpper(method) {
+		case http.MethodPut, http.MethodDelete:
+			r.Method = strings.ToUpper(method)
+		}
+		next.ServeHTTP(w, r)
+	})
+}

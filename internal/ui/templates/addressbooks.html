@@ -1,0 +1,36 @@
+{{define "content"}}
+<h1>Address Books</h1>
+<p>CardDAV collections per user.</p>
+<table>
+    <tr><th>Name</th><th>Created</th><th>Actions</th></tr>
+    {{range .Books}}
+    <tr>
+        <td><a href="/addressbooks/{{.ID}}">{{.Name}}</a></td>
+        <td>{{formatTime .CreatedAt}}</td>
+        <td>
+            <a href="/addressbooks/{{.ID}}" style="margin-right:0.5rem">View</a>
+            <form method="post" action="/addressbooks/{{.ID}}" style="display:inline">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <input type="hidden" name="_method" value="PUT">
+                <input name="name" placeholder="Rename" required>
+                <button type="submit">Rename</button>
+            </form>
+            <form method="post" action="/addressbooks/{{.ID}}" style="display:inline" onsubmit="return confirm('Delete book?')">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit">Delete</button>
+            </form>
+        </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="3">No address books yet.</td></tr>
+    {{end}}
+</table>
+<form method="post" action="/addressbooks">
+    <h3>Create address book</h3>
+    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+    <label>Name <input name="name" required></label>
+    <button type="submit">Create</button>
+</form>
+{{end}}
+{{template "base" .}}

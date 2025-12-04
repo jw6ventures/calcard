@@ -1,0 +1,1264 @@
+{{define "content"}}
+<style>
+    .addressbook-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1.5rem;
+    }
+    .addressbook-header h1 {
+        margin: 0;
+        color: #1a1a2e;
+    }
+    .back-link {
+        color: #4a5568;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .back-link:hover { color: #2d3748; }
+    
+    .search-box {
+        margin-bottom: 1rem;
+    }
+    .search-input {
+        width: 100%;
+        max-width: 400px;
+        padding: 0.75rem 1rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        font-size: 1rem;
+    }
+    .search-input:focus {
+        outline: none;
+        border-color: #667eea;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    .contact-count {
+        color: #718096;
+        margin-bottom: 1rem;
+        font-size: 0.875rem;
+    }
+    
+    .contacts-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 1rem;
+    }
+    
+    .contact-card {
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1.25rem;
+        transition: box-shadow 0.2s, transform 0.2s;
+        cursor: pointer;
+    }
+    .contact-card:hover {
+        box-shadow: 0 8px 24px rgba(0,0,0,0.1);
+        transform: translateY(-2px);
+    }
+    
+    .contact-header {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: 0.75rem;
+    }
+    .contact-avatar {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: 600;
+        font-size: 1.25rem;
+        flex-shrink: 0;
+    }
+    .contact-avatar.has-photo {
+        background: none;
+    }
+    .contact-avatar img {
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        object-fit: cover;
+    }
+    .contact-name {
+        font-weight: 600;
+        font-size: 1.1rem;
+        color: #1a202c;
+    }
+    .contact-org {
+        font-size: 0.875rem;
+        color: #718096;
+    }
+    
+    .contact-details {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    .contact-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.5rem;
+        font-size: 0.875rem;
+        color: #4a5568;
+    }
+    .contact-item-icon {
+        flex-shrink: 0;
+        width: 16px;
+        text-align: center;
+        color: #718096;
+    }
+    .contact-item a {
+        color: #667eea;
+        text-decoration: none;
+    }
+    .contact-item a:hover {
+        text-decoration: underline;
+    }
+    
+    /* Contact Modal */
+    .modal-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+        padding: 1rem;
+    }
+    .modal-overlay.show {
+        display: flex;
+    }
+    .modal-content {
+        background: #fff;
+        border-radius: 16px;
+        padding: 2rem;
+        max-width: 500px;
+        width: 100%;
+        max-height: 80vh;
+        overflow-y: auto;
+    }
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 1.5rem;
+    }
+    .modal-avatar {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: 600;
+        font-size: 2rem;
+        margin-bottom: 1rem;
+    }
+    .modal-avatar.has-photo {
+        background: none;
+    }
+    .modal-avatar img {
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        object-fit: cover;
+    }
+    .modal-close {
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        cursor: pointer;
+        color: #718096;
+        line-height: 1;
+        padding: 0.5rem;
+    }
+    .modal-close:hover { color: #2d3748; }
+    .modal-name {
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: #1a202c;
+        margin-bottom: 0.25rem;
+    }
+    .modal-org {
+        color: #718096;
+        margin-bottom: 1rem;
+    }
+    .modal-section {
+        margin-bottom: 1.5rem;
+    }
+    .modal-section-title {
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        color: #a0aec0;
+        margin-bottom: 0.5rem;
+    }
+    .modal-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .modal-item:last-child {
+        border-bottom: none;
+    }
+    .modal-item-label {
+        font-size: 0.75rem;
+        color: #a0aec0;
+        min-width: 60px;
+    }
+    .modal-item-value {
+        color: #2d3748;
+    }
+    .modal-item-value a {
+        color: #667eea;
+        text-decoration: none;
+    }
+    .modal-item-value a:hover {
+        text-decoration: underline;
+    }
+    
+    .empty-state {
+        text-align: center;
+        padding: 3rem;
+        color: #718096;
+    }
+    .empty-state h3 {
+        margin-bottom: 0.5rem;
+        color: #4a5568;
+    }
+    
+    /* Buttons */
+    .btn {
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        cursor: pointer;
+        border: none;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .btn-primary {
+        background: #667eea;
+        color: #fff;
+    }
+    .btn-primary:hover {
+        background: #5a67d8;
+    }
+    .btn-secondary {
+        background: #e2e8f0;
+        color: #4a5568;
+    }
+    .btn-secondary:hover {
+        background: #cbd5e0;
+    }
+    .btn-danger {
+        background: #e53e3e;
+        color: #fff;
+    }
+    .btn-danger:hover {
+        background: #c53030;
+    }
+    
+    /* Form styles */
+    .form-group {
+        margin-bottom: 1rem;
+    }
+    .form-group label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+        font-size: 0.875rem;
+        color: #4a5568;
+    }
+    .form-group input,
+    .form-group textarea {
+        width: 100%;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        font-size: 0.875rem;
+    }
+    .form-group input:focus,
+    .form-group textarea:focus {
+        outline: none;
+        border-color: #667eea;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    .form-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+    }
+    .form-actions {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+        margin-top: 1.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e2e8f0;
+    }
+    
+    /* Contact actions in modal */
+    .modal-contact-actions {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e2e8f0;
+    }
+</style>
+
+<div class="addressbook-header">
+    <div>
+        <a href="/addressbooks" class="back-link">&larr; Back to Address Books</a>
+        <h1>{{.AddressBook.Name}}</h1>
+    </div>
+    <button class="btn btn-primary" onclick="showCreateContactModal()">+ New Contact</button>
+</div>
+
+<div class="search-box">
+    <input type="text" class="search-input" id="search-input" placeholder="Search contacts...">
+</div>
+
+<div class="contact-count" id="contact-count"></div>
+
+<div class="contacts-grid" id="contacts-grid"></div>
+
+<div class="modal-overlay" id="contact-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <div></div>
+            <button class="modal-close" id="modal-close">&times;</button>
+        </div>
+        <div id="modal-body"></div>
+    </div>
+</div>
+
+<!-- Create Contact Modal -->
+<div class="modal-overlay" id="create-contact-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-name" style="font-size: 1.25rem; font-weight: 600;">New Contact</span>
+            <button class="modal-close" onclick="closeCreateContactModal()">&times;</button>
+        </div>
+        <form method="POST" action="/addressbooks/{{.AddressBook.ID}}/contacts">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div class="form-group">
+                <label for="create-display-name">Display Name *</label>
+                <input type="text" id="create-display-name" name="display_name" required>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="create-first-name">First Name</label>
+                    <input type="text" id="create-first-name" name="first_name">
+                </div>
+                <div class="form-group">
+                    <label for="create-last-name">Last Name</label>
+                    <input type="text" id="create-last-name" name="last_name">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="create-email">Email</label>
+                <input type="email" id="create-email" name="email">
+            </div>
+            <div class="form-group">
+                <label for="create-phone">Phone</label>
+                <input type="tel" id="create-phone" name="phone">
+            </div>
+            <div class="form-group">
+                <label>Birthday <span style="font-weight: normal; color: #718096;">(year optional)</span></label>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <select id="create-birthday-month" style="flex: 1;">
+                        <option value="">Month</option>
+                        <option value="01">January</option>
+                        <option value="02">February</option>
+                        <option value="03">March</option>
+                        <option value="04">April</option>
+                        <option value="05">May</option>
+                        <option value="06">June</option>
+                        <option value="07">July</option>
+                        <option value="08">August</option>
+                        <option value="09">September</option>
+                        <option value="10">October</option>
+                        <option value="11">November</option>
+                        <option value="12">December</option>
+                    </select>
+                    <select id="create-birthday-day" style="width: 70px;"></select>
+                    <input type="number" id="create-birthday-year" placeholder="Year" min="1900" max="2100" style="width: 90px;">
+                </div>
+                <input type="hidden" id="create-birthday" name="birthday">
+            </div>
+            <div class="form-group">
+                <label for="create-notes">Notes</label>
+                <textarea id="create-notes" name="notes" rows="3"></textarea>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeCreateContactModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Contact</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Edit Contact Modal -->
+<div class="modal-overlay" id="edit-contact-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-name" style="font-size: 1.25rem; font-weight: 600;">Edit Contact</span>
+            <button class="modal-close" onclick="closeEditContactModal()">&times;</button>
+        </div>
+        <form id="edit-contact-form" method="POST">
+            <input type="hidden" name="_method" value="PUT">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div class="form-group">
+                <label for="edit-display-name">Display Name *</label>
+                <input type="text" id="edit-display-name" name="display_name" required>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="edit-first-name">First Name</label>
+                    <input type="text" id="edit-first-name" name="first_name">
+                </div>
+                <div class="form-group">
+                    <label for="edit-last-name">Last Name</label>
+                    <input type="text" id="edit-last-name" name="last_name">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="edit-email">Email</label>
+                <input type="email" id="edit-email" name="email">
+            </div>
+            <div class="form-group">
+                <label for="edit-phone">Phone</label>
+                <input type="tel" id="edit-phone" name="phone">
+            </div>
+            <div class="form-group">
+                <label>Birthday <span style="font-weight: normal; color: #718096;">(year optional)</span></label>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <select id="edit-birthday-month" style="flex: 1;">
+                        <option value="">Month</option>
+                        <option value="01">January</option>
+                        <option value="02">February</option>
+                        <option value="03">March</option>
+                        <option value="04">April</option>
+                        <option value="05">May</option>
+                        <option value="06">June</option>
+                        <option value="07">July</option>
+                        <option value="08">August</option>
+                        <option value="09">September</option>
+                        <option value="10">October</option>
+                        <option value="11">November</option>
+                        <option value="12">December</option>
+                    </select>
+                    <select id="edit-birthday-day" style="width: 70px;"></select>
+                    <input type="number" id="edit-birthday-year" placeholder="Year" min="1900" max="2100" style="width: 90px;">
+                </div>
+                <input type="hidden" id="edit-birthday" name="birthday">
+            </div>
+            <div class="form-group">
+                <label for="edit-notes">Notes</label>
+                <textarea id="edit-notes" name="notes" rows="3"></textarea>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-danger" onclick="deleteCurrentContact()">Delete</button>
+                <div style="flex: 1;"></div>
+                <button type="button" class="btn btn-secondary" onclick="closeEditContactModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+        </form>
+        <form id="delete-contact-form" method="POST" style="display: none;">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        </form>
+    </div>
+</div>
+
+<script>
+(function() {
+    // Raw contact data from server
+    var rawContacts = [
+        {{range .Contacts}}
+        {uid: {{.UID}}, vcard: {{.RawVCard}}, lastMod: {{formatTime .LastModified}}},
+        {{end}}
+    ];
+    
+    // Parse vCard data
+    function parseVCard(vcard) {
+        var lines = unfoldLines(vcard);
+        var contact = {
+            phones: [],
+            emails: [],
+            addresses: [],
+            urls: [],
+            dates: [],       // Custom dates (anniversary, etc.)
+            relations: [],   // Related contacts (spouse, child, etc.)
+            impp: []         // Instant messaging
+        };
+        
+        // First pass: collect grouped labels (item1.X-ABLABEL, etc.)
+        var groupLabels = {};
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (!line) continue;
+            var colonIdx = line.indexOf(':');
+            if (colonIdx === -1) continue;
+            var keyPart = line.substring(0, colonIdx).toUpperCase();
+            var valuePart = line.substring(colonIdx + 1);
+            
+            // Check for grouped X-ABLABEL
+            var match = keyPart.match(/^(ITEM\d+)\.X-ABLABEL$/);
+            if (match) {
+                groupLabels[match[1]] = valuePart.replace(/_\$!<|>!\$_/g, '');
+            }
+        }
+        
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (!line || line === 'BEGIN:VCARD' || line === 'END:VCARD') continue;
+            
+            var colonIdx = line.indexOf(':');
+            if (colonIdx === -1) continue;
+            
+            var key = line.substring(0, colonIdx);
+            var value = line.substring(colonIdx + 1);
+            
+            // Parse parameters
+            var params = {};
+            var semicolonIdx = key.indexOf(';');
+            if (semicolonIdx !== -1) {
+                var paramStr = key.substring(semicolonIdx + 1);
+                key = key.substring(0, semicolonIdx);
+                paramStr.split(';').forEach(function(p) {
+                    var eq = p.indexOf('=');
+                    if (eq !== -1) {
+                        params[p.substring(0, eq).toUpperCase()] = p.substring(eq + 1);
+                    } else {
+                        // Handle type without explicit TYPE= prefix
+                        params.TYPE = (params.TYPE || '') + (params.TYPE ? ',' : '') + p;
+                    }
+                });
+            }
+            
+            key = key.toUpperCase();
+            
+            // Strip item prefixes (e.g., "item1.X-ANNIVERSARY" -> "X-ANNIVERSARY")
+            var itemPrefix = '';
+            var dotIdx = key.indexOf('.');
+            if (dotIdx !== -1) {
+                itemPrefix = key.substring(0, dotIdx).toUpperCase();
+                key = key.substring(dotIdx + 1);
+                // Check if there's a grouped label for this item
+                if (groupLabels[itemPrefix]) {
+                    params['X-ABLABEL'] = groupLabels[itemPrefix];
+                }
+            }
+            
+            switch (key) {
+                case 'FN':
+                    contact.fn = unescapeVCard(value);
+                    break;
+                case 'N':
+                    // N:Last;First;Middle;Prefix;Suffix
+                    var parts = value.split(';');
+                    contact.n = {
+                        last: unescapeVCard(parts[0] || ''),
+                        first: unescapeVCard(parts[1] || ''),
+                        middle: unescapeVCard(parts[2] || ''),
+                        prefix: unescapeVCard(parts[3] || ''),
+                        suffix: unescapeVCard(parts[4] || '')
+                    };
+                    break;
+                case 'NICKNAME':
+                    contact.nickname = unescapeVCard(value);
+                    break;
+                case 'ORG':
+                    contact.org = unescapeVCard(value.split(';')[0]);
+                    break;
+                case 'TITLE':
+                    contact.title = unescapeVCard(value);
+                    break;
+                case 'TEL':
+                    contact.phones.push({
+                        type: getType(params),
+                        value: value
+                    });
+                    break;
+                case 'EMAIL':
+                    contact.emails.push({
+                        type: getType(params),
+                        value: value
+                    });
+                    break;
+                case 'ADR':
+                    // ADR:;;Street;City;State;ZIP;Country
+                    var adrParts = value.split(';');
+                    contact.addresses.push({
+                        type: getType(params),
+                        street: unescapeVCard(adrParts[2] || ''),
+                        city: unescapeVCard(adrParts[3] || ''),
+                        state: unescapeVCard(adrParts[4] || ''),
+                        zip: unescapeVCard(adrParts[5] || ''),
+                        country: unescapeVCard(adrParts[6] || '')
+                    });
+                    break;
+                case 'URL':
+                    contact.urls.push({
+                        type: getType(params),
+                        value: value
+                    });
+                    break;
+                case 'BDAY':
+                    contact.bday = parseVCardDate(value);
+                    break;
+                case 'NOTE':
+                    contact.note = unescapeVCard(value);
+                    break;
+                case 'PHOTO':
+                    if (params.ENCODING === 'b' || params.ENCODING === 'BASE64') {
+                        var mediaType = params.TYPE || params.MEDIATYPE || 'image/jpeg';
+                        contact.photo = 'data:' + mediaType.toLowerCase() + ';base64,' + value;
+                    } else if (value.indexOf('http') === 0) {
+                        contact.photo = value;
+                    }
+                    break;
+                case 'ANNIVERSARY':
+                case 'X-ANNIVERSARY':
+                    contact.anniversary = parseVCardDate(value);
+                    break;
+                case 'X-ABDATE':
+                    // Custom date field (Apple/Thunderbird format)
+                    var dateLabel = params['X-ABLABEL'] || params.TYPE || 'Other';
+                    dateLabel = dateLabel.replace(/_\$!<|>!\$_/g, '');
+                    // Check if this is actually an anniversary
+                    if (dateLabel.toLowerCase() === 'anniversary' || dateLabel.toLowerCase() === '_$!<anniversary>!$_') {
+                        contact.anniversary = parseVCardDate(value);
+                    } else {
+                        contact.dates.push({
+                            type: dateLabel,
+                            value: parseVCardDate(value)
+                        });
+                    }
+                    break;
+                case 'RELATED':
+                    // vCard 4.0 relationships
+                    contact.relations.push({
+                        type: getType(params) || 'Related',
+                        value: unescapeVCard(value)
+                    });
+                    break;
+                case 'X-SPOUSE':
+                    contact.relations.push({
+                        type: 'Spouse',
+                        value: unescapeVCard(value)
+                    });
+                    break;
+                case 'X-MANAGER':
+                    contact.relations.push({
+                        type: 'Manager',
+                        value: unescapeVCard(value)
+                    });
+                    break;
+                case 'X-ASSISTANT':
+                    contact.relations.push({
+                        type: 'Assistant',
+                        value: unescapeVCard(value)
+                    });
+                    break;
+                case 'X-ABRELATEDNAMES':
+                    // Apple/Thunderbird format for relationships
+                    var relLabel = params['X-ABLABEL'] || params.TYPE || 'Related';
+                    relLabel = relLabel.replace(/_\$!<|>!\$_/g, '');
+                    // Capitalize first letter
+                    relLabel = relLabel.charAt(0).toUpperCase() + relLabel.slice(1).toLowerCase();
+                    contact.relations.push({
+                        type: relLabel,
+                        value: unescapeVCard(value)
+                    });
+                    break;
+                case 'X-CUSTOM1':
+                case 'X-CUSTOM2':
+                case 'X-CUSTOM3':
+                case 'X-CUSTOM4':
+                    // Some apps use X-CUSTOM fields - check label
+                    var customLabel = params['X-ABLABEL'] || params.TYPE;
+                    if (customLabel) {
+                        customLabel = customLabel.replace(/_\$!<|>!\$_/g, '');
+                        contact.dates.push({
+                            type: customLabel,
+                            value: parseVCardDate(value) || unescapeVCard(value)
+                        });
+                    }
+                    break;
+                case 'IMPP':
+                case 'X-JABBER':
+                case 'X-AIM':
+                case 'X-MSN':
+                case 'X-YAHOO':
+                case 'X-ICQ':
+                case 'X-SKYPE':
+                case 'X-SKYPE-USERNAME':
+                    var imType = key.replace('X-', '').replace('-USERNAME', '');
+                    if (key === 'IMPP') {
+                        // IMPP format: xmpp:user@example.com
+                        var colonPos = value.indexOf(':');
+                        if (colonPos > 0) {
+                            imType = value.substring(0, colonPos).toUpperCase();
+                            value = value.substring(colonPos + 1);
+                        }
+                    }
+                    contact.impp.push({
+                        type: imType,
+                        value: value
+                    });
+                    break;
+                case 'ROLE':
+                    contact.role = unescapeVCard(value);
+                    break;
+                case 'CATEGORIES':
+                    contact.categories = value.split(',').map(function(c) { return unescapeVCard(c.trim()); });
+                    break;
+            }
+        }
+        
+        // Build display name if not set
+        if (!contact.fn && contact.n) {
+            contact.fn = [contact.n.prefix, contact.n.first, contact.n.middle, contact.n.last, contact.n.suffix]
+                .filter(Boolean).join(' ');
+        }
+        
+        return contact;
+    }
+    
+    function unfoldLines(vcard) {
+        return vcard.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
+    }
+    
+    function unescapeVCard(str) {
+        return str
+            .replace(/\\n/gi, '\n')
+            .replace(/\\,/g, ',')
+            .replace(/\\;/g, ';')
+            .replace(/\\\\/g, '\\');
+    }
+    
+    function getType(params) {
+        var type = params.TYPE || '';
+        return type.split(',')[0].replace(/"/g, '').toLowerCase() || 'other';
+    }
+    
+    function parseVCardDate(str) {
+        if (!str) return null;
+        str = str.trim();
+        
+        // Handle ISO format: YYYY-MM-DD
+        if (str.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            var parts = str.split('-');
+            return new Date(
+                parseInt(parts[0], 10),
+                parseInt(parts[1], 10) - 1,
+                parseInt(parts[2], 10)
+            );
+        }
+        
+        // Handle YYYYMMDD format
+        if (str.match(/^\d{8}$/)) {
+            return new Date(
+                parseInt(str.substring(0, 4), 10),
+                parseInt(str.substring(4, 6), 10) - 1,
+                parseInt(str.substring(6, 8), 10)
+            );
+        }
+        
+        // Handle --MM-DD format (no year)
+        if (str.match(/^--\d{2}-\d{2}$/)) {
+            return new Date(
+                1900, // Use 1900 as placeholder year
+                parseInt(str.substring(2, 4), 10) - 1,
+                parseInt(str.substring(5, 7), 10)
+            );
+        }
+        
+        // Try parsing as generic date string
+        var d = new Date(str);
+        if (!isNaN(d.getTime())) {
+            return d;
+        }
+        
+        return null;
+    }
+    
+    // Parse all contacts
+    var contacts = rawContacts.map(function(raw) {
+        var parsed = parseVCard(raw.vcard);
+        parsed.uid = raw.uid;
+        parsed.lastMod = raw.lastMod;
+        return parsed;
+    }).filter(function(c) { return c.fn; });
+    
+    // Sort by name
+    contacts.sort(function(a, b) {
+        return (a.fn || '').localeCompare(b.fn || '');
+    });
+    
+    // Search functionality
+    var searchInput = document.getElementById('search-input');
+    searchInput.addEventListener('input', function() {
+        renderContacts(this.value.toLowerCase());
+    });
+    
+    // Modal
+    var modal = document.getElementById('contact-modal');
+    document.getElementById('modal-close').addEventListener('click', function() {
+        modal.classList.remove('show');
+    });
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('show');
+    });
+    
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+    
+    function getInitials(name) {
+        return name.split(' ').slice(0, 2).map(function(n) { return n.charAt(0); }).join('').toUpperCase();
+    }
+    
+    function formatAddress(addr) {
+        return [addr.street, addr.city, addr.state, addr.zip, addr.country]
+            .filter(Boolean).join(', ');
+    }
+    
+    function showContactModal(contact) {
+        var body = '';
+        
+        // Avatar
+        body += '<div class="modal-avatar' + (contact.photo ? ' has-photo' : '') + '">';
+        if (contact.photo) {
+            body += '<img src="' + escapeHtml(contact.photo) + '" alt="">';
+        } else {
+            body += getInitials(contact.fn);
+        }
+        body += '</div>';
+        
+        // Name
+        body += '<div class="modal-name">' + escapeHtml(contact.fn) + '</div>';
+        if (contact.org) {
+            var orgLine = contact.org;
+            if (contact.title) orgLine = contact.title + ', ' + orgLine;
+            body += '<div class="modal-org">' + escapeHtml(orgLine) + '</div>';
+        }
+        
+        // Phones
+        if (contact.phones.length) {
+            body += '<div class="modal-section"><div class="modal-section-title">Phone</div>';
+            contact.phones.forEach(function(p) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">' + p.type + '</span>';
+                body += '<span class="modal-item-value"><a href="tel:' + escapeHtml(p.value) + '">' + escapeHtml(p.value) + '</a></span>';
+                body += '</div>';
+            });
+            body += '</div>';
+        }
+        
+        // Emails
+        if (contact.emails.length) {
+            body += '<div class="modal-section"><div class="modal-section-title">Email</div>';
+            contact.emails.forEach(function(e) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">' + e.type + '</span>';
+                body += '<span class="modal-item-value"><a href="mailto:' + escapeHtml(e.value) + '">' + escapeHtml(e.value) + '</a></span>';
+                body += '</div>';
+            });
+            body += '</div>';
+        }
+        
+        // Addresses
+        if (contact.addresses.length) {
+            body += '<div class="modal-section"><div class="modal-section-title">Address</div>';
+            contact.addresses.forEach(function(a) {
+                var formatted = formatAddress(a);
+                if (formatted) {
+                    body += '<div class="modal-item">';
+                    body += '<span class="modal-item-label">' + a.type + '</span>';
+                    body += '<span class="modal-item-value">' + escapeHtml(formatted) + '</span>';
+                    body += '</div>';
+                }
+            });
+            body += '</div>';
+        }
+        
+        // URLs
+        if (contact.urls.length) {
+            body += '<div class="modal-section"><div class="modal-section-title">Website</div>';
+            contact.urls.forEach(function(u) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">' + u.type + '</span>';
+                body += '<span class="modal-item-value"><a href="' + escapeHtml(u.value) + '" target="_blank">' + escapeHtml(u.value) + '</a></span>';
+                body += '</div>';
+            });
+            body += '</div>';
+        }
+        
+        // Dates (Birthday, Anniversary, Custom dates)
+        var hasDates = contact.bday || contact.anniversary || contact.dates.length > 0;
+        if (hasDates) {
+            body += '<div class="modal-section"><div class="modal-section-title">Dates</div>';
+            if (contact.bday) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">Birthday</span>';
+                body += '<span class="modal-item-value">' + 
+                    contact.bday.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
+                    '</span></div>';
+            }
+            if (contact.anniversary) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">Anniversary</span>';
+                body += '<span class="modal-item-value">' + 
+                    contact.anniversary.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
+                    '</span></div>';
+            }
+            contact.dates.forEach(function(d) {
+                if (d.value) {
+                    body += '<div class="modal-item">';
+                    body += '<span class="modal-item-label">' + escapeHtml(d.type) + '</span>';
+                    body += '<span class="modal-item-value">' + 
+                        d.value.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
+                        '</span></div>';
+                }
+            });
+            body += '</div>';
+        }
+        
+        // Relationships
+        if (contact.relations.length > 0) {
+            body += '<div class="modal-section"><div class="modal-section-title">Relationships</div>';
+            contact.relations.forEach(function(r) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">' + escapeHtml(r.type) + '</span>';
+                body += '<span class="modal-item-value">' + escapeHtml(r.value) + '</span>';
+                body += '</div>';
+            });
+            body += '</div>';
+        }
+        
+        // Instant Messaging
+        if (contact.impp.length > 0) {
+            body += '<div class="modal-section"><div class="modal-section-title">Instant Messaging</div>';
+            contact.impp.forEach(function(im) {
+                body += '<div class="modal-item">';
+                body += '<span class="modal-item-label">' + escapeHtml(im.type) + '</span>';
+                body += '<span class="modal-item-value">' + escapeHtml(im.value) + '</span>';
+                body += '</div>';
+            });
+            body += '</div>';
+        }
+        
+        // Categories
+        if (contact.categories && contact.categories.length > 0) {
+            body += '<div class="modal-section"><div class="modal-section-title">Categories</div>';
+            body += '<div class="modal-item"><span class="modal-item-value">' + 
+                contact.categories.map(escapeHtml).join(', ') + '</span></div></div>';
+        }
+        
+        // Notes
+        if (contact.note) {
+            body += '<div class="modal-section"><div class="modal-section-title">Notes</div>';
+            body += '<div style="white-space:pre-wrap;color:#4a5568">' + escapeHtml(contact.note) + '</div></div>';
+        }
+        
+        // Add edit button
+        body += '<div class="modal-contact-actions">';
+        body += '<button class="btn btn-primary" onclick="document.getElementById(\'contact-modal\').classList.remove(\'show\'); showEditContactModal(window.contacts.find(function(c) { return c.uid === \'' + escapeHtml(contact.uid) + '\'; }));">Edit Contact</button>';
+        body += '</div>';
+        
+        document.getElementById('modal-body').innerHTML = body;
+        modal.classList.add('show');
+    }
+    
+    function renderContacts(filter) {
+        filter = filter || '';
+        
+        var filtered = contacts.filter(function(c) {
+            if (!filter) return true;
+            var searchable = [
+                c.fn,
+                c.org,
+                c.nickname
+            ].concat(
+                c.emails.map(function(e) { return e.value; }),
+                c.phones.map(function(p) { return p.value; })
+            ).filter(Boolean).join(' ').toLowerCase();
+            return searchable.indexOf(filter) !== -1;
+        });
+        
+        document.getElementById('contact-count').textContent = 
+            filtered.length + ' contact' + (filtered.length !== 1 ? 's' : '') + 
+            (filter ? ' found' : '');
+        
+        var grid = document.getElementById('contacts-grid');
+        
+        if (filtered.length === 0) {
+            grid.innerHTML = '<div class="empty-state"><h3>No Contacts</h3><p>' + 
+                (filter ? 'No contacts match your search.' : 'This address book has no contacts yet.') + '</p></div>';
+            return;
+        }
+        
+        grid.innerHTML = '';
+        
+        filtered.forEach(function(contact) {
+            var card = document.createElement('div');
+            card.className = 'contact-card';
+            card.addEventListener('click', function() { showContactModal(contact); });
+            
+            var html = '<div class="contact-header">';
+            html += '<div class="contact-avatar' + (contact.photo ? ' has-photo' : '') + '">';
+            if (contact.photo) {
+                html += '<img src="' + escapeHtml(contact.photo) + '" alt="">';
+            } else {
+                html += getInitials(contact.fn);
+            }
+            html += '</div>';
+            html += '<div>';
+            html += '<div class="contact-name">' + escapeHtml(contact.fn) + '</div>';
+            if (contact.org) {
+                html += '<div class="contact-org">' + escapeHtml(contact.org) + '</div>';
+            }
+            html += '</div></div>';
+            
+            html += '<div class="contact-details">';
+            if (contact.emails.length) {
+                html += '<div class="contact-item"><span class="contact-item-icon">@</span>';
+                html += '<a href="mailto:' + escapeHtml(contact.emails[0].value) + '">' + escapeHtml(contact.emails[0].value) + '</a></div>';
+            }
+            if (contact.phones.length) {
+                html += '<div class="contact-item"><span class="contact-item-icon">#</span>';
+                html += '<a href="tel:' + escapeHtml(contact.phones[0].value) + '">' + escapeHtml(contact.phones[0].value) + '</a></div>';
+            }
+            html += '</div>';
+            
+            card.innerHTML = html;
+            grid.appendChild(card);
+        });
+    }
+    
+    // Initial render
+    renderContacts();
+    
+    // Make contacts accessible globally for edit functionality
+    window.contacts = contacts;
+    window.currentEditContact = null;
+    
+    // Check for ?contact=UID query parameter to open specific contact
+    var urlParams = new URLSearchParams(window.location.search);
+    var contactUid = urlParams.get('contact');
+    if (contactUid) {
+        var targetContact = contacts.find(function(c) { return c.uid === contactUid; });
+        if (targetContact) {
+            setTimeout(function() {
+                showContactModal(targetContact);
+            }, 100);
+        }
+    }
+})();
+
+// Birthday input handling
+function initBirthdaySelects() {
+    ['create', 'edit'].forEach(function(prefix) {
+        var daySelect = document.getElementById(prefix + '-birthday-day');
+        daySelect.innerHTML = '<option value="">Day</option>';
+        for (var i = 1; i <= 31; i++) {
+            daySelect.innerHTML += '<option value="' + String(i).padStart(2, '0') + '">' + i + '</option>';
+        }
+        
+        // Update hidden field when inputs change
+        ['-month', '-day', '-year'].forEach(function(suffix) {
+            var el = document.getElementById(prefix + '-birthday' + suffix);
+            el.addEventListener('change', function() {
+                updateBirthdayHidden(prefix);
+            });
+        });
+    });
+}
+
+function updateBirthdayHidden(prefix) {
+    var month = document.getElementById(prefix + '-birthday-month').value;
+    var day = document.getElementById(prefix + '-birthday-day').value;
+    var year = document.getElementById(prefix + '-birthday-year').value;
+    var hidden = document.getElementById(prefix + '-birthday');
+    
+    if (!month || !day) {
+        hidden.value = '';
+        return;
+    }
+    
+    if (year) {
+        hidden.value = year + '-' + month + '-' + day;
+    } else {
+        // Format without year for server to parse as --MM-DD
+        hidden.value = '--' + month + '-' + day;
+    }
+}
+
+function setBirthdayFields(prefix, bday) {
+    var monthEl = document.getElementById(prefix + '-birthday-month');
+    var dayEl = document.getElementById(prefix + '-birthday-day');
+    var yearEl = document.getElementById(prefix + '-birthday-year');
+    
+    if (!bday) {
+        monthEl.value = '';
+        dayEl.value = '';
+        yearEl.value = '';
+        return;
+    }
+    
+    monthEl.value = String(bday.getMonth() + 1).padStart(2, '0');
+    dayEl.value = String(bday.getDate()).padStart(2, '0');
+    // Only set year if it's not the placeholder year (1 or 1900)
+    if (bday.getFullYear() > 1900) {
+        yearEl.value = bday.getFullYear();
+    } else {
+        yearEl.value = '';
+    }
+    updateBirthdayHidden(prefix);
+}
+
+// Initialize birthday selects on page load
+initBirthdaySelects();
+
+// Create Contact Modal
+function showCreateContactModal() {
+    document.getElementById('create-contact-modal').classList.add('show');
+    document.getElementById('create-display-name').focus();
+}
+
+function closeCreateContactModal() {
+    document.getElementById('create-contact-modal').classList.remove('show');
+    document.getElementById('create-display-name').value = '';
+    document.getElementById('create-first-name').value = '';
+    document.getElementById('create-last-name').value = '';
+    document.getElementById('create-email').value = '';
+    document.getElementById('create-phone').value = '';
+    document.getElementById('create-birthday-month').value = '';
+    document.getElementById('create-birthday-day').value = '';
+    document.getElementById('create-birthday-year').value = '';
+    document.getElementById('create-birthday').value = '';
+    document.getElementById('create-notes').value = '';
+}
+
+// Edit Contact Modal
+function showEditContactModal(contact) {
+    window.currentEditContact = contact;
+    var bookId = {{.AddressBook.ID}};
+    document.getElementById('edit-contact-form').action = '/addressbooks/' + bookId + '/contacts/' + encodeURIComponent(contact.uid);
+    document.getElementById('delete-contact-form').action = '/addressbooks/' + bookId + '/contacts/' + encodeURIComponent(contact.uid) + '/delete';
+    
+    document.getElementById('edit-display-name').value = contact.fn || '';
+    
+    // Parse name parts if available
+    if (contact.n) {
+        document.getElementById('edit-first-name').value = contact.n.first || '';
+        document.getElementById('edit-last-name').value = contact.n.last || '';
+    } else {
+        document.getElementById('edit-first-name').value = '';
+        document.getElementById('edit-last-name').value = '';
+    }
+    
+    // Set first email if available
+    if (contact.emails && contact.emails.length > 0) {
+        document.getElementById('edit-email').value = contact.emails[0].value || '';
+    } else {
+        document.getElementById('edit-email').value = '';
+    }
+    
+    // Set first phone if available
+    if (contact.phones && contact.phones.length > 0) {
+        document.getElementById('edit-phone').value = contact.phones[0].value || '';
+    } else {
+        document.getElementById('edit-phone').value = '';
+    }
+    
+    // Set birthday if available
+    setBirthdayFields('edit', contact.bday);
+    
+    document.getElementById('edit-notes').value = contact.note || '';
+    
+    document.getElementById('edit-contact-modal').classList.add('show');
+}
+
+function closeEditContactModal() {
+    document.getElementById('edit-contact-modal').classList.remove('show');
+    window.currentEditContact = null;
+}
+
+function deleteCurrentContact() {
+    if (confirm('Are you sure you want to delete this contact?')) {
+        document.getElementById('delete-contact-form').submit();
+    }
+}
+
+function formatDateForInput(date) {
+    var year = date.getFullYear();
+    var month = String(date.getMonth() + 1).padStart(2, '0');
+    var day = String(date.getDate()).padStart(2, '0');
+    return year + '-' + month + '-' + day;
+}
+
+// Close modals when clicking outside
+document.getElementById('create-contact-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeCreateContactModal();
+});
+document.getElementById('edit-contact-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeEditContactModal();
+});
+</script>
+
+{{if gt .TotalPages 1}}
+<div class="pagination" style="margin-top: 2rem; display: flex; justify-content: center; gap: 0.5rem; align-items: center;">
+    {{if .HasPrev}}
+    <a href="?page={{.PrevPage}}&limit={{.Limit}}" class="pagination-btn">&larr; Previous</a>
+    {{end}}
+    <span style="color: #718096; font-size: 0.875rem;">Page {{.Page}} of {{.TotalPages}} ({{.TotalCount}} contacts)</span>
+    {{if .HasNext}}
+    <a href="?page={{.NextPage}}&limit={{.Limit}}" class="pagination-btn">Next &rarr;</a>
+    {{end}}
+</div>
+<style>
+    .pagination-btn {
+        padding: 0.5rem 1rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        text-decoration: none;
+        color: #4a5568;
+        background: #fff;
+        font-size: 0.875rem;
+    }
+    .pagination-btn:hover {
+        background: #f7fafc;
+        border-color: #cbd5e0;
+    }
+</style>
+{{end}}
+{{end}}
+{{template "base" .}}
+

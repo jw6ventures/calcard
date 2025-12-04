@@ -1,0 +1,178 @@
+{{define "content"}}
+<style>
+    .dashboard-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 1.5rem;
+        margin-top: 1.5rem;
+    }
+    .dashboard-card {
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1.25rem;
+    }
+    .dashboard-card h2 {
+        font-size: 1rem;
+        color: #4a5568;
+        margin: 0 0 1rem 0;
+        padding-bottom: 0.75rem;
+        border-bottom: 1px solid #e2e8f0;
+    }
+    .stats-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+    }
+    .stats-list li {
+        display: flex;
+        justify-content: space-between;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .stats-list li:last-child {
+        border-bottom: none;
+    }
+    .stats-list a {
+        color: #2d3748;
+        text-decoration: none;
+    }
+    .stats-list a:hover {
+        color: #667eea;
+    }
+    
+    .recent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+    .recent-item {
+        display: flex;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        background: #f7fafc;
+        border-radius: 8px;
+        text-decoration: none;
+        color: inherit;
+        transition: background 0.15s;
+    }
+    .recent-item:hover {
+        background: #edf2f7;
+    }
+    .recent-icon {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.25rem;
+        flex-shrink: 0;
+    }
+    .recent-icon.event {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+    }
+    .recent-icon.contact {
+        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+        color: #fff;
+    }
+    .recent-info {
+        flex: 1;
+        min-width: 0;
+    }
+    .recent-title {
+        font-weight: 600;
+        color: #1a202c;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .recent-meta {
+        font-size: 0.8rem;
+        color: #718096;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .empty-recent {
+        color: #a0aec0;
+        font-size: 0.875rem;
+        text-align: center;
+        padding: 1rem;
+    }
+</style>
+
+<h1>Dashboard</h1>
+<p>Welcome, {{.User.PrimaryEmail}}</p>
+
+<div class="dashboard-grid">
+    <div class="dashboard-card">
+        <h2>Overview</h2>
+        <ul class="stats-list">
+            <li>
+                <a href="/calendars">Calendars</a>
+                <span class="badge">{{.CalendarCount}}</span>
+            </li>
+            <li>
+                <a href="/addressbooks">Address Books</a>
+                <span class="badge">{{.BookCount}}</span>
+            </li>
+            <li>
+                <a href="/app-passwords">App Passwords</a>
+                <span class="badge">{{.AppPwdCount}}</span>
+            </li>
+            <li>
+                <a href="/sessions">Active Sessions</a>
+            </li>
+        </ul>
+    </div>
+    
+    <div class="dashboard-card">
+        <h2>Recent Events</h2>
+        <div class="recent-list">
+            {{if not .RecentEvents}}
+            <div class="empty-recent">No events yet</div>
+            {{else}}
+            {{range .RecentEvents}}
+            <a class="recent-item" href="/calendars/{{.CalendarID}}?event={{.UID}}">
+                <div class="recent-icon event">&#128197;</div>
+                <div class="recent-info">
+                    <div class="recent-title">{{.Summary}}</div>
+                    <div class="recent-meta">
+                        {{.CalendarName}}
+                        {{if .DTStart}} · {{formatDate .DTStart}}{{end}}
+                        · {{relativeTime .LastModified}}
+                    </div>
+                </div>
+            </a>
+            {{end}}
+            {{end}}
+        </div>
+    </div>
+    
+    <div class="dashboard-card">
+        <h2>Recent Contacts</h2>
+        <div class="recent-list">
+            {{if not .RecentContacts}}
+            <div class="empty-recent">No contacts yet</div>
+            {{else}}
+            {{range .RecentContacts}}
+            <a class="recent-item" href="/addressbooks/{{.AddressBookID}}?contact={{.UID}}">
+                <div class="recent-icon contact">&#128100;</div>
+                <div class="recent-info">
+                    <div class="recent-title">{{.DisplayName}}</div>
+                    <div class="recent-meta">
+                        {{.AddressBookName}}
+                        {{if .Email}} · {{.Email}}{{end}}
+                        · {{relativeTime .LastModified}}
+                    </div>
+                </div>
+            </a>
+            {{end}}
+            {{end}}
+        </div>
+    </div>
+</div>
+{{end}}
+{{template "base" .}}

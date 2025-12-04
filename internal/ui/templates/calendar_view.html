@@ -1,0 +1,1764 @@
+{{define "content"}}
+<style>
+    .calendar-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1.5rem;
+    }
+    .calendar-header h1 {
+        margin: 0;
+        color: #1a1a2e;
+    }
+    .back-link {
+        color: #4a5568;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .back-link:hover { color: #2d3748; }
+    
+    .view-toggle {
+        display: flex;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .view-btn {
+        padding: 0.5rem 1rem;
+        border: 1px solid #cbd5e0;
+        background: #fff;
+        cursor: pointer;
+        border-radius: 4px;
+        font-size: 0.875rem;
+    }
+    .view-btn.active {
+        background: #1a1a2e;
+        color: #fff;
+        border-color: #1a1a2e;
+    }
+    
+    /* Month Calendar View */
+    .month-nav {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        margin-bottom: 1rem;
+    }
+    .month-nav button {
+        background: none;
+        border: 1px solid #cbd5e0;
+        padding: 0.25rem 0.75rem;
+        cursor: pointer;
+        border-radius: 4px;
+    }
+    .month-nav button:hover { background: #f7fafc; }
+    .month-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        min-width: 200px;
+        text-align: center;
+    }
+    
+    .calendar-grid {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 1px;
+        background: #e2e8f0;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        overflow: hidden;
+    }
+    .calendar-grid .day-header {
+        background: #f7fafc;
+        padding: 0.5rem;
+        text-align: center;
+        font-weight: 600;
+        font-size: 0.75rem;
+        color: #4a5568;
+        text-transform: uppercase;
+    }
+    .calendar-grid .day-cell {
+        background: #fff;
+        min-height: 100px;
+        padding: 0.25rem;
+        position: relative;
+    }
+    .calendar-grid .day-cell.other-month {
+        background: #f7fafc;
+    }
+    .calendar-grid .day-cell.today {
+        background: #ebf8ff;
+    }
+    .day-number {
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #2d3748;
+        margin-bottom: 0.25rem;
+    }
+    .day-cell.other-month .day-number {
+        color: #a0aec0;
+    }
+    .day-events {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .day-event {
+        font-size: 0.7rem;
+        padding: 2px 4px;
+        background: #667eea;
+        color: #fff;
+        border-radius: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+    }
+    .day-event:hover {
+        background: #5a67d8;
+    }
+    .day-event.all-day {
+        background: #48bb78;
+    }
+    .day-more {
+        font-size: 0.65rem;
+        color: #667eea;
+        cursor: pointer;
+        padding: 2px;
+    }
+    .day-more:hover {
+        text-decoration: underline;
+    }
+    .day-number.has-events {
+        cursor: pointer;
+    }
+    .day-number.has-events:hover {
+        color: #667eea;
+    }
+    
+    /* Day Events Modal */
+    .day-modal-date {
+        font-size: 0.875rem;
+        color: #718096;
+        margin-bottom: 1rem;
+    }
+    .day-modal-events {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+    .day-modal-event {
+        padding: 0.75rem;
+        background: #f7fafc;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background 0.15s;
+    }
+    .day-modal-event:hover {
+        background: #edf2f7;
+    }
+    .day-modal-event-title {
+        font-weight: 600;
+        color: #1a202c;
+        margin-bottom: 0.25rem;
+    }
+    .day-modal-event-time {
+        font-size: 0.875rem;
+        color: #718096;
+    }
+    .day-modal-event.all-day .day-modal-event-time {
+        color: #48bb78;
+    }
+    
+    /* List View */
+    .events-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+    .event-card {
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 1rem;
+        transition: box-shadow 0.2s;
+    }
+    .event-card:hover {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    .event-title {
+        font-weight: 600;
+        font-size: 1rem;
+        color: #1a202c;
+        margin-bottom: 0.5rem;
+    }
+    .event-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        font-size: 0.875rem;
+        color: #4a5568;
+    }
+    .event-meta-item {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .event-description {
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid #e2e8f0;
+        font-size: 0.875rem;
+        color: #4a5568;
+        white-space: pre-wrap;
+    }
+    
+    /* Event Modal */
+    .modal-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+    }
+    .modal-overlay.show {
+        display: flex;
+    }
+    .modal-content {
+        background: #fff;
+        border-radius: 12px;
+        padding: 1.5rem;
+        max-width: 500px;
+        width: 90%;
+        max-height: 85vh;
+        overflow-y: auto;
+    }
+    .modal-content.modal-lg {
+        max-width: 720px;
+        width: 95%;
+        padding: 1.5rem 2rem;
+    }
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 1rem;
+    }
+    .modal-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #1a202c;
+    }
+    .modal-close {
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        cursor: pointer;
+        color: #718096;
+        line-height: 1;
+    }
+    .modal-close:hover { color: #2d3748; }
+    .modal-body {
+        font-size: 0.9rem;
+        color: #4a5568;
+    }
+    .modal-body p {
+        margin: 0.5rem 0;
+    }
+    .modal-body strong {
+        color: #2d3748;
+    }
+    .event-html-desc {
+        padding: 0.5rem;
+        background: #f7fafc;
+        border-radius: 4px;
+        margin-top: 0.5rem;
+        line-height: 1.5;
+    }
+    .event-html-desc p { margin: 0.5rem 0; }
+    .event-html-desc a { color: #667eea; }
+    
+    .empty-state {
+        text-align: center;
+        padding: 3rem;
+        color: #718096;
+    }
+    .empty-state h3 {
+        margin-bottom: 0.5rem;
+        color: #4a5568;
+    }
+    
+    /* Buttons */
+    .btn {
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        cursor: pointer;
+        border: none;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .btn-primary {
+        background: #667eea;
+        color: #fff;
+    }
+    .btn-primary:hover {
+        background: #5a67d8;
+    }
+    .btn-secondary {
+        background: #e2e8f0;
+        color: #4a5568;
+    }
+    .btn-secondary:hover {
+        background: #cbd5e0;
+    }
+    .btn-danger {
+        background: #e53e3e;
+        color: #fff;
+    }
+    .btn-danger:hover {
+        background: #c53030;
+    }
+    .btn-sm {
+        padding: 0.25rem 0.5rem;
+        font-size: 0.75rem;
+    }
+    
+    /* Form styles */
+    .form-group {
+        margin-bottom: 1rem;
+    }
+    .form-group label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+        font-size: 0.875rem;
+        color: #4a5568;
+    }
+    .form-group input,
+    .form-group textarea,
+    .form-group select {
+        width: 100%;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        font-size: 0.875rem;
+    }
+    .form-group input:focus,
+    .form-group textarea:focus {
+        outline: none;
+        border-color: #667eea;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    .form-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+    }
+    .form-row .form-group input[type="datetime-local"],
+    .form-row .form-group input[type="date"] {
+        min-width: 0;
+    }
+    .form-check {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .form-check input[type="checkbox"] {
+        width: auto;
+    }
+    .form-actions {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+        margin-top: 1.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e2e8f0;
+    }
+    
+    /* Event actions in modal */
+    .modal-actions {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e2e8f0;
+    }
+</style>
+
+<div class="calendar-header">
+    <div>
+        <a href="/calendars" class="back-link">&larr; Back to Calendars</a>
+        <h1>{{.Calendar.Name}}</h1>
+        {{if .Calendar.Shared}}
+            <div class="badge">Shared calendar (owner: {{.Calendar.OwnerEmail}})</div>
+        {{end}}
+    </div>
+    <div style="display:flex; gap:0.5rem; align-items:center;">
+        <button class="btn btn-primary" onclick="showCreateEventModal()">+ New Event</button>
+        {{if .Calendar.Shared}}
+        <form method="post" action="/calendars/{{.Calendar.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Leave this shared calendar?')">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <button type="submit" class="btn btn-secondary">Leave</button>
+        </form>
+        {{end}}
+    </div>
+</div>
+
+<div class="view-toggle">
+    <button class="view-btn active" data-view="month">Month</button>
+    <button class="view-btn" data-view="list">List</button>
+</div>
+
+<div id="month-view">
+    <div class="month-nav">
+        <button id="prev-month">&larr;</button>
+        <span class="month-title" id="month-title"></span>
+        <button id="next-month">&rarr;</button>
+        <button id="today-btn" style="margin-left:1rem">Today</button>
+    </div>
+    <div class="calendar-grid" id="calendar-grid"></div>
+</div>
+
+<div id="list-view" style="display:none">
+    <div class="events-list" id="events-list"></div>
+</div>
+
+<div class="modal-overlay" id="event-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title" id="modal-title"></span>
+            <button class="modal-close" id="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="day-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title" id="day-modal-title">Events</span>
+            <button class="modal-close" id="day-modal-close">&times;</button>
+        </div>
+        <div class="day-modal-date" id="day-modal-date"></div>
+        <div class="day-modal-events" id="day-modal-events"></div>
+    </div>
+</div>
+
+<!-- Create Event Modal -->
+<div class="modal-overlay" id="create-event-modal">
+    <div class="modal-content modal-lg">
+        <div class="modal-header">
+            <span class="modal-title">New Event</span>
+            <button class="modal-close" onclick="closeCreateEventModal()">&times;</button>
+        </div>
+        <form method="POST" action="/calendars/{{.Calendar.ID}}/events">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div class="form-group">
+                <label for="create-summary">Title *</label>
+                <input type="text" id="create-summary" name="summary" required>
+            </div>
+            <div class="form-check" style="margin-bottom: 1rem;">
+                <input type="checkbox" id="create-all-day" name="all_day" onchange="toggleAllDay('create')">
+                <label for="create-all-day" style="margin: 0; font-weight: normal;">All day event</label>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="create-dtstart">Start</label>
+                    <input type="datetime-local" id="create-dtstart" name="dtstart">
+                </div>
+                <div class="form-group">
+                    <label for="create-dtend">End</label>
+                    <input type="datetime-local" id="create-dtend" name="dtend">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="create-location">Location</label>
+                <input type="text" id="create-location" name="location">
+            </div>
+            <div class="form-group">
+                <label for="create-description">Description</label>
+                <textarea id="create-description" name="description" rows="2"></textarea>
+            </div>
+            
+            <!-- Recurrence Options -->
+            <div class="form-group">
+                <label for="create-recurrence">Repeat</label>
+                <select id="create-recurrence" name="recurrence" onchange="toggleRecurrenceOptions('create')">
+                    <option value="">Does not repeat</option>
+                    <option value="DAILY">Daily</option>
+                    <option value="WEEKLY">Weekly</option>
+                    <option value="MONTHLY">Monthly</option>
+                    <option value="YEARLY">Yearly</option>
+                </select>
+            </div>
+            <div id="create-recurrence-options" style="display: none;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="create-recurrence-interval">Every</label>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="number" id="create-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99" style="width: 70px;">
+                            <span id="create-recurrence-unit">day(s)</span>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="create-recurrence-end">Ends</label>
+                        <select id="create-recurrence-end" name="recurrence_end_type" onchange="toggleRecurrenceEnd('create')">
+                            <option value="never">Never</option>
+                            <option value="after">After</option>
+                            <option value="on">On date</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="create-recurrence-end-options" style="display: none;">
+                    <div class="form-group" id="create-recurrence-count-group" style="display: none;">
+                        <label for="create-recurrence-count">Number of occurrences</label>
+                        <input type="number" id="create-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                    </div>
+                    <div class="form-group" id="create-recurrence-until-group" style="display: none;">
+                        <label for="create-recurrence-until">End date</label>
+                        <input type="date" id="create-recurrence-until" name="recurrence_until">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeCreateEventModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Event</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Edit Event Modal -->
+<div class="modal-overlay" id="edit-event-modal">
+    <div class="modal-content modal-lg">
+        <div class="modal-header">
+            <span class="modal-title">Edit Event</span>
+            <button class="modal-close" onclick="closeEditEventModal()">&times;</button>
+        </div>
+        <form id="edit-event-form" method="POST">
+            <input type="hidden" name="_method" value="PUT">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="edit-scope" name="edit_scope" value="series">
+            <input type="hidden" id="edit-recurrence-id" name="recurrence_id" value="">
+            <input type="hidden" id="edit-recurrence-all-day" name="recurrence_all_day" value="">
+            <div class="form-group" id="edit-scope-group" style="display: none;">
+                <label>Editing</label>
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-series" onclick="setEditScope('series')">Edit series</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-occurrence" onclick="setEditScope('occurrence')">Edit this occurrence</button>
+                </div>
+                <div id="edit-scope-hint" style="margin-top: 0.25rem; color: #4a5568; font-size: 0.8rem;"></div>
+            </div>
+            <div class="form-group">
+                <label for="edit-summary">Title *</label>
+                <input type="text" id="edit-summary" name="summary" required>
+            </div>
+            <div class="form-check" style="margin-bottom: 1rem;">
+                <input type="checkbox" id="edit-all-day" name="all_day" onchange="toggleAllDay('edit')">
+                <label for="edit-all-day" style="margin: 0; font-weight: normal;">All day event</label>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="edit-dtstart">Start</label>
+                    <input type="datetime-local" id="edit-dtstart" name="dtstart">
+                </div>
+                <div class="form-group">
+                    <label for="edit-dtend">End</label>
+                    <input type="datetime-local" id="edit-dtend" name="dtend">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="edit-location">Location</label>
+                <input type="text" id="edit-location" name="location">
+            </div>
+            <div class="form-group">
+                <label for="edit-description">Description</label>
+                <textarea id="edit-description" name="description" rows="2"></textarea>
+            </div>
+            
+            <!-- Recurrence Options -->
+            <div class="form-group">
+                <label for="edit-recurrence">Repeat</label>
+                <select id="edit-recurrence" name="recurrence" onchange="toggleRecurrenceOptions('edit')">
+                    <option value="">Does not repeat</option>
+                    <option value="DAILY">Daily</option>
+                    <option value="WEEKLY">Weekly</option>
+                    <option value="MONTHLY">Monthly</option>
+                    <option value="YEARLY">Yearly</option>
+                </select>
+            </div>
+            <div id="edit-recurrence-options" style="display: none;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="edit-recurrence-interval">Every</label>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="number" id="edit-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99" style="width: 70px;">
+                            <span id="edit-recurrence-unit">day(s)</span>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-recurrence-end">Ends</label>
+                        <select id="edit-recurrence-end" name="recurrence_end_type" onchange="toggleRecurrenceEnd('edit')">
+                            <option value="never">Never</option>
+                            <option value="after">After</option>
+                            <option value="on">On date</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="edit-recurrence-end-options" style="display: none;">
+                    <div class="form-group" id="edit-recurrence-count-group" style="display: none;">
+                        <label for="edit-recurrence-count">Number of occurrences</label>
+                        <input type="number" id="edit-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                    </div>
+                    <div class="form-group" id="edit-recurrence-until-group" style="display: none;">
+                        <label for="edit-recurrence-until">End date</label>
+                        <input type="date" id="edit-recurrence-until" name="recurrence_until">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="form-actions">
+                <button type="button" class="btn btn-danger" onclick="deleteCurrentEvent()">Delete</button>
+                <div style="flex: 1;"></div>
+                <button type="button" class="btn btn-secondary" onclick="closeEditEventModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+        </form>
+        <form id="delete-event-form" method="POST" style="display: none;">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
+            <input type="hidden" id="delete-recurrence-id" name="recurrence_id" value="">
+            <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day" value="">
+        </form>
+    </div>
+</div>
+
+<script>
+(function() {
+    // Raw event data from server
+    var rawEvents = {{if .EventsJSON}}{{.EventsJSON}}{{else}}[]{{end}};
+    
+    // Parse iCalendar data
+    function parseICAL(ical) {
+        var lines = unfoldLines(ical);
+        var components = [];
+        var current = [];
+        var inEvent = false;
+
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line === 'BEGIN:VEVENT') {
+                inEvent = true;
+                current = [];
+                continue;
+            }
+            if (line === 'END:VEVENT') {
+                components.push(current);
+                inEvent = false;
+                continue;
+            }
+            if (inEvent) {
+                current.push(line);
+            }
+        }
+
+        function parseEventLines(evLines) {
+            var event = {};
+            evLines.forEach(function(line) {
+                var colonIdx = line.indexOf(':');
+                if (colonIdx === -1) return;
+
+                var key = line.substring(0, colonIdx);
+                var value = line.substring(colonIdx + 1);
+
+                // Handle parameters in key (e.g., DTSTART;TZID=...)
+                var params = {};
+                var semicolonIdx = key.indexOf(';');
+                if (semicolonIdx !== -1) {
+                    var paramStr = key.substring(semicolonIdx + 1);
+                    key = key.substring(0, semicolonIdx);
+                    paramStr.split(';').forEach(function(p) {
+                        var eq = p.indexOf('=');
+                        if (eq !== -1) {
+                            params[p.substring(0, eq)] = p.substring(eq + 1);
+                        }
+                    });
+                }
+
+                switch (key) {
+                    case 'UID':
+                        event.uid = value;
+                        break;
+                    case 'SUMMARY':
+                        event.summary = unescapeICAL(value);
+                        break;
+                    case 'DESCRIPTION':
+                        event.description = unescapeICAL(value);
+                        break;
+                    case 'RECURRENCE-ID':
+                        event.recurrenceId = parseICALDate(value, params);
+                        event.recurrenceIdAllDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        break;
+                    case 'X-ALT-DESC':
+                        // HTML description from Thunderbird etc.
+                        if (params['FMTTYPE'] === 'text/html') {
+                            event.htmlDescription = value;
+                        }
+                        break;
+                    case 'LOCATION':
+                        event.location = unescapeICAL(value);
+                        break;
+                    case 'DTSTART':
+                        event.dtstart = parseICALDate(value, params);
+                        event.allDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        break;
+                    case 'DTEND':
+                        event.dtend = parseICALDate(value, params);
+                        break;
+                    case 'DURATION':
+                        event.duration = value;
+                        break;
+                    case 'RRULE':
+                        event.rrule = value;
+                        event.rruleParsed = parseRRule(value);
+                        break;
+                    case 'EXDATE':
+                        event.exdates = event.exdates || [];
+                        event.exdates.push(parseICALDate(value, params));
+                        break;
+                    case 'STATUS':
+                        event.status = value;
+                        break;
+                    case 'CATEGORIES':
+                        event.categories = value.split(',').map(function(c) { return c.trim(); });
+                        break;
+                }
+            });
+            return event;
+        }
+
+        var parsedComponents = components.map(parseEventLines);
+        var master = parsedComponents.find(function(c) { return !c.recurrenceId; }) || parsedComponents[0] || {};
+        var overrides = parsedComponents.filter(function(c) { return c.recurrenceId; });
+        overrides.forEach(function(o) {
+            if (!o.uid && master.uid) o.uid = master.uid;
+        });
+        master.overrides = overrides;
+        return master;
+    }
+    
+    function unfoldLines(ical) {
+        // RFC 5545: lines are folded by inserting CRLF + space/tab
+        return ical.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
+    }
+    
+    function unescapeICAL(str) {
+        return str
+            .replace(/\\n/gi, '\n')
+            .replace(/\\,/g, ',')
+            .replace(/\\;/g, ';')
+            .replace(/\\\\/g, '\\');
+    }
+    
+    function parseICALDate(str, params) {
+        // Handle YYYYMMDD and YYYYMMDDTHHMMSS formats
+        str = str.replace('Z', '');
+        var year, month, day, hour = 0, min = 0, sec = 0;
+        
+        if (str.length >= 8) {
+            year = parseInt(str.substring(0, 4), 10);
+            month = parseInt(str.substring(4, 6), 10) - 1;
+            day = parseInt(str.substring(6, 8), 10);
+        }
+        if (str.length >= 15) {
+            hour = parseInt(str.substring(9, 11), 10);
+            min = parseInt(str.substring(11, 13), 10);
+            sec = parseInt(str.substring(13, 15), 10);
+        }
+        
+        return new Date(year, month, day, hour, min, sec);
+    }
+    
+    // Parse RRULE into structured object
+    function parseRRule(rrule) {
+        var result = {};
+        rrule.split(';').forEach(function(part) {
+            var eq = part.indexOf('=');
+            if (eq !== -1) {
+                var key = part.substring(0, eq);
+                var value = part.substring(eq + 1);
+                result[key] = value;
+            }
+        });
+        return result;
+    }
+    
+    function makeOccurrenceKey(date, allDay) {
+        if (!date) return '';
+        if (allDay) {
+            var y = date.getFullYear();
+            var m = String(date.getMonth() + 1).padStart(2, '0');
+            var d = String(date.getDate()).padStart(2, '0');
+            return y + '-' + m + '-' + d;
+        }
+        return String(date.getTime());
+    }
+
+    // Expand recurring events into individual occurrences
+    function expandRecurringEvents(events, rangeStart, rangeEnd) {
+        var expanded = [];
+        var maxOccurrences = 500; // Safety limit
+        
+        events.forEach(function(event) {
+            var overrides = event.overrides || [];
+            var overrideMap = {};
+            overrides.forEach(function(ov) {
+                if (!ov.recurrenceId) return;
+                var key = makeOccurrenceKey(ov.recurrenceId, ov.recurrenceIdAllDay || ov.allDay || event.allDay);
+                // Ensure overrides keep master defaults when fields are missing
+                var merged = Object.assign({}, event, ov);
+                merged.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
+                overrideMap[key] = merged;
+            });
+
+            if (!event.rrule) {
+                // Non-recurring event
+                expanded.push(event);
+                overrides.forEach(function(ov) {
+                    var overrideEv = Object.assign({}, event, ov);
+                    overrideEv.recurrenceId = ov.recurrenceId;
+                    overrideEv.recurrenceIdAllDay = ov.recurrenceIdAllDay || ov.allDay || event.allDay;
+                    expanded.push(overrideEv);
+                });
+                return;
+            }
+            
+            var rr = event.rruleParsed;
+            var freq = rr.FREQ;
+            var interval = parseInt(rr.INTERVAL || '1', 10);
+            var count = rr.COUNT ? parseInt(rr.COUNT, 10) : null;
+            var until = rr.UNTIL ? parseICALDate(rr.UNTIL, {}) : null;
+            var byDay = rr.BYDAY ? rr.BYDAY.split(',') : null;
+            var byMonthDay = rr.BYMONTHDAY ? rr.BYMONTHDAY.split(',').map(function(d) { return parseInt(d, 10); }) : null;
+            var byMonth = rr.BYMONTH ? rr.BYMONTH.split(',').map(function(m) { return parseInt(m, 10); }) : null;
+            
+            var duration = 0;
+            if (event.dtend) {
+                duration = event.dtend.getTime() - event.dtstart.getTime();
+            }
+            
+            var exdateSet = {};
+            if (event.exdates) {
+                event.exdates.forEach(function(d) {
+                    exdateSet[makeOccurrenceKey(d, event.allDay)] = true;
+                });
+            }
+            
+            var current = new Date(event.dtstart);
+            var occurrences = 0;
+            var effectiveEnd = until || rangeEnd;
+            
+            // Generate occurrences within range
+            while (occurrences < maxOccurrences) {
+                if (count && occurrences >= count) break;
+                if (current > effectiveEnd) break;
+                
+                var matches = true;
+                
+                // Check BYDAY constraint
+                if (byDay && freq !== 'WEEKLY') {
+                    var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+                    var currentDay = dayNames[current.getDay()];
+                    matches = byDay.some(function(d) { return d.endsWith(currentDay); });
+                }
+                
+                // Check BYMONTHDAY constraint
+                if (byMonthDay) {
+                    matches = matches && byMonthDay.indexOf(current.getDate()) !== -1;
+                }
+                
+                // Check BYMONTH constraint
+                if (byMonth) {
+                    matches = matches && byMonth.indexOf(current.getMonth() + 1) !== -1;
+                }
+                
+                // Check EXDATE
+                if (exdateSet[makeOccurrenceKey(current, event.allDay)]) {
+                    matches = false;
+                }
+                
+                if (matches && current >= rangeStart) {
+                    var key = makeOccurrenceKey(current, event.allDay);
+                    var override = overrideMap[key];
+                    var occurrence;
+                    if (override) {
+                        occurrence = Object.assign({}, override);
+                        occurrence.recurrenceId = override.recurrenceId || new Date(current);
+                        occurrence.recurrenceIdAllDay = override.recurrenceIdAllDay || override.allDay || event.allDay;
+                    } else {
+                        occurrence = Object.assign({}, event);
+                        occurrence.dtstart = new Date(current);
+                        if (event.dtend) {
+                            occurrence.dtend = new Date(current.getTime() + duration);
+                        }
+                        occurrence.recurrenceId = new Date(current);
+                        occurrence.recurrenceIdAllDay = event.allDay;
+                    }
+                    occurrence.isOccurrence = true;
+                    expanded.push(occurrence);
+                }
+                
+                if (matches) occurrences++;
+                
+                // Advance to next occurrence
+                switch (freq) {
+                    case 'DAILY':
+                        current.setDate(current.getDate() + interval);
+                        break;
+                    case 'WEEKLY':
+                        if (byDay) {
+                            // Find next matching day
+                            var found = false;
+                            for (var attempts = 0; attempts < 7 * interval + 1; attempts++) {
+                                current.setDate(current.getDate() + 1);
+                                var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+                                var d = dayNames[current.getDay()];
+                                if (byDay.some(function(bd) { return bd.endsWith(d); })) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) break;
+                        } else {
+                            current.setDate(current.getDate() + 7 * interval);
+                        }
+                        break;
+                    case 'MONTHLY':
+                        current.setMonth(current.getMonth() + interval);
+                        break;
+                    case 'YEARLY':
+                        current.setFullYear(current.getFullYear() + interval);
+                        break;
+                    default:
+                        current.setDate(current.getDate() + 1);
+                }
+            }
+        });
+        
+        return expanded;
+    }
+    
+    // Parse all base events
+    var baseEvents = rawEvents.map(function(raw) {
+        var parsed = parseICAL(raw.ical);
+        parsed.uid = raw.uid;
+        parsed.lastMod = raw.lastMod;
+        return parsed;
+    }).filter(function(e) { return e.dtstart; });
+    
+    // Keep base events for list view and modals
+    var events = baseEvents.slice();
+    
+    // Sort by start date
+    events.sort(function(a, b) {
+        return a.dtstart - b.dtstart;
+    });
+    
+    // Current view state
+    var currentDate = new Date();
+    var currentView = 'month';
+    
+    // View toggle
+    document.querySelectorAll('.view-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('.view-btn').forEach(function(b) { b.classList.remove('active'); });
+            this.classList.add('active');
+            currentView = this.dataset.view;
+            
+            document.getElementById('month-view').style.display = currentView === 'month' ? 'block' : 'none';
+            document.getElementById('list-view').style.display = currentView === 'list' ? 'block' : 'none';
+            
+            if (currentView === 'list') renderListView();
+        });
+    });
+    
+    // Month navigation
+    document.getElementById('prev-month').addEventListener('click', function() {
+        currentDate.setMonth(currentDate.getMonth() - 1);
+        renderMonthView();
+    });
+    document.getElementById('next-month').addEventListener('click', function() {
+        currentDate.setMonth(currentDate.getMonth() + 1);
+        renderMonthView();
+    });
+    document.getElementById('today-btn').addEventListener('click', function() {
+        currentDate = new Date();
+        renderMonthView();
+    });
+    
+    // Event Modal
+    var modal = document.getElementById('event-modal');
+    document.getElementById('modal-close').addEventListener('click', function() {
+        modal.classList.remove('show');
+    });
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('show');
+    });
+    
+    // Day Events Modal
+    var dayModal = document.getElementById('day-modal');
+    document.getElementById('day-modal-close').addEventListener('click', function() {
+        dayModal.classList.remove('show');
+    });
+    dayModal.addEventListener('click', function(e) {
+        if (e.target === dayModal) dayModal.classList.remove('show');
+    });
+    
+    function showDayModal(cellDate, dayEvents) {
+        var dateOpts = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+        document.getElementById('day-modal-date').textContent = cellDate.toLocaleDateString(undefined, dateOpts);
+        document.getElementById('day-modal-title').textContent = dayEvents.length + ' Event' + (dayEvents.length !== 1 ? 's' : '');
+        
+        var container = document.getElementById('day-modal-events');
+        container.innerHTML = '';
+        
+        // Sort events by time
+        dayEvents.sort(function(a, b) {
+            if (a.allDay && !b.allDay) return -1;
+            if (!a.allDay && b.allDay) return 1;
+            return a.dtstart - b.dtstart;
+        });
+        
+        dayEvents.forEach(function(ev) {
+            var el = document.createElement('div');
+            el.className = 'day-modal-event' + (ev.allDay ? ' all-day' : '');
+            
+            var title = document.createElement('div');
+            title.className = 'day-modal-event-title';
+            title.textContent = ev.summary || 'Untitled Event';
+            el.appendChild(title);
+            
+            var time = document.createElement('div');
+            time.className = 'day-modal-event-time';
+            if (ev.allDay) {
+                time.textContent = 'All day';
+            } else {
+                time.textContent = ev.dtstart.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+                if (ev.dtend) {
+                    time.textContent += ' - ' + ev.dtend.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+                }
+            }
+            el.appendChild(time);
+            
+            el.addEventListener('click', function() {
+                dayModal.classList.remove('show');
+                showEventModal(ev);
+            });
+            
+            container.appendChild(el);
+        });
+        
+        dayModal.classList.add('show');
+    }
+    
+    function showEventModal(event) {
+        document.getElementById('modal-title').textContent = event.summary || 'Untitled Event';
+        
+        var body = '';
+        if (event.dtstart) {
+            var dateStr = formatDate(event.dtstart, event.allDay);
+            if (event.dtend && event.dtend.getTime() !== event.dtstart.getTime()) {
+                dateStr += ' - ' + formatDate(event.dtend, event.allDay);
+            }
+            body += '<p><strong>When:</strong> ' + dateStr + '</p>';
+        }
+        if (event.location) {
+            body += '<p><strong>Where:</strong> ' + escapeHtml(event.location) + '</p>';
+        }
+        if (event.status) {
+            body += '<p><strong>Status:</strong> ' + event.status + '</p>';
+        }
+        if (event.categories && event.categories.length) {
+            body += '<p><strong>Categories:</strong> ' + event.categories.map(escapeHtml).join(', ') + '</p>';
+        }
+        if (event.rrule) {
+            body += '<p><strong>Recurrence:</strong> ' + formatRRule(event.rrule) + '</p>';
+        }
+        if (event.htmlDescription) {
+            // Render HTML description (sanitized)
+            body += '<p><strong>Description:</strong></p><div class="event-html-desc">' + sanitizeHtml(event.htmlDescription) + '</div>';
+        } else if (event.description) {
+            body += '<p><strong>Description:</strong></p><p style="white-space:pre-wrap">' + escapeHtml(event.description) + '</p>';
+        }
+        
+        // Add edit button
+        body += '<div class="modal-actions">';
+        body += '<div id="event-action-buttons"></div>';
+        body += '</div>';
+        
+        document.getElementById('modal-body').innerHTML = body;
+        var actionContainer = document.getElementById('event-action-buttons');
+        actionContainer.innerHTML = '';
+        var masterEvent = window.baseEvents.find(function(e) { return e.uid === event.uid; }) || event;
+
+        function addAction(label, scope, targetEvent) {
+            var btn = document.createElement('button');
+            btn.className = 'btn btn-primary';
+            btn.textContent = label;
+            btn.addEventListener('click', function() {
+                document.getElementById('event-modal').classList.remove('show');
+                showEditEventModal(targetEvent, scope);
+            });
+            actionContainer.appendChild(btn);
+        }
+
+        if (masterEvent && (masterEvent.rrule || event.recurrenceId)) {
+            addAction('Edit Series', 'series', masterEvent);
+            var occurrenceTarget = event.recurrenceId ? event : masterEvent;
+            addAction('Edit Occurrence', 'occurrence', occurrenceTarget);
+        } else {
+            addAction('Edit Event', 'series', masterEvent);
+        }
+        modal.classList.add('show');
+    }
+    
+    // Sanitize HTML by allowing only safe tags
+    function sanitizeHtml(html) {
+        // Unescape iCal escaped characters first
+        html = html
+            .replace(/\\n/gi, '\n')
+            .replace(/\\,/g, ',')
+            .replace(/\\;/g, ';')
+            .replace(/\\\\/g, '\\');
+        
+        // Create a temporary element to parse HTML
+        var temp = document.createElement('div');
+        temp.innerHTML = html;
+        
+        // Walk the DOM and remove dangerous elements/attributes
+        function sanitizeNode(node) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+                var tagName = node.tagName.toLowerCase();
+                // Allowed tags
+                var allowedTags = ['p', 'br', 'b', 'i', 'u', 'strong', 'em', 'a', 'ul', 'ol', 'li', 
+                                   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'code',
+                                   'div', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody'];
+                
+                if (allowedTags.indexOf(tagName) === -1) {
+                    // Replace with its text content
+                    var text = document.createTextNode(node.textContent);
+                    node.parentNode.replaceChild(text, node);
+                    return;
+                }
+                
+                // Remove dangerous attributes
+                var attrs = Array.from(node.attributes);
+                attrs.forEach(function(attr) {
+                    var name = attr.name.toLowerCase();
+                    if (name.startsWith('on') || name === 'style' || name === 'class') {
+                        node.removeAttribute(attr.name);
+                    }
+                    if (name === 'href') {
+                        var value = attr.value.toLowerCase().trim();
+                        if (value.startsWith('javascript:') || value.startsWith('data:')) {
+                            node.removeAttribute('href');
+                        }
+                    }
+                });
+                
+                // Recursively sanitize children
+                Array.from(node.childNodes).forEach(sanitizeNode);
+            }
+        }
+        
+        Array.from(temp.childNodes).forEach(sanitizeNode);
+        return temp.innerHTML;
+    }
+    
+    function formatDate(date, allDay) {
+        var opts = { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' };
+        if (!allDay) {
+            opts.hour = '2-digit';
+            opts.minute = '2-digit';
+        }
+        return date.toLocaleDateString(undefined, opts);
+    }
+    
+    function formatRRule(rrule) {
+        var rr = {};
+        rrule.split(';').forEach(function(part) {
+            var eq = part.indexOf('=');
+            if (eq !== -1) {
+                rr[part.substring(0, eq)] = part.substring(eq + 1);
+            }
+        });
+        
+        var freq = (rr.FREQ || '').toLowerCase();
+        var interval = parseInt(rr.INTERVAL || '1', 10);
+        var result = '';
+        
+        // Base frequency
+        if (interval === 1) {
+            switch (freq) {
+                case 'daily': result = 'Daily'; break;
+                case 'weekly': result = 'Weekly'; break;
+                case 'monthly': result = 'Monthly'; break;
+                case 'yearly': result = 'Yearly'; break;
+                default: result = freq.charAt(0).toUpperCase() + freq.slice(1);
+            }
+        } else {
+            switch (freq) {
+                case 'daily': result = 'Every ' + interval + ' days'; break;
+                case 'weekly': result = 'Every ' + interval + ' weeks'; break;
+                case 'monthly': result = 'Every ' + interval + ' months'; break;
+                case 'yearly': result = 'Every ' + interval + ' years'; break;
+                default: result = 'Every ' + interval + ' ' + freq;
+            }
+        }
+        
+        // BYDAY - days of week
+        if (rr.BYDAY) {
+            var dayMap = {
+                'SU': 'Sunday', 'MO': 'Monday', 'TU': 'Tuesday', 'WE': 'Wednesday',
+                'TH': 'Thursday', 'FR': 'Friday', 'SA': 'Saturday'
+            };
+            var days = rr.BYDAY.split(',').map(function(d) {
+                // Handle ordinal days like 1MO, -1FR
+                var match = d.match(/^(-?\d*)(\w{2})$/);
+                if (match) {
+                    var ordinal = match[1];
+                    var day = dayMap[match[2]] || match[2];
+                    if (ordinal === '1') return '1st ' + day;
+                    if (ordinal === '2') return '2nd ' + day;
+                    if (ordinal === '3') return '3rd ' + day;
+                    if (ordinal === '-1') return 'last ' + day;
+                    if (ordinal) return ordinal + 'th ' + day;
+                    return day;
+                }
+                return d;
+            });
+            result += ' on ' + days.join(', ');
+        }
+        
+        // BYMONTHDAY
+        if (rr.BYMONTHDAY) {
+            result += ' on day ' + rr.BYMONTHDAY;
+        }
+        
+        // BYMONTH
+        if (rr.BYMONTH) {
+            var monthNames = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                              'July', 'August', 'September', 'October', 'November', 'December'];
+            var months = rr.BYMONTH.split(',').map(function(m) {
+                return monthNames[parseInt(m, 10)] || m;
+            });
+            result += ' in ' + months.join(', ');
+        }
+        
+        // COUNT or UNTIL
+        if (rr.COUNT) {
+            result += ', ' + rr.COUNT + ' times';
+        } else if (rr.UNTIL) {
+            var until = parseICALDate(rr.UNTIL, {});
+            result += ', until ' + until.toLocaleDateString();
+        }
+        
+        return result;
+    }
+    
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+    
+    // Expanded events for calendar view (includes recurring occurrences)
+    var expandedEvents = [];
+    
+    function renderMonthView() {
+        var year = currentDate.getFullYear();
+        var month = currentDate.getMonth();
+        
+        document.getElementById('month-title').textContent = 
+            currentDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+        
+        // Expand recurring events for this month's range (with some padding)
+        var rangeStart = new Date(year, month - 1, 1);
+        var rangeEnd = new Date(year, month + 2, 0);
+        expandedEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        
+        var grid = document.getElementById('calendar-grid');
+        grid.innerHTML = '';
+        
+        // Day headers
+        var days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        days.forEach(function(d) {
+            var el = document.createElement('div');
+            el.className = 'day-header';
+            el.textContent = d;
+            grid.appendChild(el);
+        });
+        
+        // Get first day of month and total days
+        var firstDay = new Date(year, month, 1);
+        var lastDay = new Date(year, month + 1, 0);
+        var startDayOfWeek = firstDay.getDay();
+        var totalDays = lastDay.getDate();
+        
+        // Previous month padding
+        var prevMonthDays = new Date(year, month, 0).getDate();
+        for (var i = startDayOfWeek - 1; i >= 0; i--) {
+            createDayCell(grid, prevMonthDays - i, year, month - 1, true);
+        }
+        
+        // Current month
+        var today = new Date();
+        for (var d = 1; d <= totalDays; d++) {
+            var isToday = (year === today.getFullYear() && month === today.getMonth() && d === today.getDate());
+            createDayCell(grid, d, year, month, false, isToday);
+        }
+        
+        // Next month padding
+        var totalCells = startDayOfWeek + totalDays;
+        var remaining = (7 - (totalCells % 7)) % 7;
+        for (var n = 1; n <= remaining; n++) {
+            createDayCell(grid, n, year, month + 1, true);
+        }
+    }
+    
+    function createDayCell(grid, day, year, month, otherMonth, isToday) {
+        var cell = document.createElement('div');
+        cell.className = 'day-cell';
+        if (otherMonth) cell.className += ' other-month';
+        if (isToday) cell.className += ' today';
+        
+        // Find events for this day from expanded events
+        var cellDate = new Date(year, month, day);
+        var cellDateStr = cellDate.toDateString();
+        var dayEvents = expandedEvents.filter(function(e) {
+            var start = new Date(e.dtstart.getFullYear(), e.dtstart.getMonth(), e.dtstart.getDate());
+            var end;
+            if (e.dtend) {
+                end = new Date(e.dtend.getFullYear(), e.dtend.getMonth(), e.dtend.getDate());
+                // For all-day events, DTEND is exclusive (day after the last day)
+                // So we need to subtract one day for comparison
+                if (e.allDay && end > start) {
+                    end.setDate(end.getDate() - 1);
+                }
+            } else {
+                end = start;
+            }
+            return cellDate >= start && cellDate <= end;
+        });
+        
+        var numEl = document.createElement('div');
+        numEl.className = 'day-number';
+        if (dayEvents.length > 0) {
+            numEl.className += ' has-events';
+            numEl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                showDayModal(cellDate, dayEvents);
+            });
+        }
+        numEl.textContent = day;
+        cell.appendChild(numEl);
+        
+        var eventsEl = document.createElement('div');
+        eventsEl.className = 'day-events';
+        
+        // Show first 3 events
+        var maxShow = 3;
+        dayEvents.slice(0, maxShow).forEach(function(ev) {
+            var evEl = document.createElement('div');
+            evEl.className = 'day-event' + (ev.allDay ? ' all-day' : '');
+            evEl.textContent = ev.summary || 'Untitled';
+            if (ev.isOccurrence) {
+                evEl.title = 'Recurring event';
+            }
+            evEl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                showEventModal(ev);
+            });
+            eventsEl.appendChild(evEl);
+        });
+        
+        if (dayEvents.length > maxShow) {
+            var more = document.createElement('div');
+            more.className = 'day-more';
+            more.textContent = '+' + (dayEvents.length - maxShow) + ' more';
+            more.addEventListener('click', function(e) {
+                e.stopPropagation();
+                showDayModal(cellDate, dayEvents);
+            });
+            eventsEl.appendChild(more);
+        }
+        
+        cell.appendChild(eventsEl);
+        grid.appendChild(cell);
+    }
+    
+    function renderListView() {
+        var list = document.getElementById('events-list');
+        
+        if (events.length === 0) {
+            list.innerHTML = '<div class="empty-state"><h3>No Events</h3><p>This calendar has no events yet.</p></div>';
+            return;
+        }
+        
+        var html = '';
+        events.forEach(function(ev) {
+            html += '<div class="event-card">';
+            html += '<div class="event-title">' + escapeHtml(ev.summary || 'Untitled Event') + '</div>';
+            html += '<div class="event-meta">';
+            
+            if (ev.dtstart) {
+                html += '<span class="event-meta-item">' + formatDate(ev.dtstart, ev.allDay);
+                if (ev.dtend && ev.dtend.getTime() !== ev.dtstart.getTime()) {
+                    html += ' - ' + formatDate(ev.dtend, ev.allDay);
+                }
+                html += '</span>';
+            }
+            if (ev.location) {
+                html += '<span class="event-meta-item">' + escapeHtml(ev.location) + '</span>';
+            }
+            html += '</div>';
+            
+            if (ev.description) {
+                html += '<div class="event-description">' + escapeHtml(ev.description) + '</div>';
+            }
+            html += '</div>';
+        });
+        
+        list.innerHTML = html;
+    }
+    
+    // Initial render
+    renderMonthView();
+    
+    // Check for ?event=UID query parameter to open specific event
+    var urlParams = new URLSearchParams(window.location.search);
+    var eventUid = urlParams.get('event');
+    if (eventUid) {
+        var targetEvent = baseEvents.find(function(e) { return e.uid === eventUid; });
+        if (targetEvent) {
+            setTimeout(function() {
+                showEventModal(targetEvent);
+            }, 100);
+        }
+    }
+    
+    // Store current event for editing
+    window.currentEditEvent = null;
+    
+    // Make showEventModal accessible globally for edit functionality
+    window.showEventModal = showEventModal;
+    window.baseEvents = baseEvents;
+})();
+
+// Create Event Modal
+function showCreateEventModal() {
+    document.getElementById('create-event-modal').classList.add('show');
+    document.getElementById('create-summary').focus();
+}
+
+function closeCreateEventModal() {
+    document.getElementById('create-event-modal').classList.remove('show');
+    document.getElementById('create-summary').value = '';
+    document.getElementById('create-dtstart').value = '';
+    document.getElementById('create-dtend').value = '';
+    document.getElementById('create-location').value = '';
+    document.getElementById('create-description').value = '';
+    document.getElementById('create-all-day').checked = false;
+}
+
+// Edit Event Modal
+function showEditEventModal(event, scope) {
+    if (!event || !event.uid) {
+        alert('Event data unavailable for editing.');
+        return;
+    }
+    window.currentEditEvent = event;
+    var effectiveScope = scope || (event && event.recurrenceId ? 'occurrence' : 'series');
+    var calendarId = {{.Calendar.ID}};
+    document.getElementById('edit-event-form').action = '/calendars/' + calendarId + '/events/' + encodeURIComponent(event.uid);
+    document.getElementById('delete-event-form').action = '/calendars/' + calendarId + '/events/' + encodeURIComponent(event.uid) + '/delete';
+    
+    document.getElementById('edit-summary').value = event.summary || '';
+    document.getElementById('edit-location').value = event.location || '';
+    document.getElementById('edit-description').value = event.description || '';
+    document.getElementById('edit-all-day').checked = event.allDay || false;
+    toggleAllDay('edit', true);
+    
+    if (event.dtstart) {
+        if (event.allDay) {
+            document.getElementById('edit-dtstart').value = formatDateForInput(event.dtstart);
+        } else {
+            document.getElementById('edit-dtstart').value = formatDateTimeForInput(event.dtstart);
+        }
+    } else {
+        document.getElementById('edit-dtstart').value = '';
+    }
+    
+    if (event.dtend) {
+        if (event.allDay) {
+            // For all-day, DTEND is exclusive so subtract a day for display
+            var displayEnd = new Date(event.dtend);
+            displayEnd.setDate(displayEnd.getDate() - 1);
+            document.getElementById('edit-dtend').value = formatDateForInput(displayEnd);
+        } else {
+            document.getElementById('edit-dtend').value = formatDateTimeForInput(event.dtend);
+        }
+    } else {
+        document.getElementById('edit-dtend').value = '';
+    }
+    
+    // Populate recurrence fields
+    var recurrenceSelect = document.getElementById('edit-recurrence');
+    var intervalInput = document.getElementById('edit-recurrence-interval');
+    var endTypeSelect = document.getElementById('edit-recurrence-end');
+    var countInput = document.getElementById('edit-recurrence-count');
+    var untilInput = document.getElementById('edit-recurrence-until');
+    
+    // Reset recurrence fields to defaults
+    recurrenceSelect.value = '';
+    intervalInput.value = '1';
+    endTypeSelect.value = 'never';
+    countInput.value = '10';
+    untilInput.value = '';
+    
+    if (event.rruleParsed) {
+        var rr = event.rruleParsed;
+        
+        // Set frequency
+        if (rr.FREQ) {
+            recurrenceSelect.value = rr.FREQ;
+        }
+        
+        // Set interval
+        if (rr.INTERVAL) {
+            intervalInput.value = rr.INTERVAL;
+        }
+        
+        // Set end type and value
+        if (rr.COUNT) {
+            endTypeSelect.value = 'after';
+            countInput.value = rr.COUNT;
+        } else if (rr.UNTIL) {
+            endTypeSelect.value = 'on';
+            // Parse UNTIL date (format: YYYYMMDD or YYYYMMDDTHHMMSSZ)
+            var until = rr.UNTIL.replace('Z', '');
+            if (until.length >= 8) {
+                var year = until.substring(0, 4);
+                var month = until.substring(4, 6);
+                var day = until.substring(6, 8);
+                untilInput.value = year + '-' + month + '-' + day;
+            }
+        }
+    }
+    
+    // Update UI to show/hide recurrence options
+    toggleRecurrenceOptions('edit');
+    toggleRecurrenceEnd('edit');
+    
+    toggleAllDay('edit');
+    var scopeGroup = document.getElementById('edit-scope-group');
+    if (event.rrule || event.recurrenceId) {
+        scopeGroup.style.display = 'block';
+    } else {
+        scopeGroup.style.display = 'none';
+        effectiveScope = 'series';
+    }
+    setEditScope(effectiveScope, event);
+    document.getElementById('edit-event-modal').classList.add('show');
+}
+
+function closeEditEventModal() {
+    document.getElementById('edit-event-modal').classList.remove('show');
+    window.currentEditEvent = null;
+}
+
+function formatRecurrenceIdForInput(date, allDay) {
+    if (!date) return '';
+    return allDay ? formatDateForInput(date) : formatDateTimeForInput(date);
+}
+
+function setEditScope(scope, event) {
+    if (!event) event = window.currentEditEvent;
+    var seriesBtn = document.getElementById('edit-scope-series');
+    var occBtn = document.getElementById('edit-scope-occurrence');
+    var hint = document.getElementById('edit-scope-hint');
+    var recurrenceIdInput = document.getElementById('edit-recurrence-id');
+    var recurrenceAllDayInput = document.getElementById('edit-recurrence-all-day');
+    var deleteRecurrenceIdInput = document.getElementById('delete-recurrence-id');
+    var deleteRecurrenceAllDayInput = document.getElementById('delete-recurrence-all-day');
+    var deleteBtn = document.querySelector('#edit-event-form .btn.btn-danger');
+    var recurrenceSelect = document.getElementById('edit-recurrence');
+
+    document.getElementById('edit-scope').value = scope;
+    document.getElementById('delete-edit-scope').value = scope;
+    recurrenceSelect.disabled = scope === 'occurrence';
+
+    seriesBtn.classList.remove('btn-primary');
+    occBtn.classList.remove('btn-primary');
+    seriesBtn.classList.remove('btn-secondary');
+    occBtn.classList.remove('btn-secondary');
+    seriesBtn.classList.add(scope === 'series' ? 'btn-primary' : 'btn-secondary');
+    occBtn.classList.add(scope === 'occurrence' ? 'btn-primary' : 'btn-secondary');
+
+    if (scope === 'occurrence' && event) {
+        var recDate = event.recurrenceId || event.dtstart;
+        var allDay = event.recurrenceIdAllDay || event.allDay;
+        var formatted = formatRecurrenceIdForInput(recDate, allDay);
+        recurrenceIdInput.value = formatted;
+        recurrenceAllDayInput.value = allDay ? 'true' : 'false';
+        deleteRecurrenceIdInput.value = formatted;
+        deleteRecurrenceAllDayInput.value = allDay ? 'true' : 'false';
+        hint.textContent = 'Changes apply only to this occurrence.';
+        if (deleteBtn) deleteBtn.textContent = 'Delete occurrence';
+    } else {
+        recurrenceIdInput.value = '';
+        recurrenceAllDayInput.value = '';
+        deleteRecurrenceIdInput.value = '';
+        deleteRecurrenceAllDayInput.value = '';
+        hint.textContent = scope === 'series' ? 'Changes apply to the entire series.' : '';
+        if (deleteBtn) deleteBtn.textContent = 'Delete event';
+    }
+}
+
+function deleteCurrentEvent() {
+    var scope = document.getElementById('edit-scope').value || 'series';
+    var message = scope === 'occurrence'
+        ? 'Delete just this occurrence? The series will remain.'
+        : 'Delete the entire series/event?';
+    if (confirm(message)) {
+        document.getElementById('delete-event-form').submit();
+    }
+}
+
+function toggleAllDay(prefix, preserveValues) {
+    var checkbox = document.getElementById(prefix + '-all-day');
+    var startInput = document.getElementById(prefix + '-dtstart');
+    var endInput = document.getElementById(prefix + '-dtend');
+    
+    if (checkbox.checked) {
+        // Switch to date-only inputs
+        var startVal = startInput.value;
+        var endVal = endInput.value;
+        startInput.type = 'date';
+        endInput.type = 'date';
+        if (!preserveValues) {
+            if (startVal) startInput.value = startVal.split('T')[0];
+            if (endVal) endInput.value = endVal.split('T')[0];
+        }
+    } else {
+        // Switch to datetime-local inputs
+        var startVal = startInput.value;
+        var endVal = endInput.value;
+        startInput.type = 'datetime-local';
+        endInput.type = 'datetime-local';
+        if (!preserveValues) {
+            if (startVal) {
+                startInput.value = startVal.indexOf('T') === -1 ? startVal + 'T09:00' : startVal;
+            }
+            if (endVal) {
+                endInput.value = endVal.indexOf('T') === -1 ? endVal + 'T10:00' : endVal;
+            }
+        }
+    }
+}
+
+function formatDateForInput(date) {
+    var year = date.getFullYear();
+    var month = String(date.getMonth() + 1).padStart(2, '0');
+    var day = String(date.getDate()).padStart(2, '0');
+    return year + '-' + month + '-' + day;
+}
+
+function formatDateTimeForInput(date) {
+    var year = date.getFullYear();
+    var month = String(date.getMonth() + 1).padStart(2, '0');
+    var day = String(date.getDate()).padStart(2, '0');
+    var hours = String(date.getHours()).padStart(2, '0');
+    var minutes = String(date.getMinutes()).padStart(2, '0');
+    return year + '-' + month + '-' + day + 'T' + hours + ':' + minutes;
+}
+
+// Recurrence options
+function toggleRecurrenceOptions(prefix) {
+    var select = document.getElementById(prefix + '-recurrence');
+    var optionsDiv = document.getElementById(prefix + '-recurrence-options');
+    var unitSpan = document.getElementById(prefix + '-recurrence-unit');
+    
+    if (select.value) {
+        optionsDiv.style.display = 'block';
+        var units = {
+            'DAILY': 'day(s)',
+            'WEEKLY': 'week(s)',
+            'MONTHLY': 'month(s)',
+            'YEARLY': 'year(s)'
+        };
+        unitSpan.textContent = units[select.value] || 'time(s)';
+    } else {
+        optionsDiv.style.display = 'none';
+    }
+}
+
+function toggleRecurrenceEnd(prefix) {
+    var select = document.getElementById(prefix + '-recurrence-end');
+    var optionsDiv = document.getElementById(prefix + '-recurrence-end-options');
+    var countGroup = document.getElementById(prefix + '-recurrence-count-group');
+    var untilGroup = document.getElementById(prefix + '-recurrence-until-group');
+    
+    optionsDiv.style.display = select.value !== 'never' ? 'block' : 'none';
+    countGroup.style.display = select.value === 'after' ? 'block' : 'none';
+    untilGroup.style.display = select.value === 'on' ? 'block' : 'none';
+}
+
+// Close modals when clicking outside
+document.getElementById('create-event-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeCreateEventModal();
+});
+document.getElementById('edit-event-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeEditEventModal();
+});
+</script>
+
+{{if gt .TotalPages 1}}
+<div class="pagination" style="margin-top: 2rem; display: flex; justify-content: center; gap: 0.5rem; align-items: center;">
+    {{if .HasPrev}}
+    <a href="?page={{.PrevPage}}&limit={{.Limit}}" class="pagination-btn">&larr; Previous</a>
+    {{end}}
+    <span style="color: #718096; font-size: 0.875rem;">Page {{.Page}} of {{.TotalPages}} ({{.TotalCount}} events)</span>
+    {{if .HasNext}}
+    <a href="?page={{.NextPage}}&limit={{.Limit}}" class="pagination-btn">Next &rarr;</a>
+    {{end}}
+</div>
+<style>
+    .pagination-btn {
+        padding: 0.5rem 1rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        text-decoration: none;
+        color: #4a5568;
+        background: #fff;
+        font-size: 0.875rem;
+    }
+    .pagination-btn:hover {
+        background: #f7fafc;
+        border-color: #cbd5e0;
+    }
+</style>
+{{end}}
+{{end}}
+{{template "base" .}}

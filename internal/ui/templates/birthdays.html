@@ -1,0 +1,543 @@
+{{define "content"}}
+<style>
+    .birthdays-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1.5rem;
+    }
+    .birthdays-header h1 {
+        margin: 0;
+        color: #1a1a2e;
+    }
+    .back-link {
+        color: #4a5568;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .back-link:hover { color: #2d3748; }
+    
+    .birthdays-info {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+        padding: 1rem 1.5rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+    }
+    .birthdays-info p {
+        margin: 0;
+        opacity: 0.9;
+    }
+    
+    .month-nav {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        margin-bottom: 1rem;
+    }
+    .month-nav button {
+        background: none;
+        border: 1px solid #cbd5e0;
+        padding: 0.25rem 0.75rem;
+        cursor: pointer;
+        border-radius: 4px;
+    }
+    .month-nav button:hover { background: #f7fafc; }
+    .month-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        min-width: 200px;
+        text-align: center;
+    }
+    
+    .calendar-grid {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 1px;
+        background: #e2e8f0;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        overflow: hidden;
+    }
+    .calendar-grid .day-header {
+        background: #f7fafc;
+        padding: 0.5rem;
+        text-align: center;
+        font-weight: 600;
+        font-size: 0.75rem;
+        color: #4a5568;
+        text-transform: uppercase;
+    }
+    .calendar-grid .day-cell {
+        background: #fff;
+        min-height: 100px;
+        padding: 0.25rem;
+        position: relative;
+    }
+    .calendar-grid .day-cell.other-month {
+        background: #f7fafc;
+    }
+    .calendar-grid .day-cell.today {
+        background: #ebf8ff;
+    }
+    .day-number {
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #2d3748;
+        margin-bottom: 0.25rem;
+    }
+    .day-cell.other-month .day-number {
+        color: #a0aec0;
+    }
+    .day-events {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .birthday-event {
+        font-size: 0.7rem;
+        padding: 2px 4px;
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: #fff;
+        border-radius: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+    }
+    .birthday-event:hover {
+        opacity: 0.9;
+    }
+    .day-more {
+        font-size: 0.65rem;
+        color: #f5576c;
+        cursor: pointer;
+        padding: 2px;
+    }
+    .day-more:hover {
+        text-decoration: underline;
+    }
+    
+    /* Birthday Modal */
+    .modal-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+    }
+    .modal-overlay.show {
+        display: flex;
+    }
+    .modal-content {
+        background: #fff;
+        border-radius: 12px;
+        padding: 1.5rem;
+        max-width: 400px;
+        width: 90%;
+        max-height: 80vh;
+        overflow-y: auto;
+    }
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 1rem;
+    }
+    .modal-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #1a202c;
+    }
+    .modal-close {
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        cursor: pointer;
+        color: #718096;
+        line-height: 1;
+    }
+    .modal-close:hover { color: #2d3748; }
+    .modal-body {
+        font-size: 0.9rem;
+        color: #4a5568;
+    }
+    .modal-body p {
+        margin: 0.5rem 0;
+    }
+    .modal-body strong {
+        color: #2d3748;
+    }
+    
+    .birthday-icon {
+        font-size: 2rem;
+        margin-bottom: 0.5rem;
+    }
+    
+    .birthday-list {
+        margin-top: 1.5rem;
+    }
+    .birthday-list-title {
+        font-weight: 600;
+        color: #4a5568;
+        margin-bottom: 0.75rem;
+    }
+    .birthday-list-item {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        background: #f7fafc;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+    }
+    .birthday-list-item:hover {
+        background: #edf2f7;
+    }
+    .birthday-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: 600;
+        flex-shrink: 0;
+    }
+    .birthday-details {
+        flex: 1;
+    }
+    .birthday-name {
+        font-weight: 600;
+        color: #2d3748;
+    }
+    .birthday-date {
+        font-size: 0.875rem;
+        color: #718096;
+    }
+    .birthday-age {
+        font-size: 0.75rem;
+        background: #edf2f7;
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+        color: #4a5568;
+    }
+    
+    .empty-state {
+        text-align: center;
+        padding: 3rem;
+        color: #718096;
+    }
+    .empty-state h3 {
+        margin-bottom: 0.5rem;
+        color: #4a5568;
+    }
+</style>
+
+<div class="birthdays-header">
+    <div>
+        <a href="/" class="back-link">&larr; Back to Dashboard</a>
+        <h1>🎂 Birthdays</h1>
+    </div>
+</div>
+
+<div class="birthdays-info">
+    <p>This calendar shows birthdays from all your contacts. Events are read-only and automatically generated.</p>
+</div>
+
+<div class="month-nav">
+    <button id="prev-month">&larr;</button>
+    <span class="month-title" id="month-title"></span>
+    <button id="next-month">&rarr;</button>
+    <button id="today-btn" style="margin-left:1rem">Today</button>
+</div>
+
+<div class="calendar-grid" id="calendar-grid"></div>
+
+<div class="birthday-list" id="upcoming-birthdays">
+    <div class="birthday-list-title">Upcoming Birthdays</div>
+    <div id="upcoming-list"></div>
+</div>
+
+<div class="modal-overlay" id="birthday-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title" id="modal-title">Birthday</span>
+            <button class="modal-close" id="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+    </div>
+</div>
+
+<script>
+(function() {
+    // Birthday data from server
+    var birthdays = [
+        {{range .BirthdayEvents}}
+        {
+            contactUid: {{.ContactUID}},
+            displayName: {{.DisplayName}},
+            month: {{.Month}},
+            day: {{.Day}},
+            age: {{if .Age}}{{.Age}}{{else}}null{{end}}
+        },
+        {{end}}
+    ];
+    
+    var currentDate = new Date();
+    
+    // Month navigation
+    document.getElementById('prev-month').addEventListener('click', function() {
+        currentDate.setMonth(currentDate.getMonth() - 1);
+        renderCalendar();
+    });
+    document.getElementById('next-month').addEventListener('click', function() {
+        currentDate.setMonth(currentDate.getMonth() + 1);
+        renderCalendar();
+    });
+    document.getElementById('today-btn').addEventListener('click', function() {
+        currentDate = new Date();
+        renderCalendar();
+    });
+    
+    // Modal
+    var modal = document.getElementById('birthday-modal');
+    document.getElementById('modal-close').addEventListener('click', function() {
+        modal.classList.remove('show');
+    });
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('show');
+    });
+    
+    function getInitials(name) {
+        return name.split(' ').slice(0, 2).map(function(n) { return n.charAt(0); }).join('').toUpperCase();
+    }
+    
+    function showBirthdayModal(birthday, year) {
+        var date = new Date(year, birthday.month - 1, birthday.day);
+        var dateStr = date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+        
+        var body = '<div class="birthday-icon">🎂</div>';
+        body += '<p><strong>' + escapeHtml(birthday.displayName) + '</strong></p>';
+        body += '<p>Birthday: ' + dateStr + '</p>';
+        if (birthday.age !== null) {
+            var ageThisYear = birthday.age;
+            if (year !== new Date().getFullYear()) {
+                ageThisYear = birthday.age + (year - new Date().getFullYear());
+            }
+            body += '<p>Turns ' + ageThisYear + ' years old</p>';
+        }
+        
+        document.getElementById('modal-title').textContent = 'Birthday';
+        document.getElementById('modal-body').innerHTML = body;
+        modal.classList.add('show');
+    }
+    
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+    
+    function renderCalendar() {
+        var year = currentDate.getFullYear();
+        var month = currentDate.getMonth();
+        
+        document.getElementById('month-title').textContent = 
+            currentDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+        
+        var grid = document.getElementById('calendar-grid');
+        grid.innerHTML = '';
+        
+        // Day headers
+        var days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        days.forEach(function(d) {
+            var el = document.createElement('div');
+            el.className = 'day-header';
+            el.textContent = d;
+            grid.appendChild(el);
+        });
+        
+        // Get first day of month and total days
+        var firstDay = new Date(year, month, 1);
+        var lastDay = new Date(year, month + 1, 0);
+        var startDayOfWeek = firstDay.getDay();
+        var totalDays = lastDay.getDate();
+        
+        // Previous month padding
+        var prevMonthDays = new Date(year, month, 0).getDate();
+        for (var i = startDayOfWeek - 1; i >= 0; i--) {
+            createDayCell(grid, prevMonthDays - i, year, month - 1, true);
+        }
+        
+        // Current month
+        var today = new Date();
+        for (var d = 1; d <= totalDays; d++) {
+            var isToday = (year === today.getFullYear() && month === today.getMonth() && d === today.getDate());
+            createDayCell(grid, d, year, month, false, isToday);
+        }
+        
+        // Next month padding
+        var totalCells = startDayOfWeek + totalDays;
+        var remaining = (7 - (totalCells % 7)) % 7;
+        for (var n = 1; n <= remaining; n++) {
+            createDayCell(grid, n, year, month + 1, true);
+        }
+        
+        // Render upcoming birthdays list
+        renderUpcoming();
+    }
+    
+    function createDayCell(grid, day, year, month, otherMonth, isToday) {
+        var cell = document.createElement('div');
+        cell.className = 'day-cell';
+        if (otherMonth) cell.className += ' other-month';
+        if (isToday) cell.className += ' today';
+        
+        // Normalize month for comparison
+        var displayMonth = month + 1;
+        if (displayMonth < 1) displayMonth = 12;
+        if (displayMonth > 12) displayMonth = 1;
+        
+        // Find birthdays for this day
+        var dayBirthdays = birthdays.filter(function(b) {
+            return b.month === displayMonth && b.day === day;
+        });
+        
+        var numEl = document.createElement('div');
+        numEl.className = 'day-number';
+        numEl.textContent = day;
+        cell.appendChild(numEl);
+        
+        var eventsEl = document.createElement('div');
+        eventsEl.className = 'day-events';
+        
+        // Show first 3 birthdays
+        var maxShow = 3;
+        dayBirthdays.slice(0, maxShow).forEach(function(b) {
+            var evEl = document.createElement('div');
+            evEl.className = 'birthday-event';
+            evEl.textContent = '🎂 ' + b.displayName;
+            evEl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                showBirthdayModal(b, year);
+            });
+            eventsEl.appendChild(evEl);
+        });
+        
+        if (dayBirthdays.length > maxShow) {
+            var more = document.createElement('div');
+            more.className = 'day-more';
+            more.textContent = '+' + (dayBirthdays.length - maxShow) + ' more';
+            eventsEl.appendChild(more);
+        }
+        
+        cell.appendChild(eventsEl);
+        grid.appendChild(cell);
+    }
+    
+    function renderUpcoming() {
+        var list = document.getElementById('upcoming-list');
+        var today = new Date();
+        var currentMonth = today.getMonth() + 1;
+        var currentDay = today.getDate();
+        
+        // Sort birthdays by upcoming date
+        var sorted = birthdays.slice().sort(function(a, b) {
+            // Calculate days until birthday
+            var aDays = daysUntil(a.month, a.day, currentMonth, currentDay);
+            var bDays = daysUntil(b.month, b.day, currentMonth, currentDay);
+            return aDays - bDays;
+        });
+        
+        // Show next 5 birthdays
+        var upcoming = sorted.slice(0, 5);
+        
+        if (upcoming.length === 0) {
+            list.innerHTML = '<div class="empty-state"><p>No birthdays found. Add birthdays to your contacts!</p></div>';
+            return;
+        }
+        
+        list.innerHTML = '';
+        upcoming.forEach(function(b) {
+            var item = document.createElement('div');
+            item.className = 'birthday-list-item';
+            
+            var avatar = document.createElement('div');
+            avatar.className = 'birthday-avatar';
+            avatar.textContent = getInitials(b.displayName);
+            item.appendChild(avatar);
+            
+            var details = document.createElement('div');
+            details.className = 'birthday-details';
+            
+            var name = document.createElement('div');
+            name.className = 'birthday-name';
+            name.textContent = b.displayName;
+            details.appendChild(name);
+            
+            var dateEl = document.createElement('div');
+            dateEl.className = 'birthday-date';
+            var bdayDate = new Date(today.getFullYear(), b.month - 1, b.day);
+            if (bdayDate < today) {
+                bdayDate.setFullYear(bdayDate.getFullYear() + 1);
+            }
+            var daysAway = daysUntil(b.month, b.day, currentMonth, currentDay);
+            if (daysAway === 0) {
+                dateEl.textContent = 'Today!';
+            } else if (daysAway === 1) {
+                dateEl.textContent = 'Tomorrow';
+            } else {
+                dateEl.textContent = bdayDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' (' + daysAway + ' days)';
+            }
+            details.appendChild(dateEl);
+            
+            item.appendChild(details);
+            
+            if (b.age !== null) {
+                var age = document.createElement('div');
+                age.className = 'birthday-age';
+                var nextAge = b.age;
+                if (bdayDate.getFullYear() > today.getFullYear() || 
+                    (bdayDate.getFullYear() === today.getFullYear() && (b.month > currentMonth || (b.month === currentMonth && b.day > currentDay)))) {
+                    nextAge = b.age + 1;
+                }
+                age.textContent = 'Turning ' + nextAge;
+                item.appendChild(age);
+            }
+            
+            item.addEventListener('click', function() {
+                showBirthdayModal(b, bdayDate.getFullYear());
+            });
+            
+            list.appendChild(item);
+        });
+    }
+    
+    function daysUntil(targetMonth, targetDay, currentMonth, currentDay) {
+        var today = new Date();
+        var target = new Date(today.getFullYear(), targetMonth - 1, targetDay);
+        if (target < today) {
+            target.setFullYear(target.getFullYear() + 1);
+        }
+        var diff = target - today;
+        return Math.floor(diff / (1000 * 60 * 60 * 24));
+    }
+    
+    // Initial render
+    renderCalendar();
+})();
+</script>
+{{end}}
+{{template "base" .}}
+

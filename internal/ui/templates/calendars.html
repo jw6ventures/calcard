@@ -1,0 +1,79 @@
+{{define "content"}}
+<h1>Calendars</h1>
+<p>Manage CalDAV collections and sharing.</p>
+<table>
+    <tr><th>Name</th><th>Owner</th><th>Created</th><th>Actions</th></tr>
+    {{range .CalendarViews}}
+    {{$cal := .Access}}
+    <tr>
+        <td>
+            <a href="/calendars/{{$cal.ID}}">{{$cal.Name}}</a>
+            {{if $cal.Shared}}<span class="badge">Shared</span>{{end}}
+        </td>
+        <td>{{if $cal.Shared}}{{$cal.OwnerEmail}}{{else}}You{{end}}</td>
+        <td>{{formatTime $cal.CreatedAt}}</td>
+        <td>
+            <a href="/calendars/{{$cal.ID}}" style="margin-right:0.5rem">View</a>
+            {{if not $cal.Shared}}
+            <form method="post" action="/calendars/{{$cal.ID}}" style="display:inline">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <input type="hidden" name="_method" value="PUT">
+                <input name="name" placeholder="Rename" required>
+                <button type="submit">Rename</button>
+            </form>
+            <form method="post" action="/calendars/{{$cal.ID}}" style="display:inline" onsubmit="return confirm('Delete calendar?')">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <input type="hidden" name="_method" value="DELETE">
+                <button type="submit">Delete</button>
+            </form>
+            {{else}}
+            <form method="post" action="/calendars/{{$cal.ID}}/shares/{{$.User.ID}}/delete" style="display:inline" onsubmit="return confirm('Leave this shared calendar?')">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <button type="submit">Leave</button>
+            </form>
+            {{end}}
+        </td>
+    </tr>
+    {{if not $cal.Shared}}
+    <tr>
+        <td colspan="4">
+            <strong>Share</strong>
+            <form method="post" action="/calendars/{{$cal.ID}}/shares" style="margin-top:0.5rem">
+                <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                <select name="user_id" required>
+                    <option value="">Select user</option>
+                    {{range .ShareCandidates}}
+                        <option value="{{.ID}}">{{.PrimaryEmail}}</option>
+                    {{end}}
+                </select>
+                <button type="submit">Share</button>
+            </form>
+            {{if .Shares}}
+            <div style="margin-top:0.5rem">
+                <em>Existing shares:</em>
+                {{range .Shares}}
+                    <div style="display:flex; align-items:center; gap:0.5rem; margin-top:0.25rem">
+                        <span>{{.User.PrimaryEmail}}</span>
+                        <form method="post" action="/calendars/{{$cal.ID}}/shares/{{.User.ID}}/delete" style="display:inline" onsubmit="return confirm('Remove access for {{.User.PrimaryEmail}}?')">
+                            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                            <button type="submit">Remove</button>
+                        </form>
+                    </div>
+                {{end}}
+            </div>
+            {{end}}
+        </td>
+    </tr>
+    {{end}}
+    {{else}}
+    <tr><td colspan="4">No calendars yet.</td></tr>
+    {{end}}
+</table>
+<form method="post" action="/calendars">
+    <h3>Create calendar</h3>
+    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+    <label>Name <input name="name" required></label>
+    <button type="submit">Create</button>
+</form>
+{{end}}
+{{template "base" .}}
