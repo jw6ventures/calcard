@@ -11,3 +11,5 @@ ENV APP_LISTEN_ADDR=":8080"
 EXPOSE 8080
 COPY --from=builder /app/calcard /calcard
 ENTRYPOINT ["/calcard"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/healthz || exit 1

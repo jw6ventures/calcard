@@ -3,7 +3,6 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"net/url"
@@ -263,63 +262,115 @@ func (h *Handler) ViewCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse pagination params
-	page, limit := h.parsePagination(r)
-	offset := (page - 1) * limit
+	// Initial load - no events, will be loaded via AJAX
+	data := h.withFlash(r, map[string]any{
+		"Title":    cal.Name + " - Calendar",
+		"User":     user,
+		"Calendar": cal,
+	})
+	h.render(w, "calendar_view.html", data)
+}
 
-	result, err := h.store.Events.ListForCalendarPaginated(r.Context(), id, limit, offset)
+// GetCalendarEventsJSON returns events for a specific month in JSON format.
+func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid calendar id", http.StatusBadRequest)
+		return
+	}
+
+	// Parse month and year from query params
+	year, _ := strconv.Atoi(r.URL.Query().Get("year"))
+	month, _ := strconv.Atoi(r.URL.Query().Get("month"))
+	if year == 0 || month < 1 || month > 12 {
+		now := time.Now()
+		year = now.Year()
+		month = int(now.Month())
+	}
+
+	user, _ := auth.UserFromContext(r.Context())
+	cal, err := h.store.Calendars.GetAccessible(r.Context(), id, user.ID)
+	if err != nil {
+		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		return
+	}
+	if cal == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Fetch all events for the calendar
+	allEvents, err := h.store.Events.ListForCalendar(r.Context(), id)
 	if err != nil {
 		http.Error(w, "failed to load events", http.StatusInternalServerError)
 		return
 	}
 
-	// Build view data with parsed fields
-	var eventData []map[string]any
-	var eventsJSONData []map[string]any
-	for _, ev := range result.Items {
-		summary := "Untitled Event"
-		if ev.Summary != nil {
-			summary = *ev.Summary
-		}
-		eventData = append(eventData, map[string]any{
-			"UID":          ev.UID,
-			"Summary":      summary,
-			"DTStart":      ev.DTStart,
-			"DTEnd":        ev.DTEnd,
-			"AllDay":       ev.AllDay,
-			"LastModified": ev.LastModified,
-			"RawICAL":      ev.RawICAL,
-		})
+	// Filter events relevant to the requested month
+	// Include: one-time events in this month, and recurring events that could have occurrences
+	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
 
+	var relevantEvents []store.Event
+	for _, ev := range allEvents {
+		// Check if this is a recurring event (has RRULE)
+		hasRRule := strings.Contains(ev.RawICAL, "RRULE:")
+
+		if hasRRule {
+			// For recurring events, include if they could have occurrences in this month
+			// Check if event starts before month ends
+			if ev.DTStart != nil && !ev.DTStart.After(monthEnd) {
+				// Check if event has UNTIL and it's before month starts
+				hasEnded := false
+				lines := utils.UnfoldLines(ev.RawICAL)
+				for _, line := range lines {
+					if strings.HasPrefix(line, "RRULE:") && strings.Contains(line, "UNTIL=") {
+						// Extract UNTIL date (simplified)
+						parts := strings.Split(line, "UNTIL=")
+						if len(parts) > 1 {
+							untilStr := strings.Split(parts[1], ";")[0]
+							untilStr = strings.Split(untilStr, "T")[0] // Get just the date part
+							if len(untilStr) >= 8 {
+								untilYear, _ := strconv.Atoi(untilStr[0:4])
+								untilMonth, _ := strconv.Atoi(untilStr[4:6])
+								untilDay, _ := strconv.Atoi(untilStr[6:8])
+								untilDate := time.Date(untilYear, time.Month(untilMonth), untilDay, 0, 0, 0, 0, time.UTC)
+								if untilDate.Before(monthStart) {
+									hasEnded = true
+								}
+							}
+						}
+					}
+				}
+				if !hasEnded {
+					relevantEvents = append(relevantEvents, ev)
+				}
+			}
+		} else {
+			// For one-time events, check if they fall in this month
+			if ev.DTStart != nil {
+				evStart := time.Date(ev.DTStart.Year(), ev.DTStart.Month(), ev.DTStart.Day(), 0, 0, 0, 0, time.UTC)
+				if !evStart.Before(monthStart) && !evStart.After(monthEnd) {
+					relevantEvents = append(relevantEvents, ev)
+				}
+			}
+		}
+	}
+
+	// Build JSON response
+	var eventsJSONData []map[string]any
+	for _, ev := range relevantEvents {
 		eventsJSONData = append(eventsJSONData, map[string]any{
 			"uid":     ev.UID,
 			"ical":    ev.RawICAL,
 			"lastMod": ev.LastModified.Format(time.RFC3339),
 		})
 	}
-	eventsJSON, err := json.Marshal(eventsJSONData)
-	if err != nil {
-		http.Error(w, "failed to render events", http.StatusInternalServerError)
-		return
-	}
 
-	totalPages := (result.TotalCount + limit - 1) / limit
-	data := h.withFlash(r, map[string]any{
-		"Title":      cal.Name + " - Calendar",
-		"User":       user,
-		"Calendar":   cal,
-		"Events":     eventData,
-		"EventsJSON": template.JS(eventsJSON),
-		"Page":       page,
-		"Limit":      limit,
-		"TotalCount": result.TotalCount,
-		"TotalPages": totalPages,
-		"HasPrev":    page > 1,
-		"HasNext":    page < totalPages,
-		"PrevPage":   page - 1,
-		"NextPage":   page + 1,
-	})
-	h.render(w, "calendar_view.html", data)
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(eventsJSONData); err != nil {
+		http.Error(w, "failed to encode events", http.StatusInternalServerError)
+	}
 }
 
 // ImportCalendar imports events from an ICS file into an existing calendar.

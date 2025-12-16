@@ -5,20 +5,23 @@
         justify-content: space-between;
         align-items: center;
         margin-bottom: 1.5rem;
+        flex-wrap: wrap;
+        gap: 1rem;
     }
     .addressbook-header h1 {
         margin: 0;
-        color: #1a1a2e;
+        color: var(--gray-900);
     }
     .back-link {
-        color: #4a5568;
+        color: var(--gray-600);
         text-decoration: none;
         display: inline-flex;
         align-items: center;
         gap: 0.25rem;
+        transition: color 0.2s;
     }
-    .back-link:hover { color: #2d3748; }
-    
+    .back-link:hover { color: var(--primary); }
+
     .search-box {
         margin-bottom: 1rem;
     }
@@ -26,18 +29,19 @@
         width: 100%;
         max-width: 400px;
         padding: 0.75rem 1rem;
-        border: 1px solid #e2e8f0;
-        border-radius: 8px;
+        border: 1px solid var(--gray-300);
+        border-radius: var(--border-radius);
         font-size: 1rem;
+        transition: all 0.2s;
     }
     .search-input:focus {
         outline: none;
-        border-color: #667eea;
-        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
     }
     
     .contact-count {
-        color: #718096;
+        color: var(--text-secondary);
         margin-bottom: 1rem;
         font-size: 0.875rem;
     }
@@ -49,8 +53,8 @@
     }
     
     .contact-card {
-        background: #fff;
-        border: 1px solid #e2e8f0;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
         border-radius: 12px;
         padding: 1.25rem;
         transition: box-shadow 0.2s, transform 0.2s;
@@ -71,7 +75,7 @@
         width: 48px;
         height: 48px;
         border-radius: 50%;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -92,11 +96,11 @@
     .contact-name {
         font-weight: 600;
         font-size: 1.1rem;
-        color: #1a202c;
+        color: var(--gray-900);
     }
     .contact-org {
         font-size: 0.875rem;
-        color: #718096;
+        color: var(--gray-600);
     }
     
     .contact-details {
@@ -109,22 +113,22 @@
         align-items: flex-start;
         gap: 0.5rem;
         font-size: 0.875rem;
-        color: #4a5568;
+        color: var(--text-secondary);
     }
     .contact-item-icon {
         flex-shrink: 0;
         width: 16px;
         text-align: center;
-        color: #718096;
+        color: var(--text-tertiary);
     }
     .contact-item a {
-        color: #667eea;
+        color: var(--primary);
         text-decoration: none;
     }
     .contact-item a:hover {
         text-decoration: underline;
     }
-    
+
     /* Contact Modal */
     .modal-overlay {
         display: none;
@@ -138,18 +142,35 @@
         justify-content: center;
         align-items: center;
         padding: 1rem;
+        animation: fadeIn 0.2s ease-out;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
     .modal-overlay.show {
         display: flex;
     }
     .modal-content {
-        background: #fff;
-        border-radius: 16px;
+        background: var(--bg-secondary);
+        border-radius: var(--border-radius-lg);
         padding: 2rem;
         max-width: 500px;
         width: 100%;
         max-height: 80vh;
         overflow-y: auto;
+        box-shadow: var(--shadow-xl);
+        animation: slideUp 0.3s ease-out;
+    }
+    @keyframes slideUp {
+        from {
+            opacity: 0;
+            transform: translateY(20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
     }
     .modal-header {
         display: flex;
@@ -161,7 +182,7 @@
         width: 80px;
         height: 80px;
         border-radius: 50%;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -184,19 +205,20 @@
         border: none;
         font-size: 1.5rem;
         cursor: pointer;
-        color: #718096;
+        color: var(--gray-500);
         line-height: 1;
         padding: 0.5rem;
+        transition: color 0.2s;
     }
-    .modal-close:hover { color: #2d3748; }
+    .modal-close:hover { color: var(--gray-800); }
     .modal-name {
         font-size: 1.5rem;
         font-weight: 600;
-        color: #1a202c;
+        color: var(--text-primary);
         margin-bottom: 0.25rem;
     }
     .modal-org {
-        color: #718096;
+        color: var(--text-secondary);
         margin-bottom: 1rem;
     }
     .modal-section {
@@ -206,7 +228,7 @@
         font-weight: 600;
         font-size: 0.75rem;
         text-transform: uppercase;
-        color: #a0aec0;
+        color: var(--gray-500);
         margin-bottom: 0.5rem;
     }
     .modal-item {
@@ -214,21 +236,21 @@
         align-items: flex-start;
         gap: 0.75rem;
         padding: 0.5rem 0;
-        border-bottom: 1px solid #f0f0f0;
+        border-bottom: 1px solid var(--border-primary);
     }
     .modal-item:last-child {
         border-bottom: none;
     }
     .modal-item-label {
         font-size: 0.75rem;
-        color: #a0aec0;
+        color: var(--gray-500);
         min-width: 60px;
     }
     .modal-item-value {
-        color: #2d3748;
+        color: var(--text-primary);
     }
     .modal-item-value a {
-        color: #667eea;
+        color: var(--primary);
         text-decoration: none;
     }
     .modal-item-value a:hover {
@@ -238,48 +260,14 @@
     .empty-state {
         text-align: center;
         padding: 3rem;
-        color: #718096;
+        color: var(--text-secondary);
     }
     .empty-state h3 {
         margin-bottom: 0.5rem;
-        color: #4a5568;
+        color: var(--text-secondary);
     }
     
-    /* Buttons */
-    .btn {
-        padding: 0.5rem 1rem;
-        border-radius: 6px;
-        font-size: 0.875rem;
-        cursor: pointer;
-        border: none;
-        text-decoration: none;
-        display: inline-flex;
-        align-items: center;
-        gap: 0.25rem;
-    }
-    .btn-primary {
-        background: #667eea;
-        color: #fff;
-    }
-    .btn-primary:hover {
-        background: #5a67d8;
-    }
-    .btn-secondary {
-        background: #e2e8f0;
-        color: #4a5568;
-    }
-    .btn-secondary:hover {
-        background: #cbd5e0;
-    }
-    .btn-danger {
-        background: #e53e3e;
-        color: #fff;
-    }
-    .btn-danger:hover {
-        background: #c53030;
-    }
-    
-    /* Form styles */
+    /* Addressbook-specific button and form overrides - base.html handles most styling */
     .form-group {
         margin-bottom: 1rem;
     }
@@ -288,21 +276,7 @@
         font-weight: 600;
         margin-bottom: 0.25rem;
         font-size: 0.875rem;
-        color: #4a5568;
-    }
-    .form-group input,
-    .form-group textarea {
-        width: 100%;
-        padding: 0.5rem 0.75rem;
-        border: 1px solid #e2e8f0;
-        border-radius: 6px;
-        font-size: 0.875rem;
-    }
-    .form-group input:focus,
-    .form-group textarea:focus {
-        outline: none;
-        border-color: #667eea;
-        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        color: var(--gray-700);
     }
     .form-row {
         display: grid;
@@ -315,7 +289,7 @@
         justify-content: flex-end;
         margin-top: 1.5rem;
         padding-top: 1rem;
-        border-top: 1px solid #e2e8f0;
+        border-top: 1px solid var(--border-primary);
     }
     
     /* Contact actions in modal */
@@ -324,7 +298,7 @@
         gap: 0.5rem;
         margin-top: 1rem;
         padding-top: 1rem;
-        border-top: 1px solid #e2e8f0;
+        border-top: 1px solid var(--border-primary);
     }
 </style>
 
@@ -1286,16 +1260,16 @@ document.getElementById('import-modal').addEventListener('click', function(e) {
 <style>
     .pagination-btn {
         padding: 0.5rem 1rem;
-        border: 1px solid #e2e8f0;
+        border: 1px solid var(--border-primary);
         border-radius: 6px;
         text-decoration: none;
-        color: #4a5568;
-        background: #fff;
+        color: var(--gray-600);
+        background: var(--bg-secondary);
         font-size: 0.875rem;
     }
     .pagination-btn:hover {
-        background: #f7fafc;
-        border-color: #cbd5e0;
+        background: var(--bg-tertiary);
+        border-color: var(--border-secondary);
     }
 </style>
 {{end}}

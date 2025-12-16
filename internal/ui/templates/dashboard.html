@@ -7,17 +7,17 @@
         margin-top: 1.5rem;
     }
     .dashboard-card {
-        background: #fff;
-        border: 1px solid #e2e8f0;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
         border-radius: 12px;
         padding: 1.25rem;
     }
     .dashboard-card h2 {
         font-size: 1rem;
-        color: #4a5568;
+        color: var(--gray-700);
         margin: 0 0 1rem 0;
         padding-bottom: 0.75rem;
-        border-bottom: 1px solid #e2e8f0;
+        border-bottom: 1px solid var(--border-primary);
     }
     .stats-list {
         list-style: none;
@@ -34,11 +34,11 @@
         border-bottom: none;
     }
     .stats-list a {
-        color: #2d3748;
+        color: var(--text-primary);
         text-decoration: none;
     }
     .stats-list a:hover {
-        color: #667eea;
+        color: var(--primary);
     }
     
     .recent-list {
@@ -50,14 +50,14 @@
         display: flex;
         gap: 0.75rem;
         padding: 0.75rem;
-        background: #f7fafc;
+        background: var(--bg-tertiary);
         border-radius: 8px;
         text-decoration: none;
         color: inherit;
         transition: background 0.15s;
     }
     .recent-item:hover {
-        background: #edf2f7;
+        background: var(--gray-100);
     }
     .recent-icon {
         width: 40px;
@@ -83,20 +83,20 @@
     }
     .recent-title {
         font-weight: 600;
-        color: #1a202c;
+        color: var(--text-primary);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
     .recent-meta {
         font-size: 0.8rem;
-        color: #718096;
+        color: var(--text-secondary);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
     .empty-recent {
-        color: #a0aec0;
+        color: var(--gray-500);
         font-size: 0.875rem;
         text-align: center;
         padding: 1rem;

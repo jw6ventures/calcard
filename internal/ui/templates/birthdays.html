@@ -8,16 +8,16 @@
     }
     .birthdays-header h1 {
         margin: 0;
-        color: #1a1a2e;
+        color: var(--text-primary);
     }
     .back-link {
-        color: #4a5568;
+        color: var(--text-secondary);
         text-decoration: none;
         display: inline-flex;
         align-items: center;
         gap: 0.25rem;
     }
-    .back-link:hover { color: #2d3748; }
+    .back-link:hover { color: var(--text-primary); }
     
     .birthdays-info {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -40,12 +40,13 @@
     }
     .month-nav button {
         background: none;
-        border: 1px solid #cbd5e0;
+        border: 1px solid var(--border-secondary);
         padding: 0.25rem 0.75rem;
         cursor: pointer;
         border-radius: 4px;
+        color: var(--text-primary);
     }
-    .month-nav button:hover { background: #f7fafc; }
+    .month-nav button:hover { background: var(--bg-tertiary); }
     .month-title {
         font-size: 1.25rem;
         font-weight: 600;
@@ -57,40 +58,44 @@
         display: grid;
         grid-template-columns: repeat(7, 1fr);
         gap: 1px;
-        background: #e2e8f0;
-        border: 1px solid #e2e8f0;
+        background: var(--border-primary);
+        border: 1px solid var(--border-primary);
         border-radius: 8px;
         overflow: hidden;
     }
     .calendar-grid .day-header {
-        background: #f7fafc;
+        background: var(--bg-tertiary);
         padding: 0.5rem;
         text-align: center;
         font-weight: 600;
         font-size: 0.75rem;
-        color: #4a5568;
+        color: var(--text-secondary);
         text-transform: uppercase;
     }
     .calendar-grid .day-cell {
-        background: #fff;
+        background: var(--bg-secondary);
         min-height: 100px;
         padding: 0.25rem;
         position: relative;
     }
     .calendar-grid .day-cell.other-month {
-        background: #f7fafc;
+        background: var(--bg-tertiary);
     }
     .calendar-grid .day-cell.today {
-        background: #ebf8ff;
+        background: rgba(59, 130, 246, 0.15);
+    }
+    .calendar-grid .day-cell.today .day-number {
+        color: var(--primary);
+        font-weight: 600;
     }
     .day-number {
         font-size: 0.875rem;
         font-weight: 500;
-        color: #2d3748;
+        color: var(--text-primary);
         margin-bottom: 0.25rem;
     }
     .day-cell.other-month .day-number {
-        color: #a0aec0;
+        color: var(--gray-500);
     }
     .day-events {
         display: flex;
@@ -138,7 +143,7 @@
         display: flex;
     }
     .modal-content {
-        background: #fff;
+        background: var(--bg-secondary);
         border-radius: 12px;
         padding: 1.5rem;
         max-width: 400px;
@@ -155,26 +160,26 @@
     .modal-title {
         font-size: 1.25rem;
         font-weight: 600;
-        color: #1a202c;
+        color: var(--text-primary);
     }
     .modal-close {
         background: none;
         border: none;
         font-size: 1.5rem;
         cursor: pointer;
-        color: #718096;
+        color: var(--text-secondary);
         line-height: 1;
     }
-    .modal-close:hover { color: #2d3748; }
+    .modal-close:hover { color: var(--text-primary); }
     .modal-body {
         font-size: 0.9rem;
-        color: #4a5568;
+        color: var(--text-secondary);
     }
     .modal-body p {
         margin: 0.5rem 0;
     }
     .modal-body strong {
-        color: #2d3748;
+        color: var(--text-primary);
     }
     
     .birthday-icon {
@@ -187,7 +192,7 @@
     }
     .birthday-list-title {
         font-weight: 600;
-        color: #4a5568;
+        color: var(--text-primary);
         margin-bottom: 0.75rem;
     }
     .birthday-list-item {
@@ -195,12 +200,12 @@
         align-items: center;
         gap: 0.75rem;
         padding: 0.75rem;
-        background: #f7fafc;
+        background: var(--bg-tertiary);
         border-radius: 8px;
         margin-bottom: 0.5rem;
     }
     .birthday-list-item:hover {
-        background: #edf2f7;
+        background: var(--gray-100);
     }
     .birthday-avatar {
         width: 40px;
@@ -219,28 +224,28 @@
     }
     .birthday-name {
         font-weight: 600;
-        color: #2d3748;
+        color: var(--text-primary);
     }
     .birthday-date {
         font-size: 0.875rem;
-        color: #718096;
+        color: var(--text-secondary);
     }
     .birthday-age {
         font-size: 0.75rem;
-        background: #edf2f7;
+        background: var(--bg-tertiary);
         padding: 0.25rem 0.5rem;
         border-radius: 4px;
-        color: #4a5568;
+        color: var(--text-secondary);
     }
     
     .empty-state {
         text-align: center;
         padding: 3rem;
-        color: #718096;
+        color: var(--text-secondary);
     }
     .empty-state h3 {
         margin-bottom: 0.5rem;
-        color: #4a5568;
+        color: var(--text-secondary);
     }
 </style>
 

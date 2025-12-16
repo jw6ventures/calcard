@@ -1,116 +1,151 @@
 {{define "content"}}
 <style>
-    .sessions-header {
+    .page-header {
         display: flex;
         justify-content: space-between;
-        align-items: center;
-        margin-bottom: 1.5rem;
+        align-items: start;
+        margin-bottom: 2rem;
+        flex-wrap: wrap;
+        gap: 1rem;
     }
-    .sessions-header h1 {
+
+    .header-content h1 {
+        margin: 0 0 0.5rem 0;
+    }
+
+    .header-content p {
+        color: var(--gray-600);
         margin: 0;
     }
+
     .sessions-list {
         display: flex;
         flex-direction: column;
         gap: 1rem;
     }
+
     .session-card {
-        background: #fff;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 1.25rem;
+        background: var(--bg-secondary);
+        border: 2px solid var(--gray-200);
+        border-radius: var(--border-radius-lg);
+        padding: 1.5rem;
         display: flex;
         justify-content: space-between;
-        align-items: center;
+        align-items: start;
+        gap: 1rem;
+        box-shadow: var(--shadow);
+        transition: all 0.2s;
     }
+
+    .session-card:hover {
+        box-shadow: var(--shadow-md);
+    }
+
     .session-card.current {
-        border-color: #667eea;
-        background: #f7fafc;
+        border-color: var(--primary);
+        background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(99, 102, 241, 0.02) 100%);
     }
+
     .session-info {
         flex: 1;
     }
+
     .session-info h3 {
-        margin: 0 0 0.5rem 0;
-        font-size: 1rem;
-        color: #1a202c;
+        margin: 0 0 0.75rem 0;
+        font-size: 1.1rem;
+        color: var(--gray-900);
         display: flex;
         align-items: center;
         gap: 0.5rem;
+        flex-wrap: wrap;
     }
-    .session-info h3 .badge {
+
+    .device-icon {
+        font-size: 1.25rem;
+    }
+
+    .session-meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 0.75rem;
+        font-size: 0.875rem;
+    }
+
+    .meta-item {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+
+    .meta-label {
+        color: var(--gray-500);
         font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-weight: 600;
+    }
+
+    .meta-value {
+        color: var(--gray-800);
         font-weight: 500;
     }
-    .session-meta {
-        font-size: 0.875rem;
-        color: #718096;
-    }
-    .session-meta span {
-        margin-right: 1rem;
-    }
+
     .session-actions {
         display: flex;
         gap: 0.5rem;
+        flex-shrink: 0;
     }
-    .btn-revoke {
-        background: #e53e3e;
-        color: #fff;
-        border: none;
-        padding: 0.5rem 1rem;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 0.875rem;
-    }
-    .btn-revoke:hover {
-        background: #c53030;
-    }
-    .btn-revoke:disabled {
-        background: #a0aec0;
-        cursor: not-allowed;
-    }
-    .btn-secondary {
-        background: #edf2f7;
-        color: #4a5568;
-        border: none;
-        padding: 0.5rem 1rem;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 0.875rem;
-    }
-    .btn-secondary:hover {
-        background: #e2e8f0;
-    }
+
     .empty-state {
-        text-align: center;
+        background: var(--bg-secondary);
+        border-radius: var(--border-radius-lg);
+        box-shadow: var(--shadow);
         padding: 3rem;
-        color: #718096;
+        text-align: center;
     }
-    .flash-message {
-        padding: 1rem;
+
+    .empty-state-icon {
+        font-size: 3rem;
         margin-bottom: 1rem;
-        border-radius: 8px;
-        background: #c6f6d5;
-        color: #22543d;
+    }
+
+    .empty-state h3 {
+        color: var(--gray-600);
+        margin-bottom: 0.5rem;
+    }
+
+    .empty-state p {
+        color: var(--gray-500);
+    }
+
+    @media (max-width: 768px) {
+        .session-card {
+            flex-direction: column;
+        }
+
+        .session-actions {
+            width: 100%;
+        }
+
+        .session-actions form,
+        .session-actions button {
+            flex: 1;
+        }
     }
 </style>
 
-<div class="sessions-header">
-    <h1>Active Sessions</h1>
+<div class="page-header">
+    <div class="header-content">
+        <h1>🔐 Active Sessions</h1>
+        <p>Manage your logged-in devices and security</p>
+    </div>
     {{if gt (len .Sessions) 1}}
-    <form method="POST" action="/sessions/revoke-all" style="display: inline;">
+    <form method="POST" action="/sessions/revoke-all">
         <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-        <button type="submit" class="btn-secondary" onclick="return confirm('Revoke all other sessions?')">Revoke All Others</button>
+        <button type="submit" class="btn-danger" onclick="return confirm('Revoke all other sessions? You will remain logged in on this device.')">🚫 Revoke All Others</button>
     </form>
     {{end}}
 </div>
-
-{{if .FlashMessage}}
-<div class="flash-message">
-    {{if eq .FlashMessage "revoked"}}Session revoked successfully.{{end}}
-    {{if eq .FlashMessage "all_revoked"}}All other sessions revoked.{{end}}
-</div>
-{{end}}
 
 {{if .Sessions}}
 <div class="sessions-list">
@@ -118,24 +153,39 @@
     <div class="session-card {{if .IsCurrent}}current{{end}}">
         <div class="session-info">
             <h3>
+                <span class="device-icon">{{if .IsCurrent}}💻{{else}}📱{{end}}</span>
                 {{if .UserAgent}}{{truncate .UserAgent 60}}{{else}}Unknown Device{{end}}
-                {{if .IsCurrent}}<span class="badge">Current Session</span>{{end}}
+                {{if .IsCurrent}}<span class="badge badge-primary">Current Session</span>{{end}}
             </h3>
             <div class="session-meta">
-                {{if .IPAddress}}<span>IP: {{.IPAddress}}</span>{{end}}
-                <span>Created: {{formatDateTime .CreatedAt}}</span>
-                <span>Last seen: {{relativeTime .LastSeenAt}}</span>
-                <span>Expires: {{formatDateTime .ExpiresAt}}</span>
+                {{if .IPAddress}}
+                <div class="meta-item">
+                    <div class="meta-label">IP Address</div>
+                    <div class="meta-value">{{.IPAddress}}</div>
+                </div>
+                {{end}}
+                <div class="meta-item">
+                    <div class="meta-label">Created</div>
+                    <div class="meta-value">{{formatDateTime .CreatedAt}}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-label">Last Seen</div>
+                    <div class="meta-value">{{relativeTime .LastSeenAt}}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-label">Expires</div>
+                    <div class="meta-value">{{formatDateTime .ExpiresAt}}</div>
+                </div>
             </div>
         </div>
         <div class="session-actions">
             {{if not .IsCurrent}}
             <form method="POST" action="/sessions/{{.ID}}/revoke">
                 <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                <button type="submit" class="btn-revoke">Revoke</button>
+                <button type="submit" class="btn-danger">Revoke</button>
             </form>
             {{else}}
-            <button class="btn-revoke" disabled title="Cannot revoke current session">Current</button>
+            <button class="btn-secondary" disabled title="Cannot revoke current session">Current</button>
             {{end}}
         </div>
     </div>
@@ -143,7 +193,9 @@
 </div>
 {{else}}
 <div class="empty-state">
-    <p>No active sessions found.</p>
+    <div class="empty-state-icon">🔐</div>
+    <h3>No active sessions</h3>
+    <p>You don't have any active sessions</p>
 </div>
 {{end}}
 {{end}}

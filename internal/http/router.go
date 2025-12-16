@@ -101,6 +101,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Get("/", uiHandler.Dashboard)
 		r.Get("/calendars", uiHandler.Calendars)
 		r.Get("/calendars/{id}", uiHandler.ViewCalendar)
+		r.Get("/api/calendars/{id}/events", uiHandler.GetCalendarEventsJSON)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
 		r.Get("/addressbooks/{id}", uiHandler.ViewAddressBook)
 		r.Get("/app-passwords", uiHandler.AppPasswords)
