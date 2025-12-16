@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"gitea.jw6.us/james/calcard/internal/auth"
 	"gitea.jw6.us/james/calcard/internal/config"
 	"gitea.jw6.us/james/calcard/internal/store"
-	"gitea.jw6.us/james/calcard/internal/auth"
 )
 
 func TestParseResourcePathAcceptsAbsoluteHref(t *testing.T) {
@@ -187,10 +187,10 @@ func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 func TestResolveDAVHrefHandlesRelativeAbsoluteAndURL(t *testing.T) {
 	base := "/dav/calendars/2/"
 	cases := map[string]string{
-		"event.ics":                                     "/dav/calendars/2/event.ics",
-		"/dav/calendars/2/absolute.ics":                 "/dav/calendars/2/absolute.ics",
-		"https://example.com/dav/calendars/2/full.ics":  "/dav/calendars/2/full.ics",
-		"http://example.com/dav/calendars/2/full.ics":   "/dav/calendars/2/full.ics",
+		"event.ics":                                    "/dav/calendars/2/event.ics",
+		"/dav/calendars/2/absolute.ics":                "/dav/calendars/2/absolute.ics",
+		"https://example.com/dav/calendars/2/full.ics": "/dav/calendars/2/full.ics",
+		"http://example.com/dav/calendars/2/full.ics":  "/dav/calendars/2/full.ics",
 	}
 	for raw, want := range cases {
 		if got := resolveDAVHref(base, raw); got != want {
@@ -738,14 +738,15 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader("ICALDATA"))
+	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader(validIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
 	h.Put(rr, req)
 
 	if rr.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d", rr.Code)
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
 	}
 	if rr.Header().Get("ETag") == "" {
 		t.Fatal("expected ETag header")
@@ -786,14 +787,15 @@ func TestPutCreatesContact(t *testing.T) {
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader("VCARD"))
+	validVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
 	h.Put(rr, req)
 
 	if rr.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d", rr.Code)
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
 	}
 	if rr.Header().Get("ETag") == "" {
 		t.Fatal("expected ETag header")
@@ -1001,13 +1003,47 @@ func TestHeadDelegatesToGet(t *testing.T) {
 	}
 }
 
-func TestProppatchNoContent(t *testing.T) {
+func TestProppatchRequiresAuth(t *testing.T) {
 	h := &Handler{}
 	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/1", nil)
 	rr := httptest.NewRecorder()
 	h.Proppatch(rr, req)
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestProppatchCalendarUpdatesProperties(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Old Name"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set>
+    <D:prop>
+      <D:displayname>New Name</D:displayname>
+      <C:calendar-description>Test description</C:calendar-description>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/2", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "200 OK") {
+		t.Errorf("expected success status in response, got %s", respBody)
 	}
 }
 
@@ -1119,18 +1155,19 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "old"},
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "old"},
 		},
 	}
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader("NEW"))
+	newIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(newIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
 	h.Put(rr, req)
 
 	if rr.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", rr.Code)
+		t.Fatalf("expected 204, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1438,16 +1475,17 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 	}
 	contactRepo := &fakeContactRepo{
 		contacts: map[string]*store.Contact{
-			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "OLD", ETag: "e"},
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n", ETag: "e"},
 		},
 	}
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
-	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader("NEW"))
+	newVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice Updated\r\nEMAIL:alice@example.com\r\nEND:VCARD\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
 	if rr.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", rr.Code)
+		t.Fatalf("expected 204, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1546,7 +1584,6 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 		t.Fatal("expected error from repo")
 	}
 }
-
 
 type fakeEventRepo struct {
 	events map[string]*store.Event
@@ -1956,5 +1993,632 @@ func TestReportRequestParsesDifferentNamespacePrefixes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Tests for calendar-query filtering (High Priority Feature #1)
+func TestCalendarQueryWithCompFilter(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
+			"1:todo1":  {CalendarID: 1, UID: "todo1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:todo1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n", ETag: "t1"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	// Filter for VEVENT only
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT"/>
+		</cal:filter>
+	</cal:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "event1.ics") {
+		t.Errorf("expected event1 in response, got %s", respBody)
+	}
+	if strings.Contains(respBody, "todo1.ics") {
+		t.Errorf("should not include todo1 (filtered out), got %s", respBody)
+	}
+}
+
+func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	// Query for events in June 2024 - filter should apply to VEVENT component
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "in-range.ics") {
+		t.Errorf("expected in-range event, got %s", respBody)
+	}
+	if strings.Contains(respBody, "out-range.ics") {
+		t.Errorf("should not include out-range event, got %s", respBody)
+	}
+}
+
+// Tests for supported-calendar-component-set (High Priority Feature #2)
+func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "<cal:supported-calendar-component-set>") {
+		t.Errorf("missing supported-calendar-component-set: %s", body)
+	}
+	if !strings.Contains(body, `<cal:comp name="VEVENT"`) {
+		t.Errorf("missing VEVENT component: %s", body)
+	}
+	if !strings.Contains(body, `<cal:comp name="VTODO"`) {
+		t.Errorf("missing VTODO component: %s", body)
+	}
+}
+
+// Tests for If-Match/If-None-Match (High Priority Feature #3)
+func TestPutWithIfMatchSuccess(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", `"old-etag"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", rr.Code)
+	}
+}
+
+func TestPutWithIfMatchFailure(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", `"wrong-etag"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Errorf("expected 412, got %d", rr.Code)
+	}
+}
+
+func TestPutWithIfNoneMatchStar(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader(icalData))
+	req.Header.Set("If-None-Match", "*")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201, got %d", rr.Code)
+	}
+}
+
+func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req.Header.Set("If-None-Match", "*")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Errorf("expected 412, got %d", rr.Code)
+	}
+}
+
+func TestDeleteWithIfMatchSuccess(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+	req.Header.Set("If-Match", `"current"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", rr.Code)
+	}
+}
+
+func TestDeleteWithIfMatchFailure(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+	req.Header.Set("If-Match", `"wrong"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Errorf("expected 412, got %d", rr.Code)
+	}
+}
+
+// Tests for iCalendar validation (High Priority Feature #4)
+func TestPutRejectsInvalidICalendar(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{"missing BEGIN:VCALENDAR", "BEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{"missing END:VCALENDAR", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{"no component", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"},
+		{"unbalanced tags", "BEGIN:VCALENDAR\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(tt.data))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Put(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for invalid iCalendar, got %d", rr.Code)
+			}
+			if !strings.Contains(rr.Body.String(), "invalid iCalendar") {
+				t.Errorf("expected error message about invalid iCalendar, got %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestPutAcceptsValidICalendar(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+
+	validData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/test.ics", strings.NewReader(validData))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201 for valid iCalendar, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutRejectsInvalidVCard(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+
+	invalidData := "NOT A VCARD"
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(invalidData))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid vCard, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "invalid vCard") {
+		t.Errorf("expected error message about invalid vCard, got %s", rr.Body.String())
+	}
+}
+
+func TestPutAcceptsValidVCard(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+
+	validData := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validData))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201 for valid vCard, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestParseICalDateTime(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantErr  bool
+		wantYear int
+	}{
+		{"20240601T100000Z", false, 2024},
+		{"20240601T100000", false, 2024},
+		{"2024-06-01T10:00:00Z", false, 2024},
+		{"2024-06-01T10:00:00", false, 2024},
+		{"invalid", true, 0},
+		{"", true, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result, err := parseICalDateTime(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q", tt.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for %q: %v", tt.input, err)
+				}
+				if result.Year() != tt.wantYear {
+					t.Errorf("expected year %d, got %d", tt.wantYear, result.Year())
+				}
+			}
+		})
+	}
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
+}
+
+// Tests for new medium priority features
+
+func TestFreeBusyQueryReport(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "VFREEBUSY") {
+		t.Errorf("expected VFREEBUSY in response, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "FREEBUSY:") {
+		t.Errorf("expected FREEBUSY property in response, got %s", respBody)
+	}
+}
+
+func TestPropfindParsesRequestBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	// Send a propfind with specific properties requested
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:displayname/>
+    <D:resourcetype/>
+  </D:prop>
+</D:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// Response should contain displayname and resourcetype
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "displayname") {
+		t.Errorf("expected displayname in response, got %s", respBody)
+	}
+}
+
+func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Old Name"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Updated Name</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/5", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "200 OK") {
+		t.Errorf("expected success status in response, got %s", respBody)
+	}
+}
+
+func TestCalendarPropertiesIncludeLimits(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+
+	// Check for required calendar properties
+	expectedProps := []string{
+		"<cal:max-resource-size>",
+		"<cal:min-date-time>",
+		"<cal:max-date-time>",
+		"<cal:max-instances>",
+		"<cal:max-attendees-per-instance>",
+	}
+
+	for _, prop := range expectedProps {
+		if !strings.Contains(body, prop) {
+			t.Errorf("missing required property %s in response: %s", prop, body)
+		}
+	}
+}
+
+func TestProppatchRejectsForbidden(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Not Mine"}, Editor: false},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:">
+  <D:set>
+    <D:prop>
+      <D:displayname>Hacked</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/2", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "403 Forbidden") {
+		t.Errorf("expected 403 Forbidden for non-editor, got %s", respBody)
+	}
+}
+
+func TestFreeBusyIncludesDateRange(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "ICAL", ETag: "e1", DTStart: &start, DTEnd: &end},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "DTSTART:20240601T000000Z") {
+		t.Errorf("expected DTSTART in freebusy, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
+		t.Errorf("expected DTEND in freebusy, got %s", respBody)
 	}
 }

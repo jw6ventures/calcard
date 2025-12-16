@@ -1,18 +1,26 @@
 # CalCard
-CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a minimal HTML UI, and an OAuth-centric authentication model with app passwords for DAV clients.
+CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a minimal HTML UI, and requires OAuth authentication with app passwords for DAV clients.
 
 ## Installing
-I am publishing a docker image publically at registry.jw6.us/public/calcard:beta
+### Docker (Recommended)
+I am publishing the following docker images publically:
+| Image                                 	| Branch     	| Notes                       	|
+|---------------------------------------	|------------	|-----------------------------	|
+| registry.jw6.us/public/calcard:latest 	| main       	| Automatic build after merge 	|
+| registry.jw6.us/public/calcard:beta   	| develop    	| Automatic build after merge 	|
+| registry.jw6.us/public/calcard:v1.0.0 	| tag/v1.0.0 	|                             	|
+
+### Linux Installs
+In the future I will publish a linux binary
 
 ## Features
-- WebDAV foundation with CalDAV and CardDAV hooks.
+- CalDAV and CardDAV server.
 - OAuth-only web UI sessions plus per-user app passwords for DAV Basic Auth.
 - PostgreSQL schema and repository layer for users, calendars, address books, events, contacts, and app passwords.
 - Minimal server-rendered HTML pages for dashboard, calendars, address books, and app password management.
-- Docker-friendly entrypoint via `cmd/server`.
 
 ## Configuration
-Environment variables (prefix `APP_`):
+Environment variables:
 - `APP_LISTEN_ADDR` (default `:8080`)
 - `APP_BASE_URL` (e.g., `https://dav.example.com`)
 - `APP_DB_DSN` (PostgreSQL DSN)
