@@ -27,6 +27,9 @@ type Handler struct {
 
 var errInvalidSyncToken = errors.New("invalid sync token")
 
+// maxDAVBodyBytes is the maximum body size for DAV requests. Preventing DOS attacks.
+const maxDAVBodyBytes int64 = 10 * 1024 * 1024
+
 func NewHandler(cfg *config.Config, store *store.Store) *Handler {
 	return &Handler{cfg: cfg, store: store}
 }
@@ -205,9 +208,19 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
-	body, err := io.ReadAll(r.Body)
+	if r.ContentLength > maxDAVBodyBytes {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+		}
 		return
 	}
 	etag := fmt.Sprintf("%x", sha256.Sum256(body))
@@ -323,9 +336,19 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 
 	cleanPath := path.Clean(r.URL.Path)
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	body, err := io.ReadAll(r.Body)
+	if r.ContentLength > maxDAVBodyBytes {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+		}
 		return
 	}
 	var report reportRequest
@@ -445,7 +468,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		href := ensureCollectionHref(cleanPath)
 		principalHref := h.principalURL(user)
 		res := []response{rootCollectionResponse(href, user, principalHref)}
-		if depth == "1" || depth == "0" {
+		if depth == "1" {
 			res = append(res,
 				collectionResponse(ensureCollectionHref("/dav/calendars"), "Calendars"),
 				collectionResponse(ensureCollectionHref("/dav/addressbooks"), "Address Books"),
@@ -469,7 +492,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/calendars")
 		res := []response{collectionResponse(base, "Calendars")}
-		if depth == "1" || depth == "0" {
+		if depth == "1" {
 			cals, err := h.store.Calendars.ListAccessible(ctx, user.ID)
 			if err != nil {
 				return nil, err
@@ -515,7 +538,7 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/addressbooks")
 		res := []response{collectionResponse(base, "Address Books")}
-		if depth == "1" || depth == "0" {
+		if depth == "1" {
 			books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
 			if err != nil {
 				return nil, err
@@ -927,7 +950,7 @@ func (h *Handler) principalResponses(cleanPath, depth string, user *store.User, 
 	// Only the authenticated user's principal is exposed.
 	if relPath == "" {
 		res := []response{collectionResponse(ensureCollectionHref("/dav/principals"), "Principals")}
-		if depth == "1" || depth == "0" {
+		if depth == "1" {
 			res = append(res, principalResponse(principalHref, user))
 		}
 		return res, nil

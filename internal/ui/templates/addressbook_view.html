@@ -333,7 +333,10 @@
         <a href="/addressbooks" class="back-link">&larr; Back to Address Books</a>
         <h1>{{.AddressBook.Name}}</h1>
     </div>
-    <button class="btn btn-primary" onclick="showCreateContactModal()">+ New Contact</button>
+    <div style="display: flex; gap: 0.5rem;">
+        <button class="btn btn-secondary" onclick="showImportModal()">Import VCF</button>
+        <button class="btn btn-primary" onclick="showCreateContactModal()">+ New Contact</button>
+    </div>
 </div>
 
 <div class="search-box">
@@ -415,6 +418,30 @@
             <div class="form-actions">
                 <button type="button" class="btn btn-secondary" onclick="closeCreateContactModal()">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create Contact</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Import VCF Modal -->
+<div class="modal-overlay" id="import-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-name" style="font-size: 1.25rem; font-weight: 600;">Import VCF File</span>
+            <button class="modal-close" onclick="closeImportModal()">&times;</button>
+        </div>
+        <form method="POST" action="/addressbooks/{{.AddressBook.ID}}/import" enctype="multipart/form-data">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div class="form-group">
+                <label for="import-file">VCF File</label>
+                <input type="file" id="import-file" name="file" accept=".vcf,.vcard" required style="padding: 0.5rem;">
+                <p style="margin-top: 0.5rem; font-size: 0.875rem; color: #718096;">
+                    Upload a .vcf or .vcard file to import contacts into this address book.
+                </p>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeImportModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Import</button>
             </div>
         </form>
     </div>
@@ -1224,12 +1251,25 @@ function formatDateForInput(date) {
     return year + '-' + month + '-' + day;
 }
 
+// Import modal
+function showImportModal() {
+    document.getElementById('import-modal').classList.add('show');
+}
+
+function closeImportModal() {
+    document.getElementById('import-modal').classList.remove('show');
+    document.getElementById('import-file').value = '';
+}
+
 // Close modals when clicking outside
 document.getElementById('create-contact-modal').addEventListener('click', function(e) {
     if (e.target === this) closeCreateContactModal();
 });
 document.getElementById('edit-contact-modal').addEventListener('click', function(e) {
     if (e.target === this) closeEditContactModal();
+});
+document.getElementById('import-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeImportModal();
 });
 </script>
 

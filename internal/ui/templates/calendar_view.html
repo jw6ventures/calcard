@@ -405,6 +405,9 @@
     </div>
     <div style="display:flex; gap:0.5rem; align-items:center;">
         <button class="btn btn-primary" onclick="showCreateEventModal()">+ New Event</button>
+        {{if .Calendar.Editor}}
+        <button class="btn btn-secondary" onclick="showImportModal()">Import ICS</button>
+        {{end}}
         {{if .Calendar.Shared}}
         <form method="post" action="/calendars/{{.Calendar.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Leave this shared calendar?')">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
@@ -640,6 +643,30 @@
             <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="delete-recurrence-id" name="recurrence_id" value="">
             <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day" value="">
+        </form>
+    </div>
+</div>
+
+<!-- Import ICS Modal -->
+<div class="modal-overlay" id="import-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">Import ICS File</span>
+            <button class="modal-close" onclick="closeImportModal()">&times;</button>
+        </div>
+        <form method="POST" action="/calendars/{{.Calendar.ID}}/import" enctype="multipart/form-data">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div class="form-group">
+                <label for="ics-file">Select ICS file *</label>
+                <input type="file" id="ics-file" name="ics_file" accept=".ics,.ical" required>
+                <p style="margin-top: 0.5rem; font-size: 0.875rem; color: #718096;">
+                    Upload an iCalendar (.ics) file to import events into this calendar.
+                </p>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeImportModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Import Events</button>
+            </div>
         </form>
     </div>
 </div>
@@ -1725,12 +1752,25 @@ function toggleRecurrenceEnd(prefix) {
     untilGroup.style.display = select.value === 'on' ? 'block' : 'none';
 }
 
+// Import Modal
+function showImportModal() {
+    document.getElementById('import-modal').classList.add('show');
+}
+
+function closeImportModal() {
+    document.getElementById('import-modal').classList.remove('show');
+    document.getElementById('ics-file').value = '';
+}
+
 // Close modals when clicking outside
 document.getElementById('create-event-modal').addEventListener('click', function(e) {
     if (e.target === this) closeCreateEventModal();
 });
 document.getElementById('edit-event-modal').addEventListener('click', function(e) {
     if (e.target === this) closeEditEventModal();
+});
+document.getElementById('import-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeImportModal();
 });
 </script>
 

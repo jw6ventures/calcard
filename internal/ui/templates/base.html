@@ -23,7 +23,10 @@
     <a href="/addressbooks">Address Books</a>
     <a href="/birthdays">Birthdays</a>
     <a href="/app-passwords">App Passwords</a>
-    <a href="/auth/logout">Logout</a>
+    <form action="/auth/logout" method="post" style="display:inline">
+        <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        <button type="submit" style="background:none;border:none;padding:0;color:blue;cursor:pointer;text-decoration:underline;">Logout</button>
+    </form>
 </nav>
 <hr>
 {{if .FlashMessage}}<div class="alert alert-success">{{.FlashMessage}}</div>{{end}}

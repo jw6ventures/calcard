@@ -59,24 +59,41 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metrics.Handler().ServeHTTP(w, r)
-	})
+	if cfg.PrometheusEnabled {
+		r.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			metrics.Handler().ServeHTTP(w, r)
+		})
+	}
 
-	r.Get("/.well-known/caldav", func(w http.ResponseWriter, r *http.Request) {
+	// Handle both GET and PROPFIND for CalDAV/CardDAV discovery
+	wellKnownHandler := func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
-	})
+	}
+	r.Get("/.well-known/caldav", wellKnownHandler)
+	r.MethodFunc("PROPFIND", "/.well-known/caldav", wellKnownHandler)
 
-	r.Get("/.well-known/carddav", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
-	})
+	r.Get("/.well-known/carddav", wellKnownHandler)
+	r.MethodFunc("PROPFIND", "/.well-known/carddav", wellKnownHandler)
+
+	// Redirect root PROPFIND to /dav/ for discovery
+	r.MethodFunc("PROPFIND", "/", wellKnownHandler)
+
+	// Redirect /principals/ to /dav/principals/ for Apple Calendar compatibility
+	principalsRedirectHandler := func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dav/principals/", http.StatusMovedPermanently)
+	}
+	r.MethodFunc("PROPFIND", "/principals/*", principalsRedirectHandler)
+
+	// Redirect Apple-specific legacy path to /dav/
+	r.MethodFunc("PROPFIND", "/calendar/*", wellKnownHandler)
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
 	r.Route("/auth", func(r chi.Router) {
 		r.Get("/login", authService.BeginOAuth)
 		r.Get("/callback", authService.HandleOAuthCallback)
-		r.Get("/logout", uiHandler.Logout)
 	})
+
+	r.With(authService.RequireSession, csrf.Middleware(cfg)).Post("/auth/logout", uiHandler.Logout)
 
 	r.Group(func(r chi.Router) {
 		r.Use(authService.RequireSession)
@@ -97,6 +114,9 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Delete("/calendars/{id}/shares/{userId}", uiHandler.UnshareCalendar)
 		r.Post("/calendars/{id}/shares/{userId}/delete", uiHandler.UnshareCalendar) // HTML form fallback
 
+		// Calendar import
+		r.Post("/calendars/{id}/import", uiHandler.ImportCalendar)
+
 		// Event CRUD
 		r.Post("/calendars/{id}/events", uiHandler.CreateEvent)
 		r.Put("/calendars/{id}/events/{uid}", uiHandler.UpdateEvent)
@@ -106,6 +126,9 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Post("/addressbooks", uiHandler.CreateAddressBook)
 		r.Put("/addressbooks/{id}", uiHandler.RenameAddressBook)
 		r.Delete("/addressbooks/{id}", uiHandler.DeleteAddressBook)
+
+		// Address book import
+		r.Post("/addressbooks/{id}/import", uiHandler.ImportAddressBook)
 
 		// Contact CRUD
 		r.Post("/addressbooks/{id}/contacts", uiHandler.CreateContact)
@@ -121,19 +144,25 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)
 	})
 
+	davHandler := dav.NewHandler(cfg, store)
+
 	r.Route("/dav", func(r chi.Router) {
-		r.Use(authService.RequireDAVAuth)
-		davHandler := dav.NewHandler(cfg, store)
-		r.MethodFunc("HEAD", "/*", davHandler.Head)
-		r.MethodFunc("GET", "/*", davHandler.Get)
+		// OPTIONS and root PROPFIND must be accessible without authentication for CalDAV client discovery
 		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
-		r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
-		r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
-		r.MethodFunc("MKCOL", "/*", davHandler.Mkcol)
-		r.MethodFunc("MKCALENDAR", "/*", davHandler.Mkcalendar)
-		r.MethodFunc("PUT", "/*", davHandler.Put)
-		r.MethodFunc("DELETE", "/*", davHandler.Delete)
-		r.MethodFunc("REPORT", "/*", davHandler.Report)
+
+		// All other methods require authentication
+		r.Group(func(r chi.Router) {
+			r.Use(authService.RequireDAVAuth)
+			r.MethodFunc("HEAD", "/*", davHandler.Head)
+			r.MethodFunc("GET", "/*", davHandler.Get)
+			r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
+			r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
+			r.MethodFunc("MKCOL", "/*", davHandler.Mkcol)
+			r.MethodFunc("MKCALENDAR", "/*", davHandler.Mkcalendar)
+			r.MethodFunc("PUT", "/*", davHandler.Put)
+			r.MethodFunc("DELETE", "/*", davHandler.Delete)
+			r.MethodFunc("REPORT", "/*", davHandler.Report)
+		})
 	})
 
 	return r

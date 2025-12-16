@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -25,6 +26,8 @@ type Config struct {
 	Session struct {
 		Secret string
 	}
+
+	PrometheusEnabled bool
 }
 
 // Load reads configuration from environment variables with basic validation.
@@ -41,6 +44,7 @@ func Load() (*Config, error) {
 	cfg.OAuth.DiscoveryURL = os.Getenv("APP_OAUTH_DISCOVERY_URL")
 	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
+	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", true)
 
 	if cfg.DB.DSN == "" {
 		return nil, errors.New("APP_DB_DSN is required")
@@ -61,6 +65,18 @@ func Load() (*Config, error) {
 func getenvDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
 	}
 	return def
 }
