@@ -7,7 +7,6 @@
 *.dll
 *.so
 *.dylib
-server
 calcard
 
 # Test binary, built with `go test -c`

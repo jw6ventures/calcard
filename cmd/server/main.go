@@ -4,10 +4,12 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	jw6_utils "gitea.jw6.us/Utilities/jw6-go-utils"
 	appauth "gitea.jw6.us/james/calcard/internal/auth"
 	"gitea.jw6.us/james/calcard/internal/config"
 	httpserver "gitea.jw6.us/james/calcard/internal/http"
@@ -15,7 +17,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const version = "v0.1.0"
+
 func main() {
+	logLevelString := os.Getenv("LOG_LEVEL")
+	if logLevelString == "" {
+		logLevelString = "Info"
+	}
+	logLevel := jw6_utils.LogLevelFromString(logLevelString)
+	// Initialize utilities
+	jw6utils := jw6_utils.Utils{LogLevel: logLevel}
+	jw6utils.PrintBanner("CalCard", version, "2025", 3, "James Williams")
+
 	log.Println("Starting CalCard server...")
 	cfg, err := config.Load()
 	if err != nil {
