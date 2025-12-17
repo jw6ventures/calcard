@@ -71,3 +71,41 @@ jobs:
             --platform linux/amd64 \
             "${TAG_ARGS[@]}" \
             --push .
+
+      - name: Extract calcard binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker buildx build \
+            --platform linux/amd64 \
+            --target builder \
+            --output type=local,dest=artifacts \
+            .
+          ls -lh artifacts
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
+          path: artifacts/calcard
+
+      - name: Publish binary to Gitea Packages (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: calcard
+          TAG_NAME: ${{ github.ref_name }}
+          GITEA_TOKEN: ${{ secrets.GIT_TOKEN }}
+          GITEA_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          if [ ! -f artifacts/calcard ]; then
+            echo "calcard binary missing" >&2
+            exit 1
+          fi
+
+          DEST_URL="${GITEA_SERVER_URL}/api/packages/${PACKAGE_OWNER}/generic/${PACKAGE_NAME}/${TAG_NAME}/calcard"
+          curl -f -X PUT \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -T artifacts/calcard \
+            "${DEST_URL}"

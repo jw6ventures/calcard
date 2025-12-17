@@ -92,11 +92,6 @@ import (
 // - Complex filter combinations
 // - Nested collection restrictions
 //
-// TEST RESULTS:
-// Some tests may fail or log warnings when testing optional features or features not yet
-// fully implemented. This is intentional - the tests serve as both validation and a roadmap
-// for feature completeness. Tests that verify MUST requirements from RFC 4791 should pass,
-// while tests for SHOULD or MAY requirements may fail without breaking compliance.
 //
 // REFERENCES:
 // - RFC 4791: https://www.rfc-editor.org/rfc/rfc4791.txt
@@ -440,10 +435,11 @@ func TestRFC4791_EmptyCalendarHomeReturnsNoCalendars(t *testing.T) {
 		t.Error("Must return calendar home collection even when empty")
 	}
 
-	// Should only have 1 response (the home collection)
+	// Should have 2 responses (the home collection + birthday calendar)
+	// Birthday calendar is always shown as a special read-only calendar
 	responseCount := strings.Count(body, "<d:response>")
-	if responseCount != 1 {
-		t.Errorf("Expected 1 response (calendar home only), got %d", responseCount)
+	if responseCount != 2 {
+		t.Errorf("Expected 2 responses (calendar home + birthday calendar), got %d", responseCount)
 	}
 }
 

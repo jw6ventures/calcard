@@ -17,6 +17,111 @@ import (
 	"gitea.jw6.us/james/calcard/internal/store"
 )
 
+// TestBirthdayCalendarGeneration tests that birthday events are generated correctly.
+func TestBirthdayCalendarGeneration(t *testing.T) {
+	now := time.Now()
+	birthday1 := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	birthday2 := time.Date(2000, 12, 25, 0, 0, 0, 0, time.UTC)
+	birthdayNoYear := time.Date(1, 3, 10, 0, 0, 0, 0, time.UTC)
+
+	name1 := "John Doe"
+	name2 := "Jane Smith"
+	name3 := "Bob Johnson"
+
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"1:contact1": {
+				AddressBookID: 1,
+				UID:           "contact1",
+				DisplayName:   &name1,
+				Birthday:      &birthday1,
+				LastModified:  now,
+			},
+			"1:contact2": {
+				AddressBookID: 1,
+				UID:           "contact2",
+				DisplayName:   &name2,
+				Birthday:      &birthday2,
+				LastModified:  now,
+			},
+			"1:contact3": {
+				AddressBookID: 1,
+				UID:           "contact3",
+				DisplayName:   &name3,
+				Birthday:      &birthdayNoYear,
+				LastModified:  now,
+			},
+			"1:contact4": {
+				AddressBookID: 1,
+				UID:           "contact4",
+				DisplayName:   &name1,
+				Birthday:      nil, // No birthday
+			},
+		},
+	}
+	h := &Handler{
+		store: &store.Store{Contacts: contactRepo},
+	}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents returned error: %v", err)
+	}
+
+	// Should generate 3 events (excluding the one without birthday)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Check that UIDs are properly formatted
+	for _, ev := range events {
+		if !strings.HasPrefix(ev.UID, "birthday-") {
+			t.Errorf("expected birthday event UID to start with 'birthday-', got %q", ev.UID)
+		}
+		if !strings.Contains(ev.RawICAL, "RRULE:FREQ=YEARLY") {
+			t.Errorf("expected birthday event to have yearly recurrence")
+		}
+		if !strings.Contains(ev.RawICAL, "TRANSP:TRANSPARENT") {
+			t.Errorf("expected birthday event to be transparent (free time)")
+		}
+	}
+}
+
+// TestBirthdayCalendarReadOnly tests that write operations are blocked.
+func TestBirthdayCalendarReadOnly(t *testing.T) {
+	cfg := &config.Config{}
+	h := NewHandler(cfg, &store.Store{})
+
+	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
+
+	// Test PUT is blocked
+	putBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	putReq := httptest.NewRequest("PUT", "/dav/calendars/-1/test.ics", strings.NewReader(putBody))
+	putReq = putReq.WithContext(auth.WithUser(context.Background(), user))
+	putRec := httptest.NewRecorder()
+	h.Put(putRec, putReq)
+
+	if putRec.Code != http.StatusForbidden {
+		t.Errorf("expected PUT to birthday calendar to return 403, got %d", putRec.Code)
+	}
+	if !strings.Contains(putRec.Body.String(), "read-only") {
+		t.Errorf("expected error message to mention read-only, got %q", putRec.Body.String())
+	}
+
+	// Test DELETE is blocked
+	delReq := httptest.NewRequest("DELETE", "/dav/calendars/-1/test.ics", nil)
+	delReq = delReq.WithContext(auth.WithUser(context.Background(), user))
+	delRec := httptest.NewRecorder()
+	h.Delete(delRec, delReq)
+
+	if delRec.Code != http.StatusForbidden {
+		t.Errorf("expected DELETE from birthday calendar to return 403, got %d", delRec.Code)
+	}
+	if !strings.Contains(delRec.Body.String(), "read-only") {
+		t.Errorf("expected error message to mention read-only, got %q", delRec.Body.String())
+	}
+}
+
 func TestParseResourcePathAcceptsAbsoluteHref(t *testing.T) {
 	id, uid, ok := parseResourcePath("https://cal.example.com/dav/calendars/42/test-event.ics", "/dav/calendars")
 	if !ok {
@@ -428,7 +533,7 @@ func TestPropfindCalendarsRootListsCollections(t *testing.T) {
 		t.Fatalf("expected 207, got %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 3 { // collection + two calendars
+	if strings.Count(body, "<d:response>") != 4 { // collection + birthday calendar + two calendars
 		t.Fatalf("expected calendar collection listings, got %s", body)
 	}
 }
@@ -1798,7 +1903,16 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 }
 
 func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	return nil, nil
+	if f.contacts == nil {
+		return nil, nil
+	}
+	var result []store.Contact
+	for _, c := range f.contacts {
+		if c.Birthday != nil {
+			result = append(result, *c)
+		}
+	}
+	return result, nil
 }
 
 type fakeCalendarRepo struct {

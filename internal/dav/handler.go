@@ -30,6 +30,10 @@ var errInvalidSyncToken = errors.New("invalid sync token")
 // maxDAVBodyBytes is the maximum body size for DAV requests. Preventing DOS attacks.
 const maxDAVBodyBytes int64 = 10 * 1024 * 1024
 
+// birthdayCalendarID is a special virtual calendar ID for birthdays from contacts.
+// It's a negative value to distinguish it from regular calendar IDs (which are positive).
+const birthdayCalendarID int64 = -1
+
 func NewHandler(cfg *config.Config, store *store.Store) *Handler {
 	return &Handler{cfg: cfg, store: store}
 }
@@ -59,6 +63,35 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if calendarID, uid, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
+		// Handle birthday calendar
+		if calendarID == birthdayCalendarID {
+			events, err := h.generateBirthdayEvents(r.Context(), user.ID)
+			if err != nil {
+				http.Error(w, "failed to load birthday events", http.StatusInternalServerError)
+				return
+			}
+			// Find the requested birthday event by UID
+			var event *store.Event
+			for i := range events {
+				if events[i].UID == uid {
+					event = &events[i]
+					break
+				}
+			}
+			if event == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/calendar")
+			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", event.ETag))
+			if !event.LastModified.IsZero() {
+				w.Header().Set("Last-Modified", event.LastModified.UTC().Format(http.TimeFormat))
+			}
+			_, _ = w.Write([]byte(event.RawICAL))
+			return
+		}
+
+		// Handle regular calendars
 		if _, err := h.loadCalendar(r.Context(), user, calendarID); err != nil {
 			if err == store.ErrNotFound {
 				http.Error(w, "not found", http.StatusNotFound)
@@ -283,6 +316,17 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 	calID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid calendar id")
+	}
+
+	// Block property changes on birthday calendar
+	if calID == birthdayCalendarID {
+		return []response{{
+			Href: cleanPath,
+			Propstat: []propstat{{
+				Prop:   prop{},
+				Status: "HTTP/1.1 403 Forbidden",
+			}},
+		}}, nil
 	}
 
 	cal, err := h.loadCalendar(ctx, user, calID)
@@ -698,6 +742,12 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	etag := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	if calendarID, _, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
+		// Block writes to birthday calendar
+		if calendarID == birthdayCalendarID {
+			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
+			return
+		}
+
 		cal, err := h.loadCalendar(r.Context(), user, calendarID)
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -807,6 +857,12 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	cleanPath := path.Clean(r.URL.Path)
 	if calendarID, uid, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
+		// Block deletes from birthday calendar
+		if calendarID == birthdayCalendarID {
+			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
+			return
+		}
+
 		cal, err := h.loadCalendar(r.Context(), user, calendarID)
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -899,6 +955,29 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid calendar id", http.StatusBadRequest)
 			return
 		}
+
+		// Handle birthday calendar reports
+		if calID == birthdayCalendarID {
+			responses, syncToken, err := h.birthdayCalendarReportResponses(r.Context(), user, h.principalURL(user), cleanPath, report)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			payload := multistatus{
+				XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+				XmlnsD:    "DAV:",
+				XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+				XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+				XmlnsCS:   "http://calendarserver.org/ns/",
+				SyncToken: syncToken,
+				Response:  responses,
+			}
+			w.WriteHeader(http.StatusMultiStatus)
+			_ = xml.NewEncoder(w).Encode(payload)
+			return
+		}
+
+		// Handle regular calendar reports
 		cal, err := h.loadCalendar(r.Context(), user, calID)
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -1029,6 +1108,15 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 				return nil, err
 			}
 			principalHref := h.principalURL(user)
+
+			// Add the virtual birthday calendar first
+			birthdayHref := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
+			birthdayName := "Birthdays"
+			birthdayDesc := "Contact birthdays from your address books"
+			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
+			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, principalHref, birthdayToken, "0"))
+
+			// Add regular calendars
 			for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := fmt.Sprintf("%d", c.CTag)
@@ -1044,6 +1132,27 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	if err != nil {
 		return nil, http.ErrNotSupported
 	}
+
+	// Handle birthday calendar
+	if calID == birthdayCalendarID {
+		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
+		birthdayName := "Birthdays"
+		birthdayDesc := "Contact birthdays from your address books"
+		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
+		principalHref := h.principalURL(user)
+		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0")}
+
+		if depth == "1" {
+			events, err := h.generateBirthdayEvents(ctx, user.ID)
+			if err != nil {
+				return nil, err
+			}
+			base := ensureCollectionHref(href)
+			res = append(res, calendarResourceResponses(base, events)...)
+		}
+		return res, nil
+	}
+
 	cal, err := h.loadCalendar(ctx, user, calID)
 	if err != nil {
 		return nil, err
@@ -2222,4 +2331,178 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.Add
 	}
 
 	return responses, syncToken, nil
+}
+
+// generateBirthdayEvents creates iCal birthday events from contacts with birthdays.
+// Each birthday is a yearly recurring event.
+func (h *Handler) generateBirthdayEvents(ctx context.Context, userID int64) ([]store.Event, error) {
+	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	currentYear := now.Year()
+	var events []store.Event
+
+	for _, c := range contacts {
+		if c.Birthday == nil {
+			continue
+		}
+
+		displayName := "Unknown"
+		if c.DisplayName != nil {
+			displayName = *c.DisplayName
+		}
+
+		// Generate UID for this birthday event (based on contact UID to be stable)
+		uid := fmt.Sprintf("birthday-%s@calcard", c.UID)
+
+		// Calculate age they'll turn at their next birthday
+		// This accounts for whether the birthday has already passed this year
+		var summaryAge string
+		if c.Birthday.Year() > 1900 {
+			birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
+			var ageAtNextBirthday int
+			if birthdayThisYear.After(now) {
+				// Birthday hasn't happened yet this year
+				ageAtNextBirthday = currentYear - c.Birthday.Year()
+			} else {
+				// Birthday already happened, next one is next year
+				ageAtNextBirthday = (currentYear + 1) - c.Birthday.Year()
+			}
+			summaryAge = fmt.Sprintf(" (turning %d)", ageAtNextBirthday)
+		}
+		summary := fmt.Sprintf("🎂 %s's Birthday%s", displayName, summaryAge)
+
+		// Start recurring event from current year (or next year if birthday passed)
+		// This ensures the age in the summary is accurate for near-future occurrences
+		startYear := currentYear
+		birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
+		if birthdayThisYear.Before(now) {
+			startYear = currentYear + 1
+		}
+
+		// Format the birthday date as DTSTART (all-day event)
+		dtstart := time.Date(startYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
+		dtstartStr := dtstart.Format("20060102")
+
+		// Build the iCal event with yearly recurrence
+		var sb strings.Builder
+		sb.WriteString("BEGIN:VCALENDAR\r\n")
+		sb.WriteString("VERSION:2.0\r\n")
+		sb.WriteString("PRODID:-//CalCard//Birthdays//EN\r\n")
+		sb.WriteString("BEGIN:VEVENT\r\n")
+		sb.WriteString(fmt.Sprintf("UID:%s\r\n", uid))
+		sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", time.Now().UTC().Format("20060102T150405Z")))
+		sb.WriteString(fmt.Sprintf("DTSTART;VALUE=DATE:%s\r\n", dtstartStr))
+		sb.WriteString(fmt.Sprintf("SUMMARY:%s\r\n", escapeICalText(summary)))
+		sb.WriteString("RRULE:FREQ=YEARLY\r\n")  // Recurring yearly
+		sb.WriteString("TRANSP:TRANSPARENT\r\n") // Free/busy: free time
+		sb.WriteString("CLASS:PUBLIC\r\n")
+
+		// Add X-property to mark this as a birthday event
+		sb.WriteString("X-CALCARD-TYPE:BIRTHDAY\r\n")
+		sb.WriteString(fmt.Sprintf("X-CONTACT-UID:%s\r\n", c.UID))
+
+		sb.WriteString("END:VEVENT\r\n")
+		sb.WriteString("END:VCALENDAR\r\n")
+
+		rawICAL := sb.String()
+		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(rawICAL)))
+
+		events = append(events, store.Event{
+			ID:           0, // Virtual event, no DB ID
+			CalendarID:   birthdayCalendarID,
+			UID:          uid,
+			RawICAL:      rawICAL,
+			ETag:         etag,
+			Summary:      &summary,
+			DTStart:      &dtstart,
+			DTEnd:        nil, // All-day events don't need DTEND
+			AllDay:       true,
+			LastModified: c.LastModified, // Use contact's last modified as event's last modified
+		})
+	}
+
+	return events, nil
+}
+
+// escapeICalText escapes special characters in iCal text values.
+func escapeICalText(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, ";", "\\;")
+	s = strings.ReplaceAll(s, ",", "\\,")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	return s
+}
+
+// birthdayCalendarReportResponses handles REPORT requests for the virtual birthday calendar.
+func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+	// Generate birthday events
+	events, err := h.generateBirthdayEvents(ctx, user.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to generate birthday events")
+	}
+
+	switch report.XMLName.Local {
+	case "calendar-multiget":
+		res, err := h.birthdayCalendarMultiGet(ctx, events, report.Hrefs, cleanPath)
+		return res, "", err
+	case "calendar-query":
+		// Apply filters if provided
+		if report.Filter != nil {
+			events = h.applyCalendarFilter(events, report.Filter)
+		}
+		return calendarResourceResponses(cleanPath, events), "", nil
+	case "free-busy-query":
+		// Apply filters if provided
+		if report.Filter != nil {
+			events = h.applyCalendarFilter(events, report.Filter)
+		}
+		freeBusyData := h.generateFreeBusy(events, report.Filter)
+		href := strings.TrimSuffix(cleanPath, "/") + "/freebusy.ics"
+		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(freeBusyData)))
+		return []response{resourceResponse(href, etagProp(etag, freeBusyData, true))}, "", nil
+	case "sync-collection":
+		// Birthday calendar doesn't support incremental sync, always return all events
+		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
+		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
+		responses := calendarResourceResponses(collectionHref, events)
+		return responses, syncToken, nil
+	default:
+		// Fallback: return all events
+		return calendarResourceResponses(cleanPath, events), "", nil
+	}
+}
+
+// birthdayCalendarMultiGet handles multiget requests for birthday events.
+func (h *Handler) birthdayCalendarMultiGet(ctx context.Context, events []store.Event, hrefs []string, cleanPath string) ([]response, error) {
+	if len(hrefs) == 0 {
+		return calendarResourceResponses(cleanPath, events), nil
+	}
+
+	// Create a map of UIDs to events for quick lookup
+	eventsByUID := make(map[string]store.Event)
+	for _, ev := range events {
+		eventsByUID[ev.UID] = ev
+	}
+
+	var responses []response
+	for _, href := range hrefs {
+		cleanHref := resolveDAVHref(cleanPath, href)
+		if cleanHref == "" {
+			continue
+		}
+		id, uid, ok := parseResourcePath(cleanHref, "/dav/calendars")
+		if !ok || id != birthdayCalendarID {
+			continue
+		}
+		ev, found := eventsByUID[uid]
+		if !found {
+			continue
+		}
+		responses = append(responses, resourceResponse(cleanHref, etagProp(ev.ETag, ev.RawICAL, true)))
+	}
+	return responses, nil
 }

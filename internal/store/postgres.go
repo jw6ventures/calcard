@@ -647,7 +647,7 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 		return nil, err
 	}
 
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
+	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`
 	rows, err := r.pool.Query(ctx, q, addressBookID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -1208,4 +1208,3 @@ func unescapeVCardValue(s string) string {
 	s = strings.ReplaceAll(s, "\\\\", "\\")
 	return s
 }
-

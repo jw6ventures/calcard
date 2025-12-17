@@ -199,9 +199,10 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 	phone := strings.TrimSpace(r.FormValue("phone"))
 	birthday := strings.TrimSpace(r.FormValue("birthday"))
 	notes := strings.TrimSpace(r.FormValue("notes"))
+	company := strings.TrimSpace(r.FormValue("company"))
 
 	uid := utils.GenerateUID()
-	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes)
+	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes, company)
 	etag := utils.GenerateETag(vcard)
 
 	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{
@@ -269,8 +270,9 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 	phone := strings.TrimSpace(r.FormValue("phone"))
 	birthday := strings.TrimSpace(r.FormValue("birthday"))
 	notes := strings.TrimSpace(r.FormValue("notes"))
+	company := strings.TrimSpace(r.FormValue("company"))
 
-	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes)
+	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes, company)
 	etag := utils.GenerateETag(vcard)
 
 	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{

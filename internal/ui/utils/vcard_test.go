@@ -16,6 +16,7 @@ func TestBuildVCard(t *testing.T) {
 		phone       string
 		birthday    string
 		notes       string
+		company     string
 		wantFields  []string
 	}{
 		{
@@ -28,12 +29,14 @@ func TestBuildVCard(t *testing.T) {
 			phone:       "+1234567890",
 			birthday:    "1990-01-15",
 			notes:       "Test contact",
+			company:     "Acme Corp",
 			wantFields: []string{
 				"BEGIN:VCARD",
 				"VERSION:3.0",
 				"UID:test-uid@calcard",
 				"FN:John Doe",
 				"N:Doe;John;;;",
+				"ORG:Acme Corp",
 				"EMAIL;TYPE=INTERNET:john@example.com",
 				"TEL;TYPE=CELL:+1234567890",
 				"BDAY:1990-01-15",
@@ -85,7 +88,7 @@ func TestBuildVCard(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			vcard := BuildVCard(tt.uid, tt.displayName, tt.firstName, tt.lastName, tt.email, tt.phone, tt.birthday, tt.notes)
+			vcard := BuildVCard(tt.uid, tt.displayName, tt.firstName, tt.lastName, tt.email, tt.phone, tt.birthday, tt.notes, tt.company)
 
 			for _, field := range tt.wantFields {
 				if !strings.Contains(vcard, field) {
@@ -187,7 +190,7 @@ func TestBuildVCard_EmailAndPhone(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			vcard := BuildVCard("test-uid", "Test User", "Test", "User", tt.email, tt.phone, "", "")
+			vcard := BuildVCard("test-uid", "Test User", "Test", "User", tt.email, tt.phone, "", "", "")
 
 			if tt.want != "" && !strings.Contains(vcard, tt.want) {
 				t.Errorf("BuildVCard() should contain %q", tt.want)
@@ -229,7 +232,7 @@ func TestBuildVCard_Birthday(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			vcard := BuildVCard("test-uid", "Test User", "Test", "User", "", "", tt.birthday, "")
+			vcard := BuildVCard("test-uid", "Test User", "Test", "User", "", "", tt.birthday, "", "")
 
 			if tt.want != "" {
 				if !strings.Contains(vcard, tt.want) {
@@ -275,7 +278,7 @@ func TestBuildVCard_Notes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			vcard := BuildVCard("test-uid", "Test User", "Test", "User", "", "", "", tt.notes)
+			vcard := BuildVCard("test-uid", "Test User", "Test", "User", "", "", "", tt.notes, "")
 
 			if tt.want != "" {
 				if !strings.Contains(vcard, tt.want) {
@@ -291,7 +294,7 @@ func TestBuildVCard_Notes(t *testing.T) {
 }
 
 func TestBuildVCard_Structure(t *testing.T) {
-	vcard := BuildVCard("uid", "Full Name", "First", "Last", "email@test.com", "123", "2000-01-01", "Notes")
+	vcard := BuildVCard("uid", "Full Name", "First", "Last", "email@test.com", "123", "2000-01-01", "Notes", "Company")
 
 	// Check line endings
 	lines := strings.Split(vcard, "\r\n")
@@ -325,8 +328,8 @@ func TestBuildVCard_Structure(t *testing.T) {
 }
 
 func TestBuildVCard_REVTimestamp(t *testing.T) {
-	vcard1 := BuildVCard("uid1", "Test", "T", "User", "", "", "", "")
-	vcard2 := BuildVCard("uid2", "Test", "T", "User", "", "", "", "")
+	vcard1 := BuildVCard("uid1", "Test", "T", "User", "", "", "", "", "")
+	vcard2 := BuildVCard("uid2", "Test", "T", "User", "", "", "", "", "")
 
 	// Both should have REV field
 	if !strings.Contains(vcard1, "REV:") {
@@ -355,5 +358,45 @@ func TestBuildVCard_REVTimestamp(t *testing.T) {
 	}
 	if len(rev1) < len("REV:20250101T000000Z") {
 		t.Errorf("REV timestamp seems too short: %s", rev1)
+	}
+}
+
+func TestBuildVCard_Company(t *testing.T) {
+	tests := []struct {
+		name    string
+		company string
+		want    string
+	}{
+		{
+			name:    "with company",
+			company: "Acme Corp",
+			want:    "ORG:Acme Corp",
+		},
+		{
+			name:    "company with special chars",
+			company: "Test;Company,Inc\\More",
+			want:    "ORG:Test\\;Company\\,Inc\\\\More",
+		},
+		{
+			name:    "empty company",
+			company: "",
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vcard := BuildVCard("test-uid", "Test User", "Test", "User", "", "", "", "", tt.company)
+
+			if tt.want != "" {
+				if !strings.Contains(vcard, tt.want) {
+					t.Errorf("BuildVCard() should contain %q\nGot:\n%s", tt.want, vcard)
+				}
+			} else {
+				if strings.Contains(vcard, "ORG:") {
+					t.Error("BuildVCard() should not include ORG when company is empty")
+				}
+			}
+		})
 	}
 }

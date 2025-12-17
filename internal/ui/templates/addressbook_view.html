@@ -355,6 +355,10 @@
                 </div>
             </div>
             <div class="form-group">
+                <label for="create-company">Company</label>
+                <input type="text" id="create-company" name="company">
+            </div>
+            <div class="form-group">
                 <label for="create-email">Email</label>
                 <input type="email" id="create-email" name="email">
             </div>
@@ -444,6 +448,10 @@
                     <label for="edit-last-name">Last Name</label>
                     <input type="text" id="edit-last-name" name="last_name">
                 </div>
+            </div>
+            <div class="form-group">
+                <label for="edit-company">Company</label>
+                <input type="text" id="edit-company" name="company">
             </div>
             <div class="form-group">
                 <label for="edit-email">Email</label>
@@ -1158,6 +1166,7 @@ function closeCreateContactModal() {
     document.getElementById('create-display-name').value = '';
     document.getElementById('create-first-name').value = '';
     document.getElementById('create-last-name').value = '';
+    document.getElementById('create-company').value = '';
     document.getElementById('create-email').value = '';
     document.getElementById('create-phone').value = '';
     document.getElementById('create-birthday-month').value = '';
@@ -1184,6 +1193,9 @@ function showEditContactModal(contact) {
         document.getElementById('edit-first-name').value = '';
         document.getElementById('edit-last-name').value = '';
     }
+    
+    // Set company if available
+    document.getElementById('edit-company').value = contact.org || '';
     
     // Set first email if available
     if (contact.emails && contact.emails.length > 0) {

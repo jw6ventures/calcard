@@ -7,7 +7,7 @@ import (
 )
 
 // BuildVCard constructs a valid vCard 3.0.
-func BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes string) string {
+func BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes, company string) string {
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCARD\r\n")
 	sb.WriteString("VERSION:3.0\r\n")
@@ -16,6 +16,10 @@ func BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, n
 
 	// N: Last;First;Middle;Prefix;Suffix
 	sb.WriteString(fmt.Sprintf("N:%s;%s;;;\r\n", EscapeVCardValue(lastName), EscapeVCardValue(firstName)))
+
+	if company != "" {
+		sb.WriteString(fmt.Sprintf("ORG:%s\r\n", EscapeVCardValue(company)))
+	}
 
 	if email != "" {
 		sb.WriteString(fmt.Sprintf("EMAIL;TYPE=INTERNET:%s\r\n", email))
