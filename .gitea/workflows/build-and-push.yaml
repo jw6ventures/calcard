@@ -67,6 +67,10 @@ jobs:
             TAG_ARGS+=(-t "${IMAGE}:${TAG_NAME}")
           fi
 
+          PRIMARY_TAG="${IMAGE}:${BRANCH}-${SHORT_SHA}"
+          echo "PRIMARY_TAG=${PRIMARY_TAG}" >> "${GITHUB_ENV}"
+          echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
+
           docker buildx build \
             --platform linux/amd64 \
             "${TAG_ARGS[@]}" \
@@ -76,14 +80,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          docker buildx build \
-            --platform linux/amd64 \
-            --target builder \
-            --output type=local,dest=artifacts \
-            .
-          if [ -f artifacts/app/calcard ]; then
-            cp artifacts/app/calcard artifacts/calcard
-          fi
+          docker pull "${PRIMARY_TAG}"
+          CID="$(docker create "${PRIMARY_TAG}")"
+          docker cp "${CID}:/calcard" artifacts/calcard
+          docker rm "${CID}"
           ls -lh artifacts
 
       - name: Upload binary artifact
