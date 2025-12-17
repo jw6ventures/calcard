@@ -87,7 +87,7 @@ jobs:
           ls -lh artifacts
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
           path: artifacts/calcard
