@@ -581,6 +581,43 @@ func (r *contactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid 
 	return err
 }
 
+func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	defer observeDB(ctx, "contacts.move_to_address_book")()
+
+	// Use a transaction to ensure atomicity
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Move the contact to the new address book
+	const moveQuery = `UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`
+	result, err := tx.Exec(ctx, moveQuery, toAddressBookID, fromAddressBookID, uid)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	// Create a tombstone in the source address book for sync
+	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid) VALUES ('contact', $1, $2)`
+	if _, err := tx.Exec(ctx, tombstoneQuery, fromAddressBookID, uid); err != nil {
+		return err
+	}
+
+	// Increment the source address book's ctag so clients know to sync
+	const incrementCtagQuery = `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
+	if _, err := tx.Exec(ctx, incrementCtagQuery, fromAddressBookID); err != nil {
+		return err
+	}
+
+	// The target address book's ctag is automatically incremented by the UPDATE trigger
+
+	return tx.Commit(ctx)
+}
+
 func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	defer observeDB(ctx, "contacts.get_by_uid")()

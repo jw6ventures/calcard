@@ -1915,6 +1915,22 @@ func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID in
 	return result, nil
 }
 
+func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	oldKey := f.key(fromAddressBookID, uid)
+	contact, ok := f.contacts[oldKey]
+	if !ok {
+		return nil // Contact not found
+	}
+	// Remove from old location
+	delete(f.contacts, oldKey)
+	// Update address book ID
+	contact.AddressBookID = toAddressBookID
+	// Add to new location
+	newKey := f.key(toAddressBookID, uid)
+	f.contacts[newKey] = contact
+	return nil
+}
+
 type fakeCalendarRepo struct {
 	accessible []store.CalendarAccess
 	calendars  map[int64]*store.Calendar

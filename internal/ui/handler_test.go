@@ -714,6 +714,10 @@ func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID in
 	return nil, nil
 }
 
+func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	return nil
+}
+
 // Extended fake repositories for CRUD tests
 
 type fakeEventRepoWithUpsert struct {
@@ -746,6 +750,10 @@ func (f *fakeContactRepoWithUpsert) Upsert(ctx context.Context, contact store.Co
 	return &contact, nil
 }
 
+func (f *fakeContactRepoWithUpsert) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid)
+}
+
 type fakeContactRepoWithBirthdays struct {
 	fakeContactRepo
 	birthdays []store.Contact
@@ -753,4 +761,196 @@ type fakeContactRepoWithBirthdays struct {
 
 func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
 	return f.birthdays, nil
+}
+
+func (f *fakeContactRepoWithBirthdays) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid)
+}
+
+func TestMoveContactHandler(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+			3: {ID: 3, UserID: 200, Name: "Other User Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepoWithMove{
+		fakeContactRepo: fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:John Doe\r\nEND:VCARD\r\n"},
+			},
+		},
+	}
+
+	s := &store.Store{
+		AddressBooks: bookRepo,
+		Contacts:     contactRepo,
+	}
+
+	handler := NewHandler(&config.Config{}, s, nil)
+
+	testCases := []struct {
+		name           string
+		bookID         string
+		uid            string
+		userID         int64
+		targetBookID   string
+		wantStatusCode int
+		wantMoved      bool
+	}{
+		{
+			name:           "move contact success",
+			bookID:         "1",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "2",
+			wantStatusCode: http.StatusFound,
+			wantMoved:      true,
+		},
+		{
+			name:           "missing target address book",
+			bookID:         "1",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "",
+			wantStatusCode: http.StatusFound, // Redirects with error
+			wantMoved:      false,
+		},
+		{
+			name:           "invalid target address book id",
+			bookID:         "1",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "invalid",
+			wantStatusCode: http.StatusFound, // Redirects with error
+			wantMoved:      false,
+		},
+		{
+			name:           "source address book not found",
+			bookID:         "999",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "2",
+			wantStatusCode: http.StatusNotFound,
+			wantMoved:      false,
+		},
+		{
+			name:           "target address book belongs to different user",
+			bookID:         "1",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "3",
+			wantStatusCode: http.StatusFound, // Redirects with error
+			wantMoved:      false,
+		},
+		{
+			name:           "contact not found",
+			bookID:         "1",
+			uid:            "nonexistent-contact",
+			userID:         100,
+			targetBookID:   "2",
+			wantStatusCode: http.StatusNotFound,
+			wantMoved:      false,
+		},
+		{
+			name:           "source address book belongs to different user",
+			bookID:         "3",
+			uid:            "contact-1",
+			userID:         100,
+			targetBookID:   "2",
+			wantStatusCode: http.StatusNotFound,
+			wantMoved:      false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reset moved state
+			contactRepo.moved = false
+			contactRepo.tombstoneCreated = false
+
+			form := make(url.Values)
+			if tc.targetBookID != "" {
+				form.Set("target_address_book_id", tc.targetBookID)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/addressbooks/"+tc.bookID+"/contacts/"+tc.uid+"/move", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", tc.bookID)
+			rctx.URLParams.Add("uid", tc.uid)
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+			user := &store.User{ID: tc.userID, PrimaryEmail: "test@example.com"}
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+
+			w := httptest.NewRecorder()
+			handler.MoveContact(w, req)
+
+			if w.Code != tc.wantStatusCode {
+				t.Errorf("MoveContact() status = %d, want %d", w.Code, tc.wantStatusCode)
+			}
+
+			if contactRepo.moved != tc.wantMoved {
+				t.Errorf("MoveContact() moved = %v, want %v", contactRepo.moved, tc.wantMoved)
+			}
+
+			// Check redirect location on success
+			if tc.wantStatusCode == http.StatusFound && tc.wantMoved {
+				location := w.Header().Get("Location")
+				expectedLocation := "/addressbooks/" + tc.targetBookID
+				if !strings.Contains(location, expectedLocation) {
+					t.Errorf("MoveContact() redirect location = %s, expected to contain %s", location, expectedLocation)
+				}
+			}
+			
+			// Verify tombstone was created on successful move
+			if tc.wantMoved {
+				if !contactRepo.tombstoneCreated {
+					t.Error("MoveContact() expected tombstone to be created")
+				}
+				if contactRepo.tombstoneBookID != 1 {
+					t.Errorf("MoveContact() tombstone book ID = %d, want 1", contactRepo.tombstoneBookID)
+				}
+				if contactRepo.tombstoneUID != tc.uid {
+					t.Errorf("MoveContact() tombstone UID = %s, want %s", contactRepo.tombstoneUID, tc.uid)
+				}
+			}
+		})
+	}
+}
+
+type fakeContactRepoWithMove struct {
+	fakeContactRepo
+	moved             bool
+	tombstoneCreated  bool
+	tombstoneBookID   int64
+	tombstoneUID      string
+}
+
+func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+	// Check if contact exists
+	contact, err := f.GetByUID(ctx, fromAddressBookID, uid)
+	if err != nil || contact == nil {
+		return store.ErrNotFound
+	}
+
+	// Move the contact
+	oldKey := f.key(fromAddressBookID, uid)
+	newKey := f.key(toAddressBookID, uid)
+	if c, ok := f.contacts[oldKey]; ok {
+		movedContact := *c
+		movedContact.AddressBookID = toAddressBookID
+		f.contacts[newKey] = &movedContact
+		delete(f.contacts, oldKey)
+		f.moved = true
+		
+		// Simulate tombstone creation (in real implementation, this is done in the database)
+		f.tombstoneCreated = true
+		f.tombstoneBookID = fromAddressBookID
+		f.tombstoneUID = uid
+	}
+	return nil
 }

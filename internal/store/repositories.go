@@ -67,6 +67,7 @@ type ContactRepository interface {
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MaxLastModified(ctx context.Context, addressBookID int64) (time.Time, error)
 	ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error)
+	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error
 }
 
 // AppPasswordRepository handles Basic Auth token storage.

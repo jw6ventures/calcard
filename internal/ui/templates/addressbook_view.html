@@ -490,6 +490,7 @@
             </div>
             <div class="form-actions">
                 <button type="button" class="btn btn-danger" onclick="deleteCurrentContact()">Delete</button>
+                <button type="button" class="btn btn-secondary" onclick="showMoveContactDialog()" style="margin-left: 0.5rem;">Move...</button>
                 <div style="flex: 1;"></div>
                 <button type="button" class="btn btn-secondary" onclick="closeEditContactModal()">Cancel</button>
                 <button type="submit" class="btn btn-primary">Save Changes</button>
@@ -498,6 +499,38 @@
         <form id="delete-contact-form" method="POST" style="display: none;">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
         </form>
+        <form id="move-contact-form" method="POST" style="display: none;">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="move-target-book-id" name="target_address_book_id">
+        </form>
+    </div>
+</div>
+
+<!-- Move Contact Modal -->
+<div class="modal-overlay" id="move-contact-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-name" style="font-size: 1.25rem; font-weight: 600;">Move Contact</span>
+            <button class="modal-close" onclick="closeMoveContactModal()">&times;</button>
+        </div>
+        <div style="margin-bottom: 1rem;">
+            <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+                Select the address book to move this contact to:
+            </p>
+            <div class="form-group">
+                <label for="move-addressbook-select">Target Address Book</label>
+                <select id="move-addressbook-select" style="width: 100%;">
+                    <option value="">Select address book...</option>
+                    {{range .AllAddressBooks}}
+                    <option value="{{.ID}}">{{.Name}}</option>
+                    {{end}}
+                </select>
+            </div>
+        </div>
+        <div class="form-actions">
+            <button type="button" class="btn btn-secondary" onclick="closeMoveContactModal()">Cancel</button>
+            <button type="button" class="btn btn-primary" onclick="confirmMoveContact()">Move Contact</button>
+        </div>
     </div>
 </div>
 
@@ -1230,6 +1263,52 @@ function deleteCurrentContact() {
     }
 }
 
+// Move Contact functionality
+function showMoveContactDialog() {
+    var currentBookId = {{.AddressBook.ID}};
+    var select = document.getElementById('move-addressbook-select');
+    
+    // Filter out the current address book from options
+    Array.from(select.options).forEach(function(option) {
+        if (option.value && parseInt(option.value) === currentBookId) {
+            option.style.display = 'none';
+        } else {
+            option.style.display = '';
+        }
+    });
+    
+    // Reset selection
+    select.value = '';
+    
+    document.getElementById('move-contact-modal').classList.add('show');
+}
+
+function closeMoveContactModal() {
+    document.getElementById('move-contact-modal').classList.remove('show');
+}
+
+function confirmMoveContact() {
+    var select = document.getElementById('move-addressbook-select');
+    var targetBookId = select.value;
+    
+    if (!targetBookId) {
+        alert('Please select a target address book');
+        return;
+    }
+    
+    if (!window.currentEditContact) {
+        alert('No contact selected');
+        return;
+    }
+    
+    var bookId = {{.AddressBook.ID}};
+    var form = document.getElementById('move-contact-form');
+    form.action = '/addressbooks/' + bookId + '/contacts/' + encodeURIComponent(window.currentEditContact.uid) + '/move';
+    document.getElementById('move-target-book-id').value = targetBookId;
+    
+    form.submit();
+}
+
 function formatDateForInput(date) {
     var year = date.getFullYear();
     var month = String(date.getMonth() + 1).padStart(2, '0');
@@ -1256,6 +1335,9 @@ document.getElementById('edit-contact-modal').addEventListener('click', function
 });
 document.getElementById('import-modal').addEventListener('click', function(e) {
     if (e.target === this) closeImportModal();
+});
+document.getElementById('move-contact-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeMoveContactModal();
 });
 </script>
 

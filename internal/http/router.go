@@ -136,6 +136,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Put("/addressbooks/{id}/contacts/{uid}", uiHandler.UpdateContact)
 		r.Delete("/addressbooks/{id}/contacts/{uid}", uiHandler.DeleteContact)
 		r.Post("/addressbooks/{id}/contacts/{uid}/delete", uiHandler.DeleteContact) // HTML form fallback
+		r.Post("/addressbooks/{id}/contacts/{uid}/move", uiHandler.MoveContact)     // Move contact to another address book
 
 		r.Post("/app-passwords", uiHandler.CreateAppPassword)
 		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)

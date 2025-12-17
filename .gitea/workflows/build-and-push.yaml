@@ -81,6 +81,9 @@ jobs:
             --target builder \
             --output type=local,dest=artifacts \
             .
+          if [ -f artifacts/app/calcard ]; then
+            cp artifacts/app/calcard artifacts/calcard
+          fi
           ls -lh artifacts
 
       - name: Upload binary artifact
@@ -95,7 +98,7 @@ jobs:
           PACKAGE_OWNER: ${{ github.repository_owner }}
           PACKAGE_NAME: calcard
           TAG_NAME: ${{ github.ref_name }}
-          GITEA_TOKEN: ${{ secrets.GIT_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
           GITEA_SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail

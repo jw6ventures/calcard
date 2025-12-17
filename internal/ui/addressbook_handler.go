@@ -145,20 +145,28 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Get all address books for the move contact dropdown
+	allBooks, err := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "failed to load address books", http.StatusInternalServerError)
+		return
+	}
+
 	totalPages := (result.TotalCount + limit - 1) / limit
 	data := h.withFlash(r, map[string]any{
-		"Title":       book.Name + " - Address Book",
-		"User":        user,
-		"AddressBook": book,
-		"Contacts":    contactData,
-		"Page":        page,
-		"Limit":       limit,
-		"TotalCount":  result.TotalCount,
-		"TotalPages":  totalPages,
-		"HasPrev":     page > 1,
-		"HasNext":     page < totalPages,
-		"PrevPage":    page - 1,
-		"NextPage":    page + 1,
+		"Title":           book.Name + " - Address Book",
+		"User":            user,
+		"AddressBook":     book,
+		"AllAddressBooks": allBooks,
+		"Contacts":        contactData,
+		"Page":            page,
+		"Limit":           limit,
+		"TotalCount":      result.TotalCount,
+		"TotalPages":      totalPages,
+		"HasPrev":         page > 1,
+		"HasNext":         page < totalPages,
+		"PrevPage":        page - 1,
+		"NextPage":        page + 1,
 	})
 	h.render(w, "addressbook_view.html", data)
 }
@@ -319,6 +327,81 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_deleted"})
+}
+
+// MoveContact moves a contact from one address book to another.
+func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	bookID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid address book id", http.StatusBadRequest)
+		return
+	}
+
+	uid := chi.URLParam(r, "uid")
+	if uid == "" {
+		http.Error(w, "invalid contact uid", http.StatusBadRequest)
+		return
+	}
+
+	targetBookIDStr := strings.TrimSpace(r.FormValue("target_address_book_id"))
+	if targetBookIDStr == "" {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "target address book is required"})
+		return
+	}
+
+	targetBookID, err := strconv.ParseInt(targetBookIDStr, 10, 64)
+	if err != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "invalid target address book id"})
+		return
+	}
+
+	user, _ := auth.UserFromContext(r.Context())
+
+	// Verify source address book ownership
+	sourceBook, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
+	if err != nil {
+		http.Error(w, "failed to load source address book", http.StatusInternalServerError)
+		return
+	}
+	if sourceBook == nil || sourceBook.UserID != user.ID {
+		http.Error(w, "source address book not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify target address book ownership
+	targetBook, err := h.store.AddressBooks.GetByID(r.Context(), targetBookID)
+	if err != nil {
+		http.Error(w, "failed to load target address book", http.StatusInternalServerError)
+		return
+	}
+	if targetBook == nil || targetBook.UserID != user.ID {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "target address book not found"})
+		return
+	}
+
+	// Verify contact exists in source address book
+	contact, err := h.store.Contacts.GetByUID(r.Context(), bookID, uid)
+	if err != nil {
+		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		return
+	}
+	if contact == nil {
+		http.Error(w, "contact not found", http.StatusNotFound)
+		return
+	}
+
+	// Move the contact
+	if err := h.store.Contacts.MoveToAddressBook(r.Context(), bookID, targetBookID, uid); err != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to move contact"})
+		return
+	}
+
+	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", targetBookID), map[string]string{"status": "contact_moved"})
 }
 
 // ImportAddressBook imports contacts from a VCF file into an address book.
