@@ -2,6 +2,7 @@ package store
 
 import (
 	"testing"
+	"time"
 )
 
 func TestParseICalFields(t *testing.T) {
@@ -57,6 +58,64 @@ END:VCALENDAR`
 	}
 	if dtend == nil || dtend.Hour() != 15 {
 		t.Errorf("unexpected dtend: %v", dtend)
+	}
+}
+
+func TestParseICalFieldsWithTZID(t *testing.T) {
+	ical := `BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Meeting East
+DTSTART;TZID=America/New_York:20240201T120000
+DTEND;TZID=America/New_York:20240201T130000
+END:VEVENT
+END:VCALENDAR`
+
+	summary, dtstart, dtend, allDay := parseICalFields(ical)
+
+	if summary == nil || *summary != "Meeting East" {
+		t.Errorf("expected summary 'Meeting East', got %v", summary)
+	}
+	if dtstart == nil || dtend == nil {
+		t.Fatalf("expected both dtstart and dtend to be set")
+	}
+	if allDay {
+		t.Fatal("expected allDay to be false for TZID datetime")
+	}
+
+	if got := dtstart.In(time.UTC); got.Hour() != 17 || got.Minute() != 0 {
+		t.Errorf("expected dtstart 17:00 UTC, got %v", got)
+	}
+	if got := dtend.In(time.UTC); got.Hour() != 18 || got.Minute() != 0 {
+		t.Errorf("expected dtend 18:00 UTC, got %v", got)
+	}
+}
+
+func TestParseICalFieldsWithOffset(t *testing.T) {
+	ical := `BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Offset Event
+DTSTART:20240201T120000-0500
+DTEND:20240201T123000-0500
+END:VEVENT
+END:VCALENDAR`
+
+	summary, dtstart, dtend, allDay := parseICalFields(ical)
+
+	if summary == nil || *summary != "Offset Event" {
+		t.Errorf("expected summary 'Offset Event', got %v", summary)
+	}
+	if dtstart == nil || dtend == nil {
+		t.Fatalf("expected both dtstart and dtend to be set")
+	}
+	if allDay {
+		t.Fatal("expected allDay to be false for offset datetime")
+	}
+
+	if got := dtstart.UTC(); got.Hour() != 17 || got.Minute() != 0 {
+		t.Errorf("expected dtstart 17:00 UTC, got %v", got)
+	}
+	if got := dtend.UTC(); got.Hour() != 17 || got.Minute() != 30 {
+		t.Errorf("expected dtend 17:30 UTC, got %v", got)
 	}
 }
 
@@ -126,11 +185,11 @@ END:VCARD`
 
 func TestParseVCardFieldsWithBirthday(t *testing.T) {
 	testCases := []struct {
-		name     string
-		vcard    string
-		wantYear int
+		name      string
+		vcard     string
+		wantYear  int
 		wantMonth int
-		wantDay  int
+		wantDay   int
 	}{
 		{
 			name: "YYYY-MM-DD format",
@@ -180,4 +239,3 @@ END:VCARD`,
 		})
 	}
 }
-

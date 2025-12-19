@@ -175,6 +175,7 @@ func (m *mockPool) BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx
 	tx.started = true
 	return tx, nil
 }
+func (m *mockPool) Ping(ctx context.Context) error { return nil }
 
 func (m *mockPool) assertDone() {
 	if len(m.queries) != 0 {
@@ -221,6 +222,7 @@ func (m mockRow) Scan(dest ...any) error {
 
 type mockTx struct {
 	execs     []execExpectation
+	queries   []queryExpectation
 	started   bool
 	committed bool
 	rolled    bool
@@ -265,13 +267,27 @@ func (m *mockTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	return nil, fmt.Errorf("unexpected query")
 }
 func (m *mockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	return mockRow{err: fmt.Errorf("unexpected queryrow")}
+	if len(m.queries) == 0 {
+		return mockRow{err: fmt.Errorf("unexpected queryrow: %s", sql)}
+	}
+	exp := m.queries[0]
+	m.queries = m.queries[1:]
+	if !exp.expect.MatchString(sql) {
+		return mockRow{err: fmt.Errorf("queryrow mismatch: %s", sql)}
+	}
+	if err := assertArgs(nil, exp.args, args); err != nil {
+		return mockRow{err: err}
+	}
+	return mockRow{value: exp.value, err: exp.err}
 }
 func (m *mockTx) Conn() *pgx.Conn { return nil }
 
 func (m *mockTx) assertDone() {
 	if len(m.execs) != 0 {
 		panic(fmt.Sprintf("pending tx execs: %v", m.execs))
+	}
+	if len(m.queries) != 0 {
+		panic(fmt.Sprintf("pending tx queries: %v", m.queries))
 	}
 	if !m.committed && !m.rolled {
 		panic("transaction not finished")

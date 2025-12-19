@@ -7,9 +7,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type txPool interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+	Ping(ctx context.Context) error
+}
+
 // Store aggregates repositories backed by PostgreSQL.
 type Store struct {
-	pool *pgxpool.Pool
+	pool txPool
 
 	Users            UserRepository
 	Calendars        CalendarRepository

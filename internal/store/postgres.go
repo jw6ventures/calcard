@@ -1018,31 +1018,62 @@ func (s *Store) EnsureDefaultCollections(ctx context.Context, userID int64) erro
 }
 
 func (s *Store) ensureDefaultCalendar(ctx context.Context, userID int64) error {
-	const countQuery = `SELECT COUNT(1) FROM calendars WHERE user_id=$1`
 	defer observeDB(ctx, "calendars.ensure_default")()
-	var count int
-	if err := s.pool.QueryRow(ctx, countQuery, userID).Scan(&count); err != nil {
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil
+	defer tx.Rollback(ctx)
+
+	// Serialize concurrent attempts for the same user
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
+		return err
 	}
-	_, err := s.Calendars.Create(ctx, Calendar{UserID: userID, Name: "Default"})
-	return err
+
+	var exists bool
+	const checkQuery = `SELECT EXISTS (SELECT 1 FROM calendars WHERE user_id=$1)`
+	if err := tx.QueryRow(ctx, checkQuery, userID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `INSERT INTO calendars (user_id, name) VALUES ($1, 'Default')`, userID); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ensureDefaultAddressBook(ctx context.Context, userID int64) error {
-	const countQuery = `SELECT COUNT(1) FROM address_books WHERE user_id=$1`
 	defer observeDB(ctx, "address_books.ensure_default")()
-	var count int
-	if err := s.pool.QueryRow(ctx, countQuery, userID).Scan(&count); err != nil {
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
+		return err
 	}
-	_, err := s.AddressBooks.Create(ctx, AddressBook{UserID: userID, Name: "Contacts"})
-	return err
+
+	var exists bool
+	const checkQuery = `SELECT EXISTS (SELECT 1 FROM address_books WHERE user_id=$1)`
+	if err := tx.QueryRow(ctx, checkQuery, userID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `INSERT INTO address_books (user_id, name) VALUES ($1, 'Contacts')`, userID); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Now returns a UTC timestamp to keep updates consistent.
@@ -1132,7 +1163,25 @@ func parseICalDateTime(value, keyPart string) (*time.Time, bool) {
 		isAllDay = true
 	}
 
-	// Remove trailing Z for UTC
+	// Handle timezone identifier parameter (e.g., DTSTART;TZID=America/New_York)
+	if tzid := paramValue(keyPart, "TZID"); tzid != "" {
+		if loc, err := time.LoadLocation(tzid); err == nil {
+			if t, err := time.ParseInLocation("20060102T150405", strings.TrimSuffix(value, "Z"), loc); err == nil {
+				utc := t.In(time.UTC)
+				return &utc, isAllDay
+			}
+		}
+	}
+
+	// Handle explicit numeric offsets (e.g., 20240201T120000-0500 or 20240201T120000-05:00)
+	for _, layout := range []string{"20060102T150405-0700", "20060102T150405-07:00"} {
+		if t, err := time.Parse(layout, value); err == nil {
+			utc := t.UTC()
+			return &utc, isAllDay
+		}
+	}
+
+	// Remove trailing Z for UTC and parse as basic datetime
 	value = strings.TrimSuffix(value, "Z")
 
 	var t time.Time
@@ -1153,6 +1202,23 @@ func parseICalDateTime(value, keyPart string) (*time.Time, bool) {
 		return nil, false
 	}
 	return &t, isAllDay
+}
+
+func paramValue(keyPart, param string) string {
+	parts := strings.Split(keyPart, ";")
+	if len(parts) < 2 {
+		return ""
+	}
+
+	paramUpper := strings.ToUpper(param)
+	for _, p := range parts[1:] {
+		if strings.HasPrefix(strings.ToUpper(p), paramUpper+"=") {
+			if pieces := strings.SplitN(p, "=", 2); len(pieces) == 2 {
+				return pieces[1]
+			}
+		}
+	}
+	return ""
 }
 
 // parseVCardFields extracts display_name, primary_email, and birthday from raw vCard data.
