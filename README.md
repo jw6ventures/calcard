@@ -37,3 +37,11 @@ Environment variables:
 ## Health probes
 - Liveness: `GET /healthz` returns immediately when the HTTP server is running, without touching dependencies.
 - Readiness: `GET /readyz` checks connectivity to critical dependencies (currently PostgreSQL via `Store.HealthCheck`) and returns `503 Service Unavailable` until they are reachable.
+
+## License
+CalCard is dual-licensed:
+- **AGPLv3** for open-source use
+- **Commercial License** for proprietary or hosted SaaS use
+
+If you run CalCard as a network service and do not provide full corresponding
+source code to users interacting with it, you must obtain a commercial license.

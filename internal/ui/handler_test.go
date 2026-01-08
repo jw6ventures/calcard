@@ -576,6 +576,23 @@ func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid stri
 	return nil, nil
 }
 
+func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*store.Event, error) {
+	for _, ev := range f.events {
+		if ev.CalendarID != calendarID {
+			continue
+		}
+		name := ev.ResourceName
+		if name == "" {
+			name = ev.UID
+		}
+		if name == resourceName {
+			copy := *ev
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	var result []store.Event
 	for _, ev := range f.events {
@@ -946,11 +963,101 @@ func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAdd
 		f.contacts[newKey] = &movedContact
 		delete(f.contacts, oldKey)
 		f.moved = true
-		
+
 		// Simulate tombstone creation (in real implementation, this is done in the database)
 		f.tombstoneCreated = true
 		f.tombstoneBookID = fromAddressBookID
 		f.tombstoneUID = uid
 	}
 	return nil
+}
+
+func TestUpdateEventPreservesResourceName(t *testing.T) {
+	testCases := []struct {
+		name                string
+		existingResourceName string
+		expectedResourceName string
+	}{
+		{
+			name:                "preserves CalDAV-created resource name",
+			existingResourceName: "custom-resource-name-123.ics",
+			expectedResourceName: "custom-resource-name-123.ics",
+		},
+		{
+			name:                "preserves UID-based resource name",
+			existingResourceName: "test-event-uid",
+			expectedResourceName: "test-event-uid",
+		},
+		{
+			name:                "handles empty resource name by using UID",
+			existingResourceName: "",
+			expectedResourceName: "test-event-uid",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				calendars: map[int64]*store.Calendar{
+					1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+				},
+			}
+
+			eventRepo := &fakeEventRepoWithUpsert{
+				fakeEventRepo: fakeEventRepo{
+					events: map[string]*store.Event{
+						"1:test-event-uid": {
+							ID:           1,
+							CalendarID:   1,
+							UID:          "test-event-uid",
+							ResourceName: tc.existingResourceName,
+							RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-event-uid\r\nSUMMARY:Original Summary\r\nDTSTART:20240101T100000Z\r\nDTEND:20240101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+							ETag:         "original-etag",
+						},
+					},
+				},
+			}
+
+			s := &store.Store{
+				Calendars: calRepo,
+				Events:    eventRepo,
+			}
+
+			handler := NewHandler(&config.Config{}, s, nil)
+
+			formData := url.Values{
+				"summary":     {"Updated Summary"},
+				"dtstart":     {"2024-01-02T10:00"},
+				"dtend":       {"2024-01-02T11:00"},
+				"edit_scope":  {"series"},
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 100}))
+
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			rctx.URLParams.Add("uid", "test-event-uid")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+			rec := httptest.NewRecorder()
+			handler.UpdateEvent(rec, req)
+
+			// Check that the event was updated
+			updatedEvent := eventRepo.events["1:test-event-uid"]
+			if updatedEvent == nil {
+				t.Fatal("event should exist after update")
+			}
+
+			if updatedEvent.ResourceName != tc.expectedResourceName {
+				t.Errorf("ResourceName = %q, want %q", updatedEvent.ResourceName, tc.expectedResourceName)
+			}
+
+			// Verify the event content was actually updated
+			if !strings.Contains(updatedEvent.RawICAL, "Updated Summary") {
+				t.Error("event summary should be updated")
+			}
+		})
+	}
 }

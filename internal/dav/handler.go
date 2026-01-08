@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -17,6 +18,7 @@ import (
 	"gitea.jw6.us/james/calcard/internal/auth"
 	"gitea.jw6.us/james/calcard/internal/config"
 	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Handler serves WebDAV/CalDAV/CardDAV requests.
@@ -26,6 +28,8 @@ type Handler struct {
 }
 
 var errInvalidSyncToken = errors.New("invalid sync token")
+var errInvalidPath = errors.New("invalid path")
+var errAmbiguousCalendar = errors.New("ambiguous calendar path")
 
 // maxDAVBodyBytes is the maximum body size for DAV requests. Preventing DOS attacks.
 const maxDAVBodyBytes int64 = 10 * 1024 * 1024
@@ -36,194 +40,6 @@ const birthdayCalendarID int64 = -1
 
 func NewHandler(cfg *config.Config, store *store.Store) *Handler {
 	return &Handler{cfg: cfg, store: store}
-}
-
-func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Allow", "OPTIONS, HEAD, GET, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, PUT, DELETE, REPORT")
-	w.Header().Set("DAV", "1, 2, calendar-access, addressbook")
-	w.Header().Set("Accept-Patch", "application/xml")
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
-	h.Get(w, r)
-}
-
-func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
-	cleanPath := path.Clean(r.URL.Path)
-	if !strings.HasPrefix(cleanPath, "/dav") {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	user, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		http.Error(w, "missing user", http.StatusUnauthorized)
-		return
-	}
-
-	if calendarID, uid, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
-		// Handle birthday calendar
-		if calendarID == birthdayCalendarID {
-			events, err := h.generateBirthdayEvents(r.Context(), user.ID)
-			if err != nil {
-				http.Error(w, "failed to load birthday events", http.StatusInternalServerError)
-				return
-			}
-			// Find the requested birthday event by UID
-			var event *store.Event
-			for i := range events {
-				if events[i].UID == uid {
-					event = &events[i]
-					break
-				}
-			}
-			if event == nil {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Type", "text/calendar")
-			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", event.ETag))
-			if !event.LastModified.IsZero() {
-				w.Header().Set("Last-Modified", event.LastModified.UTC().Format(http.TimeFormat))
-			}
-			_, _ = w.Write([]byte(event.RawICAL))
-			return
-		}
-
-		// Handle regular calendars
-		if _, err := h.loadCalendar(r.Context(), user, calendarID); err != nil {
-			if err == store.ErrNotFound {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "failed to load calendar", http.StatusInternalServerError)
-			return
-		}
-		event, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
-		}
-		if event == nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "text/calendar")
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", event.ETag))
-		// RFC 4791 Section 5.3.4: Include Last-Modified header
-		if !event.LastModified.IsZero() {
-			w.Header().Set("Last-Modified", event.LastModified.UTC().Format(http.TimeFormat))
-		}
-		_, _ = w.Write([]byte(event.RawICAL))
-		return
-	}
-
-	if addressBookID, uid, matched := parseResourcePath(cleanPath, "/dav/addressbooks"); matched {
-		if _, err := h.loadAddressBook(r.Context(), user, addressBookID); err != nil {
-			if err == store.ErrNotFound {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "failed to load address book", http.StatusInternalServerError)
-			return
-		}
-		contact, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
-		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
-			return
-		}
-		if contact == nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "text/vcard")
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", contact.ETag))
-		// Include Last-Modified header if available
-		if !contact.LastModified.IsZero() {
-			w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
-		}
-		_, _ = w.Write([]byte(contact.RawVCard))
-		return
-	}
-
-	w.Header().Set("DAV", "1, 2, calendar-access, addressbook")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
-	depth := strings.TrimSpace(r.Header.Get("Depth"))
-	if depth == "" {
-		depth = "1"
-	}
-
-	user, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		http.Error(w, "missing user", http.StatusUnauthorized)
-		return
-	}
-
-	// Parse PROPFIND request body (RFC 4918 Section 9.1)
-	var propfindReq propfindRequest
-	if r.ContentLength > 0 {
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxDAVBodyBytes))
-		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
-			return
-		}
-		if err := xml.Unmarshal(body, &propfindReq); err != nil {
-			// If parsing fails, default to allprop behavior
-			propfindReq.AllProp = &struct{}{}
-		}
-	} else {
-		// Empty body means allprop by default
-		propfindReq.AllProp = &struct{}{}
-	}
-
-	responses, err := h.buildPropfindResponses(r.Context(), r.URL.Path, depth, user, &propfindReq)
-	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, store.ErrNotFound) || errors.Is(err, http.ErrNotSupported) {
-			status = http.StatusNotFound
-		}
-		http.Error(w, err.Error(), status)
-		return
-	}
-
-	payload := multistatus{
-		XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:   "DAV:",
-		XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-		XmlnsCS:  "http://calendarserver.org/ns/",
-		Response: responses,
-	}
-
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(http.StatusMultiStatus)
-	_ = xml.NewEncoder(w).Encode(payload)
-}
-
-// proppatchRequest represents a PROPPATCH request body (RFC 4918 Section 9.2)
-type proppatchRequest struct {
-	XMLName xml.Name
-	Set     *proppatchSet    `xml:"DAV: set"`
-	Remove  *proppatchRemove `xml:"DAV: remove"`
-}
-
-type proppatchSet struct {
-	Prop proppatchProp `xml:"DAV: prop"`
-}
-
-type proppatchRemove struct {
-	Prop proppatchProp `xml:"DAV: prop"`
-}
-
-type proppatchProp struct {
-	DisplayName         *string `xml:"DAV: displayname"`
-	CalendarDescription *string `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
-	CalendarTimezone    *string `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
-	AddressBookDesc     *string `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
 }
 
 func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +63,7 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var proppatchReq proppatchRequest
-	if err := xml.Unmarshal(body, &proppatchReq); err != nil {
+	if err := safeUnmarshalXML(body, &proppatchReq); err != nil {
 		http.Error(w, "invalid PROPPATCH body", http.StatusBadRequest)
 		return
 	}
@@ -259,7 +75,11 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		resp, err := h.proppatchCalendar(r.Context(), user, cleanPath, &proppatchReq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			if errors.Is(err, errInvalidPath) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 		responses = append(responses, resp...)
@@ -274,7 +94,11 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		resp, err := h.proppatchAddressBook(r.Context(), user, cleanPath, &proppatchReq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			if errors.Is(err, errInvalidPath) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 		responses = append(responses, resp...)
@@ -310,12 +134,12 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
 	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-		return nil, fmt.Errorf("invalid calendar path")
+		return nil, fmt.Errorf("%w: invalid calendar path", errInvalidPath)
 	}
 
 	calID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid calendar id")
+		return nil, fmt.Errorf("%w: invalid calendar id", errInvalidPath)
 	}
 
 	// Block property changes on birthday calendar
@@ -366,6 +190,7 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 
 		err := h.store.Calendars.Update(ctx, user.ID, calID, updateName, description, timezone)
 		if err != nil {
+			log.Printf("failed to update calendar properties for calendar %d: %v", calID, err)
 			return []response{{
 				Href: cleanPath,
 				Propstat: []propstat{{
@@ -400,12 +225,12 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
 	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-		return nil, fmt.Errorf("invalid address book path")
+		return nil, fmt.Errorf("%w: invalid address book path", errInvalidPath)
 	}
 
 	bookID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid address book id")
+		return nil, fmt.Errorf("%w: invalid address book id", errInvalidPath)
 	}
 
 	book, err := h.loadAddressBook(ctx, user, bookID)
@@ -442,6 +267,7 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 
 		err := h.store.AddressBooks.Update(ctx, user.ID, bookID, updateName, description)
 		if err != nil {
+			log.Printf("failed to update address book properties for book %d: %v", bookID, err)
 			return []response{{
 				Href: cleanPath,
 				Propstat: []propstat{{
@@ -509,22 +335,94 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
 
-	// RFC 4791 Section 4.2: Calendar collections MUST NOT contain other calendar collections
-	// Only allow paths like /dav/calendars/name/, not /dav/calendars/id/name/
 	if len(parts) > 2 || (len(parts) == 2 && parts[0] != "" && parts[1] != "") {
 		http.Error(w, "nested calendar collections not allowed", http.StatusForbidden)
 		return
 	}
 
-	name := strings.TrimSpace(parts[len(parts)-1])
-	if name == "" {
+	pathName := strings.TrimSpace(parts[len(parts)-1])
+	if pathName == "" {
 		http.Error(w, "calendar name required", http.StatusBadRequest)
 		return
 	}
-	if _, err := h.store.Calendars.Create(r.Context(), store.Calendar{UserID: user.ID, Name: name}); err != nil {
+	if _, err := strconv.ParseInt(pathName, 10, 64); err == nil {
+		http.Error(w, "calendar name must be non-numeric", http.StatusBadRequest)
+		return
+	}
+
+	var mkReq mkcalendarRequest
+	if r.ContentLength > 0 {
+		if r.ContentLength > maxDAVBodyBytes {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxDAVBodyBytes))
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		if err := safeUnmarshalXML(body, &mkReq); err != nil {
+			http.Error(w, "invalid MKCALENDAR body", http.StatusBadRequest)
+			return
+		}
+	}
+
+	name := pathName
+	var description *string
+	var timezone *string
+	if mkReq.Set != nil {
+		if mkReq.Set.Prop.DisplayName != nil {
+			trimmed := strings.TrimSpace(*mkReq.Set.Prop.DisplayName)
+			if trimmed != "" {
+				name = trimmed
+			}
+		}
+		description = mkReq.Set.Prop.CalendarDescription
+		timezone = mkReq.Set.Prop.CalendarTimezone
+	}
+
+	cals, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "failed to check calendars", http.StatusInternalServerError)
+		return
+	}
+	// Normalize slug for consistent case-insensitive comparison
+	normalizedPathName := strings.ToLower(pathName)
+	for _, cal := range cals {
+		if cal.Slug != nil && *cal.Slug == normalizedPathName {
+			http.Error(w, "calendar already exists", http.StatusConflict)
+			return
+		}
+		if strings.EqualFold(cal.Name, pathName) {
+			http.Error(w, "calendar already exists", http.StatusConflict)
+			return
+		}
+	}
+	// Use pre-normalized slug to match database constraint (LOWER(slug))
+	slug := normalizedPathName
+	// Validate slug for path safety (prevent path traversal, injection)
+	if !isValidCalendarSlug(slug) {
+		http.Error(w, "invalid calendar name: must contain only lowercase letters, numbers, and hyphens", http.StatusBadRequest)
+		return
+	}
+	created, err := h.store.Calendars.Create(r.Context(), store.Calendar{
+		UserID:      user.ID,
+		Name:        name,
+		Slug:        &slug,
+		Description: description,
+		Timezone:    timezone,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			http.Error(w, "calendar already exists", http.StatusConflict)
+			return
+		}
 		http.Error(w, "failed to create", http.StatusInternalServerError)
 		return
 	}
+	location := path.Join("/dav/calendars", fmt.Sprint(created.ID)) + "/"
+	w.Header().Set("Location", location)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -543,11 +441,12 @@ func (h *Handler) validateICalendar(data string) error {
 	}
 
 	// Must contain at least one component (VEVENT, VTODO, VJOURNAL, or VFREEBUSY)
-	upper := strings.ToUpper(trimmed)
-	hasComponent := strings.Contains(upper, "BEGIN:VEVENT") ||
-		strings.Contains(upper, "BEGIN:VTODO") ||
-		strings.Contains(upper, "BEGIN:VJOURNAL") ||
-		strings.Contains(upper, "BEGIN:VFREEBUSY")
+	componentTypes := extractICalComponentTypes(data)
+	_, hasEvent := componentTypes["VEVENT"]
+	_, hasTodo := componentTypes["VTODO"]
+	_, hasJournal := componentTypes["VJOURNAL"]
+	_, hasFreeBusy := componentTypes["VFREEBUSY"]
+	hasComponent := hasEvent || hasTodo || hasJournal || hasFreeBusy
 
 	if !hasComponent {
 		return fmt.Errorf("no calendar component found (VEVENT, VTODO, VJOURNAL, or VFREEBUSY required)")
@@ -555,6 +454,7 @@ func (h *Handler) validateICalendar(data string) error {
 
 	// Check balanced BEGIN/END tags for all component types
 	// This validates that every BEGIN has a matching END
+	upper := strings.ToUpper(trimmed)
 	if err := validateBalancedTags(upper); err != nil {
 		return err
 	}
@@ -591,43 +491,284 @@ func validateBalancedTags(data string) error {
 	return nil
 }
 
-// extractUIDFromICalendar extracts the UID property from iCalendar data
-func extractUIDFromICalendar(icalData string) (string, error) {
-	lines := strings.Split(icalData, "\n")
+func extractICalComponentTypes(icalData string) map[string]struct{} {
+	types := make(map[string]struct{})
+	lines := unfoldICalLines(icalData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		// Handle both \r\n and \n line endings
-		line = strings.TrimSuffix(line, "\r")
-		upperLine := strings.ToUpper(line)
-		if strings.HasPrefix(upperLine, "UID:") {
-			uid := strings.TrimSpace(strings.TrimPrefix(line, "UID:"))
-			uid = strings.TrimSpace(strings.TrimPrefix(uid, "uid:"))
-			if uid == "" {
-				return "", fmt.Errorf("empty UID property")
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "BEGIN:") {
+			componentType := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			if componentType != "" {
+				types[componentType] = struct{}{}
 			}
-			return uid, nil
 		}
 	}
-	return "", fmt.Errorf("no UID property found in calendar data")
+	return types
+}
+
+func extractICalRRULECount(icalData string) (int, bool) {
+	lines := unfoldICalLines(icalData)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "RRULE") {
+			colonIdx := strings.Index(line, ":")
+			if colonIdx == -1 {
+				continue
+			}
+			rule := line[colonIdx+1:]
+			parts := strings.Split(rule, ";")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				if idx := strings.Index(part, "="); idx != -1 {
+					if strings.EqualFold(part[:idx], "COUNT") {
+						value := strings.TrimSpace(part[idx+1:])
+						if value == "" {
+							continue
+						}
+						if count, err := strconv.Atoi(value); err == nil {
+							return count, true
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func countICalAttendees(icalData string) int {
+	lines := unfoldICalLines(icalData)
+	targets := map[string]struct{}{
+		"VEVENT":   {},
+		"VTODO":    {},
+		"VJOURNAL": {},
+	}
+	inTarget := false
+	currentCount := 0
+	maxCount := 0
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "BEGIN:") {
+			name := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			if !inTarget {
+				if _, ok := targets[name]; ok {
+					inTarget = true
+					currentCount = 0
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(upper, "END:") {
+			name := strings.TrimSpace(strings.TrimPrefix(upper, "END:"))
+			if inTarget {
+				if _, ok := targets[name]; ok {
+					if currentCount > maxCount {
+						maxCount = currentCount
+					}
+					inTarget = false
+				}
+			}
+			continue
+		}
+		if !inTarget {
+			continue
+		}
+		if strings.HasPrefix(upper, "ATTENDEE") {
+			if len(upper) == len("ATTENDEE") || (len(upper) > len("ATTENDEE") && (upper[len("ATTENDEE")] == ';' || upper[len("ATTENDEE")] == ':')) {
+				currentCount++
+			}
+		}
+	}
+	if currentCount > maxCount {
+		maxCount = currentCount
+	}
+	return maxCount
+}
+
+// extractUIDFromICalendar extracts the UID property from iCalendar data.
+// For multi-component calendars, returns the UID from the first top-level component.
+// The validateCalendarObjectResource function handles validation of multi-component UIDs.
+func extractUIDFromICalendar(icalData string) (string, error) {
+	components := parseCalendarTopLevelComponents(icalData)
+	if len(components) == 0 {
+		return "", fmt.Errorf("no calendar components found")
+	}
+	// Return UID from first top-level component
+	firstComponent := components[0]
+	if firstComponent.UIDEmpty || firstComponent.UIDCount == 0 {
+		return "", fmt.Errorf("no UID property found in calendar data")
+	}
+	if firstComponent.UID == "" {
+		return "", fmt.Errorf("empty UID property")
+	}
+	return firstComponent.UID, nil
 }
 
 // extractUIDFromVCard extracts the UID property from vCard data
 func extractUIDFromVCard(vcardData string) (string, error) {
-	lines := strings.Split(vcardData, "\n")
+	// Unfold lines per RFC 6350 (same as RFC 5545)
+	lines := unfoldICalLines(vcardData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			continue
+		}
 		upperLine := strings.ToUpper(line)
-		if strings.HasPrefix(upperLine, "UID:") {
-			uid := strings.TrimSpace(strings.TrimPrefix(line, "UID:"))
-			uid = strings.TrimSpace(strings.TrimPrefix(uid, "uid:"))
-			if uid == "" {
-				return "", fmt.Errorf("empty UID property")
+		if strings.HasPrefix(upperLine, "UID") {
+			// Check for proper delimiter (: or ;)
+			if len(upperLine) == len("UID") || (len(upperLine) > len("UID") && (upperLine[len("UID")] == ':' || upperLine[len("UID")] == ';')) {
+				colonIdx := strings.Index(line, ":")
+				if colonIdx == -1 {
+					continue
+				}
+				uid := strings.TrimSpace(line[colonIdx+1:])
+				if uid == "" {
+					return "", fmt.Errorf("empty UID property")
+				}
+				return uid, nil
 			}
-			return uid, nil
 		}
 	}
 	return "", fmt.Errorf("no UID property found in vCard data")
+}
+
+type calendarTopLevelComponent struct {
+	Type            string
+	UID             string
+	UIDCount        int
+	UIDEmpty        bool
+	HasRecurrenceID bool
+}
+
+func validateCalendarObjectResource(icalData string) []string {
+	components := parseCalendarTopLevelComponents(icalData)
+	for _, component := range components {
+		if component.UIDEmpty || component.UIDCount == 0 {
+			return []string{"valid-calendar-object-resource"}
+		}
+		if component.UIDCount > 1 {
+			return []string{"valid-calendar-data"}
+		}
+	}
+	if len(components) <= 1 {
+		return nil
+	}
+
+	uid := components[0].UID
+	sameUID := true
+	for _, component := range components[1:] {
+		if component.UID != uid {
+			sameUID = false
+			break
+		}
+	}
+	if !sameUID {
+		return []string{"valid-calendar-object-resource", "valid-calendar-data"}
+	}
+
+	withoutRecurrence := 0
+	withRecurrence := 0
+	for _, component := range components {
+		if component.HasRecurrenceID {
+			withRecurrence++
+		} else {
+			withoutRecurrence++
+		}
+	}
+	if withRecurrence > 0 && withoutRecurrence == 1 {
+		return nil
+	}
+
+	return []string{"valid-calendar-object-resource"}
+}
+
+func parseCalendarTopLevelComponents(icalData string) []calendarTopLevelComponent {
+	lines := unfoldICalLines(icalData)
+	var stack []string
+	var current *calendarTopLevelComponent
+	var components []calendarTopLevelComponent
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "BEGIN:") {
+			componentType := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			stack = append(stack, componentType)
+			if len(stack) == 2 && stack[0] == "VCALENDAR" && isTopLevelComponentType(componentType) {
+				current = &calendarTopLevelComponent{Type: componentType}
+			}
+			continue
+		}
+		if strings.HasPrefix(upper, "END:") {
+			componentType := strings.TrimSpace(strings.TrimPrefix(upper, "END:"))
+			if current != nil && len(stack) == 2 && stack[0] == "VCALENDAR" && stack[1] == current.Type && componentType == current.Type {
+				components = append(components, *current)
+				current = nil
+			}
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(upper, "UID") {
+			if len(upper) == len("UID") || (len(upper) > len("UID") && (upper[len("UID")] == ':' || upper[len("UID")] == ';')) {
+				colonIdx := strings.Index(line, ":")
+				if colonIdx == -1 {
+					continue
+				}
+				uid := strings.TrimSpace(line[colonIdx+1:])
+				current.UIDCount++
+				if uid == "" {
+					current.UIDEmpty = true
+					continue
+				}
+				if current.UID == "" {
+					current.UID = uid
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(upper, "RECURRENCE-ID") {
+			current.HasRecurrenceID = true
+		}
+	}
+
+	if current != nil {
+		components = append(components, *current)
+	}
+
+	return components
+}
+
+func isTopLevelComponentType(componentType string) bool {
+	switch componentType {
+	case "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateVCard performs basic validation of vCard data (RFC 6350)
@@ -724,8 +865,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	_, _, isCalendar := parseCalendarResourceSegments(cleanPath)
 	if r.ContentLength > maxDAVBodyBytes {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		if isCalendar {
+			writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+		} else {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		}
 		return
 	}
 	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
@@ -733,7 +879,11 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			if isCalendar {
+				writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+			} else {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			}
 		} else {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 		}
@@ -741,7 +891,18 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 	etag := fmt.Sprintf("%x", sha256.Sum256(body))
 
-	if calendarID, _, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
+	if calendarID, resourceUID, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
+		if err == store.ErrNotFound {
+			http.Error(w, "calendar not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAmbiguousCalendar) {
+			http.Error(w, "ambiguous calendar path", http.StatusConflict)
+			return
+		}
+		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		return
+	} else if matched {
 		// Block writes to birthday calendar
 		if calendarID == birthdayCalendarID {
 			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
@@ -762,20 +923,109 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		if contentType != "" &&
+			!strings.HasPrefix(contentType, "text/calendar") &&
+			!strings.HasPrefix(contentType, "application/ical") &&
+			!strings.HasPrefix(contentType, "application/ics") {
+			writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
+			return
+		}
+
 		// Validate iCalendar data
 		if err := h.validateICalendar(string(body)); err != nil {
-			http.Error(w, fmt.Sprintf("invalid iCalendar data: %v", err), http.StatusBadRequest)
+			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
+			return
+		}
+
+	componentTypes := extractICalComponentTypes(string(body))
+	allowedComponents := map[string]struct{}{
+		"VCALENDAR": {},
+		"VEVENT":    {},
+		"VTODO":     {},
+		"VJOURNAL":  {},
+		"VFREEBUSY": {},
+		"VTIMEZONE": {},
+		"STANDARD":  {},
+		"DAYLIGHT":  {},
+		"VALARM":    {},
+	}
+		for comp := range componentTypes {
+			if _, ok := allowedComponents[comp]; !ok {
+				writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
+				return
+			}
+		}
+	_, hasEvent := componentTypes["VEVENT"]
+	_, hasTodo := componentTypes["VTODO"]
+	_, hasJournal := componentTypes["VJOURNAL"]
+	_, hasFreeBusy := componentTypes["VFREEBUSY"]
+	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
+		return
+	}
+
+		if conditions := validateCalendarObjectResource(string(body)); len(conditions) > 0 {
+			writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)
+			return
+		}
+
+		minDate, maxDate := caldavDateLimits()
+		for _, t := range extractICalDateTimes(string(body)) {
+			if t.Before(minDate) {
+				writeCalDAVError(w, http.StatusForbidden, "min-date-time")
+				return
+			}
+			if t.After(maxDate) {
+				writeCalDAVError(w, http.StatusForbidden, "max-date-time")
+				return
+			}
+		}
+
+		if attendeeCount := countICalAttendees(string(body)); attendeeCount > caldavMaxAttendees {
+			writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
+			return
+		}
+		if count, ok := extractICalRRULECount(string(body)); ok && count > caldavMaxInstances {
+			writeCalDAVError(w, http.StatusForbidden, "max-instances")
 			return
 		}
 
 		// Extract UID from calendar data (RFC 4791 Section 4.1)
 		uid, err := extractUIDFromICalendar(string(body))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("invalid iCalendar data: %v", err), http.StatusBadRequest)
+			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
+			return
+		}
+		resourceName := resourceUID
+		if resourceName == "" {
+			resourceName = uid
+		}
+
+		// RFC 4791 Section 4.1: UID must be persistent - check for conflicts
+		// Case 1: Resource path exists with different UID (UID change attempt)
+		existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
+		if err != nil {
+			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			return
+		}
+		if existingByResource != nil && existingByResource.UID != uid {
+			// Reject: client trying to change UID of existing resource
+			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
 			return
 		}
 
-		existing, _ := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+		// Case 2: UID exists at different resource path (UID reuse attempt)
+		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+		if err != nil {
+			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			return
+		}
+		if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
+			// Reject: client trying to use same UID at different path
+			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			return
+		}
 
 		// Check conditional request headers (RFC 4791 Section 5.3.1-5.3.2)
 		if !h.checkConditionalHeaders(r, existing) {
@@ -783,7 +1033,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, RawICAL: string(body), ETag: etag}); err != nil {
+		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: string(body), ETag: etag}); err != nil {
 			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
 		}
@@ -856,7 +1106,18 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
-	if calendarID, uid, matched := parseResourcePath(cleanPath, "/dav/calendars"); matched {
+	if calendarID, uid, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
+		if err == store.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAmbiguousCalendar) {
+			http.Error(w, "ambiguous calendar path", http.StatusConflict)
+			return
+		}
+		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		return
+	} else if matched {
 		// Block deletes from birthday calendar
 		if calendarID == birthdayCalendarID {
 			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
@@ -877,12 +1138,20 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Check conditional headers before deletion
-		existing, _ := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+		existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
+		if err != nil {
+			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			return
+		}
 		if !h.checkConditionalHeaders(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
 		}
-		if err := h.store.Events.DeleteByUID(r.Context(), calendarID, uid); err != nil {
+		if existing == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if err := h.store.Events.DeleteByUID(r.Context(), calendarID, existing.UID); err != nil {
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
 			return
 		}
@@ -914,150 +1183,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unsupported path", http.StatusBadRequest)
 }
 
-func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
-	user, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		http.Error(w, "missing user", http.StatusUnauthorized)
-		return
-	}
-
-	cleanPath := path.Clean(r.URL.Path)
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	if r.ContentLength > maxDAVBodyBytes {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
-	body, err := io.ReadAll(limitedBody)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		} else {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
-		}
-		return
-	}
-	var report reportRequest
-	if err := xml.Unmarshal(body, &report); err != nil {
-		http.Error(w, "invalid REPORT body", http.StatusBadRequest)
-		return
-	}
-
-	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
-		parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
-		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			http.Error(w, "invalid calendar path", http.StatusBadRequest)
-			return
-		}
-		calID, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			http.Error(w, "invalid calendar id", http.StatusBadRequest)
-			return
-		}
-
-		// Handle birthday calendar reports
-		if calID == birthdayCalendarID {
-			responses, syncToken, err := h.birthdayCalendarReportResponses(r.Context(), user, h.principalURL(user), cleanPath, report)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			payload := multistatus{
-				XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-				XmlnsD:    "DAV:",
-				XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-				XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-				XmlnsCS:   "http://calendarserver.org/ns/",
-				SyncToken: syncToken,
-				Response:  responses,
-			}
-			w.WriteHeader(http.StatusMultiStatus)
-			_ = xml.NewEncoder(w).Encode(payload)
-			return
-		}
-
-		// Handle regular calendar reports
-		cal, err := h.loadCalendar(r.Context(), user, calID)
-		if err != nil {
-			status := http.StatusInternalServerError
-			if err == store.ErrNotFound {
-				status = http.StatusNotFound
-			}
-			http.Error(w, "calendar not found", status)
-			return
-		}
-		responses, syncToken, err := h.calendarReportResponses(r.Context(), cal, h.principalURL(user), cleanPath, report)
-		if err != nil {
-			if errors.Is(err, errInvalidSyncToken) {
-				http.Error(w, "invalid sync token", http.StatusForbidden)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-
-		payload := multistatus{
-			XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-			XmlnsD:    "DAV:",
-			XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-			XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-			XmlnsCS:   "http://calendarserver.org/ns/",
-			SyncToken: syncToken,
-			Response:  responses,
-		}
-		w.WriteHeader(http.StatusMultiStatus)
-		_ = xml.NewEncoder(w).Encode(payload)
-		return
-	}
-
-	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-		if len(parts) < 2 || parts[1] == "" {
-			http.Error(w, "invalid address book path", http.StatusBadRequest)
-			return
-		}
-		bookID, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			http.Error(w, "invalid address book id", http.StatusBadRequest)
-			return
-		}
-		book, err := h.loadAddressBook(r.Context(), user, bookID)
-		if err != nil {
-			status := http.StatusInternalServerError
-			if err == store.ErrNotFound {
-				status = http.StatusNotFound
-			}
-			http.Error(w, "address book not found", status)
-			return
-		}
-		responses, syncToken, err := h.addressBookReportResponses(r.Context(), book, h.principalURL(user), cleanPath, report)
-		if err != nil {
-			if errors.Is(err, errInvalidSyncToken) {
-				http.Error(w, "invalid sync token", http.StatusForbidden)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-
-		payload := multistatus{
-			XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-			XmlnsD:    "DAV:",
-			XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-			XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-			XmlnsCS:   "http://calendarserver.org/ns/",
-			SyncToken: syncToken,
-			Response:  responses,
-		}
-		w.WriteHeader(http.StatusMultiStatus)
-		_ = xml.NewEncoder(w).Encode(payload)
-		return
-	}
-
-	http.Error(w, "REPORT not supported for path", http.StatusBadRequest)
-}
-
 // buildPropfindResponses constructs DAV multistatus responses for a path.
 func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
 	cleanPath := path.Clean(reqPath)
@@ -1087,13 +1212,45 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		}
 		return res, nil
 	case strings.HasPrefix(cleanPath, "/dav/principals"):
-		return h.principalResponses(cleanPath, depth, user, ensureCollectionHref)
+		responses, err := h.principalResponses(cleanPath, depth, user, ensureCollectionHref)
+		if err != nil {
+			return nil, err
+		}
+		if propfindReq != nil && propfindReq.AllProp != nil {
+			for i := range responses {
+				for j := range responses[i].Propstat {
+					responses[i].Propstat[j].Prop.CalendarHomeSet = nil
+					responses[i].Propstat[j].Prop.AddressbookHomeSet = nil
+				}
+			}
+		}
+		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/calendars"):
-		return h.calendarResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
+		responses, err := h.calendarResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
+		if err != nil {
+			return nil, err
+		}
+		if propfindReq != nil && propfindReq.AllProp != nil {
+			stripCalendarAllprop(responses)
+		}
+		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
 		return h.addressBookResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
 	default:
 		return nil, http.ErrNotSupported
+	}
+}
+
+func stripCalendarAllprop(responses []response) {
+	for i := range responses {
+		for j := range responses[i].Propstat {
+			prop := &responses[i].Propstat[j].Prop
+			if prop.ResourceType.Calendar == nil {
+				continue
+			}
+			prop.CalendarTimezone = nil
+			prop.SupportedCalendarData = nil
+		}
 	}
 }
 
@@ -1113,34 +1270,34 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 			birthdayHref := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
 			birthdayName := "Birthdays"
 			birthdayDesc := "Contact birthdays from your address books"
-			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
-			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, principalHref, birthdayToken, "0"))
+			// Use stable sync-token (epoch) for birthday calendar to ensure consistency
+			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, principalHref, birthdayToken, "0", true))
 
 			// Add regular calendars
 			for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := fmt.Sprintf("%d", c.CTag)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = append(res, calendarCollectionResponse(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag))
+				res = append(res, calendarCollectionResponse(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, false))
 			}
 		}
 		return res, nil
 	}
 
 	segments := strings.Split(relPath, "/")
-	calID, err := strconv.ParseInt(segments[0], 10, 64)
-	if err != nil {
+	if len(segments) > 2 {
 		return nil, http.ErrNotSupported
 	}
-
-	// Handle birthday calendar
+	calID, err := strconv.ParseInt(segments[0], 10, 64)
 	if calID == birthdayCalendarID {
 		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
 		birthdayName := "Birthdays"
 		birthdayDesc := "Contact birthdays from your address books"
-		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
+		// Use stable sync-token (epoch) for birthday calendar to ensure consistency
+		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 		principalHref := h.principalURL(user)
-		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0")}
+		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true)}
 
 		if depth == "1" {
 			events, err := h.generateBirthdayEvents(ctx, user.ID)
@@ -1153,15 +1310,44 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		return res, nil
 	}
 
-	cal, err := h.loadCalendar(ctx, user, calID)
+	var cal *store.CalendarAccess
 	if err != nil {
-		return nil, err
+		cal, err = h.loadCalendarByName(ctx, user, segments[0])
+		if err != nil {
+			if errors.Is(err, errAmbiguousCalendar) {
+				return nil, errAmbiguousCalendar
+			}
+			return nil, http.ErrNotSupported
+		}
+	} else {
+		cal, err = h.loadCalendar(ctx, user, calID)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	if len(segments) == 2 {
+		resourceName := strings.TrimSuffix(segments[1], path.Ext(segments[1]))
+		if resourceName == "" {
+			return nil, http.ErrNotSupported
+		}
+		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
+		event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
+		if err != nil {
+			return nil, err
+		}
+		resourceHref := strings.TrimSuffix(href, "/") + "/" + resourceName + ".ics"
+		if event == nil {
+			return []response{{Href: resourceHref, Status: "HTTP/1.1 404 Not Found"}}, nil
+		}
+		return []response{resourceResponse(resourceHref, etagPropWithData(event.ETag, event.RawICAL, true, true))}, nil
+	}
+
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
 	ctag := fmt.Sprintf("%d", cal.CTag)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
-	res := []response{calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag)}
+	res := []response{calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, false)}
 	if depth == "1" {
 		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 		if err != nil {
@@ -1230,6 +1416,47 @@ func (h *Handler) loadCalendar(ctx context.Context, user *store.User, id int64) 
 	return cal, nil
 }
 
+func (h *Handler) loadCalendarByName(ctx context.Context, user *store.User, name string) (*store.CalendarAccess, error) {
+	normalizedName := strings.ToLower(name)
+	accessible, err := h.store.Calendars.ListAccessible(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	var match *store.CalendarAccess
+	for _, c := range accessible {
+		if (c.Slug != nil && *c.Slug == normalizedName) || c.Name == name {
+			if match != nil {
+				return nil, errAmbiguousCalendar
+			}
+			copy := c
+			match = &copy
+		}
+	}
+	if match != nil {
+		return match, nil
+	}
+
+	owned, err := h.store.Calendars.ListByUser(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	var ownedMatch *store.CalendarAccess
+	for _, c := range owned {
+		if (c.Slug != nil && *c.Slug == normalizedName) || c.Name == name {
+			if ownedMatch != nil {
+				return nil, errAmbiguousCalendar
+			}
+			cal := store.CalendarAccess{Calendar: c, Editor: true}
+			ownedMatch = &cal
+		}
+	}
+	if ownedMatch != nil {
+		return ownedMatch, nil
+	}
+
+	return nil, store.ErrNotFound
+}
+
 func (h *Handler) loadAddressBook(ctx context.Context, user *store.User, id int64) (*store.AddressBook, error) {
 	book, err := h.store.AddressBooks.GetByID(ctx, id)
 	if err != nil {
@@ -1241,7 +1468,51 @@ func (h *Handler) loadAddressBook(ctx context.Context, user *store.User, id int6
 	return book, nil
 }
 
-// parseResourcePath extracts the numeric collection ID and resource UID from a DAV resource path.
+func (h *Handler) resolveCalendarID(ctx context.Context, user *store.User, segment string) (int64, bool, error) {
+	if segment == "" {
+		return 0, false, nil
+	}
+	if id, err := strconv.ParseInt(segment, 10, 64); err == nil {
+		return id, true, nil
+	}
+	if h.store == nil || h.store.Calendars == nil {
+		return 0, false, nil
+	}
+	cal, err := h.loadCalendarByName(ctx, user, segment)
+	if err != nil {
+		if errors.Is(err, errAmbiguousCalendar) {
+			return 0, false, errAmbiguousCalendar
+		}
+		if err == store.ErrNotFound {
+			return 0, false, store.ErrNotFound
+		}
+		return 0, false, err
+	}
+	return cal.ID, true, nil
+}
+
+func (h *Handler) parseCalendarResourcePath(ctx context.Context, user *store.User, rawPath string) (int64, string, bool, error) {
+	segment, resource, ok := parseCalendarResourceSegments(rawPath)
+	if !ok {
+		return 0, "", false, nil
+	}
+	id, ok, err := h.resolveCalendarID(ctx, user, segment)
+	if err != nil {
+		if errors.Is(err, errAmbiguousCalendar) {
+			return 0, resource, true, errAmbiguousCalendar
+		}
+		if err == store.ErrNotFound {
+			return 0, resource, true, err
+		}
+		return 0, "", false, err
+	}
+	if !ok {
+		return 0, resource, true, store.ErrNotFound
+	}
+	return id, resource, true, nil
+}
+
+// parseResourcePath extracts the numeric collection ID and resource name from a DAV resource path.
 // The returned boolean indicates whether the path matched the expected prefix and contained both parts.
 func parseResourcePath(rawPath, prefix string) (int64, string, bool) {
 	cleanPath := normalizeDAVHref(rawPath)
@@ -1315,6 +1586,24 @@ func resolveDAVHref(basePath, rawHref string) string {
 	return normalizeDAVHref(path.Join(base, trimmed))
 }
 
+// isValidCalendarSlug validates calendar slugs for path safety.
+// Slugs must: start/end with alphanumeric, contain only [a-z0-9-], be 1-64 chars.
+func isValidCalendarSlug(slug string) bool {
+	if len(slug) == 0 || len(slug) > 64 {
+		return false
+	}
+	// Must start and end with alphanumeric (not hyphen)
+	if slug[0] == '-' || slug[len(slug)-1] == '-' {
+		return false
+	}
+	for _, ch := range slug {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 const syncTokenPrefix = "urn:calcard-sync"
 
 type syncTokenInfo struct {
@@ -1360,353 +1649,6 @@ func (h *Handler) calendarSyncTokenValue(ctx context.Context, cal *store.Calenda
 
 func (h *Handler) addressBookSyncTokenValue(ctx context.Context, book *store.AddressBook) (string, time.Time) {
 	return buildSyncToken("card", book.ID, book.UpdatedAt), book.UpdatedAt
-}
-
-type multistatus struct {
-	XMLName   xml.Name   `xml:"d:multistatus"`
-	XmlnsD    string     `xml:"xmlns:d,attr"`
-	XmlnsC    string     `xml:"xmlns:cal,attr"`
-	XmlnsA    string     `xml:"xmlns:card,attr"`
-	XmlnsCS   string     `xml:"xmlns:cs,attr,omitempty"`
-	SyncToken string     `xml:"d:sync-token,omitempty"`
-	Response  []response `xml:"d:response"`
-}
-
-type response struct {
-	Href     string     `xml:"d:href"`
-	Propstat []propstat `xml:"d:propstat,omitempty"`
-	Status   string     `xml:"d:status,omitempty"`
-}
-
-type propstat struct {
-	Prop   prop   `xml:"d:prop"`
-	Status string `xml:"d:status"`
-}
-
-type prop struct {
-	DisplayName                   string                         `xml:"d:displayname,omitempty"`
-	ResourceType                  resourceType                   `xml:"d:resourcetype"`
-	GetETag                       string                         `xml:"d:getetag,omitempty"`
-	GetContentType                string                         `xml:"d:getcontenttype,omitempty"`
-	CalendarData                  cdataString                    `xml:"cal:calendar-data,omitempty"`
-	AddressData                   cdataString                    `xml:"card:address-data,omitempty"`
-	CalendarDescription           string                         `xml:"cal:calendar-description,omitempty"`
-	CalendarTimezone              *string                        `xml:"cal:calendar-timezone,omitempty"`
-	AddressBookDesc               string                         `xml:"card:addressbook-description,omitempty"`
-	SyncToken                     string                         `xml:"d:sync-token,omitempty"`
-	CTag                          string                         `xml:"cs:getctag,omitempty"`
-	CurrentUserPrincipal          *hrefProp                      `xml:"d:current-user-principal,omitempty"`
-	PrincipalURL                  *hrefProp                      `xml:"d:principal-URL,omitempty"`
-	CalendarHomeSet               *hrefListProp                  `xml:"cal:calendar-home-set,omitempty"`
-	AddressbookHomeSet            *hrefListProp                  `xml:"card:addressbook-home-set,omitempty"`
-	SupportedReportSet            *supportedReportSet            `xml:"d:supported-report-set,omitempty"`
-	SupportedCalendarComponentSet *supportedCalendarComponentSet `xml:"cal:supported-calendar-component-set,omitempty"`
-	MaxResourceSize               string                         `xml:"cal:max-resource-size,omitempty"`
-	MinDateTime                   string                         `xml:"cal:min-date-time,omitempty"`
-	MaxDateTime                   string                         `xml:"cal:max-date-time,omitempty"`
-	MaxInstances                  string                         `xml:"cal:max-instances,omitempty"`
-	MaxAttendeesPerInstance       string                         `xml:"cal:max-attendees-per-instance,omitempty"`
-}
-
-// cdataString wraps string content in CDATA for raw XML output.
-// This preserves special characters like CRLF in iCalendar/vCard data.
-type cdataString string
-
-func (c cdataString) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	if c == "" {
-		return nil
-	}
-	return e.EncodeElement(struct {
-		S string `xml:",cdata"`
-	}{S: string(c)}, start)
-}
-
-type resourceType struct {
-	Collection  *struct{} `xml:"d:collection,omitempty"`
-	Calendar    *struct{} `xml:"cal:calendar,omitempty"`
-	AddressBook *struct{} `xml:"card:addressbook,omitempty"`
-	Principal   *struct{} `xml:"d:principal,omitempty"`
-}
-
-type reportRequest struct {
-	XMLName      xml.Name
-	Hrefs        []string        `xml:"DAV: href"`
-	SyncToken    string          `xml:"DAV: sync-token"`
-	Filter       *calFilter      `xml:"urn:ietf:params:xml:ns:caldav filter"`
-	CalendarData *calendarDataEl `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-	Prop         *reportProp     `xml:"DAV: prop"`
-}
-
-// reportProp captures the prop element in reports for partial retrieval
-type reportProp struct {
-	CalendarData *calendarDataEl `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-}
-
-// calendarDataEl specifies what calendar data to return (RFC 4791 Section 9.6)
-type calendarDataEl struct {
-	Expand *expandEl `xml:"urn:ietf:params:xml:ns:caldav expand"`
-}
-
-// expandEl specifies recurrence expansion parameters
-type expandEl struct {
-	Start string `xml:"start,attr"`
-	End   string `xml:"end,attr"`
-}
-
-// propfindRequest represents a PROPFIND request body (RFC 4918 Section 9.1)
-type propfindRequest struct {
-	XMLName  xml.Name
-	AllProp  *struct{}          `xml:"DAV: allprop"`
-	PropName *struct{}          `xml:"DAV: propname"`
-	Prop     *propfindPropQuery `xml:"DAV: prop"`
-}
-
-// propfindPropQuery lists specific properties requested
-type propfindPropQuery struct {
-	DisplayName                   *struct{} `xml:"DAV: displayname"`
-	ResourceType                  *struct{} `xml:"DAV: resourcetype"`
-	GetETag                       *struct{} `xml:"DAV: getetag"`
-	GetContentType                *struct{} `xml:"DAV: getcontenttype"`
-	CalendarData                  *struct{} `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-	AddressData                   *struct{} `xml:"urn:ietf:params:xml:ns:carddav address-data"`
-	CalendarDescription           *struct{} `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
-	CalendarTimezone              *struct{} `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
-	AddressBookDesc               *struct{} `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
-	SyncToken                     *struct{} `xml:"DAV: sync-token"`
-	CTag                          *struct{} `xml:"http://calendarserver.org/ns/ getctag"`
-	CurrentUserPrincipal          *struct{} `xml:"DAV: current-user-principal"`
-	PrincipalURL                  *struct{} `xml:"DAV: principal-URL"`
-	CalendarHomeSet               *struct{} `xml:"urn:ietf:params:xml:ns:caldav calendar-home-set"`
-	AddressbookHomeSet            *struct{} `xml:"urn:ietf:params:xml:ns:carddav addressbook-home-set"`
-	SupportedReportSet            *struct{} `xml:"DAV: supported-report-set"`
-	SupportedCalendarComponentSet *struct{} `xml:"urn:ietf:params:xml:ns:caldav supported-calendar-component-set"`
-}
-
-// calFilter represents a CalDAV calendar-query filter (RFC 4791 Section 9.7)
-type calFilter struct {
-	CompFilter compFilter `xml:"urn:ietf:params:xml:ns:caldav comp-filter"`
-}
-
-// compFilter filters by component type and optionally by time-range
-type compFilter struct {
-	Name       string       `xml:"name,attr"`
-	TimeRange  *timeRange   `xml:"urn:ietf:params:xml:ns:caldav time-range"`
-	CompFilter []compFilter `xml:"urn:ietf:params:xml:ns:caldav comp-filter"`
-	PropFilter []propFilter `xml:"urn:ietf:params:xml:ns:caldav prop-filter"`
-	TextMatch  *textMatch   `xml:"urn:ietf:params:xml:ns:caldav text-match"`
-}
-
-// propFilter filters by property presence and optionally by text-match
-type propFilter struct {
-	Name         string     `xml:"name,attr"`
-	IsNotDefined *struct{}  `xml:"urn:ietf:params:xml:ns:caldav is-not-defined"`
-	TextMatch    *textMatch `xml:"urn:ietf:params:xml:ns:caldav text-match"`
-}
-
-// textMatch filters by text content
-type textMatch struct {
-	Text            string `xml:",chardata"`
-	Collation       string `xml:"collation,attr,omitempty"`
-	NegateCondition string `xml:"negate-condition,attr,omitempty"`
-}
-
-// timeRange filters events within a time window (RFC 4791 Section 9.9)
-type timeRange struct {
-	Start string `xml:"start,attr"`
-	End   string `xml:"end,attr"`
-}
-
-func collectionResponse(href, name string) response {
-	return response{
-		Href:     href,
-		Propstat: []propstat{statusOKProp(name, resourceType{Collection: &struct{}{}})},
-	}
-}
-
-func calendarCollectionResponse(href, name string, description, timezone *string, principalHref, syncToken, ctag string) response {
-	resp := response{
-		Href:     href,
-		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, Calendar: &struct{}{}}, principalHref, true, false)},
-	}
-	if syncToken != "" {
-		resp.Propstat[0].Prop.SyncToken = syncToken
-	}
-	if ctag != "" {
-		resp.Propstat[0].Prop.CTag = ctag
-	}
-	if description != nil && *description != "" {
-		resp.Propstat[0].Prop.CalendarDescription = *description
-	}
-	// Always include calendar-timezone property (RFC 4791 Section 5.2.2)
-	// Even if empty, clients expect this property to be present
-	if timezone != nil {
-		resp.Propstat[0].Prop.CalendarTimezone = timezone
-	} else {
-		emptyTZ := ""
-		resp.Propstat[0].Prop.CalendarTimezone = &emptyTZ
-	}
-	// Add supported calendar component set (RFC 4791 Section 5.2.3)
-	resp.Propstat[0].Prop.SupportedCalendarComponentSet = supportedCalendarComponents()
-
-	// Add calendar limits (RFC 4791 Section 5.2.5-5.2.9)
-	resp.Propstat[0].Prop.MaxResourceSize = "10485760"     // 10MB limit
-	resp.Propstat[0].Prop.MinDateTime = "19000101T000000Z" // Year 1900
-	resp.Propstat[0].Prop.MaxDateTime = "21001231T235959Z" // Year 2100
-	resp.Propstat[0].Prop.MaxInstances = "1000"            // Max recurring instances to expand
-	resp.Propstat[0].Prop.MaxAttendeesPerInstance = "100"  // Max attendees per event
-
-	return resp
-}
-
-func addressBookCollectionResponse(href, name string, description *string, principalHref, syncToken, ctag string) response {
-	resp := response{
-		Href:     href,
-		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}}, principalHref, false, true)},
-	}
-	if syncToken != "" {
-		resp.Propstat[0].Prop.SyncToken = syncToken
-	}
-	if ctag != "" {
-		resp.Propstat[0].Prop.CTag = ctag
-	}
-	if description != nil && *description != "" {
-		resp.Propstat[0].Prop.AddressBookDesc = *description
-	}
-	return resp
-}
-
-func statusOKProp(name string, rtype resourceType) propstat {
-	return propstat{
-		Prop: prop{
-			DisplayName:  name,
-			ResourceType: rtype,
-		},
-		Status: "HTTP/1.1 200 OK",
-	}
-}
-
-func statusOKPropWithExtras(name string, rtype resourceType, principalHref string, includeCalendarHome, includeAddressHome bool) propstat {
-	p := prop{
-		DisplayName:          name,
-		ResourceType:         rtype,
-		CurrentUserPrincipal: &hrefProp{Href: principalHref},
-	}
-	if includeCalendarHome {
-		p.CalendarHomeSet = &hrefListProp{Href: []string{"/dav/calendars/"}}
-		p.SupportedReportSet = calendarSupportedReports()
-	}
-	if includeAddressHome {
-		p.AddressbookHomeSet = &hrefListProp{Href: []string{"/dav/addressbooks/"}}
-		p.SupportedReportSet = addressbookSupportedReports()
-	}
-	if !includeCalendarHome && !includeAddressHome {
-		p.SupportedReportSet = combinedSupportedReports()
-	}
-	return propstat{Prop: p, Status: "HTTP/1.1 200 OK"}
-}
-
-func etagProp(etag, data string, calendar bool) propstat {
-	return etagPropWithData(etag, data, calendar, true)
-}
-
-// etagPropWithData allows control over whether to include the full data
-func etagPropWithData(etag, data string, calendar bool, includeData bool) propstat {
-	propVal := prop{GetETag: fmt.Sprintf("\"%s\"", etag)}
-	if includeData {
-		if calendar {
-			propVal.CalendarData = cdataString(data)
-			propVal.GetContentType = "text/calendar; charset=utf-8"
-		} else {
-			propVal.AddressData = cdataString(data)
-			propVal.GetContentType = "text/vcard; charset=utf-8"
-		}
-	}
-	return propstat{Prop: propVal, Status: "HTTP/1.1 200 OK"}
-}
-
-func resourceResponse(href string, ps propstat) response {
-	return response{Href: href, Propstat: []propstat{ps}}
-}
-
-// deletedResponse returns a response indicating the resource was deleted (for sync-collection).
-func deletedResponse(href string) response {
-	return response{Href: href, Status: "HTTP/1.1 404 Not Found"}
-}
-
-type hrefProp struct {
-	Href string `xml:"d:href"`
-}
-
-type hrefListProp struct {
-	Href []string `xml:"d:href"`
-}
-
-type supportedReportSet struct {
-	Reports []supportedReport `xml:"d:supported-report"`
-}
-
-type supportedReport struct {
-	Report reportType `xml:"d:report"`
-}
-
-type reportType struct {
-	CalendarMultiGet    *struct{} `xml:"cal:calendar-multiget,omitempty"`
-	CalendarQuery       *struct{} `xml:"cal:calendar-query,omitempty"`
-	FreeBusyQuery       *struct{} `xml:"cal:free-busy-query,omitempty"`
-	AddressbookMultiGet *struct{} `xml:"card:addressbook-multiget,omitempty"`
-	AddressbookQuery    *struct{} `xml:"card:addressbook-query,omitempty"`
-	SyncCollection      *struct{} `xml:"d:sync-collection,omitempty"`
-}
-
-type supportedCalendarComponentSet struct {
-	Comps []comp `xml:"cal:comp"`
-}
-
-type comp struct {
-	Name string `xml:"name,attr"`
-}
-
-func calendarSupportedReports() *supportedReportSet {
-	return &supportedReportSet{
-		Reports: []supportedReport{
-			{Report: reportType{CalendarMultiGet: &struct{}{}}},
-			{Report: reportType{CalendarQuery: &struct{}{}}},
-			{Report: reportType{FreeBusyQuery: &struct{}{}}},
-			{Report: reportType{SyncCollection: &struct{}{}}},
-		},
-	}
-}
-
-func addressbookSupportedReports() *supportedReportSet {
-	return &supportedReportSet{
-		Reports: []supportedReport{
-			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
-			{Report: reportType{AddressbookQuery: &struct{}{}}},
-			{Report: reportType{SyncCollection: &struct{}{}}},
-		},
-	}
-}
-
-func combinedSupportedReports() *supportedReportSet {
-	return &supportedReportSet{
-		Reports: []supportedReport{
-			{Report: reportType{CalendarMultiGet: &struct{}{}}},
-			{Report: reportType{CalendarQuery: &struct{}{}}},
-			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
-			{Report: reportType{AddressbookQuery: &struct{}{}}},
-			{Report: reportType{SyncCollection: &struct{}{}}},
-		},
-	}
-}
-
-func supportedCalendarComponents() *supportedCalendarComponentSet {
-	return &supportedCalendarComponentSet{
-		Comps: []comp{
-			{Name: "VEVENT"},
-			{Name: "VTODO"},
-			{Name: "VJOURNAL"},
-		},
-	}
 }
 
 func (h *Handler) principalURL(user *store.User) string {
@@ -1756,22 +1698,23 @@ func rootCollectionResponse(href string, user *store.User, principalHref string)
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: "HTTP/1.1 200 OK"}}}
 }
 
-func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
+	calData := reportCalendarData(report)
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, cal.ID, report.Hrefs, cleanPath)
+		res, err := h.calendarMultiGet(ctx, cal, report.Hrefs, resolvePath, responsePath, calData)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, cal.ID, cleanPath, report.Filter)
+		res, err := h.calendarQuery(ctx, cal.ID, responsePath, report.Filter, calData)
 		return res, "", err
 	case "free-busy-query":
-		res, err := h.freeBusyQuery(ctx, cal.ID, cleanPath, report.Filter)
+		res, err := h.freeBusyQuery(ctx, cal.ID, responsePath, report.Filter)
 		return res, "", err
 	case "sync-collection":
-		return h.calendarSyncCollection(ctx, cal, principalHref, cleanPath, report)
+		return h.calendarSyncCollection(ctx, cal, principalHref, responsePath, report, calData)
 	default:
 		// Fallback: return all events to keep clients moving even if they send unsupported report types.
-		res, err := h.calendarQuery(ctx, cal.ID, cleanPath, nil)
+		res, err := h.calendarQuery(ctx, cal.ID, responsePath, nil, calData)
 		return res, "", err
 	}
 }
@@ -2029,59 +1972,6 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 	return false
 }
 
-// extractRRule extracts the RRULE value from iCalendar data
-func extractRRule(icalData string) string {
-	lines := strings.Split(icalData, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		line = strings.TrimSuffix(line, "\r")
-		upperLine := strings.ToUpper(line)
-		if strings.HasPrefix(upperLine, "RRULE:") {
-			return strings.TrimPrefix(line, "RRULE:")
-		}
-	}
-	return ""
-}
-
-// extractRRuleParam extracts a parameter value from an RRULE string
-// Example: "FREQ=WEEKLY;BYDAY=MO,WE,FR" -> extractRRuleParam(rrule, "FREQ") returns "WEEKLY"
-func extractRRuleParam(rrule, param string) string {
-	parts := strings.Split(rrule, ";")
-	paramUpper := strings.ToUpper(param) + "="
-	for _, part := range parts {
-		if strings.HasPrefix(strings.ToUpper(part), paramUpper) {
-			return strings.TrimPrefix(part, param+"=")
-		}
-	}
-	return ""
-}
-
-// parseICalDateTime parses iCalendar datetime format (RFC 5545)
-func parseICalDateTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, fmt.Errorf("empty datetime")
-	}
-
-	// Remove timezone suffix if present (Z for UTC)
-	s = strings.TrimSuffix(s, "Z")
-
-	// Try various iCalendar formats
-	formats := []string{
-		"20060102T150405",      // Basic format
-		"20060102T150405Z",     // UTC format
-		"2006-01-02T15:04:05",  // Extended format
-		"2006-01-02T15:04:05Z", // Extended UTC
-	}
-
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t.UTC(), nil
-		}
-	}
-
-	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
-}
-
 // freeBusyQuery generates a VFREEBUSY response (RFC 4791 Section 7.10)
 func (h *Handler) freeBusyQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter) ([]response, error) {
 	events, err := h.store.Events.ListForCalendar(ctx, calID)
@@ -2146,7 +2036,7 @@ func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) stri
 	return sb.String()
 }
 
-func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter) ([]response, error) {
+func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter, calData *calendarDataEl) ([]response, error) {
 	events, err := h.store.Events.ListForCalendar(ctx, calID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events")
@@ -2157,33 +2047,51 @@ func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath stri
 		events = h.applyCalendarFilter(events, filter)
 	}
 
-	return calendarResourceResponses(cleanPath, events), nil
+	return calendarResourceResponsesFiltered(cleanPath, events, calData), nil
 }
 
-func (h *Handler) calendarMultiGet(ctx context.Context, calID int64, hrefs []string, cleanPath string) ([]response, error) {
+func (h *Handler) calendarMultiGet(ctx context.Context, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.calendarQuery(ctx, calID, cleanPath, nil)
+		return h.calendarQuery(ctx, cal.ID, responsePath, nil, calData)
 	}
+	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 	var responses []response
 	for _, href := range hrefs {
-		cleanHref := resolveDAVHref(cleanPath, href)
+		cleanHref := resolveDAVHref(resolvePath, href)
 		if cleanHref == "" {
 			continue
 		}
-		id, uid, ok := parseResourcePath(cleanHref, "/dav/calendars")
-		if !ok || id != calID {
+		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
+		if !ok || !calendarSegmentMatches(cal, segment) {
 			continue
 		}
-		ev, err := h.store.Events.GetByUID(ctx, calID, uid)
+		responseHref := responseBase + uid + ".ics"
+		ev, err := h.store.Events.GetByResourceName(ctx, cal.ID, uid)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch event")
 		}
 		if ev == nil {
+			responses = append(responses, response{Href: responseHref, Status: "HTTP/1.1 404 Not Found"})
 			continue
 		}
-		responses = append(responses, resourceResponse(cleanHref, etagProp(ev.ETag, ev.RawICAL, true)))
+		rawData := filterICalendarData(ev.RawICAL, calData)
+		responses = append(responses, resourceResponse(responseHref, etagProp(ev.ETag, rawData, true)))
 	}
 	return responses, nil
+}
+
+func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
+	if segment == "" {
+		return false
+	}
+	if segment == strconv.FormatInt(cal.ID, 10) {
+		return true
+	}
+	normalizedSegment := strings.ToLower(segment)
+	if cal.Slug != nil && *cal.Slug == normalizedSegment {
+		return true
+	}
+	return cal.Name == segment
 }
 
 func (h *Handler) addressBookQuery(ctx context.Context, bookID int64, cleanPath string) ([]response, error) {
@@ -2213,6 +2121,7 @@ func (h *Handler) addressBookMultiGet(ctx context.Context, bookID int64, hrefs [
 			return nil, fmt.Errorf("failed to fetch contact")
 		}
 		if c == nil {
+			responses = append(responses, response{Href: cleanHref, Status: "HTTP/1.1 404 Not Found"})
 			continue
 		}
 		responses = append(responses, resourceResponse(cleanHref, etagProp(c.ETag, c.RawVCard, false)))
@@ -2224,12 +2133,30 @@ func calendarResourceResponses(base string, events []store.Event) []response {
 	return calendarResourceResponsesWithData(base, events, true)
 }
 
+func eventResourceName(ev store.Event) string {
+	if ev.ResourceName != "" {
+		return ev.ResourceName
+	}
+	return ev.UID
+}
+
+func calendarResourceResponsesFiltered(base string, events []store.Event, calData *calendarDataEl) []response {
+	baseHref := strings.TrimSuffix(base, "/") + "/"
+	var responses []response
+	for _, ev := range events {
+		href := baseHref + eventResourceName(ev) + ".ics"
+		rawData := filterICalendarData(ev.RawICAL, calData)
+		responses = append(responses, resourceResponse(href, etagProp(ev.ETag, rawData, true)))
+	}
+	return responses
+}
+
 // calendarResourceResponsesWithData allows control over including calendar data
 func calendarResourceResponsesWithData(base string, events []store.Event, includeData bool) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	var responses []response
 	for _, ev := range events {
-		href := baseHref + ev.UID + ".ics"
+		href := baseHref + eventResourceName(ev) + ".ics"
 		responses = append(responses, resourceResponse(href, etagPropWithData(ev.ETag, ev.RawICAL, true, includeData)))
 	}
 	return responses
@@ -2245,7 +2172,7 @@ func addressBookResourceResponses(base string, contacts []store.Contact) []respo
 	return responses
 }
 
-func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, calData *calendarDataEl) ([]response, string, error) {
 	syncToken, _ := h.calendarSyncTokenValue(ctx, cal)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
@@ -2270,9 +2197,9 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 	}
 
 	responses := []response{
-		calendarCollectionResponse(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag)),
+		calendarCollectionResponse(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), false),
 	}
-	responses = append(responses, calendarResourceResponses(collectionHref, events)...)
+	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 
 	// Include deleted resources if this is an incremental sync
 	if !since.IsZero() {
@@ -2281,7 +2208,11 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 			return nil, "", fmt.Errorf("failed to list deleted events")
 		}
 		for _, d := range deleted {
-			href := collectionHref + d.UID + ".ics"
+			resourceName := d.ResourceName
+			if resourceName == "" {
+				resourceName = d.UID
+			}
+			href := collectionHref + resourceName + ".ics"
 			responses = append(responses, deletedResponse(href))
 		}
 	}
@@ -2325,7 +2256,11 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.Add
 			return nil, "", fmt.Errorf("failed to list deleted contacts")
 		}
 		for _, d := range deleted {
-			href := collectionHref + d.UID + ".vcf"
+			resourceName := d.ResourceName
+			if resourceName == "" {
+				resourceName = d.UID
+			}
+			href := collectionHref + resourceName + ".vcf"
 			responses = append(responses, deletedResponse(href))
 		}
 	}
@@ -2466,9 +2401,25 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 		return []response{resourceResponse(href, etagProp(etag, freeBusyData, true))}, "", nil
 	case "sync-collection":
 		// Birthday calendar doesn't support incremental sync, always return all events
+		// Validate incoming sync-token if provided (RFC 6578)
+		if report.SyncToken != "" {
+			info, err := parseSyncToken(report.SyncToken)
+			if err != nil || info.Kind != "cal" || info.ID != birthdayCalendarID {
+				return nil, "", errInvalidSyncToken
+			}
+		}
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
-		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Now())
-		responses := calendarResourceResponses(collectionHref, events)
+		// Use a stable sync-token (epoch time) since we always return all events
+		// This ensures consistency across requests for Apple Calendar compatibility
+		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+		birthdayName := "Birthdays"
+		birthdayDesc := "Contact birthdays from your address books"
+		calData := reportCalendarData(report)
+		// Include the collection response first (matching regular calendar behavior)
+		responses := []response{
+			calendarCollectionResponse(collectionHref, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true),
+		}
+		responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 		return responses, syncToken, nil
 	default:
 		// Fallback: return all events
@@ -2494,12 +2445,14 @@ func (h *Handler) birthdayCalendarMultiGet(ctx context.Context, events []store.E
 		if cleanHref == "" {
 			continue
 		}
+		// Birthday calendar uses numeric-only parsing (special virtual calendar with constant ID -1)
 		id, uid, ok := parseResourcePath(cleanHref, "/dav/calendars")
 		if !ok || id != birthdayCalendarID {
 			continue
 		}
 		ev, found := eventsByUID[uid]
 		if !found {
+			responses = append(responses, response{Href: cleanHref, Status: "HTTP/1.1 404 Not Found"})
 			continue
 		}
 		responses = append(responses, resourceResponse(cleanHref, etagProp(ev.ETag, ev.RawICAL, true)))

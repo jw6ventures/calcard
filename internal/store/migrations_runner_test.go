@@ -28,6 +28,22 @@ func TestApplyMigrationsEmptyDatabase(t *testing.T) {
 		{expect: regexp.MustCompile("-- Shared calendars"), args: nil},
 		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"004_shared_calendars.sql"}},
 	}}
+	tx5 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Add slug column for MKCALENDAR path mapping"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"005_calendar_slug.sql"}},
+	}}
+	tx6 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Track CalDAV resource names separately from UID"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"006_event_resource_name.sql"}},
+	}}
+	tx7 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Enforce case-insensitive uniqueness for calendar slugs"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"007_calendar_slug_unique.sql"}},
+	}}
+	tx8 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Track deleted resource names for CalDAV/CardDAV sync"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"008_deleted_resource_name.sql"}},
+	}}
 
 	pool := &mockPool{
 		t: t,
@@ -38,11 +54,15 @@ func TestApplyMigrationsEmptyDatabase(t *testing.T) {
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"002_scalability.sql"}, value: false},
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"003_birthdays.sql"}, value: false},
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"004_shared_calendars.sql"}, value: false},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"005_calendar_slug.sql"}, value: false},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"006_event_resource_name.sql"}, value: false},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"007_calendar_slug_unique.sql"}, value: false},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"008_deleted_resource_name.sql"}, value: false},
 		},
 		execs: []execExpectation{
 			{expect: regexp.MustCompile("CREATE TABLE IF NOT EXISTS schema_migrations"), args: nil},
 		},
-		txs: []*mockTx{tx1, tx2, tx3, tx4},
+		txs: []*mockTx{tx1, tx2, tx3, tx4, tx5, tx6, tx7, tx8},
 	}
 
 	if err := ApplyMigrations(context.Background(), pool); err != nil {
@@ -53,6 +73,11 @@ func TestApplyMigrationsEmptyDatabase(t *testing.T) {
 	tx1.assertDone()
 	tx2.assertDone()
 	tx3.assertDone()
+	tx4.assertDone()
+	tx5.assertDone()
+	tx6.assertDone()
+	tx7.assertDone()
+	tx8.assertDone()
 }
 
 func TestApplyMigrationsPopulatedWithoutTracking(t *testing.T) {
@@ -69,6 +94,22 @@ func TestApplyMigrationsPopulatedWithoutTracking(t *testing.T) {
 		{expect: regexp.MustCompile("-- Shared calendars"), args: nil},
 		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"004_shared_calendars.sql"}},
 	}}
+	tx5 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Add slug column for MKCALENDAR path mapping"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"005_calendar_slug.sql"}},
+	}}
+	tx6 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Track CalDAV resource names separately from UID"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"006_event_resource_name.sql"}},
+	}}
+	tx7 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Enforce case-insensitive uniqueness for calendar slugs"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"007_calendar_slug_unique.sql"}},
+	}}
+	tx8 := &mockTx{execs: []execExpectation{
+		{expect: regexp.MustCompile("-- Track deleted resource names for CalDAV/CardDAV sync"), args: nil},
+		{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"008_deleted_resource_name.sql"}},
+	}}
 
 	pool := &mockPool{
 		t: t,
@@ -83,12 +124,20 @@ func TestApplyMigrationsPopulatedWithoutTracking(t *testing.T) {
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"003_birthdays.sql"}, value: false},
 			// Fourth migration not yet applied
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"004_shared_calendars.sql"}, value: false},
+			// Fifth migration not yet applied
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"005_calendar_slug.sql"}, value: false},
+			// Sixth migration not yet applied
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"006_event_resource_name.sql"}, value: false},
+			// Seventh migration not yet applied
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"007_calendar_slug_unique.sql"}, value: false},
+			// Eighth migration not yet applied
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"008_deleted_resource_name.sql"}, value: false},
 		},
 		execs: []execExpectation{
 			{expect: regexp.MustCompile("CREATE TABLE IF NOT EXISTS schema_migrations"), args: nil},
 			{expect: regexp.MustCompile("INSERT INTO schema_migrations"), args: []any{"001_init.sql"}},
 		},
-		txs: []*mockTx{tx2, tx3, tx4},
+		txs: []*mockTx{tx2, tx3, tx4, tx5, tx6, tx7, tx8},
 	}
 
 	if err := ApplyMigrations(context.Background(), pool); err != nil {
@@ -98,6 +147,11 @@ func TestApplyMigrationsPopulatedWithoutTracking(t *testing.T) {
 	pool.assertDone()
 	tx2.assertDone()
 	tx3.assertDone()
+	tx4.assertDone()
+	tx5.assertDone()
+	tx6.assertDone()
+	tx7.assertDone()
+	tx8.assertDone()
 }
 
 func TestApplyMigrationsAllAlreadyApplied(t *testing.T) {
@@ -109,6 +163,10 @@ func TestApplyMigrationsAllAlreadyApplied(t *testing.T) {
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"002_scalability.sql"}, value: true},
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"003_birthdays.sql"}, value: true},
 			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"004_shared_calendars.sql"}, value: true},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"005_calendar_slug.sql"}, value: true},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"006_event_resource_name.sql"}, value: true},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"007_calendar_slug_unique.sql"}, value: true},
+			{expect: regexp.MustCompile("schema_migrations WHERE version=\\$1"), args: []any{"008_deleted_resource_name.sql"}, value: true},
 		},
 	}
 

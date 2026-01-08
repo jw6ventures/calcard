@@ -16,6 +16,7 @@ type Calendar struct {
 	ID          int64
 	UserID      int64
 	Name        string
+	Slug        *string
 	Description *string
 	Timezone    *string
 	Color       *string
@@ -46,6 +47,7 @@ type Event struct {
 	ID           int64
 	CalendarID   int64
 	UID          string
+	ResourceName string
 	RawICAL      string
 	ETag         string
 	Summary      *string
@@ -97,6 +99,7 @@ type DeletedResource struct {
 	ResourceType string // "event" or "contact"
 	CollectionID int64
 	UID          string
+	ResourceName string
 	DeletedAt    time.Time
 }
 

@@ -87,7 +87,7 @@ type calendarRepo struct {
 }
 
 func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar, error) {
-	const q = `SELECT id, user_id, name, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
+	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "calendars.list_by_user")()
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
@@ -98,7 +98,7 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 	var result []Calendar
 	for rows.Next() {
 		var c Calendar
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -107,10 +107,10 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 }
 
 func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error) {
-	const q = `SELECT id, user_id, name, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE id=$1`
+	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE id=$1`
 	defer observeDB(ctx, "calendars.get_by_id")()
 	var c Calendar
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := r.pool.QueryRow(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -121,13 +121,13 @@ func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error)
 
 func (r *calendarRepo) ListAccessible(ctx context.Context, userID int64) ([]CalendarAccess, error) {
 	const q = `
-SELECT c.id, c.user_id, c.name, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
+SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email, FALSE as shared, TRUE as editor
 FROM calendars c
 JOIN users u ON u.id = c.user_id
 WHERE c.user_id = $1
 UNION ALL
-SELECT c.id, c.user_id, c.name, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
+SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email, TRUE as shared, cs.editor
 FROM calendars c
 JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
@@ -144,7 +144,7 @@ ORDER BY shared, name
 	var result []CalendarAccess
 	for rows.Next() {
 		var c CalendarAccess
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -154,7 +154,7 @@ ORDER BY shared, name
 
 func (r *calendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error) {
 	const q = `
-SELECT c.id, c.user_id, c.name, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
+SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email,
        CASE WHEN c.user_id = $2 THEN FALSE ELSE TRUE END as shared,
        COALESCE(cs.editor, TRUE) as editor
@@ -165,7 +165,7 @@ WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
 `
 	defer observeDB(ctx, "calendars.get_accessible")()
 	var c CalendarAccess
-	if err := r.pool.QueryRow(ctx, q, calendarID, userID).Scan(&c.ID, &c.UserID, &c.Name, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+	if err := r.pool.QueryRow(ctx, q, calendarID, userID).Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -175,11 +175,11 @@ WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
 }
 
 func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, error) {
-	const q = `INSERT INTO calendars (user_id, name, description, timezone, color) VALUES ($1, $2, $3, $4, $5) RETURNING id, user_id, name, description, timezone, color, ctag, created_at, updated_at`
+	const q = `INSERT INTO calendars (user_id, name, slug, description, timezone, color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at`
 	defer observeDB(ctx, "calendars.create")()
-	row := r.pool.QueryRow(ctx, q, cal.UserID, cal.Name, cal.Description, cal.Timezone, cal.Color)
+	row := r.pool.QueryRow(ctx, q, cal.UserID, cal.Name, cal.Slug, cal.Description, cal.Timezone, cal.Color)
 	var created Calendar
-	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.Description, &created.Timezone, &created.Color, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
+	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.Slug, &created.Description, &created.Timezone, &created.Color, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &created, nil
@@ -275,11 +275,15 @@ type eventRepo struct {
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
 	// Parse iCal to extract fields
 	summary, dtstart, dtend, allDay := parseICalFields(event.RawICAL)
+	if event.ResourceName == "" {
+		event.ResourceName = event.UID
+	}
 
 	const q = `
-INSERT INTO events (calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
         etag = EXCLUDED.etag,
         summary = EXCLUDED.summary,
@@ -287,12 +291,12 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
         last_modified = NOW()
-RETURNING id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRow(ctx, q, event.CalendarID, event.UID, event.RawICAL, event.ETag, summary, dtstart, dtend, allDay)
+	row := r.pool.QueryRow(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, dtstart, dtend, allDay)
 	var ev Event
-	if err := row.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+	if err := row.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 		return nil, err
 	}
 	return &ev, nil
@@ -306,10 +310,23 @@ func (r *eventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid strin
 }
 
 func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error) {
-	const q = `SELECT id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
 	defer observeDB(ctx, "events.get_by_uid")()
 	var ev Event
-	if err := r.pool.QueryRow(ctx, q, calendarID, uid).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+	if err := r.pool.QueryRow(ctx, q, calendarID, uid).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &ev, nil
+}
+
+func (r *eventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error) {
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`
+	defer observeDB(ctx, "events.get_by_resource_name")()
+	var ev Event
+	if err := r.pool.QueryRow(ctx, q, calendarID, resourceName).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -322,7 +339,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 	if len(uids) == 0 {
 		return []Event{}, nil
 	}
-	const q = `SELECT id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
 	defer observeDB(ctx, "events.list_by_uids")()
 	rows, err := r.pool.Query(ctx, q, calendarID, uids)
 	if err != nil {
@@ -333,7 +350,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 	var result []Event
 	for rows.Next() {
 		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -342,7 +359,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 }
 
 func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error) {
-	const q = `SELECT id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_for_calendar")()
 	rows, err := r.pool.Query(ctx, q, calendarID)
 	if err != nil {
@@ -353,7 +370,7 @@ func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Ev
 	var result []Event
 	for rows.Next() {
 		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -371,7 +388,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 		return nil, err
 	}
 
-	const q = `SELECT id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
 	rows, err := r.pool.Query(ctx, q, calendarID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -381,7 +398,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 	var items []Event
 	for rows.Next() {
 		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 			return nil, err
 		}
 		items = append(items, ev)
@@ -399,7 +416,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 }
 
 func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error) {
-	const q = `SELECT id, calendar_id, uid, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_modified_since")()
 	rows, err := r.pool.Query(ctx, q, calendarID, since)
 	if err != nil {
@@ -410,7 +427,7 @@ func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, sin
 	var result []Event
 	for rows.Next() {
 		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -420,7 +437,7 @@ func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, sin
 
 func (r *eventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error) {
 	const q = `
-SELECT e.id, e.calendar_id, e.uid, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified
+SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified
 FROM events e
 JOIN calendars c ON c.id = e.calendar_id
 LEFT JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
@@ -438,7 +455,7 @@ LIMIT $2
 	var result []Event
 	for rows.Next() {
 		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -602,7 +619,7 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 	}
 
 	// Create a tombstone in the source address book for sync
-	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid) VALUES ('contact', $1, $2)`
+	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $2)`
 	if _, err := tx.Exec(ctx, tombstoneQuery, fromAddressBookID, uid); err != nil {
 		return err
 	}
@@ -892,7 +909,7 @@ type deletedResourceRepo struct {
 }
 
 func (r *deletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error) {
-	const q = `SELECT id, resource_type, collection_id, uid, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`
+	const q = `SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`
 	defer observeDB(ctx, "deleted_resources.list_deleted_since")()
 	rows, err := r.pool.Query(ctx, q, resourceType, collectionID, since)
 	if err != nil {
@@ -903,7 +920,7 @@ func (r *deletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType
 	var result []DeletedResource
 	for rows.Next() {
 		var d DeletedResource
-		if err := rows.Scan(&d.ID, &d.ResourceType, &d.CollectionID, &d.UID, &d.DeletedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.ResourceType, &d.CollectionID, &d.UID, &d.ResourceName, &d.DeletedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, d)

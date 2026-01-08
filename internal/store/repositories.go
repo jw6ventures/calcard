@@ -37,6 +37,7 @@ type EventRepository interface {
 	Upsert(ctx context.Context, event Event) (*Event, error)
 	DeleteByUID(ctx context.Context, calendarID int64, uid string) error
 	GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error)
+	GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error)
 	ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error)
 	ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*PaginatedResult[Event], error)
 	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)

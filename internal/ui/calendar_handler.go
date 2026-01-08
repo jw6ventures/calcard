@@ -431,6 +431,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
 			CalendarID: calendarID,
 			UID:        uid,
+			ResourceName: uid,
 			RawICAL:    eventICAL,
 			ETag:       etag,
 		}); err != nil {
@@ -497,10 +498,11 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	etag := utils.GenerateETag(ical)
 
 	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-		CalendarID: calendarID,
-		UID:        uid,
-		RawICAL:    ical,
-		ETag:       etag,
+		CalendarID:   calendarID,
+		UID:          uid,
+		ResourceName: uid,
+		RawICAL:      ical,
+		ETag:         etag,
 	}); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to create event"})
 		return
@@ -617,11 +619,16 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	etag := utils.GenerateETag(ical)
 
+	resourceName := uid
+	if existing != nil && existing.ResourceName != "" {
+		resourceName = existing.ResourceName
+	}
 	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-		CalendarID: calendarID,
-		UID:        uid,
-		RawICAL:    ical,
-		ETag:       etag,
+		CalendarID:   calendarID,
+		UID:          uid,
+		ResourceName: resourceName,
+		RawICAL:      ical,
+		ETag:         etag,
 	}); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to update event"})
 		return
@@ -720,11 +727,16 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		}
 
 		updatedICAL := utils.BuildFromComponents(header, newComponents, footer)
+		resourceName := uid
+		if existing != nil && existing.ResourceName != "" {
+			resourceName = existing.ResourceName
+		}
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-			CalendarID: calendarID,
-			UID:        uid,
-			RawICAL:    updatedICAL,
-			ETag:       utils.GenerateETag(updatedICAL),
+			CalendarID:   calendarID,
+			UID:          uid,
+			ResourceName: resourceName,
+			RawICAL:      updatedICAL,
+			ETag:         utils.GenerateETag(updatedICAL),
 		}); err != nil {
 			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete occurrence"})
 			return
