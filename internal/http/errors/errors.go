@@ -7,7 +7,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// InternalError logs the actual error with request ID and returns a generic error to the client
 func InternalError(w http.ResponseWriter, r *http.Request, err error, message string) {
 	requestID := middleware.GetReqID(r.Context())
 
@@ -22,7 +21,6 @@ func InternalError(w http.ResponseWriter, r *http.Request, err error, message st
 	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
-// BadRequestError logs the error and returns a safe error message to the client
 func BadRequestError(w http.ResponseWriter, r *http.Request, err error, clientMessage string) {
 	requestID := middleware.GetReqID(r.Context())
 
@@ -35,7 +33,6 @@ func BadRequestError(w http.ResponseWriter, r *http.Request, err error, clientMe
 	http.Error(w, clientMessage, http.StatusBadRequest)
 }
 
-// LogError logs an error with request ID without sending an HTTP response
 func LogError(r *http.Request, message string, err error) {
 	requestID := middleware.GetReqID(r.Context())
 
@@ -46,7 +43,6 @@ func LogError(r *http.Request, message string, err error) {
 	}
 }
 
-// LogInfo logs an informational message with request ID
 func LogInfo(r *http.Request, message string) {
 	requestID := middleware.GetReqID(r.Context())
 

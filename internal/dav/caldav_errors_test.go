@@ -22,17 +22,17 @@ func TestIsValidCalDAVCondition(t *testing.T) {
 		{"test-condition-123", true},
 
 		// Invalid conditions
-		{"", false},                     // Empty
-		{"Max-Resource-Size", false},    // Uppercase
-		{"123-start", false},            // Starts with digit
-		{"-start", false},               // Starts with hyphen
-		{"test_condition", false},       // Underscore not allowed
-		{"test condition", false},       // Space not allowed
-		{"test<script>", false},         // XML characters
-		{"test&amp;", false},            // XML entity
-		{"../../../etc/passwd", false},  // Path traversal attempt
-		{"test;DROP TABLE", false},      // SQL injection attempt
-		{"VALID-CONDITION", false},      // All uppercase
+		{"", false},
+		{"Max-Resource-Size", false},   // Uppercase
+		{"123-start", false},           // Starts with digit
+		{"-start", false},              // Starts with hyphen
+		{"test_condition", false},      // Underscore not allowed
+		{"test condition", false},      // Space not allowed
+		{"test<script>", false},        // XML characters
+		{"test&amp;", false},           // XML entity
+		{"../../../etc/passwd", false}, // Path traversal attempt
+		{"test;DROP TABLE", false},     // SQL injection attempt
+		{"VALID-CONDITION", false},     // All uppercase
 	}
 
 	for _, tt := range tests {
@@ -60,11 +60,9 @@ func TestWriteCalDAVError_ValidCondition(t *testing.T) {
 
 func TestWriteCalDAVError_InvalidCondition(t *testing.T) {
 	w := httptest.NewRecorder()
-	// Attempt XML injection
 	writeCalDAVError(w, 403, "test<script>alert(1)</script>")
 
 	body := w.Body.String()
-	// Should fallback to "invalid-condition" and not include the injection
 	if strings.Contains(body, "<script>") {
 		t.Error("XML injection vulnerability: script tag present in output")
 	}

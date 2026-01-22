@@ -31,11 +31,9 @@ var errInvalidSyncToken = errors.New("invalid sync token")
 var errInvalidPath = errors.New("invalid path")
 var errAmbiguousCalendar = errors.New("ambiguous calendar path")
 
-// maxDAVBodyBytes is the maximum body size for DAV requests. Preventing DOS attacks.
 const maxDAVBodyBytes int64 = 10 * 1024 * 1024
 
 // birthdayCalendarID is a special virtual calendar ID for birthdays from contacts.
-// It's a negative value to distinguish it from regular calendar IDs (which are positive).
 const birthdayCalendarID int64 = -1
 
 func NewHandler(cfg *config.Config, store *store.Store) *Handler {
@@ -938,32 +936,32 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-	componentTypes := extractICalComponentTypes(string(body))
-	allowedComponents := map[string]struct{}{
-		"VCALENDAR": {},
-		"VEVENT":    {},
-		"VTODO":     {},
-		"VJOURNAL":  {},
-		"VFREEBUSY": {},
-		"VTIMEZONE": {},
-		"STANDARD":  {},
-		"DAYLIGHT":  {},
-		"VALARM":    {},
-	}
+		componentTypes := extractICalComponentTypes(string(body))
+		allowedComponents := map[string]struct{}{
+			"VCALENDAR": {},
+			"VEVENT":    {},
+			"VTODO":     {},
+			"VJOURNAL":  {},
+			"VFREEBUSY": {},
+			"VTIMEZONE": {},
+			"STANDARD":  {},
+			"DAYLIGHT":  {},
+			"VALARM":    {},
+		}
 		for comp := range componentTypes {
 			if _, ok := allowedComponents[comp]; !ok {
 				writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
 				return
 			}
 		}
-	_, hasEvent := componentTypes["VEVENT"]
-	_, hasTodo := componentTypes["VTODO"]
-	_, hasJournal := componentTypes["VJOURNAL"]
-	_, hasFreeBusy := componentTypes["VFREEBUSY"]
-	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
-		return
-	}
+		_, hasEvent := componentTypes["VEVENT"]
+		_, hasTodo := componentTypes["VTODO"]
+		_, hasJournal := componentTypes["VJOURNAL"]
+		_, hasFreeBusy := componentTypes["VFREEBUSY"]
+		if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
+			writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
+			return
+		}
 
 		if conditions := validateCalendarObjectResource(string(body)); len(conditions) > 0 {
 			writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)

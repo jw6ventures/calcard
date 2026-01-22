@@ -69,7 +69,6 @@ func NewIPRateLimiter(r rate.Limit, b int, cleanup time.Duration, trustedProxies
 	return limiter
 }
 
-// getLimiter returns the rate limiter for a given IP
 func (l *IPRateLimiter) getLimiter(ip string) *rate.Limiter {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -94,7 +93,6 @@ func (l *IPRateLimiter) getLimiter(ip string) *rate.Limiter {
 	return entry.limiter
 }
 
-// evictOldest removes the oldest entry from the map (caller must hold lock)
 func (l *IPRateLimiter) evictOldest() {
 	var oldestIP string
 	var oldestTime time.Time
@@ -111,7 +109,6 @@ func (l *IPRateLimiter) evictOldest() {
 	}
 }
 
-// cleanupStale periodically removes inactive rate limiters to prevent memory leaks
 func (l *IPRateLimiter) cleanupStale() {
 	ticker := time.NewTicker(l.cleanup)
 	defer ticker.Stop()
@@ -145,9 +142,6 @@ func (l *IPRateLimiter) Middleware() func(http.Handler) http.Handler {
 	}
 }
 
-// getClientIP extracts the client IP from the request
-// If trustedProxies is configured, only trusts X-Forwarded-For from those IPs
-// If trustedProxies is empty (default), trusts all proxies for backwards compatibility
 func (l *IPRateLimiter) getClientIP(r *http.Request) string {
 	remoteIP := parseIP(r.RemoteAddr)
 
@@ -192,13 +186,11 @@ func (l *IPRateLimiter) getClientIP(r *http.Request) string {
 	return remoteIP.String()
 }
 
-// parseIP extracts the IP from addr (which may be "ip:port")
 func parseIP(addr string) net.IP {
 	// Try parsing as IP:port first
 	host, _, err := net.SplitHostPort(addr)
 	if err == nil {
 		return net.ParseIP(host)
 	}
-	// Otherwise parse as IP directly
 	return net.ParseIP(addr)
 }

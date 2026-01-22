@@ -88,16 +88,16 @@ type reportProp struct {
 
 // calendarDataEl specifies what calendar data to return (RFC 4791 Section 9.6)
 type calendarDataEl struct {
-	Expand *expandEl     `xml:"urn:ietf:params:xml:ns:caldav expand"`
+	Expand *expandEl      `xml:"urn:ietf:params:xml:ns:caldav expand"`
 	Comp   []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
 	Prop   []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
 }
 
 // calendarComp describes component selection within calendar-data.
 type calendarComp struct {
-	Name string          `xml:"name,attr"`
-	Comp []calendarComp  `xml:"urn:ietf:params:xml:ns:caldav comp"`
-	Prop []calendarProp  `xml:"urn:ietf:params:xml:ns:caldav prop"`
+	Name string         `xml:"name,attr"`
+	Comp []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
+	Prop []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
 }
 
 // calendarProp describes property selection within calendar-data.
@@ -169,7 +169,6 @@ type textMatch struct {
 	NegateCondition string `xml:"negate-condition,attr,omitempty"`
 }
 
-// timeRange filters events within a time window (RFC 4791 Section 9.9)
 type timeRange struct {
 	Start string `xml:"start,attr"`
 	End   string `xml:"end,attr"`

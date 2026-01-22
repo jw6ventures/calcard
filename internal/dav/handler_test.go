@@ -54,7 +54,7 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 				AddressBookID: 1,
 				UID:           "contact4",
 				DisplayName:   &name1,
-				Birthday:      nil, // No birthday
+				Birthday:      nil,
 			},
 		},
 	}
@@ -67,7 +67,6 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 		t.Fatalf("generateBirthdayEvents returned error: %v", err)
 	}
 
-	// Should generate 3 events (excluding the one without birthday)
 	if len(events) != 3 {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}

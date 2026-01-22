@@ -31,11 +31,9 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := safeUnmarshalXML(body, &propfindReq); err != nil {
-			// If parsing fails, default to allprop behavior
 			propfindReq.AllProp = &struct{}{}
 		}
 	} else {
-		// Empty body means allprop by default
 		propfindReq.AllProp = &struct{}{}
 	}
 

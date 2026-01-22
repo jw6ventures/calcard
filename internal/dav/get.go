@@ -83,7 +83,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/calendar")
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", event.ETag))
-		// RFC 4791 Section 5.3.4: Include Last-Modified header
 		if !event.LastModified.IsZero() {
 			w.Header().Set("Last-Modified", event.LastModified.UTC().Format(http.TimeFormat))
 		}
@@ -111,7 +110,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/vcard")
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", contact.ETag))
-		// Include Last-Modified header if available
 		if !contact.LastModified.IsZero() {
 			w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
 		}

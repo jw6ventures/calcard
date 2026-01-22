@@ -36,7 +36,6 @@ func init() {
 func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service) http.Handler {
 	r := chi.NewRouter()
 
-	// Create rate limiters
 	// Auth endpoints: 5 requests per second, burst of 10
 	authRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(5), 10, 5*time.Minute, cfg.TrustedProxies)
 	// DAV endpoints: 20 requests per second, burst of 50 (more permissive for sync clients)

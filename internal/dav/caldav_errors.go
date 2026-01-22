@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-// isValidCalDAVCondition validates that a condition string is safe for XML output.
-// CalDAV condition names must match: ^[a-z][a-z0-9-]*$
 func isValidCalDAVCondition(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -29,9 +27,7 @@ func isValidCalDAVCondition(s string) bool {
 }
 
 func writeCalDAVError(w http.ResponseWriter, status int, condition string) {
-	// Validate condition to prevent XML injection
 	if !isValidCalDAVCondition(condition) {
-		// Fallback to generic error if condition is invalid
 		condition = "invalid-condition"
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -56,9 +52,8 @@ func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...stri
 		if strings.TrimSpace(condition) == "" {
 			continue
 		}
-		// Validate condition to prevent XML injection
 		if !isValidCalDAVCondition(condition) {
-			continue // Skip invalid conditions
+			continue
 		}
 		builder.WriteString("<C:")
 		builder.WriteString(condition)

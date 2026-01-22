@@ -188,7 +188,6 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid address book path", http.StatusBadRequest)
 			return
 		}
-		// Reject REPORT requests on resource paths (only allow on collection)
 		if len(parts) > 2 && parts[2] != "" {
 			http.Error(w, "REPORT not allowed on address book object resources", http.StatusForbidden)
 			return

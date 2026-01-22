@@ -64,7 +64,6 @@ func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (
 	}}, nil
 }
 
-// BeginOAuth starts the OAuth/OIDC authorization flow.
 func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
 	state, err := randomState()
 	if err != nil {
@@ -86,7 +85,6 @@ func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
-// HandleOAuthCallback completes the OAuth flow and creates a session.
 func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	stateCookie, err := r.Cookie("calcard_oauth_state")
 	if err != nil || stateCookie.Value == "" || stateCookie.Value != r.URL.Query().Get("state") {
@@ -163,7 +161,6 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 	return plaintext, created, nil
 }
 
-// ValidateAppPassword verifies Basic Auth credentials for DAV clients.
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
 	user, err := s.store.Users.GetByEmail(ctx, username)
 	if err != nil {
@@ -194,7 +191,6 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 	return nil, errors.New("invalid app password")
 }
 
-// RequireSession retrieves the current user from a web session or redirects.
 func (s *Service) RequireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -215,7 +211,6 @@ func (s *Service) RequireSession(next http.Handler) http.Handler {
 	})
 }
 
-// RequireDAVAuth enforces Basic Auth for DAV endpoints.
 func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
@@ -241,7 +236,6 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 	})
 }
 
-// ClearSession removes the session cookie and database record for the current request.
 func (s *Service) ClearSession(w http.ResponseWriter, r *http.Request) {
 	s.sessions.Clear(r.Context(), w, r)
 }

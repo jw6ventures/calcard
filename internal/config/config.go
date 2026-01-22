@@ -28,10 +28,9 @@ type Config struct {
 	}
 
 	PrometheusEnabled bool
-	TrustedProxies    []string // CIDR ranges or IPs of trusted reverse proxies
+	TrustedProxies    []string
 }
 
-// Load reads configuration from environment variables with basic validation.
 func Load() (*Config, error) {
 	cfg := &Config{}
 
@@ -60,9 +59,12 @@ func Load() (*Config, error) {
 	if cfg.Session.Secret == "" {
 		return nil, errors.New("APP_SESSION_SECRET is required")
 	}
-	// Validate session secret strength (minimum 32 characters for security)
 	if len(cfg.Session.Secret) < 32 {
 		return nil, fmt.Errorf("APP_SESSION_SECRET must be at least 32 characters long (got %d)", len(cfg.Session.Secret))
+	}
+
+	if len(cfg.TrustedProxies) == 0 {
+		fmt.Println("WARNING: No APP_TRUSTED_PROXIES configured. CalCard will trust all proxies - Not recommended for public environments.")
 	}
 
 	return cfg, nil

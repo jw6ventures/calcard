@@ -15,10 +15,9 @@ import (
 
 const (
 	sessionCookieName = "calcard_session"
-	sessionDuration   = 7 * 24 * time.Hour // 7 days
+	sessionDuration   = 7 * 24 * time.Hour
 )
 
-// SessionManager manages web UI sessions backed by the database.
 type SessionManager struct {
 	cfg    *config.Config
 	store  *store.Store
@@ -38,7 +37,6 @@ func NewSessionManager(cfg *config.Config, st *store.Store) *SessionManager {
 	}
 }
 
-// Issue creates a new database session and sets the session cookie.
 func (m *SessionManager) Issue(ctx context.Context, w http.ResponseWriter, r *http.Request, userID int64) error {
 	sessionID, err := generateSessionID()
 	if err != nil {
@@ -78,7 +76,6 @@ func (m *SessionManager) Issue(ctx context.Context, w http.ResponseWriter, r *ht
 	return nil
 }
 
-// Clear removes the session cookie and deletes the session from the database.
 func (m *SessionManager) Clear(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		_ = m.store.Sessions.Delete(ctx, c.Value)
@@ -95,8 +92,6 @@ func (m *SessionManager) Clear(ctx context.Context, w http.ResponseWriter, r *ht
 	})
 }
 
-// GetSession retrieves the session from the database if the cookie is present and valid.
-// Returns the session and updates last_seen_at timestamp.
 func (m *SessionManager) GetSession(ctx context.Context, r *http.Request) (*store.Session, error) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil {
@@ -114,7 +109,6 @@ func (m *SessionManager) GetSession(ctx context.Context, r *http.Request) (*stor
 		return nil, nil
 	}
 
-	// Touch last seen (fire and forget)
 	go func() {
 		_ = m.store.Sessions.TouchLastSeen(context.Background(), session.ID)
 	}()
@@ -122,7 +116,6 @@ func (m *SessionManager) GetSession(ctx context.Context, r *http.Request) (*stor
 	return session, nil
 }
 
-// CurrentUserID extracts the user ID from the request session if present and valid.
 func (m *SessionManager) CurrentUserID(ctx context.Context, r *http.Request) (int64, string, bool) {
 	session, err := m.GetSession(ctx, r)
 	if err != nil || session == nil {
@@ -140,9 +133,7 @@ func generateSessionID() (string, error) {
 }
 
 func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header first (for proxies)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
 		if idx := len(xff); idx > 0 {
 			for i := 0; i < len(xff); i++ {
 				if xff[i] == ',' {
@@ -153,11 +144,9 @@ func getClientIP(r *http.Request) string {
 		}
 	}
 
-	// Check X-Real-IP header
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return xri
 	}
 
-	// Fall back to RemoteAddr
 	return r.RemoteAddr
 }

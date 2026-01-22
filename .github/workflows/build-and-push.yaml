@@ -92,28 +92,31 @@ jobs:
           echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
 
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
             "${TAG_ARGS[@]}" \
             --push .
 
-      - name: Extract calcard binary
+      - name: Extract calcard binaries
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          docker pull "${PRIMARY_TAG}"
-          CID="$(docker create "${PRIMARY_TAG}")"
-          docker cp "${CID}:/calcard" artifacts/calcard
-          docker rm "${CID}"
+          for platform in linux/amd64 linux/arm64 linux/arm/v7; do
+            docker pull --platform "${platform}" "${PRIMARY_TAG}"
+            CID="$(docker create --platform "${platform}" "${PRIMARY_TAG}")"
+            filename="calcard-${platform//\//-}"
+            docker cp "${CID}:/calcard" "artifacts/${filename}"
+            docker rm "${CID}"
+          done
           ls -lh artifacts
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
-          path: artifacts/calcard
+          path: artifacts/calcard-*
 
       - name: Publish binary to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/calcard
+          files: artifacts/calcard-*

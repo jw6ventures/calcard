@@ -3,23 +3,8 @@
 set -e  # Exit on error
 
 OUTPUT="THIRD_PARTY_NOTICES.txt"
-TEMP_DIR="third_party_licenses"
-GO_LICENSES="$HOME/go/bin/go-licenses"
-
-# Check if go-licenses is installed
-if [ ! -f "$GO_LICENSES" ]; then
-    echo "go-licenses not found. Installing..."
-    go install github.com/google/go-licenses@latest
-fi
 
 echo "Extracting license information from dependencies..."
-
-# Clean up any existing temporary directory
-rm -rf "$TEMP_DIR"
-
-# Run go-licenses to extract all license files
-# Ignore the local package itself to avoid AGPL "forbidden" error
-$GO_LICENSES save ./cmd/server --save_path="$TEMP_DIR" --ignore gitea.jw6.us/james/calcard 2>&1 | grep -v "contains non-Go code"
 
 # Create the output file header
 cat > "$OUTPUT" << 'HEADER'
@@ -38,21 +23,26 @@ add_license() {
     echo "" >> "$OUTPUT"
     echo "================================================================================" >> "$OUTPUT"
     echo "Package: $package_path" >> "$OUTPUT"
+    echo "License file: $(basename "$license_file")" >> "$OUTPUT"
     echo "================================================================================" >> "$OUTPUT"
     echo "" >> "$OUTPUT"
     cat "$license_file" >> "$OUTPUT"
     echo "" >> "$OUTPUT"
 }
 
-# Find all LICENSE files and add them to the output
-find "$TEMP_DIR" -type f -name "LICENSE*" | sort | while read license_file; do
-    # Extract package path from file path
-    package_path=$(echo "$license_file" | sed "s|^$TEMP_DIR/||" | sed 's|/LICENSE.*$||')
-    add_license "$package_path" "$license_file"
+# Enumerate modules with their on-disk directories, skipping the main module.
+# This avoids go-licenses' dependency on module metadata for stdlib packages.
+go list -m -f '{{if not .Main}}{{.Path}}|{{.Dir}}{{end}}' all | while IFS='|' read -r module_path module_dir; do
+    [ -n "$module_path" ] || continue
+    [ -d "$module_dir" ] || continue
+    # Collect common license/notice files in the module directory.
+    find "$module_dir" -maxdepth 2 -type f \( \
+        -iname "LICENSE*" -o \
+        -iname "COPYING*" -o \
+        -iname "NOTICE*" \
+    \) | sort | while read -r license_file; do
+        add_license "$module_path" "$license_file"
+    done
 done
 
-# Clean up temporary directory
-rm -rf "$TEMP_DIR"
-
 echo "Created $OUTPUT with all third-party licenses"
-echo "Cleaned up temporary files"

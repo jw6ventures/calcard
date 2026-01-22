@@ -25,7 +25,7 @@ func main() {
 		logLevelString = "Info"
 	}
 	logLevel := jw6_utils.LogLevelFromString(logLevelString)
-	// Initialize utilities
+
 	jw6utils := jw6_utils.Utils{LogLevel: logLevel}
 	jw6utils.PrintBanner("CalCard", version, "2025", 3, "James Williams")
 

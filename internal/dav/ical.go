@@ -84,7 +84,6 @@ func isDigits(s string) bool {
 	return s != ""
 }
 
-// extractRRule extracts the RRULE value from iCalendar data
 func extractRRule(icalData string) string {
 	lines := strings.Split(icalData, "\n")
 	for _, line := range lines {
