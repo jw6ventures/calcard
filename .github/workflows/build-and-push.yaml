@@ -1,4 +1,4 @@
-name: Build and Push to Harbor
+name: Build and Publish
 
 on:
   push:
@@ -107,7 +107,7 @@ jobs:
           ls -lh artifacts
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
           path: artifacts/calcard
