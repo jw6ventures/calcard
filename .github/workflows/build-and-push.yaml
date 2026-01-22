@@ -5,7 +5,12 @@ on:
     branches:
       - main
       - develop
+    tags:
+      - '*'
   workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
 
 jobs:
   security-scan:
@@ -38,20 +43,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Harbor
+      - name: Login to GHCR
         env:
-          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
-          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "${HARBOR_PASSWORD}" | docker login "${HARBOR_HOST}" -u "${HARBOR_USERNAME}" --password-stdin
+          echo "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
 
       - name: Build and push image
         env:
-          HARBOR_HOST: ${{ secrets.HARBOR_HOST }}
-          HARBOR_PROJECT: ${{ secrets.HARBOR_PROJECT }}
-          HARBOR_REPOSITORY: ${{ secrets.HARBOR_REPOSITORY }}
+          GHCR_OWNER: ${{ github.repository_owner }}
+          GHCR_REPOSITORY: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           REF="${GITHUB_REF:-}"
@@ -67,7 +70,7 @@ jobs:
             BRANCH="${GITHUB_REF_NAME:-${DEFAULT_BRANCH}}"
           fi
 
-          IMAGE="${HARBOR_HOST}/${HARBOR_PROJECT}/${HARBOR_REPOSITORY:-calcard}"
+          IMAGE="ghcr.io/${GHCR_OWNER}/${GHCR_REPOSITORY}"
 
           TAG_ARGS=(
             -t "${IMAGE}:${BRANCH}-${SHORT_SHA}"
@@ -109,23 +112,8 @@ jobs:
           name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
           path: artifacts/calcard
 
-      - name: Publish binary to Gitea Packages (tags only)
+      - name: Publish binary to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          PACKAGE_OWNER: ${{ github.repository_owner }}
-          PACKAGE_NAME: calcard
-          TAG_NAME: ${{ github.ref_name }}
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-          GITEA_SERVER_URL: ${{ github.server_url }}
-        run: |
-          set -euo pipefail
-          if [ ! -f artifacts/calcard ]; then
-            echo "calcard binary missing" >&2
-            exit 1
-          fi
-
-          DEST_URL="${GITEA_SERVER_URL}/api/packages/${PACKAGE_OWNER}/generic/${PACKAGE_NAME}/${TAG_NAME}/calcard"
-          curl -f -X PUT \
-            -H "Authorization: token ${GITEA_TOKEN}" \
-            -T artifacts/calcard \
-            "${DEST_URL}"
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/calcard

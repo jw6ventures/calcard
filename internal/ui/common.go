@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"gitea.jw6.us/james/calcard/internal/http/csrf"
+	"gitea.jw6.us/james/calcard/internal/http/errors"
 )
 
 const defaultPageSize = 50
@@ -63,14 +64,14 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request, path string, 
 }
 
 // render executes a template and writes the response.
-func (h *Handler) render(w http.ResponseWriter, name string, data any) {
+func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, data any) {
 	tmpl, ok := h.templates[name]
 	if !ok {
-		http.Error(w, fmt.Sprintf("template %q not found", name), http.StatusInternalServerError)
+		errors.InternalError(w, r, fmt.Errorf("template not found"), fmt.Sprintf("template %q not found", name))
 		return
 	}
 
 	if err := tmpl.ExecuteTemplate(w, name, data); err != nil {
-		http.Error(w, fmt.Sprintf("template error: %v", err), http.StatusInternalServerError)
+		errors.InternalError(w, r, err, fmt.Sprintf("template render error for %q", name))
 	}
 }

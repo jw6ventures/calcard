@@ -286,15 +286,16 @@ func TestRender(t *testing.T) {
 			templateName: "nonexistent.html",
 			data:         nil,
 			wantStatus:   http.StatusInternalServerError,
-			wantBody:     "template \"nonexistent.html\" not found",
+			wantBody:     "internal server error",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
 
-			h.render(w, tt.templateName, tt.data)
+			h.render(w, r, tt.templateName, tt.data)
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("render() status = %d, want %d", w.Code, tt.wantStatus)

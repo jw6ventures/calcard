@@ -117,7 +117,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		"RecentContacts": contactData,
 	})
 
-	h.render(w, "dashboard.html", data)
+	h.render(w, r, "dashboard.html", data)
 }
 
 // ViewBirthdays shows the virtual birthdays calendar.
@@ -169,5 +169,5 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 		"User":           user,
 		"BirthdayEvents": birthdayEvents,
 	})
-	h.render(w, "birthdays.html", data)
+	h.render(w, r, "birthdays.html", data)
 }

@@ -26,7 +26,7 @@ func (h *Handler) AddressBooks(w http.ResponseWriter, r *http.Request) {
 		"User":  user,
 		"Books": books,
 	})
-	h.render(w, "addressbooks.html", data)
+	h.render(w, r, "addressbooks.html", data)
 }
 
 // CreateAddressBook creates a new address book.
@@ -168,7 +168,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 		"PrevPage":        page - 1,
 		"NextPage":        page + 1,
 	})
-	h.render(w, "addressbook_view.html", data)
+	h.render(w, r, "addressbook_view.html", data)
 }
 
 // CreateContact creates a new contact in an address book.

@@ -84,7 +84,7 @@ func (h *Handler) Calendars(w http.ResponseWriter, r *http.Request) {
 		"ActiveUsers":    users,
 		"ShareableUsers": users,
 	})
-	h.render(w, "calendars.html", data)
+	h.render(w, r, "calendars.html", data)
 }
 
 // CreateCalendar creates a new calendar.
@@ -268,7 +268,7 @@ func (h *Handler) ViewCalendar(w http.ResponseWriter, r *http.Request) {
 		"User":     user,
 		"Calendar": cal,
 	})
-	h.render(w, "calendar_view.html", data)
+	h.render(w, r, "calendar_view.html", data)
 }
 
 // GetCalendarEventsJSON returns events for a specific month in JSON format.
@@ -429,11 +429,11 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		etag := utils.GenerateETag(eventICAL)
 
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-			CalendarID: calendarID,
-			UID:        uid,
+			CalendarID:   calendarID,
+			UID:          uid,
 			ResourceName: uid,
-			RawICAL:    eventICAL,
-			ETag:       etag,
+			RawICAL:      eventICAL,
+			ETag:         etag,
 		}); err != nil {
 			continue
 		}
@@ -486,6 +486,17 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
+	if dtstart == "" || dtend == "" {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "start and end are required"})
+		return
+	}
+
+	// Validate date format and range
+	if err := validateEventDates(dtstart, dtend); err != nil {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
+		return
+	}
+
 	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
@@ -571,6 +582,17 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
+	if dtstart == "" || dtend == "" {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "start and end are required"})
+		return
+	}
+
+	// Validate date format and range
+	if err := validateEventDates(dtstart, dtend); err != nil {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
+		return
+	}
+
 	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
@@ -749,4 +771,47 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "event_deleted"})
 	}
+}
+
+// validateEventDates validates that the date strings are parseable and end is after start
+func validateEventDates(dtstart, dtend string) error {
+	// Try parsing as datetime-local format (YYYY-MM-DDTHH:MM)
+	layouts := []string{
+		"2006-01-02T15:04",         // datetime-local
+		"2006-01-02T15:04:05",      // datetime-local with seconds
+		"2006-01-02T15:04:05Z07:00", // RFC3339
+		"2006-01-02",               // date only
+	}
+
+	var startTime, endTime time.Time
+	var startErr, endErr error
+
+	// Try parsing start time
+	for _, layout := range layouts {
+		startTime, startErr = time.Parse(layout, dtstart)
+		if startErr == nil {
+			break
+		}
+	}
+	if startErr != nil {
+		return fmt.Errorf("invalid start date format")
+	}
+
+	// Try parsing end time
+	for _, layout := range layouts {
+		endTime, endErr = time.Parse(layout, dtend)
+		if endErr == nil {
+			break
+		}
+	}
+	if endErr != nil {
+		return fmt.Errorf("invalid end date format")
+	}
+
+	// Validate that end is after start
+	if !endTime.After(startTime) {
+		return fmt.Errorf("end date must be after start date")
+	}
+
+	return nil
 }

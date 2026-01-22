@@ -50,7 +50,7 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 		"User":     user,
 		"Sessions": sessionData,
 	})
-	h.render(w, "sessions.html", data)
+	h.render(w, r, "sessions.html", data)
 }
 
 // RevokeSession revokes a single session.
@@ -211,7 +211,7 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		data["PlainToken"] = plaintext
 		data["FlashMessage"] = "created"
 	}
-	h.render(w, "app_passwords.html", data)
+	h.render(w, r, "app_passwords.html", data)
 }
 
 // Logout logs the user out.

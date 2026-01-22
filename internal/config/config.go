@@ -28,6 +28,7 @@ type Config struct {
 	}
 
 	PrometheusEnabled bool
+	TrustedProxies    []string // CIDR ranges or IPs of trusted reverse proxies
 }
 
 // Load reads configuration from environment variables with basic validation.
@@ -44,7 +45,8 @@ func Load() (*Config, error) {
 	cfg.OAuth.DiscoveryURL = os.Getenv("APP_OAUTH_DISCOVERY_URL")
 	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
-	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", true)
+	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
+	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
 
 	if cfg.DB.DSN == "" {
 		return nil, errors.New("APP_DB_DSN is required")
@@ -57,6 +59,10 @@ func Load() (*Config, error) {
 	}
 	if cfg.Session.Secret == "" {
 		return nil, errors.New("APP_SESSION_SECRET is required")
+	}
+	// Validate session secret strength (minimum 32 characters for security)
+	if len(cfg.Session.Secret) < 32 {
+		return nil, fmt.Errorf("APP_SESSION_SECRET must be at least 32 characters long (got %d)", len(cfg.Session.Secret))
 	}
 
 	return cfg, nil
@@ -79,4 +85,17 @@ func getenvBool(key string, def bool) bool {
 		}
 	}
 	return def
+}
+
+func getenvList(key string) []string {
+	if v := os.Getenv(key); v != "" {
+		var result []string
+		for _, item := range strings.Split(v, ",") {
+			if trimmed := strings.TrimSpace(item); trimmed != "" {
+				result = append(result, trimmed)
+			}
+		}
+		return result
+	}
+	return nil
 }

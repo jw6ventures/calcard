@@ -881,6 +881,20 @@
         div.textContent = str;
         return div.innerHTML;
     }
+
+    function safeUrl(raw) {
+        if (!raw) return '';
+        try {
+            var url = new URL(raw, window.location.origin);
+            var protocol = (url.protocol || '').toLowerCase();
+            if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:') {
+                return url.href;
+            }
+        } catch (e) {
+            return '';
+        }
+        return '';
+    }
     
     function getInitials(name) {
         return name.split(' ').slice(0, 2).map(function(n) { return n.charAt(0); }).join('').toUpperCase();
@@ -897,7 +911,10 @@
         // Avatar
         body += '<div class="modal-avatar' + (contact.photo ? ' has-photo' : '') + '">';
         if (contact.photo) {
-            body += '<img src="' + escapeHtml(contact.photo) + '" alt="">';
+            var photoUrl = safeUrl(contact.photo);
+            if (photoUrl) {
+                body += '<img src="' + escapeHtml(photoUrl) + '" alt="">';
+            }
         } else {
             body += getInitials(contact.fn);
         }
@@ -916,7 +933,7 @@
             body += '<div class="modal-section"><div class="modal-section-title">Phone</div>';
             contact.phones.forEach(function(p) {
                 body += '<div class="modal-item">';
-                body += '<span class="modal-item-label">' + p.type + '</span>';
+                body += '<span class="modal-item-label">' + escapeHtml(p.type) + '</span>';
                 body += '<span class="modal-item-value"><a href="tel:' + escapeHtml(p.value) + '">' + escapeHtml(p.value) + '</a></span>';
                 body += '</div>';
             });
@@ -928,7 +945,7 @@
             body += '<div class="modal-section"><div class="modal-section-title">Email</div>';
             contact.emails.forEach(function(e) {
                 body += '<div class="modal-item">';
-                body += '<span class="modal-item-label">' + e.type + '</span>';
+                body += '<span class="modal-item-label">' + escapeHtml(e.type) + '</span>';
                 body += '<span class="modal-item-value"><a href="mailto:' + escapeHtml(e.value) + '">' + escapeHtml(e.value) + '</a></span>';
                 body += '</div>';
             });
@@ -942,7 +959,7 @@
                 var formatted = formatAddress(a);
                 if (formatted) {
                     body += '<div class="modal-item">';
-                    body += '<span class="modal-item-label">' + a.type + '</span>';
+                    body += '<span class="modal-item-label">' + escapeHtml(a.type) + '</span>';
                     body += '<span class="modal-item-value">' + escapeHtml(formatted) + '</span>';
                     body += '</div>';
                 }
@@ -954,9 +971,11 @@
         if (contact.urls.length) {
             body += '<div class="modal-section"><div class="modal-section-title">Website</div>';
             contact.urls.forEach(function(u) {
+                var href = safeUrl(u.value);
+                if (!href) return;
                 body += '<div class="modal-item">';
-                body += '<span class="modal-item-label">' + u.type + '</span>';
-                body += '<span class="modal-item-value"><a href="' + escapeHtml(u.value) + '" target="_blank">' + escapeHtml(u.value) + '</a></span>';
+                body += '<span class="modal-item-label">' + escapeHtml(u.type) + '</span>';
+                body += '<span class="modal-item-value"><a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(u.value) + '</a></span>';
                 body += '</div>';
             });
             body += '</div>';
@@ -1076,7 +1095,12 @@
             var html = '<div class="contact-header">';
             html += '<div class="contact-avatar' + (contact.photo ? ' has-photo' : '') + '">';
             if (contact.photo) {
-                html += '<img src="' + escapeHtml(contact.photo) + '" alt="">';
+                var photoUrl = safeUrl(contact.photo);
+                if (photoUrl) {
+                    html += '<img src="' + escapeHtml(photoUrl) + '" alt="">';
+                } else {
+                    html += getInitials(contact.fn);
+                }
             } else {
                 html += getInitials(contact.fn);
             }
@@ -1369,4 +1393,3 @@ document.getElementById('move-contact-modal').addEventListener('click', function
 {{end}}
 {{end}}
 {{template "base" .}}
-

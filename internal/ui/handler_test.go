@@ -291,6 +291,26 @@ func TestCreateEventHandler(t *testing.T) {
 			wantStatusCode: http.StatusFound, // Redirects with error
 		},
 		{
+			name:       "missing start",
+			calendarID: "1",
+			userID:     100,
+			formValues: map[string]string{
+				"summary": "Test Event",
+				"dtend":   "2024-01-01T11:00",
+			},
+			wantStatusCode: http.StatusFound, // Redirects with error
+		},
+		{
+			name:       "missing end",
+			calendarID: "1",
+			userID:     100,
+			formValues: map[string]string{
+				"summary": "Test Event",
+				"dtstart": "2024-01-01T10:00",
+			},
+			wantStatusCode: http.StatusFound, // Redirects with error
+		},
+		{
 			name:           "calendar not found",
 			calendarID:     "999",
 			userID:         100,
@@ -922,7 +942,7 @@ func TestMoveContactHandler(t *testing.T) {
 					t.Errorf("MoveContact() redirect location = %s, expected to contain %s", location, expectedLocation)
 				}
 			}
-			
+
 			// Verify tombstone was created on successful move
 			if tc.wantMoved {
 				if !contactRepo.tombstoneCreated {
@@ -941,10 +961,10 @@ func TestMoveContactHandler(t *testing.T) {
 
 type fakeContactRepoWithMove struct {
 	fakeContactRepo
-	moved             bool
-	tombstoneCreated  bool
-	tombstoneBookID   int64
-	tombstoneUID      string
+	moved            bool
+	tombstoneCreated bool
+	tombstoneBookID  int64
+	tombstoneUID     string
 }
 
 func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
@@ -974,22 +994,22 @@ func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAdd
 
 func TestUpdateEventPreservesResourceName(t *testing.T) {
 	testCases := []struct {
-		name                string
+		name                 string
 		existingResourceName string
 		expectedResourceName string
 	}{
 		{
-			name:                "preserves CalDAV-created resource name",
+			name:                 "preserves CalDAV-created resource name",
 			existingResourceName: "custom-resource-name-123.ics",
 			expectedResourceName: "custom-resource-name-123.ics",
 		},
 		{
-			name:                "preserves UID-based resource name",
+			name:                 "preserves UID-based resource name",
 			existingResourceName: "test-event-uid",
 			expectedResourceName: "test-event-uid",
 		},
 		{
-			name:                "handles empty resource name by using UID",
+			name:                 "handles empty resource name by using UID",
 			existingResourceName: "",
 			expectedResourceName: "test-event-uid",
 		},
@@ -1026,10 +1046,10 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 			handler := NewHandler(&config.Config{}, s, nil)
 
 			formData := url.Values{
-				"summary":     {"Updated Summary"},
-				"dtstart":     {"2024-01-02T10:00"},
-				"dtend":       {"2024-01-02T11:00"},
-				"edit_scope":  {"series"},
+				"summary":    {"Updated Summary"},
+				"dtstart":    {"2024-01-02T10:00"},
+				"dtend":      {"2024-01-02T11:00"},
+				"edit_scope": {"series"},
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
@@ -1059,5 +1079,65 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 				t.Error("event summary should be updated")
 			}
 		})
+	}
+}
+
+func TestUpdateEventRequiresDates(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+		},
+	}
+
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{
+			events: map[string]*store.Event{
+				"1:test-event-uid": {
+					ID:           1,
+					CalendarID:   1,
+					UID:          "test-event-uid",
+					ResourceName: "test-event-uid",
+					RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-event-uid\r\nSUMMARY:Original Summary\r\nDTSTART:20240101T100000Z\r\nDTEND:20240101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+					ETag:         "original-etag",
+				},
+			},
+		},
+	}
+
+	s := &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+	}
+
+	handler := NewHandler(&config.Config{}, s, nil)
+
+	formData := url.Values{
+		"summary":    {"Updated Summary"},
+		"dtstart":    {"2024-01-02T10:00"},
+		"edit_scope": {"series"},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 100}))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "test-event-uid")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	rec := httptest.NewRecorder()
+	handler.UpdateEvent(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("UpdateEvent() status = %d, want %d", rec.Code, http.StatusFound)
+	}
+
+	updatedEvent := eventRepo.events["1:test-event-uid"]
+	if updatedEvent == nil {
+		t.Fatal("event should exist after update attempt")
+	}
+	if !strings.Contains(updatedEvent.RawICAL, "Original Summary") {
+		t.Error("event summary should remain unchanged when dates are missing")
 	}
 }

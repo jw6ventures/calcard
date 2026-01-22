@@ -8,11 +8,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 
 	"gitea.jw6.us/james/calcard/internal/auth"
 	"gitea.jw6.us/james/calcard/internal/config"
 	"gitea.jw6.us/james/calcard/internal/dav"
 	"gitea.jw6.us/james/calcard/internal/http/csrf"
+	"gitea.jw6.us/james/calcard/internal/http/ratelimit"
 	"gitea.jw6.us/james/calcard/internal/metrics"
 	"gitea.jw6.us/james/calcard/internal/store"
 	"gitea.jw6.us/james/calcard/internal/ui"
@@ -33,6 +35,12 @@ func init() {
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
 func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service) http.Handler {
 	r := chi.NewRouter()
+
+	// Create rate limiters
+	// Auth endpoints: 5 requests per second, burst of 10
+	authRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(5), 10, 5*time.Minute, cfg.TrustedProxies)
+	// DAV endpoints: 20 requests per second, burst of 50 (more permissive for sync clients)
+	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 50, 5*time.Minute, cfg.TrustedProxies)
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -89,6 +97,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
 	r.Route("/auth", func(r chi.Router) {
+		r.Use(authRateLimiter.Middleware())
 		r.Get("/login", authService.BeginOAuth)
 		r.Get("/callback", authService.HandleOAuthCallback)
 	})
@@ -149,6 +158,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	davHandler := dav.NewHandler(cfg, store)
 
 	r.Route("/dav", func(r chi.Router) {
+		r.Use(davRateLimiter.Middleware())
+
 		// OPTIONS and root PROPFIND must be accessible without authentication for CalDAV client discovery
 		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
 

@@ -514,12 +514,12 @@
             </div>
             <div class="form-row">
                 <div class="form-group">
-                    <label for="create-dtstart">Start</label>
-                    <input type="datetime-local" id="create-dtstart" name="dtstart">
+                    <label for="create-dtstart">Start *</label>
+                    <input type="datetime-local" id="create-dtstart" name="dtstart" required>
                 </div>
                 <div class="form-group">
-                    <label for="create-dtend">End</label>
-                    <input type="datetime-local" id="create-dtend" name="dtend">
+                    <label for="create-dtend">End *</label>
+                    <input type="datetime-local" id="create-dtend" name="dtend" required>
                 </div>
             </div>
             <div class="form-group">
@@ -611,12 +611,12 @@
             </div>
             <div class="form-row">
                 <div class="form-group">
-                    <label for="edit-dtstart">Start</label>
-                    <input type="datetime-local" id="edit-dtstart" name="dtstart">
+                    <label for="edit-dtstart">Start *</label>
+                    <input type="datetime-local" id="edit-dtstart" name="dtstart" required>
                 </div>
                 <div class="form-group">
-                    <label for="edit-dtend">End</label>
-                    <input type="datetime-local" id="edit-dtend" name="dtend">
+                    <label for="edit-dtend">End *</label>
+                    <input type="datetime-local" id="edit-dtend" name="dtend" required>
                 </div>
             </div>
             <div class="form-group">
@@ -1201,7 +1201,7 @@
             body += '<p><strong>Where:</strong> ' + escapeHtml(event.location) + '</p>';
         }
         if (event.status) {
-            body += '<p><strong>Status:</strong> ' + event.status + '</p>';
+            body += '<p><strong>Status:</strong> ' + escapeHtml(event.status) + '</p>';
         }
         if (event.categories && event.categories.length) {
             body += '<p><strong>Categories:</strong> ' + event.categories.map(escapeHtml).join(', ') + '</p>';
