@@ -18,7 +18,6 @@ func TestExtractUIDFromVCard_SimpleLine(t *testing.T) {
 }
 
 func TestExtractUIDFromVCard_FoldedLine(t *testing.T) {
-	// RFC 6350: Lines can be folded using space or tab continuation
 	vcard := "BEGIN:VCARD\nVERSION:3.0\nUID:very-long-unique-identifi\n er-that-spans-multiple-lines\nFN:John Doe\nEND:VCARD"
 	uid, err := extractUIDFromVCard(vcard)
 	if err != nil {

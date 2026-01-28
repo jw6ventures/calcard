@@ -2,6 +2,7 @@ package ui
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -116,6 +117,16 @@ var funcMap = template.FuncMap{
 			return s
 		}
 		return s[:length] + "..."
+	},
+	"toJSON": func(v interface{}) template.JS {
+		if v == nil {
+			return template.JS("null")
+		}
+		data, err := json.Marshal(v)
+		if err != nil {
+			return template.JS("null")
+		}
+		return template.JS(data)
 	},
 }
 

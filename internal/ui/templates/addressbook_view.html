@@ -537,11 +537,7 @@
 <script>
 (function() {
     // Raw contact data from server
-    var rawContacts = [
-        {{range .Contacts}}
-        {uid: {{.UID}}, vcard: {{.RawVCard}}, lastMod: {{formatTime .LastModified}}},
-        {{end}}
-    ];
+    var rawContacts = {{toJSON .Contacts}} || [];
     
     // Parse vCard data
     function parseVCard(vcard) {
@@ -850,9 +846,9 @@
     
     // Parse all contacts
     var contacts = rawContacts.map(function(raw) {
-        var parsed = parseVCard(raw.vcard);
-        parsed.uid = raw.uid;
-        parsed.lastMod = raw.lastMod;
+        var parsed = parseVCard(raw.RawVCard);
+        parsed.uid = raw.UID;
+        parsed.lastMod = raw.LastModified;
         return parsed;
     }).filter(function(c) { return c.fn; });
     

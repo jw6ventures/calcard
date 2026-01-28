@@ -1,17 +1,55 @@
 # CalCard
-CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a web UI, and requires OIDC authentication with app passwords for DAV clients.
+CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a web UI, and requires OIDC authentication with user generated app passwords for DAV clients.
 
 ## Installing
+
+Copy the .env.template file from the root of this repository, rename to .env, and modify the values to match your environment.
+
 ### Docker (Recommended)
-I am publishing the following docker images publically:
-| Image                                 	        | Branch     	| Notes                       	|
-|---------------------------------------	        |------------	|-----------------------------	|
-| docker pull ghcr.io/jw6ventures/calcard:latest 	| main       	| Automatic build after merge 	|
-| docker pull ghcr.io/jw6ventures/calcard:beta   	| develop    	| Automatic build after merge 	|
-| docker pull ghcr.io/jw6ventures/calcard:latest 	| tag/v1.0.0 	|                             	|
+| Image                                  | Branch     	| Notes                       	|
+|--------------------------------------- |------------	|-----------------------------	|
+| ghcr.io/jw6ventures/calcard:latest 	 | main       	| Latest stable release. 	|
+| ghcr.io/jw6ventures/calcard:beta   	 | develop    	| Pre-release.	|
+| ghcr.io/jw6ventures/calcard:v1.0.x 	 | tag/v1.0.x 	| Refer to github release for latest patch version |
+
+#### Docker Run
+```docker run --env-file .env ghcr.io/jw6ventures/calcard:latest```
+
+You'll also need a postgres 16 server
+
+#### Docker Compose
+```
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    image: ghcr.io/jw6ventures/calcard:latest
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    ports:
+      - "8081:8080"
+
+volumes:
+  postgres_data:
+```
 
 ### Linux Installs
-In the future I will publish a linux binary
+A linux binary is published as a github release for each version. You'll need a postgres 16 server.
+```
+source .env
+./calcard-linux-amd64
+```
 
 ## Features
 - CalDAV and CardDAV server.
@@ -25,13 +63,13 @@ Environment variables:
 | --- | --- | --- |
 | `APP_LISTEN_ADDR` | false | (Default `:8080`) Bind address|
 | `APP_BASE_URL` | false | (Default: `http://localhost:8080`) The URL that users will access for example: `https://calcard.example.com` |
-| `APP_DB_DSN` | true | PostgreSQL DSN |
+| `APP_DB_DSN` | true | PostgreSQL DSN (ex. `postgres://postgres:postgres@postgres:5432/app?sslmode=disable` )|
 | `APP_OAUTH_CLIENT_ID` | true | Provided from IDP |
 | `APP_OAUTH_CLIENT_SECRET` | true | Provided from IDP |
-| `APP_OAUTH_ISSUER_URL` | true | Provided from IDP |
-| `APP_OAUTH_DISCOVERY_URL` | true | Provided from IDP |
-| `APP_SESSION_SECRET` | true | Must be at least 32 characters long |
-| `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for pubic environments |
+| `APP_OAUTH_ISSUER_URL` | one of two | Provided from IDP. Used if `APP_OAUTH_DISCOVERY_URL` is not set. |
+| `APP_OAUTH_DISCOVERY_URL` | one of two | Provided from IDP. Overrides `APP_OAUTH_ISSUER_URL` when set. |
+| `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
+| `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for public environments |
 
 
 ## Connecting a CalDAV/CardDAV client

@@ -287,17 +287,15 @@
 <script>
 (function() {
     // Birthday data from server
-    var birthdays = [
-        {{range .BirthdayEvents}}
-        {
-            contactUid: {{.ContactUID}},
-            displayName: {{.DisplayName}},
-            month: {{.Month}},
-            day: {{.Day}},
-            age: {{if .Age}}{{.Age}}{{else}}null{{end}}
-        },
-        {{end}}
-    ];
+    var birthdays = ({{toJSON .BirthdayEvents}} || []).map(function(raw) {
+        return {
+            contactUid: raw.ContactUID,
+            displayName: raw.DisplayName,
+            month: raw.Month,
+            day: raw.Day,
+            age: raw.Age === undefined ? null : raw.Age
+        };
+    });
     
     var currentDate = new Date();
     
@@ -545,4 +543,3 @@
 </script>
 {{end}}
 {{template "base" .}}
-
