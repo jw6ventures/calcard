@@ -17,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const version = "v0.1.0"
+const version = "v1.0.2"
 
 func main() {
 	logLevelString := os.Getenv("LOG_LEVEL")
