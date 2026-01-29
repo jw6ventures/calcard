@@ -17,6 +17,12 @@ import (
 	"gitea.jw6.us/james/calcard/internal/store"
 )
 
+func newCalendarPutRequest(path string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(http.MethodPut, path, body)
+	req.Header.Set("Content-Type", "text/calendar")
+	return req
+}
+
 func TestBirthdayCalendarGeneration(t *testing.T) {
 	now := time.Now()
 	birthday1 := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
@@ -93,7 +99,7 @@ func TestBirthdayCalendarReadOnly(t *testing.T) {
 
 	// Test PUT is blocked
 	putBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	putReq := httptest.NewRequest("PUT", "/dav/calendars/-1/test.ics", strings.NewReader(putBody))
+	putReq := newCalendarPutRequest("/dav/calendars/-1/test.ics", strings.NewReader(putBody))
 	putReq = putReq.WithContext(auth.WithUser(context.Background(), user))
 	putRec := httptest.NewRecorder()
 	h.Put(putRec, putReq)
@@ -882,7 +888,7 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 	u := &store.User{ID: 1}
 
 	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader(validIcal))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(validIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -908,7 +914,7 @@ func TestPutRejectsCalendarWriteWithoutEditor(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader("ICALDATA"))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("ICALDATA"))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -1387,7 +1393,7 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 	}
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	newIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(newIcal))
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(newIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -1413,7 +1419,7 @@ func TestPutUnsupportedPath(t *testing.T) {
 
 func TestPutTooLarge(t *testing.T) {
 	h := &Handler{}
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/e.ics", nil)
+	req := newCalendarPutRequest("/dav/calendars/1/e.ics", nil)
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1556,7 +1562,7 @@ func TestGetAddressBookNotFoundForWrongUser(t *testing.T) {
 
 func TestPutRequiresUser(t *testing.T) {
 	h := &Handler{}
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/e.ics", strings.NewReader("data"))
+	req := newCalendarPutRequest("/dav/calendars/1/e.ics", strings.NewReader("data"))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -1674,7 +1680,7 @@ func TestMkcalendarRequiresUser(t *testing.T) {
 func TestPutCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/9/e.ics", strings.NewReader("ICAL"))
+	req := newCalendarPutRequest("/dav/calendars/9/e.ics", strings.NewReader("ICAL"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -1694,7 +1700,7 @@ func TestPutReadErrorReturnsBadRequest(t *testing.T) {
 		},
 	}
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/e.ics", io.NopCloser(errReader{}))
+	req := newCalendarPutRequest("/dav/calendars/1/e.ics", io.NopCloser(errReader{}))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -2426,7 +2432,7 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2452,7 +2458,7 @@ func TestPutWithIfMatchFailure(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"wrong-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2474,7 +2480,7 @@ func TestPutWithIfNoneMatchStar(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/new.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2500,7 +2506,7 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2582,7 +2588,7 @@ func TestPutRejectsInvalidICalendar(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/event.ics", strings.NewReader(tt.data))
+			req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(tt.data))
 			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 			rr := httptest.NewRecorder()
 
@@ -2607,7 +2613,7 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
 	validData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/2/test.ics", strings.NewReader(validData))
+	req := newCalendarPutRequest("/dav/calendars/2/test.ics", strings.NewReader(validData))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 

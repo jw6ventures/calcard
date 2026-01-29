@@ -51,6 +51,7 @@ type prop struct {
 	ScheduleCalendarTransp        *scheduleCalendarTransp        `xml:"cal:schedule-calendar-transp,omitempty"`
 	SupportedCalendarData         *supportedCalendarData         `xml:"cal:supported-calendar-data,omitempty"`
 	CalendarServerReadOnly        *struct{}                      `xml:"cs:read-only,omitempty"`
+	CurrentUserPrivilegeSet       *currentUserPrivilegeSet       `xml:"d:current-user-privilege-set,omitempty"`
 }
 
 // cdataString wraps string content in CDATA for raw XML output.
@@ -227,6 +228,7 @@ type reportType struct {
 	AddressbookMultiGet *struct{} `xml:"card:addressbook-multiget,omitempty"`
 	AddressbookQuery    *struct{} `xml:"card:addressbook-query,omitempty"`
 	SyncCollection      *struct{} `xml:"d:sync-collection,omitempty"`
+	ExpandProperty      *struct{} `xml:"d:expand-property,omitempty"`
 }
 
 type supportedCalendarComponentSet struct {
@@ -249,4 +251,17 @@ type supportedCalendarData struct {
 type calendarDataType struct {
 	ContentType string `xml:"content-type,attr"`
 	Version     string `xml:"version,attr,omitempty"`
+}
+
+type currentUserPrivilegeSet struct {
+	Privileges []privilege `xml:"d:privilege"`
+}
+
+type privilege struct {
+	Read         *readPrivilege `xml:"d:read,omitempty"`
+	ReadFreeBusy *struct{}      `xml:"cal:read-free-busy,omitempty"`
+}
+
+type readPrivilege struct {
+	ReadFreeBusy *struct{} `xml:"cal:read-free-busy,omitempty"`
 }

@@ -29,9 +29,9 @@ go.work.sum
 .env
 
 # Editor/IDE
- .idea/
- .vscode/
- .claude/
+.idea/
+.vscode/
+.claude/
 
 # License generation artifacts
 third_party_licenses/

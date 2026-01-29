@@ -36,6 +36,8 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 	resp.Propstat[0].Prop.SupportedCalendarData = supportedCalendarDataProp()
 	// Default to opaque for scheduling transparency (RFC 4791 Section 5.2.8)
 	resp.Propstat[0].Prop.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
+	// Add current-user-privilege-set (RFC 4791 Section 6.3)
+	resp.Propstat[0].Prop.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet()
 
 	// Add calendar limits (RFC 4791 Section 5.2.5-5.2.9)
 	resp.Propstat[0].Prop.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
@@ -118,6 +120,12 @@ func etagPropWithData(etag, data string, calendar bool, includeData bool) propst
 	return propstat{Prop: propVal, Status: "HTTP/1.1 200 OK"}
 }
 
+func calendarResourcePropstat(etag, data string, includeData bool) propstat {
+	ps := etagPropWithData(etag, data, true, includeData)
+	ps.Prop.SupportedReportSet = &supportedReportSet{}
+	return ps
+}
+
 func resourceResponse(href string, ps propstat) response {
 	return response{Href: href, Propstat: []propstat{ps}}
 }
@@ -134,6 +142,7 @@ func calendarSupportedReports() *supportedReportSet {
 			{Report: reportType{CalendarQuery: &struct{}{}}},
 			{Report: reportType{FreeBusyQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
+			{Report: reportType{ExpandProperty: &struct{}{}}},
 		},
 	}
 }
@@ -144,6 +153,7 @@ func addressbookSupportedReports() *supportedReportSet {
 			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
 			{Report: reportType{AddressbookQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
+			{Report: reportType{ExpandProperty: &struct{}{}}},
 		},
 	}
 }
@@ -156,6 +166,7 @@ func combinedSupportedReports() *supportedReportSet {
 			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
 			{Report: reportType{AddressbookQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
+			{Report: reportType{ExpandProperty: &struct{}{}}},
 		},
 	}
 }
@@ -175,6 +186,15 @@ func supportedCalendarDataProp() *supportedCalendarData {
 	return &supportedCalendarData{
 		CalendarData: []calendarDataType{
 			{ContentType: "text/calendar", Version: "2.0"},
+		},
+	}
+}
+
+func calendarCurrentUserPrivilegeSet() *currentUserPrivilegeSet {
+	return &currentUserPrivilegeSet{
+		Privileges: []privilege{
+			{Read: &readPrivilege{ReadFreeBusy: &struct{}{}}},
+			{ReadFreeBusy: &struct{}{}},
 		},
 	}
 }

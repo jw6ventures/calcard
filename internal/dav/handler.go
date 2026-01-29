@@ -769,6 +769,37 @@ func isTopLevelComponentType(componentType string) bool {
 	}
 }
 
+func containsICalMethodProperty(icalData string) bool {
+	lines := unfoldICalLines(icalData)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "METHOD") {
+			if len(upper) == len("METHOD") || (len(upper) > len("METHOD") && (upper[len("METHOD")] == ':' || upper[len("METHOD")] == ';')) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasMultipleDifferentUIDs(icalData string) bool {
+	components := parseCalendarTopLevelComponents(icalData)
+	if len(components) <= 1 {
+		return false
+	}
+	first := components[0].UID
+	for _, component := range components[1:] {
+		if component.UID != first {
+			return true
+		}
+	}
+	return false
+}
+
 // validateVCard performs basic validation of vCard data (RFC 6350)
 func (h *Handler) validateVCard(data string) error {
 	trimmed := strings.TrimSpace(data)
@@ -863,6 +894,16 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if cleanPath == "/dav/calendars" || cleanPath == "/dav/calendars/" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		if _, _, ok := parseCalendarResourceSegments(cleanPath); !ok {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
 	_, _, isCalendar := parseCalendarResourceSegments(cleanPath)
 	if r.ContentLength > maxDAVBodyBytes {
 		if isCalendar {
@@ -922,6 +963,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		}
 
 		contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		missingContentType := contentType == ""
 		if contentType != "" &&
 			!strings.HasPrefix(contentType, "text/calendar") &&
 			!strings.HasPrefix(contentType, "application/ical") &&
@@ -963,7 +1005,16 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if containsICalMethodProperty(string(body)) {
+			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
+			return
+		}
+
 		if conditions := validateCalendarObjectResource(string(body)); len(conditions) > 0 {
+			if hasMultipleDifferentUIDs(string(body)) {
+				writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
+				return
+			}
 			writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)
 			return
 		}
@@ -986,6 +1037,11 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		}
 		if count, ok := extractICalRRULECount(string(body)); ok && count > caldavMaxInstances {
 			writeCalDAVError(w, http.StatusForbidden, "max-instances")
+			return
+		}
+
+		if missingContentType {
+			writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
 			return
 		}
 
@@ -1338,7 +1394,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		if event == nil {
 			return []response{{Href: resourceHref, Status: "HTTP/1.1 404 Not Found"}}, nil
 		}
-		return []response{resourceResponse(resourceHref, etagPropWithData(event.ETag, event.RawICAL, true, true))}, nil
+		return []response{resourceResponse(resourceHref, calendarResourcePropstat(event.ETag, event.RawICAL, true))}, nil
 	}
 
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))

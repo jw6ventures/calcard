@@ -35,9 +35,9 @@ func TestRFC4791_OptionsAdvertisesCalendarAccess(t *testing.T) {
 		t.Errorf("Allow header must include REPORT method per RFC 4791 Section 5.1, got: %s", allowHeader)
 	}
 
-	// RFC 4791 Section 5.3.1: MUST support MKCALENDAR method
+	// RFC 4791 Section 5.3.1: SHOULD support MKCALENDAR method
 	if !strings.Contains(allowHeader, "MKCALENDAR") {
-		t.Errorf("Allow header must include MKCALENDAR method per RFC 4791 Section 5.3.1, got: %s", allowHeader)
+		t.Errorf("Allow header should include MKCALENDAR method per RFC 4791 Section 5.3.1, got: %s", allowHeader)
 	}
 }
 
@@ -287,7 +287,7 @@ func TestRFC4791_PutWithIfNoneMatchStarCreatesNew(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -316,7 +316,7 @@ func TestRFC4791_PutWithIfMatchRequiresMatchingETag(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/existing.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"wrong-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -345,7 +345,7 @@ func TestRFC4791_PutWithIfMatchSucceedsAndUpdatesETag(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/existing.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -364,6 +364,51 @@ func TestRFC4791_PutWithIfMatchSucceedsAndUpdatesETag(t *testing.T) {
 	}
 }
 
+// Section 5.3.4: ETag behavior on semantically identical updates (content-based policy)
+func TestRFC4791_PutIdenticalBodyKeepsETag(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:same-body\r\nSUMMARY:Same\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/same-body.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated && rr.Code != http.StatusNoContent {
+		t.Fatalf("initial PUT should succeed, got %d", rr.Code)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("initial PUT must return ETag, got empty")
+	}
+
+	req = newCalendarPutRequest("/dav/calendars/1/same-body.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", etag)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr = httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("PUT with matching If-Match must return 204, got %d", rr.Code)
+	}
+	etag2 := rr.Header().Get("ETag")
+	if etag2 == "" {
+		t.Fatalf("PUT must return ETag, got empty")
+	}
+	if etag2 != etag {
+		t.Errorf("ETag must remain the same for identical body updates (content-based), got %s then %s", etag, etag2)
+	}
+}
+
 // Section 5.3.2.1: PUT Preconditions - If-Match on missing resource
 func TestRFC4791_PutWithIfMatchOnMissingResourceFails(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
@@ -376,7 +421,7 @@ func TestRFC4791_PutWithIfMatchOnMissingResourceFails(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:missing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/missing.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/missing.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"missing-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -400,7 +445,7 @@ func TestRFC4791_PutReturnsETagHeader(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/test.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/test.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -813,6 +858,47 @@ func TestRFC4791_SharedCalendarsAreDiscoverable(t *testing.T) {
 	responseCount := strings.Count(body, "<d:response>")
 	if responseCount < 3 {
 		t.Errorf("RFC 4918: Expected 3 responses (home + 2 calendars), got %d", responseCount)
+	}
+}
+
+// Section 7.1: DAV:expand-property REPORT
+func TestRFC4791_ExpandPropertyReportWorks(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:expand-property xmlns:d="DAV:">
+  <d:prop>
+    <d:current-user-principal>
+      <d:prop>
+        <d:displayname/>
+      </d:prop>
+    </d:current-user-principal>
+  </d:prop>
+</d:expand-property>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Errorf("RFC 4791 Section 7.1: expand-property must return 207 Multi-Status, got %d", rr.Code)
+	}
+
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "displayname") || !strings.Contains(respBody, user.PrimaryEmail) {
+		t.Errorf("RFC 4791 Section 7.1: expand-property must include expanded properties, got: %s", respBody)
+	}
+	if !strings.Contains(respBody, "/dav/principals/1/") {
+		t.Errorf("RFC 4791 Section 7.1: expand-property must include expanded hrefs, got: %s", respBody)
 	}
 }
 
@@ -1578,7 +1664,7 @@ func TestRFC4791_RejectMalformedICalendar(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/test.ics", strings.NewReader(tt.data))
+			req := newCalendarPutRequest("/dav/calendars/1/test.ics", strings.NewReader(tt.data))
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -1630,6 +1716,49 @@ func TestRFC4791_SupportedReportSetProperty(t *testing.T) {
 	// RFC 4791 Section 7.10: Should support free-busy-query
 	if !strings.Contains(body, "free-busy-query") {
 		t.Error("RFC 4791 Section 7.10: Should advertise free-busy-query in supported-report-set")
+	}
+
+	// RFC 4791 Section 5.1.1: Must advertise DAV:expand-property report
+	if !strings.Contains(body, "expand-property") {
+		t.Error("RFC 4791 Section 5.1.1: Must advertise DAV:expand-property in supported-report-set")
+	}
+}
+
+func TestRFC4791_SupportedReportSetOnCalendarObjectResource(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	propBody := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:supported-report-set/>
+  </d:prop>
+</d:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/event.ics", strings.NewReader(propBody))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "supported-report-set") {
+		t.Errorf("calendar object resource should return supported-report-set, got: %s", body)
+	}
+	if strings.Contains(body, "calendar-query") || strings.Contains(body, "calendar-multiget") || strings.Contains(body, "free-busy-query") {
+		t.Errorf("calendar object resource must not advertise collection-only reports, got: %s", body)
 	}
 }
 
@@ -1773,7 +1902,7 @@ func TestRFC4791_PutContentTypeValidation(t *testing.T) {
 
 	// RFC 4791 Section 5.3.2: Clients SHOULD use Content-Type: text/calendar
 	// Our server should accept calendar data regardless, but verify it's valid iCalendar
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/test.ics", strings.NewReader(validIcal))
+	req := newCalendarPutRequest("/dav/calendars/1/test.ics", strings.NewReader(validIcal))
 	req.Header.Set("Content-Type", "text/calendar; charset=utf-8")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -1823,7 +1952,7 @@ func TestRFC4791_VTODOComponentSupport(t *testing.T) {
 
 	// RFC 4791: Calendars should support VTODO components
 	todoData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task1\r\nSUMMARY:Buy milk\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/task1.ics", strings.NewReader(todoData))
+	req := newCalendarPutRequest("/dav/calendars/1/task1.ics", strings.NewReader(todoData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -1847,7 +1976,7 @@ func TestRFC4791_VJOURNALComponentSupport(t *testing.T) {
 
 	// RFC 4791: Calendars should support VJOURNAL components
 	journalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VJOURNAL\r\nUID:journal1\r\nSUMMARY:Today's notes\r\nEND:VJOURNAL\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/journal1.ics", strings.NewReader(journalData))
+	req := newCalendarPutRequest("/dav/calendars/1/journal1.ics", strings.NewReader(journalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -1872,7 +2001,7 @@ func TestRFC4791_UIDMustMatchResourceName(t *testing.T) {
 	// RFC 4791 Section 4.1: UID in calendar data should match the resource name
 	// Client stores as "event123.ics" but UID is "different-uid"
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:different-uid\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/event123.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/event123.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2255,7 +2384,7 @@ func TestRFC4791_Precondition_SupportedCalendarData_RejectUnsupportedMediaType(t
 	}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:unsupported\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/unsupported.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/unsupported.ics", strings.NewReader(icalData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
@@ -2312,7 +2441,7 @@ func TestRFC4791_Precondition_MaxResourceSize_RejectTooLargeObject(t *testing.T)
 	}
 	largeIcal := base + "COMMENT:" + strings.Repeat("A", paddingLen) + "\r\n" + end
 
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-large.ics", strings.NewReader(largeIcal))
+	req = newCalendarPutRequest("/dav/calendars/1/too-large.ics", strings.NewReader(largeIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 
@@ -2361,7 +2490,7 @@ func TestRFC4791_Precondition_MinDateTime_RejectEarlierDates(t *testing.T) {
 		testStart.Format("20060102T150405Z"),
 		testEnd.Format("20060102T150405Z"))
 
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-early.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/too-early.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 
@@ -2415,7 +2544,7 @@ func TestRFC4791_Precondition_MinDateTime_RejectEarlierDatesWithTZID(t *testing.
 		testStart.Format("20060102T150405"),
 		testEnd.Format("20060102T150405"))
 
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-early-tzid.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/too-early-tzid.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 
@@ -2464,7 +2593,7 @@ func TestRFC4791_Precondition_MaxDateTime_RejectLaterDates(t *testing.T) {
 		testStart.Format("20060102T150405Z"),
 		testEnd.Format("20060102T150405Z"))
 
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-late.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/too-late.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 
@@ -2514,7 +2643,7 @@ func TestRFC4791_Precondition_MaxDateTime_RejectLaterDatesWithOffset(t *testing.
 		testStart.Format("20060102T150405-0700"),
 		testEnd.Format("20060102T150405-0700"))
 
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-late-offset.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/too-late-offset.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 
@@ -2537,7 +2666,7 @@ func TestRFC4791_PutBeforeMinDateTimeRejected(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-old\r\nDTSTART:18000101T000000Z\r\nDTEND:18000101T010000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-old.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/too-old.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2560,7 +2689,7 @@ func TestRFC4791_PutAfterMaxDateTimeRejected(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-far\r\nDTSTART:22000101T000000Z\r\nDTEND:22000101T010000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-far.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/too-far.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2921,7 +3050,7 @@ func TestRFC4791_PreventDuplicateUIDInDifferentResources(t *testing.T) {
 	// RFC 4791 Section 4.1: A calendar collection MUST NOT contain more than one
 	// calendar object resource with the same UID
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:duplicate-uid\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/event2.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/event2.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3123,38 +3252,6 @@ func TestRFC4791_GetReturnsLastModifiedHeader(t *testing.T) {
 	}
 }
 
-// Extension: Schedule-Tag Header (RFC 6638 - CalDAV Scheduling)
-func TestRFC6638_ScheduleTagHeader(t *testing.T) {
-	calRepo := &fakeCalendarRepo{
-		accessible: []store.CalendarAccess{
-			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
-		},
-	}
-	eventRepo := &fakeEventRepo{
-		events: map[string]*store.Event{
-			"1:meeting": {
-				CalendarID: 1,
-				UID:        "meeting",
-				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:meeting\r\nATTENDEE:mailto:user@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-				ETag:       "e",
-			},
-		},
-	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	user := &store.User{ID: 1}
-
-	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/meeting.ics", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), user))
-	rr := httptest.NewRecorder()
-
-	h.Get(rr, req)
-
-	scheduleTag := rr.Header().Get("Schedule-Tag")
-	if scheduleTag != "" {
-		t.Log("Server supports Schedule-Tag header for CalDAV scheduling")
-	}
-}
-
 // Section 5.3.2.1: PUT - If-None-Match with existing resource
 func TestRFC4791_PutWithIfNoneMatchOnExistingResource(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
@@ -3171,7 +3268,7 @@ func TestRFC4791_PutWithIfNoneMatchOnExistingResource(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/existing.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -3215,6 +3312,122 @@ func TestRFC4791_ReadFreeBusyPrivilege(t *testing.T) {
 	}
 	if contentType := rr.Header().Get("Content-Type"); !strings.Contains(contentType, "text/calendar") {
 		t.Errorf("RFC 4791 Section 5.1.1: free-busy-query must return text/calendar, got %s", contentType)
+	}
+}
+
+// Section 6.3: current-user-privilege-set must include read-free-busy
+func TestRFC4791_CurrentUserPrivilegeSetIncludesReadFreeBusy(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: false},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
+
+	propBody := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:current-user-privilege-set/>
+  </d:prop>
+</d:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", strings.NewReader(propBody))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "current-user-privilege-set") {
+		t.Fatalf("RFC 4791 Section 6.3: current-user-privilege-set must be returned, got: %s", body)
+	}
+	if !strings.Contains(body, "read-free-busy") {
+		t.Fatalf("RFC 4791 Section 6.3: current-user-privilege-set must include cal:read-free-busy, got: %s", body)
+	}
+
+	readNested := regexp.MustCompile(`(?s)<[^>]*read[^>]*>.*read-free-busy`).MatchString(body)
+	if !readNested {
+		t.Errorf("RFC 4791 Section 6.3: read-free-busy must be aggregated under DAV:read, got: %s", body)
+	}
+
+	if strings.Count(body, "read-free-busy") < 2 {
+		t.Errorf("RFC 4791 Section 6.3: read-free-busy should be grantable independently (separate from DAV:read), got: %s", body)
+	}
+}
+
+// Section 6.3: free-busy-query authorization must align with advertised privileges
+func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			// Shared calendar with limited privileges (read-free-busy but not full read).
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: store.Now()}, Shared: true, Editor: false},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {
+				CalendarID: 1,
+				UID:        "event",
+				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:       "e",
+				DTStart:    &start,
+				DTEnd:      &end,
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	freeBusyBody := `<?xml version="1.0" encoding="utf-8" ?>
+<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+      <C:comp-filter name="VEVENT"/>
+    </C:comp-filter>
+  </C:filter>
+</C:free-busy-query>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(freeBusyBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("free-busy-query must succeed with read-free-busy, got %d", rr.Code)
+	}
+
+	queryBody := `<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VEVENT"/>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>`
+	req = httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(queryBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr = httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code == http.StatusMultiStatus {
+		t.Fatalf("calendar-query must fail or be limited when only read-free-busy is granted, got %d", rr.Code)
+	}
+
+	multigetBody := `<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <D:href>/dav/calendars/1/event.ics</D:href>
+</C:calendar-multiget>`
+	req = httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(multigetBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr = httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code == http.StatusMultiStatus {
+		t.Fatalf("calendar-multiget must fail or be limited when only read-free-busy is granted, got %d", rr.Code)
 	}
 }
 
@@ -3455,7 +3668,7 @@ func TestInteroperability_CalendarObjectResourceNaming(t *testing.T) {
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 
 	// Try without .ics extension
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/event-no-extension", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/event-no-extension", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3692,7 +3905,7 @@ func TestRFC4791_PutExceedsMaxAttendeesPerInstance(t *testing.T) {
 	}
 	sb.WriteString("END:VEVENT\r\nEND:VCALENDAR\r\n")
 
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/attendees.ics", strings.NewReader(sb.String()))
+	req := newCalendarPutRequest("/dav/calendars/1/attendees.ics", strings.NewReader(sb.String()))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3715,7 +3928,7 @@ func TestRFC4791_PutExceedsMaxInstances(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-many\r\nDTSTART:20240101T000000Z\r\nRRULE:FREQ=DAILY;COUNT=2001\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-many.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/too-many.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3737,7 +3950,7 @@ func TestRFC4791_PutExceedsMaxInstancesLowercaseParams(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-many-lower\r\nDTSTART:20240101T000000Z\r\nRRULE:freq=daily;count=2001\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/too-many-lower.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/too-many-lower.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3796,7 +4009,7 @@ func TestRFC4791_PutWithUnsupportedMediaType(t *testing.T) {
 
 	// Try to PUT with unsupported content type (e.g., JSON instead of iCalendar)
 	jsonData := `{"summary": "Test Event"}`
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/test.ics", strings.NewReader(jsonData))
+	req := newCalendarPutRequest("/dav/calendars/1/test.ics", strings.NewReader(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -3806,6 +4019,55 @@ func TestRFC4791_PutWithUnsupportedMediaType(t *testing.T) {
 	// RFC 4791 Section 5.3.2.1: Server MUST reject unsupported calendar data
 	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusUnsupportedMediaType {
 		t.Errorf("RFC 4791 Section 5.3.2.1: PUT with unsupported calendar data must fail with 400 or 415, got %d", rr.Code)
+	}
+	assertCalDAVErrorBody(t, rr.Body.String(), "supported-calendar-data")
+}
+
+// Section 5.3.2.1: Content-Type is required for calendar object resources
+func TestRFC4791_PutWithoutContentTypeRejected(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:no-ctype\r\nSUMMARY:No Content-Type\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/no-ctype.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code == http.StatusCreated || rr.Code == http.StatusNoContent || rr.Code < 400 {
+		t.Errorf("PUT without Content-Type must fail, got %d", rr.Code)
+	}
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusConflict && rr.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("PUT without Content-Type must fail with 400/409/415, got %d", rr.Code)
+	}
+}
+
+// Section 5.3.2.1: text/plain is not supported calendar data
+func TestRFC4791_PutWithTextPlainRejected(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:plain-text\r\nSUMMARY:Plain Text\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/plain-text.ics", strings.NewReader(icalData))
+	req.Header.Set("Content-Type", "text/plain")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("PUT with text/plain must fail with 400 or 415, got %d", rr.Code)
 	}
 	assertCalDAVErrorBody(t, rr.Body.String(), "supported-calendar-data")
 }
@@ -3822,7 +4084,7 @@ func TestRFC4791_PutWithUnsupportedComponent(t *testing.T) {
 
 	// Try to PUT a mix of supported and unsupported components.
 	unsupportedData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event1\r\nSUMMARY:Test\r\nEND:VEVENT\r\nBEGIN:VAVAILABILITY\r\nUID:avail1\r\nDTSTART:20240101T000000Z\r\nDTEND:20240101T235959Z\r\nEND:VAVAILABILITY\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/unsupported.ics", strings.NewReader(unsupportedData))
+	req := newCalendarPutRequest("/dav/calendars/1/unsupported.ics", strings.NewReader(unsupportedData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3849,7 +4111,7 @@ func TestRFC4791_PutExceedsMaxResourceSize(t *testing.T) {
 	largeDescription := strings.Repeat("A", 1024*1024*15) // 15MB
 	largeIcal := fmt.Sprintf("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:large\r\nDESCRIPTION:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", largeDescription)
 
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/large.ics", strings.NewReader(largeIcal))
+	req := newCalendarPutRequest("/dav/calendars/1/large.ics", strings.NewReader(largeIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3862,6 +4124,29 @@ func TestRFC4791_PutExceedsMaxResourceSize(t *testing.T) {
 	assertCalDAVErrorBody(t, rr.Body.String(), "max-resource-size")
 }
 
+// Section 4.1.2/5.3.2.1: METHOD property must be rejected in calendar object resources
+func TestRFC4791_ValidCalendarObject_RejectMethodProperty(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:method-reject\r\nSUMMARY:Method\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/method.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Errorf("METHOD property must be rejected with 409, got %d", rr.Code)
+	}
+	assertCalDAVErrorBody(t, rr.Body.String(), "valid-calendar-object-resource")
+}
+
 func TestRFC4791_ValidCalendarObject_RejectMultipleTopLevelComponents(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -3872,7 +4157,7 @@ func TestRFC4791_ValidCalendarObject_RejectMultipleTopLevelComponents(t *testing
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:one\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:two\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/multi.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/multi.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3894,7 +4179,7 @@ func TestRFC4791_ValidCalendarObject_RejectMissingUID(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:Missing UID\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/missing-uid.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/missing-uid.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3917,7 +4202,7 @@ func TestRFC4791_UIDUniqueness_SameUIDMustBeSameResource(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:dup-uid\r\nSUMMARY:First\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/first.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/first.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -3927,15 +4212,15 @@ func TestRFC4791_UIDUniqueness_SameUIDMustBeSameResource(t *testing.T) {
 	}
 
 	icalData = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:dup-uid\r\nSUMMARY:Second\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/second.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/second.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 	h.Put(rr, req)
 
-	if rr.Code < 400 || rr.Code >= 500 {
-		t.Errorf("storing same UID in different resource must fail with 4xx, got %d", rr.Code)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("storing same UID in different resource must fail with 409, got %d", rr.Code)
 	}
-	assertCalDAVErrorBodyAny(t, rr.Body.String(), "no-uid-conflict", "valid-calendar-object-resource")
+	assertCalDAVErrorBody(t, rr.Body.String(), "no-uid-conflict")
 }
 
 func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
@@ -3949,7 +4234,7 @@ func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:uid-one\r\nSUMMARY:Original\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/same.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/same.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -3959,7 +4244,7 @@ func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
 	}
 
 	icalData = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:uid-two\r\nSUMMARY:Changed\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req = httptest.NewRequest(http.MethodPut, "/dav/calendars/1/same.ics", strings.NewReader(icalData))
+	req = newCalendarPutRequest("/dav/calendars/1/same.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 	h.Put(rr, req)
@@ -3982,16 +4267,16 @@ func TestRFC4791_PutWithDifferentUIDsRejected(t *testing.T) {
 
 	// RFC 4791 Section 4.1: Calendar object resource MUST NOT mix different UIDs in one resource
 	multiEventData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:event2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/multi.ics", strings.NewReader(multiEventData))
+	req := newCalendarPutRequest("/dav/calendars/1/multi.ics", strings.NewReader(multiEventData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
 	h.Put(rr, req)
 
-	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusForbidden {
-		t.Errorf("RFC 4791 Section 4.1: PUT with multiple different UIDs must fail with 400 or 403, got %d", rr.Code)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("RFC 4791 Section 4.1: PUT with multiple different UIDs must fail with 409, got %d", rr.Code)
 	}
-	assertCalDAVErrorBody(t, rr.Body.String(), "valid-calendar-data")
+	assertCalDAVErrorBodyAny(t, rr.Body.String(), "valid-calendar-object-resource", "valid-calendar-data")
 }
 
 // Section 4.1: Recurrence set with same UID in a single resource is allowed
@@ -4005,7 +4290,7 @@ func TestRFC4791_PutWithRecurrenceSetSameUIDAccepted(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:recurring\r\nDTSTART:20240101T100000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:recurring\r\nRECURRENCE-ID:20240102T100000Z\r\nSUMMARY:Override\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/recurring.ics", strings.NewReader(icalData))
+	req := newCalendarPutRequest("/dav/calendars/1/recurring.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -4013,6 +4298,29 @@ func TestRFC4791_PutWithRecurrenceSetSameUIDAccepted(t *testing.T) {
 
 	if rr.Code != http.StatusCreated && rr.Code != http.StatusNoContent {
 		t.Errorf("RFC 4791 Section 4.1: PUT with recurrence set should succeed, got %d", rr.Code)
+	}
+}
+
+// Section 5.3.2.1: Calendar object resources MUST NOT be created directly in calendar-home
+func TestRFC4791_PutCalendarObjectAtCalendarHomeRejected(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:home-root\r\nSUMMARY:Home Root\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/event.ics", strings.NewReader(icalData))
+	req.Header.Set("Content-Type", "text/calendar")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusForbidden && rr.Code != http.StatusConflict {
+		t.Errorf("PUT to calendar-home root must fail with 403 or 409, got %d", rr.Code)
 	}
 }
 
@@ -4177,7 +4485,7 @@ func TestRFC4791_PutPreservesComponentType(t *testing.T) {
 
 	// Store VTODO
 	todoData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:test\r\nBEGIN:VTODO\r\nUID:task1\r\nSUMMARY:Task\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
-	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/task1.ics", strings.NewReader(todoData))
+	req := newCalendarPutRequest("/dav/calendars/1/task1.ics", strings.NewReader(todoData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 

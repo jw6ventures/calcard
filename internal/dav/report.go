@@ -9,6 +9,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"gitea.jw6.us/james/calcard/internal/auth"
 	"gitea.jw6.us/james/calcard/internal/store"
@@ -23,6 +24,12 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	ensureCollectionHref := func(p string) string {
+		if !strings.HasSuffix(p, "/") {
+			return p + "/"
+		}
+		return p
+	}
 	if r.ContentLength > maxDAVBodyBytes {
 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
@@ -95,6 +102,30 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 
 		// Handle birthday calendar reports
 		if calID == birthdayCalendarID {
+			if report.XMLName.Local == "expand-property" {
+				principalHref := h.principalURL(user)
+				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
+				birthdayName := "Birthdays"
+				birthdayDesc := "Contact birthdays from your address books"
+				syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+				responses := []response{
+					calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true),
+					principalResponse(ensureCollectionHref(principalHref), user),
+				}
+				payload := multistatus{
+					XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
+					XmlnsD:   "DAV:",
+					XmlnsC:   "urn:ietf:params:xml:ns:caldav",
+					XmlnsA:   "urn:ietf:params:xml:ns:carddav",
+					XmlnsCS:  "http://calendarserver.org/ns/",
+					Response: responses,
+				}
+				w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+				w.WriteHeader(http.StatusMultiStatus)
+				_ = xml.NewEncoder(w).Encode(payload)
+				return
+			}
+
 			if report.XMLName.Local == "free-busy-query" {
 				events, err := h.generateBirthdayEvents(r.Context(), user.ID)
 				if err != nil {
@@ -141,7 +172,35 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "calendar not found", status)
 			return
 		}
+		if cal.Shared && !cal.Editor {
+			if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "calendar-multiget" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		canonicalPath := path.Join("/dav/calendars", fmt.Sprint(cal.ID))
+		if report.XMLName.Local == "expand-property" {
+			principalHref := h.principalURL(user)
+			href := ensureCollectionHref(canonicalPath)
+			ctag := fmt.Sprintf("%d", cal.CTag)
+			syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
+			responses := []response{
+				calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, !cal.Editor),
+				principalResponse(ensureCollectionHref(principalHref), user),
+			}
+			payload := multistatus{
+				XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
+				XmlnsD:   "DAV:",
+				XmlnsC:   "urn:ietf:params:xml:ns:caldav",
+				XmlnsA:   "urn:ietf:params:xml:ns:carddav",
+				XmlnsCS:  "http://calendarserver.org/ns/",
+				Response: responses,
+			}
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusMultiStatus)
+			_ = xml.NewEncoder(w).Encode(payload)
+			return
+		}
 		if report.XMLName.Local == "free-busy-query" {
 			events, err := h.store.Events.ListForCalendar(r.Context(), cal.ID)
 			if err != nil {
