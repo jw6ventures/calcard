@@ -109,12 +109,6 @@ jobs:
           done
           ls -lh artifacts
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: calcard-${{ github.ref_name || env.DEFAULT_BRANCH }}
-          path: artifacts/calcard-*
-
       - name: Publish binary to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
