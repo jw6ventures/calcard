@@ -5,6 +5,15 @@ on:
     branches:
       - main
       - develop
+    paths:
+      - Dockerfile
+      - cmd/**
+      - internal/**
+      - migrations/**
+      - go.mod
+      - go.sum
+      - db.sql
+      - .github/workflows/build-and-push.yaml
     tags:
       - '*'
   workflow_dispatch:
