@@ -8,26 +8,30 @@ import (
 
 // Shared iCalendar helpers used by DAV handlers.
 
-// parseICalDateTime parses iCalendar datetime format (RFC 5545)
+var icalDateTimeFormats = []string{
+	"20060102",             // Date only
+	"20060102T150405",      // Basic format
+	"20060102T150405Z",     // UTC format
+	"20060102T150405-0700", // Basic format with offset
+	"20060102T150405-07:00",
+	"2006-01-02T15:04:05",  // Extended format
+	"2006-01-02T15:04:05Z", // Extended UTC
+	"2006-01-02T15:04:05-0700",
+	"2006-01-02T15:04:05-07:00",
+}
+
+var icalLocalFormats = []string{
+	"20060102",
+	"20060102T150405",
+	"2006-01-02T15:04:05",
+}
+
 func parseICalDateTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, fmt.Errorf("empty datetime")
 	}
 
-	// Try various iCalendar formats
-	formats := []string{
-		"20060102",             // Date only
-		"20060102T150405",      // Basic format
-		"20060102T150405Z",     // UTC format
-		"20060102T150405-0700", // Basic format with offset
-		"20060102T150405-07:00",
-		"2006-01-02T15:04:05",  // Extended format
-		"2006-01-02T15:04:05Z", // Extended UTC
-		"2006-01-02T15:04:05-0700",
-		"2006-01-02T15:04:05-07:00",
-	}
-
-	for _, format := range formats {
+	for _, format := range icalDateTimeFormats {
 		if t, err := time.Parse(format, s); err == nil {
 			return t.UTC(), nil
 		}
@@ -41,13 +45,7 @@ func parseICalDateTimeInLocation(s string, loc *time.Location) (time.Time, error
 		return parseICalDateTime(s)
 	}
 
-	formats := []string{
-		"20060102",
-		"20060102T150405",
-		"2006-01-02T15:04:05",
-	}
-
-	for _, format := range formats {
+	for _, format := range icalLocalFormats {
 		if t, err := time.ParseInLocation(format, s, loc); err == nil {
 			return t.UTC(), nil
 		}

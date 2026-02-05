@@ -1,6 +1,9 @@
 package dav
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -83,5 +86,34 @@ func TestSafeUnmarshalXML_MalformedXML(t *testing.T) {
 	err := safeUnmarshalXML(malformedXML, &result)
 	if err == nil {
 		t.Error("expected error for malformed XML, got nil")
+	}
+}
+
+func TestReadDAVBodyTooLarge(t *testing.T) {
+	overLimit := bytes.Repeat([]byte("a"), int(maxDAVBodyBytes)+1)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(overLimit))
+	w := httptest.NewRecorder()
+
+	_, err := readDAVBody(w, req, maxDAVBodyBytes)
+	if err == nil {
+		t.Fatal("expected error for oversized body, got nil")
+	}
+	if err != errRequestTooLarge {
+		t.Fatalf("expected errRequestTooLarge, got: %v", err)
+	}
+}
+
+func TestReadDAVBodyChunked(t *testing.T) {
+	payload := "chunked-body"
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(payload))
+	req.ContentLength = -1
+	w := httptest.NewRecorder()
+
+	body, err := readDAVBody(w, req, maxDAVBodyBytes)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if string(body) != payload {
+		t.Fatalf("expected %q, got %q", payload, string(body))
 	}
 }

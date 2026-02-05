@@ -1,11 +1,13 @@
 # CalCard
-CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a web UI, and requires OIDC authentication with user generated app passwords for DAV clients.
+
+CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a web UI, and requires OIDC authentication with the ability to generate revokable app passwords for DAV clients.
 
 ## Installing
 
 Copy the .env.template file from the root of this repository, rename to .env, and modify the values to match your environment.
 
 ### Docker (Recommended)
+
 | Image                                  | Branch     	| Notes                       	|
 |--------------------------------------- |------------	|-----------------------------	|
 | ghcr.io/jw6ventures/calcard:latest 	 | main       	| Latest stable release. 	|
@@ -13,11 +15,12 @@ Copy the .env.template file from the root of this repository, rename to .env, an
 | ghcr.io/jw6ventures/calcard:v1.0.x 	 | tag/v1.0.x 	| Refer to github release for latest patch version |
 
 #### Docker Run
-```docker run --env-file .env ghcr.io/jw6ventures/calcard:latest```
 
-You'll also need a postgres 16 server
+```docker run -p 8080 --env-file .env ghcr.io/jw6ventures/calcard:latest```
+You'll also need a postgres 16 server:
 
 #### Docker Compose
+
 ```
 services:
   postgres:
@@ -55,7 +58,7 @@ source .env
 - CalDAV and CardDAV server.
 - OAuth-only web UI sessions plus per-user app passwords for DAV Basic Auth.
 - PostgreSQL schema and repository layer for users, calendars, address books, events, contacts, and app passwords.
-- Minimal server-rendered HTML pages for dashboard, calendars, address books, and app password management.
+- Web interface for dashboard, calendars, address books, and app password management.
 
 ## Configuration
 Environment variables:
@@ -86,7 +89,7 @@ Environment variables:
 ## License
 CalCard is dual-licensed:
 - **AGPLv3** for open-source use
-- **Commercial License** for proprietary or hosted SaaS use
+- **Commercial License** for proprietary customizations or hosted SaaS use
 
 If you run CalCard as a network service and do not provide full corresponding
 source code to users interacting with it, you must obtain a commercial license.

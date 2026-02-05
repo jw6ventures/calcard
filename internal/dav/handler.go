@@ -50,13 +50,13 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean(r.URL.Path)
 
 	// Parse PROPPATCH request body
-	if r.ContentLength > maxDAVBodyBytes {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxDAVBodyBytes))
+	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		if errors.Is(err, errRequestTooLarge) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -68,7 +68,6 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 
 	// Process the property updates
 	var responses []response
-	success := true
 
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		resp, err := h.proppatchCalendar(r.Context(), user, cleanPath, &proppatchReq)
@@ -81,14 +80,6 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		responses = append(responses, resp...)
-		// Check if any property failed
-		for _, r := range resp {
-			for _, ps := range r.Propstat {
-				if ps.Status != "HTTP/1.1 200 OK" {
-					success = false
-				}
-			}
-		}
 	} else if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		resp, err := h.proppatchAddressBook(r.Context(), user, cleanPath, &proppatchReq)
 		if err != nil {
@@ -100,13 +91,6 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		responses = append(responses, resp...)
-		for _, r := range resp {
-			for _, ps := range r.Propstat {
-				if ps.Status != "HTTP/1.1 200 OK" {
-					success = false
-				}
-			}
-		}
 	} else {
 		http.Error(w, "unsupported path for PROPPATCH", http.StatusBadRequest)
 		return
@@ -119,14 +103,7 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 		XmlnsA:   "urn:ietf:params:xml:ns:carddav",
 		Response: responses,
 	}
-
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	if success {
-		w.WriteHeader(http.StatusMultiStatus)
-	} else {
-		w.WriteHeader(http.StatusMultiStatus)
-	}
-	_ = xml.NewEncoder(w).Encode(payload)
+	writeMultiStatus(w, payload)
 }
 
 func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
@@ -146,7 +123,7 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 			Href: cleanPath,
 			Propstat: []propstat{{
 				Prop:   prop{},
-				Status: "HTTP/1.1 403 Forbidden",
+				Status: httpStatusForbidden,
 			}},
 		}}, nil
 	}
@@ -162,12 +139,11 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 			Href: cleanPath,
 			Propstat: []propstat{{
 				Prop:   prop{},
-				Status: "HTTP/1.1 403 Forbidden",
+				Status: httpStatusForbidden,
 			}},
 		}}, nil
 	}
 
-	// Extract properties to update
 	var name *string
 	var description *string
 	var timezone *string
@@ -178,7 +154,6 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 		timezone = req.Set.Prop.CalendarTimezone
 	}
 
-	// Update the calendar
 	if name != nil || description != nil || timezone != nil {
 		// Use existing name if not being updated
 		updateName := cal.Name
@@ -193,7 +168,7 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 				Href: cleanPath,
 				Propstat: []propstat{{
 					Prop:   prop{},
-					Status: "HTTP/1.1 500 Internal Server Error",
+					Status: httpStatusInternalServerError,
 				}},
 			}}, nil
 		}
@@ -215,7 +190,7 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 		Href: cleanPath,
 		Propstat: []propstat{{
 			Prop:   successProp,
-			Status: "HTTP/1.1 200 OK",
+			Status: httpStatusOK,
 		}},
 	}}, nil
 }
@@ -242,7 +217,7 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 			Href: cleanPath,
 			Propstat: []propstat{{
 				Prop:   prop{},
-				Status: "HTTP/1.1 403 Forbidden",
+				Status: httpStatusForbidden,
 			}},
 		}}, nil
 	}
@@ -270,7 +245,7 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 				Href: cleanPath,
 				Propstat: []propstat{{
 					Prop:   prop{},
-					Status: "HTTP/1.1 500 Internal Server Error",
+					Status: httpStatusInternalServerError,
 				}},
 			}}, nil
 		}
@@ -289,7 +264,7 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 		Href: cleanPath,
 		Propstat: []propstat{{
 			Prop:   successProp,
-			Status: "HTTP/1.1 200 OK",
+			Status: httpStatusOK,
 		}},
 	}}, nil
 }
@@ -349,14 +324,14 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var mkReq mkcalendarRequest
-	if r.ContentLength > 0 {
-		if r.ContentLength > maxDAVBodyBytes {
-			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxDAVBodyBytes))
+	if r.Body != http.NoBody {
+		body, err := readDAVBody(w, r, maxDAVBodyBytes)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
+			if errors.Is(err, errRequestTooLarge) {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+			}
 			return
 		}
 		if err := safeUnmarshalXML(body, &mkReq); err != nil {
@@ -800,21 +775,17 @@ func hasMultipleDifferentUIDs(icalData string) bool {
 	return false
 }
 
-// validateVCard performs basic validation of vCard data (RFC 6350)
 func (h *Handler) validateVCard(data string) error {
 	trimmed := strings.TrimSpace(data)
 
-	// Must start with BEGIN:VCARD
 	if !strings.HasPrefix(strings.ToUpper(trimmed), "BEGIN:VCARD") {
 		return fmt.Errorf("missing BEGIN:VCARD")
 	}
 
-	// Must end with END:VCARD
 	if !strings.HasSuffix(strings.ToUpper(trimmed), "END:VCARD") {
 		return fmt.Errorf("missing END:VCARD")
 	}
 
-	// Check balanced BEGIN/END tags
 	upper := strings.ToUpper(trimmed)
 	beginCount := strings.Count(upper, "BEGIN:VCARD")
 	endCount := strings.Count(upper, "END:VCARD")
@@ -840,7 +811,6 @@ func (h *Handler) checkConditionalHeaders(r *http.Request, existing *store.Event
 		if existing == nil {
 			return false
 		}
-		// Strip quotes from header value
 		requestETag := strings.Trim(ifMatch, "\"")
 		return requestETag == existing.ETag
 	}
@@ -848,7 +818,7 @@ func (h *Handler) checkConditionalHeaders(r *http.Request, existing *store.Event
 	// If-None-Match with specific ETag means "only update if ETag doesn't match"
 	if ifNoneMatch != "" {
 		if existing == nil {
-			return true // Resource doesn't exist, so create it
+			return true
 		}
 		requestETag := strings.Trim(ifNoneMatch, "\"")
 		return requestETag != existing.ETag
@@ -942,7 +912,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
-		// Block writes to birthday calendar
 		if calendarID == birthdayCalendarID {
 			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
 			return
@@ -972,7 +941,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Validate iCalendar data
 		if err := h.validateICalendar(string(body)); err != nil {
 			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
 			return
@@ -1045,7 +1013,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Extract UID from calendar data (RFC 4791 Section 4.1)
 		uid, err := extractUIDFromICalendar(string(body))
 		if err != nil {
 			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
@@ -1056,8 +1023,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			resourceName = uid
 		}
 
-		// RFC 4791 Section 4.1: UID must be persistent - check for conflicts
-		// Case 1: Resource path exists with different UID (UID change attempt)
 		existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -1069,7 +1034,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Case 2: UID exists at different resource path (UID reuse attempt)
 		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -1081,7 +1045,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check conditional request headers (RFC 4791 Section 5.3.1-5.3.2)
 		if !h.checkConditionalHeaders(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
@@ -1110,16 +1073,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Validate vCard data
 		if err := h.validateVCard(string(body)); err != nil {
 			http.Error(w, fmt.Sprintf("invalid vCard data: %v", err), http.StatusBadRequest)
 			return
 		}
 
-		// Extract UID from vCard data, or use resource name if not present
 		uid, err := extractUIDFromVCard(string(body))
 		if err != nil {
-			// UID is not strictly required in vCard 3.0, fall back to resource name
 			_, resourceUID, matched := parseResourcePath(cleanPath, "/dav/addressbooks")
 			if !matched || resourceUID == "" {
 				http.Error(w, fmt.Sprintf("invalid vCard data: %v", err), http.StatusBadRequest)
@@ -1130,7 +1090,6 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 
 		existing, _ := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
 
-		// Check conditional request headers
 		if !h.checkConditionalHeadersContact(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
@@ -1172,7 +1131,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
-		// Block deletes from birthday calendar
 		if calendarID == birthdayCalendarID {
 			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
 			return
@@ -1191,7 +1149,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		// Check conditional headers before deletion
 		existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -1221,7 +1178,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", status)
 			return
 		}
-		// Check conditional headers before deletion
 		existing, _ := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
 		if !h.checkConditionalHeadersContact(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
@@ -1237,7 +1193,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unsupported path", http.StatusBadRequest)
 }
 
-// buildPropfindResponses constructs DAV multistatus responses for a path.
 func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
 	cleanPath := path.Clean(reqPath)
 	if !strings.HasPrefix(cleanPath, "/dav") {
@@ -1392,7 +1347,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		}
 		resourceHref := strings.TrimSuffix(href, "/") + "/" + resourceName + ".ics"
 		if event == nil {
-			return []response{{Href: resourceHref, Status: "HTTP/1.1 404 Not Found"}}, nil
+			return []response{{Href: resourceHref, Status: httpStatusNotFound}}, nil
 		}
 		return []response{resourceResponse(resourceHref, calendarResourcePropstat(event.ETag, event.RawICAL, true))}, nil
 	}
@@ -1739,7 +1694,7 @@ func principalResponse(href string, user *store.User) response {
 		AddressbookHomeSet:   &hrefListProp{Href: []string{"/dav/addressbooks/"}},
 		SupportedReportSet:   combinedSupportedReports(),
 	}
-	return response{Href: href, Propstat: []propstat{{Prop: p, Status: "HTTP/1.1 200 OK"}}}
+	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
 }
 
 func rootCollectionResponse(href string, user *store.User, principalHref string) response {
@@ -1749,7 +1704,7 @@ func rootCollectionResponse(href string, user *store.User, principalHref string)
 		CurrentUserPrincipal: &hrefProp{Href: principalHref},
 		SupportedReportSet:   combinedSupportedReports(),
 	}
-	return response{Href: href, Propstat: []propstat{{Prop: p, Status: "HTTP/1.1 200 OK"}}}
+	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
 }
 
 func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
@@ -1789,7 +1744,6 @@ func (h *Handler) addressBookReportResponses(ctx context.Context, book *store.Ad
 	}
 }
 
-// applyCalendarFilter filters events based on comp-filter and time-range
 func (h *Handler) applyCalendarFilter(events []store.Event, filter *calFilter) []store.Event {
 	if filter == nil {
 		return events
@@ -1804,41 +1758,34 @@ func (h *Handler) applyCalendarFilter(events []store.Event, filter *calFilter) [
 	return filtered
 }
 
-// eventMatchesFilter checks if an event matches the calendar filter criteria
 func (h *Handler) eventMatchesFilter(event store.Event, filter *calFilter) bool {
 	return h.matchesCompFilter(event, &filter.CompFilter)
 }
 
-// matchesCompFilter recursively checks if an event matches a component filter
 func (h *Handler) matchesCompFilter(event store.Event, compFilter *compFilter) bool {
-	// Check component type filter
 	compType := compFilter.Name
 	if compType != "" && !h.hasComponent(event.RawICAL, compType) {
 		return false
 	}
 
-	// Check time-range filter if present at this level
 	if compFilter.TimeRange != nil {
 		if !h.eventInTimeRange(event, compFilter.TimeRange) {
 			return false
 		}
 	}
 
-	// Check nested component filters
 	for _, nestedFilter := range compFilter.CompFilter {
 		if !h.matchesCompFilter(event, &nestedFilter) {
 			return false
 		}
 	}
 
-	// Check property filters
 	for _, propFilter := range compFilter.PropFilter {
 		if !h.matchesPropFilter(event, &propFilter) {
 			return false
 		}
 	}
 
-	// Check text match at this level
 	if compFilter.TextMatch != nil {
 		if !h.matchesTextMatch(event.RawICAL, compFilter.TextMatch) {
 			return false
@@ -1848,22 +1795,18 @@ func (h *Handler) matchesCompFilter(event store.Event, compFilter *compFilter) b
 	return true
 }
 
-// matchesPropFilter checks if an event matches a property filter
 func (h *Handler) matchesPropFilter(event store.Event, propFilter *propFilter) bool {
 	propName := strings.ToUpper(propFilter.Name)
 	hasProp := strings.Contains(strings.ToUpper(event.RawICAL), propName+":")
 
-	// If is-not-defined is set, event should NOT have the property
 	if propFilter.IsNotDefined != nil {
 		return !hasProp
 	}
 
-	// Otherwise, event should have the property
 	if !hasProp {
 		return false
 	}
 
-	// If there's a text-match, check it
 	if propFilter.TextMatch != nil {
 		return h.matchesTextMatch(event.RawICAL, propFilter.TextMatch)
 	}
@@ -1871,7 +1814,6 @@ func (h *Handler) matchesPropFilter(event store.Event, propFilter *propFilter) b
 	return true
 }
 
-// matchesTextMatch checks if text content matches the filter
 func (h *Handler) matchesTextMatch(icalData string, textMatch *textMatch) bool {
 	text := strings.TrimSpace(textMatch.Text)
 	if text == "" {
@@ -1881,7 +1823,6 @@ func (h *Handler) matchesTextMatch(icalData string, textMatch *textMatch) bool {
 	// Case-insensitive contains check (simplified - RFC 4790 has more complex rules)
 	matches := strings.Contains(strings.ToUpper(icalData), strings.ToUpper(text))
 
-	// Check negate-condition attribute
 	if textMatch.NegateCondition == "yes" {
 		return !matches
 	}
@@ -1889,14 +1830,12 @@ func (h *Handler) matchesTextMatch(icalData string, textMatch *textMatch) bool {
 	return matches
 }
 
-// hasComponent checks if the iCalendar data contains a component of the specified type
 func (h *Handler) hasComponent(icalData, componentType string) bool {
 	componentType = strings.ToUpper(componentType)
 	beginMarker := "BEGIN:" + componentType
 	return strings.Contains(strings.ToUpper(icalData), beginMarker)
 }
 
-// eventInTimeRange checks if an event overlaps with the specified time range
 func (h *Handler) eventInTimeRange(event store.Event, tr *timeRange) bool {
 	start, err := parseICalDateTime(tr.Start)
 	if err != nil {
@@ -1914,12 +1853,10 @@ func (h *Handler) eventInTimeRange(event store.Event, tr *timeRange) bool {
 		end = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 	}
 
-	// Check if event has recurrence rule
 	if strings.Contains(strings.ToUpper(event.RawICAL), "RRULE:") {
 		return h.recurringEventInTimeRange(event, start, end)
 	}
 
-	// Non-recurring event: check if it overlaps with query range
 	if event.DTStart != nil {
 		eventEnd := event.DTEnd
 		if eventEnd == nil {
@@ -1927,21 +1864,17 @@ func (h *Handler) eventInTimeRange(event store.Event, tr *timeRange) bool {
 			eventEnd = event.DTStart
 		}
 
-		// Event overlaps if: event.start < range.end AND event.end > range.start
 		return event.DTStart.Before(end) && eventEnd.After(start)
 	}
 
-	// If no parsed dates, include the event (can't filter reliably)
 	return true
 }
 
-// recurringEventInTimeRange checks if a recurring event has any instances in the time range
 func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, rangeEnd time.Time) bool {
 	if event.DTStart == nil {
-		return true // Can't determine without start time
+		return true
 	}
 
-	// Extract RRULE from iCalendar data
 	rrule := extractRRule(event.RawICAL)
 	if rrule == "" {
 		return true // Malformed, be permissive
@@ -1953,7 +1886,6 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 	untilStr := extractRRuleParam(rrule, "UNTIL")
 	intervalStr := extractRRuleParam(rrule, "INTERVAL")
 
-	// Determine recurrence interval
 	interval := 1
 	if intervalStr != "" {
 		if i, err := strconv.Atoi(intervalStr); err == nil && i > 0 {
@@ -1961,7 +1893,6 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 		}
 	}
 
-	// Determine maximum occurrences to check
 	maxOccurrences := 500 // Default limit to prevent infinite loops
 	if countStr != "" {
 		if c, err := strconv.Atoi(countStr); err == nil && c > 0 {
@@ -1969,7 +1900,6 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 		}
 	}
 
-	// Determine recurrence end date
 	recurrenceEnd := rangeEnd.AddDate(0, 0, 1) // Default to just past query range
 	if untilStr != "" {
 		if until, err := parseICalDateTime(untilStr); err == nil {
@@ -1977,32 +1907,26 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 		}
 	}
 
-	// Calculate event duration
 	eventDuration := time.Hour // Default 1 hour
 	if event.DTEnd != nil {
 		eventDuration = event.DTEnd.Sub(*event.DTStart)
 	}
 
-	// Generate instances and check if any fall in range
 	current := *event.DTStart
 	for i := 0; i < maxOccurrences; i++ {
-		// Stop if we've passed the recurrence end
 		if current.After(recurrenceEnd) {
 			break
 		}
 
-		// Stop if we've gone well past the query range (optimization)
 		if current.After(rangeEnd.AddDate(0, 0, 7)) {
 			break
 		}
 
-		// Check if this instance overlaps with query range
 		instanceEnd := current.Add(eventDuration)
 		if current.Before(rangeEnd) && instanceEnd.After(rangeStart) {
 			return true
 		}
 
-		// Calculate next occurrence based on frequency
 		switch strings.ToUpper(freq) {
 		case "DAILY":
 			current = current.AddDate(0, 0, interval)
@@ -2017,7 +1941,7 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 			return true
 		}
 
-		// Safety check: if we've checked 1000+ days into the future, stop
+		// Safety check
 		if current.After(event.DTStart.AddDate(3, 0, 0)) && i > 100 {
 			break
 		}
@@ -2026,22 +1950,18 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 	return false
 }
 
-// freeBusyQuery generates a VFREEBUSY response (RFC 4791 Section 7.10)
 func (h *Handler) freeBusyQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter) ([]response, error) {
 	events, err := h.store.Events.ListForCalendar(ctx, calID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events")
 	}
 
-	// Apply time-range filter if present
 	if filter != nil {
 		events = h.applyCalendarFilter(events, filter)
 	}
 
-	// Generate VFREEBUSY component
 	freeBusyData := h.generateFreeBusy(events, filter)
 
-	// Return as a single resource response
 	href := strings.TrimSuffix(cleanPath, "/") + "/freebusy.ics"
 	etag := fmt.Sprintf("%x", sha256.Sum256([]byte(freeBusyData)))
 
@@ -2050,7 +1970,6 @@ func (h *Handler) freeBusyQuery(ctx context.Context, calID int64, cleanPath stri
 	}, nil
 }
 
-// generateFreeBusy creates a VFREEBUSY component from events
 func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) string {
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
@@ -2059,7 +1978,6 @@ func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) stri
 	sb.WriteString("BEGIN:VFREEBUSY\r\n")
 	sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", time.Now().UTC().Format("20060102T150405Z")))
 
-	// Add time range if specified in filter
 	if filter != nil && filter.CompFilter.TimeRange != nil {
 		if filter.CompFilter.TimeRange.Start != "" {
 			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", filter.CompFilter.TimeRange.Start))
@@ -2069,7 +1987,6 @@ func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) stri
 		}
 	}
 
-	// Add FREEBUSY periods for each event
 	for _, event := range events {
 		if event.DTStart != nil {
 			endTime := event.DTEnd
@@ -2077,7 +1994,6 @@ func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) stri
 				endTime = event.DTStart
 			}
 
-			// Format as FREEBUSY property (start/end)
 			startStr := event.DTStart.UTC().Format("20060102T150405Z")
 			endStr := endTime.UTC().Format("20060102T150405Z")
 			sb.WriteString(fmt.Sprintf("FREEBUSY:%s/%s\r\n", startStr, endStr))
@@ -2096,7 +2012,6 @@ func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath stri
 		return nil, fmt.Errorf("failed to list events")
 	}
 
-	// Apply filters if provided
 	if filter != nil {
 		events = h.applyCalendarFilter(events, filter)
 	}
@@ -2125,7 +2040,7 @@ func (h *Handler) calendarMultiGet(ctx context.Context, cal *store.CalendarAcces
 			return nil, fmt.Errorf("failed to fetch event")
 		}
 		if ev == nil {
-			responses = append(responses, response{Href: responseHref, Status: "HTTP/1.1 404 Not Found"})
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
 		rawData := filterICalendarData(ev.RawICAL, calData)
@@ -2175,7 +2090,7 @@ func (h *Handler) addressBookMultiGet(ctx context.Context, bookID int64, hrefs [
 			return nil, fmt.Errorf("failed to fetch contact")
 		}
 		if c == nil {
-			responses = append(responses, response{Href: cleanHref, Status: "HTTP/1.1 404 Not Found"})
+			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
 			continue
 		}
 		responses = append(responses, resourceResponse(cleanHref, etagProp(c.ETag, c.RawVCard, false)))
@@ -2205,7 +2120,6 @@ func calendarResourceResponsesFiltered(base string, events []store.Event, calDat
 	return responses
 }
 
-// calendarResourceResponsesWithData allows control over including calendar data
 func calendarResourceResponsesWithData(base string, events []store.Event, includeData bool) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	var responses []response
@@ -2322,8 +2236,6 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.Add
 	return responses, syncToken, nil
 }
 
-// generateBirthdayEvents creates iCal birthday events from contacts with birthdays.
-// Each birthday is a yearly recurring event.
 func (h *Handler) generateBirthdayEvents(ctx context.Context, userID int64) ([]store.Event, error) {
 	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(ctx, userID)
 	if err != nil {
@@ -2347,32 +2259,25 @@ func (h *Handler) generateBirthdayEvents(ctx context.Context, userID int64) ([]s
 		// Generate UID for this birthday event (based on contact UID to be stable)
 		uid := fmt.Sprintf("birthday-%s@calcard", c.UID)
 
-		// Calculate age they'll turn at their next birthday
-		// This accounts for whether the birthday has already passed this year
 		var summaryAge string
 		if c.Birthday.Year() > 1900 {
 			birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
 			var ageAtNextBirthday int
 			if birthdayThisYear.After(now) {
-				// Birthday hasn't happened yet this year
 				ageAtNextBirthday = currentYear - c.Birthday.Year()
 			} else {
-				// Birthday already happened, next one is next year
 				ageAtNextBirthday = (currentYear + 1) - c.Birthday.Year()
 			}
 			summaryAge = fmt.Sprintf(" (turning %d)", ageAtNextBirthday)
 		}
 		summary := fmt.Sprintf("🎂 %s's Birthday%s", displayName, summaryAge)
 
-		// Start recurring event from current year (or next year if birthday passed)
-		// This ensures the age in the summary is accurate for near-future occurrences
 		startYear := currentYear
 		birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
 		if birthdayThisYear.Before(now) {
 			startYear = currentYear + 1
 		}
 
-		// Format the birthday date as DTSTART (all-day event)
 		dtstart := time.Date(startYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
 		dtstartStr := dtstart.Format("20060102")
 
@@ -2408,16 +2313,15 @@ func (h *Handler) generateBirthdayEvents(ctx context.Context, userID int64) ([]s
 			ETag:         etag,
 			Summary:      &summary,
 			DTStart:      &dtstart,
-			DTEnd:        nil, // All-day events don't need DTEND
+			DTEnd:        nil,
 			AllDay:       true,
-			LastModified: c.LastModified, // Use contact's last modified as event's last modified
+			LastModified: c.LastModified,
 		})
 	}
 
 	return events, nil
 }
 
-// escapeICalText escapes special characters in iCal text values.
 func escapeICalText(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, ";", "\\;")
@@ -2426,9 +2330,7 @@ func escapeICalText(s string) string {
 	return s
 }
 
-// birthdayCalendarReportResponses handles REPORT requests for the virtual birthday calendar.
 func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
-	// Generate birthday events
 	events, err := h.generateBirthdayEvents(ctx, user.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate birthday events")
@@ -2439,13 +2341,11 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 		res, err := h.birthdayCalendarMultiGet(ctx, events, report.Hrefs, cleanPath)
 		return res, "", err
 	case "calendar-query":
-		// Apply filters if provided
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
 		return calendarResourceResponses(cleanPath, events), "", nil
 	case "free-busy-query":
-		// Apply filters if provided
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
@@ -2454,8 +2354,6 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(freeBusyData)))
 		return []response{resourceResponse(href, etagProp(etag, freeBusyData, true))}, "", nil
 	case "sync-collection":
-		// Birthday calendar doesn't support incremental sync, always return all events
-		// Validate incoming sync-token if provided (RFC 6578)
 		if report.SyncToken != "" {
 			info, err := parseSyncToken(report.SyncToken)
 			if err != nil || info.Kind != "cal" || info.ID != birthdayCalendarID {
@@ -2464,12 +2362,10 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 		}
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 		// Use a stable sync-token (epoch time) since we always return all events
-		// This ensures consistency across requests for Apple Calendar compatibility
 		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 		birthdayName := "Birthdays"
 		birthdayDesc := "Contact birthdays from your address books"
 		calData := reportCalendarData(report)
-		// Include the collection response first (matching regular calendar behavior)
 		responses := []response{
 			calendarCollectionResponse(collectionHref, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true),
 		}
@@ -2481,13 +2377,11 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 	}
 }
 
-// birthdayCalendarMultiGet handles multiget requests for birthday events.
 func (h *Handler) birthdayCalendarMultiGet(ctx context.Context, events []store.Event, hrefs []string, cleanPath string) ([]response, error) {
 	if len(hrefs) == 0 {
 		return calendarResourceResponses(cleanPath, events), nil
 	}
 
-	// Create a map of UIDs to events for quick lookup
 	eventsByUID := make(map[string]store.Event)
 	for _, ev := range events {
 		eventsByUID[ev.UID] = ev
@@ -2506,7 +2400,7 @@ func (h *Handler) birthdayCalendarMultiGet(ctx context.Context, events []store.E
 		}
 		ev, found := eventsByUID[uid]
 		if !found {
-			responses = append(responses, response{Href: cleanHref, Status: "HTTP/1.1 404 Not Found"})
+			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
 			continue
 		}
 		responses = append(responses, resourceResponse(cleanHref, etagProp(ev.ETag, ev.RawICAL, true)))

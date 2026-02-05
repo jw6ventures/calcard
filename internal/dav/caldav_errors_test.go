@@ -123,3 +123,29 @@ func TestWriteCalDAVErrorMulti_SingleCondition(t *testing.T) {
 		t.Errorf("expected condition in response, got: %s", body)
 	}
 }
+
+func TestBuildCalDAVErrorXMLSingle(t *testing.T) {
+	xml := buildCalDAVErrorXML([]string{"max-resource-size"})
+	if !strings.Contains(xml, "<?xml version") {
+		t.Error("expected XML declaration")
+	}
+	if !strings.Contains(xml, "xmlns:D=\"DAV:\"") || !strings.Contains(xml, "xmlns:C=\"urn:ietf:params:xml:ns:caldav\"") {
+		t.Error("expected DAV and CalDAV namespaces")
+	}
+	if !strings.Contains(xml, "<C:max-resource-size/>") {
+		t.Errorf("expected condition in XML, got: %s", xml)
+	}
+}
+
+func TestBuildCalDAVErrorXMLMulti(t *testing.T) {
+	xml := buildCalDAVErrorXML([]string{"valid-calendar-data", "<bad>", "valid-calendar-object-resource"})
+	if strings.Contains(xml, "<bad>") {
+		t.Error("expected invalid condition to be skipped")
+	}
+	if !strings.Contains(xml, "<C:valid-calendar-data/>") {
+		t.Error("expected first condition in XML")
+	}
+	if !strings.Contains(xml, "<C:valid-calendar-object-resource/>") {
+		t.Error("expected second condition in XML")
+	}
+}

@@ -1026,6 +1026,34 @@ func TestMkcalendarCreatesCalendar(t *testing.T) {
 	}
 }
 
+func TestMkcalendarParsesChunkedRequestBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	u := &store.User{ID: 1}
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Chunked Cal</D:displayname>
+    </D:prop>
+  </D:set>
+</C:mkcalendar>`
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/Chunked", strings.NewReader(body))
+	req.ContentLength = -1
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", rr.Code)
+	}
+	if len(calRepo.calendars) != 1 {
+		t.Fatalf("expected calendar to be created, got %d", len(calRepo.calendars))
+	}
+}
+
 func TestMkcalendarRejectsSlugNameCollisions(t *testing.T) {
 	slug := "team"
 	calRepo := &fakeCalendarRepo{
@@ -2787,6 +2815,40 @@ func TestPropfindParsesRequestBody(t *testing.T) {
 		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
 	}
 	// Response should contain displayname and resourcetype
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "displayname") {
+		t.Errorf("expected displayname in response, got %s", respBody)
+	}
+}
+
+func TestPropfindParsesChunkedRequestBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:displayname/>
+    <D:resourcetype/>
+  </D:prop>
+</D:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req.ContentLength = -1
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
 	respBody := rr.Body.String()
 	if !strings.Contains(respBody, "displayname") {
 		t.Errorf("expected displayname in response, got %s", respBody)
