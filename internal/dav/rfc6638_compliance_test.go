@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 // Extension: Schedule-Tag Header (RFC 6638 - CalDAV Scheduling)

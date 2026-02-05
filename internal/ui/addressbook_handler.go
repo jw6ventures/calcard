@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/store"
-	"gitea.jw6.us/james/calcard/internal/ui/utils"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 	"github.com/go-chi/chi/v5"
 )
 

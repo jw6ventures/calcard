@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/config"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 

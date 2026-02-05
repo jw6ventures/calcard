@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	jw6_utils "gitea.jw6.us/Utilities/jw6-go-utils"
-	appauth "gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/config"
-	httpserver "gitea.jw6.us/james/calcard/internal/http"
-	"gitea.jw6.us/james/calcard/internal/store"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
+	appauth "github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/config"
+	httpserver "github.com/jw6ventures/calcard/internal/http"
+	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

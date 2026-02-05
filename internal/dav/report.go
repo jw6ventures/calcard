@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {

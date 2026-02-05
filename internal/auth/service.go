@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"gitea.jw6.us/james/calcard/internal/config"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"

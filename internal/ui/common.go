@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strconv"
 
-	"gitea.jw6.us/james/calcard/internal/http/csrf"
-	"gitea.jw6.us/james/calcard/internal/http/errors"
+	"github.com/jw6ventures/calcard/internal/http/csrf"
+	"github.com/jw6ventures/calcard/internal/http/errors"
 )
 
 const defaultPageSize = 50

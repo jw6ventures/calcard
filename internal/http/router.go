@@ -10,14 +10,14 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/time/rate"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/config"
-	"gitea.jw6.us/james/calcard/internal/dav"
-	"gitea.jw6.us/james/calcard/internal/http/csrf"
-	"gitea.jw6.us/james/calcard/internal/http/ratelimit"
-	"gitea.jw6.us/james/calcard/internal/metrics"
-	"gitea.jw6.us/james/calcard/internal/store"
-	"gitea.jw6.us/james/calcard/internal/ui"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
+	"github.com/jw6ventures/calcard/internal/http/csrf"
+	"github.com/jw6ventures/calcard/internal/http/ratelimit"
+	"github.com/jw6ventures/calcard/internal/metrics"
+	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui"
 )
 
 func init() {

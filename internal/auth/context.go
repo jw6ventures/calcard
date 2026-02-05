@@ -3,7 +3,7 @@ package auth
 import (
 	"context"
 
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 type contextKey string
