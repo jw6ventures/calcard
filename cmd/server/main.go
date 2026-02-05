@@ -27,7 +27,7 @@ func main() {
 	logLevel := jw6_utils.LogLevelFromString(logLevelString)
 
 	jw6utils := jw6_utils.Utils{LogLevel: logLevel}
-	jw6utils.PrintBanner("CalCard", version, "2025", 3, "James Williams")
+	jw6utils.PrintBanner("CalCard", version, "2026", 3, "JW6 Ventures LLC")
 
 	log.Println("Starting CalCard server...")
 	cfg, err := config.Load()
