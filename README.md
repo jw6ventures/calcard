@@ -87,9 +87,7 @@ Environment variables:
 - Readiness: `GET /readyz` checks connectivity to critical dependencies and returns `503 Service Unavailable` until they are reachable.
 
 ## License
-CalCard is dual-licensed:
-- **AGPLv3** for open-source use
-- **Commercial License** for proprietary customizations or hosted SaaS use
 
-If you run CalCard as a network service and do not provide full corresponding
-source code to users interacting with it, you must obtain a commercial license.
+CalCard is licensed under the [Source First License](https://sourcefirst.com/).
+
+Commercial use requires a commercial agreement with JW6 Ventures LLC - [License Request Form](https://jw6ventures.atlassian.net/helpcenter/CSM/contact-us/9a6bbea8-202d-498f-8462-52c2ee8ab09e).
