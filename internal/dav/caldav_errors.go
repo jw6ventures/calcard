@@ -32,7 +32,7 @@ func writeCalDAVError(w http.ResponseWriter, status int, condition string) {
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:%s/></D:error>`, condition)
+	_, _ = fmt.Fprint(w, buildCalDAVErrorXML([]string{condition}))
 }
 
 func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...string) {
@@ -46,6 +46,10 @@ func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...stri
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(status)
+	_, _ = fmt.Fprint(w, buildCalDAVErrorXML(conditions))
+}
+
+func buildCalDAVErrorXML(conditions []string) string {
 	var builder strings.Builder
 	builder.WriteString(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">`)
 	for _, condition := range conditions {
@@ -59,6 +63,7 @@ func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...stri
 		builder.WriteString(condition)
 		builder.WriteString("/>")
 	}
+
 	builder.WriteString("</D:error>")
-	_, _ = fmt.Fprint(w, builder.String())
+	return builder.String()
 }

@@ -1,12 +1,12 @@
-module gitea.jw6.us/james/calcard
+module github.com/jw6ventures/calcard
 
 go 1.24.0
 
 require (
-	gitea.jw6.us/Utilities/jw6-go-utils v1.0.2
 	github.com/coreos/go-oidc/v3 v3.11.0
 	github.com/go-chi/chi/v5 v5.2.2
 	github.com/jackc/pgx/v5 v5.5.4
+	github.com/jw6ventures/jw6-go-utils v1.0.0
 	github.com/prometheus/client_golang v1.19.1
 	golang.org/x/crypto v0.45.0
 	golang.org/x/oauth2 v0.33.0

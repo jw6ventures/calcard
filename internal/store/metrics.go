@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"gitea.jw6.us/james/calcard/internal/metrics"
+	"github.com/jw6ventures/calcard/internal/metrics"
 )
 
 func observeDB(ctx context.Context, operation string) func() {

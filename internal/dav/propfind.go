@@ -3,12 +3,11 @@ package dav
 import (
 	"encoding/xml"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
@@ -24,10 +23,14 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var propfindReq propfindRequest
-	if r.ContentLength > 0 {
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxDAVBodyBytes))
+	if r.Body != http.NoBody {
+		body, err := readDAVBody(w, r, maxDAVBodyBytes)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
+			if errors.Is(err, errRequestTooLarge) {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+			}
 			return
 		}
 		if err := safeUnmarshalXML(body, &propfindReq); err != nil {
@@ -58,8 +61,5 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 		XmlnsCS:  "http://calendarserver.org/ns/",
 		Response: responses,
 	}
-
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(http.StatusMultiStatus)
-	_ = xml.NewEncoder(w).Encode(payload)
+	writeMultiStatus(w, payload)
 }

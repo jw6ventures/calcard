@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"gitea.jw6.us/james/calcard/internal/migrations"
+	"github.com/jw6ventures/calcard/internal/migrations"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )

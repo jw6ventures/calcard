@@ -19,36 +19,30 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 		Href:     href,
 		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, Calendar: &struct{}{}}, principalHref, true, false)},
 	}
+	p := &resp.Propstat[0].Prop
 	if syncToken != "" {
-		resp.Propstat[0].Prop.SyncToken = syncToken
+		p.SyncToken = syncToken
 	}
 	if ctag != "" {
-		resp.Propstat[0].Prop.CTag = ctag
+		p.CTag = ctag
 	}
 	if description != nil && *description != "" {
-		resp.Propstat[0].Prop.CalendarDescription = *description
+		p.CalendarDescription = *description
 	}
-	// Always include calendar-timezone property (RFC 4791 Section 5.2.2).
-	resp.Propstat[0].Prop.CalendarTimezone = calendarTimezoneValue(timezone)
-	// Add supported calendar component set (RFC 4791 Section 5.2.3)
-	resp.Propstat[0].Prop.SupportedCalendarComponentSet = supportedCalendarComponents()
-	// Add supported calendar data (RFC 4791 Section 5.2.4)
-	resp.Propstat[0].Prop.SupportedCalendarData = supportedCalendarDataProp()
-	// Default to opaque for scheduling transparency (RFC 4791 Section 5.2.8)
-	resp.Propstat[0].Prop.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
-	// Add current-user-privilege-set (RFC 4791 Section 6.3)
-	resp.Propstat[0].Prop.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet()
+	p.CalendarTimezone = calendarTimezoneValue(timezone)
+	p.SupportedCalendarComponentSet = supportedCalendarComponents()
+	p.SupportedCalendarData = supportedCalendarDataProp()
+	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
+	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet()
 
-	// Add calendar limits (RFC 4791 Section 5.2.5-5.2.9)
-	resp.Propstat[0].Prop.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
-	resp.Propstat[0].Prop.MinDateTime = caldavMinDateTime
-	resp.Propstat[0].Prop.MaxDateTime = caldavMaxDateTime
-	resp.Propstat[0].Prop.MaxInstances = fmt.Sprintf("%d", caldavMaxInstances)
-	resp.Propstat[0].Prop.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
+	p.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.MinDateTime = caldavMinDateTime
+	p.MaxDateTime = caldavMaxDateTime
+	p.MaxInstances = fmt.Sprintf("%d", caldavMaxInstances)
+	p.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
 
-	// Mark calendar as read-only for Apple Calendar compatibility
 	if readOnly {
-		resp.Propstat[0].Prop.CalendarServerReadOnly = &struct{}{}
+		p.CalendarServerReadOnly = &struct{}{}
 	}
 
 	return resp
@@ -59,14 +53,15 @@ func addressBookCollectionResponse(href, name string, description *string, princ
 		Href:     href,
 		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}}, principalHref, false, true)},
 	}
+	p := &resp.Propstat[0].Prop
 	if syncToken != "" {
-		resp.Propstat[0].Prop.SyncToken = syncToken
+		p.SyncToken = syncToken
 	}
 	if ctag != "" {
-		resp.Propstat[0].Prop.CTag = ctag
+		p.CTag = ctag
 	}
 	if description != nil && *description != "" {
-		resp.Propstat[0].Prop.AddressBookDesc = *description
+		p.AddressBookDesc = *description
 	}
 	return resp
 }
@@ -77,7 +72,7 @@ func statusOKProp(name string, rtype resourceType) propstat {
 			DisplayName:  name,
 			ResourceType: rtype,
 		},
-		Status: "HTTP/1.1 200 OK",
+		Status: httpStatusOK,
 	}
 }
 
@@ -98,14 +93,13 @@ func statusOKPropWithExtras(name string, rtype resourceType, principalHref strin
 	if !includeCalendarHome && !includeAddressHome {
 		p.SupportedReportSet = combinedSupportedReports()
 	}
-	return propstat{Prop: p, Status: "HTTP/1.1 200 OK"}
+	return propstat{Prop: p, Status: httpStatusOK}
 }
 
 func etagProp(etag, data string, calendar bool) propstat {
 	return etagPropWithData(etag, data, calendar, true)
 }
 
-// etagPropWithData allows control over whether to include the full data
 func etagPropWithData(etag, data string, calendar bool, includeData bool) propstat {
 	propVal := prop{GetETag: "\"" + etag + "\""}
 	if includeData {
@@ -117,7 +111,7 @@ func etagPropWithData(etag, data string, calendar bool, includeData bool) propst
 			propVal.GetContentType = "text/vcard; charset=utf-8"
 		}
 	}
-	return propstat{Prop: propVal, Status: "HTTP/1.1 200 OK"}
+	return propstat{Prop: propVal, Status: httpStatusOK}
 }
 
 func calendarResourcePropstat(etag, data string, includeData bool) propstat {
@@ -130,9 +124,8 @@ func resourceResponse(href string, ps propstat) response {
 	return response{Href: href, Propstat: []propstat{ps}}
 }
 
-// deletedResponse returns a response indicating the resource was deleted (for sync-collection).
 func deletedResponse(href string) response {
-	return response{Href: href, Status: "HTTP/1.1 404 Not Found"}
+	return response{Href: href, Status: httpStatusNotFound}
 }
 
 func calendarSupportedReports() *supportedReportSet {

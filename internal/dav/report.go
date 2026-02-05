@@ -4,18 +4,16 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"gitea.jw6.us/james/calcard/internal/auth"
-	"gitea.jw6.us/james/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// REPORT handler split for readability.
 func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -30,15 +28,9 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 		}
 		return p
 	}
-	if r.ContentLength > maxDAVBodyBytes {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
-	body, err := io.ReadAll(limitedBody)
+	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		if errors.Is(err, errRequestTooLarge) {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		} else {
 			http.Error(w, "failed to read body", http.StatusBadRequest)

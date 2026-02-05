@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"gitea.jw6.us/james/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/config"
 )
 
 type contextKey struct{}
