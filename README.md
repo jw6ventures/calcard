@@ -74,6 +74,13 @@ Environment variables:
 | `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
 | `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for public environments |
 
+## Database schema and migrations
+CalCard uses the `jw6-go-utils` database manager. On startup it will:
+- Create the schema from `db.sql` if the schema check table (`users`) does not exist.
+- Use semantic-versioned migration files in the `migrations/` directory (named `vX.Y.Z.sql`) to move from the stored database version to the current app version.
+
+The baseline version is stored in the `application` table, created by `db.sql`.
+
 
 ## Connecting a CalDAV/CardDAV client
 - Sign in to the web UI

@@ -18,7 +18,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lib/pq"
 )
 
 // Handler serves WebDAV/CalDAV/CardDAV requests.
@@ -386,8 +386,8 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 		Timezone:    timezone,
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			http.Error(w, "calendar already exists", http.StatusConflict)
 			return
 		}

@@ -2,19 +2,19 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/util"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lib/pq"
 )
 
 // userRepo implements UserRepository.
 type userRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *userRepo) UpsertOAuthUser(ctx context.Context, subject, email string) (*User, error) {
@@ -27,7 +27,7 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
 RETURNING id, oauth_subject, primary_email, created_at, last_login_at
 `
 	defer observeDB(ctx, "users.upsert_oauth")()
-	row := r.pool.QueryRow(ctx, q, subject, email)
+	row := r.pool.QueryRowContext(ctx, q, subject, email)
 	var u User
 	if err := row.Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
 		return nil, err
@@ -39,8 +39,8 @@ func (r *userRepo) GetByID(ctx context.Context, id int64) (*User, error) {
 	const q = `SELECT id, oauth_subject, primary_email, created_at, last_login_at FROM users WHERE id=$1`
 	defer observeDB(ctx, "users.get_by_id")()
 	var u User
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -52,8 +52,8 @@ func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) 
 	const q = `SELECT id, oauth_subject, primary_email, created_at, last_login_at FROM users WHERE primary_email=$1`
 	defer observeDB(ctx, "users.get_by_email")()
 	var u User
-	if err := r.pool.QueryRow(ctx, q, email).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	if err := r.pool.QueryRowContext(ctx, q, email).Scan(&u.ID, &u.OAuthSubject, &u.PrimaryEmail, &u.CreatedAt, &u.LastLoginAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -64,7 +64,7 @@ func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) 
 func (r *userRepo) ListActive(ctx context.Context) ([]User, error) {
 	const q = `SELECT id, oauth_subject, primary_email, created_at, last_login_at FROM users WHERE last_login_at IS NOT NULL ORDER BY primary_email`
 	defer observeDB(ctx, "users.list_active")()
-	rows, err := r.pool.Query(ctx, q)
+	rows, err := r.pool.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -83,13 +83,13 @@ func (r *userRepo) ListActive(ctx context.Context) ([]User, error) {
 
 // calendarRepo implements CalendarRepository.
 type calendarRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar, error) {
 	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "calendars.list_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -98,9 +98,14 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 	var result []Calendar
 	for rows.Next() {
 		var c Calendar
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var slug, description, timezone, color sql.NullString
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
+		c.Slug = nullableString(slug)
+		c.Description = nullableString(description)
+		c.Timezone = nullableString(timezone)
+		c.Color = nullableString(color)
 		result = append(result, c)
 	}
 	return result, rows.Err()
@@ -110,12 +115,17 @@ func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error)
 	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE id=$1`
 	defer observeDB(ctx, "calendars.get_by_id")()
 	var c Calendar
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var slug, description, timezone, color sql.NullString
+	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	c.Slug = nullableString(slug)
+	c.Description = nullableString(description)
+	c.Timezone = nullableString(timezone)
+	c.Color = nullableString(color)
 	return &c, nil
 }
 
@@ -135,7 +145,7 @@ JOIN users u ON u.id = c.user_id
 ORDER BY shared, name
 `
 	defer observeDB(ctx, "calendars.list_accessible")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -144,9 +154,14 @@ ORDER BY shared, name
 	var result []CalendarAccess
 	for rows.Next() {
 		var c CalendarAccess
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+		var slug, description, timezone, color sql.NullString
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
 			return nil, err
 		}
+		c.Slug = nullableString(slug)
+		c.Description = nullableString(description)
+		c.Timezone = nullableString(timezone)
+		c.Color = nullableString(color)
 		result = append(result, c)
 	}
 	return result, rows.Err()
@@ -165,34 +180,48 @@ WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
 `
 	defer observeDB(ctx, "calendars.get_accessible")()
 	var c CalendarAccess
-	if err := r.pool.QueryRow(ctx, q, calendarID, userID).Scan(&c.ID, &c.UserID, &c.Name, &c.Slug, &c.Description, &c.Timezone, &c.Color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var slug, description, timezone, color sql.NullString
+	if err := r.pool.QueryRowContext(ctx, q, calendarID, userID).Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	c.Slug = nullableString(slug)
+	c.Description = nullableString(description)
+	c.Timezone = nullableString(timezone)
+	c.Color = nullableString(color)
 	return &c, nil
 }
 
 func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, error) {
 	const q = `INSERT INTO calendars (user_id, name, slug, description, timezone, color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at`
 	defer observeDB(ctx, "calendars.create")()
-	row := r.pool.QueryRow(ctx, q, cal.UserID, cal.Name, cal.Slug, cal.Description, cal.Timezone, cal.Color)
+	row := r.pool.QueryRowContext(ctx, q, cal.UserID, cal.Name, cal.Slug, cal.Description, cal.Timezone, cal.Color)
 	var created Calendar
-	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.Slug, &created.Description, &created.Timezone, &created.Color, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
+	var slug, description, timezone, color sql.NullString
+	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &slug, &description, &timezone, &color, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
 		return nil, err
 	}
+	created.Slug = nullableString(slug)
+	created.Description = nullableString(description)
+	created.Timezone = nullableString(timezone)
+	created.Color = nullableString(color)
 	return &created, nil
 }
 
 func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
 	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4 AND user_id=$5`
 	defer observeDB(ctx, "calendars.update")()
-	res, err := r.pool.Exec(ctx, q, name, description, timezone, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -201,11 +230,15 @@ func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string
 func (r *calendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {
 	const q = `UPDATE calendars SET name=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`
 	defer observeDB(ctx, "calendars.rename")()
-	res, err := r.pool.Exec(ctx, q, name, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, name, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -214,11 +247,15 @@ func (r *calendarRepo) Rename(ctx context.Context, userID, id int64, name string
 func (r *calendarRepo) Delete(ctx context.Context, userID, id int64) error {
 	const q = `DELETE FROM calendars WHERE id=$1 AND user_id=$2`
 	defer observeDB(ctx, "calendars.delete")()
-	res, err := r.pool.Exec(ctx, q, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -226,13 +263,13 @@ func (r *calendarRepo) Delete(ctx context.Context, userID, id int64) error {
 
 // calendarShareRepo implements CalendarShareRepository.
 type calendarShareRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *calendarShareRepo) ListByCalendar(ctx context.Context, calendarID int64) ([]CalendarShare, error) {
 	const q = `SELECT calendar_id, user_id, granted_by, editor, created_at FROM calendar_shares WHERE calendar_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "calendar_shares.list_by_calendar")()
-	rows, err := r.pool.Query(ctx, q, calendarID)
+	rows, err := r.pool.QueryContext(ctx, q, calendarID)
 	if err != nil {
 		return nil, err
 	}
@@ -256,20 +293,20 @@ VALUES ($1, $2, $3, $4)
 ON CONFLICT (calendar_id, user_id) DO NOTHING
 `
 	defer observeDB(ctx, "calendar_shares.create")()
-	_, err := r.pool.Exec(ctx, q, share.CalendarID, share.UserID, share.GrantedBy, share.Editor)
+	_, err := r.pool.ExecContext(ctx, q, share.CalendarID, share.UserID, share.GrantedBy, share.Editor)
 	return err
 }
 
 func (r *calendarShareRepo) Delete(ctx context.Context, calendarID, userID int64) error {
 	const q = `DELETE FROM calendar_shares WHERE calendar_id=$1 AND user_id=$2`
 	defer observeDB(ctx, "calendar_shares.delete")()
-	_, err := r.pool.Exec(ctx, q, calendarID, userID)
+	_, err := r.pool.ExecContext(ctx, q, calendarID, userID)
 	return err
 }
 
 // eventRepo implements EventRepository.
 type eventRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
@@ -294,9 +331,9 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRow(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, dtstart, dtend, allDay)
-	var ev Event
-	if err := row.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, dtstart, dtend, allDay)
+	ev, err := scanEvent(row.Scan)
+	if err != nil {
 		return nil, err
 	}
 	return &ev, nil
@@ -305,16 +342,17 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart,
 func (r *eventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid string) error {
 	const q = `DELETE FROM events WHERE calendar_id=$1 AND uid=$2`
 	defer observeDB(ctx, "events.delete_by_uid")()
-	_, err := r.pool.Exec(ctx, q, calendarID, uid)
+	_, err := r.pool.ExecContext(ctx, q, calendarID, uid)
 	return err
 }
 
 func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error) {
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
 	defer observeDB(ctx, "events.get_by_uid")()
-	var ev Event
-	if err := r.pool.QueryRow(ctx, q, calendarID, uid).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	row := r.pool.QueryRowContext(ctx, q, calendarID, uid)
+	ev, err := scanEvent(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -325,9 +363,10 @@ func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) 
 func (r *eventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error) {
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`
 	defer observeDB(ctx, "events.get_by_resource_name")()
-	var ev Event
-	if err := r.pool.QueryRow(ctx, q, calendarID, resourceName).Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	row := r.pool.QueryRowContext(ctx, q, calendarID, resourceName)
+	ev, err := scanEvent(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -341,7 +380,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 	}
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
 	defer observeDB(ctx, "events.list_by_uids")()
-	rows, err := r.pool.Query(ctx, q, calendarID, uids)
+	rows, err := r.pool.QueryContext(ctx, q, calendarID, pq.Array(uids))
 	if err != nil {
 		return nil, err
 	}
@@ -349,8 +388,8 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 
 	var result []Event
 	for rows.Next() {
-		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -361,7 +400,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error) {
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_for_calendar")()
-	rows, err := r.pool.Query(ctx, q, calendarID)
+	rows, err := r.pool.QueryContext(ctx, q, calendarID)
 	if err != nil {
 		return nil, err
 	}
@@ -369,8 +408,8 @@ func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Ev
 
 	var result []Event
 	for rows.Next() {
-		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -384,12 +423,12 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 	// Get total count
 	var totalCount int
 	countQ := `SELECT COUNT(*) FROM events WHERE calendar_id=$1`
-	if err := r.pool.QueryRow(ctx, countQ, calendarID).Scan(&totalCount); err != nil {
+	if err := r.pool.QueryRowContext(ctx, countQ, calendarID).Scan(&totalCount); err != nil {
 		return nil, err
 	}
 
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
-	rows, err := r.pool.Query(ctx, q, calendarID, limit, offset)
+	rows, err := r.pool.QueryContext(ctx, q, calendarID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -397,8 +436,8 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 
 	var items []Event
 	for rows.Next() {
-		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		items = append(items, ev)
@@ -418,7 +457,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error) {
 	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_modified_since")()
-	rows, err := r.pool.Query(ctx, q, calendarID, since)
+	rows, err := r.pool.QueryContext(ctx, q, calendarID, since)
 	if err != nil {
 		return nil, err
 	}
@@ -426,8 +465,8 @@ func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, sin
 
 	var result []Event
 	for rows.Next() {
-		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -446,7 +485,7 @@ ORDER BY e.last_modified DESC
 LIMIT $2
 `
 	defer observeDB(ctx, "events.list_recent_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID, limit)
+	rows, err := r.pool.QueryContext(ctx, q, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -454,8 +493,8 @@ LIMIT $2
 
 	var result []Event
 	for rows.Next() {
-		var ev Event
-		if err := rows.Scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &ev.Summary, &ev.DTStart, &ev.DTEnd, &ev.AllDay, &ev.LastModified); err != nil {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, ev)
@@ -467,7 +506,7 @@ func (r *eventRepo) MaxLastModified(ctx context.Context, calendarID int64) (time
 	const q = `SELECT COALESCE(MAX(last_modified), '1970-01-01T00:00:00Z') FROM events WHERE calendar_id=$1`
 	defer observeDB(ctx, "events.max_last_modified")()
 	var ts time.Time
-	if err := r.pool.QueryRow(ctx, q, calendarID).Scan(&ts); err != nil {
+	if err := r.pool.QueryRowContext(ctx, q, calendarID).Scan(&ts); err != nil {
 		return time.Time{}, err
 	}
 	return ts.UTC(), nil
@@ -475,13 +514,13 @@ func (r *eventRepo) MaxLastModified(ctx context.Context, calendarID int64) (time
 
 // addressBookRepo implements AddressBookRepository.
 type addressBookRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]AddressBook, error) {
 	const q = `SELECT id, user_id, name, description, ctag, created_at, updated_at FROM address_books WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "address_books.list_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -490,9 +529,11 @@ func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]Addre
 	var result []AddressBook
 	for rows.Next() {
 		var book AddressBook
-		if err := rows.Scan(&book.ID, &book.UserID, &book.Name, &book.Description, &book.CTag, &book.CreatedAt, &book.UpdatedAt); err != nil {
+		var description sql.NullString
+		if err := rows.Scan(&book.ID, &book.UserID, &book.Name, &description, &book.CTag, &book.CreatedAt, &book.UpdatedAt); err != nil {
 			return nil, err
 		}
+		book.Description = nullableString(description)
 		result = append(result, book)
 	}
 	return result, rows.Err()
@@ -502,34 +543,42 @@ func (r *addressBookRepo) GetByID(ctx context.Context, id int64) (*AddressBook, 
 	const q = `SELECT id, user_id, name, description, ctag, created_at, updated_at FROM address_books WHERE id=$1`
 	defer observeDB(ctx, "address_books.get_by_id")()
 	var book AddressBook
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&book.ID, &book.UserID, &book.Name, &book.Description, &book.CTag, &book.CreatedAt, &book.UpdatedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var description sql.NullString
+	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&book.ID, &book.UserID, &book.Name, &description, &book.CTag, &book.CreatedAt, &book.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	book.Description = nullableString(description)
 	return &book, nil
 }
 
 func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*AddressBook, error) {
 	const q = `INSERT INTO address_books (user_id, name, description) VALUES ($1, $2, $3) RETURNING id, user_id, name, description, ctag, created_at, updated_at`
 	defer observeDB(ctx, "address_books.create")()
-	row := r.pool.QueryRow(ctx, q, book.UserID, book.Name, book.Description)
+	row := r.pool.QueryRowContext(ctx, q, book.UserID, book.Name, book.Description)
 	var created AddressBook
-	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &created.Description, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
+	var description sql.NullString
+	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &description, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
 		return nil, err
 	}
+	created.Description = nullableString(description)
 	return &created, nil
 }
 
 func (r *addressBookRepo) Update(ctx context.Context, userID, id int64, name string, description *string) error {
 	const q = `UPDATE address_books SET name=$1, description=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4`
 	defer observeDB(ctx, "address_books.update")()
-	res, err := r.pool.Exec(ctx, q, name, description, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, name, description, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -538,11 +587,15 @@ func (r *addressBookRepo) Update(ctx context.Context, userID, id int64, name str
 func (r *addressBookRepo) Rename(ctx context.Context, userID, id int64, name string) error {
 	const q = `UPDATE address_books SET name=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`
 	defer observeDB(ctx, "address_books.rename")()
-	res, err := r.pool.Exec(ctx, q, name, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, name, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -551,11 +604,15 @@ func (r *addressBookRepo) Rename(ctx context.Context, userID, id int64, name str
 func (r *addressBookRepo) Delete(ctx context.Context, userID, id int64) error {
 	const q = `DELETE FROM address_books WHERE id=$1 AND user_id=$2`
 	defer observeDB(ctx, "address_books.delete")()
-	res, err := r.pool.Exec(ctx, q, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, id, userID)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -563,7 +620,7 @@ func (r *addressBookRepo) Delete(ctx context.Context, userID, id int64) error {
 
 // contactRepo implements ContactRepository.
 type contactRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *contactRepo) Upsert(ctx context.Context, contact Contact) (*Contact, error) {
@@ -583,9 +640,9 @@ ON CONFLICT (address_book_id, uid) DO UPDATE SET
 RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified
 `
 	defer observeDB(ctx, "contacts.upsert")()
-	row := r.pool.QueryRow(ctx, q, contact.AddressBookID, contact.UID, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
-	var c Contact
-	if err := row.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+	row := r.pool.QueryRowContext(ctx, q, contact.AddressBookID, contact.UID, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
+	c, err := scanContact(row.Scan)
+	if err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -594,7 +651,7 @@ RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email
 func (r *contactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
 	const q = `DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	defer observeDB(ctx, "contacts.delete_by_uid")()
-	_, err := r.pool.Exec(ctx, q, addressBookID, uid)
+	_, err := r.pool.ExecContext(ctx, q, addressBookID, uid)
 	return err
 }
 
@@ -602,45 +659,50 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 	defer observeDB(ctx, "contacts.move_to_address_book")()
 
 	// Use a transaction to ensure atomicity
-	tx, err := r.pool.Begin(ctx)
+	tx, err := r.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	// Move the contact to the new address book
 	const moveQuery = `UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`
-	result, err := tx.Exec(ctx, moveQuery, toAddressBookID, fromAddressBookID, uid)
+	result, err := tx.ExecContext(ctx, moveQuery, toAddressBookID, fromAddressBookID, uid)
 	if err != nil {
 		return err
 	}
-	if result.RowsAffected() == 0 {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return ErrNotFound
 	}
 
 	// Create a tombstone in the source address book for sync
 	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $2)`
-	if _, err := tx.Exec(ctx, tombstoneQuery, fromAddressBookID, uid); err != nil {
+	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromAddressBookID, uid); err != nil {
 		return err
 	}
 
 	// Increment the source address book's ctag so clients know to sync
 	const incrementCtagQuery = `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
-	if _, err := tx.Exec(ctx, incrementCtagQuery, fromAddressBookID); err != nil {
+	if _, err := tx.ExecContext(ctx, incrementCtagQuery, fromAddressBookID); err != nil {
 		return err
 	}
 
 	// The target address book's ctag is automatically incremented by the UPDATE trigger
 
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
 func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	defer observeDB(ctx, "contacts.get_by_uid")()
-	var c Contact
-	if err := r.pool.QueryRow(ctx, q, addressBookID, uid).Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	row := r.pool.QueryRowContext(ctx, q, addressBookID, uid)
+	c, err := scanContact(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -654,7 +716,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 	}
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`
 	defer observeDB(ctx, "contacts.list_by_uids")()
-	rows, err := r.pool.Query(ctx, q, addressBookID, uids)
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, pq.Array(uids))
 	if err != nil {
 		return nil, err
 	}
@@ -662,8 +724,8 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 
 	var result []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -674,7 +736,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "contacts.list_for_book")()
-	rows, err := r.pool.Query(ctx, q, addressBookID)
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID)
 	if err != nil {
 		return nil, err
 	}
@@ -682,8 +744,8 @@ func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]C
 
 	var result []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -697,12 +759,12 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 	// Get total count
 	var totalCount int
 	countQ := `SELECT COUNT(*) FROM contacts WHERE address_book_id=$1`
-	if err := r.pool.QueryRow(ctx, countQ, addressBookID).Scan(&totalCount); err != nil {
+	if err := r.pool.QueryRowContext(ctx, countQ, addressBookID).Scan(&totalCount); err != nil {
 		return nil, err
 	}
 
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`
-	rows, err := r.pool.Query(ctx, q, addressBookID, limit, offset)
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -710,8 +772,8 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 
 	var items []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		items = append(items, c)
@@ -731,7 +793,7 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 func (r *contactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error) {
 	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "contacts.list_modified_since")()
-	rows, err := r.pool.Query(ctx, q, addressBookID, since)
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, since)
 	if err != nil {
 		return nil, err
 	}
@@ -739,8 +801,8 @@ func (r *contactRepo) ListModifiedSince(ctx context.Context, addressBookID int64
 
 	var result []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -758,7 +820,7 @@ ORDER BY c.last_modified DESC
 LIMIT $2
 `
 	defer observeDB(ctx, "contacts.list_recent_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID, limit)
+	rows, err := r.pool.QueryContext(ctx, q, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -766,8 +828,8 @@ LIMIT $2
 
 	var result []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -779,7 +841,7 @@ func (r *contactRepo) MaxLastModified(ctx context.Context, addressBookID int64) 
 	const q = `SELECT COALESCE(MAX(last_modified), '1970-01-01T00:00:00Z') FROM contacts WHERE address_book_id=$1`
 	defer observeDB(ctx, "contacts.max_last_modified")()
 	var ts time.Time
-	if err := r.pool.QueryRow(ctx, q, addressBookID).Scan(&ts); err != nil {
+	if err := r.pool.QueryRowContext(ctx, q, addressBookID).Scan(&ts); err != nil {
 		return time.Time{}, err
 	}
 	return ts.UTC(), nil
@@ -794,7 +856,7 @@ WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
 ORDER BY c.display_name
 `
 	defer observeDB(ctx, "contacts.list_with_birthdays_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -802,8 +864,8 @@ ORDER BY c.display_name
 
 	var result []Contact
 	for rows.Next() {
-		var c Contact
-		if err := rows.Scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &c.DisplayName, &c.PrimaryEmail, &c.Birthday, &c.LastModified); err != nil {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, c)
@@ -813,7 +875,7 @@ ORDER BY c.display_name
 
 // appPasswordRepo implements AppPasswordRepository.
 type appPasswordRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *appPasswordRepo) Create(ctx context.Context, token AppPassword) (*AppPassword, error) {
@@ -823,9 +885,9 @@ VALUES ($1, $2, $3, $4)
 RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
 `
 	defer observeDB(ctx, "app_passwords.create")()
-	row := r.pool.QueryRow(ctx, q, token.UserID, token.Label, token.TokenHash, token.ExpiresAt)
-	var t AppPassword
-	if err := row.Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
+	row := r.pool.QueryRowContext(ctx, q, token.UserID, token.Label, token.TokenHash, token.ExpiresAt)
+	t, err := scanAppPassword(row.Scan)
+	if err != nil {
 		return nil, err
 	}
 	return &t, nil
@@ -839,7 +901,7 @@ WHERE user_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > 
 ORDER BY created_at DESC
 `
 	defer observeDB(ctx, "app_passwords.find_valid_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -847,8 +909,8 @@ ORDER BY created_at DESC
 
 	var result []AppPassword
 	for rows.Next() {
-		var t AppPassword
-		if err := rows.Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
+		t, err := scanAppPassword(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, t)
@@ -859,7 +921,7 @@ ORDER BY created_at DESC
 func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPassword, error) {
 	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE user_id=$1 ORDER BY created_at DESC`
 	defer observeDB(ctx, "app_passwords.list_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -867,8 +929,8 @@ func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPa
 
 	var result []AppPassword
 	for rows.Next() {
-		var t AppPassword
-		if err := rows.Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
+		t, err := scanAppPassword(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, t)
@@ -879,9 +941,10 @@ func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPa
 func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, error) {
 	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.get_by_id")()
-	var t AppPassword
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	row := r.pool.QueryRowContext(ctx, q, id)
+	t, err := scanAppPassword(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -892,26 +955,26 @@ func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, 
 func (r *appPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET revoked_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.revoke")()
-	_, err := r.pool.Exec(ctx, q, id)
+	_, err := r.pool.ExecContext(ctx, q, id)
 	return err
 }
 
 func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET last_used_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.touch_last_used")()
-	_, err := r.pool.Exec(ctx, q, id)
+	_, err := r.pool.ExecContext(ctx, q, id)
 	return err
 }
 
 // deletedResourceRepo implements DeletedResourceRepository.
 type deletedResourceRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *deletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error) {
 	const q = `SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`
 	defer observeDB(ctx, "deleted_resources.list_deleted_since")()
-	rows, err := r.pool.Query(ctx, q, resourceType, collectionID, since)
+	rows, err := r.pool.QueryContext(ctx, q, resourceType, collectionID, since)
 	if err != nil {
 		return nil, err
 	}
@@ -932,16 +995,20 @@ func (r *deletedResourceRepo) Cleanup(ctx context.Context, olderThan time.Durati
 	const q = `DELETE FROM deleted_resources WHERE deleted_at < $1`
 	defer observeDB(ctx, "deleted_resources.cleanup")()
 	cutoff := time.Now().Add(-olderThan)
-	res, err := r.pool.Exec(ctx, q, cutoff)
+	res, err := r.pool.ExecContext(ctx, q, cutoff)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected(), nil
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 // sessionRepo implements SessionRepository.
 type sessionRepo struct {
-	pool *pgxpool.Pool
+	pool *sql.DB
 }
 
 func (r *sessionRepo) Create(ctx context.Context, session Session) (*Session, error) {
@@ -951,9 +1018,9 @@ VALUES ($1, $2, $3, $4, $5)
 RETURNING id, user_id, user_agent, ip_address, created_at, expires_at, last_seen_at
 `
 	defer observeDB(ctx, "sessions.create")()
-	row := r.pool.QueryRow(ctx, q, session.ID, session.UserID, session.UserAgent, session.IPAddress, session.ExpiresAt)
-	var s Session
-	if err := row.Scan(&s.ID, &s.UserID, &s.UserAgent, &s.IPAddress, &s.CreatedAt, &s.ExpiresAt, &s.LastSeenAt); err != nil {
+	row := r.pool.QueryRowContext(ctx, q, session.ID, session.UserID, session.UserAgent, session.IPAddress, session.ExpiresAt)
+	s, err := scanSession(row.Scan)
+	if err != nil {
 		return nil, err
 	}
 	return &s, nil
@@ -962,9 +1029,10 @@ RETURNING id, user_id, user_agent, ip_address, created_at, expires_at, last_seen
 func (r *sessionRepo) GetByID(ctx context.Context, id string) (*Session, error) {
 	const q = `SELECT id, user_id, user_agent, ip_address, created_at, expires_at, last_seen_at FROM sessions WHERE id=$1 AND expires_at > NOW()`
 	defer observeDB(ctx, "sessions.get_by_id")()
-	var s Session
-	if err := r.pool.QueryRow(ctx, q, id).Scan(&s.ID, &s.UserID, &s.UserAgent, &s.IPAddress, &s.CreatedAt, &s.ExpiresAt, &s.LastSeenAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	row := r.pool.QueryRowContext(ctx, q, id)
+	s, err := scanSession(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -975,7 +1043,7 @@ func (r *sessionRepo) GetByID(ctx context.Context, id string) (*Session, error) 
 func (r *sessionRepo) ListByUser(ctx context.Context, userID int64) ([]Session, error) {
 	const q = `SELECT id, user_id, user_agent, ip_address, created_at, expires_at, last_seen_at FROM sessions WHERE user_id=$1 AND expires_at > NOW() ORDER BY last_seen_at DESC`
 	defer observeDB(ctx, "sessions.list_by_user")()
-	rows, err := r.pool.Query(ctx, q, userID)
+	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -983,8 +1051,8 @@ func (r *sessionRepo) ListByUser(ctx context.Context, userID int64) ([]Session, 
 
 	var result []Session
 	for rows.Next() {
-		var s Session
-		if err := rows.Scan(&s.ID, &s.UserID, &s.UserAgent, &s.IPAddress, &s.CreatedAt, &s.ExpiresAt, &s.LastSeenAt); err != nil {
+		s, err := scanSession(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		result = append(result, s)
@@ -995,32 +1063,36 @@ func (r *sessionRepo) ListByUser(ctx context.Context, userID int64) ([]Session, 
 func (r *sessionRepo) TouchLastSeen(ctx context.Context, id string) error {
 	const q = `UPDATE sessions SET last_seen_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "sessions.touch_last_seen")()
-	_, err := r.pool.Exec(ctx, q, id)
+	_, err := r.pool.ExecContext(ctx, q, id)
 	return err
 }
 
 func (r *sessionRepo) Delete(ctx context.Context, id string) error {
 	const q = `DELETE FROM sessions WHERE id=$1`
 	defer observeDB(ctx, "sessions.delete")()
-	_, err := r.pool.Exec(ctx, q, id)
+	_, err := r.pool.ExecContext(ctx, q, id)
 	return err
 }
 
 func (r *sessionRepo) DeleteByUser(ctx context.Context, userID int64) error {
 	const q = `DELETE FROM sessions WHERE user_id=$1`
 	defer observeDB(ctx, "sessions.delete_by_user")()
-	_, err := r.pool.Exec(ctx, q, userID)
+	_, err := r.pool.ExecContext(ctx, q, userID)
 	return err
 }
 
 func (r *sessionRepo) DeleteExpired(ctx context.Context) (int64, error) {
 	const q = `DELETE FROM sessions WHERE expires_at < NOW()`
 	defer observeDB(ctx, "sessions.delete_expired")()
-	res, err := r.pool.Exec(ctx, q)
+	res, err := r.pool.ExecContext(ctx, q)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected(), nil
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 // EnsureDefaultCollections creates baseline calendar and address book when absent.
@@ -1037,65 +1109,137 @@ func (s *Store) EnsureDefaultCollections(ctx context.Context, userID int64) erro
 func (s *Store) ensureDefaultCalendar(ctx context.Context, userID int64) error {
 	defer observeDB(ctx, "calendars.ensure_default")()
 
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	// Serialize concurrent attempts for the same user
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
 		return err
 	}
 
 	var exists bool
 	const checkQuery = `SELECT EXISTS (SELECT 1 FROM calendars WHERE user_id=$1)`
-	if err := tx.QueryRow(ctx, checkQuery, userID).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, checkQuery, userID).Scan(&exists); err != nil {
 		return err
 	}
 	if exists {
-		return tx.Commit(ctx)
+		return tx.Commit()
 	}
 
-	if _, err := tx.Exec(ctx, `INSERT INTO calendars (user_id, name) VALUES ($1, 'Default')`, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO calendars (user_id, name) VALUES ($1, 'Default')`, userID); err != nil {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
 func (s *Store) ensureDefaultAddressBook(ctx context.Context, userID int64) error {
 	defer observeDB(ctx, "address_books.ensure_default")()
 
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
 		return err
 	}
 
 	var exists bool
 	const checkQuery = `SELECT EXISTS (SELECT 1 FROM address_books WHERE user_id=$1)`
-	if err := tx.QueryRow(ctx, checkQuery, userID).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, checkQuery, userID).Scan(&exists); err != nil {
 		return err
 	}
 	if exists {
-		return tx.Commit(ctx)
+		return tx.Commit()
 	}
 
-	if _, err := tx.Exec(ctx, `INSERT INTO address_books (user_id, name) VALUES ($1, 'Contacts')`, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO address_books (user_id, name) VALUES ($1, 'Contacts')`, userID); err != nil {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
 // Now returns a UTC timestamp to keep updates consistent.
 func Now() time.Time {
 	return time.Now().UTC()
+}
+
+type rowScanner func(dest ...any) error
+
+func nullableString(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	v := value.String
+	return &v
+}
+
+func nullableTime(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	v := value.Time
+	return &v
+}
+
+func scanEvent(scan rowScanner) (Event, error) {
+	var ev Event
+	var summary sql.NullString
+	var dtstart sql.NullTime
+	var dtend sql.NullTime
+	if err := scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &summary, &dtstart, &dtend, &ev.AllDay, &ev.LastModified); err != nil {
+		return Event{}, err
+	}
+	ev.Summary = nullableString(summary)
+	ev.DTStart = nullableTime(dtstart)
+	ev.DTEnd = nullableTime(dtend)
+	return ev, nil
+}
+
+func scanContact(scan rowScanner) (Contact, error) {
+	var c Contact
+	var displayName sql.NullString
+	var primaryEmail sql.NullString
+	var birthday sql.NullTime
+	if err := scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &displayName, &primaryEmail, &birthday, &c.LastModified); err != nil {
+		return Contact{}, err
+	}
+	c.DisplayName = nullableString(displayName)
+	c.PrimaryEmail = nullableString(primaryEmail)
+	c.Birthday = nullableTime(birthday)
+	return c, nil
+}
+
+func scanAppPassword(scan rowScanner) (AppPassword, error) {
+	var t AppPassword
+	var expiresAt sql.NullTime
+	var revokedAt sql.NullTime
+	var lastUsedAt sql.NullTime
+	if err := scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &expiresAt, &revokedAt, &lastUsedAt); err != nil {
+		return AppPassword{}, err
+	}
+	t.ExpiresAt = nullableTime(expiresAt)
+	t.RevokedAt = nullableTime(revokedAt)
+	t.LastUsedAt = nullableTime(lastUsedAt)
+	return t, nil
+}
+
+func scanSession(scan rowScanner) (Session, error) {
+	var s Session
+	var userAgent sql.NullString
+	var ipAddress sql.NullString
+	if err := scan(&s.ID, &s.UserID, &userAgent, &ipAddress, &s.CreatedAt, &s.ExpiresAt, &s.LastSeenAt); err != nil {
+		return Session{}, err
+	}
+	s.UserAgent = nullableString(userAgent)
+	s.IPAddress = nullableString(ipAddress)
+	return s, nil
 }
 
 // parseICalFields extracts summary, dtstart, dtend, and all_day from raw iCalendar data.

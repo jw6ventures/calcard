@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 	appauth "github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	httpserver "github.com/jw6ventures/calcard/internal/http"
 	"github.com/jw6ventures/calcard/internal/store"
-	"github.com/jackc/pgx/v5/pgxpool"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
+	"github.com/jw6ventures/jw6-go-utils/database"
 )
 
-const version = "v1.0.4"
+const version = "v1.0.5"
 
 func main() {
 	logLevelString := os.Getenv("LOG_LEVEL")
@@ -38,17 +38,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, cfg.DB.DSN)
-	if err != nil {
-		log.Fatalf("failed to create db pool: %v", err)
+	dbManager := database.NewManager(database.Config{
+		Driver:           "postgres",
+		ConnString:       cfg.DB.DSN,
+		MigrationsPath:   "migrations",
+		AppVersion:       version,
+		SchemaPath:       "db.sql",
+		SchemaCheckTable: "users",
+		Logger:           &jw6utils,
+	})
+	if err := dbManager.Initialize(); err != nil {
+		log.Fatalf("failed to initialize database: %v", err)
 	}
-	defer pool.Close()
+	defer dbManager.Close()
 
-	if err := store.ApplyMigrations(ctx, pool); err != nil {
-		log.Fatalf("failed to apply migrations: %v", err)
-	}
-
-	stor := store.New(pool)
+	stor := store.New(dbManager.DB)
 	sessionManager := appauth.NewSessionManager(cfg, stor)
 	authService, err := appauth.NewService(cfg, stor, sessionManager)
 	if err != nil {
