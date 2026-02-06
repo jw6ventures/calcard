@@ -5,6 +5,15 @@ on:
     branches:
       - main
       - develop
+    paths:
+      - Dockerfile
+      - cmd/**
+      - internal/**
+      - migrations/**
+      - go.mod
+      - go.sum
+      - db.sql
+      - .github/workflows/build-and-push.yaml
     tags:
       - '*'
   workflow_dispatch:
@@ -80,6 +89,7 @@ jobs:
             --push .
 
       - name: Extract calcard binaries
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -87,7 +97,7 @@ jobs:
             docker pull --platform "${platform}" "${PRIMARY_TAG}"
             CID="$(docker create --platform "${platform}" "${PRIMARY_TAG}")"
             filename="calcard-${platform//\//-}"
-            docker cp "${CID}:/calcard" "artifacts/${filename}"
+            docker cp "${CID}:/app/calcard" "artifacts/${filename}"
             docker rm "${CID}"
           done
           ls -lh artifacts
