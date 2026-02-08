@@ -1,0 +1,11 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "calcard.fullname" . }}-postgres-config
+  labels:
+    {{- include "calcard.labels" . | nindent 4 }}
+data:
+  POSTGRES_USER: {{ .Values.app.db.user | quote }}
+  POSTGRES_DB: {{ .Values.app.db.name | quote }}
+{{- end }}

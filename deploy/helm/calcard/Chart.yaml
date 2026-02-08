@@ -1,0 +1,6 @@
+apiVersion: v2
+name: calcard
+description: CalCard CalDAV/CardDAV server
+type: application
+version: 1.0.0
+appVersion: "0.0.0" # Overwritten by CI during packaging.

@@ -7,6 +7,7 @@ on:
       - develop
     paths:
       - Dockerfile
+      - deploy/**
       - cmd/**
       - internal/**
       - migrations/**
@@ -23,10 +24,12 @@ permissions:
 
 jobs:
   docker-build-push:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:
       DEFAULT_BRANCH: main
       BETA_BRANCH: develop
+      CHART_REPOSITORY: calcard-helm
 
     steps:
       - name: Checkout
@@ -42,6 +45,17 @@ jobs:
         run: |
           set -euo pipefail
           echo "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR for Helm
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_PASSWORD}" | helm registry login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
 
       - name: Build and push image
         env:
@@ -87,6 +101,38 @@ jobs:
             --platform linux/amd64,linux/arm64,linux/arm/v7 \
             "${TAG_ARGS[@]}" \
             --push .
+
+      - name: Package and push Helm chart
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF:-}"
+          SHORT_SHA="$(echo "${GITHUB_SHA:-unknown}" | cut -c1-7)"
+          BASE_VERSION="1.0.0"
+
+          if [[ "${REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            CHART_VERSION="${TAG_NAME#v}"
+            APP_VERSION="${TAG_NAME#v}"
+          else
+            BRANCH="${GITHUB_REF_NAME:-${DEFAULT_BRANCH}}"
+            SAFE_BRANCH="$(echo "${BRANCH}" | tr '[:upper:]' '[:lower:]' | tr '/' '-' | sed 's/[^0-9a-z.-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')"
+            if [ -z "${SAFE_BRANCH}" ]; then
+              SAFE_BRANCH="branch"
+            fi
+            CHART_VERSION="${BASE_VERSION}-${SAFE_BRANCH}.${SHORT_SHA}"
+            APP_VERSION="$(sed -n 's/^const version = \"\\(v[^\\\"]*\\)\"$/\\1/p' cmd/server/main.go | head -n1 | sed 's/^v//')"
+            if [ -z "${APP_VERSION}" ]; then
+              APP_VERSION="${SHORT_SHA}"
+            fi
+          fi
+
+          helm package deploy/helm/calcard \
+            --version "${CHART_VERSION}" \
+            --app-version "${APP_VERSION}"
+
+          helm push "calcard-${CHART_VERSION}.tgz" "oci://ghcr.io/${GHCR_OWNER}/${CHART_REPOSITORY}"
 
       - name: Extract calcard binaries
         if: startsWith(github.ref, 'refs/tags/')

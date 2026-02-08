@@ -1,0 +1,53 @@
+image:
+  repository: ghcr.io/jw6ventures/calcard
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: "" # Overrides the chart name used for resource names/labels.
+fullnameOverride: "" # Overrides the full resource name (takes precedence over nameOverride).
+
+app:
+  baseUrl: "http://localhost:8080"
+  listenAddr: ":8080"
+  trustedProxies: ""
+  oauth:
+    clientId: ""
+    clientSecret: ""
+    issuerUrl: ""
+    discoveryUrl: ""
+    redirectPath: "/auth/callback"
+  sessionSecret: ""
+  db:
+    host: ""
+    port: 5432
+    name: "app"
+    user: "postgres"
+    password: ""
+    sslmode: "disable"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: ""
+  host: ""
+  annotations: {}
+  tls:
+    enabled: true
+    secretName: ""
+
+postgres:
+  enabled: true
+  image: postgres:16
+  persistence:
+    enabled: true
+    size: 500Mi
+    storageClassName: ""
+  resources: {}
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

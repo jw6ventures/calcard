@@ -47,6 +47,53 @@ volumes:
   postgres_data:
 ```
 
+#### Kubernetes (Helm)
+
+The Helm chart lives at `deploy/helm/calcard`.
+
+1. Create a values file with your configuration:
+
+```
+image:
+  repository: ghcr.io/jw6ventures/calcard
+  tag: latest
+
+app:
+  baseUrl: "https://calcard.example.com" # Required.
+  oauth:
+    clientId: "YOUR_CLIENT_ID"
+    clientSecret: "YOUR_CLIENT_SECRET"
+    issuerUrl: "https://issuer.example.com/"
+    discoveryUrl: "https://issuer.example.com/.well-known/openid-configuration"
+  sessionSecret: "YOUR_SESSION_SECRET"
+  db:
+    user: "postgres"
+    password: "YOUR_DB_PASSWORD"
+
+ingress:
+  enabled: true
+  className: ""
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+postgres:
+  enabled: true
+```
+
+2. Install or upgrade:
+
+```
+helm upgrade --install calcard deploy/helm/calcard -f values.yaml
+```
+
+Notes:
+- The ingress host is derived from `app.baseUrl` (APP_BASE_URL) when `ingress.host` is empty.
+- `app.baseUrl` is required for the chart to render.
+- Postgres is deployed by default with a 500Mi PVC (see `postgres.persistence.size`). Set `postgres.enabled=false` to use an external database and provide `app.db.host`.
+- Secrets are stored in a Kubernetes Secret (`APP_OAUTH_CLIENT_SECRET`, `APP_SESSION_SECRET`, `APP_DB_DSN`).
+
 ### Linux Installs
 A linux binary is published as a github release for each version. You'll need a postgres 16 server.
 ```
