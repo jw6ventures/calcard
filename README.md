@@ -49,9 +49,9 @@ volumes:
 
 #### Kubernetes (Helm)
 
-The Helm chart lives at `deploy/helm/calcard`.
+The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
 
-1. Create a values file with your configuration:
+1. Create a values file with your configuration (see deploy/helm/calcard/values.yaml for full file):
 
 ```
 image:
@@ -67,6 +67,7 @@ app:
     discoveryUrl: "https://issuer.example.com/.well-known/openid-configuration"
   sessionSecret: "YOUR_SESSION_SECRET"
   db:
+    host: "" # Required when postgres.enabled is false.
     user: "postgres"
     password: "YOUR_DB_PASSWORD"
 
@@ -85,7 +86,7 @@ postgres:
 2. Install or upgrade:
 
 ```
-helm upgrade --install calcard deploy/helm/calcard -f values.yaml
+helm upgrade --install calcard oci://ghcr.io/jw6ventures/calcard-helm -f values.yaml
 ```
 
 Notes:
