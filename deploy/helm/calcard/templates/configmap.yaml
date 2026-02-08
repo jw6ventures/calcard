@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "calcard.fullname" . }}-config
+  labels:
+    {{- include "calcard.labels" . | nindent 4 }}
+data:
+  APP_LISTEN_ADDR: {{ .Values.app.listenAddr | quote }}
+  APP_BASE_URL: {{ required "app.baseUrl is required" .Values.app.baseUrl | quote }}
+  APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
+  APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
+  APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
+  APP_OAUTH_REDIRECT_PATH: {{ .Values.app.oauth.redirectPath | quote }}
+  APP_TRUSTED_PROXIES: {{ .Values.app.trustedProxies | quote }}
