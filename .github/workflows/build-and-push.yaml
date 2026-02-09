@@ -54,6 +54,8 @@ jobs:
 
       - name: Set up Kind
         uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
 
       - name: Login to GHCR for Helm
         env:
@@ -67,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build -t calcard:test .
-          kind load docker-image calcard:test
+          kind load docker-image calcard:test --name kind
 
       - name: Create mock OIDC discovery service
         run: |
