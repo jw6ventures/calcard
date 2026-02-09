@@ -144,8 +144,24 @@ jobs:
             --set app.db.name=app \
             --set postgres.enabled=true \
             --set postgres.persistence.enabled=false \
-            --wait --timeout 5m
-          helm test calcard-test --timeout 2m
+            --wait --timeout 5m || {
+              echo \"Helm install failed; dumping diagnostics...\"
+              kubectl get pods -o wide || true
+              kubectl describe deploy/calcard || true
+              kubectl logs deploy/calcard --tail=200 || true
+              kubectl logs statefulset/calcard-postgres --tail=200 || true
+              kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+              exit 1
+            }
+          helm test calcard-test --timeout 2m || {
+            echo \"Helm test failed; dumping diagnostics...\"
+            kubectl get pods -o wide || true
+            kubectl describe deploy/calcard || true
+            kubectl logs deploy/calcard --tail=200 || true
+            kubectl logs statefulset/calcard-postgres --tail=200 || true
+            kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+            exit 1
+          }
 
       - name: Build and push image
         env:
