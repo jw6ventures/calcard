@@ -82,6 +82,7 @@ jobs:
           data:
             openid-configuration: |
               {
+                "issuer": "http://oidc-mock.default.svc.cluster.local",
                 "authorization_endpoint": "http://oidc-mock/authorize",
                 "token_endpoint": "http://oidc-mock/token",
                 "userinfo_endpoint": "http://oidc-mock/userinfo"
