@@ -146,22 +146,40 @@ jobs:
             --set postgres.persistence.enabled=false \
             --wait --timeout 5m || {
               echo "Helm install failed; dumping diagnostics..."
+              helm get manifest calcard-test || true
               kubectl get pods -o wide || true
               kubectl describe deploy/calcard || true
               kubectl describe pod -l app.kubernetes.io/name=calcard || true
               kubectl logs deploy/calcard --tail=200 || true
               kubectl logs deploy/calcard --previous --tail=200 || true
+              POD_NAME="$(kubectl get pod -l app.kubernetes.io/name=calcard -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+              if [ -n "${POD_NAME}" ]; then
+                echo "Logs for ${POD_NAME}:"
+                kubectl logs "${POD_NAME}" --tail=200 --timestamps || true
+                kubectl logs "${POD_NAME}" --previous --tail=200 --timestamps || true
+              fi
+              kubectl get configmap calcard-config -o yaml || true
+              kubectl get secret calcard-secret -o yaml || true
               kubectl logs statefulset/calcard-postgres --tail=200 || true
               kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
               exit 1
             }
           helm test calcard-test --timeout 2m || {
             echo "Helm test failed; dumping diagnostics..."
+            helm get manifest calcard-test || true
             kubectl get pods -o wide || true
             kubectl describe deploy/calcard || true
             kubectl describe pod -l app.kubernetes.io/name=calcard || true
             kubectl logs deploy/calcard --tail=200 || true
             kubectl logs deploy/calcard --previous --tail=200 || true
+            POD_NAME="$(kubectl get pod -l app.kubernetes.io/name=calcard -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            if [ -n "${POD_NAME}" ]; then
+              echo "Logs for ${POD_NAME}:"
+              kubectl logs "${POD_NAME}" --tail=200 --timestamps || true
+              kubectl logs "${POD_NAME}" --previous --tail=200 --timestamps || true
+            fi
+            kubectl get configmap calcard-config -o yaml || true
+            kubectl get secret calcard-secret -o yaml || true
             kubectl logs statefulset/calcard-postgres --tail=200 || true
             kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
             exit 1
