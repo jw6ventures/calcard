@@ -148,7 +148,9 @@ jobs:
               echo "Helm install failed; dumping diagnostics..."
               kubectl get pods -o wide || true
               kubectl describe deploy/calcard || true
+              kubectl describe pod -l app.kubernetes.io/name=calcard || true
               kubectl logs deploy/calcard --tail=200 || true
+              kubectl logs deploy/calcard --previous --tail=200 || true
               kubectl logs statefulset/calcard-postgres --tail=200 || true
               kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
               exit 1
@@ -157,7 +159,9 @@ jobs:
             echo "Helm test failed; dumping diagnostics..."
             kubectl get pods -o wide || true
             kubectl describe deploy/calcard || true
+            kubectl describe pod -l app.kubernetes.io/name=calcard || true
             kubectl logs deploy/calcard --tail=200 || true
+            kubectl logs deploy/calcard --previous --tail=200 || true
             kubectl logs statefulset/calcard-postgres --tail=200 || true
             kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
             exit 1
