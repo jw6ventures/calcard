@@ -6,17 +6,20 @@ image:
 nameOverride: "" # Overrides the chart name used for resource names/labels.
 fullnameOverride: "" # Overrides the full resource name (takes precedence over nameOverride).
 
+replicaCount: 1 # HA is theoretically possible, but untested at this point. Recommend 1 until the release notes say otherwise.
+
 app:
   baseUrl: "http://localhost:8080"
-  listenAddr: ":8080"
   trustedProxies: ""
   oauth:
     clientId: ""
     clientSecret: ""
     issuerUrl: ""
     discoveryUrl: ""
-    redirectPath: "/auth/callback"
   sessionSecret: ""
+  sessionSecretExistingSecret:
+    name: ""
+    key: "APP_SESSION_SECRET"
   db:
     host: ""
     port: 5432
@@ -24,6 +27,13 @@ app:
     user: "postgres"
     password: ""
     sslmode: "disable"
+    existingSecret:
+      name: ""
+      key: "APP_DB_DSN"
+    credentialsExistingSecret:
+      name: ""
+      userKey: "APP_DB_USER"
+      passwordKey: "APP_DB_PASSWORD"
 
 service:
   type: ClusterIP
@@ -39,8 +49,11 @@ ingress:
     secretName: ""
 
 postgres:
-  enabled: true
+  enabled: false
   image: postgres:16
+  existingSecret:
+    name: ""
+    passwordKey: "POSTGRES_PASSWORD"
   persistence:
     enabled: true
     size: 500Mi

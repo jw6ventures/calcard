@@ -1,10 +1,16 @@
 {{- if .Values.postgres.enabled }}
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "calcard.fullname" . }}-postgres-config
+  name: {{ $fullname }}-postgres-config
   labels:
-    {{- include "calcard.labels" . | nindent 4 }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
 data:
   POSTGRES_USER: {{ .Values.app.db.user | quote }}
   POSTGRES_DB: {{ .Values.app.db.name | quote }}

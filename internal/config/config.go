@@ -38,6 +38,33 @@ func Load() (*Config, error) {
 	cfg.BaseURL = getenvDefault("APP_BASE_URL", "http://localhost:8080")
 	cfg.DB.DSN = os.Getenv("APP_DB_DSN")
 
+	if cfg.DB.DSN == "" {
+		host := os.Getenv("APP_DB_HOST")
+		name := os.Getenv("APP_DB_NAME")
+		user := os.Getenv("APP_DB_USER")
+		password := os.Getenv("APP_DB_PASSWORD")
+		port := getenvDefault("APP_DB_PORT", "5432")
+		sslmode := getenvDefault("APP_DB_SSLMODE", "disable")
+
+		var missing []string
+		if host == "" {
+			missing = append(missing, "APP_DB_HOST")
+		}
+		if name == "" {
+			missing = append(missing, "APP_DB_NAME")
+		}
+		if user == "" {
+			missing = append(missing, "APP_DB_USER")
+		}
+		if password == "" {
+			missing = append(missing, "APP_DB_PASSWORD")
+		}
+
+		if len(missing) == 0 {
+			cfg.DB.DSN = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, password, host, port, name, sslmode)
+		}
+	}
+
 	cfg.OAuth.ClientID = os.Getenv("APP_OAUTH_CLIENT_ID")
 	cfg.OAuth.ClientSecret = os.Getenv("APP_OAUTH_CLIENT_SECRET")
 	cfg.OAuth.IssuerURL = os.Getenv("APP_OAUTH_ISSUER_URL")
@@ -48,7 +75,7 @@ func Load() (*Config, error) {
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
 
 	if cfg.DB.DSN == "" {
-		return nil, errors.New("APP_DB_DSN is required")
+		return nil, errors.New("APP_DB_DSN is required (or set APP_DB_HOST, APP_DB_NAME, APP_DB_USER, and APP_DB_PASSWORD)")
 	}
 	if cfg.OAuth.ClientID == "" || cfg.OAuth.ClientSecret == "" {
 		return nil, fmt.Errorf("oauth configuration is required: client id and secret")

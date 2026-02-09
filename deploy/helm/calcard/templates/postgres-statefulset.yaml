@@ -1,22 +1,31 @@
 {{- if .Values.postgres.enabled }}
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+{{- $postgresSecret := default (printf "%s-postgres-secret" $fullname) .Values.postgres.existingSecret.name -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "calcard.fullname" . }}-postgres
+  name: {{ $fullname }}-postgres
   labels:
-    {{- include "calcard.labels" . | nindent 4 }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/component: postgres
 spec:
-  serviceName: {{ include "calcard.fullname" . }}-postgres
+  serviceName: {{ $fullname }}-postgres
   replicas: 1
   selector:
     matchLabels:
-      {{- include "calcard.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: postgres
   template:
     metadata:
       labels:
-        {{- include "calcard.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: postgres
     spec:
       containers:
@@ -28,9 +37,19 @@ spec:
               name: postgres
           envFrom:
             - configMapRef:
-                name: {{ include "calcard.fullname" . }}-postgres-config
+                name: {{ $fullname }}-postgres-config
+            {{- if not .Values.postgres.existingSecret.name }}
             - secretRef:
-                name: {{ include "calcard.fullname" . }}-postgres-secret
+                name: {{ $postgresSecret }}
+            {{- end }}
+          {{- if .Values.postgres.existingSecret.name }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret.name | quote }}
+                  key: {{ .Values.postgres.existingSecret.passwordKey | quote }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data

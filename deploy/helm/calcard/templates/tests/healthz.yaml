@@ -1,25 +1,23 @@
-{{- if .Values.postgres.enabled }}
 {{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 apiVersion: v1
-kind: Service
+kind: Pod
 metadata:
-  name: {{ $fullname }}-postgres
+  name: "{{ $fullname }}-test-connection"
   labels:
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/name: {{ $name }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    "helm.sh/hook": test
 spec:
-  type: ClusterIP
-  ports:
-    - port: 5432
-      targetPort: 5432
-      protocol: TCP
-      name: postgres
-  selector:
-    app.kubernetes.io/name: {{ $name }}
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    app.kubernetes.io/component: postgres
-{{- end }}
+  containers:
+    - name: curl
+      image: curlimages/curl:8.6.0
+      imagePullPolicy: IfNotPresent
+      args:
+        - "-fsS"
+        - "http://{{ $fullname }}:{{ .Values.service.port }}/healthz"
+  restartPolicy: Never

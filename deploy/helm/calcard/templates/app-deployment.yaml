@@ -1,18 +1,26 @@
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "calcard.fullname" . }}
+  name: {{ $fullname }}
   labels:
-    {{- include "calcard.labels" . | nindent 4 }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "calcard.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        {{- include "calcard.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       containers:
         - name: calcard
@@ -21,11 +29,40 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          {{- if or .Values.app.db.existingSecret.name .Values.app.db.credentialsExistingSecret.name .Values.app.sessionSecretExistingSecret.name }}
+          env:
+            {{- if .Values.app.db.existingSecret.name }}
+            - name: APP_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.existingSecret.name | quote }}
+                  key: {{ .Values.app.db.existingSecret.key | quote }}
+            {{- end }}
+            {{- if .Values.app.db.credentialsExistingSecret.name }}
+            - name: APP_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
+                  key: {{ .Values.app.db.credentialsExistingSecret.userKey | quote }}
+            - name: APP_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
+                  key: {{ .Values.app.db.credentialsExistingSecret.passwordKey | quote }}
+            {{- end }}
+            {{- if .Values.app.sessionSecretExistingSecret.name }}
+            - name: APP_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.sessionSecretExistingSecret.name | quote }}
+                  key: {{ .Values.app.sessionSecretExistingSecret.key | quote }}
+            {{- end }}
+          {{- end }}
           envFrom:
             - configMapRef:
-                name: {{ include "calcard.fullname" . }}-config
+                name: {{ $fullname }}-config
             - secretRef:
-                name: {{ include "calcard.fullname" . }}-secret
+                name: {{ $fullname }}-secret
           livenessProbe:
             httpGet:
               path: /healthz

@@ -1,14 +1,34 @@
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "calcard.fullname" . }}-config
+  name: {{ $fullname }}-config
   labels:
-    {{- include "calcard.labels" . | nindent 4 }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
 data:
-  APP_LISTEN_ADDR: {{ .Values.app.listenAddr | quote }}
   APP_BASE_URL: {{ required "app.baseUrl is required" .Values.app.baseUrl | quote }}
   APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
-  APP_OAUTH_REDIRECT_PATH: {{ .Values.app.oauth.redirectPath | quote }}
   APP_TRUSTED_PROXIES: {{ .Values.app.trustedProxies | quote }}
+  {{- if and (not .Values.app.db.existingSecret.name) .Values.app.db.credentialsExistingSecret.name }}
+  {{- $dbHost := "" -}}
+  {{- if .Values.postgres.enabled }}
+  {{- if .Values.app.db.host -}}
+  {{- $dbHost = .Values.app.db.host -}}
+  {{- else -}}
+  {{- $dbHost = printf "%s-postgres" $fullname -}}
+  {{- end -}}
+  {{- else -}}
+  {{- $dbHost = required "app.db.host is required when postgres.enabled is false and app.db.credentialsExistingSecret.name is set" .Values.app.db.host -}}
+  {{- end -}}
+  APP_DB_HOST: {{ $dbHost | quote }}
+  APP_DB_NAME: {{ required "app.db.name is required when app.db.credentialsExistingSecret.name is set" .Values.app.db.name | quote }}
+  APP_DB_PORT: {{ .Values.app.db.port | quote }}
+  APP_DB_SSLMODE: {{ .Values.app.db.sslmode | quote }}
+  {{- end }}

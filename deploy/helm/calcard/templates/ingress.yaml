@@ -1,10 +1,21 @@
 {{- if .Values.ingress.enabled }}
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+{{- $ingressHost := .Values.ingress.host -}}
+{{- if not $ingressHost -}}
+{{- $url := required "app.baseUrl is required to derive ingress.host" .Values.app.baseUrl -}}
+{{- $ingressHost = regexReplaceAll "^(https?://)?([^/]+).*$" $url "$2" -}}
+{{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "calcard.fullname" . }}
+  name: {{ $fullname }}
   labels:
-    {{- include "calcard.labels" . | nindent 4 }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -14,20 +25,20 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   {{- end }}
   rules:
-    - host: {{ include "calcard.ingressHost" . | quote }}
+    - host: {{ $ingressHost | quote }}
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: {{ include "calcard.fullname" . }}
+                name: {{ $fullname }}
                 port:
                   number: {{ .Values.service.port }}
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - {{ include "calcard.ingressHost" . | quote }}
+        - {{ $ingressHost | quote }}
       {{- if .Values.ingress.tls.secretName }}
       secretName: {{ .Values.ingress.tls.secretName | quote }}
       {{- end }}
