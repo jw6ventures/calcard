@@ -1288,7 +1288,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := fmt.Sprintf("%d", c.CTag)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = append(res, calendarCollectionResponse(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, false))
+				res = append(res, calendarCollectionResponse(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, !c.Editor))
 			}
 		}
 		return res, nil
@@ -1356,7 +1356,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	ctag := fmt.Sprintf("%d", cal.CTag)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
-	res := []response{calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, false)}
+	res := []response{calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, !cal.Editor)}
 	if depth == "1" {
 		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 		if err != nil {
@@ -2165,7 +2165,7 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 	}
 
 	responses := []response{
-		calendarCollectionResponse(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), false),
+		calendarCollectionResponse(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), !cal.Editor),
 	}
 	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 

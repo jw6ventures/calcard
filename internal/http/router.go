@@ -149,6 +149,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Post("/app-passwords", uiHandler.CreateAppPassword)
 		r.Delete("/app-passwords/{id}", uiHandler.RevokeAppPassword)
 		r.Post("/app-passwords/{id}/revoke", uiHandler.RevokeAppPassword)
+		r.Post("/app-passwords/{id}/delete", uiHandler.DeleteAppPassword)
 
 		r.Post("/sessions/{id}/revoke", uiHandler.RevokeSession)
 		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
-	"github.com/go-chi/chi/v5"
 )
 
 // Calendars displays the user's calendars.
@@ -500,12 +500,13 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
+	opts := parseEventOptions(r)
 
 	// Parse recurrence options
 	recurrence := utils.ParseRecurrenceOptions(r)
 
 	uid := utils.GenerateUID()
-	ical := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence)
+	ical := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, opts)
 	etag := utils.GenerateETag(ical)
 
 	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
@@ -596,6 +597,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
+	opts := parseEventOptions(r)
 
 	// Parse recurrence options
 	recurrence := utils.ParseRecurrenceOptions(r)
@@ -604,8 +606,8 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	if editScope == "occurrence" && recurrenceID != "" && existing.RawICAL != "" {
 		// Update only a single occurrence by replacing/adding a RECURRENCE-ID component.
 		header, components, footer := utils.SplitComponents(existing.RawICAL)
-		override := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "")
-		if recLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID"); err == nil && recLine != "" {
+		override := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "", opts)
+		if recLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", opts.Timezone); err == nil && recLine != "" {
 			if len(override) >= 2 {
 				override = append(override[:2], append([]string{recLine}, override[2:]...)...)
 			} else {
@@ -626,7 +628,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Update the series/master event while keeping overrides intact.
 		header, components, footer := utils.SplitComponents(existing.RawICAL)
-		master := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "")
+		master := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
 		replaced := false
 		for i, comp := range components {
 			if utils.RecurrenceIDValue(comp) == "" && !replaced {
@@ -708,7 +710,8 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		exdateLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "EXDATE")
+		timezone := strings.TrimSpace(r.FormValue("timezone"))
+		exdateLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "EXDATE", timezone)
 		if err != nil || exdateLine == "" {
 			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "invalid recurrence id"})
 			return
@@ -773,14 +776,65 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func parseEventOptions(r *http.Request) *utils.EventOptions {
+	timezone := strings.TrimSpace(r.FormValue("timezone"))
+	status := strings.TrimSpace(r.FormValue("status"))
+	class := strings.TrimSpace(r.FormValue("class"))
+	transparency := strings.TrimSpace(r.FormValue("transparency"))
+	url := strings.TrimSpace(r.FormValue("url"))
+	organizer := strings.TrimSpace(r.FormValue("organizer"))
+
+	categories := splitListField(r.FormValue("categories"))
+	attendees := splitListField(r.FormValue("attendees"))
+	attachments := splitListField(r.FormValue("attachments"))
+	reminders := parseReminderMinutes(r.Form["reminder_minutes"])
+
+	return &utils.EventOptions{
+		Timezone:     timezone,
+		URL:          url,
+		Status:       status,
+		Categories:   categories,
+		Class:        class,
+		Transparency: transparency,
+		Organizer:    organizer,
+		Attendees:    attendees,
+		Attachments:  attachments,
+		Reminders:    reminders,
+	}
+}
+
+func splitListField(value string) []string {
+	var out []string
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == '\n' || r == ',' }) {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func parseReminderMinutes(values []string) []int {
+	var out []int
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // validateEventDates validates that the date strings are parseable and end is after start
 func validateEventDates(dtstart, dtend string) error {
 	// Try parsing as datetime-local format (YYYY-MM-DDTHH:MM)
 	layouts := []string{
-		"2006-01-02T15:04",         // datetime-local
-		"2006-01-02T15:04:05",      // datetime-local with seconds
+		"2006-01-02T15:04",          // datetime-local
+		"2006-01-02T15:04:05",       // datetime-local with seconds
 		"2006-01-02T15:04:05Z07:00", // RFC3339
-		"2006-01-02",               // date only
+		"2006-01-02",                // date only
 	}
 
 	var startTime, endTime time.Time

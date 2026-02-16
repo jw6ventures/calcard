@@ -258,8 +258,13 @@ type currentUserPrivilegeSet struct {
 }
 
 type privilege struct {
-	Read         *readPrivilege `xml:"d:read,omitempty"`
-	ReadFreeBusy *struct{}      `xml:"cal:read-free-busy,omitempty"`
+	Read            *readPrivilege `xml:"d:read,omitempty"`
+	ReadFreeBusy    *struct{}      `xml:"cal:read-free-busy,omitempty"`
+	Write           *struct{}      `xml:"d:write,omitempty"`
+	WriteContent    *struct{}      `xml:"d:write-content,omitempty"`
+	WriteProperties *struct{}      `xml:"d:write-properties,omitempty"`
+	Bind            *struct{}      `xml:"d:bind,omitempty"`
+	Unbind          *struct{}      `xml:"d:unbind,omitempty"`
 }
 
 type readPrivilege struct {

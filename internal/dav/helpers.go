@@ -33,7 +33,7 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 	p.SupportedCalendarComponentSet = supportedCalendarComponents()
 	p.SupportedCalendarData = supportedCalendarDataProp()
 	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
-	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet()
+	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet(readOnly)
 
 	p.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
 	p.MinDateTime = caldavMinDateTime
@@ -183,13 +183,21 @@ func supportedCalendarDataProp() *supportedCalendarData {
 	}
 }
 
-func calendarCurrentUserPrivilegeSet() *currentUserPrivilegeSet {
-	return &currentUserPrivilegeSet{
-		Privileges: []privilege{
-			{Read: &readPrivilege{ReadFreeBusy: &struct{}{}}},
-			{ReadFreeBusy: &struct{}{}},
-		},
+func calendarCurrentUserPrivilegeSet(readOnly bool) *currentUserPrivilegeSet {
+	privs := []privilege{
+		{Read: &readPrivilege{ReadFreeBusy: &struct{}{}}},
+		{ReadFreeBusy: &struct{}{}},
 	}
+	if !readOnly {
+		privs = append(privs,
+			privilege{Write: &struct{}{}},
+			privilege{WriteContent: &struct{}{}},
+			privilege{WriteProperties: &struct{}{}},
+			privilege{Bind: &struct{}{}},
+			privilege{Unbind: &struct{}{}},
+		)
+	}
+	return &currentUserPrivilegeSet{Privileges: privs}
 }
 
 func calendarTimezoneValue(tz *string) *string {

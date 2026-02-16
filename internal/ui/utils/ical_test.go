@@ -202,7 +202,7 @@ func TestFormatICalDateTime(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := FormatICalDateTime(tt.value, tt.allDay, tt.exclusiveEnd, tt.prop)
+			got, err := FormatICalDateTime(tt.value, tt.allDay, tt.exclusiveEnd, tt.prop, "")
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("FormatICalDateTime() error = %v, wantErr %v", err, tt.wantErr)
@@ -224,7 +224,7 @@ func TestBuildEvent(t *testing.T) {
 	location := "Test Location"
 	description := "Test Description"
 
-	ical := BuildEvent(uid, summary, dtstart, dtend, true, location, description, nil)
+	ical := BuildEvent(uid, summary, dtstart, dtend, true, location, description, nil, nil)
 
 	requiredFields := []string{
 		"BEGIN:VCALENDAR",
@@ -254,7 +254,7 @@ func TestBuildEventWithRecurrence(t *testing.T) {
 		Count:     10,
 	}
 
-	ical := BuildEvent(uid, "Weekly Meeting", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", recurrence)
+	ical := BuildEvent(uid, "Weekly Meeting", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", recurrence, nil)
 
 	if !strings.Contains(ical, "RRULE:FREQ=WEEKLY") {
 		t.Error("BuildEvent() should include RRULE frequency")
@@ -264,6 +264,94 @@ func TestBuildEventWithRecurrence(t *testing.T) {
 	}
 	if !strings.Contains(ical, "COUNT=10") {
 		t.Error("BuildEvent() should include RRULE count")
+	}
+}
+
+func TestFormatICalDateTime_TimezoneHandling(t *testing.T) {
+	t.Run("valid timezone uses TZID", func(t *testing.T) {
+		got, err := FormatICalDateTime("2025-01-15T14:30", false, false, "DTSTART", "America/New_York")
+		if err != nil {
+			t.Fatalf("FormatICalDateTime() error = %v", err)
+		}
+		if !strings.Contains(got, "DTSTART;TZID=America/New_York:20250115T143000") {
+			t.Fatalf("expected TZID datetime, got %q", got)
+		}
+	})
+
+	t.Run("invalid timezone falls back to UTC format", func(t *testing.T) {
+		got, err := FormatICalDateTime("2025-01-15T14:30", false, false, "DTSTART", "Not/A_Real_Zone")
+		if err != nil {
+			t.Fatalf("FormatICalDateTime() error = %v", err)
+		}
+		if strings.Contains(got, "TZID=") {
+			t.Fatalf("unexpected TZID in fallback output: %q", got)
+		}
+		if !strings.HasPrefix(got, "DTSTART:") || !strings.HasSuffix(got, "Z") {
+			t.Fatalf("expected UTC DTSTART output, got %q", got)
+		}
+	})
+}
+
+func TestBuildEvent_WithOptions(t *testing.T) {
+	opts := &EventOptions{
+		Timezone:     "America/New_York",
+		URL:          "https://example.com/event",
+		Status:       "confirmed",
+		Categories:   []string{"Team", "Planning"},
+		Class:        "private",
+		Transparency: "opaque",
+		Organizer:    "Alice Example <alice@example.com>",
+		Attendees:    []string{"Bob Example <bob@example.com>"},
+		Attachments:  []string{"https://example.com/agenda.pdf"},
+		Reminders:    []int{10},
+	}
+
+	ical := BuildEvent("uid-1@calcard", "Planning", "2025-01-15T14:00", "2025-01-15T15:00", false, "HQ", "Discuss roadmap", nil, opts)
+
+	required := []string{
+		"DTSTART;TZID=America/New_York:20250115T140000",
+		"DTEND;TZID=America/New_York:20250115T150000",
+		"URL:https://example.com/event",
+		"STATUS:CONFIRMED",
+		"CLASS:PRIVATE",
+		"TRANSP:OPAQUE",
+		"CATEGORIES:Team,Planning",
+		"ORGANIZER;CN=Alice Example:mailto:alice@example.com",
+		"ATTENDEE;CN=Bob Example:mailto:bob@example.com",
+		"ATTACH:https://example.com/agenda.pdf",
+		"BEGIN:VALARM",
+		"TRIGGER:-PT10M",
+	}
+	for _, want := range required {
+		if !strings.Contains(ical, want) {
+			t.Errorf("BuildEvent() missing %q in:\n%s", want, ical)
+		}
+	}
+}
+
+func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
+	opts := &EventOptions{
+		URL:         "https://example.com\r\nBEGIN:VALARM",
+		Organizer:   "Alice <alice@example.com\r\nATTENDEE:mailto:mallory@example.com>",
+		Attendees:   []string{"Bob <bob@example.com>", "Evil <evil@example.com\r\nSUMMARY:Hacked>"},
+		Attachments: []string{"https://example.com/file.pdf\r\nSUMMARY:Hacked"},
+	}
+
+	ical := BuildEvent("uid-2@calcard", "Secure Event", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", nil, opts)
+
+	forbidden := []string{
+		"URL:https://example.com",
+		"ORGANIZER;CN=Alice",
+		"ATTACH:https://example.com/file.pdf",
+		"SUMMARY:Hacked",
+	}
+	for _, bad := range forbidden {
+		if strings.Contains(ical, bad) {
+			t.Errorf("BuildEvent() should not contain injected/invalid value %q in:\n%s", bad, ical)
+		}
+	}
+	if !strings.Contains(ical, "ATTENDEE;CN=Bob:mailto:bob@example.com") {
+		t.Errorf("BuildEvent() should keep valid attendees in:\n%s", ical)
 	}
 }
 
@@ -535,9 +623,9 @@ END:VCALENDAR`
 
 func TestExtractUID(t *testing.T) {
 	tests := []struct {
-		name  string
-		ical  string
-		want  string
+		name string
+		ical string
+		want string
 	}{
 		{
 			name: "valid UID",

@@ -17,7 +17,7 @@ import (
 	"github.com/jw6ventures/jw6-go-utils/database"
 )
 
-const version = "v1.0.5"
+const version = "v1.0.7"
 
 func main() {
 	logLevelString := os.Getenv("LOG_LEVEL")
