@@ -1,0 +1,95 @@
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: calcard
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          {{- if or .Values.app.db.existingSecret.name .Values.app.db.credentialsExistingSecret.name .Values.app.sessionSecretExistingSecret.name }}
+          env:
+            {{- if .Values.app.db.existingSecret.name }}
+            - name: APP_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.existingSecret.name | quote }}
+                  key: {{ .Values.app.db.existingSecret.key | quote }}
+            {{- end }}
+            {{- if .Values.app.db.credentialsExistingSecret.name }}
+            - name: APP_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
+                  key: {{ .Values.app.db.credentialsExistingSecret.userKey | quote }}
+            - name: APP_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
+                  key: {{ .Values.app.db.credentialsExistingSecret.passwordKey | quote }}
+            {{- end }}
+            {{- if .Values.app.sessionSecretExistingSecret.name }}
+            - name: APP_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.sessionSecretExistingSecret.name | quote }}
+                  key: {{ .Values.app.sessionSecretExistingSecret.key | quote }}
+            {{- end }}
+          {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ $fullname }}-config
+            - secretRef:
+                name: {{ $fullname }}-secret
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

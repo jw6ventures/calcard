@@ -359,6 +359,20 @@
     }
     .event-html-desc p { margin: 0.5rem 0; }
     .event-html-desc a { color: var(--primary); }
+    .reminder-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+    .reminder-item {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .reminder-item input {
+        width: 120px;
+    }
     
     .empty-state {
         text-align: center;
@@ -530,6 +544,66 @@
                 <label for="create-description">Description</label>
                 <textarea id="create-description" name="description" rows="2"></textarea>
             </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="create-timezone">Time zone</label>
+                    <input type="text" id="create-timezone" name="timezone" list="timezone-list" placeholder="e.g., America/New_York">
+                </div>
+                <div class="form-group">
+                    <label for="create-status">Status</label>
+                    <select id="create-status" name="status">
+                        <option value="">None</option>
+                        <option value="TENTATIVE">Tentative</option>
+                        <option value="CONFIRMED">Confirmed</option>
+                        <option value="CANCELLED">Cancelled</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="create-visibility">Visibility</label>
+                    <select id="create-visibility" name="class">
+                        <option value="">Default</option>
+                        <option value="PUBLIC">Public</option>
+                        <option value="PRIVATE">Private</option>
+                        <option value="CONFIDENTIAL">Confidential</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="create-availability">Availability</label>
+                    <select id="create-availability" name="transparency">
+                        <option value="">Default</option>
+                        <option value="OPAQUE">Busy</option>
+                        <option value="TRANSPARENT">Free</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="create-url">Link</label>
+                <input type="url" id="create-url" name="url" placeholder="https://">
+            </div>
+            <div class="form-group">
+                <label for="create-categories">Categories</label>
+                <input type="text" id="create-categories" name="categories" placeholder="e.g., Meeting, Sales">
+            </div>
+            <div class="form-group">
+                <label for="create-organizer">Organizer</label>
+                <input type="text" id="create-organizer" name="organizer" placeholder="Name <email@example.com>">
+            </div>
+            <div class="form-group">
+                <label for="create-attendees">Attendees</label>
+                <textarea id="create-attendees" name="attendees" rows="2" placeholder="One per line or comma-separated"></textarea>
+            </div>
+            <div class="form-group">
+                <label for="create-attachments">Attachments</label>
+                <textarea id="create-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+            </div>
+            <div class="form-group">
+                <label>Reminders (minutes before)</label>
+                <div id="create-reminders" class="reminder-list"></div>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="addReminderRow('create')">Add reminder</button>
+            </div>
             
             <!-- Recurrence Options -->
             <div class="form-group">
@@ -557,6 +631,42 @@
                             <option value="never">Never</option>
                             <option value="after">After</option>
                             <option value="on">On date</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group" id="create-recurrence-byday-group" style="display: none;">
+                    <label>Repeat on</label>
+                    <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                        <label><input type="checkbox" name="recurrence_byday" value="MO"> Mon</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="TU"> Tue</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="WE"> Wed</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="TH"> Thu</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="FR"> Fri</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="SA"> Sat</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="SU"> Sun</label>
+                    </div>
+                </div>
+                <div class="form-row" id="create-recurrence-monthly-group" style="display: none;">
+                    <div class="form-group">
+                        <label for="create-recurrence-bymonthday">Day of month</label>
+                        <input type="number" id="create-recurrence-bymonthday" name="recurrence_bymonthday" min="1" max="31">
+                    </div>
+                    <div class="form-group" id="create-recurrence-bymonth-group" style="display: none;">
+                        <label for="create-recurrence-bymonth">Month</label>
+                        <select id="create-recurrence-bymonth" name="recurrence_bymonth">
+                            <option value="">Any</option>
+                            <option value="1">January</option>
+                            <option value="2">February</option>
+                            <option value="3">March</option>
+                            <option value="4">April</option>
+                            <option value="5">May</option>
+                            <option value="6">June</option>
+                            <option value="7">July</option>
+                            <option value="8">August</option>
+                            <option value="9">September</option>
+                            <option value="10">October</option>
+                            <option value="11">November</option>
+                            <option value="12">December</option>
                         </select>
                     </div>
                 </div>
@@ -627,6 +737,66 @@
                 <label for="edit-description">Description</label>
                 <textarea id="edit-description" name="description" rows="2"></textarea>
             </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="edit-timezone">Time zone</label>
+                    <input type="text" id="edit-timezone" name="timezone" list="timezone-list" placeholder="e.g., America/New_York">
+                </div>
+                <div class="form-group">
+                    <label for="edit-status">Status</label>
+                    <select id="edit-status" name="status">
+                        <option value="">None</option>
+                        <option value="TENTATIVE">Tentative</option>
+                        <option value="CONFIRMED">Confirmed</option>
+                        <option value="CANCELLED">Cancelled</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="edit-visibility">Visibility</label>
+                    <select id="edit-visibility" name="class">
+                        <option value="">Default</option>
+                        <option value="PUBLIC">Public</option>
+                        <option value="PRIVATE">Private</option>
+                        <option value="CONFIDENTIAL">Confidential</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="edit-availability">Availability</label>
+                    <select id="edit-availability" name="transparency">
+                        <option value="">Default</option>
+                        <option value="OPAQUE">Busy</option>
+                        <option value="TRANSPARENT">Free</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="edit-url">Link</label>
+                <input type="url" id="edit-url" name="url" placeholder="https://">
+            </div>
+            <div class="form-group">
+                <label for="edit-categories">Categories</label>
+                <input type="text" id="edit-categories" name="categories" placeholder="e.g., Meeting, Sales">
+            </div>
+            <div class="form-group">
+                <label for="edit-organizer">Organizer</label>
+                <input type="text" id="edit-organizer" name="organizer" placeholder="Name <email@example.com>">
+            </div>
+            <div class="form-group">
+                <label for="edit-attendees">Attendees</label>
+                <textarea id="edit-attendees" name="attendees" rows="2" placeholder="One per line or comma-separated"></textarea>
+            </div>
+            <div class="form-group">
+                <label for="edit-attachments">Attachments</label>
+                <textarea id="edit-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+            </div>
+            <div class="form-group">
+                <label>Reminders (minutes before)</label>
+                <div id="edit-reminders" class="reminder-list"></div>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="addReminderRow('edit')">Add reminder</button>
+            </div>
             
             <!-- Recurrence Options -->
             <div class="form-group">
@@ -657,6 +827,42 @@
                         </select>
                     </div>
                 </div>
+                <div class="form-group" id="edit-recurrence-byday-group" style="display: none;">
+                    <label>Repeat on</label>
+                    <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                        <label><input type="checkbox" name="recurrence_byday" value="MO"> Mon</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="TU"> Tue</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="WE"> Wed</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="TH"> Thu</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="FR"> Fri</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="SA"> Sat</label>
+                        <label><input type="checkbox" name="recurrence_byday" value="SU"> Sun</label>
+                    </div>
+                </div>
+                <div class="form-row" id="edit-recurrence-monthly-group" style="display: none;">
+                    <div class="form-group">
+                        <label for="edit-recurrence-bymonthday">Day of month</label>
+                        <input type="number" id="edit-recurrence-bymonthday" name="recurrence_bymonthday" min="1" max="31">
+                    </div>
+                    <div class="form-group" id="edit-recurrence-bymonth-group" style="display: none;">
+                        <label for="edit-recurrence-bymonth">Month</label>
+                        <select id="edit-recurrence-bymonth" name="recurrence_bymonth">
+                            <option value="">Any</option>
+                            <option value="1">January</option>
+                            <option value="2">February</option>
+                            <option value="3">March</option>
+                            <option value="4">April</option>
+                            <option value="5">May</option>
+                            <option value="6">June</option>
+                            <option value="7">July</option>
+                            <option value="8">August</option>
+                            <option value="9">September</option>
+                            <option value="10">October</option>
+                            <option value="11">November</option>
+                            <option value="12">December</option>
+                        </select>
+                    </div>
+                </div>
                 <div id="edit-recurrence-end-options" style="display: none;">
                     <div class="form-group" id="edit-recurrence-count-group" style="display: none;">
                         <label for="edit-recurrence-count">Number of occurrences</label>
@@ -681,6 +887,7 @@
             <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="delete-recurrence-id" name="recurrence_id" value="">
             <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day" value="">
+            <input type="hidden" id="delete-timezone" name="timezone" value="">
         </form>
     </div>
 </div>
@@ -708,6 +915,20 @@
         </form>
     </div>
 </div>
+
+<datalist id="timezone-list">
+    <option value="UTC"></option>
+    <option value="America/New_York"></option>
+    <option value="America/Chicago"></option>
+    <option value="America/Denver"></option>
+    <option value="America/Los_Angeles"></option>
+    <option value="America/Phoenix"></option>
+    <option value="America/Anchorage"></option>
+    <option value="Pacific/Honolulu"></option>
+    <option value="Europe/London"></option>
+    <option value="Europe/Paris"></option>
+    <option value="Asia/Tokyo"></option>
+</datalist>
 
 <script>
 (function() {
@@ -742,7 +963,12 @@
         }
 
         function parseEventLines(evLines) {
-            var event = {};
+            var event = {
+                attendees: [],
+                attachments: [],
+                reminders: []
+            };
+            var inAlarm = false;
             evLines.forEach(function(line) {
                 var colonIdx = line.indexOf(':');
                 if (colonIdx === -1) return;
@@ -762,6 +988,24 @@
                             params[p.substring(0, eq)] = p.substring(eq + 1);
                         }
                     });
+                }
+
+                if (key === 'BEGIN' && value === 'VALARM') {
+                    inAlarm = true;
+                    return;
+                }
+                if (key === 'END' && value === 'VALARM') {
+                    inAlarm = false;
+                    return;
+                }
+                if (inAlarm) {
+                    if (key === 'TRIGGER') {
+                        var minutes = parseTriggerMinutes(value);
+                        if (minutes !== null) {
+                            event.reminders.push(minutes);
+                        }
+                    }
+                    return;
                 }
 
                 switch (key) {
@@ -790,9 +1034,11 @@
                     case 'DTSTART':
                         event.dtstart = parseICALDate(value, params);
                         event.allDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        if (params['TZID']) event.timezone = params['TZID'];
                         break;
                     case 'DTEND':
                         event.dtend = parseICALDate(value, params);
+                        if (!event.timezone && params['TZID']) event.timezone = params['TZID'];
                         break;
                     case 'DURATION':
                         event.duration = value;
@@ -810,6 +1056,26 @@
                         break;
                     case 'CATEGORIES':
                         event.categories = value.split(',').map(function(c) { return c.trim(); });
+                        break;
+                    case 'URL':
+                        event.url = value;
+                        break;
+                    case 'CLASS':
+                        event.class = value;
+                        break;
+                    case 'TRANSP':
+                        event.transp = value;
+                        break;
+                    case 'ORGANIZER':
+                        event.organizer = formatEmailValue(value, params);
+                        break;
+                    case 'ATTENDEE':
+                        event.attendees = event.attendees || [];
+                        event.attendees.push(formatEmailValue(value, params));
+                        break;
+                    case 'ATTACH':
+                        event.attachments = event.attachments || [];
+                        event.attachments.push(value);
                         break;
                 }
             });
@@ -837,6 +1103,36 @@
             .replace(/\\,/g, ',')
             .replace(/\\;/g, ';')
             .replace(/\\\\/g, '\\');
+    }
+
+    function formatEmailValue(value, params) {
+        var email = value || '';
+        if (email.toLowerCase().indexOf('mailto:') === 0) {
+            email = email.substring(7);
+        }
+        var name = params && params['CN'] ? params['CN'] : '';
+        if (!email) return '';
+        return name ? (name + ' <' + email + '>') : email;
+    }
+
+    function parseTriggerMinutes(value) {
+        if (!value) return null;
+        var sign = 1;
+        if (value[0] === '-') {
+            sign = -1;
+            value = value.substring(1);
+        } else if (value[0] === '+') {
+            value = value.substring(1);
+        }
+        var match = value.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
+        if (!match) return null;
+        var days = parseInt(match[1] || '0', 10);
+        var hours = parseInt(match[2] || '0', 10);
+        var mins = parseInt(match[3] || '0', 10);
+        var secs = parseInt(match[4] || '0', 10);
+        var total = days * 1440 + hours * 60 + mins + Math.round(secs / 60);
+        if (sign >= 0) return null;
+        return total;
     }
     
     function parseICALDate(str, params) {
@@ -945,7 +1241,7 @@
                 var matches = true;
                 
                 // Check BYDAY constraint
-                if (byDay && freq !== 'WEEKLY') {
+                if (byDay) {
                     var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
                     var currentDay = dayNames[current.getDay()];
                     matches = byDay.some(function(d) { return d.endsWith(currentDay); });
@@ -1200,11 +1496,51 @@
         if (event.location) {
             body += '<p><strong>Where:</strong> ' + escapeHtml(event.location) + '</p>';
         }
+        if (event.timezone) {
+            body += '<p><strong>Time zone:</strong> ' + escapeHtml(event.timezone) + '</p>';
+        }
+        if (event.url) {
+            var safeUrl = safeHref(event.url);
+            var urlLabel = escapeHtml(event.url);
+            if (safeUrl) {
+                body += '<p><strong>Link:</strong> <a href="' + safeUrl + '" target="_blank" rel="noopener">' + urlLabel + '</a></p>';
+            } else {
+                body += '<p><strong>Link:</strong> ' + urlLabel + '</p>';
+            }
+        }
         if (event.status) {
             body += '<p><strong>Status:</strong> ' + escapeHtml(event.status) + '</p>';
         }
+        if (event.class) {
+            body += '<p><strong>Visibility:</strong> ' + escapeHtml(event.class) + '</p>';
+        }
+        if (event.transp) {
+            var availability = event.transp === 'TRANSPARENT' ? 'Free' : (event.transp === 'OPAQUE' ? 'Busy' : event.transp);
+            body += '<p><strong>Availability:</strong> ' + escapeHtml(availability) + '</p>';
+        }
         if (event.categories && event.categories.length) {
             body += '<p><strong>Categories:</strong> ' + event.categories.map(escapeHtml).join(', ') + '</p>';
+        }
+        if (event.organizer) {
+            body += '<p><strong>Organizer:</strong> ' + escapeHtml(event.organizer) + '</p>';
+        }
+        if (event.attendees && event.attendees.length) {
+            body += '<p><strong>Attendees:</strong> ' + event.attendees.map(escapeHtml).join(', ') + '</p>';
+        }
+        if (event.attachments && event.attachments.length) {
+            var attLinks = event.attachments.map(function(a) {
+                var label = escapeHtml(a);
+                var href = safeHref(a);
+                if (!href) return label;
+                return '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>';
+            }).join('<br>');
+            body += '<p><strong>Attachments:</strong><br>' + attLinks + '</p>';
+        }
+        if (event.reminders && event.reminders.length) {
+            var reminderText = event.reminders.map(function(m) {
+                return m + ' min before';
+            }).join(', ');
+            body += '<p><strong>Reminders:</strong> ' + escapeHtml(reminderText) + '</p>';
         }
         if (event.rrule) {
             body += '<p><strong>Recurrence:</strong> ' + formatRRule(event.rrule) + '</p>';
@@ -1395,6 +1731,20 @@
         var div = document.createElement('div');
         div.textContent = str;
         return div.innerHTML;
+    }
+
+    function safeHref(raw) {
+        if (!raw) return '';
+        var value = String(raw).trim();
+        if (!value) return '';
+        try {
+            var u = new URL(value, window.location.origin);
+            var protocol = (u.protocol || '').toLowerCase();
+            if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
+                return escapeHtml(value);
+            }
+        } catch (e) {}
+        return '';
     }
     
     // Expanded events for calendar view (includes recurring occurrences)
@@ -1677,6 +2027,13 @@
 function showCreateEventModal() {
     document.getElementById('create-event-modal').classList.add('show');
     document.getElementById('create-summary').focus();
+    var tzInput = document.getElementById('create-timezone');
+    if (tzInput && !tzInput.value) {
+        try {
+            tzInput.value = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        } catch (e) {}
+    }
+    setReminderList('create', null, true);
 }
 
 function closeCreateEventModal() {
@@ -1686,7 +2043,17 @@ function closeCreateEventModal() {
     document.getElementById('create-dtend').value = '';
     document.getElementById('create-location').value = '';
     document.getElementById('create-description').value = '';
+    document.getElementById('create-timezone').value = '';
+    document.getElementById('create-status').value = '';
+    document.getElementById('create-visibility').value = '';
+    document.getElementById('create-availability').value = '';
+    document.getElementById('create-url').value = '';
+    document.getElementById('create-categories').value = '';
+    document.getElementById('create-organizer').value = '';
+    document.getElementById('create-attendees').value = '';
+    document.getElementById('create-attachments').value = '';
     document.getElementById('create-all-day').checked = false;
+    setReminderList('create', [], false);
 }
 
 // Edit Event Modal
@@ -1704,6 +2071,17 @@ function showEditEventModal(event, scope) {
     document.getElementById('edit-summary').value = event.summary || '';
     document.getElementById('edit-location').value = event.location || '';
     document.getElementById('edit-description').value = event.description || '';
+    document.getElementById('edit-timezone').value = event.timezone || '';
+    document.getElementById('edit-status').value = event.status || '';
+    document.getElementById('edit-visibility').value = event.class || '';
+    document.getElementById('edit-availability').value = event.transp || '';
+    document.getElementById('edit-url').value = event.url || '';
+    document.getElementById('edit-categories').value = (event.categories || []).join(', ');
+    document.getElementById('edit-organizer').value = event.organizer || '';
+    document.getElementById('edit-attendees').value = (event.attendees || []).join('\n');
+    document.getElementById('edit-attachments').value = (event.attachments || []).join('\n');
+    setReminderList('edit', event.reminders || [], false);
+    document.getElementById('delete-timezone').value = event.timezone || '';
     document.getElementById('edit-all-day').checked = event.allDay || false;
     toggleAllDay('edit', true);
     
@@ -1736,6 +2114,9 @@ function showEditEventModal(event, scope) {
     var endTypeSelect = document.getElementById('edit-recurrence-end');
     var countInput = document.getElementById('edit-recurrence-count');
     var untilInput = document.getElementById('edit-recurrence-until');
+    var byMonthDayInput = document.getElementById('edit-recurrence-bymonthday');
+    var byMonthSelect = document.getElementById('edit-recurrence-bymonth');
+    var byDayCheckboxes = document.querySelectorAll('#edit-recurrence-byday-group input[type="checkbox"]');
     
     // Reset recurrence fields to defaults
     recurrenceSelect.value = '';
@@ -1743,6 +2124,9 @@ function showEditEventModal(event, scope) {
     endTypeSelect.value = 'never';
     countInput.value = '10';
     untilInput.value = '';
+    if (byMonthDayInput) byMonthDayInput.value = '';
+    if (byMonthSelect) byMonthSelect.value = '';
+    byDayCheckboxes.forEach(function(cb) { cb.checked = false; });
     
     if (event.rruleParsed) {
         var rr = event.rruleParsed;
@@ -1771,6 +2155,18 @@ function showEditEventModal(event, scope) {
                 var day = until.substring(6, 8);
                 untilInput.value = year + '-' + month + '-' + day;
             }
+        }
+        if (rr.BYDAY) {
+            var days = rr.BYDAY.split(',');
+            byDayCheckboxes.forEach(function(cb) {
+                cb.checked = days.indexOf(cb.value) !== -1;
+            });
+        }
+        if (rr.BYMONTHDAY && byMonthDayInput) {
+            byMonthDayInput.value = rr.BYMONTHDAY.split(',')[0];
+        }
+        if (rr.BYMONTH && byMonthSelect) {
+            byMonthSelect.value = rr.BYMONTH.split(',')[0];
         }
     }
     
@@ -1840,6 +2236,11 @@ function setEditScope(scope, event) {
         deleteRecurrenceAllDayInput.value = '';
         hint.textContent = scope === 'series' ? 'Changes apply to the entire series.' : '';
         if (deleteBtn) deleteBtn.textContent = 'Delete event';
+    }
+    var tzInput = document.getElementById('edit-timezone');
+    var deleteTz = document.getElementById('delete-timezone');
+    if (tzInput && deleteTz) {
+        deleteTz.value = tzInput.value || '';
     }
 }
 
@@ -1919,6 +2320,24 @@ function toggleRecurrenceOptions(prefix) {
     } else {
         optionsDiv.style.display = 'none';
     }
+    updateRecurrenceDetails(prefix);
+}
+
+function updateRecurrenceDetails(prefix) {
+    var select = document.getElementById(prefix + '-recurrence');
+    var byDayGroup = document.getElementById(prefix + '-recurrence-byday-group');
+    var monthlyGroup = document.getElementById(prefix + '-recurrence-monthly-group');
+    var byMonthGroup = document.getElementById(prefix + '-recurrence-bymonth-group');
+    if (!select) return;
+    if (byDayGroup) {
+        byDayGroup.style.display = select.value === 'WEEKLY' ? 'block' : 'none';
+    }
+    if (monthlyGroup) {
+        monthlyGroup.style.display = (select.value === 'MONTHLY' || select.value === 'YEARLY') ? 'flex' : 'none';
+    }
+    if (byMonthGroup) {
+        byMonthGroup.style.display = select.value === 'YEARLY' ? 'block' : 'none';
+    }
 }
 
 function toggleRecurrenceEnd(prefix) {
@@ -1930,6 +2349,49 @@ function toggleRecurrenceEnd(prefix) {
     optionsDiv.style.display = select.value !== 'never' ? 'block' : 'none';
     countGroup.style.display = select.value === 'after' ? 'block' : 'none';
     untilGroup.style.display = select.value === 'on' ? 'block' : 'none';
+}
+
+function addReminderRow(prefix, value) {
+    var container = document.getElementById(prefix + '-reminders');
+    if (!container) return;
+    var item = document.createElement('div');
+    item.className = 'reminder-item';
+    var input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.name = 'reminder_minutes';
+    input.placeholder = '10';
+    if (value !== undefined && value !== null) {
+        input.value = value;
+    }
+    var label = document.createElement('span');
+    label.textContent = 'minutes';
+    var remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn btn-secondary btn-sm';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', function() {
+        container.removeChild(item);
+    });
+    item.appendChild(input);
+    item.appendChild(label);
+    item.appendChild(remove);
+    container.appendChild(item);
+}
+
+function setReminderList(prefix, values, defaultWhenEmpty) {
+    var container = document.getElementById(prefix + '-reminders');
+    if (!container) return;
+    container.innerHTML = '';
+    if (!values || values.length === 0) {
+        if (defaultWhenEmpty) {
+            addReminderRow(prefix, '10');
+        }
+        return;
+    }
+    values.forEach(function(v) {
+        addReminderRow(prefix, v);
+    });
 }
 
 // Import Modal
@@ -1952,6 +2414,14 @@ document.getElementById('edit-event-modal').addEventListener('click', function(e
 document.getElementById('import-modal').addEventListener('click', function(e) {
     if (e.target === this) closeImportModal();
 });
+
+var editTimezoneInput = document.getElementById('edit-timezone');
+if (editTimezoneInput) {
+    editTimezoneInput.addEventListener('input', function() {
+        var deleteTz = document.getElementById('delete-timezone');
+        if (deleteTz) deleteTz.value = editTimezoneInput.value || '';
+    });
+}
 </script>
 
 {{end}}

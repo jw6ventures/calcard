@@ -1,0 +1,77 @@
+{{- if .Values.postgres.enabled }}
+{{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+{{- $postgresSecret := default (printf "%s-postgres-secret" $fullname) .Values.postgres.existingSecret.name -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-postgres
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ $fullname }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - configMapRef:
+                name: {{ $fullname }}-postgres-config
+            {{- if not .Values.postgres.existingSecret.name }}
+            - secretRef:
+                name: {{ $postgresSecret }}
+            {{- end }}
+          {{- if .Values.postgres.existingSecret.name }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret.name | quote }}
+                  key: {{ .Values.postgres.existingSecret.passwordKey | quote }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+      {{- if not .Values.postgres.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.postgres.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.postgres.persistence.storageClassName }}
+        storageClassName: {{ .Values.postgres.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.persistence.size | quote }}
+  {{- end }}
+{{- end }}

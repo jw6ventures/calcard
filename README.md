@@ -47,6 +47,68 @@ volumes:
   postgres_data:
 ```
 
+#### Kubernetes (Helm)
+
+The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
+
+1. Create a values file with your configuration (see deploy/helm/calcard/values.yaml for full file):
+
+```
+image:
+  repository: ghcr.io/jw6ventures/calcard
+  tag: latest
+
+replicaCount: 2
+
+app:
+  baseUrl: "https://calcard.example.com" # Required.
+  oauth:
+    clientId: "YOUR_CLIENT_ID"
+    clientSecret: "YOUR_CLIENT_SECRET"
+    issuerUrl: "https://issuer.example.com/"
+    discoveryUrl: "https://issuer.example.com/.well-known/openid-configuration"
+  sessionSecret: "YOUR_SESSION_SECRET"
+  db:
+    host: "" # Required when postgres.enabled is false and app.db.existingSecret.name and app.db.credentialsExistingSecret.name are empty.
+    user: "postgres"
+    password: "YOUR_DB_PASSWORD"
+    existingSecret:
+      name: ""
+      key: "APP_DB_DSN"
+    credentialsExistingSecret:
+      name: ""
+      userKey: "APP_DB_USER"
+      passwordKey: "APP_DB_PASSWORD"
+
+ingress:
+  enabled: true
+  className: ""
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+postgres:
+  enabled: false
+  existingSecret:
+    name: ""
+    passwordKey: "POSTGRES_PASSWORD"
+```
+
+2. Install or upgrade:
+
+```
+helm upgrade --install calcard oci://ghcr.io/jw6ventures/calcard-helm -f values.yaml
+```
+
+Notes:
+- The ingress host is derived from `app.baseUrl` (APP_BASE_URL) when `ingress.host` is empty.
+- `app.baseUrl` is required for the chart to render.
+- Postgres is disabled by default. Set `postgres.enabled=true` to deploy Postgres with a 500Mi PVC (see `postgres.persistence.size`).
+- When deploying Postgres, you can set `postgres.existingSecret.name` and optionally `postgres.existingSecret.passwordKey` to pull the password from an existing secret instead of the chart creating one.
+- When using an external database, set `app.db.host`, provide `app.db.existingSecret.name` with an `APP_DB_DSN` key, or provide `app.db.credentialsExistingSecret.name` with `APP_DB_USER` and `APP_DB_PASSWORD` keys (plus `app.db.host`, `app.db.name`, `app.db.port`, `app.db.sslmode` values).
+- Secrets are stored in a Kubernetes Secret (`APP_OAUTH_CLIENT_SECRET`, `APP_SESSION_SECRET`, `APP_DB_DSN`) unless `app.db.existingSecret.name` is set.
+
 ### Linux Installs
 A linux binary is published as a github release for each version. You'll need a postgres 16 server.
 ```
@@ -66,7 +128,13 @@ Environment variables:
 | --- | --- | --- |
 | `APP_LISTEN_ADDR` | false | (Default `:8080`) Bind address|
 | `APP_BASE_URL` | false | (Default: `http://localhost:8080`) The URL that users will access for example: `https://calcard.example.com` |
-| `APP_DB_DSN` | true | PostgreSQL DSN (ex. `postgres://postgres:postgres@postgres:5432/app?sslmode=disable` )|
+| `APP_DB_DSN` | true | PostgreSQL DSN (ex. `postgres://postgres:postgres@postgres:5432/app?sslmode=disable` ). Required unless you provide `APP_DB_HOST`, `APP_DB_NAME`, `APP_DB_USER`, and `APP_DB_PASSWORD`. |
+| `APP_DB_HOST` | true | Required when not providing `APP_DB_DSN`. |
+| `APP_DB_NAME` | true | Required when not providing `APP_DB_DSN`. |
+| `APP_DB_USER` | true | Required when not providing `APP_DB_DSN`. |
+| `APP_DB_PASSWORD` | true | Required when not providing `APP_DB_DSN`. |
+| `APP_DB_PORT` | false | (Default `5432`) Used when not providing `APP_DB_DSN`. |
+| `APP_DB_SSLMODE` | false | (Default `disable`) Used when not providing `APP_DB_DSN`. |
 | `APP_OAUTH_CLIENT_ID` | true | Provided from IDP |
 | `APP_OAUTH_CLIENT_SECRET` | true | Provided from IDP |
 | `APP_OAUTH_ISSUER_URL` | one of two | Provided from IDP. Used if `APP_OAUTH_DISCOVERY_URL` is not set. |

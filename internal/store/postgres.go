@@ -959,6 +959,13 @@ func (r *appPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	return err
 }
 
+func (r *appPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
+	const q = `DELETE FROM app_passwords WHERE id=$1 AND revoked_at IS NOT NULL`
+	defer observeDB(ctx, "app_passwords.delete_revoked")()
+	_, err := r.pool.ExecContext(ctx, q, id)
+	return err
+}
+
 func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET last_used_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.touch_last_used")()

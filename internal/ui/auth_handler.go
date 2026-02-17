@@ -172,6 +172,39 @@ func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
 }
 
+// DeleteAppPassword deletes a revoked app password.
+func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid token id", http.StatusBadRequest)
+		return
+	}
+
+	token, err := h.store.AppPasswords.GetByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "failed to load app password", http.StatusInternalServerError)
+		return
+	}
+	if token == nil || token.UserID != user.ID {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if token.RevokedAt == nil {
+		http.Error(w, "token must be revoked before deletion", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.store.AppPasswords.DeleteRevoked(r.Context(), id); err != nil {
+		http.Error(w, "failed to delete app password", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/app-passwords", http.StatusFound)
+}
+
 // renderAppPasswords renders the app passwords page with optional plaintext token.
 func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, user *store.User, plaintext string) {
 	passwords, err := h.store.AppPasswords.ListByUser(r.Context(), user.ID)

@@ -78,6 +78,7 @@ type AppPasswordRepository interface {
 	ListByUser(ctx context.Context, userID int64) ([]AppPassword, error)
 	GetByID(ctx context.Context, id int64) (*AppPassword, error)
 	Revoke(ctx context.Context, id int64) error
+	DeleteRevoked(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error
 }
 
