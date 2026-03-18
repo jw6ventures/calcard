@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,10 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
-	"github.com/go-chi/chi/v5"
 )
 
 func TestViewCalendarHandler(t *testing.T) {
@@ -505,10 +507,150 @@ func TestViewBirthdaysHandler(t *testing.T) {
 	}
 }
 
+func TestImportCalendarHandler(t *testing.T) {
+	t.Run("imports grouped ICS resources and injects missing uid", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Editor: true, Shared: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		s := &store.Store{Calendars: calRepo, Events: eventRepo}
+		handler := NewHandler(&config.Config{}, s, nil)
+
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nSUMMARY:Series\r\nDTSTART;TZID=America/Chicago:20250115T140000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nRECURRENCE-ID;TZID=America/Chicago:20250122T140000\r\nSUMMARY:Override\r\nDTSTART;TZID=America/Chicago:20250122T150000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:No UID\r\nDTSTART:20250116T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "editor@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if w.Code != http.StatusFound {
+			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusFound)
+		}
+		location := w.Header().Get("Location")
+		if !strings.Contains(location, "status=Imported+") {
+			t.Fatalf("expected success status in redirect, got %s", location)
+		}
+		if len(eventRepo.events) != 2 {
+			t.Fatalf("expected 2 stored resources, got %d", len(eventRepo.events))
+		}
+
+		series := eventRepo.events["1:series@example.com"]
+		if series == nil {
+			t.Fatalf("expected recurring series resource to be stored")
+		}
+		if strings.Count(series.RawICAL, "BEGIN:VEVENT") != 2 {
+			t.Fatalf("expected grouped recurring resource, got: %s", series.RawICAL)
+		}
+		if !strings.Contains(series.RawICAL, "BEGIN:VTIMEZONE") {
+			t.Fatalf("expected VTIMEZONE to be preserved, got: %s", series.RawICAL)
+		}
+		if series.ResourceName != "series_example.com.ics" {
+			t.Fatalf("unexpected resource name: %s", series.ResourceName)
+		}
+
+		var generated *store.Event
+		for key, ev := range eventRepo.events {
+			if key == "1:series@example.com" {
+				continue
+			}
+			generated = ev
+		}
+		if generated == nil || generated.UID == "" {
+			t.Fatalf("expected generated UID event to be stored")
+		}
+		if !strings.Contains(generated.RawICAL, "UID:"+generated.UID) {
+			t.Fatalf("expected generated UID to be injected into ICS, got: %s", generated.RawICAL)
+		}
+	})
+
+	t.Run("rejects malformed ICS", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		s := &store.Store{Calendars: calRepo, Events: eventRepo}
+		handler := NewHandler(&config.Config{}, s, nil)
+
+		req := newICSImportRequest(t, "/calendars/1/import", "bad.ics", "BEGIN:VEVENT\r\nEND:VEVENT\r\n")
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if w.Code != http.StatusFound {
+			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusFound)
+		}
+		if location := w.Header().Get("Location"); !strings.Contains(location, "error=invalid+ICS+file") {
+			t.Fatalf("expected invalid ICS redirect, got %s", location)
+		}
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("expected no stored events, got %d", len(eventRepo.events))
+		}
+	})
+
+	t.Run("forbids read only shared calendars", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Editor: false, Shared: true},
+			},
+		}
+		s := &store.Store{Calendars: calRepo, Events: &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
+		handler := NewHandler(&config.Config{}, s, nil)
+
+		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "viewer@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+	})
+}
+
+func withRouteID(req *http.Request, id string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+func newICSImportRequest(t *testing.T, target, filename, content string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("ics_file", filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write([]byte(content)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, target, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
 // Fake repositories for testing
 
 type fakeCalendarRepo struct {
-	calendars map[int64]*store.Calendar
+	calendars  map[int64]*store.Calendar
+	accessible map[string]*store.CalendarAccess
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
@@ -544,6 +686,14 @@ func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]
 }
 
 func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*store.CalendarAccess, error) {
+	if f.accessible != nil {
+		key := fmt.Sprintf("%d:%d", calendarID, userID)
+		if cal, ok := f.accessible[key]; ok {
+			copy := *cal
+			return &copy, nil
+		}
+		return nil, nil
+	}
 	cal, _ := f.GetByID(ctx, calendarID)
 	if cal == nil || cal.UserID != userID {
 		return nil, nil
@@ -759,9 +909,13 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 
 type fakeEventRepoWithUpsert struct {
 	fakeEventRepo
+	failOn map[string]error
 }
 
 func (f *fakeEventRepoWithUpsert) Upsert(ctx context.Context, event store.Event) (*store.Event, error) {
+	if err := f.failOn[event.UID]; err != nil {
+		return nil, err
+	}
 	key := fmt.Sprintf("%d:%s", event.CalendarID, event.UID)
 	f.events[key] = &event
 	return &event, nil

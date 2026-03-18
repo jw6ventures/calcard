@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/time/rate"
 
+	"github.com/jw6ventures/calcard/internal/api"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/dav"
@@ -95,6 +96,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	r.MethodFunc("PROPFIND", "/calendar/*", wellKnownHandler)
 
 	uiHandler := ui.NewHandler(cfg, store, authService)
+	apiHandler := api.NewHandler(cfg, store)
 	r.Route("/auth", func(r chi.Router) {
 		r.Use(authRateLimiter.Middleware())
 		r.Get("/login", authService.BeginOAuth)
@@ -155,6 +157,18 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		r.Post("/sessions/{id}/revoke", uiHandler.RevokeSession)
 		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)
+	})
+
+	r.Route("/api", func(r chi.Router) {
+		r.Use(davRateLimiter.Middleware())
+		r.Use(authService.RequireDAVAuth)
+		r.Get("/calendars", apiHandler.ListCalendars)
+		r.Get("/calendars/{id}", apiHandler.GetCalendar)
+		r.Get("/calendars/{id}/events", apiHandler.ListEvents)
+		r.Get("/calendars/{id}/events/{uid}", apiHandler.GetEvent)
+		r.Post("/calendars/{id}/events", apiHandler.CreateEvent)
+		r.Put("/calendars/{id}/events/{uid}", apiHandler.UpdateEvent)
+		r.Delete("/calendars/{id}/events/{uid}", apiHandler.DeleteEvent)
 	})
 
 	davHandler := dav.NewHandler(cfg, store)

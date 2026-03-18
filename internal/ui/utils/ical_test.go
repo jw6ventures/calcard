@@ -595,7 +595,10 @@ DTEND:20250116T150000Z
 END:VEVENT
 END:VCALENDAR`
 
-	events := ParseICSFile(icsContent)
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
 
 	if len(events) != 2 {
 		t.Errorf("ParseICSFile() should return 2 events, got %d", len(events))
@@ -618,6 +621,61 @@ END:VCALENDAR`
 	}
 	if !strings.Contains(events[1], "event2@example.com") {
 		t.Error("Second event should contain event2 UID")
+	}
+}
+
+func TestParseICSFileGroupsSharedUIDAndPreservesTimezone(t *testing.T) {
+	icsContent := `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VTIMEZONE
+TZID:America/Chicago
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:series@example.com
+SUMMARY:Series
+DTSTART;TZID=America/Chicago:20250115T140000
+END:VEVENT
+BEGIN:VEVENT
+UID:series@example.com
+RECURRENCE-ID;TZID=America/Chicago:20250122T140000
+SUMMARY:Override
+DTSTART;TZID=America/Chicago:20250122T150000
+END:VEVENT
+END:VCALENDAR`
+
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("ParseICSFile() should group matching UIDs into one resource, got %d", len(events))
+	}
+	if strings.Count(events[0], "BEGIN:VEVENT") != 2 {
+		t.Fatalf("expected grouped resource to contain 2 VEVENTs, got: %s", events[0])
+	}
+	if !strings.Contains(events[0], "BEGIN:VTIMEZONE") {
+		t.Fatalf("expected grouped resource to preserve VTIMEZONE, got: %s", events[0])
+	}
+}
+
+func TestParseICSFileRejectsMalformedInput(t *testing.T) {
+	tests := []struct {
+		name string
+		ics  string
+	}{
+		{name: "missing calendar wrapper", ics: "BEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{name: "missing end", ics: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{name: "missing event", ics: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, err := ParseICSFile(tt.ics)
+			if err == nil {
+				t.Fatalf("expected error, got events: %#v", events)
+			}
+		})
 	}
 }
 
@@ -666,5 +724,20 @@ END:VCALENDAR`,
 				t.Errorf("ExtractUID() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEnsureUID(t *testing.T) {
+	ical := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	got := EnsureUID(ical, "generated@example.com")
+	if !strings.Contains(got, "UID:generated@example.com") {
+		t.Fatalf("expected UID to be injected, got: %s", got)
+	}
+}
+
+func TestResourceNameForUID(t *testing.T) {
+	got := ResourceNameForUID("series/one@example.com")
+	if got != "series_one_example.com.ics" {
+		t.Fatalf("ResourceNameForUID() = %q", got)
 	}
 }

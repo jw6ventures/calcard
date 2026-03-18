@@ -459,39 +459,46 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events := utils.ParseICSFile(string(icsData))
-	if len(events) == 0 {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "no events found in file"})
+	events, err := utils.ParseICSFile(string(icsData))
+	if err != nil {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": fmt.Sprintf("invalid ICS file: %v", err)})
 		return
 	}
 
 	imported := 0
+	skipped := 0
 	for _, eventICAL := range events {
 		uid := utils.ExtractUID(eventICAL)
 		if uid == "" {
 			uid = utils.GenerateUID()
+			eventICAL = utils.EnsureUID(eventICAL, uid)
 		}
 		etag := utils.GenerateETag(eventICAL)
 
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
 			CalendarID:   calendarID,
 			UID:          uid,
-			ResourceName: uid,
+			ResourceName: utils.ResourceNameForUID(uid),
 			RawICAL:      eventICAL,
 			ETag:         etag,
 		}); err != nil {
+			skipped++
 			continue
 		}
 		imported++
 	}
 
 	if imported == 0 {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to import events"})
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": fmt.Sprintf("failed to import events; skipped %d", skipped)})
 		return
 	}
 
+	statusMsg := fmt.Sprintf("Imported %d event(s)", imported)
+	if skipped > 0 {
+		statusMsg = fmt.Sprintf("%s; skipped %d", statusMsg, skipped)
+	}
 	h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{
-		"status": fmt.Sprintf("imported_%d_events", imported),
+		"status": statusMsg,
 	})
 }
 

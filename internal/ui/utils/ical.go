@@ -443,6 +443,17 @@ func BuildFromComponents(header []string, events [][]string, footer []string) st
 	return sb.String()
 }
 
+func writeICalLine(sb *strings.Builder, line string) {
+	if line == "" {
+		return
+	}
+	if strings.HasSuffix(line, "\r\n") {
+		sb.WriteString(line)
+		return
+	}
+	sb.WriteString(line + "\r\n")
+}
+
 // RecurrenceIDValue extracts the RECURRENCE-ID value from event lines.
 func RecurrenceIDValue(lines []string) string {
 	for _, line := range lines {
@@ -480,73 +491,233 @@ func EscapeICalValue(s string) string {
 	return s
 }
 
-// ParseICSFile parses an ICS file and returns individual VEVENT components wrapped in VCALENDAR.
-func ParseICSFile(icsContent string) []string {
+// ParseICSFile parses an ICS file and returns per-resource VCALENDAR payloads grouped by UID.
+func ParseICSFile(icsContent string) ([]string, error) {
+	if err := validateICSContent(icsContent); err != nil {
+		return nil, err
+	}
+
 	lines := UnfoldLines(icsContent)
-	var events []string
-	var currentEvent []string
-	var header []string
-	var inEvent bool
-	var inCalendar bool
+	var (
+		headerLines          []string
+		topLevelExtras       [][]string
+		currentExtra         []string
+		currentExtraDepth    int
+		currentEvent         []string
+		currentEventDepth    int
+		inCalendar           bool
+		groupedEvents        []string
+		groupedEventUIDOrder []string
+		eventGroups          = make(map[string][][]string)
+	)
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-
-		if trimmed == "BEGIN:VCALENDAR" {
-			inCalendar = true
+		upper := strings.ToUpper(trimmed)
+		if trimmed == "" {
 			continue
 		}
-		if trimmed == "END:VCALENDAR" {
+
+		switch upper {
+		case "BEGIN:VCALENDAR":
+			inCalendar = true
+			continue
+		case "END:VCALENDAR":
 			inCalendar = false
 			continue
 		}
-		if trimmed == "BEGIN:VEVENT" {
-			inEvent = true
-			currentEvent = []string{}
-			continue
-		}
-		if trimmed == "END:VEVENT" {
-			if inEvent && len(currentEvent) > 0 {
-				// Wrap the event in VCALENDAR structure
-				var eventICAL strings.Builder
-				eventICAL.WriteString("BEGIN:VCALENDAR\r\n")
-				// Add header properties
-				for _, h := range header {
-					eventICAL.WriteString(h + "\r\n")
-				}
-				eventICAL.WriteString("BEGIN:VEVENT\r\n")
-				for _, eventLine := range currentEvent {
-					eventICAL.WriteString(eventLine + "\r\n")
-				}
-				eventICAL.WriteString("END:VEVENT\r\n")
-				eventICAL.WriteString("END:VCALENDAR\r\n")
-				events = append(events, eventICAL.String())
-			}
-			inEvent = false
-			currentEvent = nil
+
+		if !inCalendar {
 			continue
 		}
 
-		if inEvent {
-			currentEvent = append(currentEvent, trimmed)
-		} else if inCalendar && !inEvent {
-			// Store calendar header properties (VERSION, PRODID, etc.)
-			if strings.HasPrefix(trimmed, "VERSION:") || strings.HasPrefix(trimmed, "PRODID:") || strings.HasPrefix(trimmed, "CALSCALE:") {
-				header = append(header, trimmed)
+		if currentExtraDepth > 0 {
+			currentExtra = append(currentExtra, trimmed)
+			if strings.HasPrefix(upper, "BEGIN:") {
+				currentExtraDepth++
+			} else if strings.HasPrefix(upper, "END:") {
+				currentExtraDepth--
+				if currentExtraDepth == 0 {
+					topLevelExtras = append(topLevelExtras, currentExtra)
+					currentExtra = nil
+				}
 			}
+			continue
 		}
+
+		if currentEventDepth > 0 {
+			if upper == "END:VEVENT" {
+				currentEventDepth--
+				if currentEventDepth == 0 {
+					uid := extractUIDFromLines(currentEvent)
+					if uid == "" {
+						uid = fmt.Sprintf("__missing_uid_%d", len(groupedEventUIDOrder))
+					}
+					if _, ok := eventGroups[uid]; !ok {
+						groupedEventUIDOrder = append(groupedEventUIDOrder, uid)
+					}
+					eventGroups[uid] = append(eventGroups[uid], append([]string(nil), currentEvent...))
+					currentEvent = nil
+					continue
+				}
+				currentEvent = append(currentEvent, trimmed)
+				continue
+			}
+			if strings.HasPrefix(upper, "BEGIN:") {
+				currentEventDepth++
+			}
+			currentEvent = append(currentEvent, trimmed)
+			continue
+		}
+
+		if strings.HasPrefix(upper, "BEGIN:") {
+			name := strings.TrimSpace(trimmed[len("BEGIN:"):])
+			if strings.EqualFold(name, "VEVENT") {
+				currentEventDepth = 1
+				currentEvent = nil
+			} else {
+				currentExtraDepth = 1
+				currentExtra = []string{trimmed}
+			}
+			continue
+		}
+
+		headerLines = append(headerLines, trimmed)
 	}
 
-	return events
+	if currentEventDepth != 0 || currentExtraDepth != 0 || inCalendar {
+		return nil, fmt.Errorf("malformed ICS content")
+	}
+
+	if len(groupedEventUIDOrder) == 0 {
+		return nil, fmt.Errorf("no VEVENT components found")
+	}
+
+	for _, uid := range groupedEventUIDOrder {
+		events := eventGroups[uid]
+		var eventICAL strings.Builder
+		writeICalLine(&eventICAL, "BEGIN:VCALENDAR")
+		for _, line := range headerLines {
+			writeICalLine(&eventICAL, line)
+		}
+		for _, comp := range topLevelExtras {
+			for _, line := range comp {
+				writeICalLine(&eventICAL, line)
+			}
+		}
+		for _, eventLines := range events {
+			writeICalLine(&eventICAL, "BEGIN:VEVENT")
+			for _, line := range eventLines {
+				writeICalLine(&eventICAL, line)
+			}
+			writeICalLine(&eventICAL, "END:VEVENT")
+		}
+		writeICalLine(&eventICAL, "END:VCALENDAR")
+		groupedEvents = append(groupedEvents, eventICAL.String())
+	}
+
+	return groupedEvents, nil
 }
 
 // ExtractUID extracts the UID from an iCalendar VEVENT.
 func ExtractUID(ical string) string {
 	lines := UnfoldLines(ical)
+	return extractUIDFromLines(lines)
+}
+
+func extractUIDFromLines(lines []string) string {
 	for _, line := range lines {
-		if strings.HasPrefix(line, "UID:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "UID:"))
+		if !strings.HasPrefix(strings.ToUpper(line), "UID:") {
+			continue
 		}
+		return strings.TrimSpace(line[4:])
 	}
 	return ""
+}
+
+// EnsureUID injects a UID into the first VEVENT if missing.
+func EnsureUID(ical, uid string) string {
+	if uid == "" || ExtractUID(ical) != "" {
+		return ical
+	}
+
+	lines := UnfoldLines(ical)
+	var out []string
+	inserted := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		out = append(out, trimmed)
+		if !inserted && strings.EqualFold(trimmed, "BEGIN:VEVENT") {
+			out = append(out, "UID:"+uid)
+			inserted = true
+		}
+	}
+	return strings.Join(out, "\r\n") + "\r\n"
+}
+
+// ResourceNameForUID derives a stable .ics resource name from a UID.
+func ResourceNameForUID(uid string) string {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return "event.ics"
+	}
+	var b strings.Builder
+	for _, r := range uid {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == '.' || r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	name := strings.Trim(b.String(), "._")
+	if name == "" {
+		name = "event"
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".ics") {
+		name += ".ics"
+	}
+	return name
+}
+
+func validateICSContent(icsContent string) error {
+	trimmed := strings.TrimSpace(icsContent)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "BEGIN:VCALENDAR") {
+		return fmt.Errorf("missing BEGIN:VCALENDAR")
+	}
+	if !strings.HasSuffix(upper, "END:VCALENDAR") {
+		return fmt.Errorf("missing END:VCALENDAR")
+	}
+
+	lines := UnfoldLines(trimmed)
+	var stack []string
+	hasEvent := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		upperLine := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upperLine, "BEGIN:"):
+			name := strings.TrimSpace(upperLine[len("BEGIN:"):])
+			stack = append(stack, name)
+			if name == "VEVENT" {
+				hasEvent = true
+			}
+		case strings.HasPrefix(upperLine, "END:"):
+			name := strings.TrimSpace(upperLine[len("END:"):])
+			if len(stack) == 0 || stack[len(stack)-1] != name {
+				return fmt.Errorf("unbalanced calendar tags")
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	if len(stack) != 0 {
+		return fmt.Errorf("unbalanced calendar tags")
+	}
+	if !hasEvent {
+		return fmt.Errorf("no VEVENT components found")
+	}
+	return nil
 }
