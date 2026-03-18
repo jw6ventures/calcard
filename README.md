@@ -165,4 +165,4 @@ The baseline version is stored in the `application` table, created by `db.sql`.
 
 CalCard is licensed under the [Source First License](https://sourcefirst.com/).
 
-Commercial use requires a commercial agreement with JW6 Ventures LLC - [License Request Form](https://jw6ventures.atlassian.net/helpcenter/CSM/contact-us/9a6bbea8-202d-498f-8462-52c2ee8ab09e).
+Commercial use requires a commercial agreement with JW6 Ventures LLC - [License Request Form](https://jw6ventures.atlassian.net/helpcenter/CSM/contact-us/9a6bbea8-202d-498f-8462-52c2ee8ab09e). Many small businesses with less than 50 employees will be licensed at $0.

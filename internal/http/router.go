@@ -108,6 +108,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Use(csrf.Middleware(cfg))
 		r.Get("/", uiHandler.Dashboard)
 		r.Get("/calendars", uiHandler.Calendars)
+		r.Get("/calendars/all", uiHandler.ViewAllCalendars)
+		r.Get("/api/calendars/all/events", uiHandler.GetAllCalendarEventsJSON)
 		r.Get("/calendars/{id}", uiHandler.ViewCalendar)
 		r.Get("/api/calendars/{id}/events", uiHandler.GetCalendarEventsJSON)
 		r.Get("/addressbooks", uiHandler.AddressBooks)
