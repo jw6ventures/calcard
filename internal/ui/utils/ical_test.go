@@ -292,6 +292,51 @@ func TestFormatICalDateTime_TimezoneHandling(t *testing.T) {
 	})
 }
 
+func TestGenerateVTimezone_UsesRequestedYearAndExactTransitions(t *testing.T) {
+	vtz := GenerateVTimezone("America/New_York", 2025)
+
+	required := []string{
+		"TZID:America/New_York",
+		"BEGIN:STANDARD",
+		"BEGIN:DAYLIGHT",
+		"DTSTART:20250309T020000",
+		"TZOFFSETFROM:-0500",
+		"TZOFFSETTO:-0400",
+		"DTSTART:20251102T020000",
+		"TZOFFSETFROM:-0400",
+		"TZOFFSETTO:-0500",
+	}
+	for _, want := range required {
+		if !strings.Contains(vtz, want) {
+			t.Fatalf("GenerateVTimezone() missing %q in:\n%s", want, vtz)
+		}
+	}
+	if strings.Contains(vtz, "2026") {
+		t.Fatalf("GenerateVTimezone() should not emit observances for the wrong year:\n%s", vtz)
+	}
+}
+
+func TestGenerateVTimezone_SouthernHemisphereTransitions(t *testing.T) {
+	vtz := GenerateVTimezone("Australia/Sydney", 2025)
+
+	required := []string{
+		"TZID:Australia/Sydney",
+		"BEGIN:DAYLIGHT",
+		"BEGIN:STANDARD",
+		"DTSTART:20250406T030000",
+		"TZOFFSETFROM:+1100",
+		"TZOFFSETTO:+1000",
+		"DTSTART:20251005T020000",
+		"TZOFFSETFROM:+1000",
+		"TZOFFSETTO:+1100",
+	}
+	for _, want := range required {
+		if !strings.Contains(vtz, want) {
+			t.Fatalf("GenerateVTimezone() missing %q in:\n%s", want, vtz)
+		}
+	}
+}
+
 func TestBuildEvent_WithOptions(t *testing.T) {
 	opts := &EventOptions{
 		Timezone:     "America/New_York",
@@ -327,6 +372,12 @@ func TestBuildEvent_WithOptions(t *testing.T) {
 			t.Errorf("BuildEvent() missing %q in:\n%s", want, ical)
 		}
 	}
+	if !strings.Contains(ical, "DTSTART:20250309T020000") {
+		t.Fatalf("BuildEvent() should embed VTIMEZONE for the event year, got:\n%s", ical)
+	}
+	if strings.Contains(ical, "DTSTART:20260308T020000") {
+		t.Fatalf("BuildEvent() should not embed VTIMEZONE for the current server year, got:\n%s", ical)
+	}
 }
 
 func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
@@ -352,6 +403,28 @@ func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
 	}
 	if !strings.Contains(ical, "ATTENDEE;CN=Bob:mailto:bob@example.com") {
 		t.Errorf("BuildEvent() should keep valid attendees in:\n%s", ical)
+	}
+}
+
+func TestBuildEvent_WithRecurringTimezoneIncludesUntilYear(t *testing.T) {
+	recurrence := &RecurrenceOptions{
+		Frequency: "WEEKLY",
+		Until:     "2026-12-31",
+	}
+	opts := &EventOptions{Timezone: "America/New_York"}
+
+	ical := BuildEvent("uid-3@calcard", "Series", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", recurrence, opts)
+
+	required := []string{
+		"DTSTART:20250309T020000",
+		"DTSTART:20251102T020000",
+		"DTSTART:20260308T020000",
+		"DTSTART:20261101T020000",
+	}
+	for _, want := range required {
+		if !strings.Contains(ical, want) {
+			t.Fatalf("BuildEvent() missing %q in:\n%s", want, ical)
+		}
 	}
 }
 

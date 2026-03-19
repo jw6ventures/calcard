@@ -252,6 +252,160 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 	return lines
 }
 
+// GenerateVTimezone produces a VTIMEZONE component for the given IANA timezone ID.
+// When years are provided, observances are generated for that inclusive range.
+// Returns empty string for UTC or invalid timezone IDs.
+func GenerateVTimezone(tzid string, years ...int) string {
+	tzid = strings.TrimSpace(tzid)
+	if tzid == "" || strings.EqualFold(tzid, "UTC") {
+		return ""
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		return ""
+	}
+
+	type zoneInfo struct {
+		name   string
+		offset int // seconds east of UTC
+		start  time.Time
+		prev   int
+	}
+
+	startYear := time.Now().Year()
+	endYear := startYear
+	if len(years) > 0 {
+		startYear = years[0]
+		endYear = years[0]
+		for _, year := range years[1:] {
+			if year < startYear {
+				startYear = year
+			}
+			if year > endYear {
+				endYear = year
+			}
+		}
+	}
+
+	zoneType := func(offset, standardOffset int) string {
+		if offset > standardOffset {
+			return "DAYLIGHT"
+		}
+		return "STANDARD"
+	}
+
+	formatOffset := func(seconds int) string {
+		sign := "+"
+		if seconds < 0 {
+			sign = "-"
+			seconds = -seconds
+		}
+		h := seconds / 3600
+		m := (seconds % 3600) / 60
+		return fmt.Sprintf("%s%02d%02d", sign, h, m)
+	}
+
+	formatTransition := func(utc time.Time, prevOffset int) string {
+		return utc.Add(time.Duration(prevOffset) * time.Second).UTC().Format("20060102T150405")
+	}
+
+	findTransitionUTC := func(lo, hi time.Time, prevName string, prevOffset int) time.Time {
+		for hi.Sub(lo) > time.Second {
+			mid := lo.Add(hi.Sub(lo) / 2)
+			name, offset := mid.In(loc).Zone()
+			if name == prevName && offset == prevOffset {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		return hi.Truncate(time.Second)
+	}
+
+	var zones []zoneInfo
+	for year := startYear; year <= endYear; year++ {
+		yearStart := time.Date(year, 1, 1, 0, 0, 0, 0, loc)
+		yearEnd := time.Date(year+1, 1, 1, 0, 0, 0, 0, loc)
+		initialName, initialOffset := yearStart.Zone()
+		zones = append(zones, zoneInfo{
+			name:   initialName,
+			offset: initialOffset,
+			start:  yearStart,
+			prev:   initialOffset,
+		})
+
+		scanStartUTC := yearStart.Add(-2 * time.Hour).UTC()
+		scanEndUTC := yearEnd.Add(2 * time.Hour).UTC()
+		prevUTC := scanStartUTC
+		prevName, prevOffset := prevUTC.In(loc).Zone()
+
+		for t := prevUTC.Add(time.Hour); !t.After(scanEndUTC); t = t.Add(time.Hour) {
+			name, offset := t.In(loc).Zone()
+			if name == prevName && offset == prevOffset {
+				prevUTC = t
+				continue
+			}
+
+			transitionUTC := findTransitionUTC(prevUTC, t, prevName, prevOffset)
+			transitionLocal := transitionUTC.In(loc)
+			if transitionLocal.Year() == year {
+				zones = append(zones, zoneInfo{
+					name:   name,
+					offset: offset,
+					start:  transitionUTC,
+					prev:   prevOffset,
+				})
+			}
+
+			prevUTC = t
+			prevName = name
+			prevOffset = offset
+		}
+	}
+
+	if len(zones) == 0 {
+		return ""
+	}
+
+	standardOffset := zones[0].offset
+	for _, z := range zones[1:] {
+		if z.offset < standardOffset {
+			standardOffset = z.offset
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("BEGIN:VTIMEZONE\r\n")
+	sb.WriteString(fmt.Sprintf("TZID:%s\r\n", tzid))
+
+	if len(zones) == 1 {
+		z := zones[0]
+		sb.WriteString("BEGIN:STANDARD\r\n")
+		sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", z.start.Format("20060102T150405")))
+		sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.offset)))
+		sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
+		sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
+		sb.WriteString("END:STANDARD\r\n")
+	} else {
+		for _, z := range zones {
+			compType := zoneType(z.offset, standardOffset)
+			sb.WriteString(fmt.Sprintf("BEGIN:%s\r\n", compType))
+			start := z.start.Format("20060102T150405")
+			if z.prev != z.offset {
+				start = formatTransition(z.start, z.prev)
+			}
+			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", start))
+			sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.prev)))
+			sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
+			sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
+			sb.WriteString(fmt.Sprintf("END:%s\r\n", compType))
+		}
+	}
+
+	sb.WriteString("END:VTIMEZONE\r\n")
+	return sb.String()
+}
+
 // BuildEvent constructs a valid iCalendar event.
 func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, opts *EventOptions) string {
 	eventLines := BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
@@ -260,6 +414,13 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
 	sb.WriteString("PRODID:-//CalCard//EN\r\n")
+
+	if opts != nil {
+		if vtz := GenerateVTimezone(opts.Timezone, vTimezoneYears(dtstart, allDay, opts.Timezone, recurrence)...); vtz != "" {
+			sb.WriteString(vtz)
+		}
+	}
+
 	sb.WriteString("BEGIN:VEVENT\r\n")
 	for _, line := range eventLines {
 		sb.WriteString(line + "\r\n")
@@ -268,6 +429,50 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	sb.WriteString("END:VCALENDAR\r\n")
 
 	return sb.String()
+}
+
+func vTimezoneYears(dtstart string, allDay bool, tzid string, recurrence *RecurrenceOptions) []int {
+	startYear, ok := parseEventYear(dtstart, allDay, tzid)
+	if !ok {
+		return nil
+	}
+
+	endYear := startYear
+	if recurrence != nil && recurrence.Until != "" {
+		if until, err := time.Parse("2006-01-02", recurrence.Until); err == nil {
+			endYear = until.Year()
+		}
+	}
+
+	years := make([]int, 0, endYear-startYear+1)
+	for year := startYear; year <= endYear; year++ {
+		years = append(years, year)
+	}
+	return years
+}
+
+func parseEventYear(value string, allDay bool, tzid string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if allDay {
+		t, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			return 0, false
+		}
+		return t.Year(), true
+	}
+	if tzid != "" {
+		if loc, err := time.LoadLocation(tzid); err == nil {
+			if t, err := parseDateTimeLocal(value, loc); err == nil {
+				return t.Year(), true
+			}
+		}
+	}
+	if t, err := parseDateTimeLocal(value, time.Local); err == nil {
+		return t.Year(), true
+	}
+	return 0, false
 }
 
 func buildMailtoLine(prop, value string) string {
