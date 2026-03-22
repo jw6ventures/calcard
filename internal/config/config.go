@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
@@ -89,6 +90,9 @@ func Load() (*Config, error) {
 	if len(cfg.Session.Secret) < 32 {
 		return nil, fmt.Errorf("APP_SESSION_SECRET must be at least 32 characters long (got %d)", len(cfg.Session.Secret))
 	}
+	if err := validateTrustedProxies(cfg.TrustedProxies); err != nil {
+		return nil, err
+	}
 
 	if len(cfg.TrustedProxies) == 0 {
 		fmt.Println("WARNING: No APP_TRUSTED_PROXIES configured. CalCard will trust all proxies - Not recommended for public environments.")
@@ -125,6 +129,18 @@ func getenvList(key string) []string {
 			}
 		}
 		return result
+	}
+	return nil
+}
+
+func validateTrustedProxies(values []string) error {
+	for _, value := range values {
+		if _, _, err := net.ParseCIDR(value); err == nil {
+			continue
+		}
+		if net.ParseIP(value) == nil {
+			return fmt.Errorf("APP_TRUSTED_PROXIES contains invalid IP or CIDR %q", value)
+		}
 	}
 	return nil
 }

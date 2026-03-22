@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/config"
@@ -19,9 +21,10 @@ const (
 )
 
 type SessionManager struct {
-	cfg    *config.Config
-	store  *store.Store
-	secure bool
+	cfg            *config.Config
+	store          *store.Store
+	secure         bool
+	trustedProxies []*net.IPNet
 }
 
 func NewSessionManager(cfg *config.Config, st *store.Store) *SessionManager {
@@ -31,9 +34,10 @@ func NewSessionManager(cfg *config.Config, st *store.Store) *SessionManager {
 	}
 
 	return &SessionManager{
-		cfg:    cfg,
-		store:  st,
-		secure: secure,
+		cfg:            cfg,
+		store:          st,
+		secure:         secure,
+		trustedProxies: parseTrustedProxies(cfg.TrustedProxies),
 	}
 }
 
@@ -47,7 +51,7 @@ func (m *SessionManager) Issue(ctx context.Context, w http.ResponseWriter, r *ht
 	if ua := r.UserAgent(); ua != "" {
 		userAgent = util.StrPtr(ua)
 	}
-	if ip := getClientIP(r); ip != "" {
+	if ip := m.getClientIP(r); ip != "" {
 		ipAddress = util.StrPtr(ip)
 	}
 
@@ -132,21 +136,121 @@ func generateSessionID() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func getClientIP(r *http.Request) string {
+func (m *SessionManager) getClientIP(r *http.Request) string {
+	remoteIP, remoteHost := parseRemoteAddr(r.RemoteAddr)
+
+	if len(m.trustedProxies) > 0 && !isTrustedProxy(remoteIP, m.trustedProxies) {
+		if remoteIP != nil {
+			return remoteIP.String()
+		}
+		return remoteHost
+	}
+
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if idx := len(xff); idx > 0 {
-			for i := 0; i < len(xff); i++ {
-				if xff[i] == ',' {
-					return xff[:i]
-				}
-			}
-			return xff
+		if clientIP := forwardedClientIP(xff, m.trustedProxies); clientIP != nil {
+			return clientIP.String()
 		}
 	}
 
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+		if parsed := net.ParseIP(strings.TrimSpace(xri)); parsed != nil {
+			return parsed.String()
+		}
 	}
 
-	return r.RemoteAddr
+	if remoteIP != nil {
+		return remoteIP.String()
+	}
+	return remoteHost
+}
+
+func forwardedClientIP(xff string, trusted []*net.IPNet) net.IP {
+	parts := strings.Split(xff, ",")
+
+	if len(trusted) == 0 {
+		for _, part := range parts {
+			if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
+				return parsed
+			}
+		}
+		return nil
+	}
+
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := strings.TrimSpace(parts[i])
+		if candidate == "" {
+			continue
+		}
+		parsed := net.ParseIP(candidate)
+		if parsed == nil {
+			continue
+		}
+		if !isTrustedProxy(parsed, trusted) {
+			return parsed
+		}
+	}
+
+	for _, part := range parts {
+		if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
+			return parsed
+		}
+	}
+
+	return nil
+}
+
+func parseTrustedProxies(values []string) []*net.IPNet {
+	var trusted []*net.IPNet
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		_, ipnet, err := net.ParseCIDR(value)
+		if err == nil {
+			trusted = append(trusted, ipnet)
+			continue
+		}
+		ip := net.ParseIP(value)
+		if ip == nil {
+			continue
+		}
+		suffix := "/128"
+		if ip.To4() != nil {
+			suffix = "/32"
+		}
+		_, ipnet, err = net.ParseCIDR(value + suffix)
+		if err == nil {
+			trusted = append(trusted, ipnet)
+		}
+	}
+	return trusted
+}
+
+func isTrustedProxy(ip net.IP, trusted []*net.IPNet) bool {
+	if ip == nil {
+		return false
+	}
+	for _, ipnet := range trusted {
+		if ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseRemoteAddr(remoteAddr string) (net.IP, string) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		if parsed := net.ParseIP(host); parsed != nil {
+			return parsed, parsed.String()
+		}
+		return nil, host
+	}
+
+	trimmed := strings.TrimSpace(remoteAddr)
+	if parsed := net.ParseIP(trimmed); parsed != nil {
+		return parsed, parsed.String()
+	}
+	return nil, trimmed
 }
