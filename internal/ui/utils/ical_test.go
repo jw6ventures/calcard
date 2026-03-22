@@ -292,6 +292,51 @@ func TestFormatICalDateTime_TimezoneHandling(t *testing.T) {
 	})
 }
 
+func TestGenerateVTimezone_UsesRequestedYearAndExactTransitions(t *testing.T) {
+	vtz := GenerateVTimezone("America/New_York", 2025)
+
+	required := []string{
+		"TZID:America/New_York",
+		"BEGIN:STANDARD",
+		"BEGIN:DAYLIGHT",
+		"DTSTART:20250309T020000",
+		"TZOFFSETFROM:-0500",
+		"TZOFFSETTO:-0400",
+		"DTSTART:20251102T020000",
+		"TZOFFSETFROM:-0400",
+		"TZOFFSETTO:-0500",
+	}
+	for _, want := range required {
+		if !strings.Contains(vtz, want) {
+			t.Fatalf("GenerateVTimezone() missing %q in:\n%s", want, vtz)
+		}
+	}
+	if strings.Contains(vtz, "2026") {
+		t.Fatalf("GenerateVTimezone() should not emit observances for the wrong year:\n%s", vtz)
+	}
+}
+
+func TestGenerateVTimezone_SouthernHemisphereTransitions(t *testing.T) {
+	vtz := GenerateVTimezone("Australia/Sydney", 2025)
+
+	required := []string{
+		"TZID:Australia/Sydney",
+		"BEGIN:DAYLIGHT",
+		"BEGIN:STANDARD",
+		"DTSTART:20250406T030000",
+		"TZOFFSETFROM:+1100",
+		"TZOFFSETTO:+1000",
+		"DTSTART:20251005T020000",
+		"TZOFFSETFROM:+1000",
+		"TZOFFSETTO:+1100",
+	}
+	for _, want := range required {
+		if !strings.Contains(vtz, want) {
+			t.Fatalf("GenerateVTimezone() missing %q in:\n%s", want, vtz)
+		}
+	}
+}
+
 func TestBuildEvent_WithOptions(t *testing.T) {
 	opts := &EventOptions{
 		Timezone:     "America/New_York",
@@ -327,6 +372,12 @@ func TestBuildEvent_WithOptions(t *testing.T) {
 			t.Errorf("BuildEvent() missing %q in:\n%s", want, ical)
 		}
 	}
+	if !strings.Contains(ical, "DTSTART:20250309T020000") {
+		t.Fatalf("BuildEvent() should embed VTIMEZONE for the event year, got:\n%s", ical)
+	}
+	if strings.Contains(ical, "DTSTART:20260308T020000") {
+		t.Fatalf("BuildEvent() should not embed VTIMEZONE for the current server year, got:\n%s", ical)
+	}
 }
 
 func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
@@ -352,6 +403,28 @@ func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
 	}
 	if !strings.Contains(ical, "ATTENDEE;CN=Bob:mailto:bob@example.com") {
 		t.Errorf("BuildEvent() should keep valid attendees in:\n%s", ical)
+	}
+}
+
+func TestBuildEvent_WithRecurringTimezoneIncludesUntilYear(t *testing.T) {
+	recurrence := &RecurrenceOptions{
+		Frequency: "WEEKLY",
+		Until:     "2026-12-31",
+	}
+	opts := &EventOptions{Timezone: "America/New_York"}
+
+	ical := BuildEvent("uid-3@calcard", "Series", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", recurrence, opts)
+
+	required := []string{
+		"DTSTART:20250309T020000",
+		"DTSTART:20251102T020000",
+		"DTSTART:20260308T020000",
+		"DTSTART:20261101T020000",
+	}
+	for _, want := range required {
+		if !strings.Contains(ical, want) {
+			t.Fatalf("BuildEvent() missing %q in:\n%s", want, ical)
+		}
 	}
 }
 
@@ -595,7 +668,10 @@ DTEND:20250116T150000Z
 END:VEVENT
 END:VCALENDAR`
 
-	events := ParseICSFile(icsContent)
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
 
 	if len(events) != 2 {
 		t.Errorf("ParseICSFile() should return 2 events, got %d", len(events))
@@ -618,6 +694,61 @@ END:VCALENDAR`
 	}
 	if !strings.Contains(events[1], "event2@example.com") {
 		t.Error("Second event should contain event2 UID")
+	}
+}
+
+func TestParseICSFileGroupsSharedUIDAndPreservesTimezone(t *testing.T) {
+	icsContent := `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VTIMEZONE
+TZID:America/Chicago
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:series@example.com
+SUMMARY:Series
+DTSTART;TZID=America/Chicago:20250115T140000
+END:VEVENT
+BEGIN:VEVENT
+UID:series@example.com
+RECURRENCE-ID;TZID=America/Chicago:20250122T140000
+SUMMARY:Override
+DTSTART;TZID=America/Chicago:20250122T150000
+END:VEVENT
+END:VCALENDAR`
+
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("ParseICSFile() should group matching UIDs into one resource, got %d", len(events))
+	}
+	if strings.Count(events[0], "BEGIN:VEVENT") != 2 {
+		t.Fatalf("expected grouped resource to contain 2 VEVENTs, got: %s", events[0])
+	}
+	if !strings.Contains(events[0], "BEGIN:VTIMEZONE") {
+		t.Fatalf("expected grouped resource to preserve VTIMEZONE, got: %s", events[0])
+	}
+}
+
+func TestParseICSFileRejectsMalformedInput(t *testing.T) {
+	tests := []struct {
+		name string
+		ics  string
+	}{
+		{name: "missing calendar wrapper", ics: "BEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{name: "missing end", ics: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\n"},
+		{name: "missing event", ics: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, err := ParseICSFile(tt.ics)
+			if err == nil {
+				t.Fatalf("expected error, got events: %#v", events)
+			}
+		})
 	}
 }
 
@@ -666,5 +797,20 @@ END:VCALENDAR`,
 				t.Errorf("ExtractUID() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEnsureUID(t *testing.T) {
+	ical := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	got := EnsureUID(ical, "generated@example.com")
+	if !strings.Contains(got, "UID:generated@example.com") {
+		t.Fatalf("expected UID to be injected, got: %s", got)
+	}
+}
+
+func TestResourceNameForUID(t *testing.T) {
+	got := ResourceNameForUID("series/one@example.com")
+	if got != "series_one_example.com.ics" {
+		t.Fatalf("ResourceNameForUID() = %q", got)
 	}
 }

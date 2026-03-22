@@ -252,6 +252,160 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 	return lines
 }
 
+// GenerateVTimezone produces a VTIMEZONE component for the given IANA timezone ID.
+// When years are provided, observances are generated for that inclusive range.
+// Returns empty string for UTC or invalid timezone IDs.
+func GenerateVTimezone(tzid string, years ...int) string {
+	tzid = strings.TrimSpace(tzid)
+	if tzid == "" || strings.EqualFold(tzid, "UTC") {
+		return ""
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		return ""
+	}
+
+	type zoneInfo struct {
+		name   string
+		offset int // seconds east of UTC
+		start  time.Time
+		prev   int
+	}
+
+	startYear := time.Now().Year()
+	endYear := startYear
+	if len(years) > 0 {
+		startYear = years[0]
+		endYear = years[0]
+		for _, year := range years[1:] {
+			if year < startYear {
+				startYear = year
+			}
+			if year > endYear {
+				endYear = year
+			}
+		}
+	}
+
+	zoneType := func(offset, standardOffset int) string {
+		if offset > standardOffset {
+			return "DAYLIGHT"
+		}
+		return "STANDARD"
+	}
+
+	formatOffset := func(seconds int) string {
+		sign := "+"
+		if seconds < 0 {
+			sign = "-"
+			seconds = -seconds
+		}
+		h := seconds / 3600
+		m := (seconds % 3600) / 60
+		return fmt.Sprintf("%s%02d%02d", sign, h, m)
+	}
+
+	formatTransition := func(utc time.Time, prevOffset int) string {
+		return utc.Add(time.Duration(prevOffset) * time.Second).UTC().Format("20060102T150405")
+	}
+
+	findTransitionUTC := func(lo, hi time.Time, prevName string, prevOffset int) time.Time {
+		for hi.Sub(lo) > time.Second {
+			mid := lo.Add(hi.Sub(lo) / 2)
+			name, offset := mid.In(loc).Zone()
+			if name == prevName && offset == prevOffset {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		return hi.Truncate(time.Second)
+	}
+
+	var zones []zoneInfo
+	for year := startYear; year <= endYear; year++ {
+		yearStart := time.Date(year, 1, 1, 0, 0, 0, 0, loc)
+		yearEnd := time.Date(year+1, 1, 1, 0, 0, 0, 0, loc)
+		initialName, initialOffset := yearStart.Zone()
+		zones = append(zones, zoneInfo{
+			name:   initialName,
+			offset: initialOffset,
+			start:  yearStart,
+			prev:   initialOffset,
+		})
+
+		scanStartUTC := yearStart.Add(-2 * time.Hour).UTC()
+		scanEndUTC := yearEnd.Add(2 * time.Hour).UTC()
+		prevUTC := scanStartUTC
+		prevName, prevOffset := prevUTC.In(loc).Zone()
+
+		for t := prevUTC.Add(time.Hour); !t.After(scanEndUTC); t = t.Add(time.Hour) {
+			name, offset := t.In(loc).Zone()
+			if name == prevName && offset == prevOffset {
+				prevUTC = t
+				continue
+			}
+
+			transitionUTC := findTransitionUTC(prevUTC, t, prevName, prevOffset)
+			transitionLocal := transitionUTC.In(loc)
+			if transitionLocal.Year() == year {
+				zones = append(zones, zoneInfo{
+					name:   name,
+					offset: offset,
+					start:  transitionUTC,
+					prev:   prevOffset,
+				})
+			}
+
+			prevUTC = t
+			prevName = name
+			prevOffset = offset
+		}
+	}
+
+	if len(zones) == 0 {
+		return ""
+	}
+
+	standardOffset := zones[0].offset
+	for _, z := range zones[1:] {
+		if z.offset < standardOffset {
+			standardOffset = z.offset
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("BEGIN:VTIMEZONE\r\n")
+	sb.WriteString(fmt.Sprintf("TZID:%s\r\n", tzid))
+
+	if len(zones) == 1 {
+		z := zones[0]
+		sb.WriteString("BEGIN:STANDARD\r\n")
+		sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", z.start.Format("20060102T150405")))
+		sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.offset)))
+		sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
+		sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
+		sb.WriteString("END:STANDARD\r\n")
+	} else {
+		for _, z := range zones {
+			compType := zoneType(z.offset, standardOffset)
+			sb.WriteString(fmt.Sprintf("BEGIN:%s\r\n", compType))
+			start := z.start.Format("20060102T150405")
+			if z.prev != z.offset {
+				start = formatTransition(z.start, z.prev)
+			}
+			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", start))
+			sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.prev)))
+			sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
+			sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
+			sb.WriteString(fmt.Sprintf("END:%s\r\n", compType))
+		}
+	}
+
+	sb.WriteString("END:VTIMEZONE\r\n")
+	return sb.String()
+}
+
 // BuildEvent constructs a valid iCalendar event.
 func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, opts *EventOptions) string {
 	eventLines := BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
@@ -260,6 +414,13 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
 	sb.WriteString("PRODID:-//CalCard//EN\r\n")
+
+	if opts != nil {
+		if vtz := GenerateVTimezone(opts.Timezone, vTimezoneYears(dtstart, allDay, opts.Timezone, recurrence)...); vtz != "" {
+			sb.WriteString(vtz)
+		}
+	}
+
 	sb.WriteString("BEGIN:VEVENT\r\n")
 	for _, line := range eventLines {
 		sb.WriteString(line + "\r\n")
@@ -268,6 +429,50 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	sb.WriteString("END:VCALENDAR\r\n")
 
 	return sb.String()
+}
+
+func vTimezoneYears(dtstart string, allDay bool, tzid string, recurrence *RecurrenceOptions) []int {
+	startYear, ok := parseEventYear(dtstart, allDay, tzid)
+	if !ok {
+		return nil
+	}
+
+	endYear := startYear
+	if recurrence != nil && recurrence.Until != "" {
+		if until, err := time.Parse("2006-01-02", recurrence.Until); err == nil {
+			endYear = until.Year()
+		}
+	}
+
+	years := make([]int, 0, endYear-startYear+1)
+	for year := startYear; year <= endYear; year++ {
+		years = append(years, year)
+	}
+	return years
+}
+
+func parseEventYear(value string, allDay bool, tzid string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if allDay {
+		t, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			return 0, false
+		}
+		return t.Year(), true
+	}
+	if tzid != "" {
+		if loc, err := time.LoadLocation(tzid); err == nil {
+			if t, err := parseDateTimeLocal(value, loc); err == nil {
+				return t.Year(), true
+			}
+		}
+	}
+	if t, err := parseDateTimeLocal(value, time.Local); err == nil {
+		return t.Year(), true
+	}
+	return 0, false
 }
 
 func buildMailtoLine(prop, value string) string {
@@ -443,6 +648,17 @@ func BuildFromComponents(header []string, events [][]string, footer []string) st
 	return sb.String()
 }
 
+func writeICalLine(sb *strings.Builder, line string) {
+	if line == "" {
+		return
+	}
+	if strings.HasSuffix(line, "\r\n") {
+		sb.WriteString(line)
+		return
+	}
+	sb.WriteString(line + "\r\n")
+}
+
 // RecurrenceIDValue extracts the RECURRENCE-ID value from event lines.
 func RecurrenceIDValue(lines []string) string {
 	for _, line := range lines {
@@ -480,73 +696,233 @@ func EscapeICalValue(s string) string {
 	return s
 }
 
-// ParseICSFile parses an ICS file and returns individual VEVENT components wrapped in VCALENDAR.
-func ParseICSFile(icsContent string) []string {
+// ParseICSFile parses an ICS file and returns per-resource VCALENDAR payloads grouped by UID.
+func ParseICSFile(icsContent string) ([]string, error) {
+	if err := validateICSContent(icsContent); err != nil {
+		return nil, err
+	}
+
 	lines := UnfoldLines(icsContent)
-	var events []string
-	var currentEvent []string
-	var header []string
-	var inEvent bool
-	var inCalendar bool
+	var (
+		headerLines          []string
+		topLevelExtras       [][]string
+		currentExtra         []string
+		currentExtraDepth    int
+		currentEvent         []string
+		currentEventDepth    int
+		inCalendar           bool
+		groupedEvents        []string
+		groupedEventUIDOrder []string
+		eventGroups          = make(map[string][][]string)
+	)
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-
-		if trimmed == "BEGIN:VCALENDAR" {
-			inCalendar = true
+		upper := strings.ToUpper(trimmed)
+		if trimmed == "" {
 			continue
 		}
-		if trimmed == "END:VCALENDAR" {
+
+		switch upper {
+		case "BEGIN:VCALENDAR":
+			inCalendar = true
+			continue
+		case "END:VCALENDAR":
 			inCalendar = false
 			continue
 		}
-		if trimmed == "BEGIN:VEVENT" {
-			inEvent = true
-			currentEvent = []string{}
-			continue
-		}
-		if trimmed == "END:VEVENT" {
-			if inEvent && len(currentEvent) > 0 {
-				// Wrap the event in VCALENDAR structure
-				var eventICAL strings.Builder
-				eventICAL.WriteString("BEGIN:VCALENDAR\r\n")
-				// Add header properties
-				for _, h := range header {
-					eventICAL.WriteString(h + "\r\n")
-				}
-				eventICAL.WriteString("BEGIN:VEVENT\r\n")
-				for _, eventLine := range currentEvent {
-					eventICAL.WriteString(eventLine + "\r\n")
-				}
-				eventICAL.WriteString("END:VEVENT\r\n")
-				eventICAL.WriteString("END:VCALENDAR\r\n")
-				events = append(events, eventICAL.String())
-			}
-			inEvent = false
-			currentEvent = nil
+
+		if !inCalendar {
 			continue
 		}
 
-		if inEvent {
-			currentEvent = append(currentEvent, trimmed)
-		} else if inCalendar && !inEvent {
-			// Store calendar header properties (VERSION, PRODID, etc.)
-			if strings.HasPrefix(trimmed, "VERSION:") || strings.HasPrefix(trimmed, "PRODID:") || strings.HasPrefix(trimmed, "CALSCALE:") {
-				header = append(header, trimmed)
+		if currentExtraDepth > 0 {
+			currentExtra = append(currentExtra, trimmed)
+			if strings.HasPrefix(upper, "BEGIN:") {
+				currentExtraDepth++
+			} else if strings.HasPrefix(upper, "END:") {
+				currentExtraDepth--
+				if currentExtraDepth == 0 {
+					topLevelExtras = append(topLevelExtras, currentExtra)
+					currentExtra = nil
+				}
 			}
+			continue
 		}
+
+		if currentEventDepth > 0 {
+			if upper == "END:VEVENT" {
+				currentEventDepth--
+				if currentEventDepth == 0 {
+					uid := extractUIDFromLines(currentEvent)
+					if uid == "" {
+						uid = fmt.Sprintf("__missing_uid_%d", len(groupedEventUIDOrder))
+					}
+					if _, ok := eventGroups[uid]; !ok {
+						groupedEventUIDOrder = append(groupedEventUIDOrder, uid)
+					}
+					eventGroups[uid] = append(eventGroups[uid], append([]string(nil), currentEvent...))
+					currentEvent = nil
+					continue
+				}
+				currentEvent = append(currentEvent, trimmed)
+				continue
+			}
+			if strings.HasPrefix(upper, "BEGIN:") {
+				currentEventDepth++
+			}
+			currentEvent = append(currentEvent, trimmed)
+			continue
+		}
+
+		if strings.HasPrefix(upper, "BEGIN:") {
+			name := strings.TrimSpace(trimmed[len("BEGIN:"):])
+			if strings.EqualFold(name, "VEVENT") {
+				currentEventDepth = 1
+				currentEvent = nil
+			} else {
+				currentExtraDepth = 1
+				currentExtra = []string{trimmed}
+			}
+			continue
+		}
+
+		headerLines = append(headerLines, trimmed)
 	}
 
-	return events
+	if currentEventDepth != 0 || currentExtraDepth != 0 || inCalendar {
+		return nil, fmt.Errorf("malformed ICS content")
+	}
+
+	if len(groupedEventUIDOrder) == 0 {
+		return nil, fmt.Errorf("no VEVENT components found")
+	}
+
+	for _, uid := range groupedEventUIDOrder {
+		events := eventGroups[uid]
+		var eventICAL strings.Builder
+		writeICalLine(&eventICAL, "BEGIN:VCALENDAR")
+		for _, line := range headerLines {
+			writeICalLine(&eventICAL, line)
+		}
+		for _, comp := range topLevelExtras {
+			for _, line := range comp {
+				writeICalLine(&eventICAL, line)
+			}
+		}
+		for _, eventLines := range events {
+			writeICalLine(&eventICAL, "BEGIN:VEVENT")
+			for _, line := range eventLines {
+				writeICalLine(&eventICAL, line)
+			}
+			writeICalLine(&eventICAL, "END:VEVENT")
+		}
+		writeICalLine(&eventICAL, "END:VCALENDAR")
+		groupedEvents = append(groupedEvents, eventICAL.String())
+	}
+
+	return groupedEvents, nil
 }
 
 // ExtractUID extracts the UID from an iCalendar VEVENT.
 func ExtractUID(ical string) string {
 	lines := UnfoldLines(ical)
+	return extractUIDFromLines(lines)
+}
+
+func extractUIDFromLines(lines []string) string {
 	for _, line := range lines {
-		if strings.HasPrefix(line, "UID:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "UID:"))
+		if !strings.HasPrefix(strings.ToUpper(line), "UID:") {
+			continue
 		}
+		return strings.TrimSpace(line[4:])
 	}
 	return ""
+}
+
+// EnsureUID injects a UID into the first VEVENT if missing.
+func EnsureUID(ical, uid string) string {
+	if uid == "" || ExtractUID(ical) != "" {
+		return ical
+	}
+
+	lines := UnfoldLines(ical)
+	var out []string
+	inserted := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		out = append(out, trimmed)
+		if !inserted && strings.EqualFold(trimmed, "BEGIN:VEVENT") {
+			out = append(out, "UID:"+uid)
+			inserted = true
+		}
+	}
+	return strings.Join(out, "\r\n") + "\r\n"
+}
+
+// ResourceNameForUID derives a stable .ics resource name from a UID.
+func ResourceNameForUID(uid string) string {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return "event.ics"
+	}
+	var b strings.Builder
+	for _, r := range uid {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == '.' || r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	name := strings.Trim(b.String(), "._")
+	if name == "" {
+		name = "event"
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".ics") {
+		name += ".ics"
+	}
+	return name
+}
+
+func validateICSContent(icsContent string) error {
+	trimmed := strings.TrimSpace(icsContent)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "BEGIN:VCALENDAR") {
+		return fmt.Errorf("missing BEGIN:VCALENDAR")
+	}
+	if !strings.HasSuffix(upper, "END:VCALENDAR") {
+		return fmt.Errorf("missing END:VCALENDAR")
+	}
+
+	lines := UnfoldLines(trimmed)
+	var stack []string
+	hasEvent := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		upperLine := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upperLine, "BEGIN:"):
+			name := strings.TrimSpace(upperLine[len("BEGIN:"):])
+			stack = append(stack, name)
+			if name == "VEVENT" {
+				hasEvent = true
+			}
+		case strings.HasPrefix(upperLine, "END:"):
+			name := strings.TrimSpace(upperLine[len("END:"):])
+			if len(stack) == 0 || stack[len(stack)-1] != name {
+				return fmt.Errorf("unbalanced calendar tags")
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	if len(stack) != 0 {
+		return fmt.Errorf("unbalanced calendar tags")
+	}
+	if !hasEvent {
+		return fmt.Errorf("no VEVENT components found")
+	}
+	return nil
 }

@@ -200,9 +200,12 @@
     }
 </style>
 
-<div class="page-header">
-    <h1>📅 Calendars</h1>
-    <p>Manage CalDAV collections and sharing</p>
+<div class="page-header" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
+    <div>
+        <h1>📅 Calendars</h1>
+        <p>Manage CalDAV collections and sharing</p>
+    </div>
+    <a href="/calendars/all" class="btn btn-primary">View All Calendars</a>
 </div>
 
 {{if .CalendarViews}}
