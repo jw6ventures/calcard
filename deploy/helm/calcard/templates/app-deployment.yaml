@@ -1,7 +1,7 @@
 {{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 {{- $dbSecret := default (printf "%s-db-secret" $fullname) .Values.app.db.existingSecret.name -}}
-{{- $imageTag := default .Chart.AppVersion .Values.image.tag -}}
+{{- $imageTag := default (printf "v%s" .Chart.AppVersion) .Values.image.tag -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
