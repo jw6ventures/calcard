@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,6 +21,17 @@ import (
 const version = "v1.0.8"
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		if err := healthCheck(ctx, os.Getenv("APP_LISTEN_ADDR")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	logLevelString := os.Getenv("LOG_LEVEL")
 	if logLevelString == "" {
 		logLevelString = "Info"
@@ -34,9 +46,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	dbManager := database.NewManager(database.Config{
 		Driver:           "postgres",
