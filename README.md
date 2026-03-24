@@ -52,45 +52,6 @@ volumes:
 The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
 
 1. Create a values file with your configuration (see deploy/helm/calcard/values.yaml for full file):
-
-```
-image:
-  repository: ghcr.io/jw6ventures/calcard
-  # Uses the chart appVersion by default; set this only to pin a different image tag.
-  tag: ""
-
-replicaCount: 2
-
-app:
-  baseUrl: "https://calcard.example.com" # Required.
-  oauth:
-    clientId: "YOUR_CLIENT_ID"
-    clientSecret: "YOUR_CLIENT_SECRET"
-    issuerUrl: "https://issuer.example.com/"
-    discoveryUrl: "https://issuer.example.com/.well-known/openid-configuration"
-  sessionSecret: "YOUR_SESSION_SECRET"
-  db:
-    host: "" # Required when postgres.enabled is false and app.db.existingSecret.name is empty.
-    user: "postgres"
-    password: "YOUR_DB_PASSWORD"
-    existingSecret:
-      name: ""
-      dsnKey: "APP_DB_DSN"
-      userKey: "APP_DB_USER"
-      passwordKey: "APP_DB_PASSWORD"
-
-ingress:
-  enabled: true
-  className: ""
-  host: ""
-  tls:
-    enabled: true
-    secretName: ""
-
-postgres:
-  enabled: false
-```
-
 2. Install or upgrade:
 
 ```
