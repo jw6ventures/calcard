@@ -1,5 +1,7 @@
 {{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+{{- $dbSecret := default (printf "%s-db-secret" $fullname) .Values.app.db.existingSecret.name -}}
+{{- $imageTag := default .Chart.AppVersion .Values.image.tag -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,31 +26,33 @@ spec:
     spec:
       containers:
         - name: calcard
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ $imageTag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
               containerPort: 8080
-          {{- if or .Values.app.db.existingSecret.name .Values.app.db.credentialsExistingSecret.name .Values.app.sessionSecretExistingSecret.name }}
           env:
-            {{- if .Values.app.db.existingSecret.name }}
             - name: APP_DB_DSN
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.app.db.existingSecret.name | quote }}
-                  key: {{ .Values.app.db.existingSecret.key | quote }}
-            {{- end }}
-            {{- if .Values.app.db.credentialsExistingSecret.name }}
+                  name: {{ $dbSecret | quote }}
+                  key: {{ .Values.app.db.existingSecret.dsnKey | quote }}
             - name: APP_DB_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
-                  key: {{ .Values.app.db.credentialsExistingSecret.userKey | quote }}
+                  name: {{ $dbSecret | quote }}
+                  key: {{ .Values.app.db.existingSecret.userKey | quote }}
             - name: APP_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.app.db.credentialsExistingSecret.name | quote }}
-                  key: {{ .Values.app.db.credentialsExistingSecret.passwordKey | quote }}
+                  name: {{ $dbSecret | quote }}
+                  key: {{ .Values.app.db.existingSecret.passwordKey | quote }}
+            {{- if .Values.app.oauth.clientSecretExistingSecret.name }}
+            - name: APP_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.app.oauth.clientSecretExistingSecret.name | quote }}
+                  key: {{ .Values.app.oauth.clientSecretExistingSecret.key | quote }}
             {{- end }}
             {{- if .Values.app.sessionSecretExistingSecret.name }}
             - name: APP_SESSION_SECRET
@@ -57,7 +61,6 @@ spec:
                   name: {{ .Values.app.sessionSecretExistingSecret.name | quote }}
                   key: {{ .Values.app.sessionSecretExistingSecret.key | quote }}
             {{- end }}
-          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ $fullname }}-config

@@ -56,7 +56,8 @@ The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/c
 ```
 image:
   repository: ghcr.io/jw6ventures/calcard
-  tag: latest
+  # Uses the chart appVersion by default; set this only to pin a different image tag.
+  tag: ""
 
 replicaCount: 2
 
@@ -69,14 +70,12 @@ app:
     discoveryUrl: "https://issuer.example.com/.well-known/openid-configuration"
   sessionSecret: "YOUR_SESSION_SECRET"
   db:
-    host: "" # Required when postgres.enabled is false and app.db.existingSecret.name and app.db.credentialsExistingSecret.name are empty.
+    host: "" # Required when postgres.enabled is false and app.db.existingSecret.name is empty.
     user: "postgres"
     password: "YOUR_DB_PASSWORD"
     existingSecret:
       name: ""
-      key: "APP_DB_DSN"
-    credentialsExistingSecret:
-      name: ""
+      dsnKey: "APP_DB_DSN"
       userKey: "APP_DB_USER"
       passwordKey: "APP_DB_PASSWORD"
 
@@ -90,9 +89,6 @@ ingress:
 
 postgres:
   enabled: false
-  existingSecret:
-    name: ""
-    passwordKey: "POSTGRES_PASSWORD"
 ```
 
 2. Install or upgrade:
@@ -105,9 +101,9 @@ Notes:
 - The ingress host is derived from `app.baseUrl` (APP_BASE_URL) when `ingress.host` is empty.
 - `app.baseUrl` is required for the chart to render.
 - Postgres is disabled by default. Set `postgres.enabled=true` to deploy Postgres with a 500Mi PVC (see `postgres.persistence.size`).
-- When deploying Postgres, you can set `postgres.existingSecret.name` and optionally `postgres.existingSecret.passwordKey` to pull the password from an existing secret instead of the chart creating one.
-- When using an external database, set `app.db.host`, provide `app.db.existingSecret.name` with an `APP_DB_DSN` key, or provide `app.db.credentialsExistingSecret.name` with `APP_DB_USER` and `APP_DB_PASSWORD` keys (plus `app.db.host`, `app.db.name`, `app.db.port`, `app.db.sslmode` values).
-- Secrets are stored in a Kubernetes Secret (`APP_OAUTH_CLIENT_SECRET`, `APP_SESSION_SECRET`, `APP_DB_DSN`) unless `app.db.existingSecret.name` is set.
+- When using an existing database secret, set `app.db.existingSecret.name`. The secret must contain `APP_DB_DSN`, `APP_DB_USER`, and `APP_DB_PASSWORD` by default, or the keys configured under `app.db.existingSecret`.
+- When using an external database without `app.db.existingSecret.name`, set `app.db.host`.
+- Secrets are stored in Kubernetes Secrets (`APP_OAUTH_CLIENT_SECRET`, `APP_SESSION_SECRET`, `APP_DB_DSN`, `APP_DB_USER`, `APP_DB_PASSWORD`) unless the corresponding existing-secret settings are used.
 
 ### Linux Installs
 A linux binary is published as a github release for each version. You'll need a postgres 16 server.

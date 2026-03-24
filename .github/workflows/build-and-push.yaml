@@ -161,6 +161,7 @@ jobs:
               fi
               kubectl get configmap calcard-config -o yaml || true
               kubectl get secret calcard-secret -o yaml || true
+              kubectl get secret calcard-db-secret -o yaml || true
               kubectl logs statefulset/calcard-postgres --tail=200 || true
               kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
               exit 1
@@ -181,6 +182,7 @@ jobs:
             fi
             kubectl get configmap calcard-config -o yaml || true
             kubectl get secret calcard-secret -o yaml || true
+            kubectl get secret calcard-db-secret -o yaml || true
             kubectl logs statefulset/calcard-postgres --tail=200 || true
             kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
             exit 1
