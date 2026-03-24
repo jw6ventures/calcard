@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/jw6ventures/calcard
-  tag: latest
+  tag: "" # Defaults to the chart appVersion when unset.
   pullPolicy: IfNotPresent
 
 nameOverride: "" # Overrides the chart name used for resource names/labels.
@@ -12,10 +12,13 @@ app:
   baseUrl: "http://localhost:8080"
   trustedProxies: ""
   oauth:
-    clientId: ""
-    clientSecret: ""
-    issuerUrl: ""
-    discoveryUrl: ""
+    clientId: "" # OAuth Client ID
+    clientSecret: "" # OAuth Client Secret - Plain Text
+    clientSecretExistingSecret: # Secret for storing the OAuth Client Secret
+      name: ""
+      key: "APP_OAUTH_CLIENT_SECRET" # OAuth Client Secret
+    issuerUrl: "" # OAuth Issuer URL
+    discoveryUrl: "" # OAuth Client Discovery URL
   sessionSecret: ""
   sessionSecretExistingSecret:
     name: ""
@@ -29,9 +32,7 @@ app:
     sslmode: "disable"
     existingSecret:
       name: ""
-      key: "APP_DB_DSN"
-    credentialsExistingSecret:
-      name: ""
+      dsnKey: "APP_DB_DSN"
       userKey: "APP_DB_USER"
       passwordKey: "APP_DB_PASSWORD"
 
@@ -51,9 +52,6 @@ ingress:
 postgres:
   enabled: false
   image: postgres:16
-  existingSecret:
-    name: ""
-    passwordKey: "POSTGRES_PASSWORD"
   persistence:
     enabled: true
     size: 500Mi
