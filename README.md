@@ -51,7 +51,7 @@ volumes:
 
 The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
 
-1. Create a values file with your configuration (see deploy/helm/calcard/values.yaml for full file):
+1. Create a values file with your configuration. See the [default values](./deploy/helm/calcard/values.yaml).
 2. Install or upgrade:
 
 ```
