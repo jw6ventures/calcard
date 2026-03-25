@@ -1,23 +1,21 @@
 # Build stage
-FROM golang:1.24 AS builder
+FROM golang:1.24-alpine AS builder
+RUN apk add --no-cache ca-certificates
+RUN update-ca-certificates
 WORKDIR /app
-COPY go.mod .
+COPY go.mod go.sum .
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o calcard ./cmd/server
+RUN CGO_ENABLED=0 go build -o calcard ./cmd/server
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    useradd -r -u 1000 -m -s /bin/false calcard
+FROM scratch
+USER 1000:1000
 ENV APP_LISTEN_ADDR=":8080"
-EXPOSE 8080
 WORKDIR /app
-COPY --from=builder /app/calcard /app/calcard
-COPY --from=builder /app/db.sql /app/db.sql
-COPY --from=builder /app/migrations /app/migrations
-RUN chmod +x /app/calcard
-USER calcard
+COPY --from=builder --chown=1000:1000 /app/calcard /app/calcard
+COPY --from=builder --chown=1000:1000 /app/db.sql /app/db.sql
+COPY --from=builder --chown=1000:1000 /app/migrations /app/migrations
+COPY --from=builder --chown=1000:1000 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 ENTRYPOINT ["/app/calcard"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8080/healthz || exit 1
+  CMD ["/app/calcard", "healthcheck"]
