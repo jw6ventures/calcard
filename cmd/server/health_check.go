@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-func healthCheck(ctx context.Context, listenAddr string) error {
+func healthCheck(ctx context.Context, listenAddr string) (returnedErr error) {
 	reqURL := url.URL{
 		Scheme: "http",
 		Host:   net.JoinHostPort("localhost", strings.TrimPrefix(listenAddr, ":")),
@@ -24,6 +24,11 @@ func healthCheck(ctx context.Context, listenAddr string) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := resp.Body.Close(); returnedErr == nil && err != nil {
+			returnedErr = err
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
 		body, err := io.ReadAll(resp.Body)
 		return fmt.Errorf("health check failed (%d): %s %v", resp.StatusCode, string(body), err)
