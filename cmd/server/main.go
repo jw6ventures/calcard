@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -17,8 +18,6 @@ import (
 	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 	"github.com/jw6ventures/jw6-go-utils/database"
 )
-
-const version = "v1.0.10"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -39,6 +38,10 @@ func main() {
 	logLevel := jw6_utils.LogLevelFromString(logLevelString)
 
 	jw6utils := jw6_utils.Utils{LogLevel: logLevel}
+	version := "devel"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		version = info.Main.Version
+	}
 	jw6utils.PrintBanner("CalCard", version, "2026", 3, "JW6 Ventures LLC")
 
 	log.Println("Starting CalCard server...")
