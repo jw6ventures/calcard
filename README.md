@@ -4,11 +4,11 @@ CalCard makes it easy to self-host and share calendars, reminders, and contacts.
 
 ## Features
 
-* Full CalDAV/CardDAV RFC compliance - Works seamlessly with your devices. Supports iOS, Android, macOS, Windows, and Linux.
-* Self-hosted - You own your data.
-* Single sign-on (SSO) - Sign into your existing identity service to access the website and manage your CalCard account.
-* App passwords - Generate passwords to connect devices to your account.
-* Shared calendars - Share calendars with other users.
+* **Full CalDAV/CardDAV RFC compliance** - Works seamlessly with your devices. Supports iOS, Android, macOS, Windows, and Linux.
+* **Self-hosted** - You own your data.
+* **Single sign-on (SSO)** - Sign into your existing identity service to access the website and manage your CalCard account.
+* **App passwords** - Generate passwords to connect devices to your account.
+* **Shared calendars** - Share calendars with other users.
 
 ## Prerequisites
 
