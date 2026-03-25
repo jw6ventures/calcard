@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -17,9 +19,18 @@ import (
 	"github.com/jw6ventures/jw6-go-utils/database"
 )
 
-const version = "v1.0.8"
-
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		if err := healthCheck(ctx, os.Getenv("APP_LISTEN_ADDR")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	logLevelString := os.Getenv("LOG_LEVEL")
 	if logLevelString == "" {
 		logLevelString = "Info"
@@ -27,6 +38,10 @@ func main() {
 	logLevel := jw6_utils.LogLevelFromString(logLevelString)
 
 	jw6utils := jw6_utils.Utils{LogLevel: logLevel}
+	version := "devel"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		version = info.Main.Version
+	}
 	jw6utils.PrintBanner("CalCard", version, "2026", 3, "JW6 Ventures LLC")
 
 	log.Println("Starting CalCard server...")
@@ -34,9 +49,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	dbManager := database.NewManager(database.Config{
 		Driver:           "postgres",
