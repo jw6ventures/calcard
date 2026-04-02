@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
-	"github.com/go-chi/chi/v5"
 )
 
 // AddressBooks displays the user's address books.
@@ -396,7 +396,26 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Move the contact
-	if err := h.store.Contacts.MoveToAddressBook(r.Context(), bookID, targetBookID, uid); err != nil {
+	destResourceName := contact.ResourceName
+	if destResourceName == "" {
+		destResourceName = contact.UID
+	}
+	if existingByUID, err := h.store.Contacts.GetByUID(r.Context(), targetBookID, uid); err != nil {
+		http.Error(w, "failed to check target address book", http.StatusInternalServerError)
+		return
+	} else if existingByUID != nil && targetBookID != bookID {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "contact already exists in target address book"})
+		return
+	}
+	if existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), targetBookID, destResourceName); err != nil {
+		http.Error(w, "failed to check target address book", http.StatusInternalServerError)
+		return
+	} else if existingByName != nil && (targetBookID != bookID || existingByName.UID != contact.UID) {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "contact already exists in target address book"})
+		return
+	}
+
+	if err := h.store.Contacts.MoveToAddressBook(r.Context(), bookID, targetBookID, uid, destResourceName); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to move contact"})
 		return
 	}

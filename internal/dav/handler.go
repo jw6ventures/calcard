@@ -30,6 +30,8 @@ type Handler struct {
 var errInvalidSyncToken = errors.New("invalid sync token")
 var errInvalidPath = errors.New("invalid path")
 var errAmbiguousCalendar = errors.New("ambiguous calendar path")
+var errAmbiguousAddressBook = errors.New("ambiguous address book path")
+var errForbidden = errors.New("forbidden")
 
 const maxDAVBodyBytes int64 = 10 * 1024 * 1024
 
@@ -48,6 +50,9 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if !h.requireLock(w, r, cleanPath, "resource is locked") {
+		return
+	}
 
 	// Parse PROPPATCH request body
 	body, err := readDAVBody(w, r, maxDAVBodyBytes)
@@ -201,34 +206,80 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 		return nil, fmt.Errorf("%w: invalid address book path", errInvalidPath)
 	}
 
-	bookID, err := strconv.ParseInt(parts[1], 10, 64)
+	bookID, ok, err := h.resolveAddressBookID(ctx, user, strings.TrimSpace(parts[1]))
 	if err != nil {
+		if errors.Is(err, errAmbiguousAddressBook) {
+			return nil, errAmbiguousAddressBook
+		}
+		return nil, fmt.Errorf("%w: invalid address book id", errInvalidPath)
+	}
+	if !ok {
 		return nil, fmt.Errorf("%w: invalid address book id", errInvalidPath)
 	}
 
-	book, err := h.loadAddressBook(ctx, user, bookID)
+	book, err := h.getAddressBook(ctx, bookID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Only the owner can modify properties
-	if book.UserID != user.ID {
-		return []response{{
-			Href: cleanPath,
-			Propstat: []propstat{{
-				Prop:   prop{},
-				Status: httpStatusForbidden,
-			}},
-		}}, nil
+	if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, "write-properties"); err != nil {
+		if errors.Is(err, errForbidden) || err == store.ErrNotFound {
+			return []response{{
+				Href: cleanPath,
+				Propstat: []propstat{{
+					Prop:   prop{},
+					Status: httpStatusForbidden,
+				}},
+			}}, nil
+		}
+		return nil, err
 	}
 
 	// Extract properties to update
 	var name *string
 	var description *string
+	var protectedProp prop
+	var hasProtected bool
 
 	if req.Set != nil {
 		name = req.Set.Prop.DisplayName
 		description = req.Set.Prop.AddressBookDesc
+		if req.Set.Prop.SupportedAddressData != nil {
+			protectedProp.SupportedAddressData = supportedAddressDataProp()
+			hasProtected = true
+		}
+		if req.Set.Prop.AddressBookMaxResourceSize != nil {
+			protectedProp.AddressBookMaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+			hasProtected = true
+		}
+		if req.Set.Prop.SupportedCollationSet != nil {
+			protectedProp.SupportedCollationSet = supportedCollationSetProp()
+			hasProtected = true
+		}
+	}
+
+	successProp := prop{}
+	if name != nil {
+		successProp.DisplayName = *name
+	}
+	if description != nil {
+		successProp.AddressBookDesc = *description
+	}
+
+	if hasProtected {
+		failedProp := protectedProp
+		if name != nil {
+			failedProp.DisplayName = *name
+		}
+		if description != nil {
+			failedProp.AddressBookDesc = *description
+		}
+		return []response{{
+			Href: cleanPath,
+			Propstat: []propstat{{
+				Prop:   failedProp,
+				Status: httpStatusForbidden,
+			}},
+		}}, nil
 	}
 
 	// Update the address book
@@ -238,26 +289,21 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 			updateName = *name
 		}
 
-		err := h.store.AddressBooks.Update(ctx, user.ID, bookID, updateName, description)
+		err := h.store.AddressBooks.UpdateProperties(ctx, bookID, updateName, description)
 		if err != nil {
+			status := httpStatusInternalServerError
+			if errors.Is(err, store.ErrConflict) {
+				status = httpStatusConflict
+			}
 			log.Printf("failed to update address book properties for book %d: %v", bookID, err)
 			return []response{{
 				Href: cleanPath,
 				Propstat: []propstat{{
-					Prop:   prop{},
-					Status: httpStatusInternalServerError,
+					Prop:   successProp,
+					Status: status,
 				}},
 			}}, nil
 		}
-	}
-
-	// Return success response
-	successProp := prop{}
-	if name != nil {
-		successProp.DisplayName = *name
-	}
-	if description != nil {
-		successProp.AddressBookDesc = *description
 	}
 
 	return []response{{
@@ -277,19 +323,80 @@ func (h *Handler) Mkcol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
+		return
+	}
+	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
+		return
+	}
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		http.Error(w, "unsupported path", http.StatusBadRequest)
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
+	if len(parts) > 2 || (len(parts) == 2 && parts[0] != "" && parts[1] != "") {
+		http.Error(w, "nested address book collections not allowed", http.StatusForbidden)
+		return
+	}
 	name := strings.TrimSpace(parts[len(parts)-1])
 	if name == "" {
 		http.Error(w, "collection name required", http.StatusBadRequest)
 		return
 	}
-	if _, err := h.store.AddressBooks.Create(r.Context(), store.AddressBook{UserID: user.ID, Name: name}); err != nil {
+	if _, err := strconv.ParseInt(name, 10, 64); err == nil {
+		http.Error(w, "collection name must be non-numeric", http.StatusBadRequest)
+		return
+	}
+	description := (*string)(nil)
+	if r.Body != nil && r.Body != http.NoBody {
+		body, err := readDAVBody(w, r, maxDAVBodyBytes)
+		if err != nil {
+			if errors.Is(err, errRequestTooLarge) {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+			}
+			return
+		}
+		var mkReq mkcalendarRequest
+		if len(body) > 0 {
+			if err := safeUnmarshalXML(body, &mkReq); err != nil {
+				http.Error(w, "invalid MKCOL body", http.StatusBadRequest)
+				return
+			}
+			if mkReq.Set != nil {
+				if mkReq.Set.Prop.DisplayName != nil && strings.TrimSpace(*mkReq.Set.Prop.DisplayName) != "" {
+					name = strings.TrimSpace(*mkReq.Set.Prop.DisplayName)
+				}
+				description = mkReq.Set.Prop.AddressBookDesc
+			}
+		}
+	}
+	if _, err := strconv.ParseInt(name, 10, 64); err == nil {
+		http.Error(w, "collection name must be non-numeric", http.StatusBadRequest)
+		return
+	}
+	created, err := h.store.AddressBooks.Create(r.Context(), store.AddressBook{UserID: user.ID, Name: name, Description: description})
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			http.Error(w, "address book already exists", http.StatusConflict)
+			return
+		}
 		http.Error(w, "failed to create", http.StatusInternalServerError)
 		return
+	}
+	if created != nil {
+		location := path.Join("/dav/addressbooks", fmt.Sprint(created.ID)) + "/"
+		if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
+			if deleteErr := h.store.AddressBooks.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
+				log.Printf("failed to roll back address book %d after lock rebind failure: %v", created.ID, deleteErr)
+			}
+			http.Error(w, "failed to rebind collection locks", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Location", location)
 	}
 	w.WriteHeader(http.StatusCreated)
 }
@@ -302,6 +409,14 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
+		return
+	}
+	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
+		return
+	}
 	if !strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		http.Error(w, "unsupported path", http.StatusBadRequest)
 		return
@@ -395,8 +510,109 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	location := path.Join("/dav/calendars", fmt.Sprint(created.ID)) + "/"
+	if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
+		if deleteErr := h.store.Calendars.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
+			log.Printf("failed to roll back calendar %d after lock rebind failure: %v", created.ID, deleteErr)
+		}
+		http.Error(w, "failed to rebind collection locks", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Location", location)
 	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *Handler) rebindCollectionLocks(ctx context.Context, fromPath, toPath string) error {
+	if fromPath == "" || toPath == "" || fromPath == toPath {
+		return nil
+	}
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return nil
+	}
+	return h.store.Locks.MoveResourcePath(ctx, fromPath, toPath)
+}
+
+func (h *Handler) moveDAVResourceState(ctx context.Context, user *store.User, fromPath, toPath string) error {
+	fromCanonical, err := h.canonicalDAVPath(ctx, user, fromPath)
+	if err != nil {
+		return err
+	}
+	toCanonical, err := h.canonicalDAVPath(ctx, user, toPath)
+	if err != nil {
+		return err
+	}
+	if fromCanonical == "" || toCanonical == "" || fromCanonical == toCanonical {
+		return nil
+	}
+	if h == nil || h.store == nil {
+		return nil
+	}
+	movedACL := false
+	if h.store.ACLEntries != nil {
+		if err := h.store.ACLEntries.MoveResourcePath(ctx, fromCanonical, toCanonical); err != nil {
+			return err
+		}
+		movedACL = true
+	}
+	if h.store.Locks != nil {
+		if err := h.store.Locks.MoveResourcePath(ctx, fromCanonical, toCanonical); err != nil {
+			if movedACL && h.store.ACLEntries != nil {
+				if rollbackErr := h.store.ACLEntries.MoveResourcePath(ctx, toCanonical, fromCanonical); rollbackErr != nil {
+					return fmt.Errorf("move locks: %w (acl rollback failed: %v)", err, rollbackErr)
+				}
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) rebindMovedDAVResourceState(ctx context.Context, user *store.User, fromPath, toPath string, overwrite bool) error {
+	if overwrite {
+		return h.deleteDAVResourceState(ctx, user, fromPath)
+	}
+	return h.moveDAVResourceState(ctx, user, fromPath, toPath)
+}
+
+func (h *Handler) deleteDAVACLState(ctx context.Context, user *store.User, resourcePath string) error {
+	canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
+	if err != nil {
+		return err
+	}
+	if canonicalPath == "" || h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return nil
+	}
+	for _, statePath := range davStatePaths(canonicalPath) {
+		if err := h.store.ACLEntries.Delete(ctx, statePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) deleteDAVResourceState(ctx context.Context, user *store.User, resourcePath string) error {
+	canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
+	if err != nil {
+		return err
+	}
+	if canonicalPath == "" {
+		return nil
+	}
+	if h == nil || h.store == nil {
+		return nil
+	}
+	for _, statePath := range davStatePaths(canonicalPath) {
+		if h.store.Locks != nil {
+			if err := h.store.Locks.DeleteByResourcePath(ctx, statePath); err != nil {
+				return err
+			}
+		}
+		if h.store.ACLEntries != nil {
+			if err := h.store.ACLEntries.Delete(ctx, statePath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // validateICalendar performs basic validation of iCalendar data (RFC 5545)
@@ -792,6 +1008,55 @@ func (h *Handler) validateVCard(data string) error {
 	if beginCount != endCount {
 		return fmt.Errorf("unbalanced VCARD tags")
 	}
+	if beginCount != 1 {
+		return fmt.Errorf("address object resources must contain exactly one VCARD")
+	}
+
+	lines := unfoldICalLines(trimmed)
+	versionCount := 0
+	hasFN := false
+	uidCount := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		colonIdx := strings.IndexByte(line, ':')
+		if colonIdx == -1 {
+			continue
+		}
+		head := strings.ToUpper(strings.TrimSpace(line[:colonIdx]))
+		if semiIdx := strings.IndexByte(head, ';'); semiIdx >= 0 {
+			head = head[:semiIdx]
+		}
+		name := vcardPropertyBaseName(head)
+		value := strings.TrimSpace(line[colonIdx+1:])
+		switch name {
+		case "VERSION":
+			versionCount++
+			if value != "3.0" && value != "4.0" {
+				return fmt.Errorf("unsupported VCARD version")
+			}
+		case "FN":
+			if value != "" {
+				hasFN = true
+			}
+		case "UID":
+			uidCount++
+			if value == "" {
+				return fmt.Errorf("VCARD UID must not be empty")
+			}
+		}
+	}
+	if versionCount != 1 {
+		return fmt.Errorf("VCARD must contain exactly one VERSION")
+	}
+	if uidCount != 1 {
+		return fmt.Errorf("VCARD must contain exactly one UID")
+	}
+	if !hasFN {
+		return fmt.Errorf("VCARD must contain FN")
+	}
 
 	return nil
 }
@@ -864,6 +1129,9 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if !h.requireLock(w, r, cleanPath, "resource is locked") {
+		return
+	}
 	if cleanPath == "/dav/calendars" || cleanPath == "/dav/calendars/" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -875,9 +1143,12 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_, _, isCalendar := parseCalendarResourceSegments(cleanPath)
+	_, _, isAddressBook := parseAddressBookResourceSegments(cleanPath)
 	if r.ContentLength > maxDAVBodyBytes {
 		if isCalendar {
 			writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+		} else if isAddressBook {
+			writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
 		} else {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		}
@@ -890,6 +1161,8 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &maxErr) {
 			if isCalendar {
 				writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+			} else if isAddressBook {
+				writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
 			} else {
 				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			}
@@ -1028,6 +1301,9 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
 			return
 		}
+		if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
 		if existingByResource != nil && existingByResource.UID != uid {
 			// Reject: client trying to change UID of existing resource
 			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
@@ -1063,8 +1339,20 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if addressBookID, _, matched := parseResourcePath(cleanPath, "/dav/addressbooks"); matched {
-		if _, err := h.loadAddressBook(r.Context(), user, addressBookID); err != nil {
+	if addressBookID, _, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
+		if err == store.ErrNotFound {
+			http.Error(w, "address book not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAmbiguousAddressBook) {
+			http.Error(w, "ambiguous address book path", http.StatusConflict)
+			return
+		}
+		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		return
+	} else if matched {
+		book, err := h.getAddressBook(r.Context(), addressBookID)
+		if err != nil {
 			status := http.StatusInternalServerError
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
@@ -1073,29 +1361,84 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		if contentType != "" && !strings.HasPrefix(contentType, "text/vcard") {
+			writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
+			return
+		}
+
 		if err := h.validateVCard(string(body)); err != nil {
-			http.Error(w, fmt.Sprintf("invalid vCard data: %v", err), http.StatusBadRequest)
+			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
 			return
 		}
 
 		uid, err := extractUIDFromVCard(string(body))
 		if err != nil {
-			_, resourceUID, matched := parseResourcePath(cleanPath, "/dav/addressbooks")
-			if !matched || resourceUID == "" {
-				http.Error(w, fmt.Sprintf("invalid vCard data: %v", err), http.StatusBadRequest)
-				return
-			}
-			uid = resourceUID
+			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+			return
 		}
 
-		existing, _ := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
+		// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
+		_, resourceName, _ := parseAddressBookResourceSegments(cleanPath)
+
+		// Check if an existing resource at this path has a different UID
+		existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
+		if err != nil {
+			http.Error(w, "failed to load contact", http.StatusInternalServerError)
+			return
+		}
+		if existingByName == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
+		requiredPrivilege := "bind"
+		if existingByName != nil {
+			requiredPrivilege = "write-content"
+		}
+		if err := h.requireAddressBookPrivilege(r.Context(), user, book, cleanPath, requiredPrivilege); err != nil {
+			status := http.StatusForbidden
+			if err == store.ErrNotFound {
+				status = http.StatusNotFound
+			}
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+		if existingByName != nil && existingByName.UID != uid {
+			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByName))
+			writeCardDAVUIDConflict(w, conflictHref)
+			return
+		}
+
+		// Check if another resource already uses this UID
+		existingByUID, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
+		if err != nil {
+			http.Error(w, "failed to load contact", http.StatusInternalServerError)
+			return
+		}
+		if existingByUID != nil && contactResourceName(*existingByUID) != resourceName {
+			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByUID))
+			writeCardDAVUIDConflict(w, conflictHref)
+			return
+		}
+
+		existing := existingByUID
 
 		if !h.checkConditionalHeadersContact(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
 		}
 
-		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, RawVCard: string(body), ETag: etag}); err != nil {
+		if existingByName == nil {
+			if err := h.deleteDAVACLState(r.Context(), user, cleanPath); err != nil {
+				http.Error(w, "failed to reset resource ACL state", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: string(body), ETag: etag}); err != nil {
+			if errors.Is(err, store.ErrConflict) {
+				writeCardDAVUIDConflict(w, cleanPath)
+				return
+			}
 			http.Error(w, "failed to save contact", http.StatusInternalServerError)
 			return
 		}
@@ -1119,6 +1462,9 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if !h.requireLock(w, r, cleanPath, "resource is locked") {
+		return
+	}
 	if calendarID, uid, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
 		if err == store.ErrNotFound {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -1149,6 +1495,9 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		if !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
 		existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -1162,15 +1511,32 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		if err := h.store.Events.DeleteByUID(r.Context(), calendarID, existing.UID); err != nil {
+		canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+		if err != nil {
+			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+			return
+		}
+		if err := h.store.DeleteEventAndState(r.Context(), calendarID, existing.UID, canonicalPath); err != nil {
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if addressBookID, uid, matched := parseResourcePath(cleanPath, "/dav/addressbooks"); matched {
-		if _, err := h.loadAddressBook(r.Context(), user, addressBookID); err != nil {
+	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
+		if err == store.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAmbiguousAddressBook) {
+			http.Error(w, "ambiguous address book path", http.StatusConflict)
+			return
+		}
+		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		return
+	} else if matched {
+		book, err := h.getAddressBook(r.Context(), addressBookID)
+		if err != nil {
 			status := http.StatusInternalServerError
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
@@ -1178,12 +1544,36 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", status)
 			return
 		}
-		existing, _ := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
+		existing, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
+		if err != nil {
+			http.Error(w, "failed to load contact", http.StatusInternalServerError)
+			return
+		}
+		if err := h.requireAddressBookPrivilege(r.Context(), user, book, cleanPath, "unbind"); err != nil {
+			status := http.StatusForbidden
+			if err == store.ErrNotFound {
+				status = http.StatusNotFound
+			}
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+		if !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
 		if !h.checkConditionalHeadersContact(r, existing) {
 			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
 		}
-		if err := h.store.Contacts.DeleteByUID(r.Context(), addressBookID, uid); err != nil {
+		if existing == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+		if err != nil {
+			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+			return
+		}
+		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, existing.UID, canonicalPath); err != nil {
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
 			return
 		}
@@ -1219,18 +1609,29 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 				principalResponse(ensureCollectionHref(principalHref), user),
 			)
 		}
+		if err := h.decoratePropfindResponses(ctx, user, res); err != nil {
+			return nil, err
+		}
+		if propfindReq != nil && propfindReq.Prop != nil {
+			for i := range res {
+				res[i] = filterNonPrincipalPropfindResponse(res[i], propfindReq)
+			}
+		}
 		return res, nil
 	case strings.HasPrefix(cleanPath, "/dav/principals"):
 		responses, err := h.principalResponses(cleanPath, depth, user, ensureCollectionHref)
 		if err != nil {
 			return nil, err
 		}
+		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+			return nil, err
+		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
+			stripPrincipalAllprop(responses)
+		}
+		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				for j := range responses[i].Propstat {
-					responses[i].Propstat[j].Prop.CalendarHomeSet = nil
-					responses[i].Propstat[j].Prop.AddressbookHomeSet = nil
-				}
+				responses[i] = filterPrincipalPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
@@ -1239,12 +1640,35 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		if err != nil {
 			return nil, err
 		}
+		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+			return nil, err
+		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
 			stripCalendarAllprop(responses)
 		}
+		if propfindReq != nil && propfindReq.Prop != nil {
+			for i := range responses {
+				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+			}
+		}
 		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
-		return h.addressBookResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
+		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user, ensureCollectionHref, propfindReq)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+			return nil, err
+		}
+		if propfindReq != nil && propfindReq.AllProp != nil {
+			stripAddressBookAllprop(responses)
+		}
+		if propfindReq != nil && propfindReq.Prop != nil {
+			for i := range responses {
+				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+			}
+		}
+		return responses, nil
 	default:
 		return nil, http.ErrNotSupported
 	}
@@ -1368,13 +1792,13 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	return res, nil
 }
 
-func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string) ([]response, error) {
+func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string, propfindReq *propfindRequest) ([]response, error) {
 	relPath := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/addressbooks")
 		res := []response{collectionResponse(base, "Address Books")}
 		if depth == "1" {
-			books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
+			books, err := h.accessibleAddressBooks(ctx, user)
 			if err != nil {
 				return nil, err
 			}
@@ -1390,15 +1814,43 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 	}
 
 	segments := strings.Split(relPath, "/")
-	bookID, err := strconv.ParseInt(segments[0], 10, 64)
-	if err != nil {
+	if len(segments) > 2 {
 		return nil, http.ErrNotSupported
 	}
-	book, err := h.loadAddressBook(ctx, user, bookID)
+	bookID, ok, err := h.resolveAddressBookID(ctx, user, strings.TrimSpace(segments[0]))
+	if err != nil {
+		if errors.Is(err, errAmbiguousAddressBook) {
+			return nil, errAmbiguousAddressBook
+		}
+		return nil, http.ErrNotSupported
+	}
+	if !ok {
+		return nil, http.ErrNotSupported
+	}
+	book, err := h.loadAddressBookWithPrivilege(ctx, user, bookID, cleanPath, "read")
 	if err != nil {
 		return nil, err
 	}
-	href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(book.ID)))
+	collectionHref := ensureCollectionHref(cleanPath)
+	if len(segments) == 2 {
+		collectionHref = ensureCollectionHref(strings.TrimSuffix(cleanPath, "/"+segments[1]))
+	}
+	if len(segments) == 2 {
+		resourceName := strings.TrimSuffix(segments[1], path.Ext(segments[1]))
+		if resourceName == "" {
+			return nil, http.ErrNotSupported
+		}
+		contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, resourceName)
+		if err != nil {
+			return nil, err
+		}
+		href := strings.TrimSuffix(collectionHref, "/") + "/" + resourceName + ".vcf"
+		if contact == nil {
+			return []response{{Href: href, Status: httpStatusNotFound}}, nil
+		}
+		return []response{resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard, true))}, nil
+	}
+	href := collectionHref
 	ctag := fmt.Sprintf("%d", book.CTag)
 	syncToken := buildSyncToken("card", book.ID, book.UpdatedAt)
 	principalHref := h.principalURL(user)
@@ -1408,8 +1860,13 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 		if err != nil {
 			return nil, err
 		}
+		contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
+		if err != nil {
+			return nil, err
+		}
 		base := ensureCollectionHref(href)
-		res = append(res, addressBookResourceResponses(base, contacts)...)
+		resourceResponses := addressBookResourceResponses(base, contacts)
+		res = append(res, resourceResponses...)
 	}
 	return res, nil
 }
@@ -1467,14 +1924,142 @@ func (h *Handler) loadCalendarByName(ctx context.Context, user *store.User, name
 }
 
 func (h *Handler) loadAddressBook(ctx context.Context, user *store.User, id int64) (*store.AddressBook, error) {
+	book, err := h.getAddressBook(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if book.UserID != user.ID {
+		return nil, store.ErrNotFound
+	}
+	return book, nil
+}
+
+func (h *Handler) getAddressBook(ctx context.Context, id int64) (*store.AddressBook, error) {
+	if h == nil || h.store == nil || h.store.AddressBooks == nil {
+		return nil, store.ErrNotFound
+	}
 	book, err := h.store.AddressBooks.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if book == nil || book.UserID != user.ID {
+	if book == nil {
 		return nil, store.ErrNotFound
 	}
 	return book, nil
+}
+
+func addressBookCollectionPath(cleanPath string) string {
+	cleanPath = normalizeDAVHref(cleanPath)
+	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+		return cleanPath
+	}
+	trimmed := strings.TrimPrefix(cleanPath, "/dav/addressbooks/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return "/dav/addressbooks"
+	}
+	return path.Join("/dav/addressbooks", parts[0])
+}
+
+func (h *Handler) addressBookPrivilegeDecision(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) (bool, bool, error) {
+	if book == nil {
+		return false, false, nil
+	}
+	if canonicalPath, err := h.canonicalDAVPath(ctx, user, cleanPath); err == nil && canonicalPath != "" {
+		cleanPath = canonicalPath
+	} else if err != nil {
+		return false, false, err
+	}
+	if user != nil && book.UserID == user.ID {
+		return true, false, nil
+	}
+	if granted, decided, err := h.aclDecision(ctx, user, cleanPath, privilege); err != nil {
+		return false, false, err
+	} else if decided {
+		return granted, !granted, nil
+	}
+	collectionPath := addressBookCollectionPath(cleanPath)
+	if collectionPath != cleanPath {
+		if granted, decided, err := h.aclDecision(ctx, user, collectionPath, privilege); err != nil {
+			return false, false, err
+		} else if decided {
+			return granted, !granted, nil
+		}
+	}
+	return false, false, nil
+}
+
+func (h *Handler) requireAddressBookPrivilege(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) error {
+	allowed, denied, err := h.addressBookPrivilegeDecision(ctx, user, book, cleanPath, privilege)
+	if err != nil {
+		return err
+	}
+	if allowed {
+		return nil
+	}
+	if denied {
+		return errForbidden
+	}
+	return store.ErrNotFound
+}
+
+func (h *Handler) loadAddressBookWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.AddressBook, error) {
+	book, err := h.getAddressBook(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, privilege); err != nil {
+		return nil, err
+	}
+	return book, nil
+}
+
+func (h *Handler) loadAddressBookByName(ctx context.Context, user *store.User, name string) (*store.AddressBook, error) {
+	if h.store == nil || h.store.AddressBooks == nil {
+		return nil, store.ErrNotFound
+	}
+	books, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	var match *store.AddressBook
+	for _, book := range books {
+		if book.Name != name {
+			continue
+		}
+		if match != nil {
+			return nil, errAmbiguousAddressBook
+		}
+		copy := book
+		match = &copy
+	}
+	if match == nil {
+		return nil, store.ErrNotFound
+	}
+	return match, nil
+}
+
+func (h *Handler) resolveAddressBookID(ctx context.Context, user *store.User, segment string) (int64, bool, error) {
+	if segment == "" {
+		return 0, false, nil
+	}
+	if id, err := strconv.ParseInt(segment, 10, 64); err == nil {
+		return id, true, nil
+	}
+	if user == nil {
+		return 0, false, store.ErrNotFound
+	}
+	book, err := h.loadAddressBookByName(ctx, user, segment)
+	if err != nil {
+		if errors.Is(err, errAmbiguousAddressBook) {
+			return 0, false, errAmbiguousAddressBook
+		}
+		if err == store.ErrNotFound {
+			return 0, false, store.ErrNotFound
+		}
+		return 0, false, err
+	}
+	return book.ID, true, nil
 }
 
 func (h *Handler) resolveCalendarID(ctx context.Context, user *store.User, segment string) (int64, bool, error) {
@@ -1509,6 +2094,44 @@ func (h *Handler) parseCalendarResourcePath(ctx context.Context, user *store.Use
 	if err != nil {
 		if errors.Is(err, errAmbiguousCalendar) {
 			return 0, resource, true, errAmbiguousCalendar
+		}
+		if err == store.ErrNotFound {
+			return 0, resource, true, err
+		}
+		return 0, "", false, err
+	}
+	if !ok {
+		return 0, resource, true, store.ErrNotFound
+	}
+	return id, resource, true, nil
+}
+
+func parseAddressBookResourceSegments(rawPath string) (string, string, bool) {
+	cleanPath := normalizeDAVHref(rawPath)
+	if cleanPath == "" || !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(cleanPath, "/dav/addressbooks/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	uid := strings.TrimSuffix(parts[1], path.Ext(parts[1]))
+	if uid == "" {
+		return "", "", false
+	}
+	return parts[0], uid, true
+}
+
+func (h *Handler) parseAddressBookResourcePath(ctx context.Context, user *store.User, rawPath string) (int64, string, bool, error) {
+	segment, resource, ok := parseAddressBookResourceSegments(rawPath)
+	if !ok {
+		return 0, "", false, nil
+	}
+	id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+	if err != nil {
+		if errors.Is(err, errAmbiguousAddressBook) {
+			return 0, resource, true, errAmbiguousAddressBook
 		}
 		if err == store.ErrNotFound {
 			return 0, resource, true, err
@@ -1590,7 +2213,13 @@ func resolveDAVHref(basePath, rawHref string) string {
 		base = "/"
 	}
 	if !strings.HasSuffix(base, "/") {
-		base += "/"
+		if _, _, ok := parseCalendarResourceSegments(base); ok {
+			base = path.Dir(base) + "/"
+		} else if _, _, ok := parseAddressBookResourceSegments(base); ok {
+			base = path.Dir(base) + "/"
+		} else {
+			base += "/"
+		}
 	}
 	return normalizeDAVHref(path.Join(base, trimmed))
 }
@@ -1686,25 +2315,48 @@ func (h *Handler) principalResponses(cleanPath, depth string, user *store.User, 
 
 func principalResponse(href string, user *store.User) response {
 	p := prop{
-		DisplayName:          user.PrimaryEmail,
-		ResourceType:         resourceType{Principal: &struct{}{}},
-		PrincipalURL:         &hrefProp{Href: href},
-		CurrentUserPrincipal: &hrefProp{Href: href},
-		CalendarHomeSet:      &hrefListProp{Href: []string{"/dav/calendars/"}},
-		AddressbookHomeSet:   &hrefListProp{Href: []string{"/dav/addressbooks/"}},
-		SupportedReportSet:   combinedSupportedReports(),
+		DisplayName:             user.PrimaryEmail,
+		ResourceType:            resourceType{Principal: &struct{}{}},
+		PrincipalURL:            &expandableHrefProp{Href: href},
+		CurrentUserPrincipal:    &expandableHrefProp{Href: href},
+		CurrentUserPrincipalURL: &hrefProp{Href: href},
+		CalendarHomeSet:         &hrefListProp{Href: []string{"/dav/calendars/"}},
+		AddressbookHomeSet:      &hrefListProp{Href: []string{"/dav/addressbooks/"}},
+		SupportedReportSet:      combinedSupportedReports(),
 	}
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
 }
 
 func rootCollectionResponse(href string, user *store.User, principalHref string) response {
 	p := prop{
-		DisplayName:          "CalCard DAV",
-		ResourceType:         resourceType{Collection: &struct{}{}},
-		CurrentUserPrincipal: &hrefProp{Href: principalHref},
-		SupportedReportSet:   combinedSupportedReports(),
+		DisplayName:             "CalCard DAV",
+		ResourceType:            resourceType{Collection: &struct{}{}},
+		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
+		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
+		SupportedReportSet:      combinedSupportedReports(),
 	}
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
+}
+
+func (h *Handler) expandedPrincipalProp(user *store.User, selections expandPropertySelection) prop {
+	principalHref := h.principalURL(user)
+	principalResp := principalResponse(principalHref, user)
+	result := prop{}
+	if selections.CurrentUserPrincipal != nil {
+		filtered := principalResp
+		if selections.CurrentUserPrincipal.Prop != nil {
+			filtered = filterPrincipalPropfindResponse(principalResp, selections.CurrentUserPrincipal)
+		}
+		result.CurrentUserPrincipal = &expandableHrefProp{Response: []response{filtered}}
+	}
+	if selections.PrincipalURL != nil {
+		filtered := principalResp
+		if selections.PrincipalURL.Prop != nil {
+			filtered = filterPrincipalPropfindResponse(principalResp, selections.PrincipalURL)
+		}
+		result.PrincipalURL = &expandableHrefProp{Response: []response{filtered}}
+	}
+	return result
 }
 
 func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
@@ -1728,18 +2380,50 @@ func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.Calend
 	}
 }
 
-func (h *Handler) addressBookReportResponses(ctx context.Context, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+func (h *Handler) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, expandReq *expandPropertyRequest) ([]response, string, error) {
+	targetResourceName := ""
+	addressDataReq := reportAddressData(report)
+	if _, resourceName, matched := parseAddressBookResourceSegments(cleanPath); matched {
+		targetResourceName = resourceName
+	}
 	switch report.XMLName.Local {
 	case "addressbook-multiget":
-		res, err := h.addressBookMultiGet(ctx, book.ID, report.Hrefs, cleanPath)
+		res, err := h.addressBookMultiGetReport(ctx, user, book, report.Hrefs, cleanPath, report.Prop, addressDataReq)
 		return res, "", err
 	case "addressbook-query":
-		res, err := h.addressBookQuery(ctx, book.ID, cleanPath)
+		res, err := h.addressBookQuery(ctx, user, book, cleanPath, report.CardFilter, report.Prop, addressDataReq, report.Limit)
 		return res, "", err
+	case "expand-property":
+		collectionHref := strings.TrimSuffix(cleanPath, "/")
+		if targetResourceName == "" {
+			collectionHref += "/"
+		}
+		if targetResourceName != "" {
+			contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, targetResourceName)
+			if err != nil {
+				return nil, "", fmt.Errorf("failed to fetch contact")
+			}
+			if contact == nil {
+				return []response{{Href: collectionHref, Status: httpStatusNotFound}}, "", nil
+			}
+			return []response{buildAddressObjectExpandPropertyResponse(collectionHref, *contact, expandReq)}, "", nil
+		}
+		resp := addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, buildSyncToken("card", book.ID, book.UpdatedAt), fmt.Sprintf("%d", book.CTag))
+		selections := expandPropertySelections(expandReq)
+		if len(resp.Propstat) > 0 {
+			expanded := h.expandedPrincipalProp(user, selections)
+			if expanded.CurrentUserPrincipal != nil {
+				resp.Propstat[0].Prop.CurrentUserPrincipal = expanded.CurrentUserPrincipal
+			}
+			if expanded.PrincipalURL != nil {
+				resp.Propstat[0].Prop.PrincipalURL = expanded.PrincipalURL
+			}
+		}
+		return []response{resp}, "", nil
 	case "sync-collection":
-		return h.addressBookSyncCollection(ctx, book, principalHref, cleanPath, report)
+		return h.addressBookSyncCollection(ctx, user, book, principalHref, cleanPath, report)
 	default:
-		res, err := h.addressBookQuery(ctx, book.ID, cleanPath)
+		res, err := h.addressBookQuery(ctx, user, book, cleanPath, report.CardFilter, report.Prop, addressDataReq, report.Limit)
 		return res, "", err
 	}
 }
@@ -2063,37 +2747,115 @@ func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
 	return cal.Name == segment
 }
 
-func (h *Handler) addressBookQuery(ctx context.Context, bookID int64, cleanPath string) ([]response, error) {
-	contacts, err := h.store.Contacts.ListForBook(ctx, bookID)
+func (h *Handler) addressBookQuery(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, filter *cardFilter, reqProp *reportProp, addressDataReq *addressDataQuery, limit *addressbookLimit) ([]response, error) {
+	contacts, err := h.store.Contacts.ListForBook(ctx, book.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list contacts")
 	}
-	return addressBookResourceResponses(cleanPath, contacts), nil
+	targetResourceName := ""
+	if _, resourceName, matched := parseAddressBookResourceSegments(cleanPath); matched {
+		targetResourceName = resourceName
+	}
+	baseHref := strings.TrimSuffix(cleanPath, "/") + "/"
+	if targetResourceName != "" {
+		baseHref = strings.TrimSuffix(strings.TrimSuffix(cleanPath, "/"), "/"+targetResourceName+".vcf") + "/"
+	}
+	var responses []response
+	for _, contact := range contacts {
+		resourceName := contactResourceName(contact)
+		if targetResourceName != "" && resourceName != targetResourceName {
+			continue
+		}
+		allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			continue
+		}
+		if !contactMatchesCardFilter(contact, filter) {
+			continue
+		}
+		href := baseHref + resourceName + ".vcf"
+		responses = append(responses, buildAddressObjectReportResponse(href, contact, reqProp, addressDataReq))
+	}
+	if limit != nil && limit.NResults > 0 && len(responses) > limit.NResults {
+		responses = responses[:limit.NResults]
+		responses = append(responses, response{
+			Href:   cleanPath,
+			Status: "HTTP/1.1 507 Insufficient Storage",
+			Error:  &responseError{NumberOfMatchesWithinLimits: &struct{}{}},
+		})
+	}
+	return responses, nil
 }
 
-func (h *Handler) addressBookMultiGet(ctx context.Context, bookID int64, hrefs []string, cleanPath string) ([]response, error) {
+func (h *Handler) addressBookMultiGet(ctx context.Context, user *store.User, bookID int64, hrefs []string, cleanPath string) ([]response, error) {
+	book, err := h.getAddressBook(ctx, bookID)
+	if err != nil {
+		return nil, err
+	}
+	return h.addressBookMultiGetReport(ctx, user, book, hrefs, cleanPath, nil, nil)
+}
+
+func (h *Handler) addressBookMultiGetReport(ctx context.Context, user *store.User, book *store.AddressBook, hrefs []string, cleanPath string, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.addressBookQuery(ctx, bookID, cleanPath)
+		return nil, fmt.Errorf("href required")
+	}
+	bookID := book.ID
+	targetResourceName := ""
+	if _, resourceName, matched := parseAddressBookResourceSegments(cleanPath); matched {
+		targetResourceName = resourceName
 	}
 	var responses []response
 	for _, href := range hrefs {
 		cleanHref := resolveDAVHref(cleanPath, href)
+		responseHref := cleanHref
+		if responseHref == "" {
+			responseHref = strings.TrimSpace(href)
+		}
+		if responseHref == "" {
+			responseHref = cleanPath
+		}
 		if cleanHref == "" {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		id, uid, ok := parseResourcePath(cleanHref, "/dav/addressbooks")
-		if !ok || id != bookID {
+		segment, resourceName, ok := parseAddressBookResourceSegments(cleanHref)
+		if !ok {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		c, err := h.store.Contacts.GetByUID(ctx, bookID, uid)
+		id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+		if err != nil || !ok {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
+			continue
+		}
+		if id != bookID {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
+			continue
+		}
+		c, err := h.store.Contacts.GetByResourceName(ctx, bookID, resourceName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch contact")
 		}
 		if c == nil {
-			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, resourceResponse(cleanHref, etagProp(c.ETag, c.RawVCard, false)))
+		if targetResourceName != "" && resourceName != targetResourceName {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
+			continue
+		}
+		allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
+			continue
+		}
+		responses = append(responses, buildAddressObjectReportResponse(responseHref, *c, reqProp, addressDataReq))
 	}
 	return responses, nil
 }
@@ -2107,6 +2869,46 @@ func eventResourceName(ev store.Event) string {
 		return ev.ResourceName
 	}
 	return ev.UID
+}
+
+func contactResourceName(contact store.Contact) string {
+	if contact.ResourceName != "" {
+		return contact.ResourceName
+	}
+	return contact.UID
+}
+
+func addressBookContactPath(bookID int64, resourceName string) string {
+	return path.Join("/dav/addressbooks", fmt.Sprint(bookID), resourceName)
+}
+
+func (h *Handler) canReadAddressBookContact(ctx context.Context, user *store.User, book *store.AddressBook, resourceName string) (bool, error) {
+	if strings.TrimSpace(resourceName) == "" {
+		return false, nil
+	}
+	err := h.requireAddressBookPrivilege(ctx, user, book, addressBookContactPath(book.ID, resourceName), "read")
+	switch {
+	case err == nil:
+		return true, nil
+	case err == store.ErrNotFound || errors.Is(err, errForbidden):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func (h *Handler) filterReadableAddressBookContacts(ctx context.Context, user *store.User, book *store.AddressBook, contacts []store.Contact) ([]store.Contact, error) {
+	visible := make([]store.Contact, 0, len(contacts))
+	for _, contact := range contacts {
+		allowed, err := h.canReadAddressBookContact(ctx, user, book, contactResourceName(contact))
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, contact)
+		}
+	}
+	return visible, nil
 }
 
 func calendarResourceResponsesFiltered(base string, events []store.Event, calData *calendarDataEl) []response {
@@ -2134,7 +2936,7 @@ func addressBookResourceResponses(base string, contacts []store.Contact) []respo
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	var responses []response
 	for _, c := range contacts {
-		href := baseHref + c.UID + ".vcf"
+		href := baseHref + contactResourceName(c) + ".vcf"
 		responses = append(responses, resourceResponse(href, etagProp(c.ETag, c.RawVCard, false)))
 	}
 	return responses
@@ -2188,7 +2990,7 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 	return responses, syncToken, nil
 }
 
-func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+func (h *Handler) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
 	syncToken, _ := h.addressBookSyncTokenValue(ctx, book)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
@@ -2211,6 +3013,10 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.Add
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to list contacts")
 	}
+	contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
+	if err != nil {
+		return nil, "", err
+	}
 
 	responses := []response{
 		addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, fmt.Sprintf("%d", book.CTag)),
@@ -2227,6 +3033,13 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, book *store.Add
 			resourceName := d.ResourceName
 			if resourceName == "" {
 				resourceName = d.UID
+			}
+			allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
+			if err != nil {
+				return nil, "", err
+			}
+			if !allowed {
+				continue
 			}
 			href := collectionHref + resourceName + ".vcf"
 			responses = append(responses, deletedResponse(href))

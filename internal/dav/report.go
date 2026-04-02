@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +40,14 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 	if err := safeUnmarshalXML(body, &report); err != nil {
 		http.Error(w, "invalid REPORT body", http.StatusBadRequest)
 		return
+	}
+	var expandReq *expandPropertyRequest
+	if report.XMLName.Local == "expand-property" {
+		expandReq, err = parseExpandPropertyRequest(body)
+		if err != nil {
+			http.Error(w, "invalid REPORT body", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "calendar-multiget" {
@@ -234,31 +241,116 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-		if len(parts) < 2 || parts[1] == "" {
-			http.Error(w, "invalid address book path", http.StatusBadRequest)
+		_, hasDepth := r.Header["Depth"]
+		if report.XMLName.Local == "addressbook-query" && report.CardFilter == nil {
+			http.Error(w, "filter required", http.StatusBadRequest)
 			return
 		}
-		if len(parts) > 2 && parts[2] != "" {
-			http.Error(w, "REPORT not allowed on address book object resources", http.StatusForbidden)
+		if report.XMLName.Local == "addressbook-multiget" {
+			if !hasDepth || strings.TrimSpace(r.Header.Get("Depth")) != "0" {
+				http.Error(w, "Depth: 0 required", http.StatusBadRequest)
+				return
+			}
+			if len(report.Hrefs) == 0 {
+				http.Error(w, "href required", http.StatusBadRequest)
+				return
+			}
+		}
+		if err := validateAddressDataRequest(report.AddressData); err != nil {
+			writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
 			return
 		}
-		bookID, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			http.Error(w, "invalid address book id", http.StatusBadRequest)
+		if report.Prop != nil {
+			if err := validateAddressDataRequest(report.Prop.AddressData); err != nil {
+				writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
+				return
+			}
+		}
+		if err := validateCardFilter(report.CardFilter); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "collation") {
+				status = http.StatusNotImplemented
+				writeCardDAVPrecondition(w, status, "supported-collation")
+			} else {
+				writeCardDAVPrecondition(w, status, "supported-filter")
+			}
 			return
 		}
 
-		book, err := h.loadAddressBook(r.Context(), user, bookID)
+		trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
+		parts := strings.Split(trimmed, "/")
+		if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+			http.Error(w, "invalid address book path", http.StatusBadRequest)
+			return
+		}
+		bookID, ok, err := h.resolveAddressBookID(r.Context(), user, strings.TrimSpace(parts[0]))
+		if err != nil {
+			if errors.Is(err, errAmbiguousAddressBook) {
+				http.Error(w, "ambiguous address book path", http.StatusConflict)
+				return
+			}
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(w, "address book not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "failed to resolve address book", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "invalid address book id", http.StatusBadRequest)
+			return
+		}
+		if len(parts) > 2 {
+			http.Error(w, "invalid address book path", http.StatusBadRequest)
+			return
+		}
+		isResource := len(parts) == 2 && parts[1] != ""
+		if isResource {
+			switch report.XMLName.Local {
+			case "addressbook-query", "addressbook-multiget", "expand-property":
+				if !hasDepth {
+					http.Error(w, "REPORT not allowed on address book object resources", http.StatusForbidden)
+					return
+				}
+			default:
+				http.Error(w, "REPORT not allowed on address book object resources", http.StatusForbidden)
+				return
+			}
+		}
+		if report.XMLName.Local == "addressbook-query" && !hasDepth {
+			http.Error(w, "Depth header required", http.StatusBadRequest)
+			return
+		}
+
+		book, err := h.loadAddressBookWithPrivilege(r.Context(), user, bookID, cleanPath, "read")
 		if err != nil {
 			status := http.StatusInternalServerError
+			if errors.Is(err, errForbidden) {
+				status = http.StatusForbidden
+			}
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
 			}
 			http.Error(w, "address book not found", status)
 			return
 		}
-		responses, syncToken, err := h.addressBookReportResponses(r.Context(), book, h.principalURL(user), cleanPath, report)
+		// Depth:0 on a collection for addressbook-query means only the collection
+		// itself, not its children — return empty multistatus after access checks.
+		depth := strings.TrimSpace(r.Header.Get("Depth"))
+		if report.XMLName.Local == "addressbook-query" && !isResource && depth == "0" {
+			payload := multistatus{
+				XMLName: xml.Name{Space: "DAV:", Local: "multistatus"},
+				XmlnsD:  "DAV:",
+				XmlnsC:  "urn:ietf:params:xml:ns:caldav",
+				XmlnsA:  "urn:ietf:params:xml:ns:carddav",
+				XmlnsCS: "http://calendarserver.org/ns/",
+			}
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusMultiStatus)
+			_ = xml.NewEncoder(w).Encode(payload)
+			return
+		}
+		responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, expandReq)
 		if err != nil {
 			if errors.Is(err, errInvalidSyncToken) {
 				http.Error(w, "invalid sync token", http.StatusForbidden)
@@ -276,6 +368,33 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			XmlnsCS:   "http://calendarserver.org/ns/",
 			SyncToken: syncToken,
 			Response:  responses,
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		_ = xml.NewEncoder(w).Encode(payload)
+		return
+	}
+
+	// Handle expand-property at the DAV root level
+	if report.XMLName.Local == "expand-property" && (cleanPath == "/dav" || cleanPath == "/dav/") {
+		rootResp := rootCollectionResponse("/dav/", user, h.principalURL(user))
+		selections := expandPropertySelections(expandReq)
+		if len(rootResp.Propstat) > 0 {
+			expanded := h.expandedPrincipalProp(user, selections)
+			if expanded.CurrentUserPrincipal != nil {
+				rootResp.Propstat[0].Prop.CurrentUserPrincipal = expanded.CurrentUserPrincipal
+			}
+			if expanded.PrincipalURL != nil {
+				rootResp.Propstat[0].Prop.PrincipalURL = expanded.PrincipalURL
+			}
+		}
+		payload := multistatus{
+			XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
+			XmlnsD:   "DAV:",
+			XmlnsC:   "urn:ietf:params:xml:ns:caldav",
+			XmlnsA:   "urn:ietf:params:xml:ns:carddav",
+			XmlnsCS:  "http://calendarserver.org/ns/",
+			Response: []response{rootResp},
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.WriteHeader(http.StatusMultiStatus)

@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.0.5')
+VALUES ('version', 'v1.0.11')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -47,6 +47,7 @@ CREATE TABLE contacts (
     id BIGSERIAL PRIMARY KEY,
     address_book_id BIGINT NOT NULL REFERENCES address_books(id) ON DELETE CASCADE,
     uid TEXT NOT NULL,
+    resource_name TEXT NOT NULL DEFAULT '',
     raw_vcard TEXT NOT NULL,
     etag TEXT NOT NULL,
     last_modified TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -97,6 +98,50 @@ ALTER TABLE address_books ADD COLUMN description TEXT;
 ALTER TABLE address_books ADD COLUMN ctag BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE address_books ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
+DO $$
+DECLARE
+    rec RECORD;
+    candidate TEXT;
+    suffix INT;
+BEGIN
+    FOR rec IN
+        SELECT id, user_id, name
+        FROM (
+            SELECT id, user_id, name,
+                   ROW_NUMBER() OVER (PARTITION BY user_id, LOWER(name) ORDER BY id) AS rn
+            FROM address_books
+        ) ranked
+        WHERE rn > 1
+        ORDER BY user_id, LOWER(name), id
+    LOOP
+        suffix := 1;
+        LOOP
+            candidate := rec.name || ' (' || rec.id::TEXT;
+            IF suffix > 1 THEN
+                candidate := candidate || '-' || suffix::TEXT;
+            END IF;
+            candidate := candidate || ')';
+
+            EXIT WHEN NOT EXISTS (
+                SELECT 1
+                FROM address_books
+                WHERE user_id = rec.user_id
+                  AND id <> rec.id
+                  AND LOWER(name) = LOWER(candidate)
+            );
+
+            suffix := suffix + 1;
+        END LOOP;
+
+        RAISE NOTICE 'Renaming duplicate address book for user %, "%" -> "%"', rec.user_id, rec.name, candidate;
+        UPDATE address_books
+        SET name = candidate
+        WHERE id = rec.id;
+    END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_address_books_user_name_lower ON address_books(user_id, LOWER(name));
+
 ALTER TABLE events ADD COLUMN summary TEXT;
 ALTER TABLE events ADD COLUMN dtstart TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN dtend TIMESTAMPTZ;
@@ -110,6 +155,9 @@ ALTER TABLE contacts ADD COLUMN primary_email TEXT;
 
 CREATE INDEX idx_contacts_display_name ON contacts(address_book_id, display_name);
 CREATE INDEX idx_contacts_last_modified ON contacts(address_book_id, last_modified DESC);
+
+UPDATE contacts SET resource_name = uid WHERE resource_name = '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_resource_name ON contacts(address_book_id, resource_name);
 
 CREATE TABLE deleted_resources (
     id BIGSERIAL PRIMARY KEY,
@@ -190,6 +238,37 @@ CREATE TABLE calendar_shares (
 
 CREATE INDEX idx_calendar_shares_user_id ON calendar_shares(user_id);
 
+-- Lock storage for WebDAV Class 2/3 compliance
+CREATE TABLE IF NOT EXISTS locks (
+    id BIGSERIAL PRIMARY KEY,
+    token TEXT NOT NULL UNIQUE,
+    resource_path TEXT NOT NULL,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lock_scope TEXT NOT NULL DEFAULT 'exclusive',
+    lock_type TEXT NOT NULL DEFAULT 'write',
+    depth TEXT NOT NULL DEFAULT '0',
+    owner_info TEXT,
+    timeout_seconds INT NOT NULL DEFAULT 3600,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_locks_resource ON locks(resource_path);
+CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks(expires_at);
+
+-- ACL entries for WebDAV access control (RFC 3744)
+CREATE TABLE IF NOT EXISTS acl_entries (
+    id BIGSERIAL PRIMARY KEY,
+    resource_path TEXT NOT NULL,
+    principal_href TEXT NOT NULL,
+    is_grant BOOLEAN NOT NULL DEFAULT TRUE,
+    privilege TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_acl_resource ON acl_entries(resource_path);
+CREATE INDEX IF NOT EXISTS idx_acl_principal ON acl_entries(principal_href);
+DROP INDEX IF EXISTS idx_acl_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_acl_unique ON acl_entries(resource_path, principal_href, privilege, is_grant);
+
 -- Add slug column for MKCALENDAR path mapping
 ALTER TABLE calendars ADD COLUMN slug TEXT;
 
@@ -248,7 +327,7 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = OLD.address_book_id;
         INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
-        VALUES ('contact', OLD.address_book_id, OLD.uid, OLD.uid);
+        VALUES ('contact', OLD.address_book_id, OLD.uid, OLD.resource_name);
         RETURN OLD;
     ELSE
         UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = NEW.address_book_id;

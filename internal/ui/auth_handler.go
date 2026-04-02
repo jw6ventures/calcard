@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
-	"github.com/go-chi/chi/v5"
 )
 
 // Sessions displays the user's active sessions.

@@ -23,6 +23,8 @@ type Store struct {
 	AppPasswords     AppPasswordRepository
 	DeletedResources DeletedResourceRepository
 	Sessions         SessionRepository
+	Locks            LockRepository
+	ACLEntries       ACLRepository
 }
 
 // New wires concrete repository implementations with shared connection pool.
@@ -38,6 +40,8 @@ func New(pool *sql.DB) *Store {
 		AppPasswords:     &appPasswordRepo{pool: pool},
 		DeletedResources: &deletedResourceRepo{pool: pool},
 		Sessions:         &sessionRepo{pool: pool},
+		Locks:            &lockRepo{pool: pool},
+		ACLEntries:       &aclRepo{pool: pool},
 	}
 }
 

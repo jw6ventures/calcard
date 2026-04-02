@@ -17,6 +17,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+		trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
+		if trimmed != "" && len(strings.Split(trimmed, "/")) > 2 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+	}
 
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -90,33 +97,56 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if addressBookID, uid, matched := parseResourcePath(cleanPath, "/dav/addressbooks"); matched {
-		if _, err := h.loadAddressBook(r.Context(), user, addressBookID); err != nil {
+	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
+		if err == store.ErrNotFound {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAmbiguousAddressBook) {
+			http.Error(w, "ambiguous address book path", http.StatusConflict)
+			return
+		}
+		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		return
+	} else if matched {
+		if _, err := h.loadAddressBookWithPrivilege(r.Context(), user, addressBookID, cleanPath, "read"); err != nil {
 			if err == store.ErrNotFound {
 				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			if errors.Is(err, errForbidden) {
+				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			http.Error(w, "failed to load address book", http.StatusInternalServerError)
 			return
 		}
-		contact, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
-		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
-			return
-		}
-		if contact == nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "text/vcard")
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", contact.ETag))
-		if !contact.LastModified.IsZero() {
-			w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
-		}
-		_, _ = w.Write([]byte(contact.RawVCard))
+		h.writeAddressBookContact(w, r, addressBookID, resourceName)
 		return
 	}
 
-	w.Header().Set("DAV", "1, 2, calendar-access, addressbook")
+	w.Header().Set("DAV", davHeaderForPath(cleanPath))
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
+	contact, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
+	if err != nil {
+		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		return
+	}
+	if contact == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if !acceptsVCardData(contact.RawVCard, r.Header.Get("Accept")) {
+		writeCardDAVPrecondition(w, http.StatusNotAcceptable, "supported-address-data-conversion")
+		return
+	}
+	w.Header().Set("Content-Type", "text/vcard")
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", contact.ETag))
+	if !contact.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
+	}
+	_, _ = w.Write([]byte(contact.RawVCard))
 }

@@ -1,7 +1,7 @@
 # CalCard Agent Guide
 
 ## Mission
-- Act as an implementation-focused Go agent for CalCard.
+- Act as an implementation-focused Go agent for CalCard a CalDav and CardDav RFC Compliant server.
 - Preserve DAV correctness, auth behavior, UI behavior, and PostgreSQL-backed data semantics.
 - Prefer small, testable changes over broad refactors.
 
@@ -19,7 +19,7 @@
 1. Inspect the relevant package and nearby tests before changing code.
 2. Match the local pattern already used in that package unless there is a clear defect in the pattern itself.
 3. For any bug fix or behavior change, add or update a failing test first.
-4. Implement the smallest code change that makes the new test pass.
+4. Implement the smallest code change that makes the new test pass but do not take shortcuts or fake implementations.
 5. Run `gofmt -w` on each changed Go file.
 6. Run `go test ./...` before finishing.
 7. Report any untested area, blocked verification, or unresolved risk explicitly.
@@ -31,6 +31,7 @@
 - Preserve route shapes, auth semantics, config behavior, and DAV resource paths unless the task explicitly requires changing them.
 - Do not introduce new dependencies, frameworks, or architecture layers without a strong repo-specific reason.
 - Keep unrelated cleanup out of the change unless it is required for correctness or readability.
+- Write production ready code. Do not write shortcuts or improper workarounds. If you're unable to complete a task, it is better to respond with that than cover up a partial/bad implementation. 
 
 ## TDD Expectations
 - TDD is the default workflow in this repository.
@@ -70,3 +71,53 @@
 - `go test ./...` passes.
 - The change stays scoped to the task.
 - New comments exist only where intent or constraints needed explanation.
+
+## Code Review
+
+When performing a code review, do not stop after finding a small fixed number of issues. Review the entire requested diff and all directly affected logic paths before concluding.
+
+### Review expectations
+- Inspect every changed file and every changed hunk.
+- Read enough surrounding context to understand how each change behaves in the full function, class, module, and call path.
+- Follow impacted control flow, data flow, error handling, concurrency behavior, and resource lifecycles.
+- Check changed tests and identify missing tests for changed behavior.
+- Keep looking until you are confident there are no additional reportable findings in the diff or its directly affected paths.
+
+### What to look for
+Report any issue worth surfacing, including:
+- correctness bugs
+- regressions
+- broken edge cases
+- partial implementations
+- incorrect assumptions
+- race conditions and ordering issues
+- nil/null handling problems
+- resource leaks
+- error-handling flaws
+- invalid or weak tests
+- security problems
+- API contract violations
+- design flaws in the changed code
+- code-style and maintainability issues when they materially affect readability, correctness, or future risk
+
+### Scope discipline
+- Do not artificially cap the number of findings.
+- Do not stop once you have “enough” findings to justify the review.
+- Do not ignore lower-severity but still real issues just because higher-severity issues already exist.
+- Prefer completeness over brevity.
+
+### Output format
+For each finding, include:
+- severity: high / medium / low
+- file and line or diff location
+- concise title
+- why it is a problem
+- the concrete failure mode, risk, or maintenance cost
+- a suggested fix or direction when clear
+
+### Review standard
+The review is complete only when:
+1. every changed hunk has been examined,
+2. directly impacted logic paths have been checked,
+3. related tests have been reviewed,
+4. no additional worthwhile findings remain.

@@ -73,6 +73,7 @@ type Contact struct {
 	ID            int64
 	AddressBookID int64
 	UID           string
+	ResourceName  string
 	RawVCard      string
 	ETag          string
 	DisplayName   *string
@@ -112,6 +113,31 @@ type Session struct {
 	CreatedAt  time.Time
 	ExpiresAt  time.Time
 	LastSeenAt time.Time
+}
+
+// Lock represents a WebDAV lock on a resource (RFC 4918).
+type Lock struct {
+	ID             int64
+	Token          string
+	ResourcePath   string
+	UserID         int64
+	LockScope      string
+	LockType       string
+	Depth          string
+	OwnerInfo      string
+	TimeoutSeconds int
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+}
+
+// ACLEntry represents a single access control entry (RFC 3744).
+type ACLEntry struct {
+	ID            int64
+	ResourcePath  string
+	PrincipalHref string
+	IsGrant       bool
+	Privilege     string
+	CreatedAt     time.Time
 }
 
 // PaginatedResult wraps a paginated query result.

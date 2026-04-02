@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 )
 
 func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
@@ -274,6 +276,125 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart,
 	}
 }
 
+func TestEventRepoMoveToCalendarRenameWithinSameCalendarCreatesTombstone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(5), "new-name", "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE calendar_id=$3 AND uid=$4`)).
+		WithArgs(int64(5), "new-name", int64(5), "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(5), "event-1", "old-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.MoveToCalendar(context.Background(), 5, 5, "event-1", "new-name"); err != nil {
+		t.Fatalf("MoveToCalendar() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestEventRepoMoveToCalendarOverwriteWithinSameCalendarDeletesDestination(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(5), "new-name", "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE calendar_id=$3 AND uid=$4`)).
+		WithArgs(int64(5), "new-name", int64(5), "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(5), "event-1", "old-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.MoveToCalendar(context.Background(), 5, 5, "event-1", "new-name"); err != nil {
+		t.Fatalf("MoveToCalendar() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestEventRepoCopyToCalendarRenameExistingUIDCreatesDestinationTombstone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+	now := time.Now()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(1), int64(5), "event-1", "source-name", "BEGIN:VCALENDAR", "etag-src", nil, nil, nil, false, now))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(9), "new-dest-name", "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(9), "event-1", "old-dest-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+ON CONFLICT (calendar_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_ical = EXCLUDED.raw_ical,
+        etag = EXCLUDED.etag,
+        summary = EXCLUDED.summary,
+        dtstart = EXCLUDED.dtstart,
+        dtend = EXCLUDED.dtend,
+        all_day = EXCLUDED.all_day,
+        last_modified = NOW()
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+`)).
+		WithArgs(int64(9), "event-1", "new-dest-name", "BEGIN:VCALENDAR", "etag-new", nil, nil, nil, false).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(2), int64(9), "event-1", "new-dest-name", "BEGIN:VCALENDAR", "etag-new", nil, nil, nil, false, now))
+	mock.ExpectCommit()
+
+	_, err = repo.CopyToCalendar(context.Background(), 5, 9, "event-1", "new-dest-name", "etag-new")
+	if err != nil {
+		t.Fatalf("CopyToCalendar() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestEventRepoAndAddressBookRepoReturnNilOrErrNotFound(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -418,20 +539,21 @@ func TestContactRepoUpsertAndMoveToAddressBook(t *testing.T) {
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nEMAIL:jane@example.com\r\nBDAY:1990-05-15\r\nEND:VCARD"
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO contacts (address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 ON CONFLICT (address_book_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
         raw_vcard = EXCLUDED.raw_vcard,
         etag = EXCLUDED.etag,
         display_name = EXCLUDED.display_name,
         primary_email = EXCLUDED.primary_email,
         birthday = EXCLUDED.birthday,
         last_modified = NOW()
-RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified
+RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
 `)).
-		WithArgs(int64(5), "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(1), int64(5), "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday, now))
+		WithArgs(int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(1), int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday, now))
 
 	created, err := repo.Upsert(context.Background(), Contact{
 		AddressBookID: 5,
@@ -447,27 +569,36 @@ RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`)).
-		WithArgs(int64(9), int64(5), "contact-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $2)`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("contact-1"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(9), "contact-1-copy", "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE address_book_id=$3 AND uid=$4`)).
+		WithArgs(int64(9), "contact-1-copy", int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(5), "contact-1", "contact-1").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "contact-1"); err != nil {
+	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "contact-1", "contact-1-copy"); err != nil {
 		t.Fatalf("MoveToAddressBook() error = %v", err)
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`)).
-		WithArgs(int64(9), int64(5), "missing").
-		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "missing").
+		WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
-	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "missing"); err != ErrNotFound {
+	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "missing", "missing-copy"); err != ErrNotFound {
 		t.Fatalf("MoveToAddressBook() error = %v, want ErrNotFound", err)
 	}
 
@@ -477,6 +608,371 @@ RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email
 	}
 	if len(contacts) != 0 {
 		t.Fatalf("ListByUIDs() = %#v, want empty", contacts)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestContactRepoMoveToAddressBookRenameWithinSameBookCreatesTombstone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &contactRepo{pool: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(5), "renamed-contact", "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE address_book_id=$3 AND uid=$4`)).
+		WithArgs(int64(5), "renamed-contact", int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(5), "contact-1", "legacy-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.MoveToAddressBook(context.Background(), 5, 5, "contact-1", "renamed-contact"); err != nil {
+		t.Fatalf("MoveToAddressBook() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestContactRepoMoveToAddressBookOverwriteWithinSameBookDeletesDestination(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &contactRepo{pool: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(5), "new-name", "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE address_book_id=$3 AND uid=$4`)).
+		WithArgs(int64(5), "new-name", int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(5), "contact-1", "old-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.MoveToAddressBook(context.Background(), 5, 5, "contact-1", "new-name"); err != nil {
+		t.Fatalf("MoveToAddressBook() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestContactRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &contactRepo{pool: db}
+	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+ON CONFLICT (address_book_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_vcard = EXCLUDED.raw_vcard,
+        etag = EXCLUDED.etag,
+        display_name = EXCLUDED.display_name,
+        primary_email = EXCLUDED.primary_email,
+        birthday = EXCLUDED.birthday,
+        last_modified = NOW()
+RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
+`)).
+		WithArgs(int64(5), "contact-1", "renamed", rawVCard, "etag-1", "Jane Doe", nil, nil).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "idx_contacts_resource_name"})
+
+	_, err = repo.Upsert(context.Background(), Contact{
+		AddressBookID: 5,
+		UID:           "contact-1",
+		ResourceName:  "renamed",
+		RawVCard:      rawVCard,
+		ETag:          "etag-1",
+	})
+	if err != ErrConflict {
+		t.Fatalf("Upsert() error = %v, want ErrConflict", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestContactRepoCopyToAddressBookRenameExistingUIDCreatesDestinationTombstone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &contactRepo{pool: db}
+	now := time.Now()
+	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(1), int64(5), "contact-1", "source-name", rawVCard, "etag-src", "Jane Doe", nil, nil, now))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(9), "new-dest-name", "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(9), "contact-1", "old-dest-name").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+ON CONFLICT (address_book_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_vcard = EXCLUDED.raw_vcard,
+        etag = EXCLUDED.etag,
+        display_name = EXCLUDED.display_name,
+        primary_email = EXCLUDED.primary_email,
+        birthday = EXCLUDED.birthday,
+        last_modified = NOW()
+RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
+`)).
+		WithArgs(int64(9), "contact-1", "new-dest-name", rawVCard, "etag-new", "Jane Doe", nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(2), int64(9), "contact-1", "new-dest-name", rawVCard, "etag-new", "Jane Doe", nil, nil, now))
+	mock.ExpectCommit()
+
+	_, err = repo.CopyToAddressBook(context.Background(), 5, 9, "contact-1", "new-dest-name", "etag-new")
+	if err != nil {
+		t.Fatalf("CopyToAddressBook() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreDeleteEventAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(7), "event-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/calendars/7/renamed").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/calendars/7/renamed").
+		WillReturnError(errors.New("acl delete failed"))
+	mock.ExpectRollback()
+
+	err = st.DeleteEventAndState(context.Background(), 7, "event-1", "/dav/calendars/7/renamed")
+	if err == nil {
+		t.Fatal("DeleteEventAndState() error = nil, want error")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreDeleteContactAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact.v1").
+		WillReturnError(errors.New("lock delete failed"))
+	mock.ExpectRollback()
+
+	err = st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact.v1")
+	if err == nil {
+		t.Fatal("DeleteContactAndState() error = nil, want error")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact-1"); err != nil {
+		t.Fatalf("DeleteContactAndState() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreDeleteContactAndStatePreservesACLState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact-1"); err != nil {
+		t.Fatalf("DeleteContactAndState() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockRepoCreateSerializesAncestorAndDescendantPaths(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &lockRepo{pool: db}
+	expiresAt := time.Now().Add(time.Hour)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav/addressbooks/5").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav/addressbooks").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
+		WithArgs("/dav/addressbooks/5").
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`)).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`)).
+		WithArgs(`/dav/addressbooks/5/%`).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO locks (token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at
+`)).
+		WithArgs("opaquelocktoken:test", "/dav/addressbooks/5", int64(1), "exclusive", "write", "infinity", "", 3600, expiresAt).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_path", "user_id", "lock_scope", "lock_type", "depth", "owner_info", "timeout_seconds", "created_at", "expires_at"}).
+			AddRow(int64(1), "opaquelocktoken:test", "/dav/addressbooks/5", int64(1), "exclusive", "write", "infinity", "", 3600, time.Now(), expiresAt))
+	mock.ExpectCommit()
+
+	_, err = repo.Create(context.Background(), Lock{
+		Token:          "opaquelocktoken:test",
+		ResourcePath:   "/dav/addressbooks/5",
+		UserID:         1,
+		LockScope:      "exclusive",
+		LockType:       "write",
+		Depth:          "infinity",
+		TimeoutSeconds: 3600,
+		ExpiresAt:      expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockRepoMoveResourcePath(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &lockRepo{pool: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`)).
+		WithArgs("/dav/addressbooks/5").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`)).
+		WithArgs("/dav/addressbooks/5", "/dav/addressbooks/.pending/1/NewBook").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repo.MoveResourcePath(context.Background(), "/dav/addressbooks/.pending/1/NewBook", "/dav/addressbooks/5"); err != nil {
+		t.Fatalf("MoveResourcePath() error = %v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -496,10 +992,10 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	birthday := time.Date(1985, 7, 20, 0, 0, 0, 0, time.UTC)
 	since := now.Add(-2 * time.Hour)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`)).
 		WithArgs(int64(5), sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(1), int64(5), "uid-1", "BEGIN:VCARD", "etag-1", "Jane Doe", "jane@example.com", birthday, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(1), int64(5), "uid-1", "uid-1", "BEGIN:VCARD", "etag-1", "Jane Doe", "jane@example.com", birthday, now))
 	contacts, err := repo.ListByUIDs(context.Background(), 5, []string{"uid-1"})
 	if err != nil {
 		t.Fatalf("ListByUIDs() error = %v", err)
@@ -508,10 +1004,10 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 		t.Fatalf("ListByUIDs() = %#v", contacts)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`)).
 		WithArgs(int64(5)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(2), int64(5), "uid-2", "BEGIN:VCARD", "etag-2", nil, nil, nil, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(2), int64(5), "uid-2", "uid-2", "BEGIN:VCARD", "etag-2", nil, nil, nil, now))
 	forBook, err := repo.ListForBook(context.Background(), 5)
 	if err != nil {
 		t.Fatalf("ListForBook() error = %v", err)
@@ -523,10 +1019,10 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM contacts WHERE address_book_id=$1`)).
 		WithArgs(int64(5)).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`)).
 		WithArgs(int64(5), 10, 0).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(3), int64(5), "uid-3", "BEGIN:VCARD", "etag-3", "Alex", nil, nil, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(3), int64(5), "uid-3", "uid-3", "BEGIN:VCARD", "etag-3", "Alex", nil, nil, now))
 	page, err := repo.ListForBookPaginated(context.Background(), 5, 10, 0)
 	if err != nil {
 		t.Fatalf("ListForBookPaginated() error = %v", err)
@@ -535,10 +1031,10 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 		t.Fatalf("ListForBookPaginated() = %#v", page)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
 		WithArgs(int64(5), since).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(4), int64(5), "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(4), int64(5), "uid-4", "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
 	modified, err := repo.ListModifiedSince(context.Background(), 5, since)
 	if err != nil {
 		t.Fatalf("ListModifiedSince() error = %v", err)
@@ -548,7 +1044,7 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT c.id, c.address_book_id, c.uid, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
 FROM contacts c
 JOIN address_books ab ON ab.id = c.address_book_id
 WHERE ab.user_id = $1
@@ -556,8 +1052,8 @@ ORDER BY c.last_modified DESC
 LIMIT $2
 `)).
 		WithArgs(int64(4), 5).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(5), int64(5), "uid-5", "BEGIN:VCARD", "etag-5", "Recent Contact", nil, nil, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(5), int64(5), "uid-5", "uid-5", "BEGIN:VCARD", "etag-5", "Recent Contact", nil, nil, now))
 	recent, err := repo.ListRecentByUser(context.Background(), 4, 5)
 	if err != nil {
 		t.Fatalf("ListRecentByUser() error = %v", err)
@@ -578,15 +1074,15 @@ LIMIT $2
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT c.id, c.address_book_id, c.uid, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
 FROM contacts c
 JOIN address_books ab ON ab.id = c.address_book_id
 WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
 ORDER BY c.display_name
 `)).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(6), int64(5), "uid-6", "BEGIN:VCARD", "etag-6", "Birthday Person", nil, birthday, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(6), int64(5), "uid-6", "uid-6", "BEGIN:VCARD", "etag-6", "Birthday Person", nil, birthday, now))
 	withBirthdays, err := repo.ListWithBirthdaysByUser(context.Background(), 4)
 	if err != nil {
 		t.Fatalf("ListWithBirthdaysByUser() error = %v", err)
@@ -596,18 +1092,27 @@ ORDER BY c.display_name
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`)).
-		WithArgs(int64(9), int64(5), "uid-rollback").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $2)`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "uid-rollback").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(9), "renamed-contact", "uid-rollback").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "uid-rollback").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE address_book_id=$3 AND uid=$4`)).
+		WithArgs(int64(9), "renamed-contact", int64(5), "uid-rollback").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(5), "uid-rollback", "legacy-name").
 		WillReturnError(errors.New("tombstone failed"))
 	mock.ExpectRollback()
-	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "uid-rollback"); err == nil || err.Error() != "tombstone failed" {
+	if err := repo.MoveToAddressBook(context.Background(), 5, 9, "uid-rollback", "renamed-contact"); err == nil || err.Error() != "tombstone failed" {
 		t.Fatalf("MoveToAddressBook() error = %v", err)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "missing").
 		WillReturnError(sql.ErrNoRows)
 	got, err := repo.GetByUID(context.Background(), 5, "missing")
@@ -616,6 +1121,149 @@ ORDER BY c.display_name
 	}
 	if got != nil {
 		t.Fatalf("GetByUID() = %#v, want nil", got)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestACLRepoHasPrivilegeDenyOverridesGrant(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &aclRepo{pool: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
+    ) THEN FALSE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
+    ) THEN TRUE
+    ELSE FALSE
+END
+`)).
+		WithArgs("/dav/addressbooks/5/alice.vcf", "/dav/principals/2/", "read").
+		WillReturnRows(sqlmock.NewRows([]string{"has_privilege"}).AddRow(false))
+
+	allowed, err := repo.HasPrivilege(context.Background(), "/dav/addressbooks/5/alice.vcf", "/dav/principals/2/", "read")
+	if err != nil {
+		t.Fatalf("HasPrivilege() error = %v", err)
+	}
+	if allowed {
+		t.Fatal("HasPrivilege() = true, want deny to override grant")
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
+    ) THEN FALSE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
+    ) THEN TRUE
+    ELSE FALSE
+END
+`)).
+		WithArgs("/dav/addressbooks/5/alice.vcf", "/dav/principals/3/", "read").
+		WillReturnRows(sqlmock.NewRows([]string{"has_privilege"}).AddRow(true))
+
+	allowed, err = repo.HasPrivilege(context.Background(), "/dav/addressbooks/5/alice.vcf", "/dav/principals/3/", "read")
+	if err != nil {
+		t.Fatalf("HasPrivilege() error = %v", err)
+	}
+	if !allowed {
+		t.Fatal("HasPrivilege() = false, want true when no deny exists")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockRepoCreateRejectsDepthInfinityWhenDescendantLocked(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &lockRepo{pool: db}
+	expiresAt := time.Now().Add(time.Hour)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav/addressbooks/5").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav/addressbooks").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+		WithArgs("/dav").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
+		WithArgs("/dav/addressbooks/5").
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`)).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`)).
+		WithArgs(`/dav/addressbooks/5/%`).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}).AddRow("exclusive"))
+	mock.ExpectRollback()
+
+	_, err = repo.Create(context.Background(), Lock{
+		Token:          "opaquelocktoken:new",
+		ResourcePath:   "/dav/addressbooks/5",
+		UserID:         1,
+		LockScope:      "exclusive",
+		LockType:       "write",
+		Depth:          "infinity",
+		TimeoutSeconds: 3600,
+		ExpiresAt:      expiresAt,
+	})
+	if err != ErrLockConflict {
+		t.Fatalf("Create() error = %v, want ErrLockConflict", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockRepoCreateRejectsInvalidDepth(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &lockRepo{pool: db}
+
+	_, err = repo.Create(context.Background(), Lock{
+		Token:          "opaquelocktoken:bad-depth",
+		ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+		UserID:         1,
+		LockScope:      "exclusive",
+		LockType:       "write",
+		Depth:          "1",
+		TimeoutSeconds: 3600,
+		ExpiresAt:      time.Now().Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatal("Create() error = nil, want invalid depth error")
+	}
+	if !strings.Contains(err.Error(), "invalid lock depth") {
+		t.Fatalf("Create() error = %v, want invalid lock depth", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -798,6 +798,12 @@ func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limi
 func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (time.Time, error) {
 	return time.Time{}, nil
 }
+func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	return nil
+}
+func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
+	return nil, nil
+}
 
 type fakeAddressBookRepo struct {
 	books map[int64]*store.AddressBook
@@ -826,6 +832,10 @@ func (f *fakeAddressBookRepo) Create(ctx context.Context, book store.AddressBook
 }
 
 func (f *fakeAddressBookRepo) Update(ctx context.Context, userID, id int64, name string, description *string) error {
+	return nil
+}
+
+func (f *fakeAddressBookRepo) UpdateProperties(ctx context.Context, id int64, name string, description *string) error {
 	return nil
 }
 
@@ -901,8 +911,27 @@ func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID in
 	return nil, nil
 }
 
-func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
 	return nil
+}
+func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	for _, c := range f.contacts {
+		if c.AddressBookID != addressBookID {
+			continue
+		}
+		name := c.ResourceName
+		if name == "" {
+			name = c.UID
+		}
+		if name == resourceName {
+			copy := *c
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
+	return nil, nil
 }
 
 // Extended fake repositories for CRUD tests
@@ -941,8 +970,8 @@ func (f *fakeContactRepoWithUpsert) Upsert(ctx context.Context, contact store.Co
 	return &contact, nil
 }
 
-func (f *fakeContactRepoWithUpsert) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
-	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid)
+func (f *fakeContactRepoWithUpsert) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
+	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid, destResourceName)
 }
 
 type fakeContactRepoWithBirthdays struct {
@@ -954,8 +983,8 @@ func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUser(ctx context.Conte
 	return f.birthdays, nil
 }
 
-func (f *fakeContactRepoWithBirthdays) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
-	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid)
+func (f *fakeContactRepoWithBirthdays) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
+	return f.fakeContactRepo.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid, destResourceName)
 }
 
 func TestMoveContactHandler(t *testing.T) {
@@ -1113,6 +1142,62 @@ func TestMoveContactHandler(t *testing.T) {
 	}
 }
 
+func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepoWithMove{
+		fakeContactRepo: fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "contact-1", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:John Doe\r\nEND:VCARD\r\n"},
+				"2:contact-1": {ID: 2, AddressBookID: 2, UID: "contact-1", ResourceName: "existing", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Existing John\r\nEND:VCARD\r\n"},
+			},
+		},
+	}
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: bookRepo,
+		Contacts:     contactRepo,
+	}, nil)
+
+	form := make(url.Values)
+	form.Set("target_address_book_id", "2")
+
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "contact-1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "test@example.com"}))
+
+	rr := httptest.NewRecorder()
+	handler.MoveContact(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("MoveContact() status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if contactRepo.moved {
+		t.Fatal("expected MoveContact() to reject the move before mutating contacts")
+	}
+	source, _ := contactRepo.GetByUID(req.Context(), 1, "contact-1")
+	if source == nil {
+		t.Fatal("expected source contact to remain in the source address book")
+	}
+	dest, _ := contactRepo.GetByUID(req.Context(), 2, "contact-1")
+	if dest == nil || dest.ResourceName != "existing" {
+		t.Fatalf("expected destination contact to remain unchanged, got %#v", dest)
+	}
+	location := rr.Header().Get("Location")
+	if !strings.Contains(location, "/addressbooks/1") {
+		t.Fatalf("expected redirect back to source book, got %q", location)
+	}
+}
+
 type fakeContactRepoWithMove struct {
 	fakeContactRepo
 	moved            bool
@@ -1121,7 +1206,7 @@ type fakeContactRepoWithMove struct {
 	tombstoneUID     string
 }
 
-func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
 	// Check if contact exists
 	contact, err := f.GetByUID(ctx, fromAddressBookID, uid)
 	if err != nil || contact == nil {
@@ -1134,6 +1219,9 @@ func (f *fakeContactRepoWithMove) MoveToAddressBook(ctx context.Context, fromAdd
 	if c, ok := f.contacts[oldKey]; ok {
 		movedContact := *c
 		movedContact.AddressBookID = toAddressBookID
+		if destResourceName != "" {
+			movedContact.ResourceName = destResourceName
+		}
 		f.contacts[newKey] = &movedContact
 		delete(f.contacts, oldKey)
 		f.moved = true

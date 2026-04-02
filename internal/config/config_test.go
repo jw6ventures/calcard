@@ -109,30 +109,30 @@ func TestLoadReturnsUsefulValidationErrors(t *testing.T) {
 			},
 			wantErr: "APP_OAUTH_DISCOVERY_URL or APP_OAUTH_ISSUER_URL is required",
 		},
-			{
-				name: "secret too short",
-				env: map[string]string{
-					"APP_DB_DSN":              "postgres://dsn",
-					"APP_OAUTH_CLIENT_ID":     "client",
+		{
+			name: "secret too short",
+			env: map[string]string{
+				"APP_DB_DSN":              "postgres://dsn",
+				"APP_OAUTH_CLIENT_ID":     "client",
 				"APP_OAUTH_CLIENT_SECRET": "secret",
 				"APP_OAUTH_ISSUER_URL":    "https://issuer.example",
 				"APP_SESSION_SECRET":      "short",
-				},
-				wantErr: "must be at least 32 characters",
 			},
-			{
-				name: "invalid trusted proxy value",
-				env: map[string]string{
-					"APP_DB_DSN":              "postgres://dsn",
-					"APP_OAUTH_CLIENT_ID":     "client",
-					"APP_OAUTH_CLIENT_SECRET": "secret",
-					"APP_OAUTH_ISSUER_URL":    "https://issuer.example",
-					"APP_SESSION_SECRET":      strings.Repeat("s", 32),
-					"APP_TRUSTED_PROXIES":     "not-an-ip",
-				},
-				wantErr: "APP_TRUSTED_PROXIES contains invalid IP or CIDR",
+			wantErr: "must be at least 32 characters",
+		},
+		{
+			name: "invalid trusted proxy value",
+			env: map[string]string{
+				"APP_DB_DSN":              "postgres://dsn",
+				"APP_OAUTH_CLIENT_ID":     "client",
+				"APP_OAUTH_CLIENT_SECRET": "secret",
+				"APP_OAUTH_ISSUER_URL":    "https://issuer.example",
+				"APP_SESSION_SECRET":      strings.Repeat("s", 32),
+				"APP_TRUSTED_PROXIES":     "not-an-ip",
 			},
-		}
+			wantErr: "APP_TRUSTED_PROXIES contains invalid IP or CIDR",
+		},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

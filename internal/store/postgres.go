@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -512,9 +513,161 @@ func (r *eventRepo) MaxLastModified(ctx context.Context, calendarID int64) (time
 	return ts.UTC(), nil
 }
 
+func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	defer observeDB(ctx, "events.move_to_calendar")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if destResourceName == "" {
+		destResourceName = uid
+	}
+
+	const selectQ = `SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`
+	var sourceResourceName string
+	if err := tx.QueryRowContext(ctx, selectQ, fromCalendarID, uid).Scan(&sourceResourceName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	const deleteDestByNameQ = `DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`
+	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toCalendarID, destResourceName, uid); err != nil {
+		return err
+	}
+	if fromCalendarID != toCalendarID {
+		const deleteDestByUIDQ = `DELETE FROM events WHERE calendar_id=$1 AND uid=$2`
+		if _, err := tx.ExecContext(ctx, deleteDestByUIDQ, toCalendarID, uid); err != nil {
+			return err
+		}
+	}
+
+	const moveQuery = `UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE calendar_id=$3 AND uid=$4`
+	result, err := tx.ExecContext(ctx, moveQuery, toCalendarID, destResourceName, fromCalendarID, uid)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+
+	if fromCalendarID == toCalendarID {
+		if sourceResourceName != destResourceName {
+			const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
+			if _, err := tx.ExecContext(ctx, tombstoneQuery, fromCalendarID, uid, sourceResourceName); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}
+
+	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
+	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromCalendarID, uid, sourceResourceName); err != nil {
+		return err
+	}
+
+	const incrementCtagQuery = `UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
+	if _, err := tx.ExecContext(ctx, incrementCtagQuery, fromCalendarID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error) {
+	defer observeDB(ctx, "events.copy_to_calendar")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	const selectQ = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
+	row := tx.QueryRowContext(ctx, selectQ, fromCalendarID, uid)
+	src, err := scanEvent(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if destResourceName == "" {
+		destResourceName = src.ResourceName
+		if destResourceName == "" {
+			destResourceName = src.UID
+		}
+	}
+
+	const existingDestQ = `SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`
+	var existingDestResourceName string
+	switch err := tx.QueryRowContext(ctx, existingDestQ, toCalendarID, src.UID).Scan(&existingDestResourceName); {
+	case err == nil:
+	case errors.Is(err, sql.ErrNoRows):
+		existingDestResourceName = ""
+	default:
+		return nil, err
+	}
+
+	const deleteDestByNameQ = `DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`
+	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toCalendarID, destResourceName, src.UID); err != nil {
+		return nil, err
+	}
+	if existingDestResourceName != "" && existingDestResourceName != destResourceName {
+		const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
+		if _, err := tx.ExecContext(ctx, tombstoneQuery, toCalendarID, src.UID, existingDestResourceName); err != nil {
+			return nil, err
+		}
+	}
+
+	const insertQ = `
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+ON CONFLICT (calendar_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_ical = EXCLUDED.raw_ical,
+        etag = EXCLUDED.etag,
+        summary = EXCLUDED.summary,
+        dtstart = EXCLUDED.dtstart,
+        dtend = EXCLUDED.dtend,
+        all_day = EXCLUDED.all_day,
+        last_modified = NOW()
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+`
+	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.DTStart, src.DTEnd, src.AllDay)
+	ev, err := scanEvent(insertRow.Scan)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
 // addressBookRepo implements AddressBookRepository.
 type addressBookRepo struct {
 	pool *sql.DB
+}
+
+func isAddressBookNameConflict(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "idx_address_books_user_name_lower"
+}
+
+func isContactResourceNameConflict(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "idx_contacts_resource_name"
 }
 
 func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]AddressBook, error) {
@@ -561,6 +714,9 @@ func (r *addressBookRepo) Create(ctx context.Context, book AddressBook) (*Addres
 	var created AddressBook
 	var description sql.NullString
 	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &description, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
+		if isAddressBookNameConflict(err) {
+			return nil, ErrConflict
+		}
 		return nil, err
 	}
 	created.Description = nullableString(description)
@@ -572,6 +728,29 @@ func (r *addressBookRepo) Update(ctx context.Context, userID, id int64, name str
 	defer observeDB(ctx, "address_books.update")()
 	res, err := r.pool.ExecContext(ctx, q, name, description, id, userID)
 	if err != nil {
+		if isAddressBookNameConflict(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *addressBookRepo) UpdateProperties(ctx context.Context, id int64, name string, description *string) error {
+	const q = `UPDATE address_books SET name=$1, description=$2, updated_at=NOW() WHERE id=$3`
+	defer observeDB(ctx, "address_books.update_properties")()
+	res, err := r.pool.ExecContext(ctx, q, name, description, id)
+	if err != nil {
+		if isAddressBookNameConflict(err) {
+			return ErrConflict
+		}
 		return err
 	}
 	rows, err := res.RowsAffected()
@@ -589,6 +768,9 @@ func (r *addressBookRepo) Rename(ctx context.Context, userID, id int64, name str
 	defer observeDB(ctx, "address_books.rename")()
 	res, err := r.pool.ExecContext(ctx, q, name, id, userID)
 	if err != nil {
+		if isAddressBookNameConflict(err) {
+			return ErrConflict
+		}
 		return err
 	}
 	rows, err := res.RowsAffected()
@@ -626,23 +808,30 @@ type contactRepo struct {
 func (r *contactRepo) Upsert(ctx context.Context, contact Contact) (*Contact, error) {
 	// Parse vCard to extract fields
 	displayName, primaryEmail, birthday := parseVCardFields(contact.RawVCard)
+	if contact.ResourceName == "" {
+		contact.ResourceName = contact.UID
+	}
 
 	const q = `
-INSERT INTO contacts (address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 ON CONFLICT (address_book_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
         raw_vcard = EXCLUDED.raw_vcard,
         etag = EXCLUDED.etag,
         display_name = EXCLUDED.display_name,
         primary_email = EXCLUDED.primary_email,
         birthday = EXCLUDED.birthday,
         last_modified = NOW()
-RETURNING id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified
+RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
 `
 	defer observeDB(ctx, "contacts.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, contact.AddressBookID, contact.UID, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
+	row := r.pool.QueryRowContext(ctx, q, contact.AddressBookID, contact.UID, contact.ResourceName, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
 	c, err := scanContact(row.Scan)
 	if err != nil {
+		if isContactResourceNameConflict(err) {
+			return nil, ErrConflict
+		}
 		return nil, err
 	}
 	return &c, nil
@@ -655,19 +844,42 @@ func (r *contactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid 
 	return err
 }
 
-func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
 	defer observeDB(ctx, "contacts.move_to_address_book")()
 
-	// Use a transaction to ensure atomicity
 	tx, err := r.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// Move the contact to the new address book
-	const moveQuery = `UPDATE contacts SET address_book_id=$1, last_modified=NOW() WHERE address_book_id=$2 AND uid=$3`
-	result, err := tx.ExecContext(ctx, moveQuery, toAddressBookID, fromAddressBookID, uid)
+	if destResourceName == "" {
+		destResourceName = uid
+	}
+
+	const selectQ = `SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	var sourceResourceName string
+	if err := tx.QueryRowContext(ctx, selectQ, fromAddressBookID, uid).Scan(&sourceResourceName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	const deleteDestByNameQ = `DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`
+	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toAddressBookID, destResourceName, uid); err != nil {
+		return err
+	}
+
+	if fromAddressBookID != toAddressBookID {
+		const deleteDestByUIDQ = `DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`
+		if _, err := tx.ExecContext(ctx, deleteDestByUIDQ, toAddressBookID, uid); err != nil {
+			return err
+		}
+	}
+
+	const moveQuery = `UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE address_book_id=$3 AND uid=$4`
+	result, err := tx.ExecContext(ctx, moveQuery, toAddressBookID, destResourceName, fromAddressBookID, uid)
 	if err != nil {
 		return err
 	}
@@ -679,25 +891,31 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 		return ErrNotFound
 	}
 
-	// Create a tombstone in the source address book for sync
-	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $2)`
-	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromAddressBookID, uid); err != nil {
+	if fromAddressBookID == toAddressBookID {
+		if sourceResourceName != destResourceName {
+			const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`
+			if _, err := tx.ExecContext(ctx, tombstoneQuery, fromAddressBookID, uid, sourceResourceName); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}
+
+	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`
+	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromAddressBookID, uid, sourceResourceName); err != nil {
 		return err
 	}
 
-	// Increment the source address book's ctag so clients know to sync
 	const incrementCtagQuery = `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
 	if _, err := tx.ExecContext(ctx, incrementCtagQuery, fromAddressBookID); err != nil {
 		return err
 	}
 
-	// The target address book's ctag is automatically incremented by the UPDATE trigger
-
 	return tx.Commit()
 }
 
 func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error) {
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	defer observeDB(ctx, "contacts.get_by_uid")()
 	row := r.pool.QueryRowContext(ctx, q, addressBookID, uid)
 	c, err := scanContact(row.Scan)
@@ -714,7 +932,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 	if len(uids) == 0 {
 		return []Contact{}, nil
 	}
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`
 	defer observeDB(ctx, "contacts.list_by_uids")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, pq.Array(uids))
 	if err != nil {
@@ -734,7 +952,7 @@ func (r *contactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids 
 }
 
 func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error) {
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "contacts.list_for_book")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID)
 	if err != nil {
@@ -763,7 +981,7 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 		return nil, err
 	}
 
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC LIMIT $2 OFFSET $3`
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -791,7 +1009,7 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 }
 
 func (r *contactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error) {
-	const q = `SELECT id, address_book_id, uid, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "contacts.list_modified_since")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, since)
 	if err != nil {
@@ -812,7 +1030,7 @@ func (r *contactRepo) ListModifiedSince(ctx context.Context, addressBookID int64
 
 func (r *contactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error) {
 	const q = `
-SELECT c.id, c.address_book_id, c.uid, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
 FROM contacts c
 JOIN address_books ab ON ab.id = c.address_book_id
 WHERE ab.user_id = $1
@@ -849,7 +1067,7 @@ func (r *contactRepo) MaxLastModified(ctx context.Context, addressBookID int64) 
 
 func (r *contactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error) {
 	const q = `
-SELECT c.id, c.address_book_id, c.uid, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
 FROM contacts c
 JOIN address_books ab ON ab.id = c.address_book_id
 WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
@@ -871,6 +1089,92 @@ ORDER BY c.display_name
 		result = append(result, c)
 	}
 	return result, rows.Err()
+}
+
+func (r *contactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*Contact, error) {
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND resource_name=$2`
+	defer observeDB(ctx, "contacts.get_by_resource_name")()
+	row := r.pool.QueryRowContext(ctx, q, addressBookID, resourceName)
+	c, err := scanContact(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (r *contactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*Contact, error) {
+	defer observeDB(ctx, "contacts.copy_to_address_book")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	const selectQ = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	row := tx.QueryRowContext(ctx, selectQ, fromAddressBookID, uid)
+	src, err := scanContact(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if destResourceName == "" {
+		destResourceName = src.ResourceName
+		if destResourceName == "" {
+			destResourceName = src.UID
+		}
+	}
+
+	const existingDestQ = `SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`
+	var existingDestResourceName string
+	switch err := tx.QueryRowContext(ctx, existingDestQ, toAddressBookID, src.UID).Scan(&existingDestResourceName); {
+	case err == nil:
+	case errors.Is(err, sql.ErrNoRows):
+		existingDestResourceName = ""
+	default:
+		return nil, err
+	}
+
+	const deleteDestByNameQ = `DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`
+	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toAddressBookID, destResourceName, src.UID); err != nil {
+		return nil, err
+	}
+	if existingDestResourceName != "" && existingDestResourceName != destResourceName {
+		const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`
+		if _, err := tx.ExecContext(ctx, tombstoneQuery, toAddressBookID, src.UID, existingDestResourceName); err != nil {
+			return nil, err
+		}
+	}
+
+	const insertQ = `
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+ON CONFLICT (address_book_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_vcard = EXCLUDED.raw_vcard,
+        etag = EXCLUDED.etag,
+        display_name = EXCLUDED.display_name,
+        primary_email = EXCLUDED.primary_email,
+        birthday = EXCLUDED.birthday,
+        last_modified = NOW()
+RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
+`
+	insertRow := tx.QueryRowContext(ctx, insertQ, toAddressBookID, src.UID, destResourceName, src.RawVCard, newETag, src.DisplayName, src.PrimaryEmail, src.Birthday)
+	c, err := scanContact(insertRow.Scan)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 // appPasswordRepo implements AppPasswordRepository.
@@ -998,6 +1302,13 @@ func (r *deletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType
 	return result, rows.Err()
 }
 
+func (r *deletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {
+	const q = `DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND uid=$3 AND resource_name=$4`
+	defer observeDB(ctx, "deleted_resources.delete_by_identity")()
+	_, err := r.pool.ExecContext(ctx, q, resourceType, collectionID, uid, resourceName)
+	return err
+}
+
 func (r *deletedResourceRepo) Cleanup(ctx context.Context, olderThan time.Duration) (int64, error) {
 	const q = `DELETE FROM deleted_resources WHERE deleted_at < $1`
 	defer observeDB(ctx, "deleted_resources.cleanup")()
@@ -1100,6 +1411,422 @@ func (r *sessionRepo) DeleteExpired(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return rows, nil
+}
+
+// lockRepo implements LockRepository.
+type lockRepo struct {
+	pool *sql.DB
+}
+
+func validateLockDepth(depth string) error {
+	switch strings.ToLower(strings.TrimSpace(depth)) {
+	case "0", "infinity":
+		return nil
+	default:
+		return errors.New("invalid lock depth")
+	}
+}
+
+func (r *lockRepo) Create(ctx context.Context, lock Lock) (*Lock, error) {
+	defer observeDB(ctx, "locks.create")()
+	if err := validateLockDepth(lock.Depth); err != nil {
+		return nil, err
+	}
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Serialize concurrent lock creation for the resource and its parent path so
+	// parent/child lock requests observe each other before conflict checks run.
+	for _, resourcePath := range lockSerializationPaths(lock.ResourcePath) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
+			return nil, err
+		}
+	}
+
+	// Check for conflicting locks on the resource itself.
+	const conflictQ = `SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`
+	rows, err := tx.QueryContext(ctx, conflictQ, lock.ResourcePath)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var existingScope string
+		if err := rows.Scan(&existingScope); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if existingScope == "exclusive" || lock.LockScope == "exclusive" {
+			rows.Close()
+			return nil, ErrLockConflict
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Check for depth-infinity ancestor locks that would conflict.
+	ancestors := lockAncestorPaths(lock.ResourcePath)
+	if len(ancestors) > 0 {
+		const ancestorQ = `SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`
+		aRows, err := tx.QueryContext(ctx, ancestorQ, pq.Array(ancestors))
+		if err != nil {
+			return nil, err
+		}
+		for aRows.Next() {
+			var existingScope string
+			if err := aRows.Scan(&existingScope); err != nil {
+				aRows.Close()
+				return nil, err
+			}
+			if existingScope == "exclusive" || lock.LockScope == "exclusive" {
+				aRows.Close()
+				return nil, ErrLockConflict
+			}
+		}
+		aRows.Close()
+		if err := aRows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	if lock.Depth == "infinity" {
+		const descendantQ = `SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`
+		descendantPrefix := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.TrimSuffix(lock.ResourcePath, "/") + "/")
+		dRows, err := tx.QueryContext(ctx, descendantQ, descendantPrefix+"%")
+		if err != nil {
+			return nil, err
+		}
+		for dRows.Next() {
+			var existingScope string
+			if err := dRows.Scan(&existingScope); err != nil {
+				dRows.Close()
+				return nil, err
+			}
+			if existingScope == "exclusive" || lock.LockScope == "exclusive" {
+				dRows.Close()
+				return nil, ErrLockConflict
+			}
+		}
+		dRows.Close()
+		if err := dRows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	const insertQ = `
+INSERT INTO locks (token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at
+`
+	row := tx.QueryRowContext(ctx, insertQ, lock.Token, lock.ResourcePath, lock.UserID, lock.LockScope, lock.LockType, lock.Depth, lock.OwnerInfo, lock.TimeoutSeconds, lock.ExpiresAt)
+	var l Lock
+	if err := row.Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
+func lockSerializationPaths(resourcePath string) []string {
+	cleanPath := path.Clean(resourcePath)
+	paths := []string{cleanPath}
+	paths = append(paths, lockAncestorPaths(cleanPath)...)
+	return paths
+}
+
+// lockAncestorPaths returns all parent paths of p, excluding p itself.
+func lockAncestorPaths(p string) []string {
+	p = strings.TrimSuffix(p, "/")
+	var ancestors []string
+	for {
+		idx := strings.LastIndex(p, "/")
+		if idx <= 0 {
+			break
+		}
+		parent := p[:idx]
+		if parent == "" {
+			break
+		}
+		ancestors = append(ancestors, parent)
+		p = parent
+	}
+	return ancestors
+}
+
+func (r *lockRepo) GetByToken(ctx context.Context, token string) (*Lock, error) {
+	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE token=$1 AND expires_at > NOW()`
+	defer observeDB(ctx, "locks.get_by_token")()
+	var l Lock
+	if err := r.pool.QueryRowContext(ctx, q, token).Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &l, nil
+}
+
+func (r *lockRepo) ListByResource(ctx context.Context, resourcePath string) ([]Lock, error) {
+	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path=$1 AND expires_at > NOW() ORDER BY created_at`
+	defer observeDB(ctx, "locks.list_by_resource")()
+	rows, err := r.pool.QueryContext(ctx, q, resourcePath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+			return nil, err
+		}
+		result = append(result, l)
+	}
+	return result, rows.Err()
+}
+
+func (r *lockRepo) ListByResources(ctx context.Context, paths []string) ([]Lock, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`
+	defer observeDB(ctx, "locks.list_by_resources")()
+	rows, err := r.pool.QueryContext(ctx, q, pq.Array(paths))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+			return nil, err
+		}
+		result = append(result, l)
+	}
+	return result, rows.Err()
+}
+
+func (r *lockRepo) ListByResourcePrefix(ctx context.Context, prefix string) ([]Lock, error) {
+	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW() ORDER BY created_at`
+	defer observeDB(ctx, "locks.list_by_resource_prefix")()
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	rows, err := r.pool.QueryContext(ctx, q, escaped+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+			return nil, err
+		}
+		result = append(result, l)
+	}
+	return result, rows.Err()
+}
+
+func (r *lockRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	if fromPath == toPath {
+		return nil
+	}
+	defer observeDB(ctx, "locks.move_resource_path")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	const deleteQ = `DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`
+	if _, err := tx.ExecContext(ctx, deleteQ, toPath); err != nil {
+		return err
+	}
+
+	const moveQ = `UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`
+	if _, err := tx.ExecContext(ctx, moveQ, toPath, fromPath); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *lockRepo) DeleteByResourcePath(ctx context.Context, resourcePath string) error {
+	const q = `DELETE FROM locks WHERE resource_path=$1`
+	defer observeDB(ctx, "locks.delete_by_resource_path")()
+	_, err := r.pool.ExecContext(ctx, q, resourcePath)
+	return err
+}
+
+func (r *lockRepo) Delete(ctx context.Context, token string) error {
+	const q = `DELETE FROM locks WHERE token=$1`
+	defer observeDB(ctx, "locks.delete")()
+	_, err := r.pool.ExecContext(ctx, q, token)
+	return err
+}
+
+func (r *lockRepo) DeleteExpired(ctx context.Context) (int64, error) {
+	const q = `DELETE FROM locks WHERE expires_at < NOW()`
+	defer observeDB(ctx, "locks.delete_expired")()
+	res, err := r.pool.ExecContext(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+func (r *lockRepo) Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*Lock, error) {
+	const q = `UPDATE locks SET timeout_seconds=$1, expires_at=$2 WHERE token=$3 AND expires_at > NOW() RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at`
+	defer observeDB(ctx, "locks.refresh")()
+	var l Lock
+	if err := r.pool.QueryRowContext(ctx, q, newTimeout, newExpiry, token).Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &l, nil
+}
+
+// aclRepo implements ACLRepository.
+type aclRepo struct {
+	pool *sql.DB
+}
+
+func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error {
+	defer observeDB(ctx, "acl.set_acl")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Delete existing entries for this resource
+	const deleteQ = `DELETE FROM acl_entries WHERE resource_path=$1`
+	if _, err := tx.ExecContext(ctx, deleteQ, resourcePath); err != nil {
+		return err
+	}
+
+	// Insert the new entries
+	const insertQ = `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege) VALUES ($1, $2, $3, $4)`
+	for _, entry := range entries {
+		if _, err := tx.ExecContext(ctx, insertQ, resourcePath, entry.PrincipalHref, entry.IsGrant, entry.Privilege); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error) {
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`
+	defer observeDB(ctx, "acl.list_by_resource")()
+	rows, err := r.pool.QueryContext(ctx, q, resourcePath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ACLEntry
+	for rows.Next() {
+		var e ACLEntry
+		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+func (r *aclRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error) {
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE principal_href=$1 ORDER BY created_at`
+	defer observeDB(ctx, "acl.list_by_principal")()
+	rows, err := r.pool.QueryContext(ctx, q, principalHref)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ACLEntry
+	for rows.Next() {
+		var e ACLEntry
+		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+func (r *aclRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
+	const q = `
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
+    ) THEN FALSE
+    WHEN EXISTS (
+        SELECT 1 FROM acl_entries
+        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
+    ) THEN TRUE
+    ELSE FALSE
+END
+`
+	defer observeDB(ctx, "acl.has_privilege")()
+	var exists bool
+	if err := r.pool.QueryRowContext(ctx, q, resourcePath, principalHref, privilege).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (r *aclRepo) Delete(ctx context.Context, resourcePath string) error {
+	const q = `DELETE FROM acl_entries WHERE resource_path=$1`
+	defer observeDB(ctx, "acl.delete")()
+	_, err := r.pool.ExecContext(ctx, q, resourcePath)
+	return err
+}
+
+func (r *aclRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	if fromPath == toPath {
+		return nil
+	}
+	defer observeDB(ctx, "acl.move_resource_path")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	const deleteQ = `DELETE FROM acl_entries WHERE resource_path=$1`
+	if _, err := tx.ExecContext(ctx, deleteQ, toPath); err != nil {
+		return err
+	}
+
+	const moveQ = `UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`
+	if _, err := tx.ExecContext(ctx, moveQ, toPath, fromPath); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // EnsureDefaultCollections creates baseline calendar and address book when absent.
@@ -1214,7 +1941,7 @@ func scanContact(scan rowScanner) (Contact, error) {
 	var displayName sql.NullString
 	var primaryEmail sql.NullString
 	var birthday sql.NullTime
-	if err := scan(&c.ID, &c.AddressBookID, &c.UID, &c.RawVCard, &c.ETag, &displayName, &primaryEmail, &birthday, &c.LastModified); err != nil {
+	if err := scan(&c.ID, &c.AddressBookID, &c.UID, &c.ResourceName, &c.RawVCard, &c.ETag, &displayName, &primaryEmail, &birthday, &c.LastModified); err != nil {
 		return Contact{}, err
 	}
 	c.DisplayName = nullableString(displayName)

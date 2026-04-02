@@ -71,6 +71,8 @@ func main() {
 		log.Fatalf("failed to initialize auth service: %v", err)
 	}
 
+	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
+
 	r := httpserver.NewRouter(cfg, stor, authService)
 
 	srv := &http.Server{

@@ -309,6 +309,36 @@ func TestResolveDAVHrefHandlesRelativeAbsoluteAndURL(t *testing.T) {
 	}
 }
 
+func TestAddressBookMultiGetReportHandlesRelativeHrefAgainstResourceBase(t *testing.T) {
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+				ETag:          "etag-alice",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Contacts: contactRepo}}
+	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
+
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil)
+	if err != nil {
+		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0].Href != "/dav/addressbooks/5/alice.vcf" {
+		t.Fatalf("unexpected href %q", responses[0].Href)
+	}
+	if len(responses[0].Propstat) == 0 || responses[0].Propstat[0].Prop.GetETag != "\"etag-alice\"" {
+		t.Fatalf("expected response to include the fetched contact, got %#v", responses[0])
+	}
+}
+
 func TestParseSyncTokenRoundTrip(t *testing.T) {
 	ts := time.Date(2024, 6, 1, 12, 0, 0, 123, time.UTC)
 	token := buildSyncToken("cal", 7, ts)
@@ -344,11 +374,164 @@ func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
 	if allow := res.Header.Get("Allow"); !strings.Contains(allow, "PROPFIND") || !strings.Contains(allow, "REPORT") {
 		t.Fatalf("Allow header missing DAV verbs: %q", allow)
 	}
-	if dav := res.Header.Get("DAV"); dav != "1, 2, calendar-access, addressbook" {
+	if dav := res.Header.Get("DAV"); dav != "1, 2, 3, access-control, calendar-access, addressbook" {
 		t.Fatalf("DAV header = %q", dav)
 	}
 	if patch := res.Header.Get("Accept-Patch"); patch != "application/xml" {
 		t.Fatalf("Accept-Patch header = %q", patch)
+	}
+}
+
+func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
+	h := &Handler{}
+
+	tests := []struct {
+		path          string
+		wantCopyMove  bool
+		wantDAVHeader string
+	}{
+		{path: "/dav/addressbooks/5/", wantCopyMove: false, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
+		{path: "/dav/addressbooks/5/alice.vcf", wantCopyMove: true, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
+		{path: "/dav/calendars/2/", wantCopyMove: false, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
+		{path: "/dav/calendars/2/event.ics", wantCopyMove: true, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodOptions, tc.path, nil)
+
+			h.Options(rr, req)
+
+			allow := rr.Result().Header.Get("Allow")
+			hasCopy := strings.Contains(allow, "COPY")
+			hasMove := strings.Contains(allow, "MOVE")
+			if hasCopy != tc.wantCopyMove || hasMove != tc.wantCopyMove {
+				t.Fatalf("Allow header for %s = %q, want COPY/MOVE present=%t", tc.path, allow, tc.wantCopyMove)
+			}
+			if got := rr.Result().Header.Get("DAV"); got != tc.wantDAVHeader {
+				t.Fatalf("DAV header for %s = %q, want %q", tc.path, got, tc.wantDAVHeader)
+			}
+		})
+	}
+}
+
+func TestGetAdvertisesCurrentDAVCapabilities(t *testing.T) {
+	h := &Handler{}
+
+	t.Run("positive root request advertises current capabilities", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+
+		h.Get(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+		if got := rr.Header().Get("DAV"); got != "1, 2, 3, access-control, calendar-access, addressbook" {
+			t.Fatalf("GET DAV header = %q", got)
+		}
+	})
+
+	t.Run("negative root request does not advertise collection-only extensions", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+
+		h.Get(rr, req)
+
+		if got := rr.Header().Get("DAV"); strings.Contains(got, "extended-mkcol") {
+			t.Fatalf("GET DAV header should not include extended-mkcol, got %q", got)
+		}
+	})
+}
+
+func TestSupportsCopyMove(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "", want: false},
+		{path: "/", want: false},
+		{path: "/dav", want: false},
+		{path: "/dav/addressbooks/5/", want: false},
+		{path: "/dav/addressbooks/5/alice.vcf", want: true},
+		{path: "/dav/calendars/2/", want: false},
+		{path: "/dav/calendars/2/event.ics", want: true},
+	}
+
+	for _, tc := range tests {
+		if got := supportsCopyMove(tc.path); got != tc.want {
+			t.Fatalf("supportsCopyMove(%q) = %t, want %t", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestCanLockCalendarPath(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	sharedUser := &store.User{ID: 2, PrimaryEmail: "editor@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 5, UserID: 1, Name: "Home"}, Editor: true},
+			{Calendar: store.Calendar{ID: 6, UserID: 1, Name: "Readonly Shared"}, Shared: true, Editor: false},
+			{Calendar: store.Calendar{ID: 7, UserID: 1, Name: "Writable Shared"}, Shared: true, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: 1, Name: "Home"},
+			6: {ID: 6, UserID: 1, Name: "Readonly Shared"},
+			7: {ID: 7, UserID: 1, Name: "Writable Shared"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+
+	tests := []struct {
+		name string
+		user *store.User
+		path string
+		want bool
+	}{
+		{name: "owner collection", user: user, path: "/dav/calendars/5/", want: true},
+		{name: "shared editor resource", user: sharedUser, path: "/dav/calendars/7/event.ics", want: true},
+		{name: "shared readonly collection", user: sharedUser, path: "/dav/calendars/6/", want: false},
+		{name: "birthday calendar", user: user, path: fmt.Sprintf("/dav/calendars/%d/", birthdayCalendarID), want: false},
+		{name: "unsupported path", user: user, path: "/dav/unknown", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				got bool
+				err error
+			)
+			if strings.HasPrefix(tc.path, "/dav/calendars/") {
+				got, err = h.canLockCalendarPath(context.Background(), tc.user, tc.path)
+			} else {
+				got, err = h.canLockPath(context.Background(), tc.user, tc.path)
+			}
+			if err != nil {
+				t.Fatalf("canLock path error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("canLock path = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDefaultSupportedLock(t *testing.T) {
+	prop := defaultSupportedLock()
+	if prop == nil {
+		t.Fatal("defaultSupportedLock() = nil")
+	}
+	if len(prop.LockEntries) != 2 {
+		t.Fatalf("defaultSupportedLock() entries = %d, want 2", len(prop.LockEntries))
+	}
+	if prop.LockEntries[0].LockScope.Exclusive == nil || prop.LockEntries[0].LockType.Write == nil {
+		t.Fatal("first supported lock entry should advertise exclusive write")
+	}
+	if prop.LockEntries[1].LockScope.Shared == nil || prop.LockEntries[1].LockType.Write == nil {
+		t.Fatal("second supported lock entry should advertise shared write")
 	}
 }
 
@@ -552,8 +735,8 @@ func TestPropfindPrincipalsDepth0OmitsUserPrincipal(t *testing.T) {
 	if strings.Count(body, "<d:response>") != 1 {
 		t.Fatalf("expected only collection response, got %s", body)
 	}
-	if strings.Contains(body, "/dav/principals/1/") {
-		t.Fatalf("depth 0 should not include principal resource: %s", body)
+	if strings.Contains(body, "<d:href>/dav/principals/1/</d:href></d:response>") {
+		t.Fatalf("depth 0 should not include principal resource response: %s", body)
 	}
 }
 
@@ -637,9 +820,10 @@ func TestAddressBookReportFallsBackToQueryForUnknownType(t *testing.T) {
 	}
 	h := &Handler{store: &store.Store{Contacts: contactRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
-	book := &store.AddressBook{ID: 4, Name: "Contacts"}
+	book := &store.AddressBook{ID: 4, UserID: 1, Name: "Contacts"}
+	user := &store.User{ID: 1}
 
-	responses, _, err := h.addressBookReportResponses(context.Background(), book, "/dav/principals/1/", "/dav/addressbooks/4/", report)
+	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, nil)
 	if err != nil {
 		t.Fatalf("addressBookReportResponses returned error: %v", err)
 	}
@@ -719,6 +903,72 @@ func TestGetServesContact(t *testing.T) {
 	}
 }
 
+func TestGetRejectsWildcardAcceptRangeWithZeroQuality(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+				ETag:          "etag2",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+	req.Header.Set("Accept", `text/vcard; version="4.0", */*;q=0`)
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusNotAcceptable {
+		t.Fatalf("expected 406, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "supported-address-data-conversion") {
+		t.Fatalf("expected supported-address-data-conversion error, got %s", rr.Body.String())
+	}
+}
+
+func TestGetAddressBookResourceReturnsInternalServerErrorWhenACLLookupFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+				ETag:          "etag-alice",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{listByResourceErr: errors.New("acl lookup failed")}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "reader@example.com"}))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected ACL lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestGetRequiresUser(t *testing.T) {
 	h := &Handler{}
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/e.ics", nil)
@@ -728,6 +978,36 @@ func TestGetRequiresUser(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestGetRequiresUserEvenForDAVAllAddressBookRead(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "missing user") {
+		t.Fatalf("expected missing user error, got %q", rr.Body.String())
 	}
 }
 
@@ -756,6 +1036,63 @@ func TestDeleteRemovesContactFromAddressBook(t *testing.T) {
 	if _, ok := contactRepo.contacts[contactRepo.key(5, "alice")]; ok {
 		t.Fatal("contact should be deleted")
 	}
+}
+
+func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
+	user := &store.User{ID: 1}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+
+	t.Run("positive delete succeeds", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+			},
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Delete(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected successful delete to return 204, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if remaining, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); remaining != nil {
+			t.Fatalf("expected contact to be deleted, got %#v", remaining)
+		}
+	})
+
+	t.Run("negative lookup errors return 500 and preserve state", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+			},
+			getByResourceNameErr:    errors.New("lookup failed"),
+			getByResourceNameErrKey: "5:alice",
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Delete(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		contactRepo.getByResourceNameErr = nil
+		if remaining, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); remaining == nil {
+			t.Fatal("expected contact lookup failure to leave the contact untouched")
+		}
+		if len(contactRepo.deleted) != 0 {
+			t.Fatalf("expected delete to be skipped on lookup failure, got %#v", contactRepo.deleted)
+		}
+	})
 }
 
 func TestReportRequiresAuthentication(t *testing.T) {
@@ -828,8 +1165,9 @@ func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 		},
 	}
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
-	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"/>`
+	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -936,7 +1274,7 @@ func TestPutCreatesContact(t *testing.T) {
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
-	validVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n"
+	validVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -1081,6 +1419,49 @@ func TestMkcalendarRejectsSlugNameCollisions(t *testing.T) {
 	}
 }
 
+func TestMkcalendarRequiresParentCollectionLockToken(t *testing.T) {
+	calRepo := &fakeCalendarRepo{}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:root": {
+				Token:        "opaquelocktoken:root",
+				ResourcePath: "/dav/calendars",
+				UserID:       1,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusLocked {
+		t.Fatalf("expected 423 without parent collection lock token, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
+	req.Header.Set("If", "(<opaquelocktoken:root>)")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr = httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 with parent collection lock token, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(calRepo.calendars) != 1 {
+		t.Fatalf("expected calendar to be created once lock token was supplied, got %d", len(calRepo.calendars))
+	}
+}
+
 func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 	repo := &fakeContactRepo{
 		contacts: map[string]*store.Contact{
@@ -1088,17 +1469,26 @@ func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 			"3:skip": {AddressBookID: 3, UID: "skip", RawVCard: "VCARD", ETag: "etag-2"},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		2: {ID: 2, UserID: 1, Name: "Book"},
+	}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/keep.vcf", "/dav/addressbooks/3/skip.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), 2, hrefs, "/dav/addressbooks/2/")
+	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
 	if err != nil {
 		t.Fatalf("addressBookMultiGet returned error: %v", err)
 	}
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
 	}
 	if responses[0].Href != "/dav/addressbooks/2/keep.vcf" {
 		t.Fatalf("unexpected href %q", responses[0].Href)
+	}
+	if responses[1].Href != "/dav/addressbooks/3/skip.vcf" {
+		t.Fatalf("unexpected filtered href %q", responses[1].Href)
+	}
+	if responses[1].Status != httpStatusNotFound {
+		t.Fatalf("expected out-of-book href to return 404, got %q", responses[1].Status)
 	}
 }
 
@@ -1108,9 +1498,12 @@ func TestAddressBookMultiGetMissingReturns404(t *testing.T) {
 			"2:present": {AddressBookID: 2, UID: "present", RawVCard: "VCARD", ETag: "etag-1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		2: {ID: 2, UserID: 1, Name: "Book"},
+	}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/present.vcf", "/dav/addressbooks/2/missing.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), 2, hrefs, "/dav/addressbooks/2/")
+	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
 	if err != nil {
 		t.Fatalf("addressBookMultiGet returned error: %v", err)
 	}
@@ -1139,8 +1532,9 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 5, now.Add(-time.Hour)),
 	}
-	book := &store.AddressBook{ID: 5, Name: "Book", CTag: 1, UpdatedAt: now}
-	responses, token, err := h.addressBookReportResponses(context.Background(), book, "/dav/principals/1/", "/dav/addressbooks/5/", report)
+	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Book", CTag: 1, UpdatedAt: now}
+	user := &store.User{ID: 1}
+	responses, token, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, nil)
 	if err != nil {
 		t.Fatalf("addressBookReportResponses returned error: %v", err)
 	}
@@ -1685,6 +2079,100 @@ func TestReportAddressBookSyncCollectionViaHandler(t *testing.T) {
 	}
 }
 
+func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			3: {ID: 3, UserID: 1, Name: "Contacts", CTag: 1, UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"3:shared-uid": {AddressBookID: 3, UID: "shared-uid", ResourceName: "first", RawVCard: "VCARD", ETag: "e", LastModified: now},
+		},
+	}
+	deletedRepo := &fakeDeletedResourceRepo{
+		deleted: []store.DeletedResource{
+			{ResourceType: "contact", CollectionID: 3, UID: "gone-uid", ResourceName: "former", DeletedAt: now},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", rr.Code)
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "first.vcf") || !strings.Contains(respBody, "former.vcf") {
+		t.Fatalf("expected sync responses to use stored resource names, got %s", respBody)
+	}
+	if strings.Contains(respBody, "shared-uid.vcf") || strings.Contains(respBody, "gone-uid.vcf") {
+		t.Fatalf("sync responses should not fall back to UID-derived hrefs when resource names exist, got %s", respBody)
+	}
+}
+
+func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *testing.T) {
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			3: {ID: 3, UserID: 1, Name: "Contacts", CTag: 1, UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"3:secret": {AddressBookID: 3, UID: "secret", ResourceName: "secret", RawVCard: buildVCard("3.0", "UID:secret", "FN:Secret Person"), ETag: "secret-etag", LastModified: now},
+		},
+	}
+	deletedRepo := &fakeDeletedResourceRepo{
+		deleted: []store.DeletedResource{
+			{ResourceType: "contact", CollectionID: 3, UID: "public", ResourceName: "public", DeletedAt: now},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/3", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/3/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		},
+	}
+	st := &store.Store{
+		AddressBooks:     bookRepo,
+		Contacts:         contactRepo,
+		DeletedResources: deletedRepo,
+		ACLEntries:       aclRepo,
+		Locks:            &fakeLockRepo{},
+	}
+	if err := st.DeleteContactAndState(context.Background(), 3, "secret", "/dav/addressbooks/3/secret"); err != nil {
+		t.Fatalf("DeleteContactAndState() error = %v", err)
+	}
+	deletedRepo.deleted = append(deletedRepo.deleted, store.DeletedResource{
+		ResourceType: "contact",
+		CollectionID: 3,
+		UID:          "secret",
+		ResourceName: "secret",
+		DeletedAt:    now,
+	})
+
+	h := &Handler{store: st}
+	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}))
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "public.vcf") {
+		t.Fatalf("expected collection-level read grant to expose unrelated deleted tombstones, got %s", respBody)
+	}
+	if strings.Contains(respBody, "secret.vcf") {
+		t.Fatalf("expected object-level deny ACL to keep deleted tombstone hidden after delete, got %s", respBody)
+	}
+}
+
 func TestMkcolRequiresUser(t *testing.T) {
 	h := &Handler{}
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/Book", nil)
@@ -1745,11 +2233,11 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 	}
 	contactRepo := &fakeContactRepo{
 		contacts: map[string]*store.Contact{
-			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n", ETag: "e"},
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n", ETag: "e"},
 		},
 	}
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
-	newVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice Updated\r\nEMAIL:alice@example.com\r\nEND:VCARD\r\n"
+	newVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice Updated\r\nEMAIL:alice@example.com\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1786,13 +2274,79 @@ func TestReportCalendarNotFound(t *testing.T) {
 func TestReportAddressBookNotFound(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}}
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
-	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"/>`
+	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestReportAddressBookAliasResolutionDistinguishesMissingAndPresentAliases(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			3: {ID: 3, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	t.Run("positive alias resolves to address book", func(t *testing.T) {
+		body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
+		req := httptest.NewRequest("REPORT", "/dav/addressbooks/Contacts/", strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+
+		h.Report(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected 207 for alias-based address book REPORT, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "alice.vcf") {
+			t.Fatalf("expected alias-based REPORT to include contact, got %s", rr.Body.String())
+		}
+	})
+
+	t.Run("negative missing alias returns not found", func(t *testing.T) {
+		body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
+		req := httptest.NewRequest("REPORT", "/dav/addressbooks/Missing/", strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+
+		h.Report(rr, req)
+
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("expected missing alias REPORT to return 404, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestReportAddressBookQueryDepthZeroRequiresAccess(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			9: {ID: 9, UserID: 1, Name: "Private"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for inaccessible depth-0 addressbook-query, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1835,6 +2389,7 @@ func TestReportAddressBookMultiGetPath(t *testing.T) {
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/3/alice.vcf</D:href></card:addressbook-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
@@ -1843,6 +2398,36 @@ func TestReportAddressBookMultiGetPath(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "alice.vcf") {
 		t.Fatalf("expected contact response, got %s", rr.Body.String())
+	}
+}
+
+func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			3: {ID: 3, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: "VCARD", ETag: "e"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/Contacts/alice.vcf</D:href></card:addressbook-multiget>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "/dav/addressbooks/Contacts/alice.vcf") {
+		t.Fatalf("expected multiget to preserve the requested alias href, got %s", respBody)
+	}
+	if strings.Contains(respBody, "404 Not Found") {
+		t.Fatalf("expected alias href to resolve to the requested address book, got %s", respBody)
 	}
 }
 
@@ -1856,8 +2441,4000 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	}
 }
 
+func TestCalendarCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			eventRepo := &fakeEventRepo{
+				events: map[string]*store.Event{
+					"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-event"},
+				},
+			}
+			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+			req := httptest.NewRequest(method, "/dav/calendars/2/event.ics", nil)
+			req.Header.Set("Destination", "https://example.com/dav/calendars/2/event.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusNoContent {
+				t.Fatalf("expected same-resource %s to return 204, got %d", method, rr.Code)
+			}
+			event, _ := eventRepo.GetByResourceName(req.Context(), 2, "event")
+			if event == nil {
+				t.Fatalf("expected same-resource %s to preserve the source event", method)
+			}
+		})
+	}
+}
+
+func TestContactCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
+	user := &store.User{ID: 1}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+				},
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/alice.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusNoContent {
+				t.Fatalf("expected same-resource %s to return 204, got %d", method, rr.Code)
+			}
+			contact, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice")
+			if contact == nil {
+				t.Fatalf("expected same-resource %s to preserve the source contact", method)
+			}
+		})
+	}
+}
+
+func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+			{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Archive"}, Editor: true},
+		},
+	}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+			6: {ID: 6, UserID: 1, Name: "Archive"},
+		},
+	}
+
+	t.Run("calendar copy", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			},
+			copyErr: errors.New("copy failed"),
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", rr.Code)
+		}
+		if got, _ := eventRepo.GetByResourceName(req.Context(), 3, "copied"); got == nil || got.ETag != "etag-dest" {
+			t.Fatalf("expected existing destination event to be preserved, got %#v", got)
+		}
+		if len(eventRepo.deleted) != 0 {
+			t.Fatalf("expected no eager destination delete, got %#v", eventRepo.deleted)
+		}
+	})
+
+	t.Run("calendar move", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "moved", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			},
+			moveErr: errors.New("move failed"),
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", rr.Code)
+		}
+		if got, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); got == nil || got.ETag != "etag-dest" {
+			t.Fatalf("expected existing destination event to be preserved, got %#v", got)
+		}
+		if len(eventRepo.deleted) != 0 {
+			t.Fatalf("expected no eager destination delete, got %#v", eventRepo.deleted)
+		}
+	})
+
+	t.Run("contact copy", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
+				"6:alice": {AddressBookID: 6, UID: "alice", ResourceName: "copied", RawVCard: buildVCard("3.0", "UID:alice", "FN:Old Alice"), ETag: "etag-dest"},
+			},
+			copyErr: errors.New("copy failed"),
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
+		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", rr.Code)
+		}
+		if got, _ := contactRepo.GetByResourceName(req.Context(), 6, "copied"); got == nil || got.ETag != "etag-dest" {
+			t.Fatalf("expected existing destination contact to be preserved, got %#v", got)
+		}
+		if len(contactRepo.deleted) != 0 {
+			t.Fatalf("expected no eager destination delete, got %#v", contactRepo.deleted)
+		}
+	})
+
+	t.Run("contact move", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
+				"6:alice": {AddressBookID: 6, UID: "alice", ResourceName: "moved", RawVCard: buildVCard("3.0", "UID:alice", "FN:Old Alice"), ETag: "etag-dest"},
+			},
+			moveErr: errors.New("move failed"),
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", rr.Code)
+		}
+		if got, _ := contactRepo.GetByResourceName(req.Context(), 6, "moved"); got == nil || got.ETag != "etag-dest" {
+			t.Fatalf("expected existing destination contact to be preserved, got %#v", got)
+		}
+		if len(contactRepo.deleted) != 0 {
+			t.Fatalf("expected no eager destination delete, got %#v", contactRepo.deleted)
+		}
+	})
+}
+
+func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
+	user := &store.User{ID: 1}
+
+	t.Run("calendar move rebinding succeeds", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+				{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Archive"}, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			},
+		}
+		aclRepo := &fakeACLRepo{
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			},
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if moved, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); moved == nil {
+			t.Fatal("expected destination event after successful move")
+		}
+		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src != nil {
+			t.Fatalf("expected source event to be removed after move, got %#v", src)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/3/moved"); len(entries) != 1 {
+			t.Fatalf("expected ACL entry to move to destination, got %#v", entries)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/2/event"); len(entries) != 0 {
+			t.Fatalf("expected source ACL entry to be cleared, got %#v", entries)
+		}
+	})
+
+	t.Run("calendar move rolls back when ACL rebind fails", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+				{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Archive"}, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			},
+		}
+		deletedRepo := &fakeDeletedResourceRepo{}
+		aclRepo := &fakeACLRepo{
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			},
+			moveResourcePathHook: func(fromPath, toPath string) {
+				deletedRepo.deleted = []store.DeletedResource{
+					{ResourceType: "event", CollectionID: 2, UID: "event", ResourceName: "event", DeletedAt: time.Now()},
+					{ResourceType: "event", CollectionID: 3, UID: "event", ResourceName: "moved", DeletedAt: time.Now()},
+				}
+			},
+			moveResourcePathErr: errors.New("acl move failed"),
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src == nil || src.ETag != "etag-source" {
+			t.Fatalf("expected source event to be restored, got %#v", src)
+		}
+		if dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); dest != nil {
+			t.Fatalf("expected destination event creation to be rolled back, got %#v", dest)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/2/event"); len(entries) != 1 {
+			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/3/moved"); len(entries) != 0 {
+			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
+		}
+		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{}); len(tombstones) != 0 {
+			t.Fatalf("expected source event tombstones to be removed during rollback, got %#v", tombstones)
+		}
+		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 3, time.Time{}); len(tombstones) != 0 {
+			t.Fatalf("expected destination event tombstones to be removed during rollback, got %#v", tombstones)
+		}
+	})
+
+	t.Run("contact move rebinding succeeds", func(t *testing.T) {
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Contacts"},
+				6: {ID: 6, UserID: 1, Name: "Archive"},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
+			},
+		}
+		aclRepo := &fakeACLRepo{
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			},
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if moved, _ := contactRepo.GetByResourceName(req.Context(), 6, "moved"); moved == nil {
+			t.Fatal("expected destination contact after successful move")
+		}
+		if src, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); src != nil {
+			t.Fatalf("expected source contact to be removed after move, got %#v", src)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/6/moved"); len(entries) != 1 {
+			t.Fatalf("expected ACL entry to move to destination, got %#v", entries)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/5/alice"); len(entries) != 0 {
+			t.Fatalf("expected source ACL entry to be cleared, got %#v", entries)
+		}
+	})
+
+	t.Run("contact move rolls back when ACL rebind fails", func(t *testing.T) {
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Contacts"},
+				6: {ID: 6, UserID: 1, Name: "Archive"},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
+			},
+		}
+		deletedRepo := &fakeDeletedResourceRepo{}
+		aclRepo := &fakeACLRepo{
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			},
+			moveResourcePathHook: func(fromPath, toPath string) {
+				deletedRepo.deleted = []store.DeletedResource{
+					{ResourceType: "contact", CollectionID: 5, UID: "alice", ResourceName: "alice", DeletedAt: time.Now()},
+					{ResourceType: "contact", CollectionID: 6, UID: "alice", ResourceName: "moved", DeletedAt: time.Now()},
+				}
+			},
+			moveResourcePathErr: errors.New("acl move failed"),
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if src, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); src == nil || src.ETag != "etag-source" {
+			t.Fatalf("expected source contact to be restored, got %#v", src)
+		}
+		if dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "moved"); dest != nil {
+			t.Fatalf("expected destination contact creation to be rolled back, got %#v", dest)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/5/alice"); len(entries) != 1 {
+			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
+		}
+		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/6/moved"); len(entries) != 0 {
+			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
+		}
+		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 5, time.Time{}); len(tombstones) != 0 {
+			t.Fatalf("expected source contact tombstones to be removed during rollback, got %#v", tombstones)
+		}
+		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{}); len(tombstones) != 0 {
+			t.Fatalf("expected destination contact tombstones to be removed during rollback, got %#v", tombstones)
+		}
+	})
+}
+
+func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+			{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Archive"}, Editor: true},
+		},
+	}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+			6: {ID: 6, UserID: 1, Name: "Archive"},
+		},
+	}
+
+	t.Run("calendar", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			},
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req1 := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
+		req1.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
+		req1 = req1.WithContext(auth.WithUser(req1.Context(), user))
+		rr1 := httptest.NewRecorder()
+		h.Copy(rr1, req1)
+
+		req2 := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
+		req2.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
+		req2 = req2.WithContext(auth.WithUser(req2.Context(), user))
+		rr2 := httptest.NewRecorder()
+		h.Copy(rr2, req2)
+
+		if rr1.Code != http.StatusNoContent || rr2.Code != http.StatusNoContent {
+			t.Fatalf("expected repeated calendar COPY overwrite to return 204, got %d and %d", rr1.Code, rr2.Code)
+		}
+		etag1 := strings.Trim(rr1.Header().Get("ETag"), "\"")
+		etag2 := strings.Trim(rr2.Header().Get("ETag"), "\"")
+		if etag1 == "" || etag2 == "" {
+			t.Fatalf("expected COPY responses to include ETags, got %q and %q", etag1, etag2)
+		}
+		if etag1 == etag2 {
+			t.Fatalf("expected repeated calendar COPY overwrite to generate a fresh ETag, got %q twice", etag1)
+		}
+	})
+
+	t.Run("contact", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-source"},
+				"6:alice": {AddressBookID: 6, UID: "alice", ResourceName: "copied", RawVCard: buildVCard("3.0", "UID:alice", "FN:Old Alice"), ETag: "etag-dest"},
+			},
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+		req1 := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
+		req1.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+		req1 = req1.WithContext(auth.WithUser(req1.Context(), user))
+		rr1 := httptest.NewRecorder()
+		h.Copy(rr1, req1)
+
+		req2 := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
+		req2.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+		req2 = req2.WithContext(auth.WithUser(req2.Context(), user))
+		rr2 := httptest.NewRecorder()
+		h.Copy(rr2, req2)
+
+		if rr1.Code != http.StatusNoContent || rr2.Code != http.StatusNoContent {
+			t.Fatalf("expected repeated contact COPY overwrite to return 204, got %d and %d", rr1.Code, rr2.Code)
+		}
+		etag1 := strings.Trim(rr1.Header().Get("ETag"), "\"")
+		etag2 := strings.Trim(rr2.Header().Get("ETag"), "\"")
+		if etag1 == "" || etag2 == "" {
+			t.Fatalf("expected COPY responses to include ETags, got %q and %q", etag1, etag2)
+		}
+		if etag1 == etag2 {
+			t.Fatalf("expected repeated contact COPY overwrite to generate a fresh ETag, got %q twice", etag1)
+		}
+	})
+}
+
+func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+			{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Archive"}, Editor: true},
+		},
+	}
+
+	t.Run("positive copy succeeds when destination lookups succeed", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			},
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("expected successful copy to return 201, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if copied, _ := eventRepo.GetByResourceName(req.Context(), 3, "copied"); copied == nil {
+			t.Fatal("expected destination event to be created")
+		}
+	})
+
+	t.Run("negative copy returns 500 on destination resource lookup error", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			},
+			getByResourceNameErr: errors.New("resource lookup failed"),
+			getByResourceNameKey: "3:copied",
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected destination lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		eventRepo.getByResourceNameErr = nil
+		if dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "copied"); dest == nil || dest.ETag != "etag-dest" {
+			t.Fatalf("expected destination event to remain unchanged, got %#v", dest)
+		}
+		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src == nil {
+			t.Fatal("expected source event to remain after failed copy")
+		}
+	})
+
+	t.Run("negative move returns 500 on destination UID lookup error", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "moved", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			},
+			getByUIDErr:    errors.New("uid lookup failed"),
+			getByUIDErrKey: "3:event",
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Move(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected destination UID lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		eventRepo.getByUIDErr = nil
+		if dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); dest == nil || dest.ETag != "etag-dest" {
+			t.Fatalf("expected destination event to remain unchanged, got %#v", dest)
+		}
+		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src == nil {
+			t.Fatal("expected source event to remain after failed move")
+		}
+	})
+}
+
+func TestCopyWithinSameCollectionRejectsRebindingSameUID(t *testing.T) {
+	user := &store.User{ID: 1}
+
+	t.Run("calendar", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			},
+		}
+		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/calendars/2/original.ics", nil)
+		req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("expected same-calendar COPY rebinding to fail with 409, got %d: %s", rr.Code, rr.Body.String())
+		}
+		source, _ := eventRepo.GetByResourceName(req.Context(), 2, "original")
+		if source == nil || source.UID != "event" {
+			t.Fatalf("expected source event to remain bound to original href, got %#v", source)
+		}
+		dest, _ := eventRepo.GetByResourceName(req.Context(), 2, "renamed")
+		if dest != nil {
+			t.Fatalf("expected destination href to remain absent, got %#v", dest)
+		}
+		events, _ := eventRepo.ListForCalendar(req.Context(), 2)
+		if len(events) != 1 {
+			t.Fatalf("expected same-calendar COPY rejection to leave one event, got %#v", events)
+		}
+	})
+
+	t.Run("contact", func(t *testing.T) {
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Contacts"},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "original", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
+			},
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/original.vcf", nil)
+		req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/renamed.vcf")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Copy(rr, req)
+
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("expected same-address-book COPY rebinding to fail with 409, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "no-uid-conflict") {
+			t.Fatalf("expected CardDAV no-uid-conflict response, got %s", rr.Body.String())
+		}
+		source, _ := contactRepo.GetByResourceName(req.Context(), 5, "original")
+		if source == nil || source.UID != "alice" {
+			t.Fatalf("expected source contact to remain bound to original href, got %#v", source)
+		}
+		dest, _ := contactRepo.GetByResourceName(req.Context(), 5, "renamed")
+		if dest != nil {
+			t.Fatalf("expected destination href to remain absent, got %#v", dest)
+		}
+		contacts, _ := contactRepo.ListForBook(req.Context(), 5)
+		if len(contacts) != 1 {
+			t.Fatalf("expected same-address-book COPY rejection to leave one contact, got %#v", contacts)
+		}
+	})
+}
+
+func TestCalendarCopyAndMoveRejectDestinationUIDConflict(t *testing.T) {
+	user := &store.User{ID: 1}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				accessible: []store.CalendarAccess{
+					{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Source"}, Editor: true},
+					{Calendar: store.Calendar{ID: 3, UserID: 1, Name: "Destination"}, Editor: true},
+				},
+			}
+			eventRepo := &fakeEventRepo{
+				events: map[string]*store.Event{
+					"2:event": {CalendarID: 2, UID: "event", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+					"3:event": {CalendarID: 3, UID: "event", ResourceName: "existing", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+				},
+			}
+			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+			req := httptest.NewRequest(method, "/dav/calendars/2/original.ics", nil)
+			req.Header.Set("Destination", "https://example.com/dav/calendars/3/renamed.ics")
+			req.Header.Set("Overwrite", "F")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("expected %s with destination UID conflict to return 409, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "no-uid-conflict") {
+				t.Fatalf("expected %s conflict body to contain no-uid-conflict, got %s", method, rr.Body.String())
+			}
+			dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "existing")
+			if dest == nil || dest.UID != "event" {
+				t.Fatalf("expected %s to preserve the existing destination event, got %#v", method, dest)
+			}
+			renamed, _ := eventRepo.GetByResourceName(req.Context(), 3, "renamed")
+			if renamed != nil {
+				t.Fatalf("expected %s to leave the requested destination href absent, got %#v", method, renamed)
+			}
+			source, _ := eventRepo.GetByResourceName(req.Context(), 2, "original")
+			if source == nil || source.UID != "event" {
+				t.Fatalf("expected %s to preserve the source event, got %#v", method, source)
+			}
+		})
+	}
+}
+
+func TestMoveCalendarEventOverwriteWithinSameCalendarReplacesDestination(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:source\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:destination\r\nSUMMARY:Destination\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
+	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Move(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite MOVE within same calendar to return 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+	source, _ := eventRepo.GetByResourceName(req.Context(), 2, "original")
+	if source != nil {
+		t.Fatalf("expected old source href to be removed, got %#v", source)
+	}
+	moved, _ := eventRepo.GetByResourceName(req.Context(), 2, "renamed")
+	if moved == nil || moved.UID != "source" {
+		t.Fatalf("expected destination href to point at moved source event, got %#v", moved)
+	}
+	replaced, _ := eventRepo.GetByUID(req.Context(), 2, "destination")
+	if replaced != nil {
+		t.Fatalf("expected overwritten destination event to be removed, got %#v", replaced)
+	}
+	events, _ := eventRepo.ListForCalendar(req.Context(), 2)
+	if len(events) != 1 {
+		t.Fatalf("expected overwrite MOVE to leave one event in the calendar, got %#v", events)
+	}
+}
+
+func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
+	user := &store.User{ID: 1}
+	deletedRepo := &fakeDeletedResourceRepo{}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:source\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:destination\r\nSUMMARY:Destination\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+		},
+		overwriteMoveDeletedRepo: deletedRepo,
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+
+	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
+	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Move(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite MOVE within same calendar to return 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{})
+	if err != nil {
+		t.Fatalf("ListDeletedSince() error = %v", err)
+	}
+	for _, tombstone := range tombstones {
+		if tombstone.ResourceName == "renamed" {
+			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
+		}
+	}
+}
+
+func TestCanonicalDAVPathUsesExtensionlessResourceIdentity(t *testing.T) {
+	slug := "work"
+	h := &Handler{store: &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Slug: &slug}, Editor: true},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: 1, Name: "Work", Slug: &slug},
+			},
+		},
+		AddressBooks: &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Contacts"},
+			},
+		},
+	}}
+	user := &store.User{ID: 1}
+
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/dav/calendars/2/event.ics", want: "/dav/calendars/2/event"},
+		{path: "/dav/calendars/work/event.txt", want: "/dav/calendars/2/event"},
+		{path: "/dav/addressbooks/5/alice.vcf", want: "/dav/addressbooks/5/alice"},
+		{path: "/dav/addressbooks/Contacts/alice.txt", want: "/dav/addressbooks/5/alice"},
+	}
+
+	for _, tc := range tests {
+		got, err := h.canonicalDAVPath(context.Background(), user, tc.path)
+		if err != nil {
+			t.Fatalf("canonicalDAVPath(%q) error = %v", tc.path, err)
+		}
+		if got != tc.want {
+			t.Fatalf("canonicalDAVPath(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeDAVResourceIdentityPreservesDottedCanonicalNames(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/dav/calendars/2/event.v2", want: "/dav/calendars/2/event.v2"},
+		{path: "/dav/addressbooks/5/alice.v1", want: "/dav/addressbooks/5/alice.v1"},
+		{path: "/dav/calendars/2/event.ics", want: "/dav/calendars/2/event"},
+		{path: "/dav/addressbooks/5/alice.vcf", want: "/dav/addressbooks/5/alice"},
+	}
+
+	for _, tc := range tests {
+		if got := normalizeDAVResourceIdentity(tc.path); got != tc.want {
+			t.Fatalf("normalizeDAVResourceIdentity(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestDeleteRejectsCanonicalResourceLockAcrossExtensions(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice", UserID: 2, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.txt", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusLocked {
+		t.Fatalf("expected canonical lock check to block DELETE with 423, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetRejectsCanonicalResourceACLAcrossExtensions(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.txt", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected canonical ACL check to reject GET with 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLockAndACLRejectOversizedBodies(t *testing.T) {
+	user := &store.User{ID: 1}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+
+	t.Run("lock", func(t *testing.T) {
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: &fakeLockRepo{locks: map[string]*store.Lock{}}}}
+		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
+		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Lock(rr, req)
+
+		if rr.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected oversized LOCK body to return 413, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("acl", func(t *testing.T) {
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: &fakeACLRepo{}}}
+		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
+		req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Acl(rr, req)
+
+		if rr.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected oversized ACL body to return 413, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestCalendarCopyRequiresReadAccessToSource(t *testing.T) {
+	owner := &store.User{ID: 1}
+	attacker := &store.User{ID: 2}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 9, UserID: owner.ID, Name: "Private"}, Editor: true},
+			},
+			attacker.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: attacker.ID, Name: "Mine"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: attacker.ID, Name: "Mine"},
+			9: {ID: 9, UserID: owner.ID, Name: "Private"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"9:secret": {
+				CalendarID:   9,
+				UID:          "secret",
+				ResourceName: "secret",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nSUMMARY:Top Secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-secret",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest("COPY", "/dav/calendars/9/secret.ics", nil)
+	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
+	req = req.WithContext(auth.WithUser(req.Context(), attacker))
+	rr := httptest.NewRecorder()
+	h.Copy(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected unauthorized source COPY to return 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if copied, _ := eventRepo.GetByResourceName(req.Context(), 2, "copied"); copied != nil {
+		t.Fatalf("expected COPY to leave destination untouched, got %#v", copied)
+	}
+}
+
+func TestCalendarMoveRejectsUnauthorizedSourceBeforeEventLookup(t *testing.T) {
+	owner := &store.User{ID: 1}
+	attacker := &store.User{ID: 2}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 9, UserID: owner.ID, Name: "Private"}, Editor: true},
+			},
+			attacker.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: attacker.ID, Name: "Mine"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: attacker.ID, Name: "Mine"},
+			9: {ID: 9, UserID: owner.ID, Name: "Private"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"9:secret": {
+				CalendarID:   9,
+				UID:          "secret",
+				ResourceName: "secret",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nSUMMARY:Top Secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-secret",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
+	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
+	req = req.WithContext(auth.WithUser(req.Context(), attacker))
+	rr := httptest.NewRecorder()
+	h.Move(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected unauthorized source MOVE to return 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if eventRepo.resourceLookupCount != 0 {
+		t.Fatalf("expected MOVE to reject unauthorized source before loading the event, got %d lookups", eventRepo.resourceLookupCount)
+	}
+}
+
+func TestContactCopyAndMoveRejectUnauthorizedSourceBeforeContactLookup(t *testing.T) {
+	owner := &store.User{ID: 1}
+	attacker := &store.User{ID: 2}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			2: {ID: 2, UserID: attacker.ID, Name: "Mine"},
+			9: {ID: 9, UserID: owner.ID, Name: "Private"},
+		},
+	}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"9:secret": {
+						AddressBookID: 9,
+						UID:           "secret",
+						ResourceName:  "secret",
+						RawVCard:      buildVCard("3.0", "UID:secret", "FN:Top Secret"),
+						ETag:          "etag-secret",
+					},
+				},
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+			req := httptest.NewRequest(method, "/dav/addressbooks/9/secret.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/2/copied.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), attacker))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("expected unauthorized source %s to return 404, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if contactRepo.resourceLookupCount != 0 {
+				t.Fatalf("expected %s to reject unauthorized source before loading the contact, got %d lookups", method, contactRepo.resourceLookupCount)
+			}
+		})
+	}
+}
+
+func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+
+	if lockRR.Code != http.StatusOK {
+		t.Fatalf("expected LOCK to succeed, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+
+	token := lockRR.Header().Get("Lock-Token")
+	unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/bob.vcf", nil)
+	unlockReq.Header.Set("Lock-Token", token)
+	unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user))
+	unlockRR := httptest.NewRecorder()
+	h.Unlock(unlockRR, unlockReq)
+
+	if unlockRR.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected mismatched UNLOCK to return 412, got %d: %s", unlockRR.Code, unlockRR.Body.String())
+	}
+	if lock, _ := lockRepo.GetByToken(context.Background(), strings.Trim(token, "<>")); lock == nil {
+		t.Fatal("expected mismatched UNLOCK to preserve the original lock")
+	}
+}
+
+func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", strings.NewReader(lockBody))
+	lockReq.Header.Set("Depth", "infinity")
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+
+	if lockRR.Code != http.StatusOK {
+		t.Fatalf("expected collection LOCK to succeed, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+	token := lockRR.Header().Get("Lock-Token")
+	token = strings.Trim(token, "<>")
+	original, _ := lockRepo.GetByToken(context.Background(), token)
+	if original == nil {
+		t.Fatal("expected collection lock to be stored")
+	}
+
+	t.Run("refresh uses lock root", func(t *testing.T) {
+		refreshReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", nil)
+		refreshReq.Header.Set("If", "(<"+token+">)")
+		refreshReq.Header.Set("Timeout", "Second-7200")
+		refreshReq = refreshReq.WithContext(auth.WithUser(refreshReq.Context(), user))
+		refreshRR := httptest.NewRecorder()
+		h.Lock(refreshRR, refreshReq)
+
+		if refreshRR.Code != http.StatusOK {
+			t.Fatalf("expected lock-root refresh to succeed, got %d: %s", refreshRR.Code, refreshRR.Body.String())
+		}
+
+		descendantReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
+		descendantReq.Header.Set("If", "(<"+token+">)")
+		descendantReq.Header.Set("Timeout", "Second-3600")
+		descendantReq = descendantReq.WithContext(auth.WithUser(descendantReq.Context(), user))
+		descendantRR := httptest.NewRecorder()
+		h.Lock(descendantRR, descendantReq)
+
+		if descendantRR.Code != http.StatusPreconditionFailed {
+			t.Fatalf("expected descendant refresh to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
+		}
+	})
+
+	t.Run("unlock uses lock root", func(t *testing.T) {
+		descendantReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
+		descendantReq.Header.Set("Lock-Token", "<"+token+">")
+		descendantReq = descendantReq.WithContext(auth.WithUser(descendantReq.Context(), user))
+		descendantRR := httptest.NewRecorder()
+		h.Unlock(descendantRR, descendantReq)
+
+		if descendantRR.Code != http.StatusPreconditionFailed {
+			t.Fatalf("expected descendant UNLOCK to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
+		}
+		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock == nil {
+			t.Fatal("expected descendant UNLOCK to preserve the collection lock")
+		}
+
+		unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/", nil)
+		unlockReq.Header.Set("Lock-Token", "<"+token+">")
+		unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user))
+		unlockRR := httptest.NewRecorder()
+		h.Unlock(unlockRR, unlockReq)
+
+		if unlockRR.Code != http.StatusNoContent {
+			t.Fatalf("expected lock-root UNLOCK to succeed, got %d: %s", unlockRR.Code, unlockRR.Body.String())
+		}
+	})
+}
+
+func TestLockCoversPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		lockPath    string
+		depth       string
+		requestPath string
+		want        bool
+	}{
+		{name: "exact match", lockPath: "/dav/addressbooks/5/alice", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
+		{name: "descendant covered by infinity", lockPath: "/dav/addressbooks/5", depth: "infinity", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
+		{name: "descendant not covered by depth zero", lockPath: "/dav/addressbooks/5", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: false},
+		{name: "sibling not covered", lockPath: "/dav/addressbooks/5/alice", depth: "infinity", requestPath: "/dav/addressbooks/5/bob.vcf", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lockCoversPath(tc.lockPath, tc.depth, tc.requestPath); got != tc.want {
+				t.Fatalf("lockCoversPath(%q, %q, %q) = %t, want %t", tc.lockPath, tc.depth, tc.requestPath, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestACLNormalizesPrincipalHrefWithoutTrailingSlash(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	user2 := &store.User{ID: 2, PrimaryEmail: "user2@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared Contacts"},
+		},
+	}
+	aclRepo := &fakeACLRepo{}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2</D:href></D:principal>
+    <D:grant>
+      <D:privilege><D:read/></D:privilege>
+    </D:grant>
+  </D:ace>
+</D:acl>`
+
+	req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), owner))
+	rr := httptest.NewRecorder()
+	h.Acl(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected ACL to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	granted, err := h.checkACLPrivilege(context.Background(), user2, "/dav/addressbooks/5", "read")
+	if err != nil {
+		t.Fatalf("checkACLPrivilege() error = %v", err)
+	}
+	if !granted {
+		t.Fatal("expected normalized principal href to grant read access")
+	}
+}
+
+func TestACLRejectsInvalidPrivileges(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared Contacts"},
+		},
+	}
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unsupported privilege element",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant>
+      <D:privilege><D:unlock/></D:privilege>
+    </D:grant>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "mixed valid and unsupported privileges",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant>
+      <D:privilege><D:read/></D:privilege>
+      <D:privilege><D:unlock/></D:privilege>
+    </D:grant>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "known privilege contains nested element",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant>
+      <D:privilege>
+        <D:read>
+          <D:write/>
+        </D:read>
+      </D:privilege>
+    </D:grant>
+  </D:ace>
+</D:acl>`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			aclRepo := &fakeACLRepo{
+				entries: []store.ACLEntry{{
+					ResourcePath:  "/dav/addressbooks/5",
+					PrincipalHref: "/dav/principals/9/",
+					IsGrant:       true,
+					Privilege:     "read",
+				}},
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+
+			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
+			req = req.WithContext(auth.WithUser(req.Context(), owner))
+			rr := httptest.NewRecorder()
+			h.Acl(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected ACL to reject invalid privilege with 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+
+			entries, err := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/5")
+			if err != nil {
+				t.Fatalf("ListByResource() error = %v", err)
+			}
+			if len(entries) != 1 || entries[0].PrincipalHref != "/dav/principals/9/" || entries[0].Privilege != "read" {
+				t.Fatalf("expected invalid ACL request to leave stored entries unchanged, got %#v", entries)
+			}
+		})
+	}
+}
+
+func TestLockAndACLCanonicalizeAddressBookAliases(t *testing.T) {
+	t.Run("lock alias blocks canonical path writes", func(t *testing.T) {
+		user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: user.ID, Name: "ProvisionedBook"},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+			},
+		}
+		lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+		lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+		lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/ProvisionedBook/alice.vcf", strings.NewReader(lockBody))
+		lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+		lockRR := httptest.NewRecorder()
+		h.Lock(lockRR, lockReq)
+
+		if lockRR.Code != http.StatusOK {
+			t.Fatalf("expected LOCK to succeed, got %d: %s", lockRR.Code, lockRR.Body.String())
+		}
+		var created *store.Lock
+		for _, lock := range lockRepo.locks {
+			created = lock
+			break
+		}
+		if created == nil {
+			t.Fatalf("expected lock to be stored, got %#v", lockRepo.locks)
+		}
+		if created.ResourcePath != "/dav/addressbooks/5/alice" {
+			t.Fatalf("expected canonical lock path, got %q", created.ResourcePath)
+		}
+
+		putReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
+		putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
+		putRR := httptest.NewRecorder()
+		h.Put(putRR, putReq)
+
+		if putRR.Code != http.StatusLocked {
+			t.Fatalf("expected canonical path PUT to be blocked by alias lock, got %d: %s", putRR.Code, putRR.Body.String())
+		}
+	})
+
+	t.Run("acl alias grants apply to canonical path", func(t *testing.T) {
+		owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+		reader := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: owner.ID, Name: "Contacts"},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+			},
+		}
+		aclRepo := &fakeACLRepo{}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant><D:privilege><D:read/></D:privilege></D:grant>
+  </D:ace>
+</D:acl>`
+
+		aclReq := httptest.NewRequest("ACL", "/dav/addressbooks/Contacts/", strings.NewReader(body))
+		aclReq = aclReq.WithContext(auth.WithUser(aclReq.Context(), owner))
+		aclRR := httptest.NewRecorder()
+		h.Acl(aclRR, aclReq)
+
+		if aclRR.Code != http.StatusOK {
+			t.Fatalf("expected ACL to succeed, got %d: %s", aclRR.Code, aclRR.Body.String())
+		}
+		entries, err := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/5")
+		if err != nil {
+			t.Fatalf("ListByResource() error = %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected ACL to be stored on canonical path, got %#v", entries)
+		}
+
+		getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+		getReq = getReq.WithContext(auth.WithUser(getReq.Context(), reader))
+		getRR := httptest.NewRecorder()
+		h.Get(getRR, getReq)
+
+		if getRR.Code != http.StatusOK {
+			t.Fatalf("expected canonical GET to honor alias ACL grant, got %d: %s", getRR.Code, getRR.Body.String())
+		}
+	})
+}
+
+func TestLockResponseUsesServedResourceHref(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Lock(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected LOCK to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "/dav/addressbooks/5/alice.vcf") {
+		t.Fatalf("expected LOCK response to advertise a served resource href, got %s", rr.Body.String())
+	}
+}
+
+func TestLockCreateRequiresRequestBody(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+		},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Lock(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected bodyless LOCK create to return 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(lockRepo.locks) != 0 {
+		t.Fatalf("expected bodyless LOCK create to persist no locks, got %#v", lockRepo.locks)
+	}
+}
+
+func TestLockRejectsInvalidRequestBodies(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "malformed XML",
+			body: `<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>`,
+		},
+		{
+			name: "missing lockscope",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`,
+		},
+		{
+			name: "missing locktype",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+</D:lockinfo>`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(tc.body))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			h.Lock(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected invalid LOCK request to return 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if len(lockRepo.locks) != 0 {
+				t.Fatalf("expected invalid LOCK request to persist no locks, got %#v", lockRepo.locks)
+			}
+		})
+	}
+}
+
+func TestLockOnUnmappedCollectionReturnsCreated(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	req := httptest.NewRequest("LOCK", "/dav/addressbooks/NewBook", strings.NewReader(lockBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Lock(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected LOCK on an unmapped collection to return 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Lock-Token") == "" {
+		t.Fatal("expected LOCK on an unmapped collection to return a lock token")
+	}
+}
+
+func TestLockDoesNotPersistWhenTargetResolutionFails(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		getByResourceNameErr:    errors.New("lookup failed"),
+		getByResourceNameErrKey: "5:alice",
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Lock(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected LOCK target resolution failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(lockRepo.locks) != 0 {
+		t.Fatalf("expected failed LOCK to leave no persisted lock, got %#v", lockRepo.locks)
+	}
+}
+
+func TestMkcolRebindsPendingCollectionLocks(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/NewBook", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+
+	if lockRR.Code != http.StatusCreated {
+		t.Fatalf("expected LOCK to succeed with 201, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+	token := strings.Trim(lockRR.Header().Get("Lock-Token"), "<>")
+	if token == "" {
+		t.Fatal("expected lock token to be returned")
+	}
+
+	createReq := httptest.NewRequest("MKCOL", "/dav/addressbooks/NewBook", nil)
+	createReq.Header.Set("If", "(<"+token+">)")
+	createReq = createReq.WithContext(auth.WithUser(createReq.Context(), user))
+	createRR := httptest.NewRecorder()
+	h.Mkcol(createRR, createReq)
+
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("expected MKCOL to succeed, got %d: %s", createRR.Code, createRR.Body.String())
+	}
+	if got := createRR.Header().Get("Location"); got != "/dav/addressbooks/1/" {
+		t.Fatalf("expected MKCOL location to point at the created collection, got %q", got)
+	}
+	createdLock, err := lockRepo.GetByToken(context.Background(), token)
+	if err != nil {
+		t.Fatalf("GetByToken() error = %v", err)
+	}
+	if createdLock == nil || createdLock.ResourcePath != "/dav/addressbooks/1" {
+		t.Fatalf("expected pending lock to be rebound to created collection, got %#v", createdLock)
+	}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propertyupdate xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:set>
+    <d:prop>
+      <d:displayname>Renamed</d:displayname>
+    </d:prop>
+  </d:set>
+</d:propertyupdate>`
+
+	withoutTokenReq := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/1/", strings.NewReader(body))
+	withoutTokenReq = withoutTokenReq.WithContext(auth.WithUser(withoutTokenReq.Context(), user))
+	withoutTokenRR := httptest.NewRecorder()
+	h.Proppatch(withoutTokenRR, withoutTokenReq)
+
+	if withoutTokenRR.Code != http.StatusLocked {
+		t.Fatalf("expected PROPPATCH without a lock token to be blocked after MKCOL, got %d: %s", withoutTokenRR.Code, withoutTokenRR.Body.String())
+	}
+
+	withTokenReq := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/1/", strings.NewReader(body))
+	withTokenReq.Header.Set("If", "(<"+token+">)")
+	withTokenReq = withTokenReq.WithContext(auth.WithUser(withTokenReq.Context(), user))
+	withTokenRR := httptest.NewRecorder()
+	h.Proppatch(withTokenRR, withTokenReq)
+
+	if withTokenRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPPATCH with the lock token to succeed after MKCOL, got %d: %s", withTokenRR.Code, withTokenRR.Body.String())
+	}
+}
+
+func TestMkcolAppliesExtendedBodyProperties(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:set>
+    <d:prop>
+      <d:displayname>Renamed From Body</d:displayname>
+      <card:addressbook-description>Personal contacts</card:addressbook-description>
+    </d:prop>
+  </d:set>
+</d:mkcol>`
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcol(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected MKCOL extended body to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Location"); got != "/dav/addressbooks/1/" {
+		t.Fatalf("expected Location for created address book, got %q", got)
+	}
+	book := bookRepo.books[1]
+	if book == nil {
+		t.Fatal("expected address book to be created")
+	}
+	if book.Name != "Renamed From Body" {
+		t.Fatalf("expected displayname from body to be used, got %q", book.Name)
+	}
+	if book.Description == nil || *book.Description != "Personal contacts" {
+		t.Fatalf("expected address book description from body, got %#v", book.Description)
+	}
+}
+
+func TestMkcolRejectsOversizedRequestBody(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcol(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected oversized MKCOL body to return 413, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(bookRepo.books) != 0 {
+		t.Fatalf("expected oversized MKCOL to create no address book, got %#v", bookRepo.books)
+	}
+}
+
+func TestMkcolReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{}
+	lockRepo := &fakeLockRepo{
+		locks:               map[string]*store.Lock{},
+		moveResourcePathErr: errors.New("rebind failed"),
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/NewBook", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+	token := strings.Trim(lockRR.Header().Get("Lock-Token"), "<>")
+
+	createReq := httptest.NewRequest("MKCOL", "/dav/addressbooks/NewBook", nil)
+	createReq.Header.Set("If", "(<"+token+">)")
+	createReq = createReq.WithContext(auth.WithUser(createReq.Context(), user))
+	createRR := httptest.NewRecorder()
+	h.Mkcol(createRR, createReq)
+
+	if createRR.Code != http.StatusInternalServerError {
+		t.Fatalf("expected MKCOL lock rebind failure to return 500, got %d: %s", createRR.Code, createRR.Body.String())
+	}
+	if got := createRR.Header().Get("Location"); got != "" {
+		t.Fatalf("expected MKCOL rebind failure to avoid Location header, got %q", got)
+	}
+	if len(bookRepo.books) != 0 {
+		t.Fatalf("expected MKCOL rebind failure to roll back created address book, got %#v", bookRepo.books)
+	}
+}
+
+func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	calRepo := &fakeCalendarRepo{}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/calendars/work", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+
+	if lockRR.Code != http.StatusCreated {
+		t.Fatalf("expected LOCK to succeed with 201, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+	token := strings.Trim(lockRR.Header().Get("Lock-Token"), "<>")
+	if token == "" {
+		t.Fatal("expected lock token to be returned")
+	}
+
+	createReq := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
+	createReq.Header.Set("If", "(<"+token+">)")
+	createReq = createReq.WithContext(auth.WithUser(createReq.Context(), user))
+	createRR := httptest.NewRecorder()
+	h.Mkcalendar(createRR, createReq)
+
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("expected MKCALENDAR to succeed, got %d: %s", createRR.Code, createRR.Body.String())
+	}
+	if got := createRR.Header().Get("Location"); got != "/dav/calendars/1/" {
+		t.Fatalf("expected MKCALENDAR location to point at the created collection, got %q", got)
+	}
+	createdLock, err := lockRepo.GetByToken(context.Background(), token)
+	if err != nil {
+		t.Fatalf("GetByToken() error = %v", err)
+	}
+	if createdLock == nil || createdLock.ResourcePath != "/dav/calendars/1" {
+		t.Fatalf("expected pending lock to be rebound to created collection, got %#v", createdLock)
+	}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propertyupdate xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:set>
+    <d:prop>
+      <d:displayname>Renamed</d:displayname>
+    </d:prop>
+  </d:set>
+</d:propertyupdate>`
+
+	withoutTokenReq := httptest.NewRequest("PROPPATCH", "/dav/calendars/1/", strings.NewReader(body))
+	withoutTokenReq = withoutTokenReq.WithContext(auth.WithUser(withoutTokenReq.Context(), user))
+	withoutTokenRR := httptest.NewRecorder()
+	h.Proppatch(withoutTokenRR, withoutTokenReq)
+
+	if withoutTokenRR.Code != http.StatusLocked {
+		t.Fatalf("expected PROPPATCH without a lock token to be blocked after MKCALENDAR, got %d: %s", withoutTokenRR.Code, withoutTokenRR.Body.String())
+	}
+
+	withTokenReq := httptest.NewRequest("PROPPATCH", "/dav/calendars/1/", strings.NewReader(body))
+	withTokenReq.Header.Set("If", "(<"+token+">)")
+	withTokenReq = withTokenReq.WithContext(auth.WithUser(withTokenReq.Context(), user))
+	withTokenRR := httptest.NewRecorder()
+	h.Proppatch(withTokenRR, withTokenReq)
+
+	if withTokenRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPPATCH with the lock token to succeed after MKCALENDAR, got %d: %s", withTokenRR.Code, withTokenRR.Body.String())
+	}
+}
+
+func TestMkcalendarRejectsInvalidBodyAndDoesNotCreate(t *testing.T) {
+	calRepo := &fakeCalendarRepo{}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(`<d:mkcalendar xmlns:d="DAV:"><d:set>`))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected MKCALENDAR to reject invalid body, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(calRepo.calendars) != 0 {
+		t.Fatalf("expected invalid MKCALENDAR body to create no calendar, got %#v", calRepo.calendars)
+	}
+}
+
+func TestMkcalendarRejectsOversizedRequestBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected oversized MKCALENDAR body to return 413, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(calRepo.calendars) != 0 {
+		t.Fatalf("expected oversized MKCALENDAR to create no calendar, got %#v", calRepo.calendars)
+	}
+}
+
+func TestMkcalendarReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	calRepo := &fakeCalendarRepo{}
+	lockRepo := &fakeLockRepo{
+		locks:               map[string]*store.Lock{},
+		moveResourcePathErr: errors.New("rebind failed"),
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/calendars/work", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+	token := strings.Trim(lockRR.Header().Get("Lock-Token"), "<>")
+
+	createReq := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
+	createReq.Header.Set("If", "(<"+token+">)")
+	createReq = createReq.WithContext(auth.WithUser(createReq.Context(), user))
+	createRR := httptest.NewRecorder()
+	h.Mkcalendar(createRR, createReq)
+
+	if createRR.Code != http.StatusInternalServerError {
+		t.Fatalf("expected MKCALENDAR lock rebind failure to return 500, got %d: %s", createRR.Code, createRR.Body.String())
+	}
+	if got := createRR.Header().Get("Location"); got != "" {
+		t.Fatalf("expected MKCALENDAR rebind failure to avoid Location header, got %q", got)
+	}
+	if len(calRepo.calendars) != 0 {
+		t.Fatalf("expected MKCALENDAR rebind failure to roll back created calendar, got %#v", calRepo.calendars)
+	}
+}
+
+func TestPutAddressBookMapsUpsertConflictsToCardDAVConflict(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{upsertErr: store.ErrConflict}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+
+	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected CardDAV PUT conflict to return 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "no-uid-conflict") {
+		t.Fatalf("expected CardDAV PUT conflict body to contain no-uid-conflict, got %s", rr.Body.String())
+	}
+}
+
+func TestPutAddressBookPreservesInternalErrorsFromUpsert(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{upsertErr: errors.New("db unavailable")}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+
+	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected unexpected upsert error to return 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "no-uid-conflict") {
+		t.Fatalf("did not expect generic upsert failures to be reported as CardDAV conflicts, got %s", rr.Body.String())
+	}
+}
+
+func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Source"},
+			6: {ID: 6, UserID: user.ID, Name: "Destination"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:src": {
+				Token:        "opaquelocktoken:src",
+				ResourcePath: "/dav/addressbooks/5/alice.vcf",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+			"opaquelocktoken:dest": {
+				Token:        "opaquelocktoken:dest",
+				ResourcePath: "/dav/addressbooks/6/copied.vcf",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+	req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
+	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+	req.Header.Set("If", `</dav/addressbooks/5/alice.vcf> (<opaquelocktoken:src>) </dav/addressbooks/6/copied.vcf> (<opaquelocktoken:dest>)`)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Copy(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected COPY with tagged lock tokens to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if copied, _ := contactRepo.GetByResourceName(req.Context(), 6, "copied"); copied == nil {
+		t.Fatal("expected destination contact to be created")
+	}
+}
+
+func TestPropfindAddressBookCollectionIncludesLockAndACLProperties(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Shared Contacts"},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:book": {
+				Token:          "opaquelocktoken:book",
+				ResourcePath:   "/dav/addressbooks/5",
+				UserID:         user.ID,
+				LockScope:      "exclusive",
+				LockType:       "write",
+				Depth:          "0",
+				TimeoutSeconds: 3600,
+				ExpiresAt:      time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:supportedlock/>
+    <d:lockdiscovery/>
+    <d:acl/>
+    <d:supported-privilege-set/>
+    <d:principal-collection-set/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, needle := range []string{"supportedlock", "lockdiscovery", "opaquelocktoken:book", "supported-privilege-set", "principal-collection-set", "/dav/principals/", "<d:acl>"} {
+		if !strings.Contains(respBody, needle) {
+			t.Fatalf("expected PROPFIND response to include %q, got %s", needle, respBody)
+		}
+	}
+}
+
+func TestACLRejectsInvalidACEs(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared Contacts"},
+		},
+	}
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "ace missing grant and deny",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "ace has both grant and deny",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant>
+      <D:privilege><D:read/></D:privilege>
+    </D:grant>
+    <D:deny>
+      <D:privilege><D:write/></D:privilege>
+    </D:deny>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "ace grant has no privileges",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant/>
+  </D:ace>
+</D:acl>`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			aclRepo := &fakeACLRepo{
+				entries: []store.ACLEntry{{
+					ResourcePath:  "/dav/addressbooks/5",
+					PrincipalHref: "/dav/principals/9/",
+					IsGrant:       true,
+					Privilege:     "read",
+				}},
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+
+			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
+			req = req.WithContext(auth.WithUser(req.Context(), owner))
+			rr := httptest.NewRecorder()
+			h.Acl(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected ACL to reject invalid ACE with 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+
+			entries, err := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/5")
+			if err != nil {
+				t.Fatalf("ListByResource() error = %v", err)
+			}
+			if len(entries) != 1 || entries[0].PrincipalHref != "/dav/principals/9/" || entries[0].Privilege != "read" {
+				t.Fatalf("expected invalid ACL request to leave stored entries unchanged, got %#v", entries)
+			}
+		})
+	}
+}
+
+func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Contacts"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/"); privs == nil || len(privs.Privileges) == 0 {
+		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
+	}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, needle := range []string{"current-user-privilege-set", "<d:read", "<d:bind", "<d:write-content"} {
+		if !strings.Contains(respBody, needle) {
+			t.Fatalf("expected PROPFIND response to include %q, got %s", needle, respBody)
+		}
+	}
+}
+
+func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+				ETag:          "etag-alice",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:acl/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "<d:acl>") || !strings.Contains(respBody, "/dav/principals/2/") || !strings.Contains(respBody, "<d:read") {
+		t.Fatalf("expected PROPFIND to include the stored ACE for the canonical resource path, got %s", respBody)
+	}
+}
+
+func TestPropfindGenericCollectionReportsUnsupportedRequestedPropertiesAs404(t *testing.T) {
+	h := &Handler{store: &store.Store{}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <c:calendar-home-set/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1, PrimaryEmail: "owner@example.com"}))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !propstatHasStatus(respBody, "calendar-home-set", http.StatusNotFound) {
+		t.Fatalf("expected unsupported calendar-home-set to be reported with 404, got %s", respBody)
+	}
+	if propstatHasStatus(respBody, "displayname", http.StatusOK) {
+		t.Fatalf("expected PROPFIND prop response to avoid leaking unrelated default properties, got %s", respBody)
+	}
+}
+
+func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 5, UserID: user.ID, Name: "Work"}, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: user.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"5:event": {
+				CalendarID:   5,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:event": {
+				Token:          "opaquelocktoken:event",
+				ResourcePath:   "/dav/calendars/5/event.ics",
+				UserID:         user.ID,
+				LockScope:      "exclusive",
+				LockType:       "write",
+				Depth:          "0",
+				TimeoutSeconds: 3600,
+				ExpiresAt:      time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5/event.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getetag/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/event.ics", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "<d:getetag>") {
+		t.Fatalf("expected getetag in response, got %s", respBody)
+	}
+	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "calendar-data", "getcontenttype"} {
+		if strings.Contains(respBody, forbidden) {
+			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
+		}
+	}
+}
+
+func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+				ETag:          "etag-alice",
+			},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:alice": {
+				Token:          "opaquelocktoken:alice",
+				ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+				UserID:         user.ID,
+				LockScope:      "exclusive",
+				LockType:       "write",
+				Depth:          "0",
+				TimeoutSeconds: 3600,
+				ExpiresAt:      time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getetag/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "<d:getetag>") {
+		t.Fatalf("expected getetag in response, got %s", respBody)
+	}
+	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "address-data", "getcontenttype"} {
+		if strings.Contains(respBody, forbidden) {
+			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
+		}
+	}
+}
+
+func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
+	now := store.Now()
+	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+
+	newHandler := func(denySecret bool) *Handler {
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:public": {AddressBookID: 5, UID: "public", ResourceName: "public", RawVCard: buildVCard("3.0", "UID:public", "FN:Public"), ETag: "etag-public", LastModified: now},
+				"5:secret": {AddressBookID: 5, UID: "secret", ResourceName: "secret", RawVCard: buildVCard("3.0", "UID:secret", "FN:Secret"), ETag: "etag-secret", LastModified: now},
+			},
+		}
+		entries := []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}
+		if denySecret {
+			entries = append(entries, store.ACLEntry{
+				ResourcePath:  "/dav/addressbooks/5/secret",
+				PrincipalHref: "/dav/principals/2/",
+				IsGrant:       false,
+				Privilege:     "read",
+			})
+		}
+		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+	}
+
+	t.Run("positive_includes_visible_members", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", nil)
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		newHandler(false).Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		for _, want := range []string{"public.vcf", "secret.vcf"} {
+			if !strings.Contains(respBody, want) {
+				t.Fatalf("expected PROPFIND response to include %q, got %s", want, respBody)
+			}
+		}
+	})
+
+	t.Run("negative_omits_denied_members", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", nil)
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		newHandler(true).Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !strings.Contains(respBody, "public.vcf") {
+			t.Fatalf("expected PROPFIND response to include visible contact, got %s", respBody)
+		}
+		if strings.Contains(respBody, "secret.vcf") {
+			t.Fatalf("expected PROPFIND response to omit denied contact, got %s", respBody)
+		}
+	})
+}
+
+func TestAddressBookReportsFilterDeniedContacts(t *testing.T) {
+	now := store.Now()
+	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+
+	newHandler := func(denySecret bool) *Handler {
+		bookRepo := &fakeAddressBookRepo{
+			books: map[int64]*store.AddressBook{
+				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now, CTag: 2},
+			},
+		}
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				"5:public": {AddressBookID: 5, UID: "public", ResourceName: "public", RawVCard: buildVCard("3.0", "UID:public", "FN:Public"), ETag: "etag-public", LastModified: now},
+				"5:secret": {AddressBookID: 5, UID: "secret", ResourceName: "secret", RawVCard: buildVCard("3.0", "UID:secret", "FN:Secret"), ETag: "etag-secret", LastModified: now},
+			},
+		}
+		entries := []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}
+		if denySecret {
+			entries = append(entries, store.ACLEntry{
+				ResourcePath:  "/dav/addressbooks/5/secret",
+				PrincipalHref: "/dav/principals/2/",
+				IsGrant:       false,
+				Privilege:     "read",
+			})
+		}
+		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		depth   string
+		wantAll bool
+	}{
+		{
+			name: "addressbook_query",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
+  <D:prop><card:address-data/></D:prop>
+  <card:filter/>
+</card:addressbook-query>`,
+			depth:   "1",
+			wantAll: true,
+		},
+		{
+			name: "addressbook_multiget",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
+  <D:prop><card:address-data/></D:prop>
+  <D:href>/dav/addressbooks/5/public.vcf</D:href>
+  <D:href>/dav/addressbooks/5/secret.vcf</D:href>
+</card:addressbook-multiget>`,
+			depth:   "0",
+			wantAll: false,
+		},
+		{
+			name: "sync_collection",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:sync-collection xmlns:D="DAV:">
+</D:sync-collection>`,
+			depth:   "",
+			wantAll: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name+"/positive_includes_visible_resources", func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(tc.body))
+			if tc.depth != "" {
+				req.Header.Set("Depth", tc.depth)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			newHandler(false).Report(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("expected REPORT to succeed, got %d: %s", rr.Code, rr.Body.String())
+			}
+			respBody := rr.Body.String()
+			if !strings.Contains(respBody, "UID:public") {
+				t.Fatalf("expected REPORT response to include visible contact data, got %s", respBody)
+			}
+			if tc.wantAll && !strings.Contains(respBody, "UID:secret") {
+				t.Fatalf("expected REPORT response to include unrestricted contact data, got %s", respBody)
+			}
+		})
+
+		t.Run(tc.name+"/negative_omits_denied_resources", func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(tc.body))
+			if tc.depth != "" {
+				req.Header.Set("Depth", tc.depth)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			newHandler(true).Report(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("expected REPORT to succeed, got %d: %s", rr.Code, rr.Body.String())
+			}
+			respBody := rr.Body.String()
+			if !strings.Contains(respBody, "UID:public") {
+				t.Fatalf("expected REPORT response to include visible contact data, got %s", respBody)
+			}
+			if strings.Contains(respBody, "UID:secret") {
+				t.Fatalf("expected REPORT response to omit denied contact data, got %s", respBody)
+			}
+		})
+	}
+}
+
+func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {
+				AddressBookID: 5,
+				UID:           "alice",
+				ResourceName:  "alice",
+				RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example", "EMAIL:alice@example.com"),
+				ETag:          "etag-alice",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	t.Run("positive_empty_address_data_returns_full_card", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <card:address-data/>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		for _, want := range []string{"FN:Alice Example", "EMAIL:alice@example.com"} {
+			if !strings.Contains(respBody, want) {
+				t.Fatalf("expected full address-data response to include %q, got %s", want, respBody)
+			}
+		}
+	})
+
+	t.Run("negative_selected_properties_exclude_unrequested_fields", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <card:address-data>
+      <card:prop name="FN"/>
+    </card:address-data>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !strings.Contains(respBody, "FN:Alice Example") {
+			t.Fatalf("expected filtered address-data to include FN, got %s", respBody)
+		}
+		if strings.Contains(respBody, "EMAIL:alice@example.com") {
+			t.Fatalf("expected filtered address-data to omit EMAIL, got %s", respBody)
+		}
+	})
+}
+
+func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	t.Run("positive_supported_addressbook_property_only", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:displayname/>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
+			t.Fatalf("expected displayname in response, got %s", respBody)
+		}
+		for _, forbidden := range []string{"addressbook-description", "supported-address-data", "supportedlock"} {
+			if strings.Contains(respBody, forbidden) {
+				t.Fatalf("did not expect %q in supported prop-only response, got %s", forbidden, respBody)
+			}
+		}
+	})
+
+	t.Run("negative_unsupported_addressbook_property_returns_404", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:principal-URL/>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !propstatHasStatus(respBody, "principal-URL", http.StatusNotFound) {
+			t.Fatalf("expected unsupported principal-URL to be reported with 404, got %s", respBody)
+		}
+		if strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
+			t.Fatalf("expected unsupported prop request to avoid leaking default collection properties, got %s", respBody)
+		}
+	})
+}
+
+func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &Handler{store: &store.Store{}}
+
+	t.Run("positive_supported_principal_property_only", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:principal-URL/>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/principals/1/", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !strings.Contains(respBody, "<d:principal-URL>") {
+			t.Fatalf("expected principal-URL in response, got %s", respBody)
+		}
+		if strings.Contains(respBody, "calendar-home-set") {
+			t.Fatalf("did not expect unrelated principal properties in prop-only response, got %s", respBody)
+		}
+	})
+
+	t.Run("negative_unsupported_principal_property_returns_404", func(t *testing.T) {
+		body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <c:calendar-description/>
+  </d:prop>
+</d:propfind>`
+		req := httptest.NewRequest("PROPFIND", "/dav/principals/1/", strings.NewReader(body))
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		respBody := rr.Body.String()
+		if !propstatHasStatus(respBody, "calendar-description", http.StatusNotFound) {
+			t.Fatalf("expected unsupported principal property to be reported with 404, got %s", respBody)
+		}
+		if strings.Contains(respBody, "<d:principal-URL>") {
+			t.Fatalf("expected unsupported prop request to avoid leaking principal defaults, got %s", respBody)
+		}
+	})
+}
+
+func TestIsResourceOwnerParsesPrincipalIDPositionally(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &Handler{store: &store.Store{}}
+
+	if !h.isResourceOwner(context.Background(), user, "/dav/principals/1/") {
+		t.Fatal("expected authenticated principal path to be owned by the matching user")
+	}
+	if h.isResourceOwner(context.Background(), user, "/dav/principals/settings/1/") {
+		t.Fatal("expected nested principal path with user ID in a later segment to not be treated as owner path")
+	}
+}
+
+func TestPutAddressBookUIDConflictEscapesHref(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+
+	type uidConflictBody struct {
+		Conflict struct {
+			Href string `xml:"href"`
+		} `xml:"no-uid-conflict"`
+	}
+
+	run := func(t *testing.T, resourceName string) string {
+		t.Helper()
+		contactRepo := &fakeContactRepo{
+			contacts: map[string]*store.Contact{
+				fmt.Sprintf("5:%s", "existing"): {
+					AddressBookID: 5,
+					UID:           "existing",
+					ResourceName:  resourceName,
+					RawVCard:      buildVCard("3.0", "UID:existing", "FN:Existing"),
+					ETag:          "etag-existing",
+				},
+			},
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		req := newAddressBookPutRequest("/dav/addressbooks/5/"+resourceName+".vcf", strings.NewReader(buildVCard("3.0", "UID:new", "FN:New")))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("expected UID conflict PUT to return 409, got %d: %s", rr.Code, rr.Body.String())
+		}
+		var payload uidConflictBody
+		if err := xml.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("expected UID conflict body to be valid XML, got parse error %v: %s", err, rr.Body.String())
+		}
+		return payload.Conflict.Href
+	}
+
+	t.Run("positive_plain_href_remains_valid_xml", func(t *testing.T) {
+		if href := run(t, "conflict"); href != "/dav/addressbooks/5/conflict.vcf" {
+			t.Fatalf("unexpected href %q", href)
+		}
+	})
+
+	t.Run("negative_special_characters_are_escaped", func(t *testing.T) {
+		if href := run(t, "conflict&name"); href != "/dav/addressbooks/5/conflict&name.vcf" {
+			t.Fatalf("unexpected escaped href %q", href)
+		}
+	})
+}
+
+func TestMkcolRejectsNumericDisplayNameFromBody(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:set>
+    <d:prop>
+      <d:displayname>123</d:displayname>
+    </d:prop>
+  </d:set>
+</d:mkcol>`
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcol(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected MKCOL to reject numeric displayname, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(bookRepo.books) != 0 {
+		t.Fatalf("expected no address book to be created, got %#v", bookRepo.books)
+	}
+}
+
+func TestMkcolRejectsInvalidExtendedBodyAndDoesNotCreate(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(`<d:mkcol xmlns:d="DAV:"><d:set>`))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcol(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected MKCOL to reject invalid extended body, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(bookRepo.books) != 0 {
+		t.Fatalf("expected no address book to be created, got %#v", bookRepo.books)
+	}
+}
+
+func TestMkcolRejectsDuplicateAddressBookName(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/contacts", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Mkcol(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate MKCOL to return 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAddressBookHandlersRejectExtraResourcePathSegments(t *testing.T) {
+	user := &store.User{ID: 1}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	t.Run("get", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf/extra", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Get(rr, req)
+
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("expected GET on nested address object path to return 404, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("propfind", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/alice.vcf/extra", nil)
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("expected PROPFIND on nested address object path to return 404, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestAddressBookCopyAndMoveOverwriteReplaceDifferentUIDDestination(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	now := store.Now()
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			bookRepo := &fakeAddressBookRepo{
+				books: map[int64]*store.AddressBook{
+					5: {ID: 5, UserID: user.ID, Name: "Source", UpdatedAt: now},
+					6: {ID: 6, UserID: user.ID, Name: "Destination", UpdatedAt: now},
+				},
+			}
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+					"6:bob":   {AddressBookID: 6, UID: "bob", ResourceName: "renamed", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
+				},
+			}
+			lockRepo := &fakeLockRepo{}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusNoContent {
+				t.Fatalf("expected overwrite %s to return 204, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "renamed")
+			if dest == nil || dest.UID != "alice" {
+				t.Fatalf("expected overwrite %s to replace the destination binding, got %#v", method, dest)
+			}
+			if stale, _ := contactRepo.GetByUID(req.Context(), 6, "bob"); stale != nil {
+				t.Fatalf("expected overwrite %s to remove the previous destination resource, got %#v", method, stale)
+			}
+			src, _ := contactRepo.GetByUID(req.Context(), 5, "alice")
+			if method == "COPY" && src == nil {
+				t.Fatal("expected COPY to preserve the source resource")
+			}
+			if method == "MOVE" && src != nil {
+				t.Fatalf("expected MOVE to remove the source resource, got %#v", src)
+			}
+		})
+	}
+}
+
+func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	now := store.Now()
+	deletedRepo := &fakeDeletedResourceRepo{}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts", UpdatedAt: now},
+			6: {ID: 6, UserID: user.ID, Name: "Archive", UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+			"6:bob":   {AddressBookID: 6, UID: "bob", ResourceName: "renamed", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
+		},
+		overwriteMoveDeletedRepo: deletedRepo,
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+
+	req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Move(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite MOVE to return 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{})
+	if err != nil {
+		t.Fatalf("ListDeletedSince() error = %v", err)
+	}
+	for _, tombstone := range tombstones {
+		if tombstone.ResourceName == "renamed" {
+			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
+		}
+	}
+}
+
+func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPrivileges(t *testing.T) {
+	now := store.Now()
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			bookRepo := &fakeAddressBookRepo{
+				books: map[int64]*store.AddressBook{
+					5: {ID: 5, UserID: 1, Name: "Source", UpdatedAt: now},
+					6: {ID: 6, UserID: 1, Name: "Destination", UpdatedAt: now},
+				},
+			}
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+					"6:bob":   {AddressBookID: 6, UID: "bob", ResourceName: "renamed", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
+				},
+			}
+			aclEntries := []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}
+			if method == "MOVE" {
+				aclEntries = append(aclEntries, store.ACLEntry{
+					ResourcePath:  "/dav/addressbooks/5",
+					PrincipalHref: "/dav/principals/2/",
+					IsGrant:       true,
+					Privilege:     "unbind",
+				})
+			}
+			h := &Handler{store: &store.Store{
+				AddressBooks: bookRepo,
+				Contacts:     contactRepo,
+				Locks:        &fakeLockRepo{},
+				ACLEntries:   &fakeACLRepo{entries: aclEntries},
+			}}
+			user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("expected overwrite %s without rebinding privileges to be rejected, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "renamed")
+			if dest == nil || dest.UID != "bob" {
+				t.Fatalf("expected %s to preserve the existing destination resource, got %#v", method, dest)
+			}
+			src, _ := contactRepo.GetByUID(req.Context(), 5, "alice")
+			if src == nil {
+				t.Fatalf("expected %s to preserve the source resource on forbidden overwrite", method)
+			}
+		})
+	}
+}
+
+func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Source", UpdatedAt: now},
+			6: {ID: 6, UserID: user.ID, Name: "Destination", UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+		},
+	}
+	lockToken := "opaquelocktoken:alice-lock"
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			lockToken: {
+				Token:        lockToken,
+				ResourcePath: "/dav/addressbooks/5/alice",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+	moveReq.Header.Set("If", "(<"+lockToken+">)")
+	moveReq = moveReq.WithContext(auth.WithUser(moveReq.Context(), user))
+	moveRR := httptest.NewRecorder()
+	h.Move(moveRR, moveReq)
+
+	if moveRR.Code != http.StatusCreated {
+		t.Fatalf("expected MOVE to succeed, got %d: %s", moveRR.Code, moveRR.Body.String())
+	}
+
+	putDestReq := newAddressBookPutRequest("/dav/addressbooks/6/copied.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
+	putDestReq = putDestReq.WithContext(auth.WithUser(putDestReq.Context(), user))
+	putDestRR := httptest.NewRecorder()
+	h.Put(putDestRR, putDestReq)
+
+	if putDestRR.Code != http.StatusLocked {
+		t.Fatalf("expected moved lock to protect destination resource, got %d: %s", putDestRR.Code, putDestRR.Body.String())
+	}
+
+	putDestReq = newAddressBookPutRequest("/dav/addressbooks/6/copied.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
+	putDestReq.Header.Set("If", "(<"+lockToken+">)")
+	putDestReq = putDestReq.WithContext(auth.WithUser(putDestReq.Context(), user))
+	putDestRR = httptest.NewRecorder()
+	h.Put(putDestRR, putDestReq)
+
+	if putDestRR.Code != http.StatusNoContent {
+		t.Fatalf("expected destination write with moved lock token to succeed, got %d: %s", putDestRR.Code, putDestRR.Body.String())
+	}
+
+	putOldReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:new-alice", "FN:Replacement Alice")))
+	putOldReq = putOldReq.WithContext(auth.WithUser(putOldReq.Context(), user))
+	putOldRR := httptest.NewRecorder()
+	h.Put(putOldRR, putOldReq)
+
+	if putOldRR.Code != http.StatusCreated {
+		t.Fatalf("expected old path to be unlocked after move, got %d: %s", putOldRR.Code, putOldRR.Body.String())
+	}
+}
+
+func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Source", UpdatedAt: now},
+			6: {ID: 6, UserID: user.ID, Name: "Destination", UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+			"6:bob":   {AddressBookID: 6, UID: "bob", ResourceName: "renamed", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
+		},
+	}
+	srcToken := "opaquelocktoken:source-lock"
+	destToken := "opaquelocktoken:dest-lock"
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			srcToken: {
+				Token:        srcToken,
+				ResourcePath: "/dav/addressbooks/5/alice",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+			destToken: {
+				Token:        destToken,
+				ResourcePath: "/dav/addressbooks/6/renamed",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+
+	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
+	moveReq.Header.Set("Overwrite", "T")
+	moveReq.Header.Set("If", "</dav/addressbooks/5/alice.vcf> (<"+srcToken+">) </dav/addressbooks/6/renamed.vcf> (<"+destToken+">)")
+	moveReq = moveReq.WithContext(auth.WithUser(moveReq.Context(), user))
+	moveRR := httptest.NewRecorder()
+	h.Move(moveRR, moveReq)
+
+	if moveRR.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite MOVE to succeed, got %d: %s", moveRR.Code, moveRR.Body.String())
+	}
+
+	putReq := newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
+	putReq.Header.Set("If", "(<"+destToken+">)")
+	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
+	putRR := httptest.NewRecorder()
+	h.Put(putRR, putReq)
+
+	if putRR.Code != http.StatusNoContent {
+		t.Fatalf("expected destination lock token to remain valid after overwrite MOVE, got %d: %s", putRR.Code, putRR.Body.String())
+	}
+
+	putReq = newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated Again")))
+	putReq.Header.Set("If", "(<"+srcToken+">)")
+	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
+	putRR = httptest.NewRecorder()
+	h.Put(putRR, putReq)
+
+	if putRR.Code != http.StatusLocked {
+		t.Fatalf("expected source lock token not to be rebound onto overwritten destination, got %d: %s", putRR.Code, putRR.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/renamed.vcf", nil)
+	getReq = getReq.WithContext(auth.WithUser(getReq.Context(), delegate))
+	getRR := httptest.NewRecorder()
+	h.Get(getRR, getReq)
+
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("expected overwrite MOVE to preserve destination ACL state, got %d: %s", getRR.Code, getRR.Body.String())
+	}
+}
+
+func TestDeleteContactRemovesDirectLockState(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+		},
+	}
+	lockToken := "opaquelocktoken:alice-delete"
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			lockToken: {
+				Token:        lockToken,
+				ResourcePath: "/dav/addressbooks/5/alice",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+	deleteReq.Header.Set("If", "(<"+lockToken+">)")
+	deleteReq = deleteReq.WithContext(auth.WithUser(deleteReq.Context(), user))
+	deleteRR := httptest.NewRecorder()
+	h.Delete(deleteRR, deleteReq)
+
+	if deleteRR.Code != http.StatusNoContent {
+		t.Fatalf("expected DELETE to succeed, got %d: %s", deleteRR.Code, deleteRR.Body.String())
+	}
+
+	putReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:replacement", "FN:Replacement Alice")))
+	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
+	putRR := httptest.NewRecorder()
+	h.Put(putRR, putReq)
+
+	if putRR.Code != http.StatusCreated {
+		t.Fatalf("expected deleted path to be reusable without stale lock token, got %d: %s", putRR.Code, putRR.Body.String())
+	}
+}
+
+func TestMoveContactRebindsACLToDestination(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Source", UpdatedAt: now},
+			6: {ID: 6, UserID: owner.ID, Name: "Destination", UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
+
+	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
+	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+	moveReq = moveReq.WithContext(auth.WithUser(moveReq.Context(), owner))
+	moveRR := httptest.NewRecorder()
+	h.Move(moveRR, moveReq)
+
+	if moveRR.Code != http.StatusCreated {
+		t.Fatalf("expected MOVE to succeed, got %d: %s", moveRR.Code, moveRR.Body.String())
+	}
+
+	getDestReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/copied.vcf", nil)
+	getDestReq = getDestReq.WithContext(auth.WithUser(getDestReq.Context(), delegate))
+	getDestRR := httptest.NewRecorder()
+	h.Get(getDestRR, getDestReq)
+
+	if getDestRR.Code != http.StatusOK {
+		t.Fatalf("expected moved ACL to grant delegate read access at destination, got %d: %s", getDestRR.Code, getDestRR.Body.String())
+	}
+
+	recreateReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:replacement", "FN:Replacement Alice")))
+	recreateReq = recreateReq.WithContext(auth.WithUser(recreateReq.Context(), owner))
+	recreateRR := httptest.NewRecorder()
+	h.Put(recreateRR, recreateReq)
+
+	if recreateRR.Code != http.StatusCreated {
+		t.Fatalf("expected owner to recreate source path after move, got %d: %s", recreateRR.Code, recreateRR.Body.String())
+	}
+
+	getOldReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+	getOldReq = getOldReq.WithContext(auth.WithUser(getOldReq.Context(), delegate))
+	getOldRR := httptest.NewRecorder()
+	h.Get(getOldRR, getOldReq)
+
+	if getOldRR.Code != http.StatusNotFound {
+		t.Fatalf("expected source ACL to be removed after move, got %d: %s", getOldRR.Code, getOldRR.Body.String())
+	}
+}
+
+func TestDeleteContactRemovesResourceACLState(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+	deleteReq = deleteReq.WithContext(auth.WithUser(deleteReq.Context(), owner))
+	deleteRR := httptest.NewRecorder()
+	h.Delete(deleteRR, deleteReq)
+
+	if deleteRR.Code != http.StatusNoContent {
+		t.Fatalf("expected DELETE to succeed, got %d: %s", deleteRR.Code, deleteRR.Body.String())
+	}
+
+	recreateReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:replacement", "FN:Replacement Alice")))
+	recreateReq = recreateReq.WithContext(auth.WithUser(recreateReq.Context(), owner))
+	recreateRR := httptest.NewRecorder()
+	h.Put(recreateRR, recreateReq)
+
+	if recreateRR.Code != http.StatusCreated {
+		t.Fatalf("expected owner to recreate deleted path, got %d: %s", recreateRR.Code, recreateRR.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
+	getReq = getReq.WithContext(auth.WithUser(getReq.Context(), delegate))
+	getRR := httptest.NewRecorder()
+	h.Get(getRR, getReq)
+
+	if getRR.Code != http.StatusNotFound {
+		t.Fatalf("expected deleted ACL state to be cleared before recreation, got %d: %s", getRR.Code, getRR.Body.String())
+	}
+}
+
+func TestCopyContactOverwritePreservesDestinationDAVState(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: owner.ID, Name: "Source", UpdatedAt: now},
+			6: {ID: 6, UserID: owner.ID, Name: "Destination", UpdatedAt: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
+			"6:bob":   {AddressBookID: 6, UID: "bob", ResourceName: "renamed", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
+		},
+	}
+	destToken := "opaquelocktoken:dest-lock"
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			destToken: {
+				Token:        destToken,
+				ResourcePath: "/dav/addressbooks/6/renamed",
+				UserID:       owner.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		AddressBooks: bookRepo,
+		Contacts:     contactRepo,
+		Locks:        lockRepo,
+		ACLEntries:   aclRepo,
+	}}
+
+	copyReq := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
+	copyReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
+	copyReq.Header.Set("Overwrite", "T")
+	copyReq.Header.Set("If", "</dav/addressbooks/6/renamed.vcf> (<"+destToken+">)")
+	copyReq = copyReq.WithContext(auth.WithUser(copyReq.Context(), owner))
+	copyRR := httptest.NewRecorder()
+	h.Copy(copyRR, copyReq)
+
+	if copyRR.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite COPY to succeed, got %d: %s", copyRR.Code, copyRR.Body.String())
+	}
+	if _, ok := lockRepo.locks[destToken]; !ok {
+		t.Fatalf("expected overwrite COPY to preserve destination lock state, got %#v", lockRepo.locks)
+	}
+	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/6/renamed"); len(entries) == 0 {
+		t.Fatalf("expected overwrite COPY to preserve destination ACL state, got %#v", entries)
+	}
+
+	putReq := newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
+	putReq.Header.Set("If", "(<"+destToken+">)")
+	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), owner))
+	putRR := httptest.NewRecorder()
+	h.Put(putRR, putReq)
+
+	if putRR.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite COPY to leave destination lock token valid, got %d: %s", putRR.Code, putRR.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/renamed.vcf", nil)
+	getReq = getReq.WithContext(auth.WithUser(getReq.Context(), delegate))
+	getRR := httptest.NewRecorder()
+	h.Get(getRR, getReq)
+
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("expected overwrite COPY to preserve destination ACL access, got %d: %s", getRR.Code, getRR.Body.String())
+	}
+}
+
+func TestPropfindACLUsesSpecialPrincipalElements(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: false, Privilege: "write"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:acl/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "<d:authenticated") {
+		t.Fatalf("expected DAV:authenticated principal element, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "<d:all") {
+		t.Fatalf("expected DAV:all principal element, got %s", respBody)
+	}
+	for _, invalid := range []string{"<d:href>DAV:authenticated</d:href>", "<d:href>DAV:all</d:href>"} {
+		if strings.Contains(respBody, invalid) {
+			t.Fatalf("did not expect ACL principal to be serialized as href %q, got %s", invalid, respBody)
+		}
+	}
+}
+
+func TestBuildACLPropFromEntriesSeparatesGrantAndDenyACEs(t *testing.T) {
+	acl := buildACLPropFromEntries([]store.ACLEntry{
+		{PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write"},
+	})
+
+	if len(acl.ACE) != 2 {
+		t.Fatalf("expected separate ACEs for grant and deny, got %#v", acl.ACE)
+	}
+	if acl.ACE[0].Grant == nil || acl.ACE[0].Deny != nil {
+		t.Fatalf("expected first ACE to contain only a grant, got %#v", acl.ACE[0])
+	}
+	if acl.ACE[1].Deny == nil || acl.ACE[1].Grant != nil {
+		t.Fatalf("expected second ACE to contain only a deny, got %#v", acl.ACE[1])
+	}
+}
+
+func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: user.ID, Name: "Source"},
+			6: {ID: 6, UserID: user.ID, Name: "Destination"},
+		},
+	}
+
+	t.Run("put", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts:             map[string]*store.Contact{},
+			getByResourceNameErr: errors.New("resource lookup failed"),
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected PUT lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if len(contactRepo.contacts) != 0 {
+			t.Fatalf("expected PUT lookup failure to avoid writes, got %#v", contactRepo.contacts)
+		}
+	})
+
+	t.Run("put uid lookup", func(t *testing.T) {
+		contactRepo := &fakeContactRepo{
+			contacts:       map[string]*store.Contact{},
+			getByUIDErr:    errors.New("uid lookup failed"),
+			getByUIDErrKey: "5:alice",
+		}
+		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("expected PUT UID lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if len(contactRepo.contacts) != 0 {
+			t.Fatalf("expected PUT UID lookup failure to avoid writes, got %#v", contactRepo.contacts)
+		}
+	})
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(strings.ToLower(method)+" destination name lookup", func(t *testing.T) {
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {
+						AddressBookID: 5,
+						UID:           "alice",
+						ResourceName:  "alice",
+						RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+						ETag:          "etag-alice",
+					},
+				},
+				getByResourceNameErr:    errors.New("destination lookup failed"),
+				getByResourceNameErrKey: "6:copied",
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("expected %s lookup failure to return 500, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if _, ok := contactRepo.contacts["6:alice"]; ok {
+				t.Fatalf("expected %s lookup failure to avoid destination writes, got %#v", method, contactRepo.contacts)
+			}
+			if _, ok := contactRepo.contacts["5:alice"]; !ok {
+				t.Fatalf("expected %s lookup failure to preserve source, got %#v", method, contactRepo.contacts)
+			}
+		})
+
+		t.Run(strings.ToLower(method)+" source lookup", func(t *testing.T) {
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {
+						AddressBookID: 5,
+						UID:           "alice",
+						ResourceName:  "alice",
+						RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+						ETag:          "etag-alice",
+					},
+				},
+				getByResourceNameErr:    errors.New("source lookup failed"),
+				getByResourceNameErrKey: "5:alice",
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("expected %s source lookup failure to return 500, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if _, ok := contactRepo.contacts["6:alice"]; ok {
+				t.Fatalf("expected %s source lookup failure to avoid destination writes, got %#v", method, contactRepo.contacts)
+			}
+		})
+
+		t.Run(strings.ToLower(method)+" destination uid lookup", func(t *testing.T) {
+			contactRepo := &fakeContactRepo{
+				contacts: map[string]*store.Contact{
+					"5:alice": {
+						AddressBookID: 5,
+						UID:           "alice",
+						ResourceName:  "alice",
+						RawVCard:      buildVCard("3.0", "UID:alice", "FN:Alice Example"),
+						ETag:          "etag-alice",
+					},
+				},
+				getByUIDErr:    errors.New("destination uid lookup failed"),
+				getByUIDErrKey: "6:alice",
+			}
+			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
+			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("expected %s destination UID lookup failure to return 500, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if _, ok := contactRepo.contacts["6:alice"]; ok {
+				t.Fatalf("expected %s destination UID lookup failure to avoid destination writes, got %#v", method, contactRepo.contacts)
+			}
+			if _, ok := contactRepo.contacts["5:alice"]; !ok {
+				t.Fatalf("expected %s destination UID lookup failure to preserve source, got %#v", method, contactRepo.contacts)
+			}
+		})
+	}
+}
+
+func TestCanLockAddressBookCollectionRequiresMoreThanBind(t *testing.T) {
+	user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		AddressBooks: bookRepo,
+		Contacts:     &fakeContactRepo{},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+		}},
+	}}
+
+	got, err := h.canLockAddressBookPath(context.Background(), user, "/dav/addressbooks/5/")
+	if err != nil {
+		t.Fatalf("canLockAddressBookPath() error = %v", err)
+	}
+	if got {
+		t.Fatal("expected bind-only principal to be unable to lock an existing address book collection")
+	}
+}
+
+func TestLockScopesDirectChildCollectionCreationPathsPerUser(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "address books", path: "/dav/addressbooks/Shared"},
+		{name: "calendars", path: "/dav/calendars/Shared"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lockRepo := &fakeLockRepo{}
+			h := &Handler{store: &store.Store{Locks: lockRepo}}
+			lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+			for _, user := range []*store.User{
+				{ID: 1, PrimaryEmail: "owner1@example.com"},
+				{ID: 2, PrimaryEmail: "owner2@example.com"},
+			} {
+				req := httptest.NewRequest("LOCK", tc.path, strings.NewReader(lockBody))
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				h.Lock(rr, req)
+
+				if rr.Code != http.StatusCreated {
+					t.Fatalf("expected LOCK on %s for user %d to succeed, got %d: %s", tc.path, user.ID, rr.Code, rr.Body.String())
+				}
+			}
+
+			if len(lockRepo.locks) != 2 {
+				t.Fatalf("expected both users to get independent locks, got %#v", lockRepo.locks)
+			}
+
+			paths := make(map[string]struct{}, len(lockRepo.locks))
+			for _, lock := range lockRepo.locks {
+				paths[lock.ResourcePath] = struct{}{}
+			}
+			if len(paths) != 2 {
+				t.Fatalf("expected lock paths to be scoped per user, got %#v", lockRepo.locks)
+			}
+		})
+	}
+}
+
+func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
+	lockRepo := &fakeLockRepo{}
+	bookRepo := &fakeAddressBookRepo{}
+	h := &Handler{store: &store.Store{Locks: lockRepo, AddressBooks: bookRepo}}
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/Shared", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), &store.User{ID: 1, PrimaryEmail: "owner1@example.com"}))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+	if lockRR.Code != http.StatusCreated {
+		t.Fatalf("expected initial LOCK to succeed, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+
+	mkcolReq := httptest.NewRequest("MKCOL", "/dav/addressbooks/Shared", nil)
+	mkcolReq = mkcolReq.WithContext(auth.WithUser(mkcolReq.Context(), &store.User{ID: 2, PrimaryEmail: "owner2@example.com"}))
+	mkcolRR := httptest.NewRecorder()
+	h.Mkcol(mkcolRR, mkcolReq)
+
+	if mkcolRR.Code != http.StatusCreated {
+		t.Fatalf("expected MKCOL for another user to ignore the foreign pending lock, got %d: %s", mkcolRR.Code, mkcolRR.Body.String())
+	}
+	books, err := bookRepo.ListByUser(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("ListByUser() error = %v", err)
+	}
+	if len(books) != 1 || books[0].Name != "Shared" {
+		t.Fatalf("expected second user to get an independent Shared address book, got %#v", books)
+	}
+}
+
+func TestMkcalendarIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
+	lockRepo := &fakeLockRepo{}
+	calRepo := &fakeCalendarRepo{}
+	h := &Handler{store: &store.Store{Locks: lockRepo, Calendars: calRepo}}
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+</D:lockinfo>`
+
+	lockReq := httptest.NewRequest("LOCK", "/dav/calendars/Shared", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), &store.User{ID: 1, PrimaryEmail: "owner1@example.com"}))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+	if lockRR.Code != http.StatusCreated {
+		t.Fatalf("expected initial LOCK to succeed, got %d: %s", lockRR.Code, lockRR.Body.String())
+	}
+
+	mkcalendarReq := httptest.NewRequest("MKCALENDAR", "/dav/calendars/Shared", nil)
+	mkcalendarReq = mkcalendarReq.WithContext(auth.WithUser(mkcalendarReq.Context(), &store.User{ID: 2, PrimaryEmail: "owner2@example.com"}))
+	mkcalendarRR := httptest.NewRecorder()
+	h.Mkcalendar(mkcalendarRR, mkcalendarReq)
+
+	if mkcalendarRR.Code != http.StatusCreated {
+		t.Fatalf("expected MKCALENDAR for another user to ignore the foreign pending lock, got %d: %s", mkcalendarRR.Code, mkcalendarRR.Body.String())
+	}
+	calendars, err := calRepo.ListByUser(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("ListByUser() error = %v", err)
+	}
+	if len(calendars) != 1 || calendars[0].Name != "Shared" {
+		t.Fatalf("expected second user to get an independent Shared calendar, got %#v", calendars)
+	}
+}
+
+func TestPutReturnsInternalServerErrorWhenLockLookupFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	lockRepo := &fakeLockRepo{listByResourcesErr: errors.New("lock lookup failed")}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
+	req.Header.Set("Content-Type", "text/vcard")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected lock lookup failure to return 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProppatchIgnoresParentCollectionLock(t *testing.T) {
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now},
+		},
+	}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:root": {
+				Token:        "opaquelocktoken:root",
+				ResourcePath: "/dav/addressbooks",
+				UserID:       1,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Renamed Book</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/5/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPPATCH to ignore parent collection lock and return 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := bookRepo.books[5].Name; got != "Renamed Book" {
+		t.Fatalf("expected PROPPATCH to update the address book name, got %q", got)
+	}
+}
+
+func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
+	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			2: {ID: 2, UserID: user.ID, Name: "Owned"},
+			5: {ID: 5, UserID: 1, Name: "Shared"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, href := range []string{"/dav/addressbooks/2/", "/dav/addressbooks/5/"} {
+		if !strings.Contains(respBody, href) {
+			t.Fatalf("expected addressbook-home-set listing to include %s, got %s", href, respBody)
+		}
+	}
+}
+
 type fakeEventRepo struct {
-	events map[string]*store.Event
+	events                   map[string]*store.Event
+	deleted                  []string
+	copyErr                  error
+	moveErr                  error
+	getByUIDErr              error
+	getByUIDErrKey           string
+	getByResourceNameErr     error
+	getByResourceNameKey     string
+	resourceLookupCount      int
+	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -1877,11 +6454,15 @@ func (f *fakeEventRepo) Upsert(ctx context.Context, event store.Event) (*store.E
 }
 
 func (f *fakeEventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid string) error {
+	f.deleted = append(f.deleted, f.key(calendarID, uid))
 	delete(f.events, f.key(calendarID, uid))
 	return nil
 }
 
 func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*store.Event, error) {
+	if f.getByUIDErr != nil && (f.getByUIDErrKey == "" || f.getByUIDErrKey == f.key(calendarID, uid)) {
+		return nil, f.getByUIDErr
+	}
 	if ev, ok := f.events[f.key(calendarID, uid)]; ok {
 		copy := *ev
 		return &copy, nil
@@ -1890,6 +6471,10 @@ func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid stri
 }
 
 func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*store.Event, error) {
+	f.resourceLookupCount++
+	if f.getByResourceNameErr != nil && (f.getByResourceNameKey == "" || f.getByResourceNameKey == f.key(calendarID, resourceName)) {
+		return nil, f.getByResourceNameErr
+	}
 	for _, ev := range f.events {
 		if ev.CalendarID != calendarID {
 			continue
@@ -1963,6 +6548,63 @@ func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (
 	return max, nil
 }
 
+func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	if f.moveErr != nil {
+		return f.moveErr
+	}
+	oldKey := f.key(fromCalendarID, uid)
+	ev, ok := f.events[oldKey]
+	if !ok {
+		return nil
+	}
+	for key, existing := range f.events {
+		if existing.CalendarID != toCalendarID || existing.UID == uid {
+			continue
+		}
+		name := existing.ResourceName
+		if name == "" {
+			name = existing.UID
+		}
+		if destResourceName != "" && name == destResourceName {
+			if f.overwriteMoveDeletedRepo != nil {
+				f.overwriteMoveDeletedRepo.deleted = append(f.overwriteMoveDeletedRepo.deleted, store.DeletedResource{
+					ResourceType: "event",
+					CollectionID: toCalendarID,
+					UID:          existing.UID,
+					ResourceName: name,
+					DeletedAt:    time.Now(),
+				})
+			}
+			delete(f.events, key)
+		}
+	}
+	delete(f.events, oldKey)
+	ev.CalendarID = toCalendarID
+	if destResourceName != "" {
+		ev.ResourceName = destResourceName
+	}
+	f.events[f.key(toCalendarID, uid)] = ev
+	return nil
+}
+
+func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
+	if f.copyErr != nil {
+		return nil, f.copyErr
+	}
+	src, ok := f.events[f.key(fromCalendarID, uid)]
+	if !ok {
+		return nil, nil
+	}
+	copy := *src
+	copy.CalendarID = toCalendarID
+	if destResourceName != "" {
+		copy.ResourceName = destResourceName
+	}
+	copy.ETag = newETag
+	f.events[f.key(toCalendarID, copy.UID)] = &copy
+	return &copy, nil
+}
+
 type errorEventRepo struct{}
 
 func (e *errorEventRepo) Upsert(ctx context.Context, event store.Event) (*store.Event, error) {
@@ -2005,8 +6647,26 @@ func (e *errorEventRepo) MaxLastModified(ctx context.Context, calendarID int64) 
 	return time.Time{}, errors.New("fail")
 }
 
+func (e *errorEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	return errors.New("fail")
+}
+
+func (e *errorEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
+	return nil, errors.New("fail")
+}
+
 type fakeContactRepo struct {
-	contacts map[string]*store.Contact
+	contacts                 map[string]*store.Contact
+	deleted                  []string
+	copyErr                  error
+	moveErr                  error
+	upsertErr                error
+	getByUIDErr              error
+	getByUIDErrKey           string
+	getByResourceNameErr     error
+	getByResourceNameErrKey  string
+	resourceLookupCount      int
+	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
 func (f *fakeContactRepo) key(bookID int64, uid string) string {
@@ -2014,8 +6674,14 @@ func (f *fakeContactRepo) key(bookID int64, uid string) string {
 }
 
 func (f *fakeContactRepo) Upsert(ctx context.Context, contact store.Contact) (*store.Contact, error) {
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
 	if f.contacts == nil {
 		f.contacts = map[string]*store.Contact{}
+	}
+	if contact.ResourceName == "" {
+		contact.ResourceName = contact.UID
 	}
 	copy := contact
 	f.contacts[f.key(contact.AddressBookID, contact.UID)] = &copy
@@ -2023,11 +6689,15 @@ func (f *fakeContactRepo) Upsert(ctx context.Context, contact store.Contact) (*s
 }
 
 func (f *fakeContactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
+	f.deleted = append(f.deleted, f.key(addressBookID, uid))
 	delete(f.contacts, f.key(addressBookID, uid))
 	return nil
 }
 
 func (f *fakeContactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*store.Contact, error) {
+	if f.getByUIDErr != nil && (f.getByUIDErrKey == "" || f.getByUIDErrKey == f.key(addressBookID, uid)) {
+		return nil, f.getByUIDErr
+	}
 	if c, ok := f.contacts[f.key(addressBookID, uid)]; ok {
 		copy := *c
 		return &copy, nil
@@ -2058,7 +6728,20 @@ func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, addressBookI
 }
 
 func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]store.Contact, error) {
-	return nil, nil
+	uidSet := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		uidSet[uid] = struct{}{}
+	}
+	var result []store.Contact
+	for _, c := range f.contacts {
+		if c.AddressBookID != addressBookID {
+			continue
+		}
+		if _, ok := uidSet[c.UID]; ok {
+			result = append(result, *c)
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]store.Contact, error) {
@@ -2105,7 +6788,61 @@ func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID in
 	return result, nil
 }
 
-func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error {
+func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	f.resourceLookupCount++
+	if f.getByResourceNameErr != nil && (f.getByResourceNameErrKey == "" || f.getByResourceNameErrKey == f.key(addressBookID, resourceName)) {
+		return nil, f.getByResourceNameErr
+	}
+	for _, c := range f.contacts {
+		if c.AddressBookID != addressBookID {
+			continue
+		}
+		name := c.ResourceName
+		if name == "" {
+			name = c.UID
+		}
+		if name == resourceName {
+			copy := *c
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
+	if f.copyErr != nil {
+		return nil, f.copyErr
+	}
+	src, ok := f.contacts[f.key(fromAddressBookID, uid)]
+	if !ok {
+		return nil, nil
+	}
+	copy := *src
+	copy.AddressBookID = toAddressBookID
+	if destResourceName != "" {
+		copy.ResourceName = destResourceName
+	}
+	for key, existing := range f.contacts {
+		if existing.AddressBookID != toAddressBookID || existing.UID == copy.UID {
+			continue
+		}
+		name := existing.ResourceName
+		if name == "" {
+			name = existing.UID
+		}
+		if name == copy.ResourceName {
+			delete(f.contacts, key)
+		}
+	}
+	copy.ETag = newETag
+	f.contacts[f.key(toAddressBookID, copy.UID)] = &copy
+	return &copy, nil
+}
+
+func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
+	if f.moveErr != nil {
+		return f.moveErr
+	}
 	oldKey := f.key(fromAddressBookID, uid)
 	contact, ok := f.contacts[oldKey]
 	if !ok {
@@ -2115,6 +6852,30 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 	delete(f.contacts, oldKey)
 	// Update address book ID
 	contact.AddressBookID = toAddressBookID
+	if destResourceName != "" {
+		contact.ResourceName = destResourceName
+	}
+	for key, existing := range f.contacts {
+		if existing.AddressBookID != toAddressBookID || existing.UID == contact.UID {
+			continue
+		}
+		name := existing.ResourceName
+		if name == "" {
+			name = existing.UID
+		}
+		if name == contact.ResourceName {
+			if f.overwriteMoveDeletedRepo != nil {
+				f.overwriteMoveDeletedRepo.deleted = append(f.overwriteMoveDeletedRepo.deleted, store.DeletedResource{
+					ResourceType: "contact",
+					CollectionID: toAddressBookID,
+					UID:          existing.UID,
+					ResourceName: name,
+					DeletedAt:    time.Now(),
+				})
+			}
+			delete(f.contacts, key)
+		}
+	}
 	// Add to new location
 	newKey := f.key(toAddressBookID, uid)
 	f.contacts[newKey] = contact
@@ -2122,8 +6883,9 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 }
 
 type fakeCalendarRepo struct {
-	accessible []store.CalendarAccess
-	calendars  map[int64]*store.Calendar
+	accessible       []store.CalendarAccess
+	accessibleByUser map[int64][]store.CalendarAccess
+	calendars        map[int64]*store.Calendar
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
@@ -2147,10 +6909,22 @@ func (f *fakeCalendarRepo) ListByUser(ctx context.Context, userID int64) ([]stor
 }
 
 func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]store.CalendarAccess, error) {
+	if f.accessibleByUser != nil {
+		return f.accessibleByUser[userID], nil
+	}
 	return f.accessible, nil
 }
 
 func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*store.CalendarAccess, error) {
+	if f.accessibleByUser != nil {
+		for _, c := range f.accessibleByUser[userID] {
+			if c.ID == calendarID {
+				copy := c
+				return &copy, nil
+			}
+		}
+		return nil, nil
+	}
 	for _, c := range f.accessible {
 		if c.ID == calendarID {
 			copy := c
@@ -2182,11 +6956,31 @@ func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name st
 }
 
 func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
+	cal, ok := f.calendars[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if cal.UserID != userID {
+		return store.ErrNotFound
+	}
+	delete(f.calendars, id)
 	return nil
 }
 
 type fakeAddressBookRepo struct {
 	books map[int64]*store.AddressBook
+}
+
+func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name string) bool {
+	for id, book := range f.books {
+		if id == excludeID || book.UserID != userID {
+			continue
+		}
+		if strings.EqualFold(book.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.AddressBook, error) {
@@ -2211,6 +7005,9 @@ func (f *fakeAddressBookRepo) Create(ctx context.Context, book store.AddressBook
 	if f.books == nil {
 		f.books = map[int64]*store.AddressBook{}
 	}
+	if f.hasDuplicateName(book.UserID, 0, book.Name) {
+		return nil, store.ErrConflict
+	}
 	book.ID = int64(len(f.books) + 1)
 	copy := book
 	f.books[copy.ID] = &copy
@@ -2218,14 +7015,62 @@ func (f *fakeAddressBookRepo) Create(ctx context.Context, book store.AddressBook
 }
 
 func (f *fakeAddressBookRepo) Update(ctx context.Context, userID, id int64, name string, description *string) error {
+	book, ok := f.books[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if book.UserID != userID {
+		return store.ErrNotFound
+	}
+	if f.hasDuplicateName(userID, id, name) {
+		return store.ErrConflict
+	}
+	book.Name = name
+	if description != nil {
+		book.Description = description
+	}
+	return nil
+}
+
+func (f *fakeAddressBookRepo) UpdateProperties(ctx context.Context, id int64, name string, description *string) error {
+	book, ok := f.books[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if f.hasDuplicateName(book.UserID, id, name) {
+		return store.ErrConflict
+	}
+	book.Name = name
+	if description != nil {
+		book.Description = description
+	}
 	return nil
 }
 
 func (f *fakeAddressBookRepo) Rename(ctx context.Context, userID, id int64, name string) error {
+	book, ok := f.books[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if book.UserID != userID {
+		return store.ErrNotFound
+	}
+	if f.hasDuplicateName(userID, id, name) {
+		return store.ErrConflict
+	}
+	book.Name = name
 	return nil
 }
 
 func (f *fakeAddressBookRepo) Delete(ctx context.Context, userID, id int64) error {
+	book, ok := f.books[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if book.UserID != userID {
+		return store.ErrNotFound
+	}
+	delete(f.books, id)
 	return nil
 }
 
@@ -2241,6 +7086,18 @@ func (f *fakeDeletedResourceRepo) ListDeletedSince(ctx context.Context, resource
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeDeletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {
+	filtered := f.deleted[:0]
+	for _, d := range f.deleted {
+		if d.ResourceType == resourceType && d.CollectionID == collectionID && d.UID == uid && d.ResourceName == resourceName {
+			continue
+		}
+		filtered = append(filtered, d)
+	}
+	f.deleted = filtered
+	return nil
 }
 
 func (f *fakeDeletedResourceRepo) Cleanup(ctx context.Context, olderThan time.Duration) (int64, error) {
@@ -2678,8 +7535,8 @@ func TestPutRejectsInvalidVCard(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for invalid vCard, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "invalid vCard") {
-		t.Errorf("expected error message about invalid vCard, got %s", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "valid-address-data") {
+		t.Errorf("expected CardDAV valid-address-data precondition error, got %s", rr.Body.String())
 	}
 }
 
@@ -2691,7 +7548,7 @@ func TestPutAcceptsValidVCard(t *testing.T) {
 	}
 	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
-	validData := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEND:VCARD\r\n"
+	validData := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validData))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2888,6 +7745,80 @@ func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
 	}
 }
 
+func TestProppatchAddressBookRejectsDuplicateDisplayName(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+			6: {ID: 6, UserID: 1, Name: "Work"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:set>
+    <D:prop>
+      <D:displayname>contacts</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/6", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "409 Conflict") {
+		t.Fatalf("expected duplicate displayname PROPPATCH to return 409 in propstat, got %s", rr.Body.String())
+	}
+}
+
+func TestProppatchAddressBookProtectedPropertyIsAtomic(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	u := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Renamed Contacts</D:displayname>
+      <C:supported-address-data>
+        <C:address-data-type content-type="text/vcard" version="4.0"/>
+      </C:supported-address-data>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/addressbooks/5", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "403 Forbidden") {
+		t.Fatalf("expected protected property failure in response, got %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "200 OK") {
+		t.Fatalf("expected atomic failure with no successful propstat, got %s", rr.Body.String())
+	}
+	if got := bookRepo.books[5].Name; got != "Contacts" {
+		t.Fatalf("expected PROPPATCH to leave address book unchanged, got %q", got)
+	}
+}
+
 func TestCalendarPropertiesIncludeLimits(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
@@ -3079,6 +8010,9 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			body := fmt.Sprintf(`<card:%s xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:"/>`, tc.reportType)
+			if tc.reportType == "addressbook-query" {
+				body = `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:"><card:filter/></card:addressbook-query>`
+			}
 			req := httptest.NewRequest("REPORT", tc.path, strings.NewReader(body))
 			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 			rr := httptest.NewRecorder()

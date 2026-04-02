@@ -63,6 +63,9 @@ func addressBookCollectionResponse(href, name string, description *string, princ
 	if description != nil && *description != "" {
 		p.AddressBookDesc = *description
 	}
+	p.SupportedAddressData = supportedAddressDataProp()
+	p.AddressBookMaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.SupportedCollationSet = supportedCollationSetProp()
 	return resp
 }
 
@@ -78,9 +81,10 @@ func statusOKProp(name string, rtype resourceType) propstat {
 
 func statusOKPropWithExtras(name string, rtype resourceType, principalHref string, includeCalendarHome, includeAddressHome bool) propstat {
 	p := prop{
-		DisplayName:          name,
-		ResourceType:         rtype,
-		CurrentUserPrincipal: &hrefProp{Href: principalHref},
+		DisplayName:             name,
+		ResourceType:            rtype,
+		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
+		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
 	}
 	if includeCalendarHome {
 		p.CalendarHomeSet = &hrefListProp{Href: []string{"/dav/calendars/"}}
@@ -117,6 +121,12 @@ func etagPropWithData(etag, data string, calendar bool, includeData bool) propst
 func calendarResourcePropstat(etag, data string, includeData bool) propstat {
 	ps := etagPropWithData(etag, data, true, includeData)
 	ps.Prop.SupportedReportSet = &supportedReportSet{}
+	return ps
+}
+
+func addressBookResourcePropstat(etag, data string, includeData bool) propstat {
+	ps := etagPropWithData(etag, data, false, includeData)
+	ps.Prop.SupportedReportSet = addressbookSupportedReports()
 	return ps
 }
 
@@ -180,6 +190,21 @@ func supportedCalendarDataProp() *supportedCalendarData {
 		CalendarData: []calendarDataType{
 			{ContentType: "text/calendar", Version: "2.0"},
 		},
+	}
+}
+
+func supportedAddressDataProp() *supportedAddressData {
+	return &supportedAddressData{
+		AddressDataType: []addressDataType{
+			{ContentType: "text/vcard", Version: "3.0"},
+			{ContentType: "text/vcard", Version: "4.0"},
+		},
+	}
+}
+
+func supportedCollationSetProp() *supportedCollationSet {
+	return &supportedCollationSet{
+		SupportedCollation: []string{"i;ascii-casemap", "i;unicode-casemap"},
 	}
 }
 

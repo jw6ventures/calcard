@@ -44,6 +44,8 @@ type EventRepository interface {
 	ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error)
 	MaxLastModified(ctx context.Context, calendarID int64) (time.Time, error)
+	MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error
+	CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error)
 }
 
 // AddressBookRepository manages address books.
@@ -52,6 +54,7 @@ type AddressBookRepository interface {
 	ListByUser(ctx context.Context, userID int64) ([]AddressBook, error)
 	Create(ctx context.Context, book AddressBook) (*AddressBook, error)
 	Update(ctx context.Context, userID, id int64, name string, description *string) error
+	UpdateProperties(ctx context.Context, id int64, name string, description *string) error
 	Rename(ctx context.Context, userID, id int64, name string) error
 	Delete(ctx context.Context, userID, id int64) error
 }
@@ -68,7 +71,9 @@ type ContactRepository interface {
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MaxLastModified(ctx context.Context, addressBookID int64) (time.Time, error)
 	ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error)
-	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid string) error
+	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error
+	GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*Contact, error)
+	CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*Contact, error)
 }
 
 // AppPasswordRepository handles Basic Auth token storage.
@@ -85,6 +90,7 @@ type AppPasswordRepository interface {
 // DeletedResourceRepository handles tombstone tracking for sync.
 type DeletedResourceRepository interface {
 	ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error)
+	DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error
 	Cleanup(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
@@ -97,4 +103,28 @@ type SessionRepository interface {
 	Delete(ctx context.Context, id string) error
 	DeleteByUser(ctx context.Context, userID int64) error
 	DeleteExpired(ctx context.Context) (int64, error)
+}
+
+// LockRepository handles WebDAV lock storage.
+type LockRepository interface {
+	Create(ctx context.Context, lock Lock) (*Lock, error)
+	GetByToken(ctx context.Context, token string) (*Lock, error)
+	ListByResource(ctx context.Context, resourcePath string) ([]Lock, error)
+	ListByResources(ctx context.Context, paths []string) ([]Lock, error)
+	ListByResourcePrefix(ctx context.Context, prefix string) ([]Lock, error)
+	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
+	DeleteByResourcePath(ctx context.Context, resourcePath string) error
+	Delete(ctx context.Context, token string) error
+	DeleteExpired(ctx context.Context) (int64, error)
+	Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*Lock, error)
+}
+
+// ACLRepository handles WebDAV access control entries.
+type ACLRepository interface {
+	SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error
+	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
+	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
+	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
+	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
+	Delete(ctx context.Context, resourcePath string) error
 }

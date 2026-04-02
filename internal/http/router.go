@@ -28,6 +28,11 @@ func init() {
 		"MKCOL",
 		"MKCALENDAR",
 		"REPORT",
+		"COPY",
+		"MOVE",
+		"LOCK",
+		"UNLOCK",
+		"ACL",
 	} {
 		chi.RegisterMethod(method)
 	}
@@ -191,6 +196,11 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 			r.MethodFunc("PUT", "/*", davHandler.Put)
 			r.MethodFunc("DELETE", "/*", davHandler.Delete)
 			r.MethodFunc("REPORT", "/*", davHandler.Report)
+			r.MethodFunc("COPY", "/*", davHandler.Copy)
+			r.MethodFunc("MOVE", "/*", davHandler.Move)
+			r.MethodFunc("LOCK", "/*", davHandler.Lock)
+			r.MethodFunc("UNLOCK", "/*", davHandler.Unlock)
+			r.MethodFunc("ACL", "/*", davHandler.Acl)
 		})
 	})
 

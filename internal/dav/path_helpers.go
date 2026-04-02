@@ -24,3 +24,10 @@ func parseCalendarResourceSegments(rawPath string) (string, string, bool) {
 	}
 	return parts[0], resource, true
 }
+
+func trimDAVResourceSuffix(raw, suffix string) string {
+	if strings.HasSuffix(strings.ToLower(raw), suffix) {
+		return raw[:len(raw)-len(suffix)]
+	}
+	return raw
+}
