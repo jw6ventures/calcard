@@ -1,12 +1,32 @@
-# CalCard
+# CalCard 📅
 
-CalCard is a self-hosted CalDAV/CardDAV server written in Go. It exposes DAV endpoints, a web UI, and requires OIDC authentication with the ability to generate revokable app passwords for DAV clients.
+CalCard makes it easy to self-host and share calendars, reminders, and contacts.
 
-## Installing
+## Features
 
-Copy the .env.template file from the root of this repository, rename to .env, and modify the values to match your environment.
+* **Full CalDAV/CardDAV RFC compliance** - Works seamlessly with your devices. Supports iOS, Android, macOS, Windows, and Linux.
+* **Self-hosted** - You own your data.
+* **Single sign-on (SSO)** - Sign into your existing identity service to access the website and manage your CalCard account.
+* **App passwords** - Generate passwords to connect devices to your account.
+* **Shared calendars** - Share calendars with other users.
+
+## Prerequisites
+
+CalCard requires:
+
+* Any OAuth 2.0 compatible identity service. CalCard has been tested to be compatible with:
+    - [Authentik](https://goauthentik.io/)
+    - [Keycloak](https://www.keycloak.org/)
+* A PostgresQL database. If you don't have one, see the install instructions below for your environment.
+
+## Install
+
+* [Docker (Recommended)](#docker-recommended)
+* [Kubernetes](#kubernetes)
 
 ### Docker (Recommended)
+
+Copy the .env.template file from the root of this repository, rename to .env, and modify the values to match your environment.
 
 | Image                                  | Branch     	| Notes                       	|
 |--------------------------------------- |------------	|-----------------------------	|
@@ -47,9 +67,9 @@ volumes:
   postgres_data:
 ```
 
-#### Kubernetes (Helm)
+### Kubernetes
 
-The Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
+The Kubernetes Helm chart is published to GHCR as an OCI artifact at `ghcr.io/jw6ventures/calcard-helm`.
 
 1. Create a values file with your configuration. See the [default values](./deploy/helm/calcard/values.yaml).
 2. Install or upgrade:
@@ -73,12 +93,6 @@ source .env
 ./calcard-linux-amd64
 ```
 
-## Features
-- CalDAV and CardDAV server.
-- OAuth-only web UI sessions plus per-user app passwords for DAV Basic Auth.
-- PostgreSQL schema and repository layer for users, calendars, address books, events, contacts, and app passwords.
-- Web interface for dashboard, calendars, address books, and app password management.
-
 ## Configuration
 Environment variables:
 | Name | Required | Notes |
@@ -98,13 +112,6 @@ Environment variables:
 | `APP_OAUTH_DISCOVERY_URL` | one of two | Provided from IDP. Overrides `APP_OAUTH_ISSUER_URL` when set. |
 | `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
 | `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for public environments |
-
-## Database schema and migrations
-CalCard uses the `jw6-go-utils` database manager. On startup it will:
-- Create the schema from `db.sql` if the schema check table (`users`) does not exist.
-- Use semantic-versioned migration files in the `migrations/` directory (named `vX.Y.Z.sql`) to move from the stored database version to the current app version.
-
-The baseline version is stored in the `application` table, created by `db.sql`.
 
 
 ## Connecting a CalDAV/CardDAV client
