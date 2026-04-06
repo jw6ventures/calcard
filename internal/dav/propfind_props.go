@@ -69,6 +69,56 @@ func (h *Handler) currentUserPrivilegeSetForPath(ctx context.Context, user *stor
 	}
 
 	cleanPath := normalizeDAVHref(resourcePath)
+	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
+		if segment == "" {
+			if parsedSegment, _, ok := parseCalendarResourceSegments(cleanPath); ok {
+				segment = parsedSegment
+			}
+		}
+		if segment == "" {
+			return nil
+		}
+
+		calendarID, ok, err := h.resolveCalendarID(ctx, user, segment)
+		if err != nil || !ok {
+			return nil
+		}
+		cal, err := h.getCalendar(ctx, calendarID)
+		if err != nil || cal == nil {
+			return nil
+		}
+
+		privileges := make([]privilege, 0, 7)
+		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read"); err == nil {
+			privileges = append(privileges, privilege{Read: &readPrivilege{}})
+		}
+		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read-free-busy"); err == nil {
+			privileges = append(privileges, privilege{ReadFreeBusy: &struct{}{}})
+		}
+		for _, name := range []string{"write", "write-content", "write-properties", "bind", "unbind"} {
+			if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, name); err != nil {
+				continue
+			}
+			switch name {
+			case "write":
+				privileges = append(privileges, privilege{Write: &struct{}{}})
+			case "write-content":
+				privileges = append(privileges, privilege{WriteContent: &struct{}{}})
+			case "write-properties":
+				privileges = append(privileges, privilege{WriteProperties: &struct{}{}})
+			case "bind":
+				privileges = append(privileges, privilege{Bind: &struct{}{}})
+			case "unbind":
+				privileges = append(privileges, privilege{Unbind: &struct{}{}})
+			}
+		}
+		if len(privileges) == 0 {
+			return nil
+		}
+		return &currentUserPrivilegeSet{Privileges: privileges}
+	}
+
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		return nil
 	}

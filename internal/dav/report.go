@@ -162,20 +162,21 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Handle regular calendar reports
-		cal, err := h.loadCalendar(r.Context(), user, calID)
+		loadPrivilege := "read"
+		if report.XMLName.Local == "free-busy-query" {
+			loadPrivilege = "read-free-busy"
+		}
+		cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calID, cleanPath, loadPrivilege)
 		if err != nil {
 			status := http.StatusInternalServerError
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
 			}
+			if errors.Is(err, errForbidden) {
+				status = http.StatusForbidden
+			}
 			http.Error(w, "calendar not found", status)
 			return
-		}
-		if cal.Shared && !cal.Editor {
-			if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "calendar-multiget" {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
 		}
 		canonicalPath := path.Join("/dav/calendars", fmt.Sprint(cal.ID))
 		if report.XMLName.Local == "expand-property" {
@@ -184,7 +185,7 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			ctag := fmt.Sprintf("%d", cal.CTag)
 			syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 			responses := []response{
-				calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, !cal.Editor),
+				calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, cal.EffectivePrivileges()),
 				principalResponse(ensureCollectionHref(principalHref), user),
 			}
 			payload := multistatus{
@@ -201,21 +202,21 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if report.XMLName.Local == "free-busy-query" {
-			events, err := h.store.Events.ListForCalendar(r.Context(), cal.ID)
+			responses, err := h.freeBusyQuery(r.Context(), user, cal, canonicalPath, report.Filter)
 			if err != nil {
 				http.Error(w, "failed to list events", http.StatusInternalServerError)
 				return
 			}
-			if report.Filter != nil {
-				events = h.applyCalendarFilter(events, report.Filter)
+			freeBusyData := ""
+			if len(responses) > 0 && len(responses[0].Propstat) > 0 {
+				freeBusyData = string(responses[0].Propstat[0].Prop.CalendarData)
 			}
-			freeBusyData := h.generateFreeBusy(events, report.Filter)
 			w.Header().Set("Content-Type", "text/calendar")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(freeBusyData))
 			return
 		}
-		responses, syncToken, err := h.calendarReportResponses(r.Context(), cal, h.principalURL(user), cleanPath, canonicalPath, report)
+		responses, syncToken, err := h.calendarReportResponses(r.Context(), user, cal, h.principalURL(user), cleanPath, canonicalPath, report)
 		if err != nil {
 			if errors.Is(err, errInvalidSyncToken) {
 				http.Error(w, "invalid sync token", http.StatusForbidden)

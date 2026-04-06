@@ -87,22 +87,94 @@ func (s *Service) GetCalendar(ctx context.Context, user *store.User, calendarID 
 	return cal, nil
 }
 
-func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID int64) ([]store.Event, error) {
-	if _, err := s.GetCalendar(ctx, user, calendarID); err != nil {
+func (s *Service) loadCalendarForResource(ctx context.Context, user *store.User, calendarID int64, resourceName, privilege string) (*store.CalendarAccess, error) {
+	var legacy *store.CalendarAccess
+	if s != nil && s.store != nil && s.store.Calendars != nil && user != nil {
+		cal, err := s.store.Calendars.GetAccessible(ctx, calendarID, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		legacy = cal
+	}
+
+	if s == nil || s.store == nil || s.store.Calendars == nil {
+		return nil, ErrNotFound
+	}
+	cal, err := s.store.Calendars.GetByID(ctx, calendarID)
+	if err != nil {
 		return nil, err
 	}
-	return s.store.Events.ListForCalendar(ctx, calendarID)
+	if cal == nil {
+		if legacy == nil {
+			return nil, ErrNotFound
+		}
+		cal = &legacy.Calendar
+	}
+
+	access := &store.CalendarAccess{
+		Calendar: *cal,
+		Shared:   user == nil || cal.UserID != user.ID,
+	}
+	if legacy != nil {
+		access.OwnerEmail = legacy.OwnerEmail
+		access.Shared = legacy.Shared
+		access.Privileges = legacy.EffectivePrivileges()
+		access.PrivilegesResolved = legacy.PrivilegesResolved || legacy.Privileges.HasAny()
+		access.Editor = access.Privileges.AllowsEventEditing()
+	}
+	if err := s.requireCalendarPrivilege(ctx, user, access, resourceName, privilege); err != nil {
+		return nil, err
+	}
+	return access, nil
+}
+
+func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID int64) ([]store.Event, error) {
+	cal, err := s.GetCalendar(ctx, user, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	events, err := s.store.Events.ListForCalendar(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	prefetchedACLEntries, err := s.prefetchCalendarACLEntries(ctx, user, calendarID, events)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]store.Event, 0, len(events))
+	for _, event := range events {
+		allowed, err := s.canReadCalendarResourceWithEntries(user, cal, eventResourceName(event), prefetchedACLEntries)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, event)
+		}
+	}
+	return visible, nil
 }
 
 func (s *Service) GetEvent(ctx context.Context, user *store.User, calendarID int64, uid string) (*store.Event, error) {
-	if _, err := s.GetCalendar(ctx, user, calendarID); err != nil {
-		return nil, err
-	}
 	ev, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, err
 	}
 	if ev == nil {
+		return nil, ErrNotFound
+	}
+
+	cal, err := s.loadCalendarForResource(ctx, user, calendarID, eventResourceName(*ev), "read")
+	if err != nil {
+		if errors.Is(err, ErrForbidden) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	allowed, err := s.canReadCalendarResource(ctx, user, cal, eventResourceName(*ev))
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
 		return nil, ErrNotFound
 	}
 	return ev, nil
@@ -112,9 +184,6 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	cal, err := s.GetCalendar(ctx, user, calendarID)
 	if err != nil {
 		return nil, false, err
-	}
-	if !cal.Editor {
-		return nil, false, ErrForbidden
 	}
 
 	body, uid, err := s.normalizeEventPayload(input, "")
@@ -131,20 +200,15 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	if existing != nil {
 		return nil, false, ErrConflict
 	}
+	if err := s.requireCalendarPrivilege(ctx, user, cal, uid, "bind"); err != nil {
+		return nil, false, err
+	}
 
 	event, created, err := s.saveEvent(ctx, calendarID, uid, uid, body, input.IfMatch, input.IfNoneMatch)
 	return event, created, err
 }
 
 func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID int64, uid string, input UpsertInput) (*store.Event, bool, error) {
-	cal, err := s.GetCalendar(ctx, user, calendarID)
-	if err != nil {
-		return nil, false, err
-	}
-	if !cal.Editor {
-		return nil, false, ErrForbidden
-	}
-
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, false, err
@@ -168,19 +232,18 @@ func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID 
 	if resourceName == "" {
 		resourceName = uid
 	}
+	cal, err := s.loadCalendarForResource(ctx, user, calendarID, resourceName, "write-content")
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.requireCalendarPrivilege(ctx, user, cal, resourceName, "write-content"); err != nil {
+		return nil, false, err
+	}
 	event, created, err := s.saveEvent(ctx, calendarID, uid, resourceName, body, input.IfMatch, input.IfNoneMatch)
 	return event, created, err
 }
 
 func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID int64, uid, ifMatch, ifNoneMatch string) error {
-	cal, err := s.GetCalendar(ctx, user, calendarID)
-	if err != nil {
-		return err
-	}
-	if !cal.Editor {
-		return ErrForbidden
-	}
-
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return err
@@ -191,7 +254,332 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if existing == nil {
 		return ErrNotFound
 	}
+	cal, err := s.loadCalendarForResource(ctx, user, calendarID, eventResourceName(*existing), "unbind")
+	if err != nil {
+		return err
+	}
+	if err := s.requireCalendarPrivilege(ctx, user, cal, eventResourceName(*existing), "unbind"); err != nil {
+		return err
+	}
 	return s.store.Events.DeleteByUID(ctx, calendarID, uid)
+}
+
+func (s *Service) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) error {
+	allowed, denied, err := s.calendarPrivilegeDecision(ctx, user, cal, resourceName, privilege)
+	if err != nil {
+		return err
+	}
+	if allowed {
+		return nil
+	}
+	if denied {
+		return ErrForbidden
+	}
+	if cal != nil && cal.EffectivePrivileges().Allows(privilege) {
+		return nil
+	}
+	return ErrForbidden
+}
+
+func (s *Service) canReadCalendarResource(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName string) (bool, error) {
+	allowed, denied, err := s.calendarPrivilegeDecision(ctx, user, cal, resourceName, "read")
+	if err != nil {
+		return false, err
+	}
+	if allowed {
+		return true, nil
+	}
+	if denied {
+		return false, nil
+	}
+	return cal != nil && cal.EffectivePrivileges().Allows("read"), nil
+}
+
+func (s *Service) canReadCalendarResourceWithEntries(user *store.User, cal *store.CalendarAccess, resourceName string, entriesByPath map[string][]store.ACLEntry) (bool, error) {
+	allowed, denied := calendarPrivilegeDecisionFromEntries(user, cal, resourceName, "read", entriesByPath)
+	if allowed {
+		return true, nil
+	}
+	if denied {
+		return false, nil
+	}
+	return cal != nil && cal.EffectivePrivileges().Allows("read"), nil
+}
+
+func (s *Service) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) (bool, bool, error) {
+	if cal == nil || user == nil {
+		return false, false, nil
+	}
+	if cal.UserID == user.ID {
+		return true, false, nil
+	}
+	if s == nil || s.store == nil || s.store.ACLEntries == nil {
+		return false, false, nil
+	}
+
+	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
+	resourceApplicable, err := s.aclHasApplicablePrincipal(ctx, user, resourcePaths)
+	if err != nil {
+		return false, false, err
+	}
+	if granted, applicable, err := s.aclDecision(ctx, user, resourcePaths, privilege); err != nil {
+		return false, false, err
+	} else if applicable {
+		return granted, !granted, nil
+	}
+
+	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
+	collectionApplicable, err := s.aclHasApplicablePrincipal(ctx, user, collectionPaths)
+	if err != nil {
+		return false, false, err
+	}
+	if granted, applicable, err := s.aclDecision(ctx, user, collectionPaths, privilege); err != nil {
+		return false, false, err
+	} else if applicable {
+		return granted, !granted, nil
+	}
+
+	return false, resourceApplicable || collectionApplicable, nil
+}
+
+func (s *Service) aclDecision(ctx context.Context, user *store.User, resourcePaths []string, privilege string) (bool, bool, error) {
+	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
+	if err != nil {
+		return false, false, err
+	}
+
+	applicablePrincipals := applicableACLPrincipals(user)
+	granted, applicable := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+	return granted, applicable, nil
+}
+
+func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePaths []string) (bool, error) {
+	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) == 0 {
+		return false, nil
+	}
+
+	applicablePrincipals := applicableACLPrincipals(user)
+	for _, entry := range entries {
+		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string) ([]store.ACLEntry, error) {
+	if s == nil || s.store == nil || s.store.ACLEntries == nil {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(resourcePaths))
+	var result []store.ACLEntry
+	for _, resourcePath := range resourcePaths {
+		if resourcePath == "" {
+			continue
+		}
+		if _, ok := seen[resourcePath]; ok {
+			continue
+		}
+		seen[resourcePath] = struct{}{}
+		entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, entries...)
+	}
+	return result, nil
+}
+
+func (s *Service) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
+	if s == nil || s.store == nil || s.store.ACLEntries == nil || user == nil {
+		return nil, nil
+	}
+
+	relevantPaths := map[string]struct{}{
+		calendarACLCollectionPath(calendarID): {},
+	}
+	for _, event := range events {
+		for _, resourcePath := range calendarACLResourcePaths(calendarID, eventResourceName(event)) {
+			relevantPaths[resourcePath] = struct{}{}
+		}
+	}
+
+	result := make(map[string][]store.ACLEntry, len(relevantPaths))
+	for _, principalHref := range aclPrincipalHrefs(user) {
+		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			resourcePath := strings.TrimSpace(entry.ResourcePath)
+			if _, ok := relevantPaths[resourcePath]; !ok {
+				continue
+			}
+			result[resourcePath] = append(result[resourcePath], entry)
+		}
+	}
+	return result, nil
+}
+
+func calendarACLCollectionPath(calendarID int64) string {
+	return fmt.Sprintf("/dav/calendars/%d", calendarID)
+}
+
+func calendarACLResourcePaths(calendarID int64, resourceName string) []string {
+	resourceName = strings.TrimSpace(resourceName)
+	if resourceName == "" {
+		return nil
+	}
+	base := calendarACLCollectionPath(calendarID) + "/" + resourceName
+	paths := []string{base}
+	if strings.EqualFold(pathExt(resourceName), ".ics") {
+		paths = append(paths, strings.TrimSuffix(base, pathExt(resourceName)))
+	} else {
+		paths = append(paths, base+".ics")
+	}
+	return paths
+}
+
+func eventResourceName(event store.Event) string {
+	if event.ResourceName != "" {
+		return event.ResourceName
+	}
+	return event.UID
+}
+
+func applicableACLPrincipals(user *store.User) map[string]struct{} {
+	principals := map[string]struct{}{"DAV:all": {}}
+	if user != nil {
+		principals[fmt.Sprintf("/dav/principals/%d/", user.ID)] = struct{}{}
+		principals["DAV:authenticated"] = struct{}{}
+	}
+	return principals
+}
+
+func aclPrincipalHrefs(user *store.User) []string {
+	principals := []string{"DAV:all"}
+	if user != nil {
+		principals = append(principals, "DAV:authenticated", fmt.Sprintf("/dav/principals/%d/", user.ID))
+	}
+	return principals
+}
+
+func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
+	if cal == nil || user == nil {
+		return false, false
+	}
+	if cal.UserID == user.ID {
+		return true, false
+	}
+
+	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, resourcePaths, privilege); applicable {
+		return granted, !granted
+	}
+
+	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, collectionPaths, privilege); applicable {
+		return granted, !granted
+	}
+
+	return false, aclHasApplicablePrincipalForPaths(entriesByPath, user, resourcePaths) || aclHasApplicablePrincipalForPaths(entriesByPath, user, collectionPaths)
+}
+
+func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string, privilege string) (bool, bool) {
+	if len(entriesByPath) == 0 {
+		return false, false
+	}
+	entries := make([]store.ACLEntry, 0, len(resourcePaths))
+	for _, resourcePath := range resourcePaths {
+		entries = append(entries, entriesByPath[resourcePath]...)
+	}
+	return aclDecisionForPrivilege(entries, applicableACLPrincipals(user), privilege)
+}
+
+func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string) bool {
+	if len(entriesByPath) == 0 {
+		return false
+	}
+	applicablePrincipals := applicableACLPrincipals(user)
+	for _, resourcePath := range resourcePaths {
+		for _, entry := range entriesByPath[resourcePath] {
+			if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeACLPrincipalHref(raw string) string {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "", "DAV:all", "DAV:authenticated":
+		return raw
+	}
+	if strings.HasPrefix(raw, "/dav/principals/") && !strings.HasSuffix(raw, "/") {
+		return raw + "/"
+	}
+	return raw
+}
+
+func aclPrivilegeMatches(granted, requested string) bool {
+	if granted == requested || granted == "all" {
+		return true
+	}
+	if granted == "read" && requested == "read-free-busy" {
+		return true
+	}
+	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
+}
+
+func aclDecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
+	if privilege == "write" {
+		return aclAggregateWriteDecision(entries, applicablePrincipals)
+	}
+	hasGrant := false
+	for _, entry := range entries {
+		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
+			continue
+		}
+		if !aclPrivilegeMatches(entry.Privilege, privilege) {
+			continue
+		}
+		if !entry.IsGrant {
+			return false, true
+		}
+		hasGrant = true
+	}
+	if hasGrant {
+		return true, true
+	}
+	return false, false
+}
+
+func aclAggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
+	applicable := false
+	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
+		granted, decided := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+		if decided {
+			applicable = true
+		}
+		if !granted {
+			return false, applicable
+		}
+	}
+	return applicable, applicable
+}
+
+func pathExt(resourceName string) string {
+	idx := strings.LastIndex(resourceName, ".")
+	if idx < 0 {
+		return ""
+	}
+	return resourceName[idx:]
 }
 
 func (s *Service) normalizeEventPayload(input UpsertInput, expectedUID string) (string, string, error) {

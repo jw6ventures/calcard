@@ -482,14 +482,32 @@ func (h *Handler) canLockCalendarPath(ctx context.Context, user *store.User, cle
 		if calendarID == birthdayCalendarID {
 			return false, nil
 		}
-		cal, err := h.loadCalendar(ctx, user, calendarID)
+		cal, err := h.getCalendar(ctx, calendarID)
 		if err != nil {
-			if err == store.ErrNotFound {
+			if err == store.ErrNotFound || errors.Is(err, errForbidden) {
 				return false, nil
 			}
 			return false, err
 		}
-		return cal.Editor, nil
+		privilege := "bind"
+		if h.store != nil && h.store.Events != nil {
+			existing, err := h.store.Events.GetByResourceName(ctx, calendarID, path.Base(normalizeDAVResourceIdentity(cleanPath)))
+			if err != nil {
+				return false, err
+			}
+			if existing != nil {
+				privilege = "write-content"
+			}
+		} else {
+			privilege = "write-content"
+		}
+		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, privilege); err != nil {
+			if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
 	}
 
 	segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
@@ -514,12 +532,30 @@ func (h *Handler) canLockCalendarPath(ctx context.Context, user *store.User, cle
 	}
 	cal, err := h.loadCalendar(ctx, user, calendarID)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if err == store.ErrNotFound || errors.Is(err, errForbidden) {
 			return false, nil
 		}
 		return false, err
 	}
-	return cal.Editor, nil
+	allowed, err := h.hasAnyCalendarWritePrivilege(ctx, user, cal, cleanPath)
+	if err != nil {
+		return false, err
+	}
+	if !allowed {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (h *Handler) hasAnyCalendarWritePrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string) (bool, error) {
+	for _, privilege := range []string{"write", "bind", "write-content", "write-properties", "unbind"} {
+		if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, privilege); err == nil {
+			return true, nil
+		} else if err != store.ErrNotFound && !errors.Is(err, errForbidden) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func singleCollectionSegment(cleanPath, prefix string) string {

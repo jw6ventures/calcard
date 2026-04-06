@@ -16,7 +16,6 @@ type Store struct {
 
 	Users            UserRepository
 	Calendars        CalendarRepository
-	CalendarShares   CalendarShareRepository
 	Events           EventRepository
 	AddressBooks     AddressBookRepository
 	Contacts         ContactRepository
@@ -33,7 +32,6 @@ func New(pool *sql.DB) *Store {
 		pool:             pool,
 		Users:            &userRepo{pool: pool},
 		Calendars:        &calendarRepo{pool: pool},
-		CalendarShares:   &calendarShareRepo{pool: pool},
 		Events:           &eventRepo{pool: pool},
 		AddressBooks:     &addressBookRepo{pool: pool},
 		Contacts:         &contactRepo{pool: pool},

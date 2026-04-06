@@ -21,15 +21,9 @@ type CalendarRepository interface {
 	GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error)
 	Create(ctx context.Context, cal Calendar) (*Calendar, error)
 	Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error
+	UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error
 	Rename(ctx context.Context, userID, id int64, name string) error
 	Delete(ctx context.Context, userID, id int64) error
-}
-
-// CalendarShareRepository manages shared calendar grants.
-type CalendarShareRepository interface {
-	ListByCalendar(ctx context.Context, calendarID int64) ([]CalendarShare, error)
-	Create(ctx context.Context, share CalendarShare) error
-	Delete(ctx context.Context, calendarID, userID int64) error
 }
 
 // EventRepository handles event storage.
@@ -125,6 +119,7 @@ type ACLRepository interface {
 	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
 	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
+	DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
 }

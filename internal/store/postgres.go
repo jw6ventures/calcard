@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,6 +88,101 @@ type calendarRepo struct {
 	pool *sql.DB
 }
 
+func sqlLiteralList(items ...string) string {
+	quoted := make([]string, 0, len(items))
+	for _, item := range items {
+		quoted = append(quoted, "'"+item+"'")
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func calendarACLBooleanExpr(userParam string, privileges ...string) string {
+	privilegeList := sqlLiteralList(privileges...)
+	principals := aclPrincipalListExpr(userParam)
+	return `(
+       NOT EXISTS (
+           SELECT 1 FROM acl_entries d
+           WHERE d.resource_path = '/dav/calendars/' || c.id::text
+             AND d.principal_href IN ` + principals + `
+             AND d.is_grant = FALSE
+             AND d.privilege IN (` + privilegeList + `)
+       )
+       AND EXISTS (
+           SELECT 1 FROM acl_entries g
+           WHERE g.resource_path = '/dav/calendars/' || c.id::text
+             AND g.principal_href IN ` + principals + `
+             AND g.is_grant = TRUE
+             AND g.privilege IN (` + privilegeList + `)
+       )
+   )`
+}
+
+func aclPrincipalListExpr(userParam string) string {
+	return "('DAV:all', 'DAV:authenticated', '/dav/principals/' || " + userParam + "::text || '/')"
+}
+
+func calendarEventACLPathListExpr() string {
+	return `(
+            '/dav/calendars/' || c.id::text || '/' || e.resource_name,
+            '/dav/calendars/' || c.id::text || '/' || regexp_replace(e.resource_name, '\.ics$', ''),
+            '/dav/calendars/' || c.id::text || '/' || regexp_replace(e.resource_name, '\.ics$', '') || '.ics'
+        )`
+}
+
+func calendarEventACLDenyExpr(userParam string, privileges ...string) string {
+	privilegeList := sqlLiteralList(privileges...)
+	return `EXISTS (
+           SELECT 1 FROM acl_entries d
+           WHERE d.resource_path IN ` + calendarEventACLPathListExpr() + `
+             AND d.principal_href IN ` + aclPrincipalListExpr(userParam) + `
+             AND d.is_grant = FALSE
+             AND d.privilege IN (` + privilegeList + `)
+       )`
+}
+
+func calendarEventACLGrantExpr(userParam string, privileges ...string) string {
+	privilegeList := sqlLiteralList(privileges...)
+	return `EXISTS (
+           SELECT 1 FROM acl_entries g
+           WHERE g.resource_path IN ` + calendarEventACLPathListExpr() + `
+             AND g.principal_href IN ` + aclPrincipalListExpr(userParam) + `
+             AND g.is_grant = TRUE
+             AND g.privilege IN (` + privilegeList + `)
+       )`
+}
+
+func calendarEventACLAllowsExpr(userParam string, privileges ...string) string {
+	return `(NOT ` + calendarEventACLDenyExpr(userParam, privileges...) + ` AND ` + calendarEventACLGrantExpr(userParam, privileges...) + `)`
+}
+
+func calendarACLAnyAccessExpr(userParam string) string {
+	return `(` +
+		calendarACLBooleanExpr(userParam, "read", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "read-free-busy", "read", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "write", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "write-content", "write", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "write-properties", "write", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "bind", "write", "all") + `
+           OR ` + calendarACLBooleanExpr(userParam, "unbind", "write", "all") + `
+       )`
+}
+
+func calendarObjectACLAnyAccessExpr(userParam string) string {
+	return `EXISTS (
+           SELECT 1 FROM events e
+           WHERE e.calendar_id = c.id
+             AND (
+                 ` + calendarEventACLAllowsExpr(userParam, "read", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "read-free-busy", "read", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "write", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "write-content", "write", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "write-properties", "write", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "bind", "write", "all") + `
+                 OR ` + calendarEventACLAllowsExpr(userParam, "unbind", "write", "all") + `
+             )
+       )`
+}
+
 func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar, error) {
 	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "calendars.list_by_user")()
@@ -131,18 +227,25 @@ func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error)
 }
 
 func (r *calendarRepo) ListAccessible(ctx context.Context, userID int64) ([]CalendarAccess, error) {
-	const q = `
+	q := `
 SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
-       u.primary_email as owner_email, FALSE as shared, TRUE as editor
+       u.primary_email as owner_email,
+       CASE WHEN c.user_id = $1 THEN FALSE ELSE TRUE END as shared,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "read", "all") + ` END as can_read,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "read-free-busy", "read", "all") + ` END as can_read_free_busy,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write", "all") + ` END as can_write,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write-content", "write", "all") + ` END as can_write_content,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write-properties", "write", "all") + ` END as can_write_properties,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "bind", "write", "all") + ` END as can_bind,
+       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "unbind", "write", "all") + ` END as can_unbind
 FROM calendars c
 JOIN users u ON u.id = c.user_id
 WHERE c.user_id = $1
-UNION ALL
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
-       u.primary_email as owner_email, TRUE as shared, cs.editor
-FROM calendars c
-JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
-JOIN users u ON u.id = c.user_id
+   OR (
+       c.user_id <> $1
+       AND (` + calendarACLAnyAccessExpr("$1") + `
+            OR ` + calendarObjectACLAnyAccessExpr("$1") + `)
+   )
 ORDER BY shared, name
 `
 	defer observeDB(ctx, "calendars.list_accessible")()
@@ -156,33 +259,55 @@ ORDER BY shared, name
 	for rows.Next() {
 		var c CalendarAccess
 		var slug, description, timezone, color sql.NullString
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+		if err := rows.Scan(
+			&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
+			&c.Privileges.Read, &c.Privileges.ReadFreeBusy, &c.Privileges.Write, &c.Privileges.WriteContent, &c.Privileges.WriteProperties, &c.Privileges.Bind, &c.Privileges.Unbind,
+		); err != nil {
 			return nil, err
 		}
 		c.Slug = nullableString(slug)
 		c.Description = nullableString(description)
 		c.Timezone = nullableString(timezone)
 		c.Color = nullableString(color)
+		c.PrivilegesResolved = true
+		c.Privileges = c.Privileges.Normalized()
+		c.Editor = c.Privileges.AllowsEventEditing()
 		result = append(result, c)
 	}
 	return result, rows.Err()
 }
 
 func (r *calendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error) {
-	const q = `
+	q := `
 SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email,
        CASE WHEN c.user_id = $2 THEN FALSE ELSE TRUE END as shared,
-       COALESCE(cs.editor, TRUE) as editor
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "read", "all") + ` END as can_read,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "read-free-busy", "read", "all") + ` END as can_read_free_busy,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write", "all") + ` END as can_write,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write-content", "write", "all") + ` END as can_write_content,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write-properties", "write", "all") + ` END as can_write_properties,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "bind", "write", "all") + ` END as can_bind,
+       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "unbind", "write", "all") + ` END as can_unbind
 FROM calendars c
 JOIN users u ON u.id = c.user_id
-LEFT JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $2
-WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
+WHERE c.id = $1
+  AND (
+      c.user_id = $2
+      OR (
+          c.user_id <> $2
+          AND (` + calendarACLAnyAccessExpr("$2") + `
+               OR ` + calendarObjectACLAnyAccessExpr("$2") + `)
+      )
+  )
 `
 	defer observeDB(ctx, "calendars.get_accessible")()
 	var c CalendarAccess
 	var slug, description, timezone, color sql.NullString
-	if err := r.pool.QueryRowContext(ctx, q, calendarID, userID).Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared, &c.Editor); err != nil {
+	if err := r.pool.QueryRowContext(ctx, q, calendarID, userID).Scan(
+		&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
+		&c.Privileges.Read, &c.Privileges.ReadFreeBusy, &c.Privileges.Write, &c.Privileges.WriteContent, &c.Privileges.WriteProperties, &c.Privileges.Bind, &c.Privileges.Unbind,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -192,6 +317,9 @@ WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
 	c.Description = nullableString(description)
 	c.Timezone = nullableString(timezone)
 	c.Color = nullableString(color)
+	c.PrivilegesResolved = true
+	c.Privileges = c.Privileges.Normalized()
+	c.Editor = c.Privileges.AllowsEventEditing()
 	return &c, nil
 }
 
@@ -215,6 +343,23 @@ func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string
 	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4 AND user_id=$5`
 	defer observeDB(ctx, "calendars.update")()
 	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, id, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *calendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4`
+	defer observeDB(ctx, "calendars.update_properties")()
+	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, id)
 	if err != nil {
 		return err
 	}
@@ -260,49 +405,6 @@ func (r *calendarRepo) Delete(ctx context.Context, userID, id int64) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-// calendarShareRepo implements CalendarShareRepository.
-type calendarShareRepo struct {
-	pool *sql.DB
-}
-
-func (r *calendarShareRepo) ListByCalendar(ctx context.Context, calendarID int64) ([]CalendarShare, error) {
-	const q = `SELECT calendar_id, user_id, granted_by, editor, created_at FROM calendar_shares WHERE calendar_id=$1 ORDER BY created_at`
-	defer observeDB(ctx, "calendar_shares.list_by_calendar")()
-	rows, err := r.pool.QueryContext(ctx, q, calendarID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var shares []CalendarShare
-	for rows.Next() {
-		var cs CalendarShare
-		if err := rows.Scan(&cs.CalendarID, &cs.UserID, &cs.GrantedBy, &cs.Editor, &cs.CreatedAt); err != nil {
-			return nil, err
-		}
-		shares = append(shares, cs)
-	}
-	return shares, rows.Err()
-}
-
-func (r *calendarShareRepo) Create(ctx context.Context, share CalendarShare) error {
-	const q = `
-INSERT INTO calendar_shares (calendar_id, user_id, granted_by, editor)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (calendar_id, user_id) DO NOTHING
-`
-	defer observeDB(ctx, "calendar_shares.create")()
-	_, err := r.pool.ExecContext(ctx, q, share.CalendarID, share.UserID, share.GrantedBy, share.Editor)
-	return err
-}
-
-func (r *calendarShareRepo) Delete(ctx context.Context, calendarID, userID int64) error {
-	const q = `DELETE FROM calendar_shares WHERE calendar_id=$1 AND user_id=$2`
-	defer observeDB(ctx, "calendar_shares.delete")()
-	_, err := r.pool.ExecContext(ctx, q, calendarID, userID)
-	return err
 }
 
 // eventRepo implements EventRepository.
@@ -476,12 +578,19 @@ func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, sin
 }
 
 func (r *eventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error) {
-	const q = `
+	q := `
 SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified
 FROM events e
 JOIN calendars c ON c.id = e.calendar_id
-LEFT JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
-WHERE c.user_id = $1 OR cs.user_id = $1
+WHERE c.user_id = $1
+   OR (
+       c.user_id <> $1
+       AND NOT ` + calendarEventACLDenyExpr("$1", "read", "all") + `
+       AND (
+           ` + calendarEventACLGrantExpr("$1", "read", "all") + `
+           OR ` + calendarACLBooleanExpr("$1", "read", "all") + `
+       )
+   )
 ORDER BY e.last_modified DESC
 LIMIT $2
 `
@@ -533,6 +642,19 @@ func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalend
 			return ErrNotFound
 		}
 		return err
+	}
+	if fromCalendarID != toCalendarID {
+		const existingDestQ = `SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`
+		var existingDestResourceName string
+		switch err := tx.QueryRowContext(ctx, existingDestQ, toCalendarID, uid).Scan(&existingDestResourceName); {
+		case err == nil:
+			if existingDestResourceName != "" && existingDestResourceName != destResourceName {
+				return ErrConflict
+			}
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return err
+		}
 	}
 
 	const deleteDestByNameQ = `DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`
@@ -612,6 +734,9 @@ func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalend
 	var existingDestResourceName string
 	switch err := tx.QueryRowContext(ctx, existingDestQ, toCalendarID, src.UID).Scan(&existingDestResourceName); {
 	case err == nil:
+		if existingDestResourceName != "" && existingDestResourceName != destResourceName {
+			return nil, ErrConflict
+		}
 	case errors.Is(err, sql.ErrNoRows):
 		existingDestResourceName = ""
 	default:
@@ -1718,6 +1843,42 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 	}
 	defer tx.Rollback()
 
+	type aclIdentity struct {
+		principalHref string
+		isGrant       bool
+		privilege     string
+	}
+
+	const existingQ = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`
+	rows, err := tx.QueryContext(ctx, existingQ, resourcePath)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existingCreatedAt := make(map[aclIdentity]time.Time)
+	for rows.Next() {
+		var (
+			id            int64
+			existingPath  string
+			principalHref string
+			isGrant       bool
+			privilege     string
+			createdAt     time.Time
+		)
+		if err := rows.Scan(&id, &existingPath, &principalHref, &isGrant, &privilege, &createdAt); err != nil {
+			return err
+		}
+		existingCreatedAt[aclIdentity{
+			principalHref: principalHref,
+			isGrant:       isGrant,
+			privilege:     privilege,
+		}] = createdAt
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	// Delete existing entries for this resource
 	const deleteQ = `DELETE FROM acl_entries WHERE resource_path=$1`
 	if _, err := tx.ExecContext(ctx, deleteQ, resourcePath); err != nil {
@@ -1725,14 +1886,117 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 	}
 
 	// Insert the new entries
-	const insertQ = `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege) VALUES ($1, $2, $3, $4)`
+	const insertQ = `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`
 	for _, entry := range entries {
-		if _, err := tx.ExecContext(ctx, insertQ, resourcePath, entry.PrincipalHref, entry.IsGrant, entry.Privilege); err != nil {
+		createdAt := entry.CreatedAt
+		if createdAt.IsZero() {
+			if preserved, ok := existingCreatedAt[aclIdentity{
+				principalHref: entry.PrincipalHref,
+				isGrant:       entry.IsGrant,
+				privilege:     entry.Privilege,
+			}]; ok {
+				createdAt = preserved
+			} else {
+				createdAt = time.Now().UTC()
+			}
+		}
+		if _, err := tx.ExecContext(ctx, insertQ, resourcePath, entry.PrincipalHref, entry.IsGrant, entry.Privilege, createdAt); err != nil {
 			return err
 		}
 	}
 
+	if err := touchACLDependentState(ctx, tx, resourcePath); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+func touchACLDependentState(ctx context.Context, tx *sql.Tx, resourcePath string) error {
+	collectionType, collectionID, resourceName, collectionPath, ok := aclResourceIdentity(resourcePath)
+	if !ok {
+		return nil
+	}
+
+	switch collectionType {
+	case "calendar":
+		const touchCalendarQ = `UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
+		if _, err := tx.ExecContext(ctx, touchCalendarQ, collectionID); err != nil {
+			return err
+		}
+		if collectionPath {
+			const touchEventsQ = `UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`
+			if _, err := tx.ExecContext(ctx, touchEventsQ, collectionID); err != nil {
+				return err
+			}
+		} else {
+			canonical, alternate := aclResourceNameCandidates(resourceName, ".ics")
+			const touchEventQ = `UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`
+			if _, err := tx.ExecContext(ctx, touchEventQ, collectionID, canonical, alternate); err != nil {
+				return err
+			}
+		}
+	case "addressbook":
+		const touchBookQ = `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
+		if _, err := tx.ExecContext(ctx, touchBookQ, collectionID); err != nil {
+			return err
+		}
+		if collectionPath {
+			const touchContactsQ = `UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1`
+			if _, err := tx.ExecContext(ctx, touchContactsQ, collectionID); err != nil {
+				return err
+			}
+		} else {
+			canonical, alternate := aclResourceNameCandidates(resourceName, ".vcf")
+			const touchContactQ = `UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1 AND resource_name IN ($2, $3)`
+			if _, err := tx.ExecContext(ctx, touchContactQ, collectionID, canonical, alternate); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func aclResourceIdentity(resourcePath string) (string, int64, string, bool, bool) {
+	cleanPath := path.Clean(strings.TrimSpace(resourcePath))
+	for _, candidate := range []struct {
+		prefix string
+		kind   string
+	}{
+		{prefix: "/dav/calendars/", kind: "calendar"},
+		{prefix: "/dav/addressbooks/", kind: "addressbook"},
+	} {
+		if !strings.HasPrefix(cleanPath, candidate.prefix) {
+			continue
+		}
+		trimmed := strings.TrimPrefix(cleanPath, candidate.prefix)
+		segment := strings.Split(trimmed, "/")[0]
+		if segment == "" {
+			return "", 0, "", false, false
+		}
+		id, err := strconv.ParseInt(segment, 10, 64)
+		if err != nil {
+			return "", 0, "", false, false
+		}
+		if len(strings.Split(trimmed, "/")) == 1 {
+			return candidate.kind, id, "", true, true
+		}
+		resourceName := strings.Split(trimmed, "/")[1]
+		if resourceName == "" {
+			return "", 0, "", false, false
+		}
+		return candidate.kind, id, resourceName, false, true
+	}
+	return "", 0, "", false, false
+}
+
+func aclResourceNameCandidates(resourceName, ext string) (string, string) {
+	resourceName = strings.TrimSpace(resourceName)
+	if strings.EqualFold(path.Ext(resourceName), ext) {
+		return resourceName, strings.TrimSuffix(resourceName, path.Ext(resourceName))
+	}
+	return resourceName, resourceName + ext
 }
 
 func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error) {
@@ -1795,6 +2059,54 @@ END
 		return false, err
 	}
 	return exists, nil
+}
+
+func (r *aclRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
+	defer observeDB(ctx, "acl.delete_principal_entries_by_resource_prefix")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(resourcePathPrefix)
+	likePrefix := escaped + "/%"
+
+	const listQ = `SELECT DISTINCT resource_path FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\') ORDER BY resource_path`
+	rows, err := tx.QueryContext(ctx, listQ, principalHref, resourcePathPrefix, likePrefix)
+	if err != nil {
+		return err
+	}
+	var affected []string
+	for rows.Next() {
+		var resourcePath string
+		if err := rows.Scan(&resourcePath); err != nil {
+			rows.Close()
+			return err
+		}
+		affected = append(affected, resourcePath)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	const deleteQ = `DELETE FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')`
+	if _, err := tx.ExecContext(ctx, deleteQ, principalHref, resourcePathPrefix, likePrefix); err != nil {
+		return err
+	}
+
+	for _, resourcePath := range affected {
+		if err := touchACLDependentState(ctx, tx, resourcePath); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (r *aclRepo) Delete(ctx context.Context, resourcePath string) error {

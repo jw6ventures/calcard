@@ -219,14 +219,34 @@ func (h *Handler) checkACLPrivilege(ctx context.Context, user *store.User, resou
 		return true, nil
 	}
 
-	if granted, decided, err := h.aclDecision(ctx, user, resourcePath, privilege); err != nil {
+	if granted, applicable, err := h.aclDecision(ctx, user, resourcePath, privilege); err != nil {
 		return false, err
-	} else if decided {
+	} else if applicable {
 		return granted, nil
 	}
 
-	// Fall back to existing calendar share model
-	return h.hasCalendarSharePrivilege(ctx, user, resourcePath, privilege), nil
+	switch {
+	case strings.HasPrefix(resourcePath, "/dav/calendars/"):
+		collectionPath := calendarCollectionPath(resourcePath)
+		if collectionPath != resourcePath {
+			if granted, applicable, err := h.aclDecision(ctx, user, collectionPath, privilege); err != nil {
+				return false, err
+			} else if applicable {
+				return granted, nil
+			}
+		}
+	case strings.HasPrefix(resourcePath, "/dav/addressbooks/"):
+		collectionPath := addressBookCollectionPath(resourcePath)
+		if collectionPath != resourcePath {
+			if granted, applicable, err := h.aclDecision(ctx, user, collectionPath, privilege); err != nil {
+				return false, err
+			} else if applicable {
+				return granted, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 func (h *Handler) aclDecision(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
@@ -239,32 +259,13 @@ func (h *Handler) aclDecision(ctx context.Context, user *store.User, resourcePat
 		return false, false, err
 	}
 
-	applicablePrincipals := map[string]struct{}{"DAV:all": {}}
-	if user != nil {
-		principalHref := fmt.Sprintf("/dav/principals/%d/", user.ID)
-		applicablePrincipals[principalHref] = struct{}{}
-		applicablePrincipals["DAV:authenticated"] = struct{}{}
-	}
+	applicablePrincipals := applicableACLPrincipals(user)
+	granted, applicable := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+	return granted, applicable, nil
+}
 
-	// RFC 3744: deny ACEs MUST be evaluated before grant ACEs.
-	// Two-pass: first check for any applicable deny, then for any grant.
-	hasGrant := false
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
-			continue
-		}
-		if !aclPrivilegeMatches(entry.Privilege, privilege) {
-			continue
-		}
-		if !entry.IsGrant {
-			return false, true, nil
-		}
-		hasGrant = true
-	}
-	if hasGrant {
-		return true, true, nil
-	}
-	return false, false, nil
+func (h *Handler) aclDecisionMatchingPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
+	return h.aclDecision(ctx, user, resourcePath, privilege)
 }
 
 func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
@@ -310,7 +311,56 @@ func aclPrivilegeMatches(granted, requested string) bool {
 	if granted == requested || granted == "all" {
 		return true
 	}
+	if granted == "read" && requested == "read-free-busy" {
+		return true
+	}
 	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
+}
+
+func aclDecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
+	if privilege == "write" {
+		return aclAggregateWriteDecision(entries, applicablePrincipals)
+	}
+	hasGrant := false
+	for _, entry := range entries {
+		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
+			continue
+		}
+		if !aclPrivilegeMatches(entry.Privilege, privilege) {
+			continue
+		}
+		if !entry.IsGrant {
+			return false, true
+		}
+		hasGrant = true
+	}
+	if hasGrant {
+		return true, true
+	}
+	return false, false
+}
+
+func aclAggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
+	applicable := false
+	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
+		granted, decided := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+		if decided {
+			applicable = true
+		}
+		if !granted {
+			return false, applicable
+		}
+	}
+	return applicable, applicable
+}
+
+func applicableACLPrincipals(user *store.User) map[string]struct{} {
+	principals := map[string]struct{}{"DAV:all": {}}
+	if user != nil {
+		principals[fmt.Sprintf("/dav/principals/%d/", user.ID)] = struct{}{}
+		principals["DAV:authenticated"] = struct{}{}
+	}
+	return principals
 }
 
 func (h *Handler) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) bool {
@@ -359,33 +409,6 @@ func (h *Handler) isResourceOwner(ctx context.Context, user *store.User, resourc
 		return principalID == user.ID
 	}
 
-	return false
-}
-
-func (h *Handler) hasCalendarSharePrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) bool {
-	cleanPath := path.Clean(resourcePath)
-	if !strings.HasPrefix(cleanPath, "/dav/calendars/") {
-		return false
-	}
-
-	calID, _, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath)
-	if err != nil || !matched {
-		return false
-	}
-
-	cal, err := h.loadCalendar(ctx, user, calID)
-	if err != nil {
-		return false
-	}
-
-	switch privilege {
-	case "read", "read-acl":
-		return true // Shared calendars always grant read
-	case "write", "write-content", "write-properties", "bind", "unbind":
-		return cal.Editor
-	case "write-acl":
-		return !cal.Shared // Only owner can modify ACL
-	}
 	return false
 }
 

@@ -51,14 +51,38 @@ type eventResponse struct {
 }
 
 type calendarResponse struct {
-	ID          int64   `json:"id"`
-	Name        string  `json:"name"`
-	Description *string `json:"description,omitempty"`
-	Timezone    *string `json:"timezone,omitempty"`
-	Color       *string `json:"color,omitempty"`
-	OwnerEmail  string  `json:"ownerEmail"`
-	Shared      bool    `json:"shared"`
-	Editor      bool    `json:"editor"`
+	ID           int64                    `json:"id"`
+	Name         string                   `json:"name"`
+	Description  *string                  `json:"description,omitempty"`
+	Timezone     *string                  `json:"timezone,omitempty"`
+	Color        *string                  `json:"color,omitempty"`
+	OwnerEmail   string                   `json:"ownerEmail"`
+	Shared       bool                     `json:"shared"`
+	Capabilities store.CalendarPrivileges `json:"capabilities"`
+}
+
+func calendarMetadataVisible(cal store.CalendarAccess) bool {
+	if !cal.Shared {
+		return true
+	}
+	return cal.EffectivePrivileges().HasAny()
+}
+
+func calendarResponseForAccess(cal store.CalendarAccess) calendarResponse {
+	resp := calendarResponse{
+		ID:           cal.ID,
+		Shared:       cal.Shared,
+		Capabilities: cal.EffectivePrivileges(),
+	}
+	if !calendarMetadataVisible(cal) {
+		return resp
+	}
+	resp.Name = cal.Name
+	resp.Description = cal.Description
+	resp.Timezone = cal.Timezone
+	resp.Color = cal.Color
+	resp.OwnerEmail = cal.OwnerEmail
+	return resp
 }
 
 func (h *Handler) ListCalendars(w http.ResponseWriter, r *http.Request) {
@@ -74,16 +98,7 @@ func (h *Handler) ListCalendars(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := make([]calendarResponse, 0, len(cals))
 	for _, cal := range cals {
-		resp = append(resp, calendarResponse{
-			ID:          cal.ID,
-			Name:        cal.Name,
-			Description: cal.Description,
-			Timezone:    cal.Timezone,
-			Color:       cal.Color,
-			OwnerEmail:  cal.OwnerEmail,
-			Shared:      cal.Shared,
-			Editor:      cal.Editor,
-		})
+		resp = append(resp, calendarResponseForAccess(cal))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -103,16 +118,7 @@ func (h *Handler) GetCalendar(w http.ResponseWriter, r *http.Request) {
 		writeEventError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, calendarResponse{
-		ID:          cal.ID,
-		Name:        cal.Name,
-		Description: cal.Description,
-		Timezone:    cal.Timezone,
-		Color:       cal.Color,
-		OwnerEmail:  cal.OwnerEmail,
-		Shared:      cal.Shared,
-		Editor:      cal.Editor,
-	})
+	writeJSON(w, http.StatusOK, calendarResponseForAccess(*cal))
 }
 
 func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {

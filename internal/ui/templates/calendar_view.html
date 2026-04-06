@@ -445,8 +445,10 @@
         {{end}}
     </div>
     <div style="display:flex; gap:0.5rem; align-items:center;">
+        {{if .CalendarCapabilities.Bind}}
         <button class="btn btn-primary" onclick="showCreateEventModal()">+ New Event</button>
-        {{if .Calendar.Editor}}
+        {{end}}
+        {{if or .CalendarCapabilities.Bind .CalendarCapabilities.WriteContent}}
         <button class="btn btn-secondary" onclick="showImportModal()">Import ICS</button>
         {{end}}
         {{if .Calendar.Shared}}

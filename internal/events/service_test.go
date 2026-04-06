@@ -61,7 +61,12 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	})
 
 	t.Run("create forbidden", func(t *testing.T) {
-		svc := newServiceWithRepos(false, &fakeEventRepo{events: map[string]store.Event{}})
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 9, Name: "Shared"}, Shared: true, Editor: false},
+			}},
+			Events: &fakeEventRepo{events: map[string]store.Event{}},
+		})
 		_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
 			Structured: &StructuredInput{Summary: "x", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
 		})
@@ -182,9 +187,14 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	})
 
 	t.Run("delete forbidden and not found", func(t *testing.T) {
-		svc := newServiceWithRepos(false, &fakeEventRepo{events: map[string]store.Event{
-			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "etag-1"},
-		}})
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 9, Name: "Shared"}, Shared: true, Editor: false},
+			}},
+			Events: &fakeEventRepo{events: map[string]store.Event{
+				"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "etag-1"},
+			}},
+		})
 		if err := svc.DeleteEvent(context.Background(), user, 1, "uid-1", "", ""); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("expected ErrForbidden, got %v", err)
 		}
@@ -206,6 +216,218 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 			t.Fatalf("expected ErrBadRequest, got %v", err)
 		}
 	})
+}
+
+func TestServiceEnforcesCalendarObjectACLs(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	summaryVisible := "Visible"
+	summaryHidden := "Hidden"
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+
+	svc := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{
+			"1:visible": {CalendarID: 1, UID: "visible", ResourceName: "visible", ETag: "etag-visible", Summary: &summaryVisible, DTStart: &start, DTEnd: &end},
+			"1:hidden":  {CalendarID: 1, UID: "hidden", ResourceName: "hidden", ETag: "etag-hidden", Summary: &summaryHidden, DTStart: &start, DTEnd: &end},
+		}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		}},
+	})
+
+	events, err := svc.ListEvents(context.Background(), delegate, 1)
+	if err != nil {
+		t.Fatalf("ListEvents() error = %v", err)
+	}
+	if len(events) != 1 || events[0].UID != "visible" {
+		t.Fatalf("ListEvents() = %#v, want only visible event", events)
+	}
+
+	got, err := svc.GetEvent(context.Background(), delegate, 1, "hidden")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetEvent() error = %v, want ErrNotFound", err)
+	}
+	if got != nil {
+		t.Fatalf("GetEvent() = %#v, want nil", got)
+	}
+}
+
+func TestServiceAllowsDirectObjectAccessWithoutCollectionAccess(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	repo := &fakeEventRepo{events: map[string]store.Event{
+		"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: validICS("event-1"), ETag: "etag-1"},
+	}}
+	svc := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: false},
+		}},
+		Events: repo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+		}},
+	})
+
+	got, err := svc.GetEvent(context.Background(), delegate, 1, "event-1")
+	if err != nil || got == nil || got.UID != "event-1" {
+		t.Fatalf("GetEvent() err=%v got=%#v", err, got)
+	}
+
+	updated, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
+		RawICS:      validICS("event-1"),
+		ContentType: "text/calendar",
+		IfMatch:     `"etag-1"`,
+	})
+	if err != nil || updated == nil || updated.UID != "event-1" {
+		t.Fatalf("UpdateEvent() err=%v updated=%#v", err, updated)
+	}
+
+	if err := svc.DeleteEvent(context.Background(), delegate, 1, "event-1", `"`+updated.ETag+`"`, ""); err != nil {
+		t.Fatalf("DeleteEvent() error = %v", err)
+	}
+	if got, _ := repo.GetByUID(context.Background(), 1, "event-1"); got != nil {
+		t.Fatalf("expected event deletion, got %#v", got)
+	}
+}
+
+func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
+	delegate := &store.User{ID: 2}
+
+	t.Run("create requires bind", func(t *testing.T) {
+		repo := &fakeEventRepo{events: map[string]store.Event{}}
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: true},
+			}},
+			Events: repo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}},
+		})
+
+		_, _, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{
+			Structured: &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
+		})
+		if !errors.Is(err, ErrForbidden) {
+			t.Fatalf("CreateEvent() error = %v, want ErrForbidden", err)
+		}
+		if len(repo.events) != 0 {
+			t.Fatalf("expected no stored events, got %#v", repo.events)
+		}
+	})
+
+	t.Run("update requires write-content", func(t *testing.T) {
+		repo := &fakeEventRepo{events: map[string]store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", ETag: "etag-1"},
+		}}
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: true},
+			}},
+			Events: repo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			}},
+		})
+
+		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
+			RawICS:      validICS("event-1"),
+			ContentType: "text/calendar",
+			IfMatch:     `"etag-1"`,
+		})
+		if !errors.Is(err, ErrForbidden) {
+			t.Fatalf("UpdateEvent() error = %v, want ErrForbidden", err)
+		}
+	})
+
+	t.Run("update honors object deny", func(t *testing.T) {
+		repo := &fakeEventRepo{events: map[string]store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1.ics", ETag: "etag-1"},
+		}}
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: true},
+			}},
+			Events: repo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
+			}},
+		})
+
+		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
+			RawICS:      validICS("event-1"),
+			ContentType: "text/calendar",
+			IfMatch:     `"etag-1"`,
+		})
+		if !errors.Is(err, ErrForbidden) {
+			t.Fatalf("UpdateEvent() error = %v, want ErrForbidden", err)
+		}
+	})
+
+	t.Run("delete requires unbind", func(t *testing.T) {
+		repo := &fakeEventRepo{events: map[string]store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", ETag: "etag-1"},
+		}}
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, Editor: true},
+			}},
+			Events: repo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}},
+		})
+
+		err := svc.DeleteEvent(context.Background(), delegate, 1, "event-1", `"etag-1"`, "")
+		if !errors.Is(err, ErrForbidden) {
+			t.Fatalf("DeleteEvent() error = %v, want ErrForbidden", err)
+		}
+	})
+}
+
+func TestServiceListEventsBatchesACLLookups(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden-2", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		},
+	}
+	svc := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{
+			"1:visible-1": {CalendarID: 1, UID: "visible-1", ResourceName: "visible-1"},
+			"1:hidden-2":  {CalendarID: 1, UID: "hidden-2", ResourceName: "hidden-2"},
+			"1:visible-3": {CalendarID: 1, UID: "visible-3", ResourceName: "visible-3"},
+		}},
+		ACLEntries: aclRepo,
+	})
+
+	events, err := svc.ListEvents(context.Background(), delegate, 1)
+	if err != nil {
+		t.Fatalf("ListEvents() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ListEvents() len = %d, want 2 visible events", len(events))
+	}
+	if aclRepo.listByResourceCalls != 0 {
+		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
+	}
+	if aclRepo.listByPrincipalCalls == 0 || aclRepo.listByPrincipalCalls > 3 {
+		t.Fatalf("expected batched ListByPrincipal calls, got %d", aclRepo.listByPrincipalCalls)
+	}
 }
 
 func TestHelpersAndValidators(t *testing.T) {
@@ -390,6 +612,10 @@ type fakeCalendarRepo struct {
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
+	if cal, ok := f.calendars[id]; ok {
+		copy := cal.Calendar
+		return &copy, nil
+	}
 	return nil, nil
 }
 func (f *fakeCalendarRepo) ListByUser(ctx context.Context, userID int64) ([]store.Calendar, error) {
@@ -415,6 +641,9 @@ func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*sto
 	return nil, nil
 }
 func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+	return nil
+}
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
 	return nil
 }
 func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {
@@ -485,6 +714,54 @@ func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCa
 }
 func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
 	return nil, nil
+}
+
+type fakeACLRepo struct {
+	entries              []store.ACLEntry
+	listByResourceCalls  int
+	listByPrincipalCalls int
+}
+
+func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
+	return nil
+}
+
+func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	f.listByResourceCalls++
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if entry.ResourcePath == resourcePath {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
+	f.listByPrincipalCalls++
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if entry.PrincipalHref == principalHref {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
+	return nil
+}
+
+func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	return nil
+}
+
+func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
+	return nil
 }
 
 func key(calendarID int64, uid string) string {

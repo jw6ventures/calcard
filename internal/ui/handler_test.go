@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -124,6 +125,78 @@ func TestViewCalendarHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
+	t.Run("bind access shows create and import actions", func(t *testing.T) {
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars: &fakeCalendarRepo{
+				accessible: map[string]*store.CalendarAccess{
+					"1:100": {
+						Calendar:   store.Calendar{ID: 1, UserID: 200, Name: "Shared"},
+						Shared:     true,
+						OwnerEmail: "owner@example.com",
+						Privileges: store.CalendarPrivileges{Read: true, Bind: true},
+					},
+				},
+			},
+		}, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.ViewCalendar(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("ViewCalendar() status = %d, want %d", w.Code, http.StatusOK)
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "+ New Event") {
+			t.Fatalf("expected create action for bind access, got %s", body)
+		}
+		if !strings.Contains(body, ">Import ICS<") {
+			t.Fatalf("expected import action for bind access, got %s", body)
+		}
+	})
+
+	t.Run("read-only access hides write actions", func(t *testing.T) {
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars: &fakeCalendarRepo{
+				accessible: map[string]*store.CalendarAccess{
+					"1:100": {
+						Calendar:   store.Calendar{ID: 1, UserID: 200, Name: "Shared"},
+						Shared:     true,
+						OwnerEmail: "owner@example.com",
+						Privileges: store.CalendarPrivileges{Read: true},
+					},
+				},
+			},
+		}, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.ViewCalendar(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("ViewCalendar() status = %d, want %d", w.Code, http.StatusOK)
+		}
+		body := w.Body.String()
+		if strings.Contains(body, "+ New Event") {
+			t.Fatalf("did not expect create action for read-only access, got %s", body)
+		}
+		if strings.Contains(body, ">Import ICS<") {
+			t.Fatalf("did not expect import action for read-only access, got %s", body)
+		}
+	})
 }
 
 func TestViewAddressBookHandler(t *testing.T) {
@@ -393,6 +466,255 @@ func TestDeleteEventHandler(t *testing.T) {
 	}
 }
 
+func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
+	t.Run("create_requires_bind", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		form := url.Values{
+			"summary": {"Test Event"},
+			"dtstart": {"2024-01-01T10:00"},
+			"dtend":   {"2024-01-01T11:00"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.CreateEvent(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("CreateEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("expected no created events, got %#v", eventRepo.events)
+		}
+	})
+
+	t.Run("update_requires_write_content", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:event-1": {
+						ID:           1,
+						CalendarID:   1,
+						UID:          "event-1",
+						ResourceName: "event-1",
+						RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Original\r\nDTSTART:20240101T100000Z\r\nDTEND:20240101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-1",
+					},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "bind"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		form := url.Values{
+			"summary":    {"Updated Summary"},
+			"dtstart":    {"2024-01-02T10:00"},
+			"dtend":      {"2024-01-02T11:00"},
+			"edit_scope": {"series"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		rctx.URLParams.Add("uid", "event-1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+		w := httptest.NewRecorder()
+		handler.UpdateEvent(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if strings.Contains(eventRepo.events["1:event-1"].RawICAL, "Updated Summary") {
+			t.Fatalf("expected event update to be blocked, got %s", eventRepo.events["1:event-1"].RawICAL)
+		}
+	})
+
+	t.Run("update_respects_canonical_object_deny_for_ics_resource", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:event-1": {
+						ID:           1,
+						CalendarID:   1,
+						UID:          "event-1",
+						ResourceName: "event-1.ics",
+						RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Original\r\nDTSTART:20240101T100000Z\r\nDTEND:20240101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-1",
+					},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "write-content"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		form := url.Values{
+			"summary":    {"Updated Summary"},
+			"dtstart":    {"2024-01-02T10:00"},
+			"dtend":      {"2024-01-02T11:00"},
+			"edit_scope": {"series"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		rctx.URLParams.Add("uid", "event-1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+		w := httptest.NewRecorder()
+		handler.UpdateEvent(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if strings.Contains(eventRepo.events["1:event-1"].RawICAL, "Updated Summary") {
+			t.Fatalf("expected canonical object deny to block update, got %s", eventRepo.events["1:event-1"].RawICAL)
+		}
+	})
+
+	t.Run("delete_requires_unbind", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithDelete{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:event-1": {ID: 1, CalendarID: 1, UID: "event-1", ResourceName: "event-1"},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		rctx.URLParams.Add("uid", "event-1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.DeleteEvent(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("DeleteEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if len(eventRepo.deleted) != 0 {
+			t.Fatalf("expected no deleted events, got %#v", eventRepo.deleted)
+		}
+	})
+
+	t.Run("delete_occurrence_requires_write_content_not_unbind", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:event-1": {
+						ID:           1,
+						CalendarID:   1,
+						UID:          "event-1",
+						ResourceName: "event-1",
+						RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nRRULE:FREQ=DAILY\r\nDTSTART:20240101T100000Z\r\nDTEND:20240101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-1",
+					},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		form := url.Values{
+			"edit_scope":         {"occurrence"},
+			"recurrence_id":      {"2024-01-02T10:00"},
+			"recurrence_all_day": {"false"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event-1/delete", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		rctx.URLParams.Add("uid", "event-1")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.DeleteEvent(w, req)
+
+		if w.Code != http.StatusFound {
+			t.Fatalf("DeleteEvent() status = %d, want %d", w.Code, http.StatusFound)
+		}
+		updated := eventRepo.events["1:event-1"]
+		if updated == nil || !strings.Contains(updated.RawICAL, "EXDATE:") {
+			t.Fatalf("expected occurrence delete to update series with EXDATE, got %#v", updated)
+		}
+	})
+}
+
 func TestCreateContactHandler(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -618,6 +940,668 @@ func TestImportCalendarHandler(t *testing.T) {
 			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusForbidden)
 		}
 	})
+
+	t.Run("requires_write_content_when_import_overwrites_existing_resource", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Editor: true, Shared: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:existing@example.com": {
+						CalendarID:   1,
+						UID:          "existing@example.com",
+						ResourceName: "existing_example.com.ics",
+						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Original\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-existing",
+					},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "bind"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if strings.Contains(eventRepo.events["1:existing@example.com"].RawICAL, "SUMMARY:Updated") {
+			t.Fatalf("expected existing event to remain unchanged, got %s", eventRepo.events["1:existing@example.com"].RawICAL)
+		}
+	})
+
+	t.Run("does not partially import before a later authorization failure", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Editor: true, Shared: true},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{
+				events: map[string]*store.Event{
+					"1:existing@example.com": {
+						CalendarID:   1,
+						UID:          "existing@example.com",
+						ResourceName: "existing_example.com.ics",
+						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Original\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-existing",
+					},
+				},
+			},
+		}
+		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "bind"},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			Calendars:  calRepo,
+			Events:     eventRepo,
+			ACLEntries: aclRepo,
+		}, nil)
+
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new@example.com\r\nSUMMARY:New Event\r\nDTSTART:20250110T120000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated Existing\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusForbidden)
+		}
+		if _, ok := eventRepo.events["1:new@example.com"]; ok {
+			t.Fatalf("expected preflight failure to prevent partial import, got %#v", eventRepo.events)
+		}
+		if strings.Contains(eventRepo.events["1:existing@example.com"].RawICAL, "Updated Existing") {
+			t.Fatalf("expected existing event to remain unchanged, got %s", eventRepo.events["1:existing@example.com"].RawICAL)
+		}
+	})
+}
+
+func TestDashboardHidesDeniedRecentEvents(t *testing.T) {
+	visibleSummary := "Visible Event"
+	hiddenSummary := "Hidden Event"
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: false, OwnerEmail: "owner@example.com"},
+		}},
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}},
+		AppPasswords: &fakeAppPasswordRepo{},
+		Events: &fakeEventRepo{recent: []store.Event{
+			{CalendarID: 1, UID: "visible", ResourceName: "visible", Summary: &visibleSummary, DTStart: &start},
+			{CalendarID: 1, UID: "hidden", ResourceName: "hidden", Summary: &hiddenSummary, DTStart: &start},
+		}},
+		Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.Dashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Dashboard() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, visibleSummary) {
+		t.Fatalf("expected visible event in dashboard, got %s", body)
+	}
+	if strings.Contains(body, hiddenSummary) {
+		t.Fatalf("expected denied event to be hidden from dashboard, got %s", body)
+	}
+}
+
+func TestDashboardBackfillsVisibleRecentEventsAfterFiltering(t *testing.T) {
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	recent := make([]store.Event, 0, 30)
+	for i := 1; i <= 25; i++ {
+		summary := fmt.Sprintf("Hidden Event %d", i)
+		s := summary
+		recent = append(recent, store.Event{
+			CalendarID:   1,
+			UID:          fmt.Sprintf("hidden-%d", i),
+			ResourceName: fmt.Sprintf("hidden-%d", i),
+			Summary:      &s,
+			DTStart:      &start,
+		})
+	}
+	for i := 1; i <= 5; i++ {
+		summary := fmt.Sprintf("Visible Event %d", i)
+		s := summary
+		recent = append(recent, store.Event{
+			CalendarID:   1,
+			UID:          fmt.Sprintf("visible-%d", i),
+			ResourceName: fmt.Sprintf("visible-%d", i),
+			Summary:      &s,
+			DTStart:      &start,
+		})
+	}
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: false, OwnerEmail: "owner@example.com"},
+		}},
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}},
+		AppPasswords: &fakeAppPasswordRepo{},
+		Events:       &fakeEventRepo{recent: recent},
+		Contacts:     &fakeContactRepo{contacts: map[string]*store.Contact{}},
+		ACLEntries:   buildHiddenRecentEventACLs(25),
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.Dashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Dashboard() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, summary := range []string{"Visible Event 1", "Visible Event 2", "Visible Event 3", "Visible Event 4", "Visible Event 5"} {
+		if !strings.Contains(body, summary) {
+			t.Fatalf("expected %q in dashboard, got %s", summary, body)
+		}
+	}
+	if strings.Contains(body, "Hidden Event") {
+		t.Fatalf("expected denied recent event to be replaced, got %s", body)
+	}
+}
+
+func TestDashboardShowsRecentEventsWithDirectObjectReadGrant(t *testing.T) {
+	summary := "Direct Object Event"
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 200, Name: "Object Shared"},
+			},
+			listAccessible: []store.CalendarAccess{},
+		},
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}},
+		AppPasswords: &fakeAppPasswordRepo{},
+		Events: &fakeEventRepo{recent: []store.Event{
+			{CalendarID: 1, UID: "direct", ResourceName: "direct", Summary: &summary, DTStart: &start},
+		}},
+		Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1/direct", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.Dashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Dashboard() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, summary) {
+		t.Fatalf("expected direct object grant event in dashboard, got %s", body)
+	}
+	if !strings.Contains(body, "Object Shared") {
+		t.Fatalf("expected dashboard to resolve calendar name for object grant event, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONHidesDeniedEvents(t *testing.T) {
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: false},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:visible": {CalendarID: 1, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &start},
+			"1:hidden":  {CalendarID: 1, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &start},
+		}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"uid":"visible"`) {
+		t.Fatalf("expected visible event in JSON response, got %s", body)
+	}
+	if strings.Contains(body, `"uid":"hidden"`) {
+		t.Fatalf("expected denied event to be omitted from JSON response, got %s", body)
+	}
+}
+
+func TestAllCalendarEventsJSONHidesDeniedEvents(t *testing.T) {
+	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: false},
+		}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:visible": {CalendarID: 1, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &start},
+			"1:hidden":  {CalendarID: 1, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &start},
+		}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"uid":"visible"`) {
+		t.Fatalf("expected visible event in all-calendars JSON, got %s", body)
+	}
+	if strings.Contains(body, `"uid":"hidden"`) {
+		t.Fatalf("expected denied event to be omitted from all-calendars JSON, got %s", body)
+	}
+}
+
+func TestShareCalendarStoresACLEntries(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		},
+	}
+	userRepo := &fakeUserRepo{
+		users: map[int64]*store.User{
+			200: {ID: 200, PrimaryEmail: "viewer@example.com"},
+		},
+	}
+	aclRepo := &fakeACLRepo{}
+	s := &store.Store{
+		Calendars:  calRepo,
+		Users:      userRepo,
+		ACLEntries: aclRepo,
+	}
+	handler := NewHandler(&config.Config{}, s, nil)
+
+	form := url.Values{"user_id": {"200"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.ShareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("ShareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 ACL entries, got %#v", entries)
+	}
+
+	got := map[string]bool{}
+	for _, entry := range entries {
+		if entry.PrincipalHref != "/dav/principals/200/" || !entry.IsGrant {
+			t.Fatalf("unexpected ACL entry %#v", entry)
+		}
+		got[entry.Privilege] = true
+	}
+	for _, privilege := range []string{"read", "read-free-busy", "write"} {
+		if !got[privilege] {
+			t.Fatalf("expected %q ACL grant, got %#v", privilege, entries)
+		}
+	}
+}
+
+func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read-free-busy"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "write"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	s := &store.Store{
+		Calendars:  calRepo,
+		ACLEntries: aclRepo,
+	}
+	handler := NewHandler(&config.Config{}, s, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("userId", "200")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.UnshareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected only unrelated ACL entry to remain, got %#v", entries)
+	}
+	if entries[0].PrincipalHref != "/dav/principals/300/" {
+		t.Fatalf("unexpected ACL entries after unshare: %#v", entries)
+	}
+}
+
+func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: map[string]*store.CalendarAccess{
+			"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true, Editor: true},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "write"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	s := &store.Store{
+		Calendars:  calRepo,
+		ACLEntries: aclRepo,
+	}
+	handler := NewHandler(&config.Config{}, s, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("userId", "200")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 200, PrimaryEmail: "viewer@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.UnshareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].PrincipalHref != "/dav/principals/300/" {
+		t.Fatalf("unexpected ACL entries after leave: %#v", entries)
+	}
+
+	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
+		t.Fatalf("expected descendant ACLs for leaving user to be deleted, got %#v", descendantEntries)
+	}
+}
+
+func TestShareCalendarPreservesCustomPrincipalACLs(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		},
+	}
+	userRepo := &fakeUserRepo{
+		users: map[int64]*store.User{
+			200: {ID: 200, PrimaryEmail: "viewer@example.com"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read-acl"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars:  calRepo,
+		Users:      userRepo,
+		ACLEntries: aclRepo,
+	}, nil)
+
+	form := url.Values{"user_id": {"200"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.ShareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("ShareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+
+	got := map[string]struct{}{}
+	for _, entry := range entries {
+		if entry.PrincipalHref == "/dav/principals/200/" {
+			got[fmt.Sprintf("%t:%s", entry.IsGrant, entry.Privilege)] = struct{}{}
+		}
+	}
+	for _, want := range []string{
+		"true:read",
+		"true:read-free-busy",
+		"true:write",
+		"true:read-acl",
+		"false:write-content",
+	} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("expected preserved/shared ACL %q, got %#v", want, entries)
+		}
+	}
+}
+
+func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read-free-busy"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "write"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read-acl"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars:  calRepo,
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("userId", "200")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.UnshareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.PrincipalHref == "/dav/principals/200/" {
+			t.Fatalf("expected all ACLs for removed principal to be deleted, got %#v", entries)
+		}
+	}
+
+	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
+		t.Fatalf("expected descendant ACLs for removed principal to be deleted, got %#v", descendantEntries)
+	}
+}
+
+func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		},
+		deletePrincipalEntriesByResourcePrefixErr: errors.New("boom"),
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars:  calRepo,
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("userId", "200")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+	w := httptest.NewRecorder()
+	handler.UnshareCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+
+	entries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected collection ACLs to remain unchanged after failed removal, got %#v", entries)
+	}
+
+	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
+	if err != nil {
+		t.Fatalf("ListByResource() error = %v", err)
+	}
+	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/200/" {
+		t.Fatalf("expected descendant ACLs to remain unchanged after failed removal, got %#v", descendantEntries)
+	}
+}
+
+func TestCalendarShareViewsIncludePrincipalsWithCustomAccess(t *testing.T) {
+	userMap := map[int64]store.User{
+		200: {ID: 200, PrimaryEmail: "delegate@example.com"},
+	}
+	h := NewHandler(&config.Config{}, &store.Store{
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind"},
+		}},
+	}, nil)
+
+	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
+	if err != nil {
+		t.Fatalf("calendarShareViews() error = %v", err)
+	}
+	if len(shares) != 1 {
+		t.Fatalf("expected principal with custom access grant to appear in share list, got %#v", shares)
+	}
+	if !shares[0].Editor {
+		t.Fatalf("expected bind grant to be treated as editable access, got %#v", shares)
+	}
+}
+
+func buildHiddenRecentEventACLs(hiddenCount int) *fakeACLRepo {
+	entries := []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+	}
+	for i := 1; i <= hiddenCount; i++ {
+		entries = append(entries, store.ACLEntry{
+			ResourcePath:  fmt.Sprintf("/dav/calendars/1/hidden-%d", i),
+			PrincipalHref: "/dav/principals/100/",
+			IsGrant:       false,
+			Privilege:     "read",
+		})
+	}
+	return &fakeACLRepo{entries: entries}
 }
 
 func withRouteID(req *http.Request, id string) *http.Request {
@@ -649,8 +1633,9 @@ func newICSImportRequest(t *testing.T, target, filename, content string) *http.R
 // Fake repositories for testing
 
 type fakeCalendarRepo struct {
-	calendars  map[int64]*store.Calendar
-	accessible map[string]*store.CalendarAccess
+	calendars      map[int64]*store.Calendar
+	accessible     map[string]*store.CalendarAccess
+	listAccessible []store.CalendarAccess
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
@@ -672,6 +1657,11 @@ func (f *fakeCalendarRepo) ListByUser(ctx context.Context, userID int64) ([]stor
 }
 
 func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]store.CalendarAccess, error) {
+	if f.listAccessible != nil {
+		result := make([]store.CalendarAccess, len(f.listAccessible))
+		copy(result, f.listAccessible)
+		return result, nil
+	}
 	cals, _ := f.ListByUser(ctx, userID)
 	var result []store.CalendarAccess
 	for _, cal := range cals {
@@ -714,6 +1704,10 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	return nil
 }
 
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+	return nil
+}
+
 func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {
 	return nil
 }
@@ -724,6 +1718,7 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 
 type fakeEventRepo struct {
 	events map[string]*store.Event
+	recent []store.Event
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -792,6 +1787,14 @@ func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64,
 }
 
 func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
+	if f.recent != nil {
+		if limit <= 0 || limit > len(f.recent) {
+			limit = len(f.recent)
+		}
+		result := make([]store.Event, limit)
+		copy(result, f.recent[:limit])
+		return result, nil
+	}
 	return nil, nil
 }
 
@@ -932,6 +1935,159 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 }
 func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
 	return nil, nil
+}
+
+type fakeUserRepo struct {
+	users map[int64]*store.User
+}
+
+type fakeAppPasswordRepo struct{}
+
+func (f *fakeAppPasswordRepo) Create(ctx context.Context, token store.AppPassword) (*store.AppPassword, error) {
+	return nil, nil
+}
+
+func (f *fakeAppPasswordRepo) FindValidByUser(ctx context.Context, userID int64) ([]store.AppPassword, error) {
+	return nil, nil
+}
+
+func (f *fakeAppPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]store.AppPassword, error) {
+	return nil, nil
+}
+
+func (f *fakeAppPasswordRepo) GetByID(ctx context.Context, id int64) (*store.AppPassword, error) {
+	return nil, nil
+}
+
+func (f *fakeAppPasswordRepo) Revoke(ctx context.Context, id int64) error {
+	return nil
+}
+
+func (f *fakeAppPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
+	return nil
+}
+
+func (f *fakeAppPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
+	return nil
+}
+
+func (f *fakeUserRepo) UpsertOAuthUser(ctx context.Context, subject, email string) (*store.User, error) {
+	return nil, nil
+}
+
+func (f *fakeUserRepo) GetByID(ctx context.Context, id int64) (*store.User, error) {
+	if user, ok := f.users[id]; ok {
+		copy := *user
+		return &copy, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeUserRepo) GetByEmail(ctx context.Context, email string) (*store.User, error) {
+	for _, user := range f.users {
+		if user.PrimaryEmail == email {
+			copy := *user
+			return &copy, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeUserRepo) ListActive(ctx context.Context) ([]store.User, error) {
+	result := make([]store.User, 0, len(f.users))
+	for _, user := range f.users {
+		result = append(result, *user)
+	}
+	return result, nil
+}
+
+type fakeACLRepo struct {
+	entries                                   []store.ACLEntry
+	deletePrincipalEntriesByResourcePrefixErr error
+}
+
+func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
+	filtered := f.entries[:0]
+	for _, entry := range f.entries {
+		if entry.ResourcePath == resourcePath {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	f.entries = append(filtered, entries...)
+	return nil
+}
+
+func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if entry.ResourcePath != resourcePath {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result, nil
+}
+
+func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if entry.PrincipalHref != principalHref {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result, nil
+}
+
+func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
+	for _, entry := range f.entries {
+		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && !entry.IsGrant {
+			return false, nil
+		}
+	}
+	for _, entry := range f.entries {
+		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && entry.IsGrant {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	for i := range f.entries {
+		if f.entries[i].ResourcePath == fromPath {
+			f.entries[i].ResourcePath = toPath
+		}
+	}
+	return nil
+}
+
+func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
+	filtered := f.entries[:0]
+	for _, entry := range f.entries {
+		if entry.ResourcePath == resourcePath {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	f.entries = filtered
+	return nil
+}
+
+func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
+	if f.deletePrincipalEntriesByResourcePrefixErr != nil {
+		return f.deletePrincipalEntriesByResourcePrefixErr
+	}
+	filtered := f.entries[:0]
+	for _, entry := range f.entries {
+		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	f.entries = filtered
+	return nil
 }
 
 // Extended fake repositories for CRUD tests

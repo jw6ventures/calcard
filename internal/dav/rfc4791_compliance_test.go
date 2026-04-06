@@ -834,7 +834,10 @@ func TestRFC4791_SharedCalendarsAreDiscoverable(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Shared With Me", UpdatedAt: now}, Editor: false}, // Read-only
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -3365,7 +3368,12 @@ func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			// Shared calendar with limited privileges (read-free-busy but not full read).
-			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: store.Now()}, Shared: true, Editor: false},
+			{
+				Calendar:   store.Calendar{ID: 1, UserID: 9, Name: "Test", UpdatedAt: store.Now()},
+				Shared:     true,
+				Editor:     false,
+				Privileges: store.CalendarPrivileges{ReadFreeBusy: true},
+			},
 		},
 	}
 	eventRepo := &fakeEventRepo{

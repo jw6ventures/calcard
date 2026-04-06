@@ -91,16 +91,12 @@ func TestCalendarRepoAccessQueriesReturnNilWhenMissing(t *testing.T) {
 		t.Fatalf("GetByID() = %#v, want nil", got)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
-       u.primary_email as owner_email,
-       CASE WHEN c.user_id = $2 THEN FALSE ELSE TRUE END as shared,
-       COALESCE(cs.editor, TRUE) as editor
-FROM calendars c
-JOIN users u ON u.id = c.user_id
-LEFT JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $2
-WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
-`)).
+	mock.ExpectQuery(`(?s)`+
+		regexp.QuoteMeta(`SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,`)+
+		`.*acl_entries.*`+
+		regexp.QuoteMeta(`FROM calendars c`)+
+		`.*`+
+		regexp.QuoteMeta(`WHERE c.id = $1`)).
 		WithArgs(int64(12), int64(4)).
 		WillReturnError(sql.ErrNoRows)
 	accessible, err := repo.GetAccessible(context.Background(), 12, 4)
@@ -116,7 +112,7 @@ WHERE c.id = $1 AND (c.user_id = $2 OR cs.user_id = $2)
 	}
 }
 
-func TestCalendarAccessibleAndShareRepos(t *testing.T) {
+func TestCalendarAccessibleReposUseACLs(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -124,27 +120,13 @@ func TestCalendarAccessibleAndShareRepos(t *testing.T) {
 	defer db.Close()
 
 	calendarRepo := &calendarRepo{pool: db}
-	shareRepo := &calendarShareRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
-       u.primary_email as owner_email, FALSE as shared, TRUE as editor
-FROM calendars c
-JOIN users u ON u.id = c.user_id
-WHERE c.user_id = $1
-UNION ALL
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
-       u.primary_email as owner_email, TRUE as shared, cs.editor
-FROM calendars c
-JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
-JOIN users u ON u.id = c.user_id
-ORDER BY shared, name
-`)).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*acl_entries.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "editor"}).
-			AddRow(int64(1), int64(4), "Owned", nil, nil, nil, nil, int64(1), now, now, "owner@example.com", false, true).
-			AddRow(int64(2), int64(9), "Shared", "shared", "Desc", "UTC", "#123456", int64(3), now, now, "other@example.com", true, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(1), int64(4), "Owned", nil, nil, nil, nil, int64(1), now, now, "owner@example.com", false, true, true, true, true, true, true, true).
+			AddRow(int64(2), int64(9), "Shared", "shared", "Desc", "UTC", "#123456", int64(3), now, now, "other@example.com", true, true, false, false, false, false, true, false))
 
 	accessible, err := calendarRepo.ListAccessible(context.Background(), 4)
 	if err != nil {
@@ -156,35 +138,170 @@ ORDER BY shared, name
 	if accessible[1].Slug == nil || *accessible[1].Slug != "shared" || accessible[1].Color == nil || *accessible[1].Color != "#123456" {
 		t.Fatalf("ListAccessible() optional fields = %#v", accessible[1])
 	}
+	if !accessible[1].Privileges.Read || !accessible[1].Privileges.Bind {
+		t.Fatalf("ListAccessible() privileges = %#v, want read+bind", accessible[1].Privileges)
+	}
+	if accessible[1].Privileges.WriteContent || accessible[1].Privileges.Unbind {
+		t.Fatalf("ListAccessible() privileges = %#v, unexpected write-content/unbind", accessible[1].Privileges)
+	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT calendar_id, user_id, granted_by, editor, created_at FROM calendar_shares WHERE calendar_id=$1 ORDER BY created_at`)).
-		WithArgs(int64(2)).
-		WillReturnRows(sqlmock.NewRows([]string{"calendar_id", "user_id", "granted_by", "editor", "created_at"}).
-			AddRow(int64(2), int64(4), int64(9), false, now))
-	shares, err := shareRepo.ListByCalendar(context.Background(), 2)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestCalendarAccessibleReposIncludeReadFreeBusyOnlyCalendars(t *testing.T) {
+	db, mock, err := sqlmock.New()
 	if err != nil {
-		t.Fatalf("ListByCalendar() error = %v", err)
+		t.Fatalf("sqlmock.New() error = %v", err)
 	}
-	if len(shares) != 1 || shares[0].GrantedBy != 9 {
-		t.Fatalf("ListByCalendar() = %#v", shares)
+	defer db.Close()
+
+	repo := &calendarRepo{pool: db}
+	now := time.Now().UTC()
+
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*read-free-busy.*ORDER BY shared, name`).
+		WithArgs(int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
+
+	accessible, err := repo.ListAccessible(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("ListAccessible() error = %v", err)
+	}
+	if len(accessible) != 1 {
+		t.Fatalf("ListAccessible() len = %d, want 1", len(accessible))
+	}
+	if accessible[0].Privileges.Read {
+		t.Fatalf("ListAccessible() read = true, want false for free-busy-only access")
+	}
+	if !accessible[0].Privileges.ReadFreeBusy {
+		t.Fatalf("ListAccessible() readFreeBusy = false, want true")
+	}
+	if accessible[0].Editor {
+		t.Fatalf("ListAccessible() editor = true, want false")
 	}
 
-	mock.ExpectExec(regexp.QuoteMeta(`
-INSERT INTO calendar_shares (calendar_id, user_id, granted_by, editor)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (calendar_id, user_id) DO NOTHING
-`)).
-		WithArgs(int64(2), int64(4), int64(9), false).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	if err := shareRepo.Create(context.Background(), CalendarShare{CalendarID: 2, UserID: 4, GrantedBy: 9, Editor: false}); err != nil {
-		t.Fatalf("Create() error = %v", err)
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*read-free-busy.*`).
+		WithArgs(int64(7), int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
+
+	got, err := repo.GetAccessible(context.Background(), 7, 4)
+	if err != nil {
+		t.Fatalf("GetAccessible() error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetAccessible() = nil, want calendar access")
+	}
+	if got.Privileges.Read {
+		t.Fatalf("GetAccessible() read = true, want false for free-busy-only access")
+	}
+	if !got.Privileges.ReadFreeBusy {
+		t.Fatalf("GetAccessible() readFreeBusy = false, want true")
 	}
 
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM calendar_shares WHERE calendar_id=$1 AND user_id=$2`)).
-		WithArgs(int64(2), int64(4)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	if err := shareRepo.Delete(context.Background(), 2, 4); err != nil {
-		t.Fatalf("Delete() error = %v", err)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestCalendarAccessibleReposIncludeBindOnlyCalendars(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &calendarRepo{pool: db}
+	now := time.Now().UTC()
+
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*bind.*ORDER BY shared, name`).
+		WithArgs(int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
+
+	accessible, err := repo.ListAccessible(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("ListAccessible() error = %v", err)
+	}
+	if len(accessible) != 1 {
+		t.Fatalf("ListAccessible() len = %d, want 1", len(accessible))
+	}
+	if accessible[0].Privileges.Read || accessible[0].Privileges.ReadFreeBusy {
+		t.Fatalf("ListAccessible() read privileges = %#v, want none for bind-only access", accessible[0].Privileges)
+	}
+	if !accessible[0].Privileges.Bind {
+		t.Fatalf("ListAccessible() bind = false, want true")
+	}
+	if accessible[0].Editor {
+		t.Fatalf("ListAccessible() editor = true, want false")
+	}
+
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*bind.*`).
+		WithArgs(int64(8), int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
+
+	got, err := repo.GetAccessible(context.Background(), 8, 4)
+	if err != nil {
+		t.Fatalf("GetAccessible() error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetAccessible() = nil, want calendar access")
+	}
+	if got.Privileges.Read || got.Privileges.ReadFreeBusy {
+		t.Fatalf("GetAccessible() read privileges = %#v, want none for bind-only access", got.Privileges)
+	}
+	if !got.Privileges.Bind {
+		t.Fatalf("GetAccessible() bind = false, want true")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestCalendarAccessibleReposIncludeObjectGrantedCalendars(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &calendarRepo{pool: db}
+	now := time.Now().UTC()
+
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*events e.*resource_path IN.*ORDER BY shared, name`).
+		WithArgs(int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
+
+	accessible, err := repo.ListAccessible(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("ListAccessible() error = %v", err)
+	}
+	if len(accessible) != 1 {
+		t.Fatalf("ListAccessible() len = %d, want 1", len(accessible))
+	}
+	if accessible[0].Privileges.HasAny() {
+		t.Fatalf("ListAccessible() privileges = %#v, want no collection privileges for object-only grant", accessible[0].Privileges)
+	}
+
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*events e.*resource_path IN`).
+		WithArgs(int64(12), int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
+
+	got, err := repo.GetAccessible(context.Background(), 12, 4)
+	if err != nil {
+		t.Fatalf("GetAccessible() error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetAccessible() = nil, want calendar access")
+	}
+	if got.Privileges.HasAny() {
+		t.Fatalf("GetAccessible() privileges = %#v, want no collection privileges for object-only grant", got.Privileges)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -342,7 +459,7 @@ func TestEventRepoMoveToCalendarOverwriteWithinSameCalendarDeletesDestination(t 
 	}
 }
 
-func TestEventRepoCopyToCalendarRenameExistingUIDCreatesDestinationTombstone(t *testing.T) {
+func TestEventRepoMoveToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -350,7 +467,35 @@ func TestEventRepoCopyToCalendarRenameExistingUIDCreatesDestinationTombstone(t *
 	defer db.Close()
 
 	repo := &eventRepo{pool: db}
-	now := time.Now()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("source-name"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "event-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
+	mock.ExpectRollback()
+
+	err = repo.MoveToCalendar(context.Background(), 5, 9, "event-1", "new-dest-name")
+	if err != ErrConflict {
+		t.Fatalf("MoveToCalendar() error = %v, want ErrConflict", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestEventRepoCopyToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+	now := time.Now().UTC()
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
@@ -360,34 +505,11 @@ func TestEventRepoCopyToCalendarRenameExistingUIDCreatesDestinationTombstone(t *
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(9), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
-		WithArgs(int64(9), "new-dest-name", "event-1").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
-		WithArgs(int64(9), "event-1", "old-dest-name").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-ON CONFLICT (calendar_id, uid) DO UPDATE SET
-        resource_name = EXCLUDED.resource_name,
-        raw_ical = EXCLUDED.raw_ical,
-        etag = EXCLUDED.etag,
-        summary = EXCLUDED.summary,
-        dtstart = EXCLUDED.dtstart,
-        dtend = EXCLUDED.dtend,
-        all_day = EXCLUDED.all_day,
-        last_modified = NOW()
-RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
-`)).
-		WithArgs(int64(9), "event-1", "new-dest-name", "BEGIN:VCALENDAR", "etag-new", nil, nil, nil, false).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(2), int64(9), "event-1", "new-dest-name", "BEGIN:VCALENDAR", "etag-new", nil, nil, nil, false, now))
-	mock.ExpectCommit()
+	mock.ExpectRollback()
 
 	_, err = repo.CopyToCalendar(context.Background(), 5, 9, "event-1", "new-dest-name", "etag-new")
-	if err != nil {
-		t.Fatalf("CopyToCalendar() error = %v", err)
+	if err != ErrConflict {
+		t.Fatalf("CopyToCalendar() error = %v, want ErrConflict", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -482,15 +604,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListModifiedSince() = %#v", modified)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified
-FROM events e
-JOIN calendars c ON c.id = e.calendar_id
-LEFT JOIN calendar_shares cs ON cs.calendar_id = c.id AND cs.user_id = $1
-WHERE c.user_id = $1 OR cs.user_id = $1
-ORDER BY e.last_modified DESC
-LIMIT $2
-`)).
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified.*FROM events e.*acl_entries.*ORDER BY e.last_modified DESC.*LIMIT \$2`).
 		WithArgs(int64(4), 2).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(3), int64(8), "uid-3", "uid-3.ics", "BEGIN:VCALENDAR", "etag-3", nil, nil, nil, false, now))
@@ -500,6 +614,18 @@ LIMIT $2
 	}
 	if len(recent) != 1 || recent[0].UID != "uid-3" {
 		t.Fatalf("ListRecentByUser() = %#v", recent)
+	}
+
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path IN.*e.resource_name.*LIMIT \$2`).
+		WithArgs(int64(4), 2).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(6), int64(8), "uid-object", "uid-object", "BEGIN:VCALENDAR", "etag-6", "Direct Grant", nil, nil, false, now))
+	recent, err = eventRepo.ListRecentByUser(context.Background(), 4, 2)
+	if err != nil {
+		t.Fatalf("ListRecentByUser() direct grant error = %v", err)
+	}
+	if len(recent) != 1 || recent[0].UID != "uid-object" {
+		t.Fatalf("ListRecentByUser() direct grant = %#v", recent)
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, name, description, ctag, created_at, updated_at FROM address_books WHERE user_id=$1 ORDER BY created_at`)).
@@ -1183,6 +1309,137 @@ END
 	}
 	if !allowed {
 		t.Fatal("HasPrivilege() = false, want true when no deny exists")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestACLRepoSetACLPreservesCreatedAtForUnchangedEntries(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &aclRepo{pool: db}
+	resourcePath := "/dav/calendars/1"
+	createdAt := time.Date(2024, time.June, 1, 12, 0, 0, 0, time.UTC)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`)).
+		WithArgs(resourcePath).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "created_at"}).
+			AddRow(int64(1), resourcePath, "/dav/principals/2/", true, "read", createdAt))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs(resourcePath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", true, "read", createdAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", true, "write", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+
+	err = repo.SetACL(context.Background(), resourcePath, []ACLEntry{
+		{PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
+	})
+	if err != nil {
+		t.Fatalf("SetACL() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &aclRepo{pool: db}
+	resourcePath := "/dav/calendars/1/event-1"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`)).
+		WithArgs(resourcePath).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "created_at"}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs(resourcePath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", false, "read", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
+		WithArgs(int64(1), "event-1", "event-1.ics").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = repo.SetACL(context.Background(), resourcePath, []ACLEntry{
+		{PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+	})
+	if err != nil {
+		t.Fatalf("SetACL() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestACLRepoDeletePrincipalEntriesByResourcePrefixUsesSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &aclRepo{pool: db}
+	principalHref := "/dav/principals/2/"
+	resourcePrefix := "/dav/calendars/1"
+	likePrefix := "/dav/calendars/1/%"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT resource_path FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\') ORDER BY resource_path`)).
+		WithArgs(principalHref, resourcePrefix, likePrefix).
+		WillReturnRows(sqlmock.NewRows([]string{"resource_path"}).
+			AddRow("/dav/calendars/1").
+			AddRow("/dav/calendars/1/private-event"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')`)).
+		WithArgs(principalHref, resourcePrefix, likePrefix).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
+		WithArgs(int64(1), "private-event", "private-event.ics").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = repo.DeletePrincipalEntriesByResourcePrefix(context.Background(), principalHref, resourcePrefix)
+	if err != nil {
+		t.Fatalf("DeletePrincipalEntriesByResourcePrefix() error = %v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

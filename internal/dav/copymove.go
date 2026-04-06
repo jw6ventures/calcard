@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -83,8 +84,13 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
-	if _, err := h.loadCalendar(r.Context(), user, srcCalID); err != nil {
-		http.Error(w, "source not found", http.StatusNotFound)
+	_, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read")
+	if err != nil {
+		status := http.StatusNotFound
+		if errors.Is(err, errForbidden) {
+			status = http.StatusForbidden
+		}
+		http.Error(w, "source not found", status)
 		return
 	}
 
@@ -93,18 +99,12 @@ func (h *Handler) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user
 		http.Error(w, "source event not found", http.StatusNotFound)
 		return
 	}
-
 	destCalID, destResourceName, destMatched, err := h.parseCalendarResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
 
-	cal, err := h.loadCalendar(r.Context(), user, destCalID)
-	if err != nil || !cal.Editor {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
 	if !h.requireLock(w, r, path.Dir(destPath), "destination is locked") {
 		return
 	}
@@ -144,10 +144,41 @@ func (h *Handler) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
+	loadPrivilege := "bind"
+	if existing != nil && existing.UID == src.UID {
+		loadPrivilege = "write-content"
+	}
+	destCal, err := h.loadCalendarWithPrivilege(r.Context(), user, destCalID, destPath, loadPrivilege)
+	if err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if err := h.requireCalendarDestinationWritePrivileges(r.Context(), user, destCal, destPath, existing, src.UID); err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if existing != nil {
+		if err := h.deleteDAVResourceState(r.Context(), user, destPath); err != nil {
+			http.Error(w, "failed to clear destination state", http.StatusInternalServerError)
+			return
+		}
+	}
 	etag := newCopyETag(src.RawICAL, destCalID)
 
 	_, err = h.store.Events.CopyToCalendar(r.Context(), srcCalID, destCalID, src.UID, destResourceName, etag)
 	if err != nil {
+		if err == store.ErrConflict {
+			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			return
+		}
 		http.Error(w, "failed to copy event", http.StatusInternalServerError)
 		return
 	}
@@ -250,7 +281,12 @@ func (h *Handler) copyContact(w http.ResponseWriter, r *http.Request, user *stor
 	}
 	etag := newCopyETag(src.RawVCard, destBookID)
 
-	if existingByName == nil {
+	if existingByName != nil {
+		if err := h.deleteDAVResourceState(r.Context(), user, destPath); err != nil {
+			http.Error(w, "failed to clear destination state", http.StatusInternalServerError)
+			return
+		}
+	} else {
 		if err := h.deleteDAVACLState(r.Context(), user, destPath); err != nil {
 			http.Error(w, "failed to reset destination ACL state", http.StatusInternalServerError)
 			return
@@ -315,17 +351,24 @@ func (h *Handler) Move(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
-	srcCal, err := h.loadCalendar(r.Context(), user, srcCalID)
+	srcCal, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read")
 	if err != nil {
 		status := http.StatusInternalServerError
 		if err == store.ErrNotFound {
 			status = http.StatusNotFound
 		}
+		if errors.Is(err, errForbidden) {
+			status = http.StatusForbidden
+		}
 		http.Error(w, http.StatusText(status), status)
 		return
 	}
-	if !srcCal.Editor {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if err := h.requireCalendarPrivilege(r.Context(), user, &srcCal.Calendar, srcPath(r), "unbind"); err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 	if !h.requireLock(w, r, path.Dir(path.Clean(r.URL.Path)), "source is locked") {
@@ -343,11 +386,6 @@ func (h *Handler) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	destCal, err := h.loadCalendar(r.Context(), user, destCalID)
-	if err != nil || !destCal.Editor {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
 	if !h.requireLock(w, r, path.Dir(destPath), "destination is locked") {
 		return
 	}
@@ -382,8 +420,33 @@ func (h *Handler) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
+	loadPrivilege := "bind"
+	if existing != nil && existing.UID == src.UID {
+		loadPrivilege = "write-content"
+	}
+	destCal, err := h.loadCalendarWithPrivilege(r.Context(), user, destCalID, destPath, loadPrivilege)
+	if err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if err := h.requireCalendarDestinationWritePrivileges(r.Context(), user, destCal, destPath, existing, src.UID); err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
 
 	if err := h.store.Events.MoveToCalendar(r.Context(), srcCalID, destCalID, src.UID, destResourceName); err != nil {
+		if err == store.ErrConflict {
+			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			return
+		}
 		http.Error(w, "failed to move event", http.StatusInternalServerError)
 		return
 	}
@@ -536,6 +599,21 @@ func (h *Handler) requireAddressBookDestinationWritePrivileges(ctx context.Conte
 	}
 	for _, privilege := range []string{"unbind", "bind"} {
 		if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, privilege); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) requireCalendarDestinationWritePrivileges(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, existing *store.Event, sourceUID string) error {
+	if existing == nil {
+		return h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, "bind")
+	}
+	if existing.UID == sourceUID {
+		return h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, "write-content")
+	}
+	for _, privilege := range []string{"unbind", "bind"} {
+		if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, privilege); err != nil {
 			return err
 		}
 	}

@@ -133,13 +133,11 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 		}}, nil
 	}
 
-	cal, err := h.loadCalendar(ctx, user, calID)
+	calAccess, err := h.loadCalendar(ctx, user, calID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Only owners or editors can modify properties
-	if !cal.Editor {
+	if err := h.requireCalendarPrivilege(ctx, user, &calAccess.Calendar, cleanPath, "write-properties"); err != nil {
 		return []response{{
 			Href: cleanPath,
 			Propstat: []propstat{{
@@ -161,12 +159,12 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 
 	if name != nil || description != nil || timezone != nil {
 		// Use existing name if not being updated
-		updateName := cal.Name
+		updateName := calAccess.Name
 		if name != nil {
 			updateName = *name
 		}
 
-		err := h.store.Calendars.Update(ctx, user.ID, calID, updateName, description, timezone)
+		err := h.store.Calendars.UpdateProperties(ctx, calID, updateName, description, timezone)
 		if err != nil {
 			log.Printf("failed to update calendar properties for calendar %d: %v", calID, err)
 			return []response{{
@@ -567,9 +565,6 @@ func (h *Handler) moveDAVResourceState(ctx context.Context, user *store.User, fr
 }
 
 func (h *Handler) rebindMovedDAVResourceState(ctx context.Context, user *store.User, fromPath, toPath string, overwrite bool) error {
-	if overwrite {
-		return h.deleteDAVResourceState(ctx, user, fromPath)
-	}
 	return h.moveDAVResourceState(ctx, user, fromPath, toPath)
 }
 
@@ -1190,17 +1185,25 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cal, err := h.loadCalendar(r.Context(), user, calendarID)
+		existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceUID)
+		if err != nil {
+			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			return
+		}
+		requiredPrivilege := "bind"
+		if existingByResource != nil {
+			requiredPrivilege = "write-content"
+		}
+		_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
 		if err != nil {
 			status := http.StatusInternalServerError
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
 			}
-			http.Error(w, "calendar not found", status)
-			return
-		}
-		if !cal.Editor {
-			http.Error(w, "forbidden", http.StatusForbidden)
+			if errors.Is(err, errForbidden) {
+				status = http.StatusForbidden
+			}
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 
@@ -1296,7 +1299,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			resourceName = uid
 		}
 
-		existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
+		existingByResource, err = h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
 			return
@@ -1482,17 +1485,16 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cal, err := h.loadCalendar(r.Context(), user, calendarID)
+		_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "unbind")
 		if err != nil {
 			status := http.StatusInternalServerError
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
 			}
+			if errors.Is(err, errForbidden) {
+				status = http.StatusForbidden
+			}
 			http.Error(w, "not found", status)
-			return
-		}
-		if !cal.Editor {
-			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		if !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
@@ -1693,7 +1695,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		base := ensureCollectionHref("/dav/calendars")
 		res := []response{collectionResponse(base, "Calendars")}
 		if depth == "1" {
-			cals, err := h.store.Calendars.ListAccessible(ctx, user.ID)
+			cals, err := h.accessibleCalendars(ctx, user)
 			if err != nil {
 				return nil, err
 			}
@@ -1712,7 +1714,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := fmt.Sprintf("%d", c.CTag)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = append(res, calendarCollectionResponse(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, !c.Editor))
+				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, c.EffectivePrivileges()))
 			}
 		}
 		return res, nil
@@ -1753,7 +1755,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 			return nil, http.ErrNotSupported
 		}
 	} else {
-		cal, err = h.loadCalendar(ctx, user, calID)
+		cal, err = h.loadDiscoverableCalendar(ctx, user, calID)
 		if err != nil {
 			return nil, err
 		}
@@ -1765,11 +1767,18 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 			return nil, http.ErrNotSupported
 		}
 		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
+		resourceHref := strings.TrimSuffix(href, "/") + "/" + resourceName + ".ics"
+		allowed, err := h.canReadCalendarObject(ctx, user, cal, resourceName)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return []response{{Href: resourceHref, Status: httpStatusNotFound}}, nil
+		}
 		event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
 		if err != nil {
 			return nil, err
 		}
-		resourceHref := strings.TrimSuffix(href, "/") + "/" + resourceName + ".ics"
 		if event == nil {
 			return []response{{Href: resourceHref, Status: httpStatusNotFound}}, nil
 		}
@@ -1780,9 +1789,13 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	ctag := fmt.Sprintf("%d", cal.CTag)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
-	res := []response{calendarCollectionResponse(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, !cal.Editor)}
+	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
 	if depth == "1" {
 		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
+		if err != nil {
+			return nil, err
+		}
+		events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
 		if err != nil {
 			return nil, err
 		}
@@ -1790,6 +1803,28 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		res = append(res, calendarResourceResponses(base, events)...)
 	}
 	return res, nil
+}
+
+func (h *Handler) loadDiscoverableCalendar(ctx context.Context, user *store.User, calendarID int64) (*store.CalendarAccess, error) {
+	cal, err := h.loadCalendar(ctx, user, calendarID)
+	if err == nil {
+		return cal, nil
+	}
+	if err != store.ErrNotFound && !errors.Is(err, errForbidden) {
+		return nil, err
+	}
+
+	calendars, err := h.accessibleCalendars(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range calendars {
+		if candidate.ID == calendarID {
+			copy := candidate
+			return &copy, nil
+		}
+	}
+	return nil, store.ErrNotFound
 }
 
 func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string, propfindReq *propfindRequest) ([]response, error) {
@@ -1872,25 +1907,17 @@ func (h *Handler) addressBookResponses(ctx context.Context, cleanPath, depth str
 }
 
 func (h *Handler) loadCalendar(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {
-	cal, err := h.store.Calendars.GetAccessible(ctx, id, user.ID)
-	if err != nil {
-		return nil, err
-	}
-	if cal == nil {
-		return nil, store.ErrNotFound
-	}
-	return cal, nil
+	return h.loadCalendarWithAnyPrivilege(ctx, user, id, path.Join("/dav/calendars", fmt.Sprint(id)))
 }
 
 func (h *Handler) loadCalendarByName(ctx context.Context, user *store.User, name string) (*store.CalendarAccess, error) {
-	normalizedName := strings.ToLower(name)
-	accessible, err := h.store.Calendars.ListAccessible(ctx, user.ID)
+	accessible, err := h.accessibleCalendars(ctx, user)
 	if err != nil {
 		return nil, err
 	}
 	var match *store.CalendarAccess
 	for _, c := range accessible {
-		if (c.Slug != nil && *c.Slug == normalizedName) || c.Name == name {
+		if (c.Slug != nil && *c.Slug == strings.ToLower(name)) || c.Name == name {
 			if match != nil {
 				return nil, errAmbiguousCalendar
 			}
@@ -1898,29 +1925,10 @@ func (h *Handler) loadCalendarByName(ctx context.Context, user *store.User, name
 			match = &copy
 		}
 	}
-	if match != nil {
-		return match, nil
+	if match == nil {
+		return nil, store.ErrNotFound
 	}
-
-	owned, err := h.store.Calendars.ListByUser(ctx, user.ID)
-	if err != nil {
-		return nil, err
-	}
-	var ownedMatch *store.CalendarAccess
-	for _, c := range owned {
-		if (c.Slug != nil && *c.Slug == normalizedName) || c.Name == name {
-			if ownedMatch != nil {
-				return nil, errAmbiguousCalendar
-			}
-			cal := store.CalendarAccess{Calendar: c, Editor: true}
-			ownedMatch = &cal
-		}
-	}
-	if ownedMatch != nil {
-		return ownedMatch, nil
-	}
-
-	return nil, store.ErrNotFound
+	return match, nil
 }
 
 func (h *Handler) loadAddressBook(ctx context.Context, user *store.User, id int64) (*store.AddressBook, error) {
@@ -1973,14 +1981,14 @@ func (h *Handler) addressBookPrivilegeDecision(ctx context.Context, user *store.
 	if user != nil && book.UserID == user.ID {
 		return true, false, nil
 	}
-	if granted, decided, err := h.aclDecision(ctx, user, cleanPath, privilege); err != nil {
+	if granted, decided, err := h.aclDecisionMatchingPrivilege(ctx, user, cleanPath, privilege); err != nil {
 		return false, false, err
 	} else if decided {
 		return granted, !granted, nil
 	}
 	collectionPath := addressBookCollectionPath(cleanPath)
 	if collectionPath != cleanPath {
-		if granted, decided, err := h.aclDecision(ctx, user, collectionPath, privilege); err != nil {
+		if granted, decided, err := h.aclDecisionMatchingPrivilege(ctx, user, collectionPath, privilege); err != nil {
 			return false, false, err
 		} else if decided {
 			return granted, !granted, nil
@@ -2359,23 +2367,23 @@ func (h *Handler) expandedPrincipalProp(user *store.User, selections expandPrope
 	return result
 }
 
-func (h *Handler) calendarReportResponses(ctx context.Context, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
+func (h *Handler) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
 	calData := reportCalendarData(report)
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, cal, report.Hrefs, resolvePath, responsePath, calData)
+		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, calData)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, cal.ID, responsePath, report.Filter, calData)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, report.Filter, calData)
 		return res, "", err
 	case "free-busy-query":
-		res, err := h.freeBusyQuery(ctx, cal.ID, responsePath, report.Filter)
+		res, err := h.freeBusyQuery(ctx, user, cal, responsePath, report.Filter)
 		return res, "", err
 	case "sync-collection":
-		return h.calendarSyncCollection(ctx, cal, principalHref, responsePath, report, calData)
+		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
 	default:
 		// Fallback: return all events to keep clients moving even if they send unsupported report types.
-		res, err := h.calendarQuery(ctx, cal.ID, responsePath, nil, calData)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, nil, calData)
 		return res, "", err
 	}
 }
@@ -2634,14 +2642,18 @@ func (h *Handler) recurringEventInTimeRange(event store.Event, rangeStart, range
 	return false
 }
 
-func (h *Handler) freeBusyQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter) ([]response, error) {
-	events, err := h.store.Events.ListForCalendar(ctx, calID)
+func (h *Handler) freeBusyQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter) ([]response, error) {
+	events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events")
 	}
 
 	if filter != nil {
 		events = h.applyCalendarFilter(events, filter)
+	}
+	events, err = h.filterCalendarEventsByPrivilege(ctx, user, cal, events, "read-free-busy")
+	if err != nil {
+		return nil, err
 	}
 
 	freeBusyData := h.generateFreeBusy(events, filter)
@@ -2690,8 +2702,8 @@ func (h *Handler) generateFreeBusy(events []store.Event, filter *calFilter) stri
 	return sb.String()
 }
 
-func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath string, filter *calFilter, calData *calendarDataEl) ([]response, error) {
-	events, err := h.store.Events.ListForCalendar(ctx, calID)
+func (h *Handler) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter, calData *calendarDataEl) ([]response, error) {
+	events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events")
 	}
@@ -2699,13 +2711,17 @@ func (h *Handler) calendarQuery(ctx context.Context, calID int64, cleanPath stri
 	if filter != nil {
 		events = h.applyCalendarFilter(events, filter)
 	}
+	events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
+	if err != nil {
+		return nil, err
+	}
 
 	return calendarResourceResponsesFiltered(cleanPath, events, calData), nil
 }
 
-func (h *Handler) calendarMultiGet(ctx context.Context, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl) ([]response, error) {
+func (h *Handler) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.calendarQuery(ctx, cal.ID, responsePath, nil, calData)
+		return h.calendarQuery(ctx, user, cal, responsePath, nil, calData)
 	}
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 	var responses []response
@@ -2724,6 +2740,14 @@ func (h *Handler) calendarMultiGet(ctx context.Context, cal *store.CalendarAcces
 			return nil, fmt.Errorf("failed to fetch event")
 		}
 		if ev == nil {
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
+			continue
+		}
+		allowed, err := h.canReadCalendarObject(ctx, user, cal, uid)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
@@ -2942,7 +2966,7 @@ func addressBookResourceResponses(base string, contacts []store.Contact) []respo
 	return responses
 }
 
-func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, calData *calendarDataEl) ([]response, string, error) {
+func (h *Handler) calendarSyncCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, calData *calendarDataEl) ([]response, string, error) {
 	syncToken, _ := h.calendarSyncTokenValue(ctx, cal)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
@@ -2965,14 +2989,36 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to list events")
 	}
+	allEvents := events
+	events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
+	if err != nil {
+		return nil, "", err
+	}
 
 	responses := []response{
-		calendarCollectionResponse(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), !cal.Editor),
+		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), cal.EffectivePrivileges()),
 	}
 	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 
 	// Include deleted resources if this is an incremental sync
 	if !since.IsZero() {
+		deletedHrefs := make(map[string]struct{})
+		visible := make(map[string]struct{}, len(events))
+		for _, event := range events {
+			visible[eventResourceName(event)] = struct{}{}
+		}
+		for _, event := range allEvents {
+			if !event.LastModified.After(since) {
+				continue
+			}
+			resourceName := eventResourceName(event)
+			if _, ok := visible[resourceName]; ok {
+				continue
+			}
+			href := collectionHref + resourceName + ".ics"
+			responses = append(responses, deletedResponse(href))
+			deletedHrefs[href] = struct{}{}
+		}
 		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "event", cal.ID, since)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to list deleted events")
@@ -2983,7 +3029,11 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, cal *store.Calenda
 				resourceName = d.UID
 			}
 			href := collectionHref + resourceName + ".ics"
+			if _, ok := deletedHrefs[href]; ok {
+				continue
+			}
 			responses = append(responses, deletedResponse(href))
+			deletedHrefs[href] = struct{}{}
 		}
 	}
 

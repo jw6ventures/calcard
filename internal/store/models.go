@@ -25,21 +25,91 @@ type Calendar struct {
 	UpdatedAt   time.Time
 }
 
-// CalendarShare grants another user access to a calendar.
-type CalendarShare struct {
-	CalendarID int64
-	UserID     int64
-	GrantedBy  int64
-	Editor     bool
-	CreatedAt  time.Time
+// CalendarPrivileges captures the effective collection privileges available to the current user.
+type CalendarPrivileges struct {
+	Read            bool `json:"read"`
+	ReadFreeBusy    bool `json:"readFreeBusy"`
+	Write           bool `json:"write"`
+	WriteContent    bool `json:"writeContent"`
+	WriteProperties bool `json:"writeProperties"`
+	Bind            bool `json:"bind"`
+	Unbind          bool `json:"unbind"`
+}
+
+func (p CalendarPrivileges) Normalized() CalendarPrivileges {
+	p.Write = p.WriteContent && p.WriteProperties && p.Bind && p.Unbind
+	return p
+}
+
+func (p CalendarPrivileges) HasAny() bool {
+	return p.Read || p.ReadFreeBusy || p.Write || p.WriteContent || p.WriteProperties || p.Bind || p.Unbind
+}
+
+func (p CalendarPrivileges) Allows(privilege string) bool {
+	p = p.Normalized()
+	switch privilege {
+	case "read":
+		return p.Read
+	case "read-free-busy":
+		return p.ReadFreeBusy
+	case "write":
+		return p.Write
+	case "write-content":
+		return p.WriteContent
+	case "write-properties":
+		return p.WriteProperties
+	case "bind":
+		return p.Bind
+	case "unbind":
+		return p.Unbind
+	default:
+		return false
+	}
+}
+
+func (p CalendarPrivileges) AllowsEventEditing() bool {
+	p = p.Normalized()
+	return p.Write || (p.WriteContent && p.Bind && p.Unbind)
+}
+
+func (p CalendarPrivileges) AllowsAnyWrite() bool {
+	p = p.Normalized()
+	return p.Write || p.WriteContent || p.WriteProperties || p.Bind || p.Unbind
+}
+
+func FullCalendarPrivileges() CalendarPrivileges {
+	return CalendarPrivileges{
+		Read:            true,
+		ReadFreeBusy:    true,
+		Write:           true,
+		WriteContent:    true,
+		WriteProperties: true,
+		Bind:            true,
+		Unbind:          true,
+	}
 }
 
 // CalendarAccess wraps a calendar with context about how the current user can access it.
 type CalendarAccess struct {
 	Calendar
-	OwnerEmail string
-	Shared     bool
-	Editor     bool
+	OwnerEmail         string
+	Shared             bool
+	Editor             bool
+	Privileges         CalendarPrivileges
+	PrivilegesResolved bool
+}
+
+func (c CalendarAccess) EffectivePrivileges() CalendarPrivileges {
+	if c.PrivilegesResolved || c.Privileges.HasAny() {
+		return c.Privileges.Normalized()
+	}
+	if !c.Shared {
+		return FullCalendarPrivileges()
+	}
+	if c.Editor {
+		return FullCalendarPrivileges()
+	}
+	return CalendarPrivileges{Read: true, ReadFreeBusy: true}
 }
 
 // Event stores raw iCalendar payload and metadata.

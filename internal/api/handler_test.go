@@ -195,6 +195,56 @@ func TestListCalendarsSuccess(t *testing.T) {
 	}
 }
 
+func TestListCalendarsIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {
+				Calendar:           store.Calendar{ID: 1, UserID: 9, Name: "Object Shared"},
+				OwnerEmail:         "owner@example.com",
+				Shared:             true,
+				PrivilegesResolved: true,
+			},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/calendars", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rec := httptest.NewRecorder()
+
+	handler.ListCalendars(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListCalendars() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body []map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("expected one calendar, got %#v", body)
+	}
+	if body[0]["name"] != "" {
+		t.Fatalf("expected object-only grant to redact calendar name, got %#v", body[0]["name"])
+	}
+	if body[0]["ownerEmail"] != "" {
+		t.Fatalf("expected object-only grant to redact owner email, got %#v", body[0]["ownerEmail"])
+	}
+	for _, key := range []string{"description", "timezone", "color"} {
+		if _, ok := body[0][key]; ok {
+			t.Fatalf("expected object-only grant to omit %s, got %#v", key, body[0][key])
+		}
+	}
+	capabilities, ok := body[0]["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected capabilities object, got %#v", body[0]["capabilities"])
+	}
+	for _, privilege := range []string{"read", "readFreeBusy", "write", "writeContent", "writeProperties", "bind", "unbind"} {
+		if capabilities[privilege] != false {
+			t.Fatalf("expected %s=false for object-only grant discovery row, got %#v", privilege, capabilities)
+		}
+	}
+}
+
 func TestListCalendarsInternalError(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{listAccessibleErr: errors.New("boom")},
@@ -246,6 +296,138 @@ func TestGetCalendarSuccess(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GetCalendar() status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestGetCalendarIncludesPartialWriteCapabilities(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {
+				Calendar:   store.Calendar{ID: 1, UserID: 9, Name: "Shared"},
+				OwnerEmail: "owner@example.com",
+				Shared:     true,
+				Editor:     false,
+				Privileges: store.CalendarPrivileges{Read: true, Bind: true},
+			},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
+	req = withUserAndRoute(req, "1", "")
+	rec := httptest.NewRecorder()
+
+	handler.GetCalendar(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GetCalendar() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if body["name"] != "Shared" {
+		t.Fatalf("expected calendar metadata to remain visible for collection grant, got %#v", body["name"])
+	}
+	if _, ok := body["editor"]; ok {
+		t.Fatalf("did not expect legacy editor field, got %#v", body["editor"])
+	}
+	capabilities, ok := body["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected capabilities object, got %#v", body["capabilities"])
+	}
+	if capabilities["bind"] != true {
+		t.Fatalf("expected bind capability, got %#v", capabilities)
+	}
+	if capabilities["writeContent"] != false {
+		t.Fatalf("expected writeContent=false for bind-only access, got %#v", capabilities)
+	}
+}
+
+func TestGetCalendarDoesNotAdvertiseDeniedWriteSubPrivileges(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {
+				Calendar:   store.Calendar{ID: 1, UserID: 9, Name: "Shared"},
+				OwnerEmail: "owner@example.com",
+				Shared:     true,
+				Editor:     true,
+				Privileges: store.CalendarPrivileges{
+					Read:            true,
+					ReadFreeBusy:    true,
+					Write:           true,
+					WriteContent:    false,
+					WriteProperties: true,
+					Bind:            true,
+					Unbind:          true,
+				},
+			},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
+	req = withUserAndRoute(req, "1", "")
+	rec := httptest.NewRecorder()
+
+	handler.GetCalendar(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GetCalendar() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if body["name"] != "Shared" {
+		t.Fatalf("expected calendar metadata to remain visible for collection grant, got %#v", body["name"])
+	}
+	capabilities, ok := body["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected capabilities object, got %#v", body["capabilities"])
+	}
+	if capabilities["write"] != false {
+		t.Fatalf("expected write=false when write-content is denied, got %#v", capabilities)
+	}
+	if capabilities["writeContent"] != false {
+		t.Fatalf("expected writeContent=false when explicitly denied, got %#v", capabilities)
+	}
+	if capabilities["bind"] != true || capabilities["unbind"] != true {
+		t.Fatalf("expected bind/unbind to remain true, got %#v", capabilities)
+	}
+}
+
+func TestGetCalendarIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {
+				Calendar:           store.Calendar{ID: 1, UserID: 9, Name: "Object Shared"},
+				OwnerEmail:         "owner@example.com",
+				Shared:             true,
+				PrivilegesResolved: true,
+			},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
+	req = withUserAndRoute(req, "1", "")
+	rec := httptest.NewRecorder()
+
+	handler.GetCalendar(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GetCalendar() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	capabilities, ok := body["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected capabilities object, got %#v", body["capabilities"])
+	}
+	for _, privilege := range []string{"read", "readFreeBusy", "write", "writeContent", "writeProperties", "bind", "unbind"} {
+		if capabilities[privilege] != false {
+			t.Fatalf("expected %s=false for object-only grant calendar, got %#v", privilege, capabilities)
+		}
 	}
 }
 
@@ -675,6 +857,9 @@ func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*sto
 	return nil, nil
 }
 func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+	return nil
+}
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
 	return nil
 }
 func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {

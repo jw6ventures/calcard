@@ -70,9 +70,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Handle regular calendars
-		if _, err := h.loadCalendar(r.Context(), user, calendarID); err != nil {
+		cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "read")
+		if err != nil {
 			if err == store.ErrNotFound {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			if errors.Is(err, errForbidden) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -85,6 +89,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if event == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		allowed, err := h.canReadCalendarObject(r.Context(), user, cal, uid)
+		if err != nil {
+			http.Error(w, "failed to evaluate calendar access", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -152,8 +153,8 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2}}
-	responses, err := h.calendarMultiGet(context.Background(), cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -179,8 +180,8 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"test-event.ics"}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2}}
-	responses, err := h.calendarMultiGet(context.Background(), cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -223,8 +224,8 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
-	responses, token, err := h.calendarReportResponses(context.Background(), cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
+	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -255,8 +256,8 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("cal", 2, now.Add(-time.Hour)),
 	}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -287,8 +288,8 @@ func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
 	}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	_, _, err := h.calendarReportResponses(context.Background(), cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
+	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
 	if !errors.Is(err, errInvalidSyncToken) {
 		t.Fatalf("expected errInvalidSyncToken, got %v", err)
 	}
@@ -471,19 +472,43 @@ func TestSupportsCopyMove(t *testing.T) {
 func TestCanLockCalendarPath(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	sharedUser := &store.User{ID: 2, PrimaryEmail: "editor@example.com"}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/7", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/7", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/8", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/8", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/10", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/10", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/11/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+	}}
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 5, UserID: 1, Name: "Home"}, Editor: true},
 			{Calendar: store.Calendar{ID: 6, UserID: 1, Name: "Readonly Shared"}, Shared: true, Editor: false},
 			{Calendar: store.Calendar{ID: 7, UserID: 1, Name: "Writable Shared"}, Shared: true, Editor: true},
+			{Calendar: store.Calendar{ID: 8, UserID: 1, Name: "Bind Shared"}, Shared: true, Privileges: store.CalendarPrivileges{Read: true, Bind: true}},
+			{Calendar: store.Calendar{ID: 9, UserID: 1, Name: "Write Content Shared"}, Shared: true, Privileges: store.CalendarPrivileges{Read: true, WriteContent: true}},
+			{Calendar: store.Calendar{ID: 10, UserID: 1, Name: "Unbind Shared"}, Shared: true, Privileges: store.CalendarPrivileges{Read: true, Unbind: true}},
 		},
 		calendars: map[int64]*store.Calendar{
-			5: {ID: 5, UserID: 1, Name: "Home"},
-			6: {ID: 6, UserID: 1, Name: "Readonly Shared"},
-			7: {ID: 7, UserID: 1, Name: "Writable Shared"},
+			5:  {ID: 5, UserID: 1, Name: "Home"},
+			6:  {ID: 6, UserID: 1, Name: "Readonly Shared"},
+			7:  {ID: 7, UserID: 1, Name: "Writable Shared"},
+			8:  {ID: 8, UserID: 1, Name: "Bind Shared"},
+			9:  {ID: 9, UserID: 1, Name: "Write Content Shared"},
+			10: {ID: 10, UserID: 1, Name: "Unbind Shared"},
+			11: {ID: 11, UserID: 1, Name: "Direct Object Shared"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"7:event":  {CalendarID: 7, UID: "event", ResourceName: "event"},
+			"11:event": {CalendarID: 11, UID: "event", ResourceName: "event"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	tests := []struct {
 		name string
@@ -494,6 +519,10 @@ func TestCanLockCalendarPath(t *testing.T) {
 		{name: "owner collection", user: user, path: "/dav/calendars/5/", want: true},
 		{name: "shared editor resource", user: sharedUser, path: "/dav/calendars/7/event.ics", want: true},
 		{name: "shared readonly collection", user: sharedUser, path: "/dav/calendars/6/", want: false},
+		{name: "shared bind-only collection", user: sharedUser, path: "/dav/calendars/8/", want: true},
+		{name: "shared write-content-only collection", user: sharedUser, path: "/dav/calendars/9/", want: true},
+		{name: "shared unbind-only collection", user: sharedUser, path: "/dav/calendars/10/", want: true},
+		{name: "direct object write-content grant without collection access", user: sharedUser, path: "/dav/calendars/11/event.ics", want: true},
 		{name: "birthday calendar", user: user, path: fmt.Sprintf("/dav/calendars/%d/", birthdayCalendarID), want: false},
 		{name: "unsupported path", user: user, path: "/dav/unknown", want: false},
 	}
@@ -798,9 +827,9 @@ func TestCalendarReportFallsBackToQueryForUnknownType(t *testing.T) {
 	}
 	h := &Handler{store: &store.Store{Events: eventRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, Name: "Test"}}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
-	responses, _, err := h.calendarReportResponses(context.Background(), cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -1218,7 +1247,7 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
-			{Calendar: store.Calendar{ID: 2, Name: "Work", UpdatedAt: now}, Editor: true},
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", UpdatedAt: now}, Editor: true},
 		},
 	}
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
@@ -1246,13 +1275,16 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 func TestPutRejectsCalendarWriteWithoutEditor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
-			{Calendar: store.Calendar{ID: 2, Name: "Work"}, Editor: false},
+			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Work"}, Shared: true, Editor: false},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
-	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("ICALDATA"))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -1295,15 +1327,18 @@ func TestPutCreatesContact(t *testing.T) {
 func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
-			{Calendar: store.Calendar{ID: 2, Name: "Work"}, Editor: false},
+			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Work"}, Shared: true, Editor: false},
 		},
 	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
 			"2:old": {CalendarID: 2, UID: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/old.ics", nil)
@@ -1318,6 +1353,12 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 
 	// Grant editor and delete
 	calRepo.accessible[0].Editor = true
+	aclRepo.entries = append(aclRepo.entries, store.ACLEntry{
+		ResourcePath:  "/dav/calendars/2",
+		PrincipalHref: "/dav/principals/1/",
+		IsGrant:       true,
+		Privilege:     "unbind",
+	})
 	rr = httptest.NewRecorder()
 	h.Delete(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -1572,8 +1613,8 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("cal", 2, then),
 	}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -1636,6 +1677,9 @@ func TestProppatchCalendarUpdatesProperties(t *testing.T) {
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Old Name"}, Editor: true},
 		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 1, Name: "Old Name"},
+		},
 	}
 	h := &Handler{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
@@ -1688,7 +1732,11 @@ func TestPropfindRejectsAmbiguousCalendarSlug(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 3, Name: "Work", Slug: &slug}, Editor: false},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/work/", nil)
@@ -2044,6 +2092,145 @@ func TestReportCalendarSyncCollectionViaHandler(t *testing.T) {
 	respBody := rr.Body.String()
 	if !strings.Contains(respBody, "event.ics") || !strings.Contains(respBody, "gone.ics") {
 		t.Fatalf("expected sync responses for event and deleted resource, got %s", respBody)
+	}
+}
+
+func TestReportCalendarSyncCollectionReturnsTombstoneForACLHiddenEvent(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 9, Name: "Shared", CTag: 4, UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:hidden": {
+				CalendarID:   2,
+				UID:          "hidden",
+				ResourceName: "hidden",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-hidden",
+				LastModified: now,
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars:        calRepo,
+		Events:           eventRepo,
+		DeletedResources: &fakeDeletedResourceRepo{},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2/hidden", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read"},
+		}},
+	}}
+
+	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "hidden.ics") {
+		t.Fatalf("expected sync response for ACL-hidden event, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "404 Not Found") {
+		t.Fatalf("expected ACL-hidden event to be emitted as deleted response, got %s", respBody)
+	}
+}
+
+func TestReportCalendarSyncCollectionDoesNotRepeatACLHiddenTombstoneAfterTokenAdvances(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 9, Name: "Shared", CTag: 4, UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:hidden": {
+				CalendarID:   2,
+				UID:          "hidden",
+				ResourceName: "hidden",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-hidden",
+				LastModified: now,
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars:        calRepo,
+		Events:           eventRepo,
+		DeletedResources: &fakeDeletedResourceRepo{},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2/hidden", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read"},
+		}},
+	}}
+
+	firstBody := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
+	firstReq := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(firstBody))
+	firstReq = firstReq.WithContext(auth.WithUser(firstReq.Context(), &store.User{ID: 1}))
+	firstRR := httptest.NewRecorder()
+	h.Report(firstRR, firstReq)
+	if firstRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected first sync 207, got %d: %s", firstRR.Code, firstRR.Body.String())
+	}
+	if !strings.Contains(firstRR.Body.String(), "hidden.ics") {
+		t.Fatalf("expected first incremental sync to include hidden tombstone, got %s", firstRR.Body.String())
+	}
+
+	secondBody := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now) + `</D:sync-token></D:sync-collection>`
+	secondReq := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(secondBody))
+	secondReq = secondReq.WithContext(auth.WithUser(secondReq.Context(), &store.User{ID: 1}))
+	secondRR := httptest.NewRecorder()
+	h.Report(secondRR, secondReq)
+	if secondRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected second sync 207, got %d: %s", secondRR.Code, secondRR.Body.String())
+	}
+	if strings.Contains(secondRR.Body.String(), "hidden.ics") {
+		t.Fatalf("expected advanced sync token to suppress repeated hidden tombstone, got %s", secondRR.Body.String())
+	}
+}
+
+func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2/hidden", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"2:visible": {CalendarID: 2, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-visible"},
+			"2:hidden":  {CalendarID: 2, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-hidden"},
+			"2:other":   {CalendarID: 2, UID: "other", ResourceName: "other", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:other\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-other"},
+		}},
+		ACLEntries: aclRepo,
+	}}
+	cal := &store.CalendarAccess{
+		Calendar:           store.Calendar{ID: 2, UserID: 9, Name: "Shared"},
+		Shared:             true,
+		PrivilegesResolved: true,
+		Privileges:         store.CalendarPrivileges{Read: true},
+	}
+
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", nil, nil)
+	if err != nil {
+		t.Fatalf("calendarQuery() error = %v", err)
+	}
+	if len(responses) != 2 {
+		t.Fatalf("calendarQuery() responses = %#v, want only visible resources", responses)
+	}
+	if aclRepo.listByResourceCalls != 0 {
+		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
+	}
+	if aclRepo.listByPrincipalCalls == 0 || aclRepo.listByPrincipalCalls > 3 {
+		t.Fatalf("expected batched ListByPrincipal calls, got %d", aclRepo.listByPrincipalCalls)
 	}
 }
 
@@ -2434,8 +2621,8 @@ func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testi
 func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	brokenRepo := &errorEventRepo{}
 	h := &Handler{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
-	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1}}
-	_, err := h.calendarMultiGet(context.Background(), cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", nil)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
+	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", nil)
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -2841,6 +3028,392 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 			t.Fatalf("expected destination contact tombstones to be removed during rollback, got %#v", tombstones)
 		}
 	})
+}
+
+func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: delegate.ID, Name: "Destination"},
+			9: {ID: 9, UserID: owner.ID, Name: "Shared"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"9:secret": {
+				CalendarID:   9,
+				UID:          "secret",
+				ResourceName: "secret",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-secret",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/9/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
+	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Move(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected source read denial to return 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if eventRepo.resourceLookupCount != 0 {
+		t.Fatalf("expected MOVE to reject denied source before loading the event, got %d lookups", eventRepo.resourceLookupCount)
+	}
+}
+
+func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			delegate.ID: {
+				{
+					Calendar:   store.Calendar{ID: 5, UserID: owner.ID, Name: "Shared", UpdatedAt: now},
+					Shared:     true,
+					Editor:     false,
+					Privileges: store.CalendarPrivileges{Read: true, ReadFreeBusy: true, Bind: true},
+				},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared", UpdatedAt: now},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo}}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
+	if privilegeSet == "" {
+		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
+	}
+	if !strings.Contains(privilegeSet, "bind") {
+		t.Fatalf("expected bind privilege in response, got %s", privilegeSet)
+	}
+	if strings.Contains(privilegeSet, "write-content") {
+		t.Fatalf("did not expect write-content privilege for bind-only access, got %s", privilegeSet)
+	}
+	if strings.Contains(privilegeSet, "write-properties") {
+		t.Fatalf("did not expect write-properties privilege for bind-only access, got %s", privilegeSet)
+	}
+	if strings.Contains(privilegeSet, "unbind") {
+		t.Fatalf("did not expect unbind privilege for bind-only access, got %s", privilegeSet)
+	}
+}
+
+func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared"},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+
+	privilegeSet := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if privilegeSet == nil {
+		t.Fatal("expected privilege set for readable calendar")
+	}
+	if len(privilegeSet.Privileges) != 1 {
+		t.Fatalf("expected only DAV:read privilege, got %#v", privilegeSet.Privileges)
+	}
+	if privilegeSet.Privileges[0].Read == nil {
+		t.Fatalf("expected DAV:read privilege, got %#v", privilegeSet.Privileges[0])
+	}
+	if privilegeSet.Privileges[0].Read.ReadFreeBusy != nil {
+		t.Fatalf("did not expect read-free-busy nested under DAV:read when explicitly denied, got %#v", privilegeSet.Privileges[0])
+	}
+	if privilegeSet.Privileges[0].ReadFreeBusy != nil {
+		t.Fatalf("did not expect standalone read-free-busy privilege when explicitly denied, got %#v", privilegeSet.Privileges[0])
+	}
+}
+
+func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			delegate.ID: {
+				{
+					Calendar:   store.Calendar{ID: 8, UserID: owner.ID, Name: "Inbox", UpdatedAt: now},
+					Shared:     true,
+					Privileges: store.CalendarPrivileges{Bind: true},
+				},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			8: {ID: 8, UserID: owner.ID, Name: "Inbox", UpdatedAt: now},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/8", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+
+	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	rootReq.Header.Set("Depth", "1")
+	rootReq = rootReq.WithContext(auth.WithUser(rootReq.Context(), delegate))
+	rootRR := httptest.NewRecorder()
+
+	h.Propfind(rootRR, rootReq)
+
+	if rootRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
+	}
+	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/8/") {
+		t.Fatalf("expected bind-only calendar to be discoverable, got %s", rootRR.Body.String())
+	}
+
+	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/8/", nil)
+	calReq.Header.Set("Depth", "0")
+	calReq = calReq.WithContext(auth.WithUser(calReq.Context(), delegate))
+	calRR := httptest.NewRecorder()
+
+	h.Propfind(calRR, calReq)
+
+	if calRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected bind-only calendar PROPFIND to succeed, got %d: %s", calRR.Code, calRR.Body.String())
+	}
+	body := calRR.Body.String()
+	if !strings.Contains(body, "/dav/calendars/8/") {
+		t.Fatalf("expected bind-only calendar href in response, got %s", body)
+	}
+	if !strings.Contains(body, "bind") {
+		t.Fatalf("expected bind privilege in response, got %s", body)
+	}
+}
+
+func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	now := store.Now()
+	reviewSlug := "review"
+
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			delegate.ID: {
+				{
+					Calendar:   store.Calendar{ID: 9, UserID: owner.ID, Name: "Drafts", UpdatedAt: now},
+					Shared:     true,
+					Privileges: store.CalendarPrivileges{WriteContent: true},
+				},
+				{
+					Calendar:   store.Calendar{ID: 10, UserID: owner.ID, Name: "Archive", UpdatedAt: now},
+					Shared:     true,
+					Privileges: store.CalendarPrivileges{Unbind: true},
+				},
+				{
+					Calendar:   store.Calendar{ID: 11, UserID: owner.ID, Name: "Review", Slug: &reviewSlug, UpdatedAt: now},
+					Shared:     true,
+					Privileges: store.CalendarPrivileges{WriteContent: true},
+				},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			9:  {ID: 9, UserID: owner.ID, Name: "Drafts", UpdatedAt: now},
+			10: {ID: 10, UserID: owner.ID, Name: "Archive", UpdatedAt: now},
+			11: {ID: 11, UserID: owner.ID, Name: "Review", Slug: &reviewSlug, UpdatedAt: now},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/10", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/11", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+
+	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	rootReq.Header.Set("Depth", "1")
+	rootReq = rootReq.WithContext(auth.WithUser(rootReq.Context(), delegate))
+	rootRR := httptest.NewRecorder()
+
+	h.Propfind(rootRR, rootReq)
+
+	if rootRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
+	}
+	rootBody := rootRR.Body.String()
+	for _, href := range []string{"/dav/calendars/9/", "/dav/calendars/10/", "/dav/calendars/11/"} {
+		if !strings.Contains(rootBody, href) {
+			t.Fatalf("expected partial-access calendar %s to be discoverable, got %s", href, rootBody)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		path      string
+		wantHref  string
+		privilege string
+	}{
+		{name: "write-content by id", path: "/dav/calendars/9/", wantHref: "/dav/calendars/9/", privilege: "write-content"},
+		{name: "unbind by id", path: "/dav/calendars/10/", wantHref: "/dav/calendars/10/", privilege: "unbind"},
+		{name: "write-content by slug", path: "/dav/calendars/review/", wantHref: "/dav/calendars/11/", privilege: "write-content"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("PROPFIND", tc.path, nil)
+			req.Header.Set("Depth", "0")
+			req = req.WithContext(auth.WithUser(req.Context(), delegate))
+			rr := httptest.NewRecorder()
+
+			h.Propfind(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("expected partial-access calendar PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+			}
+			body := rr.Body.String()
+			if !strings.Contains(body, tc.wantHref) {
+				t.Fatalf("expected calendar href %s in response, got %s", tc.wantHref, body)
+			}
+			if !strings.Contains(body, tc.privilege) {
+				t.Fatalf("expected privilege %q in response, got %s", tc.privilege, body)
+			}
+		})
+	}
+}
+
+func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			12: {ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"12:special": {
+				CalendarID:   12,
+				UID:          "special",
+				ResourceName: "special",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:special\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-special",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/12/special", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	rootReq.Header.Set("Depth", "1")
+	rootReq = rootReq.WithContext(auth.WithUser(rootReq.Context(), delegate))
+	rootRR := httptest.NewRecorder()
+
+	h.Propfind(rootRR, rootReq)
+
+	if rootRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
+	}
+	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/12/") {
+		t.Fatalf("expected object-granted calendar to be discoverable, got %s", rootRR.Body.String())
+	}
+
+	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/12/", nil)
+	calReq.Header.Set("Depth", "0")
+	calReq = calReq.WithContext(auth.WithUser(calReq.Context(), delegate))
+	calRR := httptest.NewRecorder()
+
+	h.Propfind(calRR, calReq)
+
+	if calRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected direct calendar PROPFIND to succeed for object grant, got %d: %s", calRR.Code, calRR.Body.String())
+	}
+	body := calRR.Body.String()
+	if !strings.Contains(body, "/dav/calendars/12/") {
+		t.Fatalf("expected object-granted calendar href in response, got %s", body)
+	}
+	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
+	if privilegeSet == "" {
+		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
+	}
+	for _, privilege := range []string{"<d:read", "read-free-busy", "write-content", "write-properties", "<d:bind", "<d:unbind", "<d:write"} {
+		if strings.Contains(privilegeSet, privilege) {
+			t.Fatalf("did not expect collection privilege %q for object-only calendar discovery, got %s", privilege, privilegeSet)
+		}
+	}
+}
+
+func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 13, UserID: owner.ID, Name: "Hidden By Deny", UpdatedAt: now}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			13: {ID: 13, UserID: owner.ID, Name: "Hidden By Deny", UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"13:secret": {
+				CalendarID:   13,
+				UID:          "secret",
+				ResourceName: "secret",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-secret",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/13/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	rootReq.Header.Set("Depth", "1")
+	rootReq = rootReq.WithContext(auth.WithUser(rootReq.Context(), delegate))
+	rootRR := httptest.NewRecorder()
+
+	h.Propfind(rootRR, rootReq)
+
+	if rootRR.Code != http.StatusMultiStatus {
+		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
+	}
+	if strings.Contains(rootRR.Body.String(), "/dav/calendars/13/") {
+		t.Fatalf("did not expect deny-only object ACE to surface calendar discovery, got %s", rootRR.Body.String())
+	}
 }
 
 func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
@@ -4641,6 +5214,190 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 	}
 }
 
+func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/"); privs == nil || len(privs.Privileges) == 0 {
+		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
+	}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, needle := range []string{"current-user-privilege-set", "<d:read", "<d:bind", "<d:write-content"} {
+		if !strings.Contains(respBody, needle) {
+			t.Fatalf("expected PROPFIND response to include %q, got %s", needle, respBody)
+		}
+	}
+}
+
+func TestCalendarCurrentUserPrivilegeSetForReadFreeBusyDelegate(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: 1, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+
+	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if privs == nil {
+		t.Fatal("expected computed privilege set for read-free-busy delegate")
+	}
+	if len(privs.Privileges) != 1 || privs.Privileges[0].ReadFreeBusy == nil {
+		t.Fatalf("expected only read-free-busy privilege, got %#v", privs)
+	}
+	if privs.Privileges[0].Read != nil {
+		t.Fatalf("did not expect DAV:read privilege, got %#v", privs)
+	}
+}
+
+func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenied(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: 1, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+
+	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if privs == nil {
+		t.Fatal("expected computed privilege set")
+	}
+	for _, privilege := range privs.Privileges {
+		if privilege.Write != nil {
+			t.Fatalf("did not expect aggregate write privilege when write-content is denied, got %#v", privs)
+		}
+	}
+}
+
+func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+
+	t.Run("calendar home discovery", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "<d:href>/dav/calendars/5/</d:href>") {
+			t.Fatalf("expected read-free-busy calendar in discovery response, got %s", rr.Body.String())
+		}
+	})
+
+	t.Run("direct collection propfind", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/", nil)
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Propfind(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("expected direct PROPFIND to succeed with read-free-busy, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "read-free-busy") {
+			t.Fatalf("expected direct PROPFIND to advertise read-free-busy, got %s", rr.Body.String())
+		}
+	})
+}
+
+func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}},
+	}}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "<d:href>/dav/calendars/5/</d:href>") {
+		t.Fatalf("expected ACL-granted calendar in discovery response, got %s", respBody)
+	}
+}
+
 func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{
@@ -4782,6 +5539,57 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 		if strings.Contains(respBody, forbidden) {
 			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
 		}
+	}
+}
+
+func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
+	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: 1, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"5:event": {
+				CalendarID:   5,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getetag/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/event.ics", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if strings.Contains(respBody, "<d:getetag>") {
+		t.Fatalf("expected denied object PROPFIND to hide getetag, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "404 Not Found") {
+		t.Fatalf("expected denied object PROPFIND to look like not found, got %s", respBody)
 	}
 }
 
@@ -5557,6 +6365,83 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 	}
 }
 
+func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPrivileges(t *testing.T) {
+	now := store.Now()
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				calendars: map[int64]*store.Calendar{
+					5: {ID: 5, UserID: 1, Name: "Source", UpdatedAt: now},
+					6: {ID: 6, UserID: 1, Name: "Destination", UpdatedAt: now},
+				},
+			}
+			eventRepo := &fakeEventRepo{
+				events: map[string]*store.Event{
+					"5:alice": {
+						CalendarID:   5,
+						UID:          "alice",
+						ResourceName: "alice",
+						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:alice\r\nSUMMARY:Alice\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-a",
+						LastModified: now,
+					},
+					"6:bob": {
+						CalendarID:   6,
+						UID:          "bob",
+						ResourceName: "renamed",
+						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bob\r\nSUMMARY:Bob\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						ETag:         "etag-b",
+						LastModified: now,
+					},
+				},
+			}
+			aclEntries := []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}
+			if method == "MOVE" {
+				aclEntries = append(aclEntries, store.ACLEntry{
+					ResourcePath:  "/dav/calendars/5",
+					PrincipalHref: "/dav/principals/2/",
+					IsGrant:       true,
+					Privilege:     "unbind",
+				})
+			}
+			h := &Handler{store: &store.Store{
+				Calendars:  calRepo,
+				Events:     eventRepo,
+				Locks:      &fakeLockRepo{},
+				ACLEntries: &fakeACLRepo{entries: aclEntries},
+			}}
+			user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+
+			req := httptest.NewRequest(method, "/dav/calendars/5/alice.ics", nil)
+			req.Header.Set("Destination", "https://example.com/dav/calendars/6/renamed.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("expected overwrite %s without rebinding privileges to be rejected, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			dest, _ := eventRepo.GetByResourceName(req.Context(), 6, "renamed")
+			if dest == nil || dest.UID != "bob" {
+				t.Fatalf("expected %s to preserve the existing destination event, got %#v", method, dest)
+			}
+			src, _ := eventRepo.GetByUID(req.Context(), 5, "alice")
+			if src == nil {
+				t.Fatalf("expected %s to preserve the source event on forbidden overwrite", method)
+			}
+		})
+	}
+}
+
 func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	now := store.Now()
@@ -5687,23 +6572,23 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	}
 
 	putReq := newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
-	putReq.Header.Set("If", "(<"+destToken+">)")
+	putReq.Header.Set("If", "(<"+srcToken+">)")
 	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
 	putRR := httptest.NewRecorder()
 	h.Put(putRR, putReq)
 
 	if putRR.Code != http.StatusNoContent {
-		t.Fatalf("expected destination lock token to remain valid after overwrite MOVE, got %d: %s", putRR.Code, putRR.Body.String())
+		t.Fatalf("expected source lock token to be rebound onto overwritten destination, got %d: %s", putRR.Code, putRR.Body.String())
 	}
 
 	putReq = newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated Again")))
-	putReq.Header.Set("If", "(<"+srcToken+">)")
+	putReq.Header.Set("If", "(<"+destToken+">)")
 	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), user))
 	putRR = httptest.NewRecorder()
 	h.Put(putRR, putReq)
 
 	if putRR.Code != http.StatusLocked {
-		t.Fatalf("expected source lock token not to be rebound onto overwritten destination, got %d: %s", putRR.Code, putRR.Body.String())
+		t.Fatalf("expected overwritten destination lock token to be cleared, got %d: %s", putRR.Code, putRR.Body.String())
 	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/renamed.vcf", nil)
@@ -5711,8 +6596,8 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	getRR := httptest.NewRecorder()
 	h.Get(getRR, getReq)
 
-	if getRR.Code != http.StatusOK {
-		t.Fatalf("expected overwrite MOVE to preserve destination ACL state, got %d: %s", getRR.Code, getRR.Body.String())
+	if getRR.Code != http.StatusNotFound {
+		t.Fatalf("expected overwrite MOVE to clear destination ACL state, got %d: %s", getRR.Code, getRR.Body.String())
 	}
 }
 
@@ -5872,7 +6757,7 @@ func TestDeleteContactRemovesResourceACLState(t *testing.T) {
 	}
 }
 
-func TestCopyContactOverwritePreservesDestinationDAVState(t *testing.T) {
+func TestCopyContactOverwriteClearsDestinationDAVState(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	now := store.Now()
@@ -5925,21 +6810,11 @@ func TestCopyContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	if copyRR.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite COPY to succeed, got %d: %s", copyRR.Code, copyRR.Body.String())
 	}
-	if _, ok := lockRepo.locks[destToken]; !ok {
-		t.Fatalf("expected overwrite COPY to preserve destination lock state, got %#v", lockRepo.locks)
+	if _, ok := lockRepo.locks[destToken]; ok {
+		t.Fatalf("expected overwrite COPY to clear destination lock state, got %#v", lockRepo.locks)
 	}
-	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/6/renamed"); len(entries) == 0 {
-		t.Fatalf("expected overwrite COPY to preserve destination ACL state, got %#v", entries)
-	}
-
-	putReq := newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
-	putReq.Header.Set("If", "(<"+destToken+">)")
-	putReq = putReq.WithContext(auth.WithUser(putReq.Context(), owner))
-	putRR := httptest.NewRecorder()
-	h.Put(putRR, putReq)
-
-	if putRR.Code != http.StatusNoContent {
-		t.Fatalf("expected overwrite COPY to leave destination lock token valid, got %d: %s", putRR.Code, putRR.Body.String())
+	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/6/renamed"); len(entries) != 0 {
+		t.Fatalf("expected overwrite COPY to clear destination ACL state, got %#v", entries)
 	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/renamed.vcf", nil)
@@ -5947,8 +6822,82 @@ func TestCopyContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	getRR := httptest.NewRecorder()
 	h.Get(getRR, getReq)
 
-	if getRR.Code != http.StatusOK {
-		t.Fatalf("expected overwrite COPY to preserve destination ACL access, got %d: %s", getRR.Code, getRR.Body.String())
+	if getRR.Code != http.StatusNotFound {
+		t.Fatalf("expected overwrite COPY to clear destination ACL access, got %d: %s", getRR.Code, getRR.Body.String())
+	}
+}
+
+func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Source", UpdatedAt: now}, Editor: true},
+			{Calendar: store.Calendar{ID: 6, UserID: owner.ID, Name: "Destination", UpdatedAt: now}, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Source", UpdatedAt: now},
+			6: {ID: 6, UserID: owner.ID, Name: "Destination", UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"5:alice": {CalendarID: 5, UID: "alice", ResourceName: "alice", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:alice\r\nSUMMARY:Alice\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-a", LastModified: now},
+			"6:bob":   {CalendarID: 6, UID: "bob", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bob\r\nSUMMARY:Bob\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-b", LastModified: now},
+		},
+	}
+	destToken := "opaquelocktoken:dest-calendar-lock"
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			destToken: {
+				Token:        destToken,
+				ResourcePath: "/dav/calendars/6/renamed",
+				UserID:       owner.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars:  calRepo,
+		Events:     eventRepo,
+		Locks:      lockRepo,
+		ACLEntries: aclRepo,
+	}}
+
+	copyReq := httptest.NewRequest("COPY", "/dav/calendars/5/alice.ics", nil)
+	copyReq.Header.Set("Destination", "https://example.com/dav/calendars/6/renamed.ics")
+	copyReq.Header.Set("Overwrite", "T")
+	copyReq.Header.Set("If", "</dav/calendars/6/renamed.ics> (<"+destToken+">)")
+	copyReq = copyReq.WithContext(auth.WithUser(copyReq.Context(), owner))
+	copyRR := httptest.NewRecorder()
+	h.Copy(copyRR, copyReq)
+
+	if copyRR.Code != http.StatusNoContent {
+		t.Fatalf("expected overwrite COPY to succeed, got %d: %s", copyRR.Code, copyRR.Body.String())
+	}
+	if _, ok := lockRepo.locks[destToken]; ok {
+		t.Fatalf("expected overwrite COPY to clear destination lock state, got %#v", lockRepo.locks)
+	}
+	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/calendars/6/renamed"); len(entries) != 0 {
+		t.Fatalf("expected overwrite COPY to clear destination ACL state, got %#v", entries)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/dav/calendars/6/renamed.ics", nil)
+	getReq = getReq.WithContext(auth.WithUser(getReq.Context(), delegate))
+	getRR := httptest.NewRecorder()
+	h.Get(getRR, getReq)
+
+	if getRR.Code != http.StatusNotFound {
+		t.Fatalf("expected overwrite COPY to clear destination ACL access, got %d: %s", getRR.Code, getRR.Body.String())
 	}
 }
 
@@ -6919,6 +7868,9 @@ func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID
 	if f.accessibleByUser != nil {
 		for _, c := range f.accessibleByUser[userID] {
 			if c.ID == calendarID {
+				if c.UserID == 0 && !c.Shared {
+					c.UserID = userID
+				}
 				copy := c
 				return &copy, nil
 			}
@@ -6927,6 +7879,9 @@ func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID
 	}
 	for _, c := range f.accessible {
 		if c.ID == calendarID {
+			if c.UserID == 0 && !c.Shared {
+				c.UserID = userID
+			}
 			copy := c
 			return &copy, nil
 		}
@@ -6948,6 +7903,24 @@ func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*sto
 }
 
 func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+	cal, ok := f.calendars[id]
+	if !ok || cal.UserID != userID {
+		return store.ErrNotFound
+	}
+	cal.Name = name
+	cal.Description = description
+	cal.Timezone = timezone
+	return nil
+}
+
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+	cal, ok := f.calendars[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	cal.Name = name
+	cal.Description = description
+	cal.Timezone = timezone
 	return nil
 }
 
@@ -7329,6 +8302,286 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 	}
 }
 
+func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected GET to succeed via collection ACL, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "UID:event") {
+		t.Fatalf("expected event body in GET response, got %s", rr.Body.String())
+	}
+}
+
+func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-acl"},
+		}},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected GET to succeed via collection ACL fallback, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "UID:event") {
+		t.Fatalf("expected event body in GET response, got %s", rr.Body.String())
+	}
+}
+
+func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected GET to succeed via object ACL, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			delegate.ID: {
+				{
+					Calendar:   store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"},
+					Shared:     true,
+					Editor:     false,
+					Privileges: store.CalendarPrivileges{Read: true, ReadFreeBusy: true},
+				},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+		}},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected GET to hide explicitly denied object, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "UID:event") {
+		t.Fatalf("expected denied GET not to expose event data, got %s", rr.Body.String())
+	}
+}
+
+func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 1, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", ResourceName: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		}},
+	}}
+
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected REPORT to succeed via collection ACL, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "event1.ics") {
+		t.Fatalf("expected REPORT to include event resource, got %s", rr.Body.String())
+	}
+}
+
+func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			owner.ID: {
+				{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: owner.ID, Name: "Work"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Original\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "old-etag",
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-acl"},
+		}},
+	}}
+
+	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
+	req.Header.Set("If-Match", `"old-etag"`)
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected PUT to succeed via collection ACL fallback, got %d: %s", rr.Code, rr.Body.String())
+	}
+	updated := eventRepo.events["2:event"]
+	if updated == nil || !strings.Contains(updated.RawICAL, "SUMMARY:Updated") {
+		t.Fatalf("expected event update to succeed, got %#v", updated)
+	}
+}
+
 func TestPutWithIfMatchFailure(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -7401,6 +8654,307 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 	if rr.Code != http.StatusPreconditionFailed {
 		t.Errorf("expected 412, got %d", rr.Code)
 	}
+}
+
+func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	t.Run("read-only grant cannot create event", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			}},
+		}}
+
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("expected read-only delegate PUT to be forbidden, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("bind grant can create event", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			}},
+		}}
+
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("expected bind grant to allow calendar PUT create, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("write-content grant can modify existing event", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}},
+		}}
+
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+		req.Header.Set("If-Match", `"old-etag"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected write-content grant to allow calendar PUT update, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("object-level write-content grant can modify existing event without collection access", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+			}},
+		}}
+
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+		req.Header.Set("If-Match", `"old-etag"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected object-level write-content grant to allow calendar PUT update, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("object-level write-content deny blocks existing event update despite collection grant", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				delegate.ID: {
+					{
+						Calendar:   store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"},
+						Shared:     true,
+						Editor:     true,
+						Privileges: store.CalendarPrivileges{Read: true, WriteContent: true},
+					},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
+			}},
+		}}
+
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+		req.Header.Set("If-Match", `"old-etag"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("expected object-level deny to block calendar PUT update, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("unbind grant can delete existing event", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+			}},
+		}}
+
+		req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("If-Match", `"current"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Delete(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected unbind grant to allow calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("object-level unbind grant can delete existing event without collection access", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				owner.ID: {
+					{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+			}},
+		}}
+
+		req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("If-Match", `"current"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Delete(rr, req)
+
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected object-level unbind grant to allow calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("object-level unbind deny blocks existing event delete despite collection grant", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			accessibleByUser: map[int64][]store.CalendarAccess{
+				delegate.ID: {
+					{
+						Calendar:   store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"},
+						Shared:     true,
+						Editor:     true,
+						Privileges: store.CalendarPrivileges{Read: true, Unbind: true},
+					},
+				},
+			},
+			calendars: map[int64]*store.Calendar{
+				2: {ID: 2, UserID: owner.ID, Name: "Work"},
+			},
+		}
+		eventRepo := &fakeEventRepo{
+			events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
+			},
+		}
+		h := &Handler{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
+				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"},
+			}},
+		}}
+
+		req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+		req.Header.Set("If-Match", `"current"`)
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Delete(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("expected object-level deny to block calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
 }
 
 func TestDeleteWithIfMatchSuccess(t *testing.T) {
@@ -7862,8 +9416,14 @@ func TestProppatchRejectsForbidden(t *testing.T) {
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Not Mine"}, Editor: false},
 		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 2, Name: "Not Mine"},
+		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -7887,6 +9447,54 @@ func TestProppatchRejectsForbidden(t *testing.T) {
 	respBody := rr.Body.String()
 	if !strings.Contains(respBody, "403 Forbidden") {
 		t.Errorf("expected 403 Forbidden for non-editor, got %s", respBody)
+	}
+}
+
+func TestProppatchSharedCalendarWritePropertiesGrantPersistsChange(t *testing.T) {
+	owner := &store.User{ID: 1}
+	delegate := &store.User{ID: 2}
+	description := "Before"
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: owner.ID, Name: "Shared", Description: &description},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Renamed Shared</D:displayname>
+      <C:calendar-description>Updated by delegate</C:calendar-description>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/5", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	updated, err := calRepo.GetByID(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("expected updated calendar")
+	}
+	if updated.Name != "Renamed Shared" {
+		t.Fatalf("expected shared PROPPATCH to persist display name, got %#v", updated)
+	}
+	if updated.Description == nil || *updated.Description != "Updated by delegate" {
+		t.Fatalf("expected shared PROPPATCH to persist description, got %#v", updated)
 	}
 }
 
@@ -7926,6 +9534,113 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 	}
 	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
 		t.Errorf("expected DTEND in freebusy, got %s", respBody)
+	}
+}
+
+func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
+	visibleStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	visibleEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+	hiddenStart := time.Date(2024, 6, 2, 12, 0, 0, 0, time.UTC)
+	hiddenEnd := time.Date(2024, 6, 2, 13, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 1, Name: "Shared"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:visible": {CalendarID: 1, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &visibleStart, DTEnd: &visibleEnd},
+			"1:hidden":  {CalendarID: 1, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nDTSTART:20240602T120000Z\r\nDTEND:20240602T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: &hiddenStart, DTEnd: &hiddenEnd},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
+		{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "FREEBUSY:20240601T100000Z/20240601T110000Z") {
+		t.Fatalf("expected visible busy slot, got %s", respBody)
+	}
+	if strings.Contains(respBody, "FREEBUSY:20240602T120000Z/20240602T130000Z") {
+		t.Fatalf("expected denied busy slot to be omitted, got %s", respBody)
+	}
+}
+
+func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessibleByUser: map[int64][]store.CalendarAccess{
+			delegate.ID: {
+				{
+					Calendar:   store.Calendar{ID: 1, UserID: 1, Name: "Shared"},
+					Shared:     true,
+					Editor:     false,
+					Privileges: store.CalendarPrivileges{Read: true},
+				},
+			},
+		},
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 1, Name: "Shared"},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {
+				CalendarID:   1,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "e1",
+				DTStart:      &start,
+				DTEnd:        &end,
+			},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
+	}}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), delegate))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected explicit read-free-busy deny to block REPORT, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

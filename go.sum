@@ -16,8 +16,8 @@ github.com/go-jose/go-jose/v4 v4.0.5 h1:M6T8+mKZl/+fNNuFHvGIzDz7BTLQPIounk/b9dw3
 github.com/go-jose/go-jose/v4 v4.0.5/go.mod h1:s3P1lRrkT8igV8D9OjyL4WRyHvjB6a4JSllnOrmmBOA=
 github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
 github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
-github.com/jw6ventures/jw6-go-utils v1.0.0 h1:E8AV0yO/ZeuApKQK+hH3HBBDFCXOB+bk7ZeDaM9wmXM=
-github.com/jw6ventures/jw6-go-utils v1.0.0/go.mod h1:L1weXUF300tFOhRG6TZaQKrWNG8LhYQhc0wqzAhTNg8=
+github.com/jw6ventures/jw6-go-utils v1.0.3 h1:G6QObEZGyrzt2WFXIa7jpKI+exHrys4tbb8YrmypQSk=
+github.com/jw6ventures/jw6-go-utils v1.0.3/go.mod h1:L1weXUF300tFOhRG6TZaQKrWNG8LhYQhc0wqzAhTNg8=
 github.com/kisielk/sqlstruct v0.0.0-20201105191214-5f3e10d3ab46/go.mod h1:yyMNCyc/Ib3bDTKd379tNMpB/7/H5TjM2Y9QJ5THLbE=
 github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
 github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=

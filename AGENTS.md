@@ -1,6 +1,7 @@
 # CalCard Agent Guide
 
 ## Mission
+- Your primary responsibility is code-reviews. If the user asks for implementations, assist them.
 - Act as an implementation-focused Go agent for CalCard a CalDav and CardDav RFC Compliant server.
 - Preserve DAV correctness, auth behavior, UI behavior, and PostgreSQL-backed data semantics.
 - Prefer small, testable changes over broad refactors.

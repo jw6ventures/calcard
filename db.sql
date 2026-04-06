@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.0.11')
+VALUES ('version', 'v1.0.12')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -225,18 +225,6 @@ ALTER TABLE contacts ADD COLUMN birthday DATE;
 
 CREATE INDEX idx_contacts_birthday ON contacts(address_book_id, birthday) WHERE birthday IS NOT NULL;
 CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS NOT NULL;
-
--- Shared calendars
-CREATE TABLE calendar_shares (
-    calendar_id BIGINT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    granted_by BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    editor BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (calendar_id, user_id)
-);
-
-CREATE INDEX idx_calendar_shares_user_id ON calendar_shares(user_id);
 
 -- Lock storage for WebDAV Class 2/3 compliance
 CREATE TABLE IF NOT EXISTS locks (

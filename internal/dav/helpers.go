@@ -3,6 +3,8 @@ package dav
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 // Shared helpers for building DAV responses.
@@ -42,6 +44,41 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 	p.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
 
 	if readOnly {
+		p.CalendarServerReadOnly = &struct{}{}
+	}
+
+	return resp
+}
+
+func calendarCollectionResponseWithPrivileges(href, name string, description, timezone *string, principalHref, syncToken, ctag string, privileges store.CalendarPrivileges) response {
+	privileges = privileges.Normalized()
+	resp := response{
+		Href:     href,
+		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, Calendar: &struct{}{}}, principalHref, true, false)},
+	}
+	p := &resp.Propstat[0].Prop
+	if syncToken != "" {
+		p.SyncToken = syncToken
+	}
+	if ctag != "" {
+		p.CTag = ctag
+	}
+	if description != nil && *description != "" {
+		p.CalendarDescription = *description
+	}
+	p.CalendarTimezone = calendarTimezoneValue(timezone)
+	p.SupportedCalendarComponentSet = supportedCalendarComponents()
+	p.SupportedCalendarData = supportedCalendarDataProp()
+	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
+	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSetForCalendar(privileges)
+
+	p.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.MinDateTime = caldavMinDateTime
+	p.MaxDateTime = caldavMaxDateTime
+	p.MaxInstances = fmt.Sprintf("%d", caldavMaxInstances)
+	p.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
+
+	if !privileges.AllowsAnyWrite() {
 		p.CalendarServerReadOnly = &struct{}{}
 	}
 
@@ -221,6 +258,33 @@ func calendarCurrentUserPrivilegeSet(readOnly bool) *currentUserPrivilegeSet {
 			privilege{Bind: &struct{}{}},
 			privilege{Unbind: &struct{}{}},
 		)
+	}
+	return &currentUserPrivilegeSet{Privileges: privs}
+}
+
+func calendarCurrentUserPrivilegeSetForCalendar(privileges store.CalendarPrivileges) *currentUserPrivilegeSet {
+	privileges = privileges.Normalized()
+	var privs []privilege
+	if privileges.Read {
+		privs = append(privs, privilege{Read: &readPrivilege{}})
+	}
+	if privileges.ReadFreeBusy {
+		privs = append(privs, privilege{ReadFreeBusy: &struct{}{}})
+	}
+	if privileges.Write {
+		privs = append(privs, privilege{Write: &struct{}{}})
+	}
+	if privileges.WriteContent {
+		privs = append(privs, privilege{WriteContent: &struct{}{}})
+	}
+	if privileges.WriteProperties {
+		privs = append(privs, privilege{WriteProperties: &struct{}{}})
+	}
+	if privileges.Bind {
+		privs = append(privs, privilege{Bind: &struct{}{}})
+	}
+	if privileges.Unbind {
+		privs = append(privs, privilege{Unbind: &struct{}{}})
 	}
 	return &currentUserPrivilegeSet{Privileges: privs}
 }

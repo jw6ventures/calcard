@@ -175,6 +175,8 @@ type fakeACLRepo struct {
 	entries              []store.ACLEntry
 	listByResourceErr    error
 	listByPrincipalErr   error
+	listByResourceCalls  int
+	listByPrincipalCalls int
 	moveResourcePathHook func(fromPath, toPath string)
 	moveResourcePathErr  error
 }
@@ -195,6 +197,7 @@ func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries [
 }
 
 func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	f.listByResourceCalls++
 	if f.listByResourceErr != nil {
 		return nil, f.listByResourceErr
 	}
@@ -208,6 +211,7 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 }
 
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
+	f.listByPrincipalCalls++
 	if f.listByPrincipalErr != nil {
 		return nil, f.listByPrincipalErr
 	}
@@ -244,6 +248,18 @@ func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 		if entry.ResourcePath != resourcePath {
 			filtered = append(filtered, entry)
 		}
+	}
+	f.entries = filtered
+	return nil
+}
+
+func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
+	filtered := f.entries[:0]
+	for _, entry := range f.entries {
+		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
+			continue
+		}
+		filtered = append(filtered, entry)
 	}
 	f.entries = filtered
 	return nil
