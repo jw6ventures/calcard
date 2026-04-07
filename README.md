@@ -1,4 +1,4 @@
-# CalCard 📅
+# CalCard - Community Edition 📅
 
 CalCard makes it easy to self-host and share calendars, reminders, and contacts.
 
@@ -127,6 +127,4 @@ Environment variables:
 
 ## License
 
-CalCard is licensed under the [Source First License](https://sourcefirst.com/).
-
-Commercial use requires a commercial agreement with JW6 Ventures LLC - [License Request Form](https://jw6ventures.atlassian.net/helpcenter/CSM/contact-us/9a6bbea8-202d-498f-8462-52c2ee8ab09e). Pricing is dependent on organization size, many small business qualify for $0/yr license costs. 
+CalCard Community Edition is licensed using the GNU Affero General Public License (AGPL).
