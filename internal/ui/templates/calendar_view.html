@@ -445,6 +445,7 @@
         {{end}}
     </div>
     <div style="display:flex; gap:0.5rem; align-items:center;">
+        <a class="btn btn-secondary" href="/calendars/{{.Calendar.ID}}/export">Export ICS</a>
         {{if .CalendarCapabilities.Bind}}
         <button class="btn btn-primary" onclick="showCreateEventModal()">+ New Event</button>
         {{end}}
@@ -1420,13 +1421,34 @@
     // Parse all base events
     var baseEvents = [];
     var events = [];
+
+    function parseServerDate(value) {
+        if (!value) return null;
+        var parsed = new Date(value);
+        return isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    function normalizeServerEvent(raw) {
+        var parsed = Object.assign({}, raw);
+        parsed.dtstart = parseServerDate(raw.dtstart);
+        parsed.dtend = parseServerDate(raw.dtend);
+        parsed.recurrenceId = parseServerDate(raw.recurrenceId);
+        parsed.exdates = (raw.exdates || []).map(parseServerDate).filter(Boolean);
+        parsed.overrides = (raw.overrides || []).map(normalizeServerEvent);
+        if (!parsed.dtstart && raw.ical) {
+            var fallback = parseICAL(raw.ical);
+            parsed = Object.assign(fallback, parsed);
+            parsed.dtstart = parsed.dtstart || fallback.dtstart;
+            parsed.dtend = parsed.dtend || fallback.dtend;
+            parsed.exdates = parsed.exdates.length ? parsed.exdates : (fallback.exdates || []);
+            parsed.overrides = parsed.overrides.length ? parsed.overrides : (fallback.overrides || []);
+        }
+        return parsed;
+    }
     
     function parseEvents(rawEventsData) {
         baseEvents = rawEventsData.map(function(raw) {
-            var parsed = parseICAL(raw.ical);
-            parsed.uid = raw.uid;
-            parsed.lastMod = raw.lastMod;
-            return parsed;
+            return normalizeServerEvent(raw);
         }).filter(function(e) { return e.dtstart; });
         
         // Keep base events for list view and modals

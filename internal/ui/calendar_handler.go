@@ -564,11 +564,7 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	// Build JSON response
 	var eventsJSONData []map[string]any
 	for _, ev := range relevantEvents {
-		eventsJSONData = append(eventsJSONData, map[string]any{
-			"uid":     ev.UID,
-			"ical":    ev.RawICAL,
-			"lastMod": ev.LastModified.Format(time.RFC3339),
-		})
+		eventsJSONData = append(eventsJSONData, calendarEventJSON(ev))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -656,14 +652,11 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 
 		color := calendarColor(cal.Calendar.Color, i)
 		for _, ev := range filterEventsForMonth(allEvents, monthStart, monthEnd) {
-			result = append(result, map[string]any{
-				"uid":           ev.UID,
-				"ical":          ev.RawICAL,
-				"lastMod":       ev.LastModified.Format(time.RFC3339),
-				"calendarId":    cal.ID,
-				"calendarName":  cal.Name,
-				"calendarColor": color,
-			})
+			payload := calendarEventJSON(ev)
+			payload["calendarId"] = cal.ID
+			payload["calendarName"] = cal.Name
+			payload["calendarColor"] = color
+			result = append(result, payload)
 		}
 	}
 
@@ -671,6 +664,136 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 	if err := json.NewEncoder(w).Encode(result); err != nil {
 		http.Error(w, "failed to encode events", http.StatusInternalServerError)
 	}
+}
+
+// ExportCalendar downloads the readable events in a calendar as an iCalendar file.
+func (h *Handler) ExportCalendar(w http.ResponseWriter, r *http.Request) {
+	calendarID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid calendar id", http.StatusBadRequest)
+		return
+	}
+
+	user, _ := auth.UserFromContext(r.Context())
+	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
+	if err != nil {
+		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
+		return
+	}
+	if cal == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarACLResourcePath(calendarID), "read"); err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	events, err := h.store.Events.ListForCalendar(r.Context(), calendarID)
+	if err != nil {
+		http.Error(w, "failed to load events", http.StatusInternalServerError)
+		return
+	}
+	events, err = h.filterReadableCalendarEvents(r.Context(), user, cal, events)
+	if err != nil {
+		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		return
+	}
+
+	filename := calendarExportFilename(cal.Name)
+	w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	_, _ = w.Write([]byte(buildCalendarExport(cal.Name, events)))
+}
+
+func calendarExportFilename(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		case r == '.' || r == '_':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	base := strings.Trim(b.String(), "-.")
+	if base == "" {
+		base = "calendar"
+	}
+	return base + ".ics"
+}
+
+func buildCalendarExport(name string, events []store.Event) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\n")
+	b.WriteString("VERSION:2.0\r\n")
+	b.WriteString("PRODID:-//CalCard//Calendar Export//EN\r\n")
+	b.WriteString("CALSCALE:GREGORIAN\r\n")
+	if name = strings.TrimSpace(name); name != "" {
+		b.WriteString("X-WR-CALNAME:")
+		b.WriteString(utils.EscapeICalValue(name))
+		b.WriteString("\r\n")
+	}
+
+	seenTimezones := make(map[string]struct{})
+	for _, event := range events {
+		for _, timezone := range rawICalComponents(event.RawICAL, "VTIMEZONE") {
+			if _, ok := seenTimezones[timezone]; ok {
+				continue
+			}
+			seenTimezones[timezone] = struct{}{}
+			b.WriteString(timezone)
+		}
+	}
+	for _, event := range events {
+		for _, component := range rawICalComponents(event.RawICAL, "VEVENT") {
+			b.WriteString(component)
+		}
+	}
+
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+func rawICalComponents(raw, componentName string) []string {
+	componentName = strings.ToUpper(componentName)
+	var components []string
+	var current []string
+	depth := 0
+
+	for _, line := range utils.UnfoldLines(raw) {
+		upperLine := strings.ToUpper(strings.TrimSpace(line))
+		if depth == 0 {
+			if upperLine == "BEGIN:"+componentName {
+				current = []string{line}
+				depth = 1
+			}
+			continue
+		}
+
+		current = append(current, line)
+		if strings.HasPrefix(upperLine, "BEGIN:") {
+			depth++
+			continue
+		}
+		if strings.HasPrefix(upperLine, "END:") {
+			depth--
+			if depth == 0 {
+				components = append(components, strings.Join(current, "\r\n")+"\r\n")
+				current = nil
+			}
+		}
+	}
+	return components
 }
 
 // ImportCalendar imports events from an ICS file into an existing calendar.
@@ -1176,9 +1299,10 @@ func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Tim
 	var relevant []store.Event
 	for _, ev := range allEvents {
 		hasRRule := strings.Contains(ev.RawICAL, "RRULE:")
+		startDate := eventMonthFilterStart(ev)
 
 		if hasRRule {
-			if ev.DTStart != nil && !ev.DTStart.After(monthEnd) {
+			if startDate != nil && !startDate.After(monthEnd) {
 				hasEnded := false
 				lines := utils.UnfoldLines(ev.RawICAL)
 				for _, line := range lines {
@@ -1204,15 +1328,626 @@ func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Tim
 				}
 			}
 		} else {
-			if ev.DTStart != nil {
-				evStart := time.Date(ev.DTStart.Year(), ev.DTStart.Month(), ev.DTStart.Day(), 0, 0, 0, 0, time.UTC)
-				if !evStart.Before(monthStart) && !evStart.After(monthEnd) {
-					relevant = append(relevant, ev)
-				}
+			endDate := eventMonthFilterEnd(ev, startDate)
+			if startDate != nil && endDate != nil && !startDate.After(monthEnd) && !endDate.Before(monthStart) {
+				relevant = append(relevant, ev)
 			}
 		}
 	}
 	return relevant
+}
+
+func eventMonthFilterStart(ev store.Event) *time.Time {
+	start, _ := rawICalMonthFilterRange(ev.RawICAL)
+	if start != nil {
+		return start
+	}
+	if ev.DTStart == nil {
+		return nil
+	}
+	normalized := time.Date(ev.DTStart.Year(), ev.DTStart.Month(), ev.DTStart.Day(), 0, 0, 0, 0, time.UTC)
+	return &normalized
+}
+
+func eventMonthFilterEnd(ev store.Event, start *time.Time) *time.Time {
+	_, end := rawICalMonthFilterRange(ev.RawICAL)
+	if end != nil {
+		if start != nil && end.Before(*start) {
+			return start
+		}
+		return end
+	}
+	if ev.DTEnd != nil {
+		normalized := time.Date(ev.DTEnd.Year(), ev.DTEnd.Month(), ev.DTEnd.Day(), 0, 0, 0, 0, time.UTC)
+		if start != nil && normalized.Before(*start) {
+			return start
+		}
+		return &normalized
+	}
+	return start
+}
+
+func rawICalMonthFilterRange(raw string) (*time.Time, *time.Time) {
+	inEvent := false
+	componentHasRecurrenceID := false
+	var startFallback, endFallback *time.Time
+
+	for _, line := range utils.UnfoldLines(raw) {
+		switch line {
+		case "BEGIN:VEVENT":
+			inEvent = true
+			componentHasRecurrenceID = false
+			continue
+		case "END:VEVENT":
+			inEvent = false
+			componentHasRecurrenceID = false
+			continue
+		}
+		if !inEvent {
+			continue
+		}
+
+		key, params, value, ok := parseICalProperty(line)
+		if !ok {
+			continue
+		}
+
+		switch key {
+		case "RECURRENCE-ID":
+			componentHasRecurrenceID = true
+		case "DTSTART":
+			start := rawICalCalendarDate(value, params, false)
+			if start == nil {
+				continue
+			}
+			if !componentHasRecurrenceID {
+				if endFallback != nil {
+					return start, endFallback
+				}
+				startFallback = start
+				continue
+			}
+			if startFallback == nil {
+				startFallback = start
+			}
+		case "DTEND":
+			end := rawICalCalendarDate(value, params, true)
+			if end == nil {
+				continue
+			}
+			if !componentHasRecurrenceID {
+				endFallback = end
+				if startFallback != nil {
+					return startFallback, endFallback
+				}
+				continue
+			}
+			if endFallback == nil {
+				endFallback = end
+			}
+		}
+	}
+
+	return startFallback, endFallback
+}
+
+func rawICalCalendarDate(value string, params map[string]string, isEnd bool) *time.Time {
+	value = strings.TrimSpace(value)
+	if len(value) < 8 {
+		return nil
+	}
+	datePart := value[:8]
+	parsed, err := time.Parse("20060102", datePart)
+	if err != nil {
+		return nil
+	}
+	start := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, time.UTC)
+	if isEnd && (strings.EqualFold(params["VALUE"], "DATE") || len(value) == 8) {
+		start = start.AddDate(0, 0, -1)
+	}
+	return &start
+}
+
+func calendarEventJSON(ev store.Event) map[string]any {
+	payload := map[string]any{
+		"uid":     ev.UID,
+		"ical":    ev.RawICAL,
+		"lastMod": ev.LastModified.Format(time.RFC3339),
+	}
+
+	parsed := parseCalendarEventMetadata(ev)
+	parsed.addToPayload(payload)
+	return payload
+}
+
+type calendarEventMetadata struct {
+	UID                string
+	Summary            string
+	Description        string
+	HTMLDescription    string
+	Location           string
+	DTStart            *time.Time
+	DTEnd              *time.Time
+	AllDay             bool
+	Timezone           string
+	Duration           string
+	RRule              string
+	RRuleParsed        map[string]string
+	Exdates            []time.Time
+	Status             string
+	Categories         []string
+	URL                string
+	Class              string
+	Transparency       string
+	Organizer          string
+	Attendees          []string
+	Attachments        []string
+	Reminders          []int
+	RecurrenceID       *time.Time
+	RecurrenceIDAllDay bool
+	Overrides          []calendarEventMetadata
+}
+
+func (m calendarEventMetadata) addToPayload(payload map[string]any) {
+	if m.UID != "" {
+		payload["uid"] = m.UID
+	}
+	if m.Summary != "" {
+		payload["summary"] = m.Summary
+	}
+	if m.Description != "" {
+		payload["description"] = m.Description
+	}
+	if m.HTMLDescription != "" {
+		payload["htmlDescription"] = m.HTMLDescription
+	}
+	if m.Location != "" {
+		payload["location"] = m.Location
+	}
+	if m.DTStart != nil {
+		payload["dtstart"] = m.DTStart.Format(time.RFC3339)
+	}
+	if m.DTEnd != nil {
+		payload["dtend"] = m.DTEnd.Format(time.RFC3339)
+	}
+	payload["allDay"] = m.AllDay
+	if m.Timezone != "" {
+		payload["timezone"] = m.Timezone
+	}
+	if m.Duration != "" {
+		payload["duration"] = m.Duration
+	}
+	if m.RRule != "" {
+		payload["rrule"] = m.RRule
+	}
+	if len(m.RRuleParsed) > 0 {
+		payload["rruleParsed"] = m.RRuleParsed
+	}
+	if len(m.Exdates) > 0 {
+		payload["exdates"] = formatCalendarEventTimes(m.Exdates)
+	}
+	if m.Status != "" {
+		payload["status"] = m.Status
+	}
+	if len(m.Categories) > 0 {
+		payload["categories"] = m.Categories
+	}
+	if m.URL != "" {
+		payload["url"] = m.URL
+	}
+	if m.Class != "" {
+		payload["class"] = m.Class
+	}
+	if m.Transparency != "" {
+		payload["transp"] = m.Transparency
+	}
+	if m.Organizer != "" {
+		payload["organizer"] = m.Organizer
+	}
+	if len(m.Attendees) > 0 {
+		payload["attendees"] = m.Attendees
+	}
+	if len(m.Attachments) > 0 {
+		payload["attachments"] = m.Attachments
+	}
+	if len(m.Reminders) > 0 {
+		payload["reminders"] = m.Reminders
+	}
+	if m.RecurrenceID != nil {
+		payload["recurrenceId"] = m.RecurrenceID.Format(time.RFC3339)
+		payload["recurrenceIdAllDay"] = m.RecurrenceIDAllDay
+	}
+	if len(m.Overrides) > 0 {
+		overrides := make([]map[string]any, 0, len(m.Overrides))
+		for _, override := range m.Overrides {
+			overridePayload := make(map[string]any)
+			override.addToPayload(overridePayload)
+			overrides = append(overrides, overridePayload)
+		}
+		payload["overrides"] = overrides
+	}
+}
+
+func parseCalendarEventMetadata(ev store.Event) calendarEventMetadata {
+	components := parseCalendarEventComponents(ev.RawICAL)
+	var master *calendarEventMetadata
+	var overrides []calendarEventMetadata
+
+	for i := range components {
+		component := components[i]
+		if component.UID == "" {
+			component.UID = ev.UID
+		}
+		if component.RecurrenceID != nil {
+			overrides = append(overrides, component)
+			continue
+		}
+		if master == nil {
+			master = &component
+		}
+	}
+	if master == nil {
+		if len(components) > 0 {
+			component := components[0]
+			master = &component
+		} else {
+			master = &calendarEventMetadata{}
+		}
+	}
+
+	if master.UID == "" {
+		master.UID = ev.UID
+	}
+	if ev.Summary != nil && master.Summary == "" {
+		master.Summary = *ev.Summary
+	}
+	if ev.DTStart != nil {
+		master.DTStart = ev.DTStart
+	}
+	if ev.DTEnd != nil {
+		master.DTEnd = ev.DTEnd
+	}
+	master.AllDay = ev.AllDay
+	master.Overrides = overrides
+	return *master
+}
+
+func parseCalendarEventComponents(raw string) []calendarEventMetadata {
+	var components []calendarEventMetadata
+	var current []string
+	inEvent := false
+
+	for _, line := range utils.UnfoldLines(raw) {
+		switch {
+		case strings.EqualFold(line, "BEGIN:VEVENT"):
+			inEvent = true
+			current = nil
+		case strings.EqualFold(line, "END:VEVENT"):
+			if inEvent {
+				components = append(components, parseCalendarEventComponent(current))
+			}
+			inEvent = false
+			current = nil
+		case inEvent:
+			current = append(current, line)
+		}
+	}
+
+	return components
+}
+
+func parseCalendarEventComponent(lines []string) calendarEventMetadata {
+	var event calendarEventMetadata
+	inAlarm := false
+
+	for _, line := range lines {
+		key, params, value, ok := parseICalProperty(line)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "BEGIN":
+			if strings.EqualFold(value, "VALARM") {
+				inAlarm = true
+			}
+			continue
+		case "END":
+			if strings.EqualFold(value, "VALARM") {
+				inAlarm = false
+			}
+			continue
+		}
+
+		if inAlarm {
+			if key == "TRIGGER" {
+				if minutes, ok := parseTriggerMinutes(value); ok {
+					event.Reminders = append(event.Reminders, minutes)
+				}
+			}
+			continue
+		}
+
+		switch key {
+		case "UID":
+			event.UID = value
+		case "SUMMARY":
+			event.Summary = unescapeICalText(value)
+		case "DESCRIPTION":
+			event.Description = unescapeICalText(value)
+		case "RECURRENCE-ID":
+			if t, allDay := parseCalendarEventDate(value, params); t != nil {
+				event.RecurrenceID = t
+				event.RecurrenceIDAllDay = allDay
+			}
+		case "X-ALT-DESC":
+			if strings.EqualFold(params["FMTTYPE"], "text/html") {
+				event.HTMLDescription = value
+			}
+		case "LOCATION":
+			event.Location = unescapeICalText(value)
+		case "DTSTART":
+			if t, allDay := parseCalendarEventDate(value, params); t != nil {
+				event.DTStart = t
+				event.AllDay = allDay
+			}
+			if tzid := params["TZID"]; tzid != "" {
+				event.Timezone = tzid
+			}
+		case "DTEND":
+			if t, _ := parseCalendarEventDate(value, params); t != nil {
+				event.DTEnd = t
+			}
+			if event.Timezone == "" {
+				event.Timezone = params["TZID"]
+			}
+		case "DURATION":
+			event.Duration = value
+		case "RRULE":
+			event.RRule = value
+			event.RRuleParsed = parseRRuleParts(value)
+		case "EXDATE":
+			event.Exdates = append(event.Exdates, parseCalendarEventDateList(value, params)...)
+		case "STATUS":
+			event.Status = value
+		case "CATEGORIES":
+			event.Categories = splitICalTextList(value)
+		case "URL":
+			event.URL = value
+		case "CLASS":
+			event.Class = value
+		case "TRANSP":
+			event.Transparency = value
+		case "ORGANIZER":
+			event.Organizer = formatICalEmailValue(value, params)
+		case "ATTENDEE":
+			event.Attendees = append(event.Attendees, formatICalEmailValue(value, params))
+		case "ATTACH":
+			event.Attachments = append(event.Attachments, value)
+		}
+	}
+
+	return event
+}
+
+func parseICalProperty(line string) (string, map[string]string, string, bool) {
+	colonIdx := strings.Index(line, ":")
+	if colonIdx == -1 {
+		return "", nil, "", false
+	}
+
+	keyPart := line[:colonIdx]
+	value := line[colonIdx+1:]
+	keyParts := splitICalParameterParts(keyPart)
+	key := strings.ToUpper(strings.TrimSpace(keyParts[0]))
+	params := make(map[string]string)
+	for _, part := range keyParts[1:] {
+		name, val, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		params[strings.ToUpper(strings.TrimSpace(name))] = strings.Trim(strings.TrimSpace(val), `"`)
+	}
+	return key, params, value, key != ""
+}
+
+func splitICalParameterParts(value string) []string {
+	var parts []string
+	var current strings.Builder
+	inQuote := false
+	for _, r := range value {
+		switch r {
+		case '"':
+			inQuote = !inQuote
+			current.WriteRune(r)
+		case ';':
+			if inQuote {
+				current.WriteRune(r)
+				continue
+			}
+			parts = append(parts, current.String())
+			current.Reset()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	parts = append(parts, current.String())
+	return parts
+}
+
+func parseCalendarEventDateList(value string, params map[string]string) []time.Time {
+	values := strings.Split(value, ",")
+	dates := make([]time.Time, 0, len(values))
+	for _, v := range values {
+		if t, _ := parseCalendarEventDate(v, params); t != nil {
+			dates = append(dates, *t)
+		}
+	}
+	return dates
+}
+
+func parseCalendarEventDate(value string, params map[string]string) (*time.Time, bool) {
+	value = strings.TrimSpace(value)
+	allDay := strings.EqualFold(params["VALUE"], "DATE") || (len(value) == 8 && !strings.Contains(value, "T"))
+	if allDay {
+		if len(value) < 8 {
+			return nil, false
+		}
+		t, err := time.Parse("20060102", value[:8])
+		if err != nil {
+			return nil, false
+		}
+		return &t, true
+	}
+
+	for _, layout := range []string{"20060102T150405Z", "20060102T150405-0700", "20060102T150405-07:00"} {
+		if t, err := time.Parse(layout, value); err == nil {
+			utc := t.UTC()
+			return &utc, false
+		}
+	}
+
+	tzid := params["TZID"]
+	loc := time.UTC
+	if tzid != "" {
+		if loaded, err := loadCalendarEventLocation(tzid); err == nil {
+			loc = loaded
+		}
+	}
+	if t, err := time.ParseInLocation("20060102T150405", strings.TrimSuffix(value, "Z"), loc); err == nil {
+		utc := t.UTC()
+		return &utc, false
+	}
+
+	return nil, false
+}
+
+func loadCalendarEventLocation(tzid string) (*time.Location, error) {
+	switch tzid {
+	case "US/Central":
+		tzid = "America/Chicago"
+	case "US/Eastern":
+		tzid = "America/New_York"
+	case "US/Mountain":
+		tzid = "America/Denver"
+	case "US/Pacific":
+		tzid = "America/Los_Angeles"
+	}
+	return time.LoadLocation(tzid)
+}
+
+func parseRRuleParts(value string) map[string]string {
+	parts := make(map[string]string)
+	for _, part := range strings.Split(value, ";") {
+		key, val, ok := strings.Cut(part, "=")
+		if ok {
+			parts[strings.ToUpper(strings.TrimSpace(key))] = strings.TrimSpace(val)
+		}
+	}
+	return parts
+}
+
+func parseTriggerMinutes(value string) (int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if value[0] == '+' {
+		return 0, false
+	}
+	if value[0] == '-' {
+		value = value[1:]
+	}
+	if !strings.HasPrefix(value, "P") {
+		return 0, false
+	}
+
+	days, hours, minutes, seconds := 0, 0, 0, 0
+	timePart := false
+	var digits strings.Builder
+	flush := func(unit rune) bool {
+		if digits.Len() == 0 {
+			return false
+		}
+		n, err := strconv.Atoi(digits.String())
+		if err != nil {
+			return false
+		}
+		digits.Reset()
+		switch unit {
+		case 'D':
+			days = n
+		case 'H':
+			hours = n
+		case 'M':
+			if timePart {
+				minutes = n
+			}
+		case 'S':
+			seconds = n
+		}
+		return true
+	}
+
+	for _, r := range value[1:] {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == 'T':
+			timePart = true
+		case r == 'D' || r == 'H' || r == 'M' || r == 'S':
+			if !flush(r) {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+	}
+
+	return days*1440 + hours*60 + minutes + (seconds+30)/60, true
+}
+
+func unescapeICalText(value string) string {
+	value = strings.ReplaceAll(value, "\\n", "\n")
+	value = strings.ReplaceAll(value, "\\N", "\n")
+	value = strings.ReplaceAll(value, "\\,", ",")
+	value = strings.ReplaceAll(value, "\\;", ";")
+	value = strings.ReplaceAll(value, "\\\\", "\\")
+	return value
+}
+
+func splitICalTextList(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(unescapeICalText(part))
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func formatICalEmailValue(value string, params map[string]string) string {
+	email := strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(email), "mailto:") {
+		email = email[7:]
+	}
+	name := params["CN"]
+	if email == "" {
+		return ""
+	}
+	if name == "" {
+		return email
+	}
+	return fmt.Sprintf("%s <%s>", name, email)
+}
+
+func formatCalendarEventTimes(times []time.Time) []string {
+	formatted := make([]string, 0, len(times))
+	for _, t := range times {
+		formatted = append(formatted, t.Format(time.RFC3339))
+	}
+	return formatted
 }
 
 // validateEventDates validates that the date strings are parseable and end is after start

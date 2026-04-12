@@ -1210,6 +1210,286 @@ func TestCalendarEventJSONHidesDeniedEvents(t *testing.T) {
 	}
 }
 
+func TestExportCalendarDownloadsReadableEventsAsICS(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work Calendar"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {
+				CalendarID:   1,
+				UID:          "event-1",
+				ResourceName: "event-1",
+				RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Import//EN\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\n" +
+					"BEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Planning\r\nDTSTART;TZID=America/Chicago:20260401T090000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			},
+			"1:event-2": {
+				CalendarID:   1,
+				UID:          "event-2",
+				ResourceName: "event-2",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-2\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ExportCalendar(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ExportCalendar() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Content-Type"); got != "text/calendar; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want text/calendar; charset=utf-8", got)
+	}
+	if got := w.Header().Get("Content-Disposition"); got != `attachment; filename="work-calendar.ics"` {
+		t.Fatalf("Content-Disposition = %q, want export filename", got)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"BEGIN:VCALENDAR\r\n",
+		"PRODID:-//CalCard//Calendar Export//EN\r\n",
+		"X-WR-CALNAME:Work Calendar\r\n",
+		"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\n",
+		"BEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Planning\r\nDTSTART;TZID=America/Chicago:20260401T090000\r\nEND:VEVENT\r\n",
+		"BEGIN:VEVENT\r\nUID:event-2\r\nSUMMARY:Review\r\nEND:VEVENT\r\n",
+		"END:VCALENDAR\r\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected export to contain %q, got %s", want, body)
+		}
+	}
+	if strings.Count(body, "BEGIN:VCALENDAR") != 1 {
+		t.Fatalf("expected one VCALENDAR wrapper, got %s", body)
+	}
+}
+
+func TestExportCalendarHidesDeniedEvents(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: false},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:visible": {CalendarID: 1, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nSUMMARY:Visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
+			"1:hidden":  {CalendarID: 1, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nSUMMARY:Hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
+		}},
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ExportCalendar(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ExportCalendar() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "UID:visible") {
+		t.Fatalf("expected export to contain visible event, got %s", body)
+	}
+	if strings.Contains(body, "UID:hidden") || strings.Contains(body, "SUMMARY:Hidden") {
+		t.Fatalf("expected export to omit denied event, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONIncludesImportedTimezoneEventForSourceMonth(t *testing.T) {
+	storedStart := time.Date(2026, 4, 1, 4, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:imported": {
+				CalendarID:   1,
+				UID:          "imported",
+				ResourceName: "imported",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:imported\r\nSUMMARY:Late Night Import\r\n" +
+					"DTSTART;TZID=America/Chicago:20260331T230000\r\nDTEND;TZID=America/Chicago:20260401T000000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart: &storedStart,
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"uid":"imported"`) {
+		t.Fatalf("expected imported timezone event in March JSON response, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONIncludesCrossMonthEventForEndMonth(t *testing.T) {
+	start := time.Date(2026, 3, 31, 23, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 1, 1, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Test"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:cross-month": {
+				CalendarID:   1,
+				UID:          "cross-month",
+				ResourceName: "cross-month",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:cross-month\r\nSUMMARY:Cross Month\r\n" +
+					"DTSTART:20260331T230000Z\r\nDTEND:20260401T010000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart: &start,
+				DTEnd:   &end,
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"uid":"cross-month"`) {
+		t.Fatalf("expected cross-month event in April JSON response, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONIncludesServerDateFields(t *testing.T) {
+	start := time.Date(2026, 3, 28, 17, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 3, 28, 18, 0, 0, 0, time.UTC)
+	summary := "Imported Event"
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Test"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:imported": {
+				CalendarID:   1,
+				UID:          "imported",
+				ResourceName: "imported",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:imported\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				Summary:      &summary,
+				DTStart:      &start,
+				DTEnd:        &end,
+				AllDay:       false,
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"dtstart":"2026-03-28T17:00:00Z"`) {
+		t.Fatalf("expected dtstart in JSON response, got %s", body)
+	}
+	if !strings.Contains(body, `"dtend":"2026-03-28T18:00:00Z"`) {
+		t.Fatalf("expected dtend in JSON response, got %s", body)
+	}
+	if !strings.Contains(body, `"summary":"Imported Event"`) {
+		t.Fatalf("expected summary in JSON response, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONIncludesParsedICalMetadata(t *testing.T) {
+	start := time.Date(2026, 3, 28, 17, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 3, 28, 18, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Test"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:imported": {
+				CalendarID:   1,
+				UID:          "imported",
+				ResourceName: "imported",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:imported\r\nSUMMARY:Imported Metadata\r\n" +
+					"DESCRIPTION:Line\\nTwo\r\nLOCATION:Room 1\r\nDTSTART;TZID=US/Central:20260328T120000\r\nDTEND;TZID=US/Central:20260328T130000\r\n" +
+					"RRULE:FREQ=WEEKLY;COUNT=2\r\nEXDATE;TZID=US/Central:20260404T120000\r\nSTATUS:CONFIRMED\r\nCLASS:PRIVATE\r\nTRANSP:OPAQUE\r\n" +
+					"CATEGORIES:Team,Planning\r\nORGANIZER;CN=Alice Example:mailto:alice@example.com\r\nATTENDEE;CN=Bob Example:mailto:bob@example.com\r\n" +
+					"ATTACH:https://example.com/agenda.pdf\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\n" +
+					"BEGIN:VEVENT\r\nUID:imported\r\nRECURRENCE-ID;TZID=US/Central:20260411T120000\r\nSUMMARY:Override\r\nDTSTART;TZID=US/Central:20260411T123000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart: &start,
+				DTEnd:   &end,
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`"summary":"Imported Metadata"`,
+		`"description":"Line\nTwo"`,
+		`"location":"Room 1"`,
+		`"timezone":"US/Central"`,
+		`"rrule":"FREQ=WEEKLY;COUNT=2"`,
+		`"COUNT":"2"`,
+		`"FREQ":"WEEKLY"`,
+		`"exdates":["2026-04-04T17:00:00Z"]`,
+		`"status":"CONFIRMED"`,
+		`"class":"PRIVATE"`,
+		`"transp":"OPAQUE"`,
+		`"categories":["Team","Planning"]`,
+		`"organizer":"Alice Example \u003calice@example.com\u003e"`,
+		`"attendees":["Bob Example \u003cbob@example.com\u003e"]`,
+		`"attachments":["https://example.com/agenda.pdf"]`,
+		`"reminders":[15]`,
+		`"overrides":[`,
+		`"recurrenceId":"2026-04-11T17:00:00Z"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected JSON to contain %s, got %s", want, body)
+		}
+	}
+}
+
 func TestAllCalendarEventsJSONHidesDeniedEvents(t *testing.T) {
 	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
 
