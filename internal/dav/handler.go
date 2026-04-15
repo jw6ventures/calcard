@@ -102,11 +102,12 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := multistatus{
-		XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:   "DAV:",
-		XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-		Response: responses,
+		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+		XmlnsD:    "DAV:",
+		XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+		XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+		XmlnsICAL: "http://apple.com/ns/ical/",
+		Response:  responses,
 	}
 	writeMultiStatus(w, payload)
 }
@@ -150,21 +151,53 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 	var name *string
 	var description *string
 	var timezone *string
+	var color *string
+	colorChanged := false
 
 	if req.Set != nil {
 		name = req.Set.Prop.DisplayName
 		description = req.Set.Prop.CalendarDescription
 		timezone = req.Set.Prop.CalendarTimezone
+		if req.Set.Prop.CalendarColor != nil {
+			colorChanged = true
+			color, err = store.NormalizeCalendarColor(*req.Set.Prop.CalendarColor)
+			if err != nil {
+				return []response{{
+					Href: cleanPath,
+					Propstat: []propstat{{
+						Prop:   prop{CalendarColor: req.Set.Prop.CalendarColor},
+						Status: httpStatusForbidden,
+					}},
+				}}, nil
+			}
+		}
+	}
+	if req.Remove != nil && req.Remove.Prop.CalendarColor != nil {
+		colorChanged = true
+		color = nil
 	}
 
-	if name != nil || description != nil || timezone != nil {
+	if name != nil || description != nil || timezone != nil || colorChanged {
 		// Use existing name if not being updated
 		updateName := calAccess.Name
 		if name != nil {
 			updateName = *name
 		}
 
-		err := h.store.Calendars.UpdateProperties(ctx, calID, updateName, description, timezone)
+		updateDescription := description
+		if updateDescription == nil {
+			updateDescription = calAccess.Description
+		}
+		updateTimezone := timezone
+		if updateTimezone == nil {
+			updateTimezone = calAccess.Timezone
+		}
+		updateColor := color
+		if !colorChanged {
+			updateColor = calAccess.Color
+		}
+
+		err := h.store.Calendars.UpdateProperties(ctx, calID, updateName, updateDescription, updateTimezone, updateColor)
 		if err != nil {
 			log.Printf("failed to update calendar properties for calendar %d: %v", calID, err)
 			return []response{{
@@ -187,6 +220,12 @@ func (h *Handler) proppatchCalendar(ctx context.Context, user *store.User, clean
 	}
 	if timezone != nil {
 		successProp.CalendarTimezone = timezone
+	}
+	if colorChanged {
+		successProp.CalendarColor = color
+		if successProp.CalendarColor == nil {
+			successProp.CalendarColor = stringPtr("")
+		}
 	}
 
 	return []response{{
@@ -456,6 +495,7 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	name := pathName
 	var description *string
 	var timezone *string
+	var color *string
 	if mkReq.Set != nil {
 		if mkReq.Set.Prop.DisplayName != nil {
 			trimmed := strings.TrimSpace(*mkReq.Set.Prop.DisplayName)
@@ -465,6 +505,13 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		description = mkReq.Set.Prop.CalendarDescription
 		timezone = mkReq.Set.Prop.CalendarTimezone
+		if mkReq.Set.Prop.CalendarColor != nil {
+			color, err = store.NormalizeCalendarColor(*mkReq.Set.Prop.CalendarColor)
+			if err != nil {
+				http.Error(w, "invalid calendar color", http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	cals, err := h.store.Calendars.ListAccessible(r.Context(), user.ID)
@@ -497,6 +544,7 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 		Slug:        &slug,
 		Description: description,
 		Timezone:    timezone,
+		Color:       color,
 	})
 	if err != nil {
 		var pqErr *pq.Error
@@ -1707,14 +1755,14 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 			birthdayDesc := "Contact birthdays from your address books"
 			// Use stable sync-token (epoch) for birthday calendar to ensure consistency
 			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
-			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, principalHref, birthdayToken, "0", true))
+			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, nil, principalHref, birthdayToken, "0", true))
 
 			// Add regular calendars
 			for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := fmt.Sprintf("%d", c.CTag)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, principalHref, syncToken, ctag, c.EffectivePrivileges()))
+				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges()))
 			}
 		}
 		return res, nil
@@ -1732,7 +1780,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 		// Use stable sync-token (epoch) for birthday calendar to ensure consistency
 		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 		principalHref := h.principalURL(user)
-		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true)}
+		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true)}
 
 		if depth == "1" {
 			events, err := h.generateBirthdayEvents(ctx, user.ID)
@@ -1789,7 +1837,7 @@ func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string
 	ctag := fmt.Sprintf("%d", cal.CTag)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
-	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
+	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
 	if depth == "1" {
 		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 		if err != nil {
@@ -2996,7 +3044,7 @@ func (h *Handler) calendarSyncCollection(ctx context.Context, user *store.User, 
 	}
 
 	responses := []response{
-		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), cal.EffectivePrivileges()),
+		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), cal.EffectivePrivileges()),
 	}
 	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 
@@ -3230,7 +3278,7 @@ func (h *Handler) birthdayCalendarReportResponses(ctx context.Context, user *sto
 		birthdayDesc := "Contact birthdays from your address books"
 		calData := reportCalendarData(report)
 		responses := []response{
-			calendarCollectionResponse(collectionHref, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true),
+			calendarCollectionResponse(collectionHref, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true),
 		}
 		responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 		return responses, syncToken, nil

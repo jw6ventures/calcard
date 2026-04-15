@@ -61,7 +61,7 @@ func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
 
 func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
 	resp := calendarCollectionResponse(
-		"/dav/calendars/1/", "Test Calendar", nil, nil,
+		"/dav/calendars/1/", "Test Calendar", nil, nil, nil,
 		"/dav/principals/user@example.com/", "sync-token", "1", false,
 	)
 
@@ -81,7 +81,7 @@ func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
 
 func TestCalendarCollectionResponse_ReadOnlyHasFlag(t *testing.T) {
 	resp := calendarCollectionResponse(
-		"/dav/calendars/-1/", "Birthdays", nil, nil,
+		"/dav/calendars/-1/", "Birthdays", nil, nil, nil,
 		"/dav/principals/user@example.com/", "sync-token", "0", true,
 	)
 

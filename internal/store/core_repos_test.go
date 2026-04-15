@@ -45,10 +45,10 @@ func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
 		t.Fatalf("Create() = %#v", created)
 	}
 
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4 AND user_id=$5`)).
-		WithArgs("Renamed", &description, &timezone, int64(10), int64(4)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5 AND user_id=$6`)).
+		WithArgs("Renamed", &description, &timezone, &color, int64(10), int64(4)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	if err := repo.Update(context.Background(), 4, 10, "Renamed", &description, &timezone); err != nil {
+	if err := repo.Update(context.Background(), 4, 10, "Renamed", &description, &timezone, &color); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
@@ -68,6 +68,24 @@ func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestNormalizeCalendarColorOpaqueAddsAlpha(t *testing.T) {
+	got, err := NormalizeCalendarColorOpaque(" #22cc88 ")
+	if err != nil {
+		t.Fatalf("NormalizeCalendarColorOpaque() error = %v", err)
+	}
+	if got == nil || *got != "#22CC88FF" {
+		t.Fatalf("NormalizeCalendarColorOpaque() = %v, want #22CC88FF", got)
+	}
+
+	got, err = NormalizeCalendarColorOpaque("#33669980")
+	if err != nil {
+		t.Fatalf("NormalizeCalendarColorOpaque() error = %v", err)
+	}
+	if got == nil || *got != "#33669980" {
+		t.Fatalf("NormalizeCalendarColorOpaque() = %v, want #33669980", got)
 	}
 }
 

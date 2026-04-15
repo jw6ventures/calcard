@@ -16,7 +16,7 @@ func collectionResponse(href, name string) response {
 	}
 }
 
-func calendarCollectionResponse(href, name string, description, timezone *string, principalHref, syncToken, ctag string, readOnly bool) response {
+func calendarCollectionResponse(href, name string, description, timezone, color *string, principalHref, syncToken, ctag string, readOnly bool) response {
 	resp := response{
 		Href:     href,
 		Propstat: []propstat{statusOKPropWithExtras(name, resourceType{Collection: &struct{}{}, Calendar: &struct{}{}}, principalHref, true, false)},
@@ -30,6 +30,9 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 	}
 	if description != nil && *description != "" {
 		p.CalendarDescription = *description
+	}
+	if color != nil && *color != "" {
+		p.CalendarColor = color
 	}
 	p.CalendarTimezone = calendarTimezoneValue(timezone)
 	p.SupportedCalendarComponentSet = supportedCalendarComponents()
@@ -50,7 +53,7 @@ func calendarCollectionResponse(href, name string, description, timezone *string
 	return resp
 }
 
-func calendarCollectionResponseWithPrivileges(href, name string, description, timezone *string, principalHref, syncToken, ctag string, privileges store.CalendarPrivileges) response {
+func calendarCollectionResponseWithPrivileges(href, name string, description, timezone, color *string, principalHref, syncToken, ctag string, privileges store.CalendarPrivileges) response {
 	privileges = privileges.Normalized()
 	resp := response{
 		Href:     href,
@@ -65,6 +68,9 @@ func calendarCollectionResponseWithPrivileges(href, name string, description, ti
 	}
 	if description != nil && *description != "" {
 		p.CalendarDescription = *description
+	}
+	if color != nil && *color != "" {
+		p.CalendarColor = color
 	}
 	p.CalendarTimezone = calendarTimezoneValue(timezone)
 	p.SupportedCalendarComponentSet = supportedCalendarComponents()

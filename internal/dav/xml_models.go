@@ -15,6 +15,7 @@ type multistatus struct {
 	XmlnsC    string     `xml:"xmlns:cal,attr"`
 	XmlnsA    string     `xml:"xmlns:card,attr"`
 	XmlnsCS   string     `xml:"xmlns:cs,attr,omitempty"`
+	XmlnsICAL string     `xml:"xmlns:ical,attr,omitempty"`
 	SyncToken string     `xml:"d:sync-token,omitempty"`
 	Response  []response `xml:"d:response"`
 }
@@ -45,6 +46,7 @@ type prop struct {
 	AddressData                   cdataString                    `xml:"card:address-data,omitempty"`
 	CalendarDescription           string                         `xml:"cal:calendar-description,omitempty"`
 	CalendarTimezone              *string                        `xml:"cal:calendar-timezone,omitempty"`
+	CalendarColor                 *string                        `xml:"ical:calendar-color,omitempty"`
 	AddressBookDesc               string                         `xml:"card:addressbook-description,omitempty"`
 	SupportedAddressData          *supportedAddressData          `xml:"card:supported-address-data,omitempty"`
 	AddressBookMaxResourceSize    string                         `xml:"card:max-resource-size,omitempty"`
@@ -160,6 +162,7 @@ type propfindPropQuery struct {
 	AddressData                   *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 	CalendarDescription           *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
 	CalendarTimezone              *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
+	CalendarColor                 *struct{}         `xml:"http://apple.com/ns/ical/ calendar-color"`
 	AddressBookDesc               *struct{}         `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
 	SupportedAddressData          *struct{}         `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
 	AddressBookMaxResourceSize    *struct{}         `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`
@@ -272,6 +275,7 @@ type proppatchProp struct {
 	ResourceType               *resourceType          `xml:"DAV: resourcetype"`
 	CalendarDescription        *string                `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
 	CalendarTimezone           *string                `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
+	CalendarColor              *string                `xml:"http://apple.com/ns/ical/ calendar-color"`
 	AddressBookDesc            *string                `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
 	SupportedAddressData       *supportedAddressData  `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
 	AddressBookMaxResourceSize *string                `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`

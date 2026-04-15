@@ -100,9 +100,14 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "name is required"})
 		return
 	}
+	color, err := calendarColorFromForm(r, nil)
+	if err != nil {
+		h.redirect(w, r, "/calendars", map[string]string{"error": "invalid color"})
+		return
+	}
 
 	user, _ := auth.UserFromContext(r.Context())
-	_, err := h.store.Calendars.Create(r.Context(), store.Calendar{UserID: user.ID, Name: name})
+	_, err = h.store.Calendars.Create(r.Context(), store.Calendar{UserID: user.ID, Name: name, Color: color})
 	if err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "failed to create"})
 		return
@@ -136,11 +141,45 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if err := h.store.Calendars.Rename(r.Context(), user.ID, id, name); err != nil {
+	color := cal.Color
+	if _, ok := r.Form["color"]; ok {
+		color, err = calendarColorFromForm(r, cal.Color)
+		if err != nil {
+			h.redirect(w, r, "/calendars", map[string]string{"error": "invalid color"})
+			return
+		}
+	}
+	if err := h.store.Calendars.Update(r.Context(), user.ID, id, name, cal.Description, cal.Timezone, color); err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
 	}
 	h.redirect(w, r, "/calendars", map[string]string{"status": "renamed"})
+}
+
+func calendarColorFromForm(r *http.Request, existing *string) (*string, error) {
+	color, err := store.NormalizeCalendarColor(r.FormValue("color"))
+	if err != nil || color == nil {
+		return color, err
+	}
+	if len(*color) == 9 {
+		return color, nil
+	}
+
+	alphaValue := strings.TrimSpace(r.FormValue("color_alpha"))
+	if alphaValue == "" {
+		if existing != nil && len(*existing) == 9 && strings.EqualFold((*existing)[:7], *color) {
+			preserved := strings.ToUpper(*color + (*existing)[7:])
+			return &preserved, nil
+		}
+		return store.NormalizeCalendarColorOpaque(*color)
+	}
+
+	alpha, err := strconv.Atoi(alphaValue)
+	if err != nil || alpha < 0 || alpha > 100 {
+		return nil, fmt.Errorf("invalid color alpha")
+	}
+	normalized := fmt.Sprintf("%s%02X", *color, (alpha*255+50)/100)
+	return &normalized, nil
 }
 
 // DeleteCalendar deletes a calendar.

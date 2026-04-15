@@ -239,12 +239,20 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		"Title":        "App Passwords",
 		"User":         user,
 		"AppPasswords": view,
+		"DAVEndpoint":  h.davEndpoint(),
 	})
 	if plaintext != "" {
 		data["PlainToken"] = plaintext
 		data["FlashMessage"] = "created"
 	}
 	h.render(w, r, "app_passwords.html", data)
+}
+
+func (h *Handler) davEndpoint() string {
+	if h.cfg == nil || strings.TrimSpace(h.cfg.BaseURL) == "" {
+		return "/dav"
+	}
+	return strings.TrimRight(h.cfg.BaseURL, "/") + "/dav"
 }
 
 // Logout logs the user out.

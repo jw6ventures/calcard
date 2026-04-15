@@ -1075,6 +1075,120 @@ func TestDashboardHidesDeniedRecentEvents(t *testing.T) {
 	}
 }
 
+func TestCreateCalendarPersistsSelectedColor(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil)
+
+	form := url.Values{}
+	form.Set("name", "Work")
+	form.Set("color", "#22cc88")
+	form.Set("color_alpha", "75")
+	req := httptest.NewRequest(http.MethodPost, "/calendars", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.CreateCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("CreateCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	cal := calRepo.calendars[1]
+	if cal == nil || cal.Color == nil || *cal.Color != "#22CC88BF" {
+		t.Fatalf("expected selected color to be persisted, got %#v", cal)
+	}
+}
+
+func TestRenameCalendarPersistsSelectedColor(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+		1: {ID: 1, UserID: 100, Name: "Work"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil)
+
+	form := url.Values{}
+	form.Set("name", "Personal")
+	form.Set("color", "#336699")
+	form.Set("color_alpha", "50")
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.RenameCalendar(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("RenameCalendar() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	cal := calRepo.calendars[1]
+	if cal == nil || cal.Name != "Personal" || cal.Color == nil || *cal.Color != "#33669980" {
+		t.Fatalf("expected renamed calendar color to be persisted, got %#v", cal)
+	}
+}
+
+func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
+	color := "#33669980"
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+		1: {ID: 1, UserID: 100, Name: "Work", Color: &color},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars:  calRepo,
+		Users:      &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}},
+		ACLEntries: &fakeACLRepo{},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.Calendars(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Calendars() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := w.Body.String()
+	expected := []string{
+		`onclick="openCalendarEditModal('edit-calendar-1')"`,
+		`id="edit-calendar-1"`,
+		`<input type="text" name="name" value="Work" required>`,
+		`<input type="color" name="color" value="#336699">`,
+		`<input type="range" name="color_alpha" min="0" max="100" value="50" class="color-alpha-input">`,
+		`>Cancel</button>`,
+		`>Save</button>`,
+	}
+	for _, want := range expected {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected calendars page to contain %q, got %s", want, body)
+		}
+	}
+	if strings.Contains(body, `class="rename-form"`) {
+		t.Fatalf("expected inline rename form to be removed, got %s", body)
+	}
+}
+
+func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
+	handler := NewHandler(&config.Config{BaseURL: "https://calcard.example/"}, &store.Store{
+		AppPasswords: &fakeAppPasswordRepo{},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.AppPasswords(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("AppPasswords() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "https://calcard.example/dav") {
+		t.Fatalf("expected configured DAV endpoint in response, got %s", body)
+	}
+	if strings.Contains(body, "example.app.calcard.app") {
+		t.Fatalf("expected app password guidance not to contain hard-coded example host, got %s", body)
+	}
+}
+
 func TestDashboardBackfillsVisibleRecentEventsAfterFiltering(t *testing.T) {
 	start := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
 	recent := make([]store.Event, 0, 30)
@@ -1977,14 +2091,38 @@ func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID
 }
 
 func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*store.Calendar, error) {
-	return nil, nil
+	if f.calendars == nil {
+		f.calendars = map[int64]*store.Calendar{}
+	}
+	if cal.ID == 0 {
+		cal.ID = int64(len(f.calendars) + 1)
+	}
+	copy := cal
+	f.calendars[copy.ID] = &copy
+	return &copy, nil
 }
 
-func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error {
+	cal, ok := f.calendars[id]
+	if !ok || cal.UserID != userID {
+		return store.ErrNotFound
+	}
+	cal.Name = name
+	cal.Description = description
+	cal.Timezone = timezone
+	cal.Color = color
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+	cal, ok := f.calendars[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	cal.Name = name
+	cal.Description = description
+	cal.Timezone = timezone
+	cal.Color = color
 	return nil
 }
 

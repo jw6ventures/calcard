@@ -339,10 +339,10 @@ func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, err
 	return &created, nil
 }
 
-func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
-	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4 AND user_id=$5`
+func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error {
+	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5 AND user_id=$6`
 	defer observeDB(ctx, "calendars.update")()
-	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, id, userID)
+	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, color, id, userID)
 	if err != nil {
 		return err
 	}
@@ -356,10 +356,10 @@ func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string
 	return nil
 }
 
-func (r *calendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
-	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, updated_at=NOW() WHERE id=$4`
+func (r *calendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5`
 	defer observeDB(ctx, "calendars.update_properties")()
-	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, id)
+	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, color, id)
 	if err != nil {
 		return err
 	}

@@ -57,12 +57,13 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := multistatus{
-		XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:   "DAV:",
-		XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-		XmlnsCS:  "http://calendarserver.org/ns/",
-		Response: responses,
+		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+		XmlnsD:    "DAV:",
+		XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+		XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+		XmlnsCS:   "http://calendarserver.org/ns/",
+		XmlnsICAL: "http://apple.com/ns/ical/",
+		Response:  responses,
 	}
 	writeMultiStatus(w, payload)
 }

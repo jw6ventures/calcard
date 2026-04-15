@@ -108,16 +108,17 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 				birthdayDesc := "Contact birthdays from your address books"
 				syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 				responses := []response{
-					calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, principalHref, syncToken, "0", true),
+					calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true),
 					principalResponse(ensureCollectionHref(principalHref), user),
 				}
 				payload := multistatus{
-					XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-					XmlnsD:   "DAV:",
-					XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-					XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-					XmlnsCS:  "http://calendarserver.org/ns/",
-					Response: responses,
+					XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+					XmlnsD:    "DAV:",
+					XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+					XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+					XmlnsCS:   "http://calendarserver.org/ns/",
+					XmlnsICAL: "http://apple.com/ns/ical/",
+					Response:  responses,
 				}
 				w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 				w.WriteHeader(http.StatusMultiStatus)
@@ -152,6 +153,7 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 				XmlnsC:    "urn:ietf:params:xml:ns:caldav",
 				XmlnsA:    "urn:ietf:params:xml:ns:carddav",
 				XmlnsCS:   "http://calendarserver.org/ns/",
+				XmlnsICAL: "http://apple.com/ns/ical/",
 				SyncToken: syncToken,
 				Response:  responses,
 			}
@@ -185,16 +187,17 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			ctag := fmt.Sprintf("%d", cal.CTag)
 			syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 			responses := []response{
-				calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, principalHref, syncToken, ctag, cal.EffectivePrivileges()),
+				calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges()),
 				principalResponse(ensureCollectionHref(principalHref), user),
 			}
 			payload := multistatus{
-				XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-				XmlnsD:   "DAV:",
-				XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-				XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-				XmlnsCS:  "http://calendarserver.org/ns/",
-				Response: responses,
+				XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+				XmlnsD:    "DAV:",
+				XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+				XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+				XmlnsCS:   "http://calendarserver.org/ns/",
+				XmlnsICAL: "http://apple.com/ns/ical/",
+				Response:  responses,
 			}
 			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 			w.WriteHeader(http.StatusMultiStatus)
@@ -232,6 +235,7 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			XmlnsC:    "urn:ietf:params:xml:ns:caldav",
 			XmlnsA:    "urn:ietf:params:xml:ns:carddav",
 			XmlnsCS:   "http://calendarserver.org/ns/",
+			XmlnsICAL: "http://apple.com/ns/ical/",
 			SyncToken: syncToken,
 			Response:  responses,
 		}
@@ -340,11 +344,12 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 		depth := strings.TrimSpace(r.Header.Get("Depth"))
 		if report.XMLName.Local == "addressbook-query" && !isResource && depth == "0" {
 			payload := multistatus{
-				XMLName: xml.Name{Space: "DAV:", Local: "multistatus"},
-				XmlnsD:  "DAV:",
-				XmlnsC:  "urn:ietf:params:xml:ns:caldav",
-				XmlnsA:  "urn:ietf:params:xml:ns:carddav",
-				XmlnsCS: "http://calendarserver.org/ns/",
+				XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+				XmlnsD:    "DAV:",
+				XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+				XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+				XmlnsCS:   "http://calendarserver.org/ns/",
+				XmlnsICAL: "http://apple.com/ns/ical/",
 			}
 			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 			w.WriteHeader(http.StatusMultiStatus)
@@ -367,6 +372,7 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			XmlnsC:    "urn:ietf:params:xml:ns:caldav",
 			XmlnsA:    "urn:ietf:params:xml:ns:carddav",
 			XmlnsCS:   "http://calendarserver.org/ns/",
+			XmlnsICAL: "http://apple.com/ns/ical/",
 			SyncToken: syncToken,
 			Response:  responses,
 		}
@@ -390,12 +396,13 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		payload := multistatus{
-			XMLName:  xml.Name{Space: "DAV:", Local: "multistatus"},
-			XmlnsD:   "DAV:",
-			XmlnsC:   "urn:ietf:params:xml:ns:caldav",
-			XmlnsA:   "urn:ietf:params:xml:ns:carddav",
-			XmlnsCS:  "http://calendarserver.org/ns/",
-			Response: []response{rootResp},
+			XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
+			XmlnsD:    "DAV:",
+			XmlnsC:    "urn:ietf:params:xml:ns:caldav",
+			XmlnsA:    "urn:ietf:params:xml:ns:carddav",
+			XmlnsCS:   "http://calendarserver.org/ns/",
+			XmlnsICAL: "http://apple.com/ns/ical/",
+			Response:  []response{rootResp},
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.WriteHeader(http.StatusMultiStatus)

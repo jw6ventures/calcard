@@ -20,8 +20,8 @@ type CalendarRepository interface {
 	ListAccessible(ctx context.Context, userID int64) ([]CalendarAccess, error)
 	GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error)
 	Create(ctx context.Context, cal Calendar) (*Calendar, error)
-	Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error
-	UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error
+	Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error
+	UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error
 	Rename(ctx context.Context, userID, id int64, name string) error
 	Delete(ctx context.Context, userID, id int64) error
 }

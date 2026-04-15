@@ -640,10 +640,10 @@ func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID
 func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*store.Calendar, error) {
 	return nil, nil
 }
-func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error {
 	return nil
 }
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
 	return nil
 }
 func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {

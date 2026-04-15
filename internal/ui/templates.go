@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -128,6 +130,59 @@ var funcMap = template.FuncMap{
 		}
 		return template.JS(data)
 	},
+	"formColor": func(v interface{}) string {
+		const fallback = "#3B82F6"
+		color, ok := templateColorString(v)
+		if !ok {
+			return fallback
+		}
+		color = strings.TrimSpace(color)
+		if len(color) >= 7 && color[0] == '#' && isHexColor(color[1:7]) {
+			return strings.ToUpper(color[:7])
+		}
+		return fallback
+	},
+	"formAlpha": func(v interface{}) int {
+		color, ok := templateColorString(v)
+		if !ok {
+			return 100
+		}
+		color = strings.TrimSpace(color)
+		if len(color) != 9 || color[0] != '#' || !isHexColor(color[7:9]) {
+			return 100
+		}
+		alpha, err := strconv.ParseInt(color[7:9], 16, 64)
+		if err != nil {
+			return 100
+		}
+		return int((alpha*100 + 127) / 255)
+	},
+}
+
+func templateColorString(v interface{}) (string, bool) {
+	switch c := v.(type) {
+	case nil:
+		return "", false
+	case string:
+		return c, true
+	case *string:
+		if c == nil {
+			return "", false
+		}
+		return *c, true
+	default:
+		return "", false
+	}
+}
+
+func isHexColor(value string) bool {
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func mustParseTemplates() map[string]*template.Template {

@@ -7902,7 +7902,7 @@ func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*sto
 	return &copy, nil
 }
 
-func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error {
 	cal, ok := f.calendars[id]
 	if !ok || cal.UserID != userID {
 		return store.ErrNotFound
@@ -7910,10 +7910,11 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	cal.Name = name
 	cal.Description = description
 	cal.Timezone = timezone
+	cal.Color = color
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
@@ -7921,6 +7922,7 @@ func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name 
 	cal.Name = name
 	cal.Description = description
 	cal.Timezone = timezone
+	cal.Color = color
 	return nil
 }
 
@@ -9411,6 +9413,78 @@ func TestCalendarPropertiesIncludeLimits(t *testing.T) {
 	}
 }
 
+func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
+	now := store.Now()
+	color := "#336699FF"
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Color: &color, CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
+  <D:prop>
+    <ical:calendar-color/>
+  </D:prop>
+</D:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, `<ical:calendar-color>#336699FF</ical:calendar-color>`) {
+		t.Fatalf("expected calendar color in response, got %s", respBody)
+	}
+	if !strings.Contains(respBody, `xmlns:ical="http://apple.com/ns/ical/"`) {
+		t.Fatalf("expected Apple calendar namespace in response, got %s", respBody)
+	}
+}
+
+func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	u := &store.User{ID: 1}
+
+	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
+  <D:prop>
+    <ical:calendar-color/>
+  </D:prop>
+</D:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, `HTTP/1.1 404 Not Found`) {
+		t.Fatalf("expected calendar color 404 propstat, got %s", respBody)
+	}
+	if strings.Contains(respBody, `HTTP/1.1 200 OK`) {
+		t.Fatalf("did not expect empty 200 propstat for missing color, got %s", respBody)
+	}
+	if !strings.Contains(respBody, `<ical:calendar-color>calendar-color</ical:calendar-color>`) {
+		t.Fatalf("expected calendar-color in 404 propstat, got %s", respBody)
+	}
+}
+
 func TestProppatchRejectsForbidden(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -9495,6 +9569,85 @@ func TestProppatchSharedCalendarWritePropertiesGrantPersistsChange(t *testing.T)
 	}
 	if updated.Description == nil || *updated.Description != "Updated by delegate" {
 		t.Fatalf("expected shared PROPPATCH to persist description, got %#v", updated)
+	}
+}
+
+func TestProppatchCalendarColorPersistsChange(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: user.ID, Name: "Work"},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
+  <D:set>
+    <D:prop>
+      <ical:calendar-color>#22CC88FF</ical:calendar-color>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/5", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	updated, err := calRepo.GetByID(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Color == nil || *updated.Color != "#22CC88FF" {
+		t.Fatalf("expected PROPPATCH to persist color, got %#v", updated)
+	}
+	if !strings.Contains(rr.Body.String(), `<ical:calendar-color>#22CC88FF</ical:calendar-color>`) {
+		t.Fatalf("expected color in PROPPATCH response, got %s", rr.Body.String())
+	}
+}
+
+func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
+	user := &store.User{ID: 1}
+	color := "#22CC8880"
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			5: {ID: 5, UserID: user.ID, Name: "Work", Color: &color},
+		},
+	}
+	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
+  <D:remove>
+    <D:prop>
+      <ical:calendar-color/>
+    </D:prop>
+  </D:remove>
+</D:propertyupdate>`
+
+	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/5", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Proppatch(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	updated, err := calRepo.GetByID(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Color != nil {
+		t.Fatalf("expected PROPPATCH remove to clear color, got %#v", updated)
+	}
+	if !strings.Contains(rr.Body.String(), `<ical:calendar-color></ical:calendar-color>`) {
+		t.Fatalf("expected color remove in PROPPATCH response, got %s", rr.Body.String())
 	}
 }
 

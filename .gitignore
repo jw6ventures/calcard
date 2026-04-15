@@ -32,6 +32,7 @@ go.work.sum
 .idea/
 .vscode/
 .claude/
+.codex
 
 # License generation artifacts
 third_party_licenses/

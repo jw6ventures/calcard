@@ -338,6 +338,10 @@ func filterGenericCollectionPropfindResponse(resp response, req *propfindRequest
 		notFoundProp.CalendarTimezone = stringPtr("calendar-timezone")
 		notFoundSet = true
 	}
+	if req.Prop.CalendarColor != nil {
+		notFoundProp.CalendarColor = stringPtr("calendar-color")
+		notFoundSet = true
+	}
 	if req.Prop.AddressBookDesc != nil {
 		notFoundProp.AddressBookDesc = "addressbook-description"
 		notFoundSet = true
@@ -459,6 +463,15 @@ func filterCalendarCollectionPropfindResponse(resp response, req *propfindReques
 	if req.Prop.CalendarTimezone != nil {
 		okProp.CalendarTimezone = src.CalendarTimezone
 		okSet = true
+	}
+	if req.Prop.CalendarColor != nil {
+		if src.CalendarColor != nil {
+			okProp.CalendarColor = src.CalendarColor
+			okSet = true
+		} else {
+			notFoundProp.CalendarColor = stringPtr("calendar-color")
+			notFoundSet = true
+		}
 	}
 	if req.Prop.SyncToken != nil {
 		okProp.SyncToken = src.SyncToken
