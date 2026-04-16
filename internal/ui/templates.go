@@ -157,6 +157,24 @@ var funcMap = template.FuncMap{
 		}
 		return int((alpha*100 + 127) / 255)
 	},
+	"calendarHeaderColor": func(v interface{}) template.CSS {
+		const fallback = "#3B82F6FF"
+		color, ok := templateColorString(v)
+		if !ok {
+			return template.CSS(fallback)
+		}
+		color = strings.TrimSpace(color)
+		if len(color) != 7 && len(color) != 9 {
+			return template.CSS(fallback)
+		}
+		if color[0] != '#' || !isHexColor(color[1:]) {
+			return template.CSS(fallback)
+		}
+		if len(color) == 7 {
+			color += "FF"
+		}
+		return template.CSS(strings.ToUpper(color))
+	},
 }
 
 func templateColorString(v interface{}) (string, bool) {
