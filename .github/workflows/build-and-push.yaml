@@ -196,12 +196,16 @@ jobs:
           REF="${GITHUB_REF:-}"
           SHORT_SHA="$(echo "${GITHUB_SHA:-unknown}" | cut -c1-7)"
           IS_TAG=false
+          IS_RC_TAG=false
           TAG_NAME=""
 
           if [[ "${REF}" == refs/tags/* ]]; then
             IS_TAG=true
             TAG_NAME="${GITHUB_REF_NAME}"
             BRANCH="${DEFAULT_BRANCH}"
+            if [[ "${TAG_NAME}" =~ -rc[0-9]+$ ]]; then
+              IS_RC_TAG=true
+            fi
           else
             BRANCH="${GITHUB_REF_NAME:-${DEFAULT_BRANCH}}"
           fi
@@ -213,7 +217,7 @@ jobs:
           )
 
           # Tag special channels
-          if [ "${BRANCH}" = "${DEFAULT_BRANCH}" ]; then
+          if [ "${BRANCH}" = "${DEFAULT_BRANCH}" ] && [ "${IS_RC_TAG}" != true ]; then
             TAG_ARGS+=(-t "${IMAGE}:latest")
           elif [ "${BRANCH}" = "${BETA_BRANCH}" ]; then
             TAG_ARGS+=(-t "${IMAGE}:beta")
@@ -226,6 +230,7 @@ jobs:
           PRIMARY_TAG="${IMAGE}:${BRANCH}-${SHORT_SHA}"
           echo "PRIMARY_TAG=${PRIMARY_TAG}" >> "${GITHUB_ENV}"
           echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
+          echo "IS_RC_TAG=${IS_RC_TAG}" >> "${GITHUB_ENV}"
 
           docker buildx build \
             --platform linux/amd64,linux/arm64,linux/arm/v7 \
@@ -283,3 +288,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/calcard-*
+          prerelease: ${{ env.IS_RC_TAG == 'true' }}
+          make_latest: ${{ env.IS_RC_TAG == 'true' && 'false' || 'true' }}

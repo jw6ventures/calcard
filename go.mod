@@ -1,21 +1,21 @@
 module github.com/jw6ventures/calcard
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
-	github.com/coreos/go-oidc/v3 v3.11.0
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/go-chi/chi/v5 v5.2.2
 	github.com/jw6ventures/jw6-go-utils v1.0.3
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.19.1
 	golang.org/x/crypto v0.45.0
-	golang.org/x/oauth2 v0.33.0
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/text v0.31.0
 	golang.org/x/time v0.14.0
 )
 
-require github.com/go-jose/go-jose/v4 v4.0.5 // indirect
+require github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 
 require (
 	github.com/Masterminds/semver/v3 v3.3.1 // indirect
