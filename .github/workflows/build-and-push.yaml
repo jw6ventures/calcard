@@ -233,7 +233,7 @@ jobs:
           echo "IS_RC_TAG=${IS_RC_TAG}" >> "${GITHUB_ENV}"
 
           docker buildx build \
-            --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            --platform linux/amd64,linux/arm64\
             "${TAG_ARGS[@]}" \
             --push .
 
