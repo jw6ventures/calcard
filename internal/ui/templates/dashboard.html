@@ -135,7 +135,7 @@
             <div class="empty-recent">No events yet</div>
             {{else}}
             {{range .RecentEvents}}
-            <a class="recent-item" href="/calendars/{{.CalendarID}}?event={{.UID}}">
+            <a class="recent-item" href="{{.EventURL}}">
                 <div class="recent-icon event">&#128197;</div>
                 <div class="recent-info">
                     <div class="recent-title">{{.Summary}}</div>

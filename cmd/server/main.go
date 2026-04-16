@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	appauth "github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"

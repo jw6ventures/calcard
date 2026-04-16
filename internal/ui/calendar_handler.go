@@ -601,7 +601,7 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	relevantEvents := filterEventsForMonth(allEvents, monthStart, monthEnd)
 
 	// Build JSON response
-	var eventsJSONData []map[string]any
+	eventsJSONData := make([]map[string]any, 0, len(relevantEvents))
 	for _, ev := range relevantEvents {
 		eventsJSONData = append(eventsJSONData, calendarEventJSON(ev))
 	}
@@ -677,7 +677,7 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
 
-	var result []map[string]any
+	var result = make([]map[string]any, 0)
 	for i, cal := range calendars {
 		allEvents, err := h.store.Events.ListForCalendar(r.Context(), cal.ID)
 		if err != nil {
@@ -1337,15 +1337,15 @@ func parseReminderMinutes(values []string) []int {
 func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Time) []store.Event {
 	var relevant []store.Event
 	for _, ev := range allEvents {
-		hasRRule := strings.Contains(ev.RawICAL, "RRULE:")
+		rruleLines := rawICalEventRRuleLines(ev.RawICAL)
+		hasRRule := len(rruleLines) > 0
 		startDate := eventMonthFilterStart(ev)
 
 		if hasRRule {
 			if startDate != nil && !startDate.After(monthEnd) {
 				hasEnded := false
-				lines := utils.UnfoldLines(ev.RawICAL)
-				for _, line := range lines {
-					if strings.HasPrefix(line, "RRULE:") && strings.Contains(line, "UNTIL=") {
+				for _, line := range rruleLines {
+					if strings.Contains(line, "UNTIL=") {
 						parts := strings.Split(line, "UNTIL=")
 						if len(parts) > 1 {
 							untilStr := strings.Split(parts[1], ";")[0]
@@ -1374,6 +1374,28 @@ func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Tim
 		}
 	}
 	return relevant
+}
+
+func rawICalEventRRuleLines(raw string) []string {
+	var lines []string
+	inEvent := false
+	for _, line := range utils.UnfoldLines(raw) {
+		switch {
+		case strings.EqualFold(line, "BEGIN:VEVENT"):
+			inEvent = true
+			continue
+		case strings.EqualFold(line, "END:VEVENT"):
+			inEvent = false
+			continue
+		case !inEvent:
+			continue
+		}
+		key, _, _, ok := parseICalProperty(line)
+		if ok && key == "RRULE" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func eventMonthFilterStart(ev store.Event) *time.Time {
@@ -1640,10 +1662,10 @@ func parseCalendarEventMetadata(ev store.Event) calendarEventMetadata {
 	if ev.Summary != nil && master.Summary == "" {
 		master.Summary = *ev.Summary
 	}
-	if ev.DTStart != nil {
+	if ev.DTStart != nil && master.DTStart == nil {
 		master.DTStart = ev.DTStart
 	}
-	if ev.DTEnd != nil {
+	if ev.DTEnd != nil && master.DTEnd == nil {
 		master.DTEnd = ev.DTEnd
 	}
 	master.AllDay = ev.AllDay

@@ -3,6 +3,8 @@ package ui
 import (
 	"html/template"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -125,6 +127,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 			"CalendarID":   ev.CalendarID,
 			"CalendarName": calendarNames[ev.CalendarID],
 			"UID":          ev.UID,
+			"EventURL":     dashboardEventURL(ev),
 			"Summary":      summary,
 			"DTStart":      ev.DTStart,
 			"AllDay":       ev.AllDay,
@@ -177,6 +180,16 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	})
 
 	h.render(w, r, "dashboard.html", data)
+}
+
+func dashboardEventURL(ev store.Event) string {
+	values := url.Values{}
+	values.Set("event", ev.UID)
+	if ev.DTStart != nil {
+		values.Set("year", strconv.Itoa(ev.DTStart.Year()))
+		values.Set("month", strconv.Itoa(int(ev.DTStart.Month())))
+	}
+	return "/calendars/" + strconv.FormatInt(ev.CalendarID, 10) + "?" + values.Encode()
 }
 
 // ViewBirthdays shows the virtual birthdays calendar.

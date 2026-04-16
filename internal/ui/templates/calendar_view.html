@@ -1484,8 +1484,15 @@
     }
     
     // Current view state
+    var urlParams = new URLSearchParams(window.location.search);
+    var eventUid = urlParams.get('event');
+    var initialYear = parseInt(urlParams.get('year'), 10);
+    var initialMonth = parseInt(urlParams.get('month'), 10);
     var currentDate = new Date();
-    var currentListMonth = new Date();
+    if (initialYear && initialMonth >= 1 && initialMonth <= 12) {
+        currentDate = new Date(initialYear, initialMonth - 1, 1);
+    }
+    var currentListMonth = new Date(currentDate);
     var currentView = 'month';
     
     // View toggle
@@ -2114,22 +2121,22 @@
         });
     }
     
-    // Initial load - fetch events for current month
-    fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, function() {
-        renderMonthView();
-    });
-    
-    // Check for ?event=UID query parameter to open specific event
-    var urlParams = new URLSearchParams(window.location.search);
-    var eventUid = urlParams.get('event');
-    if (eventUid) {
-        var targetEvent = baseEvents.find(function(e) { return e.uid === eventUid; });
+    function openLinkedEvent() {
+        if (!eventUid) return;
+        var targetEvent = baseEvents.find(function(e) { return e.uid === eventUid; }) ||
+            expandedEvents.find(function(e) { return e.uid === eventUid; });
         if (targetEvent) {
             setTimeout(function() {
                 showEventModal(targetEvent);
             }, 100);
         }
     }
+
+    // Initial load - fetch events for current month
+    fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, function() {
+        renderMonthView();
+        openLinkedEvent();
+    });
     
     // Store current event for editing
     window.currentEditEvent = null;

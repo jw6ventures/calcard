@@ -1070,8 +1070,19 @@ func TestDashboardHidesDeniedRecentEvents(t *testing.T) {
 	if !strings.Contains(body, visibleSummary) {
 		t.Fatalf("expected visible event in dashboard, got %s", body)
 	}
+	if !strings.Contains(body, `href="/calendars/1?event=visible&amp;month=3&amp;year=2026"`) {
+		t.Fatalf("expected dashboard event link to include event month, got %s", body)
+	}
 	if strings.Contains(body, hiddenSummary) {
 		t.Fatalf("expected denied event to be hidden from dashboard, got %s", body)
+	}
+}
+
+func TestDashboardEventURLFallsBackWithoutStartDate(t *testing.T) {
+	got := dashboardEventURL(store.Event{CalendarID: 7, UID: "event with space"})
+	want := "/calendars/7?event=event+with+space"
+	if got != want {
+		t.Fatalf("dashboardEventURL() = %q, want %q", got, want)
 	}
 }
 
@@ -1324,6 +1335,31 @@ func TestCalendarEventJSONHidesDeniedEvents(t *testing.T) {
 	}
 }
 
+func TestCalendarEventJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Empty"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
+		t.Fatalf("expected empty JSON array, got %s", body)
+	}
+}
+
 func TestExportCalendarDownloadsReadableEventsAsICS(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{
@@ -1452,6 +1488,125 @@ func TestCalendarEventJSONIncludesImportedTimezoneEventForSourceMonth(t *testing
 	}
 	if body := w.Body.String(); !strings.Contains(body, `"uid":"imported"`) {
 		t.Fatalf("expected imported timezone event in March JSON response, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONIncludesAppleImportedCurrentMonthEvents(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Default"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:apple-april-15": {
+				CalendarID:   1,
+				UID:          "apple-april-15",
+				ResourceName: "apple-april-15.ics",
+				RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.3.2//EN\r\n" +
+					"BEGIN:VEVENT\r\nSUMMARY:Apple April 15\r\nUID:apple-april-15\r\nCREATED:20260415T225311Z\r\n" +
+					"DTSTART;TZID=America/Chicago:20260415T174500\r\nDTEND;TZID=America/Chicago:20260415T184500\r\nEND:VEVENT\r\n" +
+					"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			},
+			"1:apple-april-16": {
+				CalendarID:   1,
+				UID:          "apple-april-16",
+				ResourceName: "apple-april-16.ics",
+				RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.3.2//EN\r\n" +
+					"BEGIN:VEVENT\r\nSUMMARY:Apple April 16\r\nUID:apple-april-16\r\nCREATED:20260415T225315Z\r\n" +
+					"DTSTART;TZID=America/Chicago:20260416T193000\r\nDTEND;TZID=America/Chicago:20260416T200500\r\nEND:VEVENT\r\n" +
+					"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			},
+			"1:apple-april-14": {
+				CalendarID:   1,
+				UID:          "apple-april-14",
+				ResourceName: "apple-april-14.ics",
+				RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.3.2//EN\r\n" +
+					"BEGIN:VEVENT\r\nSUMMARY:Apple April 14\r\nUID:apple-april-14\r\nCREATED:20260415T225319Z\r\n" +
+					"DTSTART;TZID=America/Chicago:20260414T191500\r\nDTEND;TZID=America/Chicago:20260414T195500\r\nEND:VEVENT\r\n" +
+					"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`"summary":"Apple April 14"`,
+		`"summary":"Apple April 15"`,
+		`"summary":"Apple April 16"`,
+		`"timezone":"America/Chicago"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected JSON to contain %s, got %s", want, body)
+		}
+	}
+}
+
+func TestCalendarEventJSONIgnoresTimezoneRRuleWhenFilteringMonth(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Default"}, Shared: false, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:apple-timezone-rrule": {
+				CalendarID:   1,
+				UID:          "apple-timezone-rrule",
+				ResourceName: "apple-timezone-rrule.ics",
+				RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" +
+					"BEGIN:DAYLIGHT\r\nDTSTART:19180331T020000\r\nRRULE:FREQ=YEARLY;UNTIL=19190330T080000Z;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\n" +
+					"BEGIN:STANDARD\r\nDTSTART:19181027T020000\r\nRRULE:FREQ=YEARLY;UNTIL=19191026T070000Z;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n" +
+					"END:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:apple-timezone-rrule\r\nSUMMARY:Apple Timezone RRule\r\n" +
+					"DTSTART;TZID=America/Chicago:20260415T174500\r\nDTEND;TZID=America/Chicago:20260415T184500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"summary":"Apple Timezone RRule"`) {
+		t.Fatalf("expected VTIMEZONE RRULE not to exclude event, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONPrefersRawTimezoneDateOverStoredDate(t *testing.T) {
+	storedStart := time.Date(2026, 4, 14, 19, 15, 0, 0, time.UTC)
+	storedEnd := time.Date(2026, 4, 14, 19, 55, 0, 0, time.UTC)
+
+	payload := calendarEventJSON(store.Event{
+		CalendarID:   1,
+		UID:          "apple-timezone",
+		ResourceName: "apple-timezone.ics",
+		RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:apple-timezone\r\nSUMMARY:Apple Timezone\r\n" +
+			"DTSTART;TZID=America/Chicago:20260414T191500\r\nDTEND;TZID=America/Chicago:20260414T195500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		DTStart: &storedStart,
+		DTEnd:   &storedEnd,
+	})
+
+	if got := payload["dtstart"]; got != "2026-04-15T00:15:00Z" {
+		t.Fatalf("dtstart = %v, want raw timezone-adjusted time", got)
+	}
+	if got := payload["dtend"]; got != "2026-04-15T00:55:00Z" {
+		t.Fatalf("dtend = %v, want raw timezone-adjusted time", got)
 	}
 }
 
@@ -1636,6 +1791,28 @@ func TestAllCalendarEventsJSONHidesDeniedEvents(t *testing.T) {
 	}
 	if strings.Contains(body, `"uid":"hidden"`) {
 		t.Fatalf("expected denied event to be omitted from all-calendars JSON, got %s", body)
+	}
+}
+
+func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Empty"}, Shared: false, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=4", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
+		t.Fatalf("expected empty JSON array, got %s", body)
 	}
 }
 
