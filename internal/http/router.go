@@ -49,7 +49,6 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(overrideMethod)
 	r.Use(metrics.Middleware())

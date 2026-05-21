@@ -1,12 +1,15 @@
 package httpserver
 
 import (
+	"bytes"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -138,5 +141,32 @@ func TestNewRouterMetricsCanBeDisabled(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("/metrics status = %d", rec.Code)
+	}
+}
+
+func TestNewRouterDoesNotWriteRequestLogs(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	var logs bytes.Buffer
+	originalLogger := middleware.DefaultLogger
+	middleware.DefaultLogger = middleware.RequestLogger(&middleware.DefaultLogFormatter{
+		Logger:  log.New(&logs, "", 0),
+		NoColor: true,
+	})
+	t.Cleanup(func() {
+		middleware.DefaultLogger = originalLogger
+	})
+
+	r := NewRouter(&config.Config{BaseURL: "http://localhost:8080"}, store.New(db), nil)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if logs.Len() != 0 {
+		t.Fatalf("request logs = %q, want none", logs.String())
 	}
 }
