@@ -170,13 +170,15 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := h.withFlash(r, map[string]any{
-		"Title":          "Dashboard",
-		"User":           user,
-		"CalendarCount":  len(calendars),
-		"BookCount":      len(books),
-		"AppPwdCount":    len(passwords),
-		"RecentEvents":   eventData,
-		"RecentContacts": contactData,
+		"Title":           "Dashboard",
+		"User":            user,
+		"CalendarCount":   len(calendars),
+		"BookCount":       len(books),
+		"AppPwdCount":     len(passwords),
+		"RecentEvents":    eventData,
+		"RecentContacts":  contactData,
+		"ShowWelcomeTour": user.OnboardingCompletedAt == nil,
+		"DAVEndpoint":     h.davEndpoint(),
 	})
 
 	h.render(w, r, "dashboard.html", data)

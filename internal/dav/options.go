@@ -3,28 +3,35 @@ package dav
 import (
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 )
 
-const davAllowMethods = "OPTIONS, HEAD, GET, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, PUT, DELETE, REPORT, LOCK, UNLOCK, ACL"
-const davAllowMethodsWithCopyMove = "OPTIONS, HEAD, GET, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, PUT, DELETE, REPORT, COPY, MOVE, LOCK, UNLOCK, ACL"
+var davAllowMethods = []string{"OPTIONS", "HEAD", "GET", "PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "PUT", "DELETE", "REPORT", "LOCK", "UNLOCK", "ACL"}
+var davAllowMethodsWithCopyMove = []string{"OPTIONS", "HEAD", "GET", "PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "PUT", "DELETE", "REPORT", "COPY", "MOVE", "LOCK", "UNLOCK", "ACL"}
 
-func davHeaderForPath(cleanPath string) string {
+func (h *Handler) davHeaderForPath(cleanPath string) string {
 	if cleanPath == "/dav" || cleanPath == "/dav/" {
 		return "1, 2, 3, access-control, calendar-access, addressbook"
+	}
+	if h != nil && h.davRegistry().isExtensionPath(cleanPath) {
+		return "1, 2, 3, access-control"
 	}
 	return "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"
 }
 
 func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
-	allow := davAllowMethods
-	if r != nil && supportsCopyMove(path.Clean(r.URL.Path)) {
-		allow = davAllowMethodsWithCopyMove
+	if h.handleRegisteredMethod(w, r) {
+		return
 	}
-	w.Header().Set("Allow", allow)
-	davHeader := davHeaderForPath("")
+	cleanPath := ""
 	if r != nil {
-		davHeader = davHeaderForPath(path.Clean(r.URL.Path))
+		cleanPath = path.Clean(r.URL.Path)
+	}
+	w.Header().Set("Allow", h.allowHeaderForPath(cleanPath))
+	davHeader := h.davHeaderForPath("")
+	if r != nil {
+		davHeader = h.davHeaderForPath(path.Clean(r.URL.Path))
 	}
 	w.Header().Set("DAV", davHeader)
 	w.Header().Set("Accept-Patch", "application/xml")
@@ -32,7 +39,36 @@ func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	h.Get(w, r)
+}
+
+func (h *Handler) allowHeaderForPath(cleanPath string) string {
+	methods := davAllowMethods
+	if supportsCopyMove(cleanPath) {
+		methods = davAllowMethodsWithCopyMove
+	}
+	seen := make(map[string]struct{}, len(methods))
+	allow := make([]string, 0, len(methods))
+	for _, method := range methods {
+		seen[method] = struct{}{}
+		allow = append(allow, method)
+	}
+	var extensionMethods []string
+	if h != nil {
+		extensionMethods = h.davRegistry().registeredMethodsForPath(cleanPath)
+	}
+	sort.Strings(extensionMethods)
+	for _, method := range extensionMethods {
+		if _, ok := seen[method]; ok {
+			continue
+		}
+		seen[method] = struct{}{}
+		allow = append(allow, method)
+	}
+	return strings.Join(allow, ", ")
 }
 
 func supportsCopyMove(cleanPath string) bool {

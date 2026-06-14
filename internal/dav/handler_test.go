@@ -94,7 +94,7 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 
 func TestBirthdayCalendarReadOnly(t *testing.T) {
 	cfg := &config.Config{}
-	h := NewHandler(cfg, &store.Store{})
+	h := NewServer(Options{Config: cfg, Store: &store.Store{}})
 
 	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
 
@@ -1627,12 +1627,12 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 	}
 }
 
-func TestNewHandlerInitializesFields(t *testing.T) {
+func TestNewServerInitializesFields(t *testing.T) {
 	cfg := &config.Config{}
 	s := &store.Store{}
-	h := NewHandler(cfg, s)
+	h := NewServer(Options{Config: cfg, Store: s})
 	if h.cfg != cfg || h.store != s {
-		t.Fatal("handler fields not initialized")
+		t.Fatal("server fields not initialized")
 	}
 }
 

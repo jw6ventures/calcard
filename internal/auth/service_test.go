@@ -39,6 +39,7 @@ func (m *userRepoMock) GetByEmail(ctx context.Context, email string) (*store.Use
 	return m.getByEmailFn(ctx, email)
 }
 func (m *userRepoMock) ListActive(context.Context) ([]store.User, error) { return nil, nil }
+func (m *userRepoMock) MarkOnboardingComplete(context.Context, int64) error { return nil }
 
 type appPasswordRepoMock struct {
 	createFn          func(context.Context, store.AppPassword) (*store.AppPassword, error)

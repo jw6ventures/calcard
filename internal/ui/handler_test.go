@@ -1086,6 +1086,70 @@ func TestDashboardEventURLFallsBackWithoutStartDate(t *testing.T) {
 	}
 }
 
+func newDashboardTestStore() *store.Store {
+	return &store.Store{
+		Calendars:    &fakeCalendarRepo{listAccessible: []store.CalendarAccess{}},
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}},
+		AppPasswords: &fakeAppPasswordRepo{},
+		Events:       &fakeEventRepo{recent: []store.Event{}},
+		Contacts:     &fakeContactRepo{contacts: map[string]*store.Contact{}},
+		ACLEntries:   &fakeACLRepo{entries: []store.ACLEntry{}},
+	}
+}
+
+func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "new@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.Dashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Dashboard() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !strings.Contains(w.Body.String(), "Welcome to CalCard") {
+		t.Fatalf("expected welcome tour for first-login user, got %s", w.Body.String())
+	}
+}
+
+func TestDashboardHidesWelcomeTourAfterOnboarding(t *testing.T) {
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil)
+
+	completed := time.Now()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "old@example.com", OnboardingCompletedAt: &completed}))
+	w := httptest.NewRecorder()
+
+	handler.Dashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Dashboard() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if strings.Contains(w.Body.String(), "Welcome to CalCard") {
+		t.Fatalf("expected no welcome tour for onboarded user, got %s", w.Body.String())
+	}
+}
+
+func TestCompleteOnboardingMarksUser(t *testing.T) {
+	userRepo := &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Users: userRepo}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/onboarding/complete", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.CompleteOnboarding(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("CompleteOnboarding() status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	if userRepo.users[100].OnboardingCompletedAt == nil {
+		t.Fatalf("expected onboarding to be marked complete")
+	}
+}
+
 func TestCreateCalendarPersistsSelectedColor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{}}
 	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil)
@@ -2595,6 +2659,14 @@ func (f *fakeUserRepo) ListActive(ctx context.Context) ([]store.User, error) {
 		result = append(result, *user)
 	}
 	return result, nil
+}
+
+func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64) error {
+	if user, ok := f.users[userID]; ok {
+		now := time.Now()
+		user.OnboardingCompletedAt = &now
+	}
+	return nil
 }
 
 type fakeACLRepo struct {

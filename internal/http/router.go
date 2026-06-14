@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +21,27 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui"
 )
+
+var registeredDAVMethods = struct {
+	sync.Mutex
+	methods map[string]struct{}
+}{methods: map[string]struct{}{
+	http.MethodHead:    {},
+	http.MethodGet:     {},
+	http.MethodOptions: {},
+	http.MethodPut:     {},
+	http.MethodDelete:  {},
+	"PROPFIND":         {},
+	"PROPPATCH":        {},
+	"MKCOL":            {},
+	"MKCALENDAR":       {},
+	"REPORT":           {},
+	"COPY":             {},
+	"MOVE":             {},
+	"LOCK":             {},
+	"UNLOCK":           {},
+	"ACL":              {},
+}}
 
 func init() {
 	for _, method := range []string{
@@ -38,8 +60,19 @@ func init() {
 	}
 }
 
+// RouterOptions configures optional router integrations.
+type RouterOptions struct {
+	DAVExtensions     []dav.Extension
+	DAVAuthMiddleware func(http.Handler) http.Handler
+}
+
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
 func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service) http.Handler {
+	return NewRouterWithOptions(cfg, store, authService, RouterOptions{})
+}
+
+// NewRouterWithOptions wires all HTTP routes and optional integrations.
+func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *auth.Service, opts RouterOptions) http.Handler {
 	r := chi.NewRouter()
 
 	// Auth endpoints: 5 requests per second, burst of 10
@@ -162,6 +195,8 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		r.Post("/sessions/{id}/revoke", uiHandler.RevokeSession)
 		r.Post("/sessions/revoke-all", uiHandler.RevokeAllSessions)
+
+		r.Post("/onboarding/complete", uiHandler.CompleteOnboarding)
 	})
 
 	r.Route("/api", func(r chi.Router) {
@@ -176,7 +211,19 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 		r.Delete("/calendars/{id}/events/{uid}", apiHandler.DeleteEvent)
 	})
 
-	davHandler := dav.NewHandler(cfg, store)
+	davHandler := dav.NewServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions})
+	registerDAVMethods(davHandler.RegisteredMethods())
+	davAuth := opts.DAVAuthMiddleware
+	if davAuth == nil && authService != nil {
+		davAuth = authService.RequireDAVAuth
+	}
+	if davAuth == nil {
+		davAuth = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+			})
+		}
+	}
 
 	r.Route("/dav", func(r chi.Router) {
 		r.Use(davRateLimiter.Middleware())
@@ -186,7 +233,7 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 
 		// All other methods require authentication
 		r.Group(func(r chi.Router) {
-			r.Use(authService.RequireDAVAuth)
+			r.Use(davAuth)
 			r.MethodFunc("HEAD", "/*", davHandler.Head)
 			r.MethodFunc("GET", "/*", davHandler.Get)
 			r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
@@ -202,9 +249,61 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 			r.MethodFunc("UNLOCK", "/*", davHandler.Unlock)
 			r.MethodFunc("ACL", "/*", davHandler.Acl)
 		})
+
+		// Extension-registered methods carry their own per-route auth policy.
+		// They are mounted outside the auth group so that MethodAuthNone routes
+		// can be served without authentication; routes that require auth are
+		// wrapped with davAuth at request time.
+		extensionHandler := extensionMethodHandler(davHandler, davAuth)
+		for _, method := range davHandler.RegisteredMethods() {
+			if isBuiltInDAVMethod(method) {
+				continue
+			}
+			r.Method(method, "/*", extensionHandler)
+		}
 	})
 
 	return r
+}
+
+func registerDAVMethods(methods []string) {
+	registeredDAVMethods.Lock()
+	defer registeredDAVMethods.Unlock()
+	for _, method := range methods {
+		method = strings.ToUpper(strings.TrimSpace(method))
+		if method == "" {
+			continue
+		}
+		if _, ok := registeredDAVMethods.methods[method]; ok {
+			continue
+		}
+		chi.RegisterMethod(method)
+		registeredDAVMethods.methods[method] = struct{}{}
+	}
+}
+
+// extensionMethodHandler serves an extension-registered DAV method, applying
+// davAuth only when the matched route declares that it requires authentication.
+func extensionMethodHandler(davHandler *dav.Server, davAuth func(http.Handler) http.Handler) http.Handler {
+	authed := davAuth(http.HandlerFunc(davHandler.ServeHTTP))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if davHandler.RouteRequiresAuth(r.Method, r.URL.Path) {
+			authed.ServeHTTP(w, r)
+			return
+		}
+		davHandler.ServeHTTP(w, r)
+	})
+}
+
+func isBuiltInDAVMethod(method string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	switch method {
+	case http.MethodHead, http.MethodGet, http.MethodOptions, http.MethodPut, http.MethodDelete,
+		"PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "REPORT", "COPY", "MOVE", "LOCK", "UNLOCK", "ACL":
+		return true
+	default:
+		return false
+	}
 }
 
 func overrideMethod(next http.Handler) http.Handler {

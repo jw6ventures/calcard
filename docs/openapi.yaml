@@ -1,0 +1,573 @@
+openapi: 3.1.0
+info:
+  title: CalCard JSON API
+  version: 0.1.0
+  description: |
+    OpenAPI documentation for CalCard's JSON calendar endpoints under `/api`.
+    CalDAV and CardDAV endpoints under `/dav` are protocol endpoints and are not
+    represented here.
+servers:
+  - url: /
+security:
+  - basicAuth: []
+tags:
+  - name: Calendars
+    description: Calendar metadata visible to the authenticated user.
+  - name: Events
+    description: Calendar event resources and raw iCalendar payloads.
+paths:
+  /api/calendars:
+    get:
+      tags:
+        - Calendars
+      operationId: listCalendars
+      summary: List accessible calendars
+      responses:
+        "200":
+          description: Calendars accessible to the authenticated user.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Calendar"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /api/calendars/{id}:
+    parameters:
+      - $ref: "#/components/parameters/CalendarID"
+    get:
+      tags:
+        - Calendars
+      operationId: getCalendar
+      summary: Get a calendar
+      responses:
+        "200":
+          description: Calendar metadata and effective privileges.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Calendar"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /api/calendars/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/CalendarID"
+    get:
+      tags:
+        - Events
+      operationId: listEvents
+      summary: List events in a calendar
+      responses:
+        "200":
+          description: Events visible in the calendar.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Event"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    post:
+      tags:
+        - Events
+      operationId: createEvent
+      summary: Create or upsert an event
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/IfNoneMatch"
+      requestBody:
+        $ref: "#/components/requestBodies/EventWrite"
+      responses:
+        "200":
+          description: Existing event updated by the create request.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "201":
+          description: Event created.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /api/calendars/{id}/events/{uid}:
+    parameters:
+      - $ref: "#/components/parameters/CalendarID"
+      - $ref: "#/components/parameters/EventUID"
+    get:
+      tags:
+        - Events
+      operationId: getEvent
+      summary: Get an event
+      responses:
+        "200":
+          description: Event details and raw iCalendar data.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    put:
+      tags:
+        - Events
+      operationId: updateEvent
+      summary: Update an event
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/IfNoneMatch"
+      requestBody:
+        $ref: "#/components/requestBodies/EventWrite"
+      responses:
+        "200":
+          description: Event updated.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      tags:
+        - Events
+      operationId: deleteEvent
+      summary: Delete an event
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "204":
+          description: Event deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: DAV Basic authentication using the user's email and an app password.
+  parameters:
+    CalendarID:
+      name: id
+      in: path
+      required: true
+      description: Numeric calendar identifier.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    EventUID:
+      name: uid
+      in: path
+      required: true
+      description: URL-encoded iCalendar UID.
+      schema:
+        type: string
+        minLength: 1
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Only apply the write if the current event ETag matches.
+      schema:
+        type: string
+      example: "\"abc123\""
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: Only apply the write if the current event ETag does not match.
+      schema:
+        type: string
+      example: "*"
+  headers:
+    ETag:
+      description: Current entity tag for the event.
+      schema:
+        type: string
+      example: "\"abc123\""
+  requestBodies:
+    EventWrite:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/EventWriteRequest"
+        text/calendar:
+          schema:
+            $ref: "#/components/schemas/RawICalendar"
+        application/ical:
+          schema:
+            $ref: "#/components/schemas/RawICalendar"
+        application/ics:
+          schema:
+            $ref: "#/components/schemas/RawICalendar"
+  responses:
+    BadRequest:
+      description: Invalid path parameter, request body, calendar data, or structured event data.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    Unauthorized:
+      description: Missing or invalid DAV Basic authentication.
+      headers:
+        WWW-Authenticate:
+          description: Basic authentication challenge.
+          schema:
+            type: string
+          example: Basic realm="CalCard DAV"
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    Forbidden:
+      description: The authenticated user cannot perform the requested operation.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    NotFound:
+      description: Calendar or event was not found, or is not visible to the authenticated user.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    Conflict:
+      description: The request conflicts with existing calendar data or resource constraints.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    PreconditionFailed:
+      description: Conditional request headers were not satisfied.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    UnsupportedMediaType:
+      description: The request content type is unsupported for event writes.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    InternalServerError:
+      description: Unexpected server error.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+  schemas:
+    Calendar:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - ownerEmail
+        - shared
+        - capabilities
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        description:
+          type: string
+        timezone:
+          type: string
+          example: America/Chicago
+        color:
+          type: string
+          example: "#2f80ed"
+        ownerEmail:
+          type: string
+          format: email
+        shared:
+          type: boolean
+        capabilities:
+          $ref: "#/components/schemas/CalendarPrivileges"
+    CalendarPrivileges:
+      type: object
+      additionalProperties: false
+      required:
+        - read
+        - readFreeBusy
+        - write
+        - writeContent
+        - writeProperties
+        - bind
+        - unbind
+      properties:
+        read:
+          type: boolean
+        readFreeBusy:
+          type: boolean
+        write:
+          type: boolean
+        writeContent:
+          type: boolean
+        writeProperties:
+          type: boolean
+        bind:
+          type: boolean
+        unbind:
+          type: boolean
+    Event:
+      type: object
+      additionalProperties: false
+      required:
+        - uid
+        - calendarId
+        - resourceName
+        - allDay
+        - etag
+        - lastModified
+        - rawIcal
+      properties:
+        uid:
+          type: string
+        calendarId:
+          type: integer
+          format: int64
+        resourceName:
+          type: string
+          description: Stored resource name for the calendar object.
+          example: example-event.ics
+        summary:
+          type: string
+        dtstart:
+          type: string
+          format: date-time
+        dtend:
+          type: string
+          format: date-time
+        allDay:
+          type: boolean
+        etag:
+          type: string
+        lastModified:
+          type: string
+          format: date-time
+        rawIcal:
+          type: string
+          description: Raw iCalendar data for the event.
+    EventWriteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        inputMode:
+          type: string
+          enum:
+            - structured
+            - raw_ical
+          description: Defaults to `structured` when omitted.
+        rawIcal:
+          type: string
+          description: Required when `inputMode` is `raw_ical`.
+        structured:
+          $ref: "#/components/schemas/StructuredEventInput"
+      oneOf:
+        - required:
+            - structured
+        - required:
+            - inputMode
+            - rawIcal
+          properties:
+            inputMode:
+              const: raw_ical
+    StructuredEventInput:
+      type: object
+      additionalProperties: false
+      required:
+        - summary
+        - dtstart
+        - dtend
+      properties:
+        uid:
+          type: string
+          description: Optional event UID. On path-based updates, it must match the path UID when supplied.
+        summary:
+          type: string
+        dtstart:
+          type: string
+          description: Event start. Accepted formats include local date-time and all-day date values.
+          examples:
+            - "2026-03-20T10:00"
+            - "2026-03-20"
+        dtend:
+          type: string
+          description: Event end. Accepted formats include local date-time and all-day date values.
+          examples:
+            - "2026-03-20T11:00"
+            - "2026-03-21"
+        allDay:
+          type: boolean
+        location:
+          type: string
+        description:
+          type: string
+        timezone:
+          type: string
+          example: America/Chicago
+        url:
+          type: string
+          format: uri
+        status:
+          type: string
+          description: iCalendar status value.
+          example: CONFIRMED
+        categories:
+          type: array
+          items:
+            type: string
+        class:
+          type: string
+          description: iCalendar CLASS value.
+          example: PUBLIC
+        transparency:
+          type: string
+          description: iCalendar TRANSP value.
+          example: OPAQUE
+        organizer:
+          type: string
+        attendees:
+          type: array
+          items:
+            type: string
+        attachments:
+          type: array
+          items:
+            type: string
+        reminders:
+          type: array
+          items:
+            type: integer
+            description: Reminder offset in minutes.
+        recurrence:
+          $ref: "#/components/schemas/StructuredRecurrence"
+    StructuredRecurrence:
+      type: object
+      additionalProperties: false
+      properties:
+        frequency:
+          type: string
+          example: WEEKLY
+        interval:
+          type: integer
+          minimum: 0
+        count:
+          type: integer
+          minimum: 0
+        until:
+          type: string
+        byDay:
+          type: array
+          items:
+            type: string
+        byMonth:
+          type: integer
+          minimum: 0
+          maximum: 12
+        byMonthDay:
+          type: integer
+          minimum: 0
+          maximum: 31
+    RawICalendar:
+      type: string
+      description: Raw iCalendar VCALENDAR data.
+      example: |
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        BEGIN:VEVENT
+        UID:example-event
+        DTSTAMP:20260320T150000Z
+        DTSTART:20260320T150000Z
+        DTEND:20260320T160000Z
+        SUMMARY:Example event
+        END:VEVENT
+        END:VCALENDAR
+    ErrorText:
+      type: string
+      description: Plain-text error response produced by `http.Error`.

@@ -32,6 +32,16 @@ func main() {
 		return
 	}
 
+	if err := runServer(ctx, ServerOptions{}); err != nil {
+		log.Fatal(err)
+	}
+}
+
+type ServerOptions struct {
+	Router httpserver.RouterOptions
+}
+
+func runServer(ctx context.Context, opts ServerOptions) error {
 	logLevelString := os.Getenv("LOG_LEVEL")
 	if logLevelString == "" {
 		logLevelString = "Info"
@@ -48,7 +58,7 @@ func main() {
 	log.Println("Starting CalCard server...")
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
 	dbManager := database.NewManager(database.Config{
@@ -61,7 +71,7 @@ func main() {
 		Logger:           &jw6utils,
 	})
 	if err := dbManager.Initialize(); err != nil {
-		log.Fatalf("failed to initialize database: %v", err)
+		return fmt.Errorf("failed to initialize database: %w", err)
 	}
 	defer dbManager.Close()
 
@@ -69,12 +79,12 @@ func main() {
 	sessionManager := appauth.NewSessionManager(cfg, stor)
 	authService, err := appauth.NewService(cfg, stor, sessionManager)
 	if err != nil {
-		log.Fatalf("failed to initialize auth service: %v", err)
+		return fmt.Errorf("failed to initialize auth service: %w", err)
 	}
 
 	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
 
-	r := httpserver.NewRouter(cfg, stor, authService)
+	r := httpserver.NewRouterWithOptions(cfg, stor, authService, opts.Router)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -100,4 +110,5 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown failed: %v", err)
 	}
+	return nil
 }

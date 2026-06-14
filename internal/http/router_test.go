@@ -10,7 +10,9 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -144,6 +146,113 @@ func TestNewRouterMetricsCanBeDisabled(t *testing.T) {
 	}
 }
 
+func TestNewRouterWithOptionsWiresDAVExtensions(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	r := NewRouterWithOptions(&config.Config{BaseURL: "http://localhost:8080"}, store.New(db), nil, RouterOptions{
+		DAVExtensions: []dav.Extension{davExtensionFunc(func(reg *dav.Registry) {
+			reg.RegisterCollection("/dav/pro")
+			reg.RegisterMethod("SEARCH", "/dav/pro", dav.MethodOptions{Auth: dav.MethodAuthRequired}, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			})
+		})},
+		DAVAuthMiddleware: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := auth.WithUser(r.Context(), &store.User{ID: 1})
+				next.ServeHTTP(w, r.WithContext(ctx))
+			})
+		},
+	})
+	req := httptest.NewRequest("SEARCH", "/dav/pro/query", nil)
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("extension SEARCH status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodOptions, "/dav/pro/query", nil)
+	rec = httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("extension OPTIONS status = %d, want %d: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, "SEARCH") {
+		t.Fatalf("extension OPTIONS Allow = %q, want SEARCH", allow)
+	}
+}
+
+func TestNewRouterWithOptionsHonorsMethodAuthNone(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	r := NewRouterWithOptions(&config.Config{BaseURL: "http://localhost:8080"}, store.New(db), nil, RouterOptions{
+		DAVExtensions: []dav.Extension{davExtensionFunc(func(reg *dav.Registry) {
+			reg.RegisterCollection("/dav/pro")
+			reg.RegisterMethod("SEARCH", "/dav/pro", dav.MethodOptions{Auth: dav.MethodAuthNone}, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			})
+		})},
+		// Auth middleware that always rejects: a MethodAuthNone route must still
+		// be reachable without passing through it.
+		DAVAuthMiddleware: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "denied", http.StatusUnauthorized)
+			})
+		},
+	})
+
+	req := httptest.NewRequest("SEARCH", "/dav/pro/query", nil)
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("MethodAuthNone SEARCH status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+}
+
+func TestNewRouterWithOptionsWiresAdditiveDAVMethodOnDefaultPath(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	r := NewRouterWithOptions(&config.Config{BaseURL: "http://localhost:8080"}, store.New(db), nil, RouterOptions{
+		DAVExtensions: []dav.Extension{davExtensionFunc(func(reg *dav.Registry) {
+			reg.RegisterMethod(http.MethodPost, "/dav/calendars", dav.MethodOptions{Auth: dav.MethodAuthRequired}, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			})
+		})},
+		DAVAuthMiddleware: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := auth.WithUser(r.Context(), &store.User{ID: 1})
+				next.ServeHTTP(w, r.WithContext(ctx))
+			})
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/dav/calendars/1/outbox", nil)
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("extension POST status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+}
+
 func TestNewRouterDoesNotWriteRequestLogs(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
@@ -169,4 +278,10 @@ func TestNewRouterDoesNotWriteRequestLogs(t *testing.T) {
 	if logs.Len() != 0 {
 		t.Fatalf("request logs = %q, want none", logs.String())
 	}
+}
+
+type davExtensionFunc func(*dav.Registry)
+
+func (f davExtensionFunc) RegisterDAV(r *dav.Registry) {
+	f(r)
 }

@@ -41,6 +41,9 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 }
 
 func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -308,6 +311,9 @@ func (h *Handler) copyContact(w http.ResponseWriter, r *http.Request, user *stor
 }
 
 func (h *Handler) Move(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

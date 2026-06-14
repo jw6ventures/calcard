@@ -17,7 +17,7 @@ import (
 )
 
 func TestRFC4791_OptionsAdvertisesCalendarAccess(t *testing.T) {
-	h := NewHandler(&config.Config{}, &store.Store{})
+	h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 	req := httptest.NewRequest(http.MethodOptions, "/dav/calendars/1/", nil)
 	rr := httptest.NewRecorder()
 

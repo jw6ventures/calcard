@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) decoratePropfindResponses(ctx context.Context, user *store.User, responses []response) error {
+func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response) error {
 	for i := range responses {
 		if len(responses[i].Propstat) == 0 {
 			continue
@@ -21,6 +22,17 @@ func (h *Handler) decoratePropfindResponses(ctx context.Context, user *store.Use
 				continue
 			}
 			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop); err != nil {
+				return err
+			}
+			if err := h.davRegistry().decoratePropfind(RequestContext{
+				Context: ctx,
+				User:    user,
+				Request: r,
+				Path:    resourcePath,
+			}, &PropfindProperties{
+				href: resourcePath,
+				prop: &responses[i].Propstat[j].Prop,
+			}); err != nil {
 				return err
 			}
 		}
@@ -314,6 +326,7 @@ func filterGenericCollectionPropfindResponse(resp response, req *propfindRequest
 		okProp.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
 	if req.Prop.GetETag != nil {
 		notFoundProp.GetETag = "getetag"
 		notFoundSet = true
@@ -439,6 +452,25 @@ func stringPtr(v string) *string {
 	return &v
 }
 
+func addRequestedCustomXMLProperties(req *propfindPropQuery, src prop, okProp *prop, okSet *bool, notFoundProp *prop, notFoundSet *bool) {
+	if req == nil {
+		return
+	}
+	for _, name := range req.CustomXML {
+		if name.Local == "" {
+			continue
+		}
+		property, ok := src.customXMLProperty(name)
+		if ok {
+			okProp.setCustomXMLProperty(property)
+			*okSet = true
+			continue
+		}
+		notFoundProp.setCustomXMLProperty(XMLProperty{Name: name})
+		*notFoundSet = true
+	}
+}
+
 func filterCalendarCollectionPropfindResponse(resp response, req *propfindRequest) response {
 	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
 		return resp
@@ -553,6 +585,7 @@ func filterCalendarCollectionPropfindResponse(resp response, req *propfindReques
 		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
 	if req.Prop.GetETag != nil {
 		notFoundProp.GetETag = "getetag"
 		notFoundSet = true
@@ -662,6 +695,7 @@ func propstatForCalendarObjectPropfind(req *propfindPropQuery, src prop) []props
 		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
 	if req.DisplayName != nil {
 		notFoundProp.DisplayName = "displayname"
 		notFoundSet = true

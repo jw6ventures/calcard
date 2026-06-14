@@ -16,16 +16,9 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
-	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/lib/pq"
 )
-
-// Handler serves WebDAV/CalDAV/CardDAV requests.
-type Handler struct {
-	cfg   *config.Config
-	store *store.Store
-}
 
 var errInvalidSyncToken = errors.New("invalid sync token")
 var errInvalidPath = errors.New("invalid path")
@@ -38,11 +31,10 @@ const maxDAVBodyBytes int64 = 10 * 1024 * 1024
 // birthdayCalendarID is a special virtual calendar ID for birthdays from contacts.
 const birthdayCalendarID int64 = -1
 
-func NewHandler(cfg *config.Config, store *store.Store) *Handler {
-	return &Handler{cfg: cfg, store: store}
-}
-
 func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -353,6 +345,9 @@ func (h *Handler) proppatchAddressBook(ctx context.Context, user *store.User, cl
 }
 
 func (h *Handler) Mkcol(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -439,6 +434,9 @@ func (h *Handler) Mkcol(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1165,6 +1163,9 @@ func (h *Handler) checkConditionalHeadersContact(r *http.Request, existing *stor
 }
 
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1377,6 +1378,21 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := h.davRegistry().validatePut(PutValidation{
+			Context:      r.Context(),
+			User:         user,
+			Request:      r,
+			Path:         cleanPath,
+			ResourceType: ResourceTypeCalendarObject,
+			CollectionID: calendarID,
+			ResourceName: resourceName,
+			ContentType:  contentType,
+			Body:         body,
+			ETag:         etag,
+		}); writeResponseError(w, err) {
+			return
+		}
+
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: string(body), ETag: etag}); err != nil {
 			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
@@ -1478,6 +1494,21 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := h.davRegistry().validatePut(PutValidation{
+			Context:      r.Context(),
+			User:         user,
+			Request:      r,
+			Path:         cleanPath,
+			ResourceType: ResourceTypeAddressObject,
+			CollectionID: addressBookID,
+			ResourceName: resourceName,
+			ContentType:  contentType,
+			Body:         body,
+			ETag:         etag,
+		}); writeResponseError(w, err) {
+			return
+		}
+
 		if existingByName == nil {
 			if err := h.deleteDAVACLState(r.Context(), user, cleanPath); err != nil {
 				http.Error(w, "failed to reset resource ACL state", http.StatusInternalServerError)
@@ -1506,6 +1537,9 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1633,7 +1667,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unsupported path", http.StatusBadRequest)
 }
 
-func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
+func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, reqPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
 	cleanPath := path.Clean(reqPath)
 	if !strings.HasPrefix(cleanPath, "/dav") {
 		return nil, http.ErrNotSupported
@@ -1659,7 +1693,11 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 				principalResponse(ensureCollectionHref(principalHref), user),
 			)
 		}
-		if err := h.decoratePropfindResponses(ctx, user, res); err != nil {
+		res, err := h.appendCollectionContributors(ctx, r, user, cleanPath, depth, res)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, r, user, res); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
@@ -1673,7 +1711,11 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+		responses, err = h.appendCollectionContributors(ctx, r, user, cleanPath, depth, responses)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1690,7 +1732,11 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+		responses, err = h.appendCollectionContributors(ctx, r, user, cleanPath, depth, responses)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1707,7 +1753,11 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, user, responses); err != nil {
+		responses, err = h.appendCollectionContributors(ctx, r, user, cleanPath, depth, responses)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1720,7 +1770,32 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, reqPath, depth str
 		}
 		return responses, nil
 	default:
-		return nil, http.ErrNotSupported
+		collection, ok := h.davRegistry().registeredExtensionCollection(cleanPath)
+		if !ok {
+			return nil, http.ErrNotSupported
+		}
+		href := normalizeDAVHref(collection.Href)
+		if !strings.HasSuffix(href, "/") {
+			href += "/"
+		}
+		if collection.Name == "" {
+			collection.Name = path.Base(strings.TrimSuffix(href, "/"))
+		}
+		responses := []response{collectionResponse(href, collection.Name)}
+		var err error
+		responses, err = h.appendCollectionContributors(ctx, r, user, cleanPath, depth, responses)
+		if err != nil {
+			return nil, err
+		}
+		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
+			return nil, err
+		}
+		if propfindReq != nil && propfindReq.Prop != nil {
+			for i := range responses {
+				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+			}
+		}
+		return responses, nil
 	}
 }
 
@@ -1735,6 +1810,36 @@ func stripCalendarAllprop(responses []response) {
 			prop.SupportedCalendarData = nil
 		}
 	}
+}
+
+func (h *Handler) appendCollectionContributors(ctx context.Context, r *http.Request, user *store.User, cleanPath, depth string, responses []response) ([]response, error) {
+	if depth != "1" {
+		return responses, nil
+	}
+	collections, err := h.davRegistry().contributeCollections(RequestContext{
+		Context: ctx,
+		User:    user,
+		Request: r,
+		Path:    cleanPath,
+		Depth:   depth,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range collections {
+		href := normalizeDAVHref(c.Href)
+		if strings.HasSuffix(c.Href, "/") && !strings.HasSuffix(href, "/") {
+			href += "/"
+		}
+		if href == "." || href == "" {
+			continue
+		}
+		if c.Name == "" {
+			c.Name = path.Base(strings.TrimSuffix(href, "/"))
+		}
+		responses = append(responses, collectionResponse(href, c.Name))
+	}
+	return responses, nil
 }
 
 func (h *Handler) calendarResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string) ([]response, error) {

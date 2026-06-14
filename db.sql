@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.0.12')
+VALUES ('version', 'v1.0.13')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -15,7 +15,8 @@ CREATE TABLE users (
     oauth_subject TEXT NOT NULL UNIQUE,
     primary_email TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    onboarding_completed_at TIMESTAMPTZ NULL
 );
 
 CREATE TABLE calendars (

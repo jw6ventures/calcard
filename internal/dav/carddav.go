@@ -743,6 +743,7 @@ func propstatForAddressObjectPropfind(req *propfindPropQuery, src prop) []propst
 		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
 	if req.DisplayName != nil {
 		notFoundProp.DisplayName = "displayname"
 		notFoundSet = true
@@ -844,6 +845,7 @@ func filterPrincipalPropfindResponse(resp response, req *propfindRequest) respon
 		okProp.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFound, &notFoundSet)
 	if req.Prop.GetETag != nil {
 		notFound.GetETag = "getetag"
 		notFoundSet = true
@@ -1027,6 +1029,7 @@ func filterAddressBookCollectionPropfindResponse(resp response, req *propfindReq
 		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
 		okSet = true
 	}
+	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFound, &notFoundSet)
 	if req.Prop.GetETag != nil {
 		notFound.GetETag = "getetag"
 		notFoundSet = true

@@ -12,6 +12,9 @@ import (
 )
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	cleanPath := path.Clean(r.URL.Path)
 	if !strings.HasPrefix(cleanPath, "/dav") {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -138,7 +141,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("DAV", davHeaderForPath(cleanPath))
+	w.Header().Set("DAV", h.davHeaderForPath(cleanPath))
 	w.WriteHeader(http.StatusOK)
 }
 

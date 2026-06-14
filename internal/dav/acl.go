@@ -16,6 +16,9 @@ import (
 var allPrivileges = []string{"read", "write", "write-content", "write-properties", "read-acl", "write-acl", "bind", "unbind"}
 
 func (h *Handler) Acl(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

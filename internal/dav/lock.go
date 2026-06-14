@@ -194,6 +194,9 @@ func firstIfLockToken(header string, resourcePaths ...string) string {
 }
 
 func (h *Handler) Lock(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -584,6 +587,9 @@ func writeLockResponse(w http.ResponseWriter, lock *store.Lock, status int) {
 }
 
 func (h *Handler) Unlock(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

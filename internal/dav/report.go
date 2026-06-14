@@ -1,9 +1,11 @@
 package dav
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strings"
@@ -14,6 +16,9 @@ import (
 )
 
 func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -46,6 +51,19 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 		expandReq, err = parseExpandPropertyRequest(body)
 		if err != nil {
 			http.Error(w, "invalid REPORT body", http.StatusBadRequest)
+			return
+		}
+	}
+	if handler, ok := h.davRegistry().reportHandler(cleanPath, report.XMLName.Local); ok {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if handler(w, r, RequestContext{
+			Context:    r.Context(),
+			User:       user,
+			Request:    r,
+			Path:       cleanPath,
+			Body:       body,
+			ReportName: report.XMLName.Local,
+		}) {
 			return
 		}
 	}

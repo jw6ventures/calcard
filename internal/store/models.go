@@ -4,11 +4,12 @@ import "time"
 
 // User represents a person authenticated via OAuth.
 type User struct {
-	ID           int64
-	OAuthSubject string
-	PrimaryEmail string
-	CreatedAt    time.Time
-	LastLoginAt  time.Time
+	ID                    int64
+	OAuthSubject          string
+	PrimaryEmail          string
+	CreatedAt             time.Time
+	LastLoginAt           time.Time
+	OnboardingCompletedAt *time.Time
 }
 
 // Calendar is a CalDAV calendar belonging to a user.

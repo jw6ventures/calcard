@@ -76,6 +76,37 @@ type prop struct {
 	ACL                           *aclProp                       `xml:"d:acl,omitempty"`
 	SupportedPrivilegeSet         *supportedPrivilegeSetProp     `xml:"d:supported-privilege-set,omitempty"`
 	PrincipalCollectionSet        *hrefListProp                  `xml:"d:principal-collection-set,omitempty"`
+	CustomXML                     []XMLProperty                  `xml:",any,omitempty"`
+}
+
+func (p *prop) setCustomXMLProperty(property XMLProperty) {
+	for i := range p.CustomXML {
+		if p.CustomXML[i].Name == property.Name {
+			p.CustomXML[i] = property
+			return
+		}
+	}
+	p.CustomXML = append(p.CustomXML, property)
+}
+
+func (p prop) customXMLProperty(name xml.Name) (XMLProperty, bool) {
+	for _, property := range p.CustomXML {
+		if property.Name == name {
+			return property, true
+		}
+	}
+	return XMLProperty{}, false
+}
+
+func (p XMLProperty) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
+	start.Name = p.Name
+	if p.Value == nil {
+		if err := enc.EncodeToken(start); err != nil {
+			return err
+		}
+		return enc.EncodeToken(start.End())
+	}
+	return enc.EncodeElement(p.Value, start)
 }
 
 // cdataString wraps string content in CDATA for raw XML output.
@@ -192,6 +223,7 @@ type propfindPropQuery struct {
 	ACLProp                       *struct{}         `xml:"DAV: acl"`
 	SupportedPrivilegeSet         *struct{}         `xml:"DAV: supported-privilege-set"`
 	PrincipalCollectionSet        *struct{}         `xml:"DAV: principal-collection-set"`
+	CustomXML                     []xml.Name        `xml:",any"`
 }
 
 // calFilter represents a CalDAV calendar-query filter (RFC 4791 Section 9.7)

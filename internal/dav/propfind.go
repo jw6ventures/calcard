@@ -11,6 +11,9 @@ import (
 )
 
 func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	if depth == "" {
 		depth = "1"
@@ -40,7 +43,7 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 		propfindReq.AllProp = &struct{}{}
 	}
 
-	responses, err := h.buildPropfindResponses(r.Context(), r.URL.Path, depth, user, &propfindReq)
+	responses, err := h.buildPropfindResponses(r.Context(), r, r.URL.Path, depth, user, &propfindReq)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {

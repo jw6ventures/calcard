@@ -289,7 +289,7 @@ func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath str
 
 func TestRFC6352_RequirementsOverview(t *testing.T) {
 	t.Run("Section3_OptionsAdvertisesCardDAV", func(t *testing.T) {
-		h := NewHandler(&config.Config{}, &store.Store{})
+		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 		rr := httptest.NewRecorder()
 
@@ -316,7 +316,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_WebDAVClass3AndACLAreAdvertised", func(t *testing.T) {
-		h := NewHandler(&config.Config{}, &store.Store{})
+		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 		rr := httptest.NewRecorder()
 
@@ -332,7 +332,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_WebDAVMethodSurfaceMatchesAdvertisedSupport", func(t *testing.T) {
-		h := NewHandler(&config.Config{}, &store.Store{})
+		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		t.Run("collection", func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 			rr := httptest.NewRecorder()
@@ -639,7 +639,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_ExtendedMKCOLShouldBeAdvertisedWhenSupported", func(t *testing.T) {
-		h := NewHandler(&config.Config{}, &store.Store{})
+		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/", nil)
 		rr := httptest.NewRecorder()
 

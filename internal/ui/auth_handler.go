@@ -255,6 +255,22 @@ func (h *Handler) davEndpoint() string {
 	return strings.TrimRight(h.cfg.BaseURL, "/") + "/dav"
 }
 
+// CompleteOnboarding records that the current user has finished (or skipped) the
+// first-login welcome tour, so it is not shown again. Called via fetch from the
+// dashboard tour modal; returns 204 with no body.
+func (h *Handler) CompleteOnboarding(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok || user == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := h.store.Users.MarkOnboardingComplete(r.Context(), user.ID); err != nil {
+		http.Error(w, "failed to record onboarding", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // Logout logs the user out.
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	h.authService.RequireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
