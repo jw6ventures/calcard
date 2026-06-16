@@ -128,15 +128,30 @@ func (s *Service) loadCalendarForResource(ctx context.Context, user *store.User,
 	return access, nil
 }
 
-func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID int64) ([]store.Event, error) {
+func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
 	cal, err := s.GetCalendar(ctx, user, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	events, err := s.store.Events.ListForCalendar(ctx, calendarID)
+
+	// Date and text predicates are pushed into SQL (calendar-scoped, indexed),
+	// but pagination is applied in Go after per-event ACL filtering so page
+	// sizes stay correct even on calendars with per-resource grants.
+	limit, offset := filter.Limit, filter.Offset
+	dbFilter := filter
+	dbFilter.Limit = 0
+	dbFilter.Offset = 0
+
+	var events []store.Event
+	if dbFilter.IsZero() {
+		events, err = s.store.Events.ListForCalendar(ctx, calendarID)
+	} else {
+		events, err = s.store.Events.ListForCalendarFiltered(ctx, calendarID, dbFilter)
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	prefetchedACLEntries, err := s.prefetchCalendarACLEntries(ctx, user, calendarID, events)
 	if err != nil {
 		return nil, err
@@ -150,6 +165,16 @@ func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID i
 		if allowed {
 			visible = append(visible, event)
 		}
+	}
+
+	if offset > 0 {
+		if offset >= len(visible) {
+			return []store.Event{}, nil
+		}
+		visible = visible[offset:]
+	}
+	if limit > 0 && limit < len(visible) {
+		visible = visible[:limit]
 	}
 	return visible, nil
 }

@@ -34,6 +34,7 @@ type EventRepository interface {
 	GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error)
 	GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error)
 	ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error)
+	ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error)
 	ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*PaginatedResult[Event], error)
 	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)
 	ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error)
@@ -60,6 +61,7 @@ type ContactRepository interface {
 	DeleteByUID(ctx context.Context, addressBookID int64, uid string) error
 	GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error)
 	ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error)
+	ListForBookFiltered(ctx context.Context, addressBookID int64, f ContactFilter) ([]Contact, error)
 	ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*PaginatedResult[Contact], error)
 	ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error)
 	ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error)

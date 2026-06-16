@@ -422,28 +422,29 @@ type eventRepo struct {
 }
 
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
-	// Parse iCal to extract fields
-	summary, dtstart, dtend, allDay := parseICalFields(event.RawICAL)
+	summary, description, location, dtstart, dtend, allDay := parseICalFields(event.RawICAL)
 	if event.ResourceName == "" {
 		event.ResourceName = event.UID
 	}
 
 	const q = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
         etag = EXCLUDED.etag,
         summary = EXCLUDED.summary,
+        description = EXCLUDED.description,
+        location = EXCLUDED.location,
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
         last_modified = NOW()
-RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, dtstart, dtend, allDay)
+	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, description, location, dtstart, dtend, allDay)
 	ev, err := scanEvent(row.Scan)
 	if err != nil {
 		return nil, err
@@ -459,7 +460,7 @@ func (r *eventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid strin
 }
 
 func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error) {
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
 	defer observeDB(ctx, "events.get_by_uid")()
 	row := r.pool.QueryRowContext(ctx, q, calendarID, uid)
 	ev, err := scanEvent(row.Scan)
@@ -473,7 +474,7 @@ func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) 
 }
 
 func (r *eventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error) {
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`
 	defer observeDB(ctx, "events.get_by_resource_name")()
 	row := r.pool.QueryRowContext(ctx, q, calendarID, resourceName)
 	ev, err := scanEvent(row.Scan)
@@ -490,7 +491,7 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 	if len(uids) == 0 {
 		return []Event{}, nil
 	}
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`
 	defer observeDB(ctx, "events.list_by_uids")()
 	rows, err := r.pool.QueryContext(ctx, q, calendarID, pq.Array(uids))
 	if err != nil {
@@ -510,9 +511,77 @@ func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []str
 }
 
 func (r *eventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error) {
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_for_calendar")()
 	rows, err := r.pool.QueryContext(ctx, q, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ev)
+	}
+	return result, rows.Err()
+}
+
+// eventColumns is the canonical select list shared by event queries.
+const eventColumns = `id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified`
+
+// likeEscape escapes characters with special meaning in a LIKE/ILIKE pattern so
+// user-supplied search text is matched literally (using the default '\' escape).
+func likeEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// ListForCalendarFiltered returns calendar events matching f. Every query is
+// scoped to a single calendar_id (served by the calendar/dtstart indexes), so
+// it never triggers a full table scan; the date range uses the
+// (calendar_id, dtstart) index and text predicates run over that narrowed set.
+func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error) {
+	var sb strings.Builder
+	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1`)
+	args := []any{calendarID}
+	placeholder := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+
+	if f.Start != nil {
+		// Keep events that end at or after Start; undated dtend falls back to dtstart.
+		sb.WriteString(` AND COALESCE(dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
+	}
+	if f.End != nil {
+		sb.WriteString(` AND dtstart <= ` + placeholder(f.End.UTC()))
+	}
+	if f.Title != "" {
+		sb.WriteString(` AND summary ILIKE ` + placeholder("%"+likeEscape(f.Title)+"%"))
+	}
+	if f.Description != "" {
+		sb.WriteString(` AND description ILIKE ` + placeholder("%"+likeEscape(f.Description)+"%"))
+	}
+	if f.Location != "" {
+		sb.WriteString(` AND location ILIKE ` + placeholder("%"+likeEscape(f.Location)+"%"))
+	}
+	if f.Query != "" {
+		p := placeholder("%" + likeEscape(f.Query) + "%")
+		sb.WriteString(` AND (summary ILIKE ` + p + ` OR description ILIKE ` + p + ` OR location ILIKE ` + p + `)`)
+	}
+	sb.WriteString(` ORDER BY dtstart ASC NULLS LAST, last_modified DESC`)
+	if f.Limit > 0 {
+		sb.WriteString(` LIMIT ` + placeholder(f.Limit))
+	}
+	if f.Offset > 0 {
+		sb.WriteString(` OFFSET ` + placeholder(f.Offset))
+	}
+
+	defer observeDB(ctx, "events.list_for_calendar_filtered")()
+	rows, err := r.pool.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +608,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 		return nil, err
 	}
 
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`
 	rows, err := r.pool.QueryContext(ctx, q, calendarID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -567,7 +636,7 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 }
 
 func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error) {
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "events.list_modified_since")()
 	rows, err := r.pool.QueryContext(ctx, q, calendarID, since)
 	if err != nil {
@@ -588,7 +657,7 @@ func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, sin
 
 func (r *eventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error) {
 	q := `
-SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified
+SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified
 FROM events e
 JOIN calendars c ON c.id = e.calendar_id
 WHERE c.user_id = $1
@@ -722,7 +791,7 @@ func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalend
 	}
 	defer tx.Rollback()
 
-	const selectQ = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
+	const selectQ = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
 	row := tx.QueryRowContext(ctx, selectQ, fromCalendarID, uid)
 	src, err := scanEvent(row.Scan)
 	if err != nil {
@@ -764,20 +833,22 @@ func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalend
 	}
 
 	const insertQ = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
         etag = EXCLUDED.etag,
         summary = EXCLUDED.summary,
+        description = EXCLUDED.description,
+        location = EXCLUDED.location,
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
         last_modified = NOW()
-RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
-	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.DTStart, src.DTEnd, src.AllDay)
+	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.Description, src.Location, src.DTStart, src.DTEnd, src.AllDay)
 	ev, err := scanEvent(insertRow.Scan)
 	if err != nil {
 		return nil, err
@@ -1089,6 +1160,58 @@ func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]C
 	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 ORDER BY last_modified DESC`
 	defer observeDB(ctx, "contacts.list_for_book")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Contact
+	for rows.Next() {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+// contactColumns is the canonical select list shared by contact queries.
+const contactColumns = `id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified`
+
+// ListForBookFiltered returns contacts in an address book matching f. Every
+// query is scoped to a single address_book_id (served by the
+// (address_book_id, display_name) index), so it never triggers a full table
+// scan; text predicates run over that narrowed set.
+func (r *contactRepo) ListForBookFiltered(ctx context.Context, addressBookID int64, f ContactFilter) ([]Contact, error) {
+	var sb strings.Builder
+	sb.WriteString(`SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1`)
+	args := []any{addressBookID}
+	placeholder := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+
+	if f.Name != "" {
+		sb.WriteString(` AND display_name ILIKE ` + placeholder("%"+likeEscape(f.Name)+"%"))
+	}
+	if f.Email != "" {
+		sb.WriteString(` AND primary_email ILIKE ` + placeholder("%"+likeEscape(f.Email)+"%"))
+	}
+	if f.Query != "" {
+		p := placeholder("%" + likeEscape(f.Query) + "%")
+		sb.WriteString(` AND (display_name ILIKE ` + p + ` OR primary_email ILIKE ` + p + `)`)
+	}
+	sb.WriteString(` ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC`)
+	if f.Limit > 0 {
+		sb.WriteString(` LIMIT ` + placeholder(f.Limit))
+	}
+	if f.Offset > 0 {
+		sb.WriteString(` OFFSET ` + placeholder(f.Offset))
+	}
+
+	defer observeDB(ctx, "contacts.list_for_book_filtered")()
+	rows, err := r.pool.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2246,12 +2369,16 @@ func nullableTime(value sql.NullTime) *time.Time {
 func scanEvent(scan rowScanner) (Event, error) {
 	var ev Event
 	var summary sql.NullString
+	var description sql.NullString
+	var location sql.NullString
 	var dtstart sql.NullTime
 	var dtend sql.NullTime
-	if err := scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &summary, &dtstart, &dtend, &ev.AllDay, &ev.LastModified); err != nil {
+	if err := scan(&ev.ID, &ev.CalendarID, &ev.UID, &ev.ResourceName, &ev.RawICAL, &ev.ETag, &summary, &description, &location, &dtstart, &dtend, &ev.AllDay, &ev.LastModified); err != nil {
 		return Event{}, err
 	}
 	ev.Summary = nullableString(summary)
+	ev.Description = nullableString(description)
+	ev.Location = nullableString(location)
 	ev.DTStart = nullableTime(dtstart)
 	ev.DTEnd = nullableTime(dtend)
 	return ev, nil
@@ -2297,11 +2424,9 @@ func scanSession(scan rowScanner) (Session, error) {
 	return s, nil
 }
 
-// parseICalFields extracts summary, dtstart, dtend, and all_day from raw iCalendar data.
-func parseICalFields(ical string) (*string, *time.Time, *time.Time, bool) {
-	var summary *string
-	var dtstart, dtend *time.Time
-	allDay := false
+// parseICalFields extracts summary, description, location, dtstart, dtend, and
+// all_day from raw iCalendar data.
+func parseICalFields(ical string) (summary, description, location *string, dtstart, dtend *time.Time, allDay bool) {
 
 	lines := unfoldICalLines(ical)
 	inEvent := false
@@ -2335,6 +2460,10 @@ func parseICalFields(ical string) (*string, *time.Time, *time.Time, bool) {
 		switch key {
 		case "SUMMARY":
 			summary = util.StrPtr(unescapeICalValue(value))
+		case "DESCRIPTION":
+			description = util.StrPtr(unescapeICalValue(value))
+		case "LOCATION":
+			location = util.StrPtr(unescapeICalValue(value))
 		case "DTSTART":
 			t, isAllDay := parseICalDateTime(value, keyPart)
 			if t != nil {
@@ -2349,7 +2478,7 @@ func parseICalFields(ical string) (*string, *time.Time, *time.Time, bool) {
 		}
 	}
 
-	return summary, dtstart, dtend, allDay
+	return summary, description, location, dtstart, dtend, allDay
 }
 
 func unfoldICalLines(ical string) []string {

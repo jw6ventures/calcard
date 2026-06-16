@@ -177,7 +177,7 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		"AppPwdCount":     len(passwords),
 		"RecentEvents":    eventData,
 		"RecentContacts":  contactData,
-		"ShowWelcomeTour": user.OnboardingCompletedAt == nil,
+		"ShowWelcomeTour": user.OnboardingCompletedAt == nil || r.URL.Query().Get("tour") == "1",
 		"DAVEndpoint":     h.davEndpoint(),
 	})
 
@@ -244,4 +244,18 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 		"BirthdayEvents": birthdayEvents,
 	})
 	h.render(w, r, "birthdays.html", data)
+}
+
+// Help shows a dedicated, resumable help page mirroring the first-login welcome
+// tour, plus links to relaunch the interactive tour and reach the community.
+func (h *Handler) Help(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+
+	data := h.withFlash(r, map[string]any{
+		"Title":        "Help",
+		"User":         user,
+		"DAVEndpoint":  h.davEndpoint(),
+		"CommunityURL": h.communityURL(),
+	})
+	h.render(w, r, "help.html", data)
 }

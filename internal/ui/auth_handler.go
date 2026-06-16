@@ -255,6 +255,13 @@ func (h *Handler) davEndpoint() string {
 	return strings.TrimRight(h.cfg.BaseURL, "/") + "/dav"
 }
 
+func (h *Handler) communityURL() string {
+	if h.cfg == nil || strings.TrimSpace(h.cfg.CommunityURL) == "" {
+		return "https://github.com/jw6ventures/calcard/issues"
+	}
+	return strings.TrimSpace(h.cfg.CommunityURL)
+}
+
 // CompleteOnboarding records that the current user has finished (or skipped) the
 // first-login welcome tour, so it is not shown again. Called via fetch from the
 // dashboard tour modal; returns 204 with no body.

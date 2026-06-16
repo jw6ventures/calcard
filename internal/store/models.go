@@ -122,10 +122,33 @@ type Event struct {
 	RawICAL      string
 	ETag         string
 	Summary      *string
+	Description  *string
+	Location     *string
 	DTStart      *time.Time
 	DTEnd        *time.Time
 	AllDay       bool
 	LastModified time.Time
+}
+
+// EventFilter narrows ListForCalendarFiltered. Zero-value fields are ignored,
+// so an empty filter returns every event in the calendar (ordered by start).
+// All set fields are ANDed together; Query matches any of the text fields.
+type EventFilter struct {
+	Start       *time.Time // include events ending at or after Start
+	End         *time.Time // include events starting at or before End
+	Title       string     // case-insensitive substring match on summary
+	Description string     // case-insensitive substring match on description
+	Location    string     // case-insensitive substring match on location
+	Query       string     // case-insensitive substring across summary/description/location
+	Limit       int        // maximum rows to return; <= 0 means no limit
+	Offset      int        // rows to skip, for pagination
+}
+
+// IsZero reports whether the filter neither constrains nor paginates results.
+func (f EventFilter) IsZero() bool {
+	return f.Start == nil && f.End == nil &&
+		f.Title == "" && f.Description == "" && f.Location == "" && f.Query == "" &&
+		f.Limit <= 0 && f.Offset == 0
 }
 
 // AddressBook belongs to a user for CardDAV.
@@ -151,6 +174,22 @@ type Contact struct {
 	PrimaryEmail  *string
 	Birthday      *time.Time
 	LastModified  time.Time
+}
+
+// ContactFilter narrows ListForBookFiltered. Zero-value fields are ignored, so
+// an empty filter returns every contact in the address book (ordered by name).
+// All set fields are ANDed together; Query matches either text field.
+type ContactFilter struct {
+	Name   string // case-insensitive substring match on display name
+	Email  string // case-insensitive substring match on primary email
+	Query  string // case-insensitive substring across display name/email
+	Limit  int    // maximum rows to return; <= 0 means no limit
+	Offset int    // rows to skip, for pagination
+}
+
+// IsZero reports whether the filter neither constrains nor paginates results.
+func (f ContactFilter) IsZero() bool {
+	return f.Name == "" && f.Email == "" && f.Query == "" && f.Limit <= 0 && f.Offset == 0
 }
 
 // AppPassword is a per-client credential for DAV access.

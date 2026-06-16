@@ -341,22 +341,24 @@ func TestEventRepoUpsertParsesFieldsAndPagination(t *testing.T) {
 
 	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test-uid\r\nSUMMARY:Planning Day\r\nDTSTART;VALUE=DATE:20260412\r\nDTEND;VALUE=DATE:20260413\r\nEND:VEVENT\r\nEND:VCALENDAR"
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
         etag = EXCLUDED.etag,
         summary = EXCLUDED.summary,
+        description = EXCLUDED.description,
+        location = EXCLUDED.location,
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
         last_modified = NOW()
-RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `)).
-		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", dtstart, dtend, true).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(1), int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", dtstart, dtend, true, now))
+		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(1), int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, now))
 
 	created, err := repo.Upsert(context.Background(), Event{
 		CalendarID: 7,
@@ -374,10 +376,10 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart,
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM events WHERE calendar_id=$1`)).
 		WithArgs(int64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 ORDER BY last_modified DESC LIMIT $2 OFFSET $3`)).
 		WithArgs(int64(7), 1, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(2), int64(7), "other", "other.ics", rawICAL, "etag-2", nil, nil, nil, false, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(2), int64(7), "other", "other.ics", rawICAL, "etag-2", nil, nil, nil, nil, nil, false, now))
 
 	page, err := repo.ListForCalendarPaginated(context.Background(), 7, 1, 1)
 	if err != nil {
@@ -516,10 +518,10 @@ func TestEventRepoCopyToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *te
 	now := time.Now().UTC()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(1), int64(5), "event-1", "source-name", "BEGIN:VCALENDAR", "etag-src", nil, nil, nil, false, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(1), int64(5), "event-1", "source-name", "BEGIN:VCALENDAR", "etag-src", nil, nil, nil, nil, nil, false, now))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(9), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
@@ -545,7 +547,7 @@ func TestEventRepoAndAddressBookRepoReturnNilOrErrNotFound(t *testing.T) {
 	eventRepo := &eventRepo{pool: db}
 	addressBookRepo := &addressBookRepo{pool: db}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(2), "missing").
 		WillReturnError(sql.ErrNoRows)
 	ev, err := eventRepo.GetByUID(context.Background(), 2, "missing")
@@ -586,10 +588,10 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	bookRepo := &addressBookRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid = ANY($2)`)).
 		WithArgs(int64(7), sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(1), int64(7), "uid-1", "uid-1.ics", "BEGIN:VCALENDAR", "etag-1", "Meeting", now, now.Add(time.Hour), false, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(1), int64(7), "uid-1", "uid-1.ics", "BEGIN:VCALENDAR", "etag-1", "Meeting", nil, nil, now, now.Add(time.Hour), false, now))
 	byUIDs, err := eventRepo.ListByUIDs(context.Background(), 7, []string{"uid-1"})
 	if err != nil {
 		t.Fatalf("ListByUIDs() error = %v", err)
@@ -598,7 +600,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListByUIDs() = %#v", byUIDs)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name=$2`)).
 		WithArgs(int64(7), "missing.ics").
 		WillReturnError(sql.ErrNoRows)
 	resource, err := eventRepo.GetByResourceName(context.Background(), 7, "missing.ics")
@@ -610,10 +612,10 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	}
 
 	since := now.Add(-time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
 		WithArgs(int64(7), since).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, true, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, nil, nil, true, now))
 	modified, err := eventRepo.ListModifiedSince(context.Background(), 7, since)
 	if err != nil {
 		t.Fatalf("ListModifiedSince() error = %v", err)
@@ -622,10 +624,10 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListModifiedSince() = %#v", modified)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified.*FROM events e.*acl_entries.*ORDER BY e.last_modified DESC.*LIMIT \$2`).
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*FROM events e.*acl_entries.*ORDER BY e.last_modified DESC.*LIMIT \$2`).
 		WithArgs(int64(4), 2).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(3), int64(8), "uid-3", "uid-3.ics", "BEGIN:VCALENDAR", "etag-3", nil, nil, nil, false, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(3), int64(8), "uid-3", "uid-3.ics", "BEGIN:VCALENDAR", "etag-3", nil, nil, nil, nil, nil, false, now))
 	recent, err := eventRepo.ListRecentByUser(context.Background(), 4, 2)
 	if err != nil {
 		t.Fatalf("ListRecentByUser() error = %v", err)
@@ -634,10 +636,10 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListRecentByUser() = %#v", recent)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path IN.*e.resource_name.*LIMIT \$2`).
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path IN.*e.resource_name.*LIMIT \$2`).
 		WithArgs(int64(4), 2).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(6), int64(8), "uid-object", "uid-object", "BEGIN:VCALENDAR", "etag-6", "Direct Grant", nil, nil, false, now))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
+			AddRow(int64(6), int64(8), "uid-object", "uid-object", "BEGIN:VCALENDAR", "etag-6", "Direct Grant", nil, nil, nil, nil, false, now))
 	recent, err = eventRepo.ListRecentByUser(context.Background(), 4, 2)
 	if err != nil {
 		t.Fatalf("ListRecentByUser() direct grant error = %v", err)

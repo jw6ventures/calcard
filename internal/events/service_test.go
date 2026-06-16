@@ -30,7 +30,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		if err != nil || cal == nil {
 			t.Fatalf("GetCalendar() err=%v cal=%v", err, cal)
 		}
-		events, err := svc.ListEvents(context.Background(), user, 1)
+		events, err := svc.ListEvents(context.Background(), user, 1, store.EventFilter{})
 		if err != nil || len(events) != 0 {
 			t.Fatalf("ListEvents() err=%v len=%d", err, len(events))
 		}
@@ -239,7 +239,7 @@ func TestServiceEnforcesCalendarObjectACLs(t *testing.T) {
 		}},
 	})
 
-	events, err := svc.ListEvents(context.Background(), delegate, 1)
+	events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
 	if err != nil {
 		t.Fatalf("ListEvents() error = %v", err)
 	}
@@ -415,7 +415,7 @@ func TestServiceListEventsBatchesACLLookups(t *testing.T) {
 		ACLEntries: aclRepo,
 	})
 
-	events, err := svc.ListEvents(context.Background(), delegate, 1)
+	events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
 	if err != nil {
 		t.Fatalf("ListEvents() error = %v", err)
 	}
@@ -693,6 +693,9 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 		}
 	}
 	return out, nil
+}
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
+	return f.ListForCalendar(ctx, calendarID)
 }
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	return nil, nil

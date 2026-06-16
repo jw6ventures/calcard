@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,21 +14,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/events"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
 type Handler struct {
-	cfg    *config.Config
-	store  *store.Store
-	events *events.Service
+	cfg      *config.Config
+	store    *store.Store
+	events   *events.Service
+	contacts *contacts.Service
 }
 
 func NewHandler(cfg *config.Config, st *store.Store) *Handler {
 	return &Handler{
-		cfg:    cfg,
-		store:  st,
-		events: events.NewService(st),
+		cfg:      cfg,
+		store:    st,
+		events:   events.NewService(st),
+		contacts: contacts.NewService(st),
 	}
 }
 
@@ -42,6 +46,8 @@ type eventResponse struct {
 	CalendarID   int64   `json:"calendarId"`
 	ResourceName string  `json:"resourceName"`
 	Summary      *string `json:"summary,omitempty"`
+	Description  *string `json:"description,omitempty"`
+	Location     *string `json:"location,omitempty"`
 	DTStart      *string `json:"dtstart,omitempty"`
 	DTEnd        *string `json:"dtend,omitempty"`
 	AllDay       bool    `json:"allDay"`
@@ -131,7 +137,12 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := h.events.ListEvents(r.Context(), user, calendarID)
+	filter, err := parseEventFilter(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	items, err := h.events.ListEvents(r.Context(), user, calendarID, filter)
 	if err != nil {
 		writeEventError(w, err)
 		return
@@ -310,6 +321,84 @@ func parseCalendarIDAndUID(w http.ResponseWriter, r *http.Request) (int64, strin
 	return calendarID, uid, true
 }
 
+const maxEventSearchLen = 256
+
+const maxEventLimit = 1000
+
+// parseEventFilter builds a store.EventFilter from the request query string.
+// Supported params: start, end (RFC3339 or YYYY-MM-DD), title, description,
+// location, q (matches any text field), limWere it, offset.
+func parseEventFilter(r *http.Request) (store.EventFilter, error) {
+	q := r.URL.Query()
+	var f store.EventFilter
+
+	start, err := parseTimeParam(q.Get("start"))
+	if err != nil {
+		return f, fmt.Errorf("invalid start: %w", err)
+	}
+	f.Start = start
+
+	end, err := parseTimeParam(q.Get("end"))
+	if err != nil {
+		return f, fmt.Errorf("invalid end: %w", err)
+	}
+	f.End = end
+
+	if f.Start != nil && f.End != nil && f.End.Before(*f.Start) {
+		return f, errors.New("end must not be before start")
+	}
+
+	for name, dst := range map[string]*string{
+		"title":       &f.Title,
+		"description": &f.Description,
+		"location":    &f.Location,
+		"q":           &f.Query,
+	} {
+		v := strings.TrimSpace(q.Get(name))
+		if len(v) > maxEventSearchLen {
+			return f, fmt.Errorf("%s is too long (max %d characters)", name, maxEventSearchLen)
+		}
+		*dst = v
+	}
+
+	if raw := q.Get("limit"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			return f, errors.New("invalid limit")
+		}
+		if limit > maxEventLimit {
+			limit = maxEventLimit
+		}
+		f.Limit = limit
+	}
+	if raw := q.Get("offset"); raw != "" {
+		offset, err := strconv.Atoi(raw)
+		if err != nil || offset < 0 {
+			return f, errors.New("invalid offset")
+		}
+		f.Offset = offset
+	}
+
+	return f, nil
+}
+
+// parseTimeParam accepts an RFC3339 timestamp or a bare YYYY-MM-DD date (UTC).
+// An empty string yields a nil time with no error.
+func parseTimeParam(v string) (*time.Time, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return &t, nil
+	}
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return nil, fmt.Errorf("expected RFC3339 or YYYY-MM-DD")
+	}
+	return &t, nil
+}
+
 func toEventResponse(ev store.Event) eventResponse {
 	var dtstart, dtend *string
 	if ev.DTStart != nil {
@@ -325,6 +414,8 @@ func toEventResponse(ev store.Event) eventResponse {
 		CalendarID:   ev.CalendarID,
 		ResourceName: ev.ResourceName,
 		Summary:      ev.Summary,
+		Description:  ev.Description,
+		Location:     ev.Location,
 		DTStart:      dtstart,
 		DTEnd:        dtend,
 		AllDay:       ev.AllDay,

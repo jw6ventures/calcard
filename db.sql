@@ -144,6 +144,8 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_address_books_user_name_lower ON address_books(user_id, LOWER(name));
 
 ALTER TABLE events ADD COLUMN summary TEXT;
+ALTER TABLE events ADD COLUMN description TEXT;
+ALTER TABLE events ADD COLUMN location TEXT;
 ALTER TABLE events ADD COLUMN dtstart TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN dtend TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN all_day BOOLEAN NOT NULL DEFAULT false;

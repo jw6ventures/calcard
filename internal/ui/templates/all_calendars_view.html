@@ -994,7 +994,7 @@
     }
 
     function fetchEventsForMonth(year, month, callback) {
-        var url = '/api/calendars/all/events?year=' + year + '&month=' + month;
+        var url = '/calendars/all/events.json?year=' + year + '&month=' + month;
         fetch(url)
             .then(function(response) {
                 if (!response.ok) throw new Error('Failed to fetch events');

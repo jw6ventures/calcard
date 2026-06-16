@@ -7452,6 +7452,10 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 	return result, nil
 }
 
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
+	return f.ListForCalendar(ctx, calendarID)
+}
+
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	events, _ := f.ListForCalendar(ctx, calendarID)
 	return &store.PaginatedResult[store.Event]{
@@ -7576,6 +7580,10 @@ func (e *errorEventRepo) ListForCalendar(ctx context.Context, calendarID int64) 
 	return nil, errors.New("fail")
 }
 
+func (e *errorEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
+	return nil, errors.New("fail")
+}
+
 func (e *errorEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	return nil, errors.New("fail")
 }
@@ -7664,6 +7672,10 @@ func (f *fakeContactRepo) ListForBook(ctx context.Context, addressBookID int64) 
 		result = append(result, copy)
 	}
 	return result, nil
+}
+
+func (f *fakeContactRepo) ListForBookFiltered(ctx context.Context, addressBookID int64, _ store.ContactFilter) ([]store.Contact, error) {
+	return f.ListForBook(ctx, addressBookID)
 }
 
 func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*store.PaginatedResult[store.Contact], error) {

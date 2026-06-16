@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -472,6 +474,86 @@ func TestListEventsSuccessAndUnauthorized(t *testing.T) {
 	}
 }
 
+func TestListEventsFilter(t *testing.T) {
+	strptr := func(s string) *string { return &s }
+	tm := func(s string) *time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("bad time %q: %v", s, err)
+		}
+		return &v
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{
+			"1:a": {CalendarID: 1, UID: "a", ResourceName: "a", ETag: "e", Summary: strptr("Team standup"), Location: strptr("Room 1"), DTStart: tm("2026-06-10T09:00:00Z")},
+			"1:b": {CalendarID: 1, UID: "b", ResourceName: "b", ETag: "e", Summary: strptr("Budget review"), Description: strptr("Discuss Q3 budget"), DTStart: tm("2026-06-20T09:00:00Z")},
+			"1:c": {CalendarID: 1, UID: "c", ResourceName: "c", ETag: "e", Summary: strptr("Lunch"), Location: strptr("Cafe Paris"), DTStart: tm("2026-07-01T12:00:00Z")},
+		}},
+	})
+
+	listUIDs := func(query string) []string {
+		req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events?"+query, nil)
+		req = withUserAndRoute(req, "1", "")
+		rec := httptest.NewRecorder()
+		handler.ListEvents(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ListEvents(%q) status = %d, body=%s", query, rec.Code, rec.Body.String())
+		}
+		var out []eventResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		uids := make([]string, len(out))
+		for i, ev := range out {
+			uids[i] = ev.UID
+		}
+		return uids
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"title", "title=team", []string{"a"}},
+		{"description", "description=Q3", []string{"b"}},
+		{"location", "location=paris", []string{"c"}},
+		{"q across fields", "q=budget", []string{"b"}},
+		{"date range", "start=2026-06-15&end=2026-06-30", []string{"b"}},
+		{"date-only start orders by dtstart", "start=2026-06-01", []string{"a", "b", "c"}},
+		{"no match", "title=nonexistent", []string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := listUIDs(tc.query)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("query %q = %v, want %v", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestListEventsFilterInvalidParams(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{}},
+	})
+	for _, query := range []string{"start=not-a-date", "end=2026-13-40", "limit=-1", "start=2026-06-10&end=2026-06-01"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events?"+query, nil)
+		req = withUserAndRoute(req, "1", "")
+		rec := httptest.NewRecorder()
+		handler.ListEvents(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("ListEvents(%q) status = %d, want 400", query, rec.Code)
+		}
+	}
+}
+
 func TestListEventsInvalidCalendarID(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{})
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/x/events", nil)
@@ -910,6 +992,56 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 			out = append(out, ev)
 		}
 	}
+	return out, nil
+}
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	all, _ := f.ListForCalendar(ctx, calendarID)
+	contains := func(p *string, term string) bool {
+		return p != nil && strings.Contains(strings.ToLower(*p), strings.ToLower(term))
+	}
+	var out []store.Event
+	for _, ev := range all {
+		if filter.Start != nil {
+			end := ev.DTEnd
+			if end == nil {
+				end = ev.DTStart
+			}
+			if end == nil || end.Before(*filter.Start) {
+				continue
+			}
+		}
+		if filter.End != nil && (ev.DTStart == nil || ev.DTStart.After(*filter.End)) {
+			continue
+		}
+		if filter.Title != "" && !contains(ev.Summary, filter.Title) {
+			continue
+		}
+		if filter.Description != "" && !contains(ev.Description, filter.Description) {
+			continue
+		}
+		if filter.Location != "" && !contains(ev.Location, filter.Location) {
+			continue
+		}
+		if filter.Query != "" &&
+			!contains(ev.Summary, filter.Query) &&
+			!contains(ev.Description, filter.Query) &&
+			!contains(ev.Location, filter.Query) {
+			continue
+		}
+		out = append(out, ev)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		switch {
+		case out[i].DTStart == nil && out[j].DTStart == nil:
+			return out[i].LastModified.After(out[j].LastModified)
+		case out[i].DTStart == nil:
+			return false
+		case out[j].DTStart == nil:
+			return true
+		default:
+			return out[i].DTStart.Before(*out[j].DTStart)
+		}
+	})
 	return out, nil
 }
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {

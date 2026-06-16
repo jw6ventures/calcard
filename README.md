@@ -99,6 +99,7 @@ Environment variables:
 | --- | --- | --- |
 | `APP_LISTEN_ADDR` | false | (Default `:8080`) Bind address|
 | `APP_BASE_URL` | false | (Default: `http://localhost:8080`) The URL that users will access for example: `https://calcard.example.com` |
+| `APP_COMMUNITY_URL` | false | (Default: `https://github.com/jw6ventures/calcard/issues`) Link used by the "Reach out to the community" buttons on the Help page and welcome tour |
 | `APP_DB_DSN` | true | PostgreSQL DSN (ex. `postgres://postgres:postgres@postgres:5432/app?sslmode=disable` ). Required unless you provide `APP_DB_HOST`, `APP_DB_NAME`, `APP_DB_USER`, and `APP_DB_PASSWORD`. |
 | `APP_DB_HOST` | true | Required when not providing `APP_DB_DSN`. |
 | `APP_DB_NAME` | true | Required when not providing `APP_DB_DSN`. |

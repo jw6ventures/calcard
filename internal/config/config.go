@@ -9,8 +9,9 @@ import (
 )
 
 type Config struct {
-	ListenAddr string
-	BaseURL    string
+	ListenAddr   string
+	BaseURL      string
+	CommunityURL string
 
 	DB struct {
 		DSN string
@@ -37,6 +38,7 @@ func Load() (*Config, error) {
 
 	cfg.ListenAddr = getenvDefault("APP_LISTEN_ADDR", ":8080")
 	cfg.BaseURL = getenvDefault("APP_BASE_URL", "http://localhost:8080")
+	cfg.CommunityURL = getenvDefault("APP_COMMUNITY_URL", "https://github.com/jw6ventures/calcard/issues")
 	cfg.DB.DSN = os.Getenv("APP_DB_DSN")
 
 	if cfg.DB.DSN == "" {

@@ -14,7 +14,7 @@ DTEND:20231226
 END:VEVENT
 END:VCALENDAR`
 
-	summary, dtstart, dtend, allDay := parseICalFields(ical)
+	summary, _, _, dtstart, dtend, allDay := parseICalFields(ical)
 
 	if summary == nil || *summary != "Test Event" {
 		t.Errorf("expected summary 'Test Event', got %v", summary)
@@ -42,7 +42,7 @@ DTEND:20231225T150000Z
 END:VEVENT
 END:VCALENDAR`
 
-	summary, dtstart, dtend, allDay := parseICalFields(ical)
+	summary, _, _, dtstart, dtend, allDay := parseICalFields(ical)
 
 	if summary == nil || *summary != "Meeting" {
 		t.Errorf("expected summary 'Meeting', got %v", summary)
@@ -70,7 +70,7 @@ DTEND;TZID=America/New_York:20240201T130000
 END:VEVENT
 END:VCALENDAR`
 
-	summary, dtstart, dtend, allDay := parseICalFields(ical)
+	summary, _, _, dtstart, dtend, allDay := parseICalFields(ical)
 
 	if summary == nil || *summary != "Meeting East" {
 		t.Errorf("expected summary 'Meeting East', got %v", summary)
@@ -99,7 +99,7 @@ DTEND:20240201T123000-0500
 END:VEVENT
 END:VCALENDAR`
 
-	summary, dtstart, dtend, allDay := parseICalFields(ical)
+	summary, _, _, dtstart, dtend, allDay := parseICalFields(ical)
 
 	if summary == nil || *summary != "Offset Event" {
 		t.Errorf("expected summary 'Offset Event', got %v", summary)
@@ -123,11 +123,31 @@ func TestParseICalFieldsWithFoldedLines(t *testing.T) {
 	// Lines are folded by CRLF followed by space - the unfold regex handles this
 	ical := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Long summary\r\nDTSTART:20231225\r\nEND:VEVENT\r\nEND:VCALENDAR"
 
-	summary, _, _, _ := parseICalFields(ical)
+	summary, _, _, _, _, _ := parseICalFields(ical)
 
 	expected := "Long summary"
 	if summary == nil || *summary != expected {
 		t.Errorf("expected summary %q, got %v", expected, summary)
+	}
+}
+
+func TestParseICalFieldsDescriptionLocation(t *testing.T) {
+	ical := `BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Team sync
+DESCRIPTION:Quarterly planning\, bring notes
+LOCATION:Room 4B
+DTSTART:20231225T140000Z
+END:VEVENT
+END:VCALENDAR`
+
+	_, description, location, _, _, _ := parseICalFields(ical)
+
+	if description == nil || *description != "Quarterly planning, bring notes" {
+		t.Errorf("expected unescaped description, got %v", description)
+	}
+	if location == nil || *location != "Room 4B" {
+		t.Errorf("expected location 'Room 4B', got %v", location)
 	}
 }
 

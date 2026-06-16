@@ -1,0 +1,132 @@
+{{define "content"}}
+<style>
+    .help-hero {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
+        border-radius: var(--border-radius-lg);
+        padding: 1.75rem;
+        margin-bottom: 1.5rem;
+    }
+    .help-hero p {
+        color: var(--text-secondary);
+        max-width: 60ch;
+    }
+    .help-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-top: 1.25rem;
+    }
+    .help-section {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
+        border-radius: var(--border-radius-lg);
+        padding: 1.5rem;
+        margin-bottom: 1.25rem;
+    }
+    .help-section h2 {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        font-size: 1.25rem;
+        margin: 0 0 0.75rem 0;
+    }
+    .help-step-num {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        flex-shrink: 0;
+        border-radius: 9999px;
+        background: var(--primary);
+        color: #fff;
+        font-size: 0.9rem;
+        font-weight: 700;
+    }
+    .help-section p {
+        color: var(--text-secondary);
+        margin: 0 0 0.75rem 0;
+    }
+    .help-section ul {
+        color: var(--text-secondary);
+        margin: 0 0 0.75rem 0;
+        padding-left: 1.25rem;
+    }
+    .help-section li {
+        margin-bottom: 0.4rem;
+    }
+    .help-section a {
+        color: var(--primary);
+    }
+    .help-url {
+        display: block;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-primary);
+        border-radius: var(--border-radius);
+        padding: 0.625rem 0.875rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.85rem;
+        color: var(--text-primary);
+        word-break: break-all;
+        margin: 0.25rem 0 0.75rem 0;
+    }
+</style>
+
+<h1>Help &amp; Getting Started</h1>
+
+<div class="help-hero">
+    <p>CalCard hosts your calendars and contacts and syncs them to any CalDAV/CardDAV
+    app. This page walks through everything in the welcome tour — at your own pace, and
+    always here when you need it again.</p>
+    <div class="help-actions">
+        <a class="btn btn-primary" href="/?tour=1">Start tutorial</a>
+        <a class="btn btn-secondary" href="{{.CommunityURL}}" target="_blank" rel="noopener">Reach out to the community</a>
+    </div>
+</div>
+
+<div class="help-section">
+    <h2><span class="help-step-num">1</span> Find your way around</h2>
+    <p>Use the top navigation to reach your <a href="/">Dashboard</a>,
+    <a href="/calendars">Calendars</a>, <a href="/addressbooks">Address Books</a>,
+    <a href="/birthdays">Birthdays</a>, and <a href="/app-passwords">App Passwords</a> at any time.
+    The 🌙 / ☀️ button in the header toggles light and dark mode.</p>
+</div>
+
+<div class="help-section">
+    <h2><span class="help-step-num">2</span> Connect a client app</h2>
+    <p>Add this server URL to Apple Calendar, Thunderbird, DAVx5, or any other
+    CalDAV/CardDAV client:</p>
+    <code class="help-url">{{.DAVEndpoint}}</code>
+    <p>Sign in with your email and an <strong>app password</strong> (created in step 4) —
+    not your login password. Your devices will then sync automatically.</p>
+</div>
+
+<div class="help-section">
+    <h2><span class="help-step-num">3</span> Calendars &amp; contacts</h2>
+    <p>Create and manage your collections right here in the web UI:</p>
+    <ul>
+        <li><a href="/calendars">Calendars</a> — add calendars, events, and import/export <code>.ics</code> files.</li>
+        <li><a href="/addressbooks">Address Books</a> — keep contacts that sync to your phone and desktop.</li>
+    </ul>
+    <p>Everything you add here shows up in your connected apps, and vice versa.</p>
+</div>
+
+<div class="help-section">
+    <h2><span class="help-step-num">4</span> App passwords</h2>
+    <p>Client apps authenticate with <strong>app passwords</strong> instead of your
+    login credentials, so you can revoke a single device without affecting the others.</p>
+    <p>Head to <a href="/app-passwords">App Passwords</a> to create one, then paste it into
+    your calendar/contacts app alongside the server URL. That's it — you're all set!</p>
+</div>
+
+<div class="help-section">
+    <h2>Still stuck?</h2>
+    <p>Questions, bug reports, and feature ideas are all welcome. Reach the community and
+    open an issue on GitHub:</p>
+    <div class="help-actions">
+        <a class="btn btn-secondary" href="{{.CommunityURL}}" target="_blank" rel="noopener">Reach out to the community</a>
+    </div>
+</div>
+{{end}}
+{{template "base" .}}
