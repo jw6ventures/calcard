@@ -1,32 +1,102 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
 
-// AddressBooks displays the user's address books.
+type addressBookShareView struct {
+	User      store.User
+	Editor    bool
+	CreatedAt time.Time
+}
+
+// AddressBooks displays the address books the user can access, with sharing
+// controls for the ones they own.
 func (h *Handler) AddressBooks(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
-	books, err := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
+	books, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
 		http.Error(w, "failed to load address books", http.StatusInternalServerError)
 		return
 	}
+	users, err := h.store.Users.ListActive(r.Context())
+	if err != nil {
+		http.Error(w, "failed to load users", http.StatusInternalServerError)
+		return
+	}
+	userMap := make(map[int64]store.User, len(users))
+	for _, u := range users {
+		userMap[u.ID] = u
+	}
+
+	type addressBookView struct {
+		Access          contacts.AddressBookAccess
+		Shares          []addressBookShareView
+		ShareCandidates []store.User
+	}
+
+	items := make([]addressBookView, 0, len(books))
+	for _, book := range books {
+		bv := addressBookView{Access: book}
+		if !book.Shared {
+			shares, err := h.addressBookShareViews(r.Context(), user, book.ID, userMap)
+			if err != nil {
+				http.Error(w, "failed to load shares", http.StatusInternalServerError)
+				return
+			}
+			bv.Shares = shares
+			shared := make(map[int64]struct{}, len(shares))
+			for _, s := range shares {
+				shared[s.User.ID] = struct{}{}
+			}
+			for _, candidate := range users {
+				if candidate.ID == user.ID {
+					continue
+				}
+				if _, ok := shared[candidate.ID]; ok {
+					continue
+				}
+				bv.ShareCandidates = append(bv.ShareCandidates, candidate)
+			}
+		}
+		items = append(items, bv)
+	}
+
 	data := h.withFlash(r, map[string]any{
-		"Title": "Address Books",
-		"User":  user,
-		"Books": books,
+		"Title":            "Address Books",
+		"User":             user,
+		"Books":            books,
+		"AddressBookViews": items,
 	})
 	h.render(w, r, "addressbooks.html", data)
+}
+
+func (h *Handler) addressBookShareViews(ctx context.Context, owner *store.User, bookID int64, userMap map[int64]store.User) ([]addressBookShareView, error) {
+	shares, err := h.contacts.ListAddressBookShares(ctx, owner, bookID)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]addressBookShareView, 0, len(shares))
+	for _, s := range shares {
+		u, ok := userMap[s.UserID]
+		if !ok {
+			continue
+		}
+		views = append(views, addressBookShareView{User: u, Editor: s.Editor, CreatedAt: s.CreatedAt})
+	}
+	return views, nil
 }
 
 // CreateAddressBook creates a new address book.
@@ -97,6 +167,78 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 	h.redirect(w, r, "/addressbooks", map[string]string{"status": "deleted"})
 }
 
+// ShareAddressBook shares an address book with another user.
+func (h *Handler) ShareAddressBook(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid form"})
+		return
+	}
+	user, _ := auth.UserFromContext(r.Context())
+	bookID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid address book"})
+		return
+	}
+	targetID, err := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
+	if err != nil || targetID == 0 {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid user"})
+		return
+	}
+	editor := strings.EqualFold(strings.TrimSpace(r.FormValue("role")), "editor")
+	if err := h.contacts.ShareAddressBook(r.Context(), user, bookID, targetID, editor); err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
+		return
+	}
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "shared"})
+}
+
+// UnshareAddressBook removes a share (owner) or leaves a shared book (sharee).
+func (h *Handler) UnshareAddressBook(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+	bookID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid address book"})
+		return
+	}
+	targetID, err := strconv.ParseInt(chi.URLParam(r, "userId"), 10, 64)
+	if err != nil || targetID == 0 {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": "invalid user"})
+		return
+	}
+	if err := h.contacts.UnshareAddressBook(r.Context(), user, bookID, targetID); err != nil {
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
+		return
+	}
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "updated"})
+}
+
+// writeContactAccessError maps a contacts.Service error to an HTTP response for
+// non-redirecting handlers (hidden books are 404; a sharee lacking a privilege
+// is 403).
+func (h *Handler) writeContactAccessError(w http.ResponseWriter, err error) {
+	switch contacts.StatusCode(err) {
+	case http.StatusNotFound:
+		http.Error(w, "not found", http.StatusNotFound)
+	case http.StatusForbidden:
+		http.Error(w, "forbidden", http.StatusForbidden)
+	default:
+		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+	}
+}
+
+func addressBookShareError(err error) string {
+	switch contacts.StatusCode(err) {
+	case http.StatusNotFound:
+		return "not found"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusBadRequest:
+		return "invalid request"
+	default:
+		return "failed to update sharing"
+	}
+}
+
 // ViewAddressBook displays an address book and its contacts.
 func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -105,13 +247,14 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, _ := auth.UserFromContext(r.Context())
-	book, err := h.store.AddressBooks.GetByID(r.Context(), id)
+	book, err := h.contacts.GetAddressBook(r.Context(), user, id)
 	if err != nil {
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
+		h.writeContactAccessError(w, err)
 		return
 	}
-	if book == nil || book.UserID != user.ID {
-		http.Error(w, "not found", http.StatusNotFound)
+	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
+	if err != nil {
+		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
 		return
 	}
 
@@ -145,11 +288,17 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Get all address books for the move contact dropdown
-	allBooks, err := h.store.AddressBooks.ListByUser(r.Context(), user.ID)
+	// Get the address books the user may move contacts into (editor access).
+	accessibleBooks, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
 		http.Error(w, "failed to load address books", http.StatusInternalServerError)
 		return
+	}
+	allBooks := make([]store.AddressBook, 0, len(accessibleBooks))
+	for _, b := range accessibleBooks {
+		if b.Editor {
+			allBooks = append(allBooks, b.AddressBook)
+		}
 	}
 
 	totalPages := (result.TotalCount + limit - 1) / limit
@@ -157,6 +306,8 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 		"Title":           book.Name + " - Address Book",
 		"User":            user,
 		"AddressBook":     book,
+		"CanEdit":         access.Editor,
+		"Shared":          access.Shared,
 		"AllAddressBooks": allBooks,
 		"Contacts":        contactData,
 		"Page":            page,
@@ -184,14 +335,7 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, _ := auth.UserFromContext(r.Context())
-	book, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
-	if err != nil {
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
-		return
-	}
-	if book == nil || book.UserID != user.ID {
-		http.Error(w, "not found", http.StatusNotFound)
+	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
 		return
 	}
 
@@ -226,6 +370,28 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_created"})
 }
 
+// requireEditableAddressBook resolves an address book the current user may
+// modify (owner or editor share). It writes the appropriate error response and
+// returns ok=false when access is denied.
+func (h *Handler) requireEditableAddressBook(w http.ResponseWriter, r *http.Request, bookID int64) (*store.AddressBook, bool) {
+	user, _ := auth.UserFromContext(r.Context())
+	book, err := h.contacts.GetAddressBook(r.Context(), user, bookID)
+	if err != nil {
+		h.writeContactAccessError(w, err)
+		return nil, false
+	}
+	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
+	if err != nil {
+		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		return nil, false
+	}
+	if !access.Editor {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	return book, true
+}
+
 // UpdateContact updates an existing contact.
 func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -245,14 +411,7 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, _ := auth.UserFromContext(r.Context())
-	book, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
-	if err != nil {
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
-		return
-	}
-	if book == nil || book.UserID != user.ID {
-		http.Error(w, "not found", http.StatusNotFound)
+	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
 		return
 	}
 
@@ -310,14 +469,7 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, _ := auth.UserFromContext(r.Context())
-	book, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
-	if err != nil {
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
-		return
-	}
-	if book == nil || book.UserID != user.ID {
-		http.Error(w, "not found", http.StatusNotFound)
+	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
 		return
 	}
 
@@ -362,25 +514,23 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 
 	user, _ := auth.UserFromContext(r.Context())
 
-	// Verify source address book ownership
-	sourceBook, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
+	// Moving = remove from source + create in target, so the user needs editor
+	// access (owner or write share) on both books.
+	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
+		return
+	}
+	targetBook, err := h.contacts.GetAddressBook(r.Context(), user, targetBookID)
 	if err != nil {
-		http.Error(w, "failed to load source address book", http.StatusInternalServerError)
-		return
-	}
-	if sourceBook == nil || sourceBook.UserID != user.ID {
-		http.Error(w, "source address book not found", http.StatusNotFound)
-		return
-	}
-
-	// Verify target address book ownership
-	targetBook, err := h.store.AddressBooks.GetByID(r.Context(), targetBookID)
-	if err != nil {
-		http.Error(w, "failed to load target address book", http.StatusInternalServerError)
-		return
-	}
-	if targetBook == nil || targetBook.UserID != user.ID {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "target address book not found"})
+		return
+	}
+	targetAccess, err := h.contacts.AddressBookAccessFor(r.Context(), user, *targetBook)
+	if err != nil {
+		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		return
+	}
+	if !targetAccess.Editor {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "cannot write to target address book"})
 		return
 	}
 
@@ -431,14 +581,7 @@ func (h *Handler) ImportAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, _ := auth.UserFromContext(r.Context())
-	book, err := h.store.AddressBooks.GetByID(r.Context(), bookID)
-	if err != nil {
-		http.Error(w, "failed to load address book", http.StatusInternalServerError)
-		return
-	}
-	if book == nil || book.UserID != user.ID {
-		http.Error(w, "not found", http.StatusNotFound)
+	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
 		return
 	}
 

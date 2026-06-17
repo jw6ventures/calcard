@@ -1,6 +1,11 @@
 {{define "content"}}
 <style>
     .page-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 1rem;
         margin-bottom: 2rem;
     }
 
@@ -9,8 +14,32 @@
         margin-top: 0.5rem;
     }
 
+    .page-header-actions {
+        display: flex;
+        gap: 0.5rem;
+        flex-shrink: 0;
+        flex-wrap: wrap;
+    }
+
+    .page-header-actions .btn {
+        white-space: nowrap;
+    }
+
+    /* type="button" elements get base.html's gray secondary style on
+       specificity; force primary buttons back to the accent color. */
+    .btn.btn-primary {
+        background: var(--primary);
+        color: #fff;
+    }
+
+    .btn.btn-primary:hover:not(:disabled) {
+        background: var(--primary-dark);
+        box-shadow: var(--shadow-md);
+    }
+
     .calendars-grid {
         display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
         gap: 1.5rem;
         margin-bottom: 2rem;
     }
@@ -20,19 +49,17 @@
         border-radius: var(--border-radius-lg);
         box-shadow: var(--shadow);
         overflow: hidden;
-        transition: box-shadow 0.2s;
+        transition: box-shadow 0.2s, transform 0.2s;
     }
 
     .calendar-card:hover {
-        box-shadow: var(--shadow-md);
+        box-shadow: var(--shadow-lg);
+        transform: translateY(-2px);
     }
 
     .calendar-card-header {
         padding: 1.25rem 1.5rem;
         color: #fff;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
     }
 
     .calendar-name {
@@ -44,8 +71,9 @@
     }
 
     .calendar-meta {
-        font-size: 0.875rem;
+        font-size: 0.8rem;
         opacity: 0.9;
+        margin-top: 0.35rem;
     }
 
     .calendar-card-body {
@@ -54,7 +82,7 @@
 
     .calendar-info {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
         gap: 1rem;
         margin-bottom: 1.25rem;
         padding-bottom: 1.25rem;
@@ -78,86 +106,67 @@
     .info-value {
         color: var(--gray-800);
         font-weight: 500;
+        word-break: break-word;
     }
 
     .calendar-actions {
         display: flex;
-        gap: 0.5rem;
-        flex-wrap: wrap;
-    }
-
-    .share-section {
-        margin-top: 1.25rem;
-        padding-top: 1.25rem;
-        border-top: 1px solid var(--gray-200);
-    }
-
-    .share-section h4 {
-        font-size: 0.9rem;
-        color: var(--gray-700);
-        margin-bottom: 0.75rem;
-        font-weight: 600;
-    }
-
-    .share-form {
-        display: flex;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-    }
-
-    .share-form select {
-        flex: 1;
-        max-width: 300px;
-    }
-
-    .shares-list {
-        display: flex;
         flex-direction: column;
-        gap: 0.5rem;
-    }
-
-    .share-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.75rem;
-        background: var(--gray-50);
-        border-radius: var(--border-radius);
-        border: 1px solid var(--gray-200);
-    }
-
-    .share-email {
-        color: var(--gray-700);
-        font-weight: 500;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-
-    .share-email::before {
-        content: "👤";
-    }
-
-    .create-calendar-card {
-        background: var(--bg-secondary);
-        border-radius: var(--border-radius-lg);
-        box-shadow: var(--shadow);
-        padding: 1.5rem;
-    }
-
-    .create-calendar-card h3 {
-        margin-bottom: 1rem;
-    }
-
-    .create-form {
-        display: flex;
         gap: 0.75rem;
-        align-items: flex-end;
     }
 
-    .create-form label {
+    .view-btn {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .action-row {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .action-row > * {
         flex: 1;
-        max-width: 400px;
+    }
+
+    .action-row .btn,
+    .action-row button {
+        width: 100%;
+        justify-content: center;
+        white-space: nowrap;
+    }
+
+    .action-row .btn-secondary {
+        background: var(--gray-100);
+        color: var(--gray-700);
+    }
+
+    .action-row .btn-secondary:hover:not(:disabled) {
+        background: var(--gray-200);
+    }
+
+    .delete-form {
+        display: flex;
+    }
+
+    .delete-form button {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .delete-form .btn-danger {
+        background: var(--danger);
+        color: #fff;
+    }
+
+    .delete-form .btn-danger:hover:not(:disabled) {
+        background: var(--danger-dark);
+    }
+
+    .share-count {
+        margin-left: 0.35rem;
+        opacity: 0.85;
+        font-weight: 400;
     }
 
     .empty-state {
@@ -182,6 +191,7 @@
         color: var(--gray-500);
     }
 
+    /* Modal */
     .modal-overlay {
         position: fixed;
         inset: 0;
@@ -201,7 +211,7 @@
         background: var(--bg-secondary);
         border-radius: var(--border-radius-lg);
         box-shadow: var(--shadow-lg);
-        max-width: 420px;
+        max-width: 440px;
         width: 100%;
         padding: 1.5rem;
     }
@@ -234,17 +244,88 @@
         color: var(--gray-800);
     }
 
-    .edit-calendar-form {
-        display: flex;
-        flex-direction: column;
-        gap: 1rem;
-    }
-
     .modal-actions {
         display: flex;
         justify-content: flex-end;
         gap: 0.75rem;
         margin-top: 0.5rem;
+    }
+
+    .modal-actions .btn-secondary {
+        background: var(--gray-100);
+        color: var(--gray-700);
+    }
+
+    .modal-actions .btn-secondary:hover:not(:disabled) {
+        background: var(--gray-200);
+    }
+
+    .edit-calendar-form,
+    .create-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .share-form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+
+    .share-form select {
+        width: 100%;
+    }
+
+    .share-controls {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .share-controls select {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .share-controls button {
+        white-space: nowrap;
+    }
+
+    .shares-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin-top: 1.25rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--gray-200);
+    }
+
+    .share-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem;
+        background: var(--gray-50);
+        border-radius: var(--border-radius);
+        border: 1px solid var(--gray-200);
+    }
+
+    .share-email {
+        color: var(--gray-700);
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .share-email::before {
+        content: "👤";
+    }
+
+    .shares-empty {
+        color: var(--gray-500);
+        font-size: 0.9rem;
+        margin-top: 1rem;
     }
 
     .calendar-color-controls {
@@ -275,12 +356,15 @@
     }
 </style>
 
-<div class="page-header" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
+<div class="page-header">
     <div>
         <h1>📅 Calendars</h1>
         <p>Manage CalDAV collections and sharing</p>
     </div>
-    <a href="/calendars/all" class="btn btn-primary">View All Calendars</a>
+    <div class="page-header-actions">
+        <a href="/calendars/all" class="btn btn-secondary">View All Calendars</a>
+        <button type="button" class="btn btn-primary" onclick="openModal('create-calendar')">➕ Create New</button>
+    </div>
 </div>
 
 {{if .CalendarViews}}
@@ -313,53 +397,26 @@
             </div>
 
             <div class="calendar-actions">
-                <a href="/calendars/{{$cal.ID}}" class="btn btn-primary">📖 View Calendar</a>
+                <a href="/calendars/{{$cal.ID}}" class="btn btn-primary view-btn">📖 View Calendar</a>
 
                 {{if not $cal.Shared}}
-                <button type="button" class="btn btn-secondary" onclick="openCalendarEditModal('edit-calendar-{{$cal.ID}}')">Edit</button>
+                <div class="action-row">
+                    <button type="button" class="btn btn-secondary" onclick="openModal('edit-calendar-{{$cal.ID}}')">✏️ Edit</button>
+                    <button type="button" class="btn btn-secondary" onclick="openModal('share-calendar-{{$cal.ID}}')">🔗 Share{{if .Shares}}<span class="share-count">({{len .Shares}})</span>{{end}}</button>
+                </div>
 
-                <form method="post" action="/calendars/{{$cal.ID}}" onsubmit="return confirm('Are you sure you want to delete this calendar?')">
+                <form method="post" action="/calendars/{{$cal.ID}}" class="delete-form" onsubmit="return confirm('Are you sure you want to delete this calendar?')">
                     <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                     <input type="hidden" name="_method" value="DELETE">
                     <button type="submit" class="btn-danger">🗑️ Delete</button>
                 </form>
                 {{else}}
-                <form method="post" action="/calendars/{{$cal.ID}}/shares/{{$.User.ID}}/delete" onsubmit="return confirm('Leave this shared calendar?')">
+                <form method="post" action="/calendars/{{$cal.ID}}/shares/{{$.User.ID}}/delete" class="delete-form" onsubmit="return confirm('Leave this shared calendar?')">
                     <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                     <button type="submit" class="btn-danger">Leave</button>
                 </form>
                 {{end}}
             </div>
-
-            {{if not $cal.Shared}}
-            <div class="share-section">
-                <h4>🔗 Share this calendar</h4>
-                <form method="post" action="/calendars/{{$cal.ID}}/shares" class="share-form">
-                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                    <select name="user_id" required>
-                        <option value="">Select user to share with</option>
-                        {{range .ShareCandidates}}
-                        <option value="{{.ID}}">{{.PrimaryEmail}}</option>
-                        {{end}}
-                    </select>
-                    <button type="submit">Share</button>
-                </form>
-
-                {{if .Shares}}
-                <div class="shares-list">
-                    {{range .Shares}}
-                    <div class="share-item">
-                        <span class="share-email">{{.User.PrimaryEmail}}</span>
-                        <form method="post" action="/calendars/{{$cal.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Remove access for {{.User.PrimaryEmail}}?')">
-                            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                            <button type="submit" class="btn-sm btn-danger">Remove</button>
-                        </form>
-                    </div>
-                    {{end}}
-                </div>
-                {{end}}
-            </div>
-            {{end}}
         </div>
     </div>
     {{end}}
@@ -368,11 +425,11 @@
 {{range .CalendarViews}}
 {{$cal := .Access}}
 {{if not $cal.Shared}}
-<div class="modal-overlay calendar-edit-modal" id="edit-calendar-{{$cal.ID}}">
+<div class="modal-overlay calendar-modal" id="edit-calendar-{{$cal.ID}}">
     <div class="modal-content">
         <div class="modal-header">
             <span class="modal-title">Edit Calendar</span>
-            <button type="button" class="modal-close" onclick="closeCalendarEditModal('edit-calendar-{{$cal.ID}}')">&times;</button>
+            <button type="button" class="modal-close" onclick="closeModal('edit-calendar-{{$cal.ID}}')">&times;</button>
         </div>
         <form method="post" action="/calendars/{{$cal.ID}}" class="edit-calendar-form">
             <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
@@ -392,10 +449,47 @@
                 </div>
             </label>
             <div class="modal-actions">
-                <button type="button" class="btn btn-secondary" onclick="closeCalendarEditModal('edit-calendar-{{$cal.ID}}')">Cancel</button>
+                <button type="button" class="btn btn-secondary" onclick="closeModal('edit-calendar-{{$cal.ID}}')">Cancel</button>
                 <button type="submit" class="btn btn-primary">Save</button>
             </div>
         </form>
+    </div>
+</div>
+
+<div class="modal-overlay calendar-modal" id="share-calendar-{{$cal.ID}}">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">Share “{{$cal.Name}}”</span>
+            <button type="button" class="modal-close" onclick="closeModal('share-calendar-{{$cal.ID}}')">&times;</button>
+        </div>
+        <form method="post" action="/calendars/{{$cal.ID}}/shares" class="share-form">
+            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+            <div class="share-controls">
+                <select name="user_id" required>
+                    <option value="">Select user to share with</option>
+                    {{range .ShareCandidates}}
+                    <option value="{{.ID}}">{{.PrimaryEmail}}</option>
+                    {{end}}
+                </select>
+                <button type="submit">Share</button>
+            </div>
+        </form>
+
+        {{if .Shares}}
+        <div class="shares-list">
+            {{range .Shares}}
+            <div class="share-item">
+                <span class="share-email">{{.User.PrimaryEmail}}</span>
+                <form method="post" action="/calendars/{{$cal.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Remove access for {{.User.PrimaryEmail}}?')">
+                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                    <button type="submit" class="btn-sm btn-danger">Remove</button>
+                </form>
+            </div>
+            {{end}}
+        </div>
+        {{else}}
+        <p class="shares-empty">Not shared with anyone yet.</p>
+        {{end}}
     </div>
 </div>
 {{end}}
@@ -405,43 +499,52 @@
     <div class="empty-state-icon">📅</div>
     <h3>No calendars yet</h3>
     <p>Create your first calendar to get started</p>
+    <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="openModal('create-calendar')">➕ Create Calendar</button>
 </div>
 {{end}}
 
-<div class="create-calendar-card">
-    <h3>➕ Create New Calendar</h3>
-    <form method="post" action="/calendars" class="create-form">
-        <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-        <label>
-            Calendar Name
-            <input type="text" name="name" placeholder="e.g., Work Calendar" required>
-        </label>
-        <label>
-            Calendar Color
-            <div class="calendar-color-controls">
-                <input type="color" name="color" value="{{formColor nil}}">
-                <div class="color-alpha-row">
-                    <input type="range" name="color_alpha" min="0" max="100" value="{{formAlpha nil}}" class="color-alpha-input">
-                    <span class="color-alpha-value">{{formAlpha nil}}%</span>
+<div class="modal-overlay calendar-modal" id="create-calendar">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">➕ Create New Calendar</span>
+            <button type="button" class="modal-close" onclick="closeModal('create-calendar')">&times;</button>
+        </div>
+        <form method="post" action="/calendars" class="create-form">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <label>
+                Calendar Name
+                <input type="text" name="name" placeholder="e.g., Work Calendar" required>
+            </label>
+            <label>
+                Calendar Color
+                <div class="calendar-color-controls">
+                    <input type="color" name="color" value="{{formColor nil}}">
+                    <div class="color-alpha-row">
+                        <input type="range" name="color_alpha" min="0" max="100" value="{{formAlpha nil}}" class="color-alpha-input">
+                        <span class="color-alpha-value">{{formAlpha nil}}%</span>
+                    </div>
                 </div>
+            </label>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('create-calendar')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Calendar</button>
             </div>
-        </label>
-        <button type="submit">Create Calendar</button>
-    </form>
+        </form>
+    </div>
 </div>
 
 <script>
-function openCalendarEditModal(id) {
+function openModal(id) {
     var modal = document.getElementById(id);
     if (modal) modal.classList.add('show');
 }
 
-function closeCalendarEditModal(id) {
+function closeModal(id) {
     var modal = document.getElementById(id);
     if (modal) modal.classList.remove('show');
 }
 
-document.querySelectorAll('.calendar-edit-modal').forEach(function(modal) {
+document.querySelectorAll('.calendar-modal').forEach(function(modal) {
     modal.addEventListener('click', function(e) {
         if (e.target === modal) modal.classList.remove('show');
     });
@@ -449,7 +552,7 @@ document.querySelectorAll('.calendar-edit-modal').forEach(function(modal) {
 
 document.addEventListener('keydown', function(e) {
     if (e.key !== 'Escape') return;
-    document.querySelectorAll('.calendar-edit-modal.show').forEach(function(modal) {
+    document.querySelectorAll('.calendar-modal.show').forEach(function(modal) {
         modal.classList.remove('show');
     });
 });

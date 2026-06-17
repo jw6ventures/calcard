@@ -308,8 +308,11 @@
         <h1>{{.AddressBook.Name}}</h1>
     </div>
     <div style="display: flex; gap: 0.5rem;">
+        {{if .Shared}}<span class="badge badge-success" style="align-self: center;">{{if .CanEdit}}Shared (editor){{else}}Shared (read-only){{end}}</span>{{end}}
+        {{if .CanEdit}}
         <button class="btn btn-secondary" onclick="showImportModal()">Import VCF</button>
         <button class="btn btn-primary" onclick="showCreateContactModal()">+ New Contact</button>
+        {{end}}
     </div>
 </div>
 
@@ -534,6 +537,10 @@
     </div>
 </div>
 
+<script>
+    // Whether the current user may modify contacts in this address book.
+    window.canEditAddressBook = {{if .CanEdit}}true{{else}}false{{end}};
+</script>
 <script>
 (function() {
     // Raw contact data from server
@@ -1044,10 +1051,12 @@
             body += '<div style="white-space:pre-wrap;color:#4a5568">' + escapeHtml(contact.note) + '</div></div>';
         }
         
-        // Add edit button
-        body += '<div class="modal-contact-actions">';
-        body += '<button class="btn btn-primary" onclick="document.getElementById(\'contact-modal\').classList.remove(\'show\'); showEditContactModal(window.contacts.find(function(c) { return c.uid === \'' + escapeHtml(contact.uid) + '\'; }));">Edit Contact</button>';
-        body += '</div>';
+        // Add edit button (only when the user may modify this address book)
+        if (window.canEditAddressBook) {
+            body += '<div class="modal-contact-actions">';
+            body += '<button class="btn btn-primary" onclick="document.getElementById(\'contact-modal\').classList.remove(\'show\'); showEditContactModal(window.contacts.find(function(c) { return c.uid === \'' + escapeHtml(contact.uid) + '\'; }));">Edit Contact</button>';
+            body += '</div>';
+        }
         
         document.getElementById('modal-body').innerHTML = body;
         modal.classList.add('show');

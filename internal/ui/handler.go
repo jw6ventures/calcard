@@ -9,6 +9,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -17,6 +18,7 @@ type Handler struct {
 	cfg         *config.Config
 	store       *store.Store
 	authService *auth.Service
+	contacts    *contacts.Service
 	templates   map[string]*template.Template
 }
 
@@ -27,7 +29,7 @@ const (
 
 // NewHandler creates a new Handler instance.
 func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service) *Handler {
-	return &Handler{cfg: cfg, store: store, authService: authService, templates: templates}
+	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates}
 }
 
 // Dashboard displays the main dashboard.

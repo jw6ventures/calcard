@@ -1224,7 +1224,7 @@ func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
 	body := w.Body.String()
 	expected := []string{
 		`<div class="calendar-card-header" style="background: #33669980;">`,
-		`onclick="openCalendarEditModal('edit-calendar-1')"`,
+		`onclick="openModal('edit-calendar-1')"`,
 		`id="edit-calendar-1"`,
 		`<input type="text" name="name" value="Work" required>`,
 		`<input type="color" name="color" value="#336699">`,

@@ -31,6 +31,19 @@ type addressBookResponse struct {
 	ID          int64   `json:"id"`
 	Name        string  `json:"name"`
 	Description *string `json:"description,omitempty"`
+	Shared      bool    `json:"shared"`
+	ReadOnly    bool    `json:"readOnly"`
+}
+
+type addressBookShareResponse struct {
+	UserID int64  `json:"userId"`
+	Email  string `json:"email"`
+	Role   string `json:"role"`
+}
+
+type shareAddressBookRequest struct {
+	UserID int64  `json:"userId"`
+	Role   string `json:"role"`
 }
 
 type contactResponse struct {
@@ -51,14 +64,14 @@ func (h *Handler) ListAddressBooks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing user", http.StatusUnauthorized)
 		return
 	}
-	books, err := h.contacts.ListAddressBooks(r.Context(), user)
+	books, err := h.contacts.ListAccessibleAddressBooks(r.Context(), user)
 	if err != nil {
 		http.Error(w, "failed to load address books", http.StatusInternalServerError)
 		return
 	}
 	resp := make([]addressBookResponse, 0, len(books))
 	for _, b := range books {
-		resp = append(resp, toAddressBookResponse(b))
+		resp = append(resp, toAddressBookAccessResponse(b))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -78,7 +91,12 @@ func (h *Handler) GetAddressBook(w http.ResponseWriter, r *http.Request) {
 		writeContactError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toAddressBookResponse(*book))
+	access, err := h.contacts.AddressBookAccessFor(r.Context(), user, *book)
+	if err != nil {
+		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, toAddressBookAccessResponse(access))
 }
 
 func (h *Handler) ListContacts(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +213,97 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListAddressBookShares returns the principals an owned address book is shared with.
+func (h *Handler) ListAddressBookShares(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "missing user", http.StatusUnauthorized)
+		return
+	}
+	bookID, ok := parseAddressBookID(w, r)
+	if !ok {
+		return
+	}
+	shares, err := h.contacts.ListAddressBookShares(r.Context(), user, bookID)
+	if err != nil {
+		writeContactError(w, err)
+		return
+	}
+	resp := make([]addressBookShareResponse, 0, len(shares))
+	for _, s := range shares {
+		email := ""
+		if u, err := h.store.Users.GetByID(r.Context(), s.UserID); err == nil && u != nil {
+			email = u.PrimaryEmail
+		}
+		resp = append(resp, addressBookShareResponse{UserID: s.UserID, Email: email, Role: shareRole(s.Editor)})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ShareAddressBook grants another user read-only or editor access to an owned book.
+func (h *Handler) ShareAddressBook(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "missing user", http.StatusUnauthorized)
+		return
+	}
+	bookID, ok := parseAddressBookID(w, r)
+	if !ok {
+		return
+	}
+	var req shareAddressBookRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := h.contacts.ShareAddressBook(r.Context(), user, bookID, req.UserID, roleIsEditor(req.Role)); err != nil {
+		writeContactError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// UnshareAddressBook revokes a share (owner) or leaves a shared book (sharee).
+func (h *Handler) UnshareAddressBook(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "missing user", http.StatusUnauthorized)
+		return
+	}
+	bookID, ok := parseAddressBookID(w, r)
+	if !ok {
+		return
+	}
+	targetID, err := strconv.ParseInt(chi.URLParam(r, "userId"), 10, 64)
+	if err != nil || targetID == 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	if err := h.contacts.UnshareAddressBook(r.Context(), user, bookID, targetID); err != nil {
+		writeContactError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func roleIsEditor(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "editor", "write", "read-write", "readwrite":
+		return true
+	default:
+		return false
+	}
+}
+
+func shareRole(editor bool) string {
+	if editor {
+		return "editor"
+	}
+	return "read"
 }
 
 func decodeContactInput(r *http.Request) (contacts.UpsertInput, error) {
@@ -319,6 +428,13 @@ func toAddressBookResponse(b store.AddressBook) addressBookResponse {
 		Name:        b.Name,
 		Description: b.Description,
 	}
+}
+
+func toAddressBookAccessResponse(a contacts.AddressBookAccess) addressBookResponse {
+	resp := toAddressBookResponse(a.AddressBook)
+	resp.Shared = a.Shared
+	resp.ReadOnly = !a.Editor
+	return resp
 }
 
 func toContactResponse(c store.Contact) contactResponse {

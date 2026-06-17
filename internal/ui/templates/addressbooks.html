@@ -1,12 +1,33 @@
 {{define "content"}}
 <style>
     .page-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
         margin-bottom: 2rem;
     }
 
     .page-header p {
         color: var(--gray-600);
         margin-top: 0.5rem;
+    }
+
+    .page-header .create-trigger {
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+
+    /* type="button" elements get base.html's gray secondary style on
+       specificity; force primary buttons back to the accent color. */
+    .btn.btn-primary {
+        background: var(--primary);
+        color: #fff;
+    }
+
+    .btn.btn-primary:hover:not(:disabled) {
+        background: var(--primary-dark);
+        box-shadow: var(--shadow-md);
     }
 
     .addressbooks-grid {
@@ -78,17 +99,36 @@
         justify-content: center;
     }
 
-    .rename-form {
+    .action-row {
         display: flex;
         gap: 0.5rem;
     }
 
-    .rename-form input {
+    .action-row > * {
         flex: 1;
     }
 
-    .delete-form {
+    .action-row .btn,
+    .action-row button {
         width: 100%;
+        justify-content: center;
+        white-space: nowrap;
+    }
+
+    /* Keep secondary/danger buttons visually distinct from the primary
+       View button (base.html's button[type=submit] selector would otherwise
+       win on specificity and color them all purple). */
+    .action-row .btn-secondary {
+        background: var(--gray-100);
+        color: var(--gray-700);
+    }
+
+    .action-row .btn-secondary:hover:not(:disabled) {
+        background: var(--gray-200);
+    }
+
+    .delete-form {
+        display: flex;
     }
 
     .delete-form button {
@@ -96,26 +136,161 @@
         justify-content: center;
     }
 
-    .create-addressbook-card {
+    .delete-form .btn-danger {
+        background: var(--danger);
+        color: #fff;
+    }
+
+    .delete-form .btn-danger:hover:not(:disabled) {
+        background: var(--danger-dark);
+    }
+
+    .share-count {
+        margin-left: 0.35rem;
+        opacity: 0.85;
+        font-weight: 400;
+    }
+
+    /* Modal */
+    .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(17, 24, 39, 0.55);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem;
+        z-index: 1000;
+    }
+
+    .modal-overlay.show {
+        display: flex;
+    }
+
+    .modal-content {
         background: var(--bg-secondary);
         border-radius: var(--border-radius-lg);
-        box-shadow: var(--shadow);
+        box-shadow: var(--shadow-lg);
+        max-width: 440px;
+        width: 100%;
         padding: 1.5rem;
     }
 
-    .create-addressbook-card h3 {
+    .modal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
         margin-bottom: 1rem;
+    }
+
+    .modal-title {
+        color: var(--gray-900);
+        font-size: 1.25rem;
+        font-weight: 600;
+    }
+
+    .modal-close {
+        background: none;
+        border: none;
+        color: var(--gray-500);
+        cursor: pointer;
+        font-size: 1.5rem;
+        line-height: 1;
+        padding: 0;
+    }
+
+    .modal-close:hover {
+        color: var(--gray-800);
+    }
+
+    .modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 0.75rem;
+        margin-top: 0.5rem;
+    }
+
+    .modal-actions .btn-secondary {
+        background: var(--gray-100);
+        color: var(--gray-700);
+    }
+
+    .modal-actions .btn-secondary:hover:not(:disabled) {
+        background: var(--gray-200);
+    }
+
+    .rename-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .share-form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+
+    .share-form select[name="user_id"] {
+        width: 100%;
+    }
+
+    .share-controls {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .share-controls select {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .share-controls button {
+        white-space: nowrap;
+    }
+
+    .shares-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin-top: 1.25rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--gray-200);
+    }
+
+    .shares-empty {
+        color: var(--gray-500);
+        font-size: 0.9rem;
+        margin-top: 1rem;
+    }
+
+    .share-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem;
+        background: var(--gray-50);
+        border-radius: var(--border-radius);
+        border: 1px solid var(--gray-200);
+    }
+
+    .share-email {
+        color: var(--gray-700);
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .share-email::before {
+        content: "👤";
     }
 
     .create-form {
         display: flex;
-        gap: 0.75rem;
-        align-items: flex-end;
-    }
-
-    .create-form label {
-        flex: 1;
-        max-width: 400px;
+        flex-direction: column;
+        gap: 1rem;
     }
 
     .empty-state {
@@ -142,66 +317,177 @@
 </style>
 
 <div class="page-header">
-    <h1>📇 Address Books</h1>
-    <p>Manage CardDAV collections</p>
+    <div>
+        <h1>📇 Address Books</h1>
+        <p>Manage CardDAV collections</p>
+    </div>
+    <button type="button" class="btn btn-primary create-trigger" onclick="openModal('create-book')">➕ Create New</button>
 </div>
 
-{{if .Books}}
+{{if .AddressBookViews}}
 <div class="addressbooks-grid">
-    {{range .Books}}
+    {{range .AddressBookViews}}
+    {{$book := .Access}}
     <div class="addressbook-card">
         <div class="addressbook-card-header">
-            <a href="/addressbooks/{{.ID}}" style="color: #fff; text-decoration: none;">
+            <a href="/addressbooks/{{$book.ID}}" style="color: #fff; text-decoration: none;">
                 <div class="addressbook-name">
-                    👥 {{.Name}}
+                    👥 {{$book.Name}}
+                    {{if $book.Shared}}<span class="badge badge-success">Shared</span>{{end}}
                 </div>
             </a>
         </div>
 
         <div class="addressbook-card-body">
             <div class="addressbook-info">
-                <div class="info-label">Created</div>
-                <div class="info-value">{{formatTime .CreatedAt}}</div>
+                <div class="info-label">{{if $book.Shared}}Access{{else}}Created{{end}}</div>
+                <div class="info-value">{{if $book.Shared}}{{if $book.Editor}}Shared with you (editor){{else}}Shared with you (read-only){{end}}{{else}}{{formatTime $book.CreatedAt}}{{end}}</div>
             </div>
 
             <div class="addressbook-actions">
-                <a href="/addressbooks/{{.ID}}" class="btn btn-primary view-btn">📖 View Contacts</a>
+                <a href="/addressbooks/{{$book.ID}}" class="btn btn-primary view-btn">📖 View Contacts</a>
 
-                <form method="post" action="/addressbooks/{{.ID}}" class="rename-form">
-                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                    <input type="hidden" name="_method" value="PUT">
-                    <input type="text" name="name" placeholder="New name" required>
-                    <button type="submit" class="btn-secondary">✏️ Rename</button>
-                </form>
+                {{if not $book.Shared}}
+                <div class="action-row">
+                    <button type="button" class="btn btn-secondary" onclick="openModal('rename-book-{{$book.ID}}')">✏️ Rename</button>
+                    <button type="button" class="btn btn-secondary" onclick="openModal('share-book-{{$book.ID}}')">🔗 Share{{if .Shares}}<span class="share-count">({{len .Shares}})</span>{{end}}</button>
+                </div>
 
-                <form method="post" action="/addressbooks/{{.ID}}" class="delete-form" onsubmit="return confirm('Are you sure you want to delete this address book?')">
+                <form method="post" action="/addressbooks/{{$book.ID}}" class="delete-form" onsubmit="return confirm('Are you sure you want to delete this address book?')">
                     <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                     <input type="hidden" name="_method" value="DELETE">
                     <button type="submit" class="btn-danger">🗑️ Delete</button>
                 </form>
+                {{else}}
+                <form method="post" action="/addressbooks/{{$book.ID}}/shares/{{$.User.ID}}/delete" class="delete-form" onsubmit="return confirm('Leave this shared address book?')">
+                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                    <button type="submit" class="btn-danger">Leave</button>
+                </form>
+                {{end}}
             </div>
         </div>
     </div>
     {{end}}
 </div>
+
+{{range .AddressBookViews}}
+{{$book := .Access}}
+{{if not $book.Shared}}
+<div class="modal-overlay addressbook-modal" id="rename-book-{{$book.ID}}">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">Rename Address Book</span>
+            <button type="button" class="modal-close" onclick="closeModal('rename-book-{{$book.ID}}')">&times;</button>
+        </div>
+        <form method="post" action="/addressbooks/{{$book.ID}}" class="rename-form">
+            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+            <input type="hidden" name="_method" value="PUT">
+            <label>
+                Address Book Name
+                <input type="text" name="name" value="{{$book.Name}}" placeholder="New name" required>
+            </label>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('rename-book-{{$book.ID}}')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="modal-overlay addressbook-modal" id="share-book-{{$book.ID}}">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">Share “{{$book.Name}}”</span>
+            <button type="button" class="modal-close" onclick="closeModal('share-book-{{$book.ID}}')">&times;</button>
+        </div>
+        <form method="post" action="/addressbooks/{{$book.ID}}/shares" class="share-form">
+            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+            <select name="user_id" required>
+                <option value="">Select user to share with</option>
+                {{range .ShareCandidates}}
+                <option value="{{.ID}}">{{.PrimaryEmail}}</option>
+                {{end}}
+            </select>
+            <div class="share-controls">
+                <select name="role">
+                    <option value="read">Read-only</option>
+                    <option value="editor">Editor</option>
+                </select>
+                <button type="submit">Share</button>
+            </div>
+        </form>
+
+        {{if .Shares}}
+        <div class="shares-list">
+            {{range .Shares}}
+            <div class="share-item">
+                <span class="share-email">{{.User.PrimaryEmail}} <span class="badge">{{if .Editor}}Editor{{else}}Read-only{{end}}</span></span>
+                <form method="post" action="/addressbooks/{{$book.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Remove access for {{.User.PrimaryEmail}}?')">
+                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                    <button type="submit" class="btn-sm btn-danger">Remove</button>
+                </form>
+            </div>
+            {{end}}
+        </div>
+        {{else}}
+        <p class="shares-empty">Not shared with anyone yet.</p>
+        {{end}}
+    </div>
+</div>
+{{end}}
+{{end}}
 {{else}}
 <div class="empty-state">
     <div class="empty-state-icon">📇</div>
     <h3>No address books yet</h3>
     <p>Create your first address book to start managing contacts</p>
+    <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="openModal('create-book')">➕ Create Address Book</button>
 </div>
 {{end}}
 
-<div class="create-addressbook-card">
-    <h3>➕ Create New Address Book</h3>
-    <form method="post" action="/addressbooks" class="create-form">
-        <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-        <label>
-            Address Book Name
-            <input type="text" name="name" placeholder="e.g., Personal Contacts" required>
-        </label>
-        <button type="submit">Create Address Book</button>
-    </form>
+<div class="modal-overlay addressbook-modal" id="create-book">
+    <div class="modal-content">
+        <div class="modal-header">
+            <span class="modal-title">➕ Create New Address Book</span>
+            <button type="button" class="modal-close" onclick="closeModal('create-book')">&times;</button>
+        </div>
+        <form method="post" action="/addressbooks" class="create-form">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <label>
+                Address Book Name
+                <input type="text" name="name" placeholder="e.g., Personal Contacts" required>
+            </label>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('create-book')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Address Book</button>
+            </div>
+        </form>
+    </div>
 </div>
+
+<script>
+function openModal(id) {
+    var modal = document.getElementById(id);
+    if (modal) modal.classList.add('show');
+}
+
+function closeModal(id) {
+    var modal = document.getElementById(id);
+    if (modal) modal.classList.remove('show');
+}
+
+document.querySelectorAll('.addressbook-modal').forEach(function(modal) {
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('show');
+    });
+});
+
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    document.querySelectorAll('.addressbook-modal.show').forEach(function(modal) {
+        modal.classList.remove('show');
+    });
+});
+</script>
 {{end}}
 {{template "base" .}}

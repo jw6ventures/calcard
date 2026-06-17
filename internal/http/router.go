@@ -178,6 +178,9 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Post("/addressbooks", uiHandler.CreateAddressBook)
 		r.Put("/addressbooks/{id}", uiHandler.RenameAddressBook)
 		r.Delete("/addressbooks/{id}", uiHandler.DeleteAddressBook)
+		r.Post("/addressbooks/{id}/shares", uiHandler.ShareAddressBook)
+		r.Delete("/addressbooks/{id}/shares/{userId}", uiHandler.UnshareAddressBook)
+		r.Post("/addressbooks/{id}/shares/{userId}/delete", uiHandler.UnshareAddressBook) // HTML form fallback
 
 		// Address book import
 		r.Post("/addressbooks/{id}/import", uiHandler.ImportAddressBook)
@@ -213,6 +216,9 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 
 		r.Get("/addressbooks", apiHandler.ListAddressBooks)
 		r.Get("/addressbooks/{id}", apiHandler.GetAddressBook)
+		r.Get("/addressbooks/{id}/shares", apiHandler.ListAddressBookShares)
+		r.Post("/addressbooks/{id}/shares", apiHandler.ShareAddressBook)
+		r.Delete("/addressbooks/{id}/shares/{userId}", apiHandler.UnshareAddressBook)
 		r.Get("/addressbooks/{id}/contacts", apiHandler.ListContacts)
 		r.Get("/addressbooks/{id}/contacts/{uid}", apiHandler.GetContact)
 		r.Post("/addressbooks/{id}/contacts", apiHandler.CreateContact)
