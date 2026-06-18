@@ -1,64 +1,88 @@
+# ---------------------------------------------------------------------------
+# CalCard Helm values
+#
+# Quick start: at minimum set app.baseUrl, the OAuth settings under app.oauth,
+# app.sessionSecret, and either point app.db.* at your Postgres or set
+# postgres.enabled=true to run a bundled instance. Everything else has a
+# working default.
+# ---------------------------------------------------------------------------
+
+# Container image to deploy.
 image:
-  repository: ghcr.io/jw6ventures/calcard
-  tag: "" # Defaults to the chart appVersion when unset.
-  pullPolicy: IfNotPresent
+  repository: ghcr.io/jw6ventures/calcard # Image repository to pull from.
+  tag: "" # Image tag. Defaults to "v<chart appVersion>" when unset.
+  pullPolicy: IfNotPresent # When to pull the image: IfNotPresent, Always, or Never.
 
 nameOverride: "" # Overrides the chart name used for resource names/labels.
 fullnameOverride: "" # Overrides the full resource name (takes precedence over nameOverride).
 
 replicaCount: 1 # HA is theoretically possible, but untested at this point. Recommend 1 until the release notes say otherwise.
 
+# Application configuration. These map directly to the APP_* environment
+# variables the container reads.
 app:
-  baseUrl: "http://localhost:8080"
-  trustedProxies: ""
+  baseUrl: "http://localhost:8080" # Public URL the app is served from. Required. Used for OAuth redirects and to derive ingress.host when that is unset.
+  trustedProxies: "" # Comma-separated CIDRs/IPs to trust for X-Forwarded-* headers (e.g. your ingress/load balancer). Leave empty if not behind a proxy.
+
+  # OAuth / OIDC single sign-on settings. CalCard delegates login to an
+  # external identity provider.
   oauth:
-    clientId: "" # OAuth Client ID
-    clientSecret: "" # OAuth Client Secret - Plain Text
-    clientSecretExistingSecret: # Secret for storing the OAuth Client Secret
-      name: ""
-      key: "APP_OAUTH_CLIENT_SECRET" # OAuth Client Secret
-    issuerUrl: "" # OAuth Issuer URL
-    discoveryUrl: "" # OAuth Client Discovery URL
-  sessionSecret: ""
-  sessionSecretExistingSecret:
-    name: ""
-    key: "APP_SESSION_SECRET"
+    clientId: "" # OAuth Client ID issued by your identity provider.
+    clientSecret: "" # OAuth Client Secret, in plain text. Stored in a generated Secret. Ignored if clientSecretExistingSecret.name is set.
+    clientSecretExistingSecret: # Reference an existing Secret for the OAuth Client Secret instead of clientSecret above.
+      name: "" # Name of the existing Secret. Leave empty to use the plain-text clientSecret.
+      key: "APP_OAUTH_CLIENT_SECRET" # Key within that Secret holding the client secret.
+    issuerUrl: "" # OAuth/OIDC issuer URL (e.g. https://accounts.example.com).
+    discoveryUrl: "" # OIDC discovery document URL (.../.well-known/openid-configuration). Often derivable from issuerUrl.
+
+  sessionSecret: "" # Secret used to sign user session cookies. Set a long random value. Ignored if sessionSecretExistingSecret.name is set.
+  sessionSecretExistingSecret: # Reference an existing Secret for the session secret instead of sessionSecret above.
+    name: "" # Name of the existing Secret. Leave empty to use the plain-text sessionSecret.
+    key: "APP_SESSION_SECRET" # Key within that Secret holding the session secret.
+
+  # Database connection. Required: either point these at an external Postgres,
+  # or set postgres.enabled=true to deploy the bundled one (host is then
+  # auto-derived if left empty).
   db:
-    host: ""
-    port: 5432
-    name: "app"
-    user: "postgres"
-    password: ""
-    sslmode: "disable"
-    existingSecret:
-      name: ""
-      dsnKey: "APP_DB_DSN"
-      userKey: "APP_DB_USER"
-      passwordKey: "APP_DB_PASSWORD"
+    host: "" # Postgres host. Required when postgres.enabled is false. When postgres.enabled is true and this is empty, the in-cluster instance is used automatically.
+    port: 5432 # Postgres port.
+    name: "app" # Database name to connect to.
+    user: "postgres" # Database user.
+    password: "" # Database password. Stored in a generated Secret. Ignored if existingSecret.name is set.
+    sslmode: "disable" # Postgres sslmode (disable, require, verify-ca, verify-full). Use a stronger mode for external databases.
+    existingSecret: # Reference an existing Secret holding the DB credentials instead of generating one from the values above.
+      name: "" # Name of the existing Secret. Leave empty to generate one.
+      dsnKey: "APP_DB_DSN" # Key holding the full connection string (postgres://user:pass@host:port/db?sslmode=...).
+      userKey: "APP_DB_USER" # Key holding the database user.
+      passwordKey: "APP_DB_PASSWORD" # Key holding the database password.
 
+# Kubernetes Service that fronts the app pods.
 service:
-  type: ClusterIP
-  port: 80
+  type: ClusterIP # Service type: ClusterIP, NodePort, or LoadBalancer.
+  port: 80 # Port the Service listens on (the container always listens on 8080).
 
+# Ingress for external HTTP(S) access.
 ingress:
-  enabled: true
-  className: ""
-  host: ""
-  annotations: {}
+  enabled: true # Whether to create an Ingress resource.
+  className: "" # IngressClass name (e.g. nginx, traefik). Leave empty to use the cluster default.
+  host: "" # Hostname to route. When empty, it is derived from app.baseUrl.
+  annotations: {} # Extra annotations for the Ingress (e.g. cert-manager or nginx settings).
   tls:
-    enabled: true
-    secretName: ""
+    enabled: true # Whether to request TLS for the host.
+    secretName: "" # Existing TLS Secret name. Leave empty when cert-manager (or similar) provisions the certificate.
 
+# Optional bundled Postgres. Convenient for getting started; use an external,
+# backed-up database for production.
 postgres:
-  enabled: false
-  image: postgres:16
+  enabled: false # Deploy an in-cluster Postgres StatefulSet. When true, app.db.host can be left empty.
+  image: postgres:16 # Postgres image for the bundled instance.
   persistence:
-    enabled: true
-    size: 500Mi
-    storageClassName: ""
-  resources: {}
+    enabled: true # Use a PersistentVolumeClaim so data survives pod restarts. If false, data is ephemeral.
+    size: 500Mi # Size of the data volume.
+    storageClassName: "" # StorageClass for the PVC. Leave empty to use the cluster default.
+  resources: {} # CPU/memory requests and limits for the Postgres container.
 
-resources: {}
-nodeSelector: {}
-tolerations: []
-affinity: {}
+resources: {} # CPU/memory requests and limits for the app container.
+nodeSelector: {} # Constrain app pods to nodes with matching labels.
+tolerations: [] # Tolerations allowing app pods to schedule onto tainted nodes.
+affinity: {} # Affinity/anti-affinity rules for app pod scheduling.
