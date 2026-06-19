@@ -331,3 +331,21 @@ DROP TRIGGER IF EXISTS trg_contacts_increment_ctag ON contacts;
 CREATE TRIGGER trg_contacts_increment_ctag
 AFTER INSERT OR UPDATE OR DELETE ON contacts
 FOR EACH ROW EXECUTE FUNCTION increment_address_book_ctag();
+
+-- Normalized ACL join keys for object-level access checks. resource_path_norm
+-- and object_acl_path both drop the trailing .ics/.vcf extension so a grant
+-- stored with or without it lines up. Maintained as STORED generated columns so
+-- the normalization is always correct on write and can be indexed.
+ALTER TABLE acl_entries
+    ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
+    GENERATED ALWAYS AS (regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i')) STORED;
+
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || regexp_replace(resource_name, '\.ics$', '', 'i')) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
+    ON acl_entries (principal_href, is_grant, resource_path_norm);
+
+CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
+    ON events (object_acl_path);

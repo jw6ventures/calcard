@@ -290,7 +290,7 @@ func TestCalendarAccessibleReposIncludeObjectGrantedCalendars(t *testing.T) {
 	repo := &calendarRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*events e.*resource_path IN.*ORDER BY shared, name`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*JOIN events e.*e.object_acl_path = g0.resource_path_norm.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
 			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
@@ -306,7 +306,7 @@ func TestCalendarAccessibleReposIncludeObjectGrantedCalendars(t *testing.T) {
 		t.Fatalf("ListAccessible() privileges = %#v, want no collection privileges for object-only grant", accessible[0].Privileges)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*events e.*resource_path IN`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*JOIN events e.*e.object_acl_path = g0.resource_path_norm`).
 		WithArgs(int64(12), int64(4)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
 			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
@@ -636,7 +636,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListRecentByUser() = %#v", recent)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path IN.*e.resource_name.*LIMIT \$2`).
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path_norm = e.object_acl_path.*LIMIT \$2`).
 		WithArgs(int64(4), 2).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(6), int64(8), "uid-object", "uid-object", "BEGIN:VCALENDAR", "etag-6", "Direct Grant", nil, nil, nil, nil, false, now))

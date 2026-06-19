@@ -152,7 +152,7 @@ func TestHandleOAuthCallbackReturnsBadRequestOnExchangeFailure(t *testing.T) {
 
 func TestCreateAndValidateAppPassword(t *testing.T) {
 	var stored store.AppPassword
-	var touched int64
+	touched := make(chan int64, 1)
 	user := &store.User{ID: 9, PrimaryEmail: "user@example.com"}
 
 	service := &Service{
@@ -184,7 +184,7 @@ func TestCreateAndValidateAppPassword(t *testing.T) {
 					}, nil
 				},
 				touchLastUsedFn: func(_ context.Context, id int64) error {
-					touched = id
+					touched <- id
 					return nil
 				},
 			},
@@ -209,8 +209,17 @@ func TestCreateAndValidateAppPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ValidateAppPassword() error = %v", err)
 	}
-	if validatedUser.ID != user.ID || touched != 77 {
-		t.Fatalf("validatedUser = %#v, touched = %d", validatedUser, touched)
+	// touch_last_used now runs asynchronously off the request path.
+	select {
+	case id := <-touched:
+		if id != 77 {
+			t.Fatalf("touched = %d", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TouchLastUsed was not called")
+	}
+	if validatedUser.ID != user.ID {
+		t.Fatalf("validatedUser = %#v", validatedUser)
 	}
 }
 

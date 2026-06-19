@@ -130,19 +130,15 @@ func aclPrincipalListExpr(userParam string) string {
 	return "('DAV:all', 'DAV:authenticated', '/dav/principals/' || " + userParam + "::text || '/')"
 }
 
-func calendarEventACLPathListExpr() string {
-	return `(
-            '/dav/calendars/' || c.id::text || '/' || e.resource_name,
-            '/dav/calendars/' || c.id::text || '/' || regexp_replace(e.resource_name, '\.ics$', ''),
-            '/dav/calendars/' || c.id::text || '/' || regexp_replace(e.resource_name, '\.ics$', '') || '.ics'
-        )`
-}
-
+// Event ACL paths are matched against the normalized columns
+// acl_entries.resource_path_norm and events.object_acl_path (both strip the
+// trailing .ics/.vcf so a grant stored either way lines up). The equality is
+// index-backed.
 func calendarEventACLDenyExpr(userParam string, privileges ...string) string {
 	privilegeList := sqlLiteralList(privileges...)
 	return `EXISTS (
            SELECT 1 FROM acl_entries d
-           WHERE d.resource_path IN ` + calendarEventACLPathListExpr() + `
+           WHERE d.resource_path_norm = e.object_acl_path
              AND d.principal_href IN ` + aclPrincipalListExpr(userParam) + `
              AND d.is_grant = FALSE
              AND d.privilege IN (` + privilegeList + `)
@@ -153,7 +149,7 @@ func calendarEventACLGrantExpr(userParam string, privileges ...string) string {
 	privilegeList := sqlLiteralList(privileges...)
 	return `EXISTS (
            SELECT 1 FROM acl_entries g
-           WHERE g.resource_path IN ` + calendarEventACLPathListExpr() + `
+           WHERE g.resource_path_norm = e.object_acl_path
              AND g.principal_href IN ` + aclPrincipalListExpr(userParam) + `
              AND g.is_grant = TRUE
              AND g.privilege IN (` + privilegeList + `)
@@ -176,10 +172,20 @@ func calendarACLAnyAccessExpr(userParam string) string {
        )`
 }
 
+// calendarObjectACLAnyAccessExpr is true when the principal has any access to at
+// least one object inside calendar c via an object-level ACL. It drives from the
+// principal's grant entries (typically a handful) joined to the matching event,
+// rather than scanning every event in the calendar, then re-applies the full
+// per-privilege grant/deny check so deny semantics are preserved exactly.
 func calendarObjectACLAnyAccessExpr(userParam string) string {
 	return `EXISTS (
-           SELECT 1 FROM events e
-           WHERE e.calendar_id = c.id
+           SELECT 1
+           FROM acl_entries g0
+           JOIN events e
+             ON e.calendar_id = c.id
+            AND e.object_acl_path = g0.resource_path_norm
+           WHERE g0.principal_href IN ` + aclPrincipalListExpr(userParam) + `
+             AND g0.is_grant = TRUE
              AND (
                  ` + calendarEventACLAllowsExpr(userParam, "read", "all") + `
                  OR ` + calendarEventACLAllowsExpr(userParam, "read-free-busy", "read", "all") + `

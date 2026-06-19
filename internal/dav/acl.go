@@ -274,6 +274,16 @@ func (h *Handler) aclDecisionMatchingPrivilege(ctx context.Context, user *store.
 
 func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
 	resourcePath = normalizeDAVResourceIdentity(resourcePath)
+
+	// Within a read request the same resource path is resolved once per
+	// privilege; reuse the cached entries to avoid repeating the query.
+	cache := aclEntryCacheFromContext(ctx)
+	if cache != nil {
+		if entries, ok := cache.get(resourcePath); ok {
+			return entries, nil
+		}
+	}
+
 	candidates := append([]string{resourcePath}, legacyDAVResourcePaths(resourcePath)...)
 	seen := make(map[string]struct{}, len(candidates))
 	var result []store.ACLEntry
@@ -290,6 +300,10 @@ func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string
 			return nil, err
 		}
 		result = append(result, entries...)
+	}
+
+	if cache != nil {
+		cache.put(resourcePath, result)
 	}
 	return result, nil
 }

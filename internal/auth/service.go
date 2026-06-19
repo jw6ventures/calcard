@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -29,6 +30,9 @@ type Service struct {
 	userinfo string
 	provider *oidc.Provider
 	verifier *oidc.IDTokenVerifier
+
+	authMu    sync.Mutex
+	authCache map[string]authCacheEntry
 }
 
 func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (*Service, error) {
@@ -162,6 +166,14 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 }
 
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
+	// Fast path: DAV clients re-send Basic credentials on every request, so a
+	// short-lived cache lets us skip the GetByEmail/FindValidByUser reads and,
+	// crucially, the per-request bcrypt comparison (the dominant CPU cost).
+	cacheKey := authCacheKey(username, password)
+	if user, ok := s.authCacheGet(cacheKey); ok {
+		return user, nil
+	}
+
 	user, err := s.store.Users.GetByEmail(ctx, username)
 	if err != nil {
 		return nil, err
@@ -183,7 +195,8 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 			continue
 		}
 		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
-			_ = s.store.AppPasswords.TouchLastUsed(ctx, t.ID)
+			s.touchLastUsedThrottled(t)
+			s.authCachePut(cacheKey, user, t.ID)
 			return user, nil
 		}
 	}

@@ -112,7 +112,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.Get(w, r)
 	case "PROPFIND":
-		h.Propfind(w, r)
+		h.Propfind(w, r.WithContext(withACLEntryCache(r.Context())))
 	case "PROPPATCH":
 		h.Proppatch(w, r)
 	case "MKCOL":
@@ -124,7 +124,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		h.Delete(w, r)
 	case "REPORT":
-		h.Report(w, r)
+		h.Report(w, r.WithContext(withACLEntryCache(r.Context())))
 	case "COPY":
 		h.Copy(w, r)
 	case "MOVE":
