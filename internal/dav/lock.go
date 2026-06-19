@@ -197,6 +197,7 @@ func (h *Handler) Lock(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Lock", "LOCK %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -590,6 +591,7 @@ func (h *Handler) Unlock(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Unlock", "UNLOCK %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

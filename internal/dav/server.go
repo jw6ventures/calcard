@@ -6,14 +6,19 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+// logClass is the component tag applied to every DAV log line.
+const logClass = "DAV"
 
 // Options configures a DAV server instance.
 type Options struct {
 	Config     *config.Config
 	Store      *store.Store
 	Extensions []Extension
+	Logger     logging.Sink
 }
 
 // Server contains the DAV server state shared by default modules and
@@ -22,6 +27,7 @@ type Server struct {
 	cfg      *config.Config
 	store    *store.Store
 	registry *Registry
+	log      *logging.Logger
 }
 
 // Handler is kept as a package compatibility alias while the DAV entrypoints
@@ -38,7 +44,16 @@ func NewServer(opts Options) *Server {
 			ext.RegisterDAV(registry)
 		}
 	}
-	return &Server{cfg: opts.Config, store: opts.Store, registry: registry}
+	return &Server{cfg: opts.Config, store: opts.Store, registry: registry, log: logging.New(opts.Logger, logClass)}
+}
+
+// logger returns a usable logger, lazily creating a no-op one so handlers never
+// need to nil-check before logging.
+func (h *Handler) logger() *logging.Logger {
+	if h.log == nil {
+		h.log = logging.New(nil, logClass)
+	}
+	return h.log
 }
 
 func (h *Handler) davRegistry() *Registry {
@@ -77,15 +92,18 @@ func (h *Handler) handleRegisteredMethod(w http.ResponseWriter, r *http.Request)
 	}
 	if route.options.Auth != MethodAuthNone {
 		if _, ok := auth.UserFromContext(r.Context()); !ok {
+			h.logger().Error("handleRegisteredMethod", "unauthenticated request for %s %s", r.Method, r.URL.Path)
 			http.Error(w, "missing user", http.StatusUnauthorized)
 			return true
 		}
 	}
+	h.logger().Trace("handleRegisteredMethod", "dispatching %s %s to registered handler", r.Method, r.URL.Path)
 	route.handler(w, r)
 	return true
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.logger().Debug("ServeHTTP", "%s %s", r.Method, r.URL.Path)
 	switch r.Method {
 	case http.MethodOptions:
 		h.Options(w, r)

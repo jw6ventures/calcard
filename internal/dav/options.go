@@ -28,6 +28,7 @@ func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
 	if r != nil {
 		cleanPath = path.Clean(r.URL.Path)
 	}
+	h.logger().Trace("Options", "OPTIONS %s", cleanPath)
 	w.Header().Set("Allow", h.allowHeaderForPath(cleanPath))
 	davHeader := h.davHeaderForPath("")
 	if r != nil {

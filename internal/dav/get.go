@@ -15,6 +15,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Get", "handling GET %s", r.URL.Path)
 	cleanPath := path.Clean(r.URL.Path)
 	if !strings.HasPrefix(cleanPath, "/dav") {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -88,6 +89,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		}
 		event, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
 		if err != nil {
+			h.logger().Error("Get", "failed to load event %q from calendar %d: %v", uid, calendarID, err)
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
 			return
 		}
@@ -148,6 +150,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
 	contact, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
+		h.logger().Error("writeAddressBookContact", "failed to load contact %q from address book %d: %v", resourceName, addressBookID, err)
 		http.Error(w, "failed to load contact", http.StatusInternalServerError)
 		return
 	}

@@ -19,6 +19,7 @@ func (h *Handler) Acl(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Acl", "ACL %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

@@ -35,6 +35,7 @@ func (h *Handler) Proppatch(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Proppatch", "PROPPATCH %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -348,6 +349,7 @@ func (h *Handler) Mkcol(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Mkcol", "MKCOL %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -437,6 +439,7 @@ func (h *Handler) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Mkcalendar", "MKCALENDAR %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1166,6 +1169,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Put", "PUT %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1394,13 +1398,16 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: string(body), ETag: etag}); err != nil {
+			h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
 			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
 		if existing == nil {
+			h.logger().Info("Put", "created event %q in calendar %d", uid, calendarID)
 			w.WriteHeader(http.StatusCreated)
 		} else {
+			h.logger().Info("Put", "updated event %q in calendar %d", uid, calendarID)
 			w.WriteHeader(http.StatusNoContent)
 		}
 		return
@@ -1521,13 +1528,16 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 				writeCardDAVUIDConflict(w, cleanPath)
 				return
 			}
+			h.logger().Error("Put", "failed to save contact %q in address book %d: %v", uid, addressBookID, err)
 			http.Error(w, "failed to save contact", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
 		if existing == nil {
+			h.logger().Info("Put", "created contact %q in address book %d", uid, addressBookID)
 			w.WriteHeader(http.StatusCreated)
 		} else {
+			h.logger().Info("Put", "updated contact %q in address book %d", uid, addressBookID)
 			w.WriteHeader(http.StatusNoContent)
 		}
 		return
@@ -1540,6 +1550,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Delete", "DELETE %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -1601,9 +1612,11 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.store.DeleteEventAndState(r.Context(), calendarID, existing.UID, canonicalPath); err != nil {
+			h.logger().Error("Delete", "failed to delete event %q from calendar %d: %v", existing.UID, calendarID, err)
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
 			return
 		}
+		h.logger().Info("Delete", "deleted event %q from calendar %d", existing.UID, calendarID)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1658,9 +1671,11 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, existing.UID, canonicalPath); err != nil {
+			h.logger().Error("Delete", "failed to delete contact %q from address book %d: %v", existing.UID, addressBookID, err)
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
 			return
 		}
+		h.logger().Info("Delete", "deleted contact %q from address book %d", existing.UID, addressBookID)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

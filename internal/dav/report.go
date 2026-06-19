@@ -43,9 +43,11 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 	}
 	var report reportRequest
 	if err := safeUnmarshalXML(body, &report); err != nil {
+		h.logger().Error("Report", "invalid REPORT body for %s: %v", cleanPath, err)
 		http.Error(w, "invalid REPORT body", http.StatusBadRequest)
 		return
 	}
+	h.logger().Trace("Report", "REPORT %s type=%s", cleanPath, report.XMLName.Local)
 	var expandReq *expandPropertyRequest
 	if report.XMLName.Local == "expand-property" {
 		expandReq, err = parseExpandPropertyRequest(body)
@@ -109,6 +111,7 @@ func (h *Handler) Report(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "calendar not found", http.StatusNotFound)
 				return
 			}
+			h.logger().Error("Report", "failed to resolve calendar for %s: %v", cleanPath, err)
 			http.Error(w, "failed to resolve calendar", http.StatusInternalServerError)
 			return
 		}

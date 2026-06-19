@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"log"
 	"time"
 )
 
@@ -18,11 +17,15 @@ func StartLockCleanup(ctx context.Context, repo LockRepository, interval time.Du
 		case <-ticker.C:
 			deleted, err := repo.DeleteExpired(ctx)
 			if err != nil {
-				log.Printf("lock cleanup error: %v", err)
+				if isConnError(err) {
+					queryLogger.Error("lock_cleanup", "expired-lock cleanup failed, database appears unreachable: %v", err)
+				} else {
+					queryLogger.Warn("lock_cleanup", "expired-lock cleanup failed: %v", err)
+				}
 				continue
 			}
 			if deleted > 0 {
-				log.Printf("cleaned up %d expired locks", deleted)
+				queryLogger.Debug("lock_cleanup", "cleaned up %d expired locks", deleted)
 			}
 		}
 	}

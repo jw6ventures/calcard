@@ -46,11 +46,27 @@ func New(pool *sql.DB) *Store {
 // BeginTx starts a transaction with default options.
 func (s *Store) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	defer observeDB(ctx, "db.begin_tx")()
-	return s.pool.BeginTx(ctx, opts)
+	tx, err := s.pool.BeginTx(ctx, opts)
+	if err != nil {
+		// Always Error here: a failed transaction fails the caller's request
+		// regardless of cause. isConnError only refines the message. (The
+		// background lock-cleanup sweep instead downgrades non-conn errors to
+		// Warn, since a missed sweep is not request-fatal.)
+		if isConnError(err) {
+			queryLogger.Error("db.begin_tx", "could not start transaction, database appears unreachable: %v", err)
+		} else {
+			queryLogger.Error("db.begin_tx", "could not start transaction: %v", err)
+		}
+	}
+	return tx, err
 }
 
 // HealthCheck verifies that the underlying database is reachable.
 func (s *Store) HealthCheck(ctx context.Context) error {
 	defer observeDB(ctx, "db.healthcheck")()
-	return s.pool.PingContext(ctx)
+	if err := s.pool.PingContext(ctx); err != nil {
+		queryLogger.Warn("db.healthcheck", "database ping failed, marking unready: %v", err)
+		return err
+	}
+	return nil
 }

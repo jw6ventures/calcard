@@ -44,6 +44,7 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Copy", "COPY %s -> %s", r.URL.Path, r.Header.Get("Destination"))
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -314,6 +315,7 @@ func (h *Handler) Move(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
+	h.logger().Trace("Move", "MOVE %s -> %s", r.URL.Path, r.Header.Get("Destination"))
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)

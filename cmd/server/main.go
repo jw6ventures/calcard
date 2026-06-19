@@ -55,7 +55,7 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 	jw6utils.PrintBanner("CalCard", version, "2026", 3, "JW6 Ventures LLC")
 
-	log.Println("Starting CalCard server...")
+	jw6utils.Log("Main", "runServer-mainLoop", jw6_utils.Info, "Starting CalCard server...")
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
@@ -75,6 +75,8 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 	defer dbManager.Close()
 
+	store.SetLogger(&jw6utils)
+
 	stor := store.New(dbManager.DB)
 	sessionManager := appauth.NewSessionManager(cfg, stor)
 	authService, err := appauth.NewService(cfg, stor, sessionManager)
@@ -84,6 +86,9 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 
 	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
 
+	if opts.Router.Logger == nil {
+		opts.Router.Logger = &jw6utils
+	}
 	r := httpserver.NewRouterWithOptions(cfg, stor, authService, opts.Router)
 
 	srv := &http.Server{
@@ -95,14 +100,17 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 
 	go func() {
-		log.Printf("server listening on %s", cfg.ListenAddr)
+		jw6utils.Log("Main", "runServer-mainLoop", jw6_utils.Info, fmt.Sprintf("server listening on %s", cfg.ListenAddr))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
+			// jw6_utils Fatal does not exit the process, so do it explicitly:
+			// a dead listener must surface as a non-zero exit for restart logic.
+			jw6utils.Log("Main", "runServer-mainLoop", jw6_utils.Fatal, fmt.Sprintf("server error: %v", err))
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Printf("shutting down...")
+	jw6utils.Log("Main", "runServer", jw6_utils.Info, "shutting down...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

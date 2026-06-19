@@ -17,6 +17,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/http/csrf"
 	"github.com/jw6ventures/calcard/internal/http/ratelimit"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/metrics"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui"
@@ -64,6 +65,9 @@ func init() {
 type RouterOptions struct {
 	DAVExtensions     []dav.Extension
 	DAVAuthMiddleware func(http.Handler) http.Handler
+	// Logger is the leveled log sink handed to the DAV server. A nil sink
+	// disables DAV logging.
+	Logger logging.Sink
 }
 
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
@@ -226,7 +230,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Delete("/addressbooks/{id}/contacts/{uid}", apiHandler.DeleteContact)
 	})
 
-	davHandler := dav.NewServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions})
+	davHandler := dav.NewServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions, Logger: opts.Logger})
 	registerDAVMethods(davHandler.RegisteredMethods())
 	davAuth := opts.DAVAuthMiddleware
 	if davAuth == nil && authService != nil {

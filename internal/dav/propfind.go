@@ -18,6 +18,7 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 	if depth == "" {
 		depth = "1"
 	}
+	h.logger().Trace("Propfind", "PROPFIND %s depth=%s", r.URL.Path, depth)
 
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -55,9 +56,11 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, http.ErrNotSupported) {
 			status = http.StatusNotFound
 		}
+		h.logger().Error("Propfind", "failed to build responses for %s (status %d): %v", r.URL.Path, status, err)
 		http.Error(w, err.Error(), status)
 		return
 	}
+	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))
 
 	payload := multistatus{
 		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},

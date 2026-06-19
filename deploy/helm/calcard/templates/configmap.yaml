@@ -16,3 +16,4 @@ data:
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
   APP_TRUSTED_PROXIES: {{ .Values.app.trustedProxies | quote }}
+  LOG_LEVEL: {{ .Values.app.logLevel | quote }}

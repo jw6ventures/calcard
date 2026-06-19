@@ -23,6 +23,7 @@ replicaCount: 1 # HA is theoretically possible, but untested at this point. Reco
 app:
   baseUrl: "http://localhost:8080" # Public URL the app is served from. Required. Used for OAuth redirects and to derive ingress.host when that is unset.
   trustedProxies: "" # Comma-separated CIDRs/IPs to trust for X-Forwarded-* headers (e.g. your ingress/load balancer). Leave empty if not behind a proxy.
+  logLevel: "Info" # Minimum log level to emit: Trace, Debug, Info, Warn, or Error.
 
   # OAuth / OIDC single sign-on settings. CalCard delegates login to an
   # external identity provider.
