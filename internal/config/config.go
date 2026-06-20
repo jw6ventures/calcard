@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -14,7 +16,16 @@ type Config struct {
 	CommunityURL string
 
 	DB struct {
-		DSN string
+		DSN             string
+		MaxOpenConns    int
+		MaxIdleConns    int
+		ConnMaxLifetime time.Duration
+	}
+
+	HTTP struct {
+		ReadTimeout  time.Duration
+		WriteTimeout time.Duration
+		IdleTimeout  time.Duration
 	}
 
 	OAuth struct {
@@ -31,6 +42,13 @@ type Config struct {
 
 	PrometheusEnabled bool
 	TrustedProxies    []string
+
+	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
+	// (PprofAddr). It is off by default and the listener should stay bound to
+	// loopback: the profiling handlers leak runtime internals and the
+	// profile/trace endpoints are easy denial-of-service vectors.
+	PprofEnabled bool
+	PprofAddr    string
 }
 
 func Load() (*Config, error) {
@@ -40,6 +58,31 @@ func Load() (*Config, error) {
 	cfg.BaseURL = getenvDefault("APP_BASE_URL", "http://localhost:8080")
 	cfg.CommunityURL = getenvDefault("APP_COMMUNITY_URL", "https://github.com/jw6ventures/calcard/issues")
 	cfg.DB.DSN = os.Getenv("APP_DB_DSN")
+	var err error
+	cfg.DB.MaxOpenConns, err = getenvIntDefault("APP_DB_MAX_OPEN_CONNS", 25)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DB.MaxIdleConns, err = getenvIntDefault("APP_DB_MAX_IDLE_CONNS", 10)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DB.ConnMaxLifetime, err = getenvDurationDefault("APP_DB_CONN_MAX_LIFETIME", 30*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.HTTP.ReadTimeout, err = getenvDurationDefault("APP_HTTP_READ_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	cfg.HTTP.WriteTimeout, err = getenvDurationDefault("APP_HTTP_WRITE_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	cfg.HTTP.IdleTimeout, err = getenvDurationDefault("APP_HTTP_IDLE_TIMEOUT", 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	if cfg.DB.DSN == "" {
 		host := os.Getenv("APP_DB_HOST")
@@ -75,6 +118,8 @@ func Load() (*Config, error) {
 	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
+	cfg.PprofEnabled = getenvBool("APP_PPROF_ENABLED", false)
+	cfg.PprofAddr = getenvDefault("APP_PPROF_ADDR", "127.0.0.1:6060")
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
 
 	if cfg.DB.DSN == "" {
@@ -120,6 +165,30 @@ func getenvBool(key string, def bool) bool {
 		}
 	}
 	return def
+}
+
+func getenvIntDefault(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return n, nil
+}
+
+func getenvDurationDefault(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return d, nil
 }
 
 func getenvList(key string) []string {

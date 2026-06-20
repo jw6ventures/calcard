@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -177,9 +178,9 @@ func (h *Handler) hasDiscoverableCalendarObjectGrant(ctx context.Context, user *
 		return false, err
 	}
 
-	applicablePrincipals := applicableACLPrincipals(user)
+	applicablePrincipals := acl.ApplicablePrincipals(user)
 	for _, privilege := range []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"} {
-		granted, applicable := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+		granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
 		if applicable && granted {
 			return true, nil
 		}
@@ -287,13 +288,7 @@ func (h *Handler) aclHasApplicablePrincipal(ctx context.Context, user *store.Use
 		return false, err
 	}
 
-	applicablePrincipals := applicableACLPrincipals(user)
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
-			return true, nil
-		}
-	}
-	return false, nil
+	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
 }
 
 func (h *Handler) loadCalendarWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.CalendarAccess, error) {
@@ -358,7 +353,7 @@ func (h *Handler) prefetchCalendarACLEntries(ctx context.Context, user *store.Us
 	}
 
 	result := make(map[string][]store.ACLEntry, len(relevantPaths))
-	for _, principalHref := range aclPrincipalHrefs(user) {
+	for _, principalHref := range acl.PrincipalHrefs(user) {
 		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principalHref)
 		if err != nil {
 			return nil, err
@@ -502,14 +497,6 @@ func calendarObjectACLPaths(calendarID int64, resourceName string) []string {
 	return paths
 }
 
-func aclPrincipalHrefs(user *store.User) []string {
-	principals := []string{"DAV:all"}
-	if user != nil {
-		principals = append(principals, "DAV:authenticated", fmt.Sprintf("/dav/principals/%d/", user.ID))
-	}
-	return principals
-}
-
 func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
 	if cal == nil || user == nil {
 		return false, false
@@ -539,19 +526,17 @@ func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user
 	for _, resourcePath := range resourcePaths {
 		entries = append(entries, entriesByPath[normalizeDAVHref(resourcePath)]...)
 	}
-	return aclDecisionForPrivilege(entries, applicableACLPrincipals(user), privilege)
+	return acl.DecisionForPrivilege(entries, acl.ApplicablePrincipals(user), privilege)
 }
 
 func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string) bool {
 	if len(entriesByPath) == 0 {
 		return false
 	}
-	applicablePrincipals := applicableACLPrincipals(user)
+	applicablePrincipals := acl.ApplicablePrincipals(user)
 	for _, resourcePath := range resourcePaths {
-		for _, entry := range entriesByPath[normalizeDAVHref(resourcePath)] {
-			if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
-				return true
-			}
+		if acl.HasApplicablePrincipal(entriesByPath[normalizeDAVHref(resourcePath)], applicablePrincipals) {
+			return true
 		}
 	}
 	return false

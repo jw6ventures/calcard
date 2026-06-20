@@ -119,9 +119,11 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
 	}
 	r.Get("/.well-known/caldav", wellKnownHandler)
+	r.MethodFunc("OPTIONS", "/.well-known/caldav", wellKnownHandler)
 	r.MethodFunc("PROPFIND", "/.well-known/caldav", wellKnownHandler)
 
 	r.Get("/.well-known/carddav", wellKnownHandler)
+	r.MethodFunc("OPTIONS", "/.well-known/carddav", wellKnownHandler)
 	r.MethodFunc("PROPFIND", "/.well-known/carddav", wellKnownHandler)
 
 	// Redirect root PROPFIND to /dav/ for discovery

@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
@@ -29,6 +30,62 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	want := []string{"10.0.0.0/8", "127.0.0.1/32", "2001:db8::1/128"}
 	if !reflect.DeepEqual(cfg.TrustedProxies, want) {
 		t.Fatalf("TrustedProxies = %#v, want %#v", cfg.TrustedProxies, want)
+	}
+	if cfg.DB.MaxOpenConns != 25 {
+		t.Fatalf("DB.MaxOpenConns = %d, want 25", cfg.DB.MaxOpenConns)
+	}
+	if cfg.DB.MaxIdleConns != 10 {
+		t.Fatalf("DB.MaxIdleConns = %d, want 10", cfg.DB.MaxIdleConns)
+	}
+	if cfg.DB.ConnMaxLifetime != 30*time.Minute {
+		t.Fatalf("DB.ConnMaxLifetime = %s, want 30m", cfg.DB.ConnMaxLifetime)
+	}
+	if cfg.HTTP.ReadTimeout != 15*time.Second {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 15s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 15*time.Second {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 15s", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 60*time.Second {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 60s", cfg.HTTP.IdleTimeout)
+	}
+}
+
+func TestLoadParsesPoolAndHTTPTimeoutConfig(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DB_MAX_OPEN_CONNS", "50")
+	t.Setenv("APP_DB_MAX_IDLE_CONNS", "20")
+	t.Setenv("APP_DB_CONN_MAX_LIFETIME", "45m")
+	t.Setenv("APP_HTTP_READ_TIMEOUT", "30s")
+	t.Setenv("APP_HTTP_WRITE_TIMEOUT", "60s")
+	t.Setenv("APP_HTTP_IDLE_TIMEOUT", "2m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.DB.MaxOpenConns != 50 {
+		t.Fatalf("DB.MaxOpenConns = %d, want 50", cfg.DB.MaxOpenConns)
+	}
+	if cfg.DB.MaxIdleConns != 20 {
+		t.Fatalf("DB.MaxIdleConns = %d, want 20", cfg.DB.MaxIdleConns)
+	}
+	if cfg.DB.ConnMaxLifetime != 45*time.Minute {
+		t.Fatalf("DB.ConnMaxLifetime = %s, want 45m", cfg.DB.ConnMaxLifetime)
+	}
+	if cfg.HTTP.ReadTimeout != 30*time.Second {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 30s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 60*time.Second {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 60s", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 2*time.Minute {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 2m", cfg.HTTP.IdleTimeout)
 	}
 }
 
@@ -142,6 +199,8 @@ func TestLoadReturnsUsefulValidationErrors(t *testing.T) {
 				"APP_OAUTH_CLIENT_ID", "APP_OAUTH_CLIENT_SECRET", "APP_OAUTH_ISSUER_URL",
 				"APP_OAUTH_DISCOVERY_URL", "APP_OAUTH_REDIRECT_PATH", "APP_SESSION_SECRET",
 				"APP_PROMETHEUS_ENDPOINT_ENABLED", "APP_TRUSTED_PROXIES",
+				"APP_DB_MAX_OPEN_CONNS", "APP_DB_MAX_IDLE_CONNS", "APP_DB_CONN_MAX_LIFETIME",
+				"APP_HTTP_READ_TIMEOUT", "APP_HTTP_WRITE_TIMEOUT", "APP_HTTP_IDLE_TIMEOUT",
 			} {
 				t.Setenv(key, "")
 			}

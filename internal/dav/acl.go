@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -77,7 +78,7 @@ func (h *Handler) Acl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid ACL request", http.StatusBadRequest)
 			return
 		}
-		principalHref := normalizeACLPrincipalHref(a.Principal.Href)
+		principalHref := acl.NormalizePrincipalHref(a.Principal.Href)
 		if principalHref == "" {
 			if a.Principal.Self != nil {
 				principalHref = h.principalURL(user)
@@ -263,8 +264,8 @@ func (h *Handler) aclDecision(ctx context.Context, user *store.User, resourcePat
 		return false, false, err
 	}
 
-	applicablePrincipals := applicableACLPrincipals(user)
-	granted, applicable := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+	applicablePrincipals := acl.ApplicablePrincipals(user)
+	granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
 	return granted, applicable, nil
 }
 
@@ -306,79 +307,6 @@ func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string
 		cache.put(resourcePath, result)
 	}
 	return result, nil
-}
-
-func normalizeACLPrincipalHref(raw string) string {
-	raw = strings.TrimSpace(raw)
-	switch raw {
-	case "", "DAV:all", "DAV:authenticated":
-		return raw
-	}
-
-	normalized := normalizeDAVHref(raw)
-	if strings.HasPrefix(normalized, "/dav/principals/") {
-		if !strings.HasSuffix(normalized, "/") {
-			normalized += "/"
-		}
-		return normalized
-	}
-	return raw
-}
-
-func aclPrivilegeMatches(granted, requested string) bool {
-	if granted == requested || granted == "all" {
-		return true
-	}
-	if granted == "read" && requested == "read-free-busy" {
-		return true
-	}
-	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
-}
-
-func aclDecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	if privilege == "write" {
-		return aclAggregateWriteDecision(entries, applicablePrincipals)
-	}
-	hasGrant := false
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
-			continue
-		}
-		if !aclPrivilegeMatches(entry.Privilege, privilege) {
-			continue
-		}
-		if !entry.IsGrant {
-			return false, true
-		}
-		hasGrant = true
-	}
-	if hasGrant {
-		return true, true
-	}
-	return false, false
-}
-
-func aclAggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
-	applicable := false
-	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
-		granted, decided := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
-		if decided {
-			applicable = true
-		}
-		if !granted {
-			return false, applicable
-		}
-	}
-	return applicable, applicable
-}
-
-func applicableACLPrincipals(user *store.User) map[string]struct{} {
-	principals := map[string]struct{}{"DAV:all": {}}
-	if user != nil {
-		principals[fmt.Sprintf("/dav/principals/%d/", user.ID)] = struct{}{}
-		principals["DAV:authenticated"] = struct{}{}
-	}
-	return principals
 }
 
 func (h *Handler) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) bool {
@@ -477,7 +405,7 @@ func buildACLPropFromEntries(entries []store.ACLEntry) *aclProp {
 	var currentGrant bool
 	for _, entry := range entries {
 		privilege := privilegeNameToResp(entry.Privilege)
-		normalizedPrincipal := normalizeACLPrincipalHref(entry.PrincipalHref)
+		normalizedPrincipal := acl.NormalizePrincipalHref(entry.PrincipalHref)
 		if len(aces) == 0 || normalizedPrincipal != currentPrincipal || entry.IsGrant != currentGrant {
 			ace := aceResp{Principal: principalRespFromStored(entry.PrincipalHref)}
 			if entry.IsGrant {
@@ -501,7 +429,7 @@ func buildACLPropFromEntries(entries []store.ACLEntry) *aclProp {
 }
 
 func principalRespFromStored(principal string) acePrincipalResp {
-	switch normalizeACLPrincipalHref(principal) {
+	switch acl.NormalizePrincipalHref(principal) {
 	case "DAV:all":
 		return acePrincipalResp{All: &struct{}{}}
 	case "DAV:authenticated":

@@ -103,6 +103,15 @@ func TestNewRouterPublicEndpoints(t *testing.T) {
 		t.Fatalf("/.well-known/caldav = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 
+	for _, target := range []string{"/.well-known/caldav", "/.well-known/carddav"} {
+		req = httptest.NewRequest(http.MethodOptions, target, nil)
+		rec = httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/dav/" {
+			t.Fatalf("OPTIONS %s = %d %q", target, rec.Code, rec.Header().Get("Location"))
+		}
+	}
+
 	req = httptest.NewRequest("PROPFIND", "/principals/user", nil)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)

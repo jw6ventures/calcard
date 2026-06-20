@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/lib/pq"
@@ -1712,7 +1713,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, r
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, r, user, res); err != nil {
+		if err := h.decoratePropfindResponses(ctx, r, user, res, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
@@ -1730,7 +1731,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, r
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
+		if err := h.decoratePropfindResponses(ctx, r, user, responses, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1751,7 +1752,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, r
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
+		if err := h.decoratePropfindResponses(ctx, r, user, responses, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1772,7 +1773,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, r
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
+		if err := h.decoratePropfindResponses(ctx, r, user, responses, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.AllProp != nil {
@@ -1802,7 +1803,7 @@ func (h *Handler) buildPropfindResponses(ctx context.Context, r *http.Request, r
 		if err != nil {
 			return nil, err
 		}
-		if err := h.decoratePropfindResponses(ctx, r, user, responses); err != nil {
+		if err := h.decoratePropfindResponses(ctx, r, user, responses, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
@@ -2952,17 +2953,25 @@ func (h *Handler) addressBookQuery(ctx context.Context, user *store.User, book *
 	if targetResourceName != "" {
 		baseHref = strings.TrimSuffix(strings.TrimSuffix(cleanPath, "/"), "/"+targetResourceName+".vcf") + "/"
 	}
+	resourceNames := make([]string, 0, len(contacts))
+	for _, contact := range contacts {
+		resourceName := contactResourceName(contact)
+		if targetResourceName != "" && resourceName != targetResourceName {
+			continue
+		}
+		resourceNames = append(resourceNames, resourceName)
+	}
+	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, resourceNames)
+	if err != nil {
+		return nil, err
+	}
 	var responses []response
 	for _, contact := range contacts {
 		resourceName := contactResourceName(contact)
 		if targetResourceName != "" && resourceName != targetResourceName {
 			continue
 		}
-		allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
+		if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
 			continue
 		}
 		if !contactMatchesCardFilter(contact, filter) {
@@ -2998,6 +3007,20 @@ func (h *Handler) addressBookMultiGetReport(ctx context.Context, user *store.Use
 	targetResourceName := ""
 	if _, resourceName, matched := parseAddressBookResourceSegments(cleanPath); matched {
 		targetResourceName = resourceName
+	}
+	resourceNames := make([]string, 0, len(hrefs))
+	for _, href := range hrefs {
+		cleanHref := resolveDAVHref(cleanPath, href)
+		if cleanHref == "" {
+			continue
+		}
+		if _, resourceName, ok := parseAddressBookResourceSegments(cleanHref); ok {
+			resourceNames = append(resourceNames, resourceName)
+		}
+	}
+	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, bookID, resourceNames)
+	if err != nil {
+		return nil, err
 	}
 	var responses []response
 	for _, href := range hrefs {
@@ -3039,11 +3062,7 @@ func (h *Handler) addressBookMultiGetReport(ctx context.Context, user *store.Use
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
+		if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
@@ -3074,29 +3093,107 @@ func addressBookContactPath(bookID int64, resourceName string) string {
 	return path.Join("/dav/addressbooks", fmt.Sprint(bookID), resourceName)
 }
 
-func (h *Handler) canReadAddressBookContact(ctx context.Context, user *store.User, book *store.AddressBook, resourceName string) (bool, error) {
-	if strings.TrimSpace(resourceName) == "" {
-		return false, nil
-	}
-	err := h.requireAddressBookPrivilege(ctx, user, book, addressBookContactPath(book.ID, resourceName), "read")
-	switch {
-	case err == nil:
-		return true, nil
-	case err == store.ErrNotFound || errors.Is(err, errForbidden):
-		return false, nil
-	default:
-		return false, err
-	}
+func addressBookCollectionResourcePath(bookID int64) string {
+	return path.Join("/dav/addressbooks", fmt.Sprint(bookID))
 }
 
-func (h *Handler) filterReadableAddressBookContacts(ctx context.Context, user *store.User, book *store.AddressBook, contacts []store.Contact) ([]store.Contact, error) {
-	visible := make([]store.Contact, 0, len(contacts))
-	for _, contact := range contacts {
-		allowed, err := h.canReadAddressBookContact(ctx, user, book, contactResourceName(contact))
+func addressBookObjectACLPaths(bookID int64, resourceName string) []string {
+	resourceName = strings.TrimSpace(resourceName)
+	if resourceName == "" {
+		return nil
+	}
+	base := addressBookContactPath(bookID, resourceName)
+	paths := []string{base}
+	if strings.EqualFold(path.Ext(resourceName), ".vcf") {
+		paths = append(paths, strings.TrimSuffix(base, path.Ext(resourceName)))
+	} else {
+		paths = append(paths, base+".vcf")
+	}
+	return paths
+}
+
+// prefetchAddressBookACLEntries loads the ACL entries relevant to a book's
+// collection and the supplied contact resource names in a single sweep over the
+// user's principals, mirroring prefetchCalendarACLEntries. This replaces the
+// per-contact ListByResource lookups that otherwise make a single REPORT/sync
+// O(N) in ACL repository queries.
+func (h *Handler) prefetchAddressBookACLEntries(ctx context.Context, user *store.User, bookID int64, resourceNames []string) (map[string][]store.ACLEntry, error) {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil || user == nil {
+		return nil, nil
+	}
+
+	relevantPaths := map[string]struct{}{
+		normalizeDAVHref(addressBookCollectionResourcePath(bookID)): {},
+	}
+	for _, resourceName := range resourceNames {
+		for _, resourcePath := range addressBookObjectACLPaths(bookID, resourceName) {
+			relevantPaths[normalizeDAVHref(resourcePath)] = struct{}{}
+		}
+	}
+
+	result := make(map[string][]store.ACLEntry, len(relevantPaths))
+	for _, principalHref := range acl.PrincipalHrefs(user) {
+		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principalHref)
 		if err != nil {
 			return nil, err
 		}
-		if allowed {
+		for _, entry := range entries {
+			resourcePath := normalizeDAVHref(entry.ResourcePath)
+			if _, ok := relevantPaths[resourcePath]; !ok {
+				continue
+			}
+			result[resourcePath] = append(result[resourcePath], entry)
+		}
+	}
+	return result, nil
+}
+
+// addressBookPrivilegeDecisionFromEntries evaluates contact visibility from a
+// prefetched ACL map, preserving the object-deny-over-collection-fallback
+// semantics of addressBookPrivilegeDecision. Unlike calendars, address books
+// have no EffectivePrivileges fallback: a non-owner with no applicable ACL is
+// not allowed.
+func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.AddressBook, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
+	if book == nil || user == nil {
+		return false, false
+	}
+	if book.UserID == user.ID {
+		return true, false
+	}
+
+	objectPaths := addressBookObjectACLPaths(book.ID, resourceName)
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, objectPaths, privilege); applicable {
+		return granted, !granted
+	}
+
+	collectionPaths := []string{addressBookCollectionResourcePath(book.ID)}
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, collectionPaths, privilege); applicable {
+		return granted, !granted
+	}
+
+	return false, false
+}
+
+func canReadAddressBookContactWithEntries(user *store.User, book *store.AddressBook, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
+	if strings.TrimSpace(resourceName) == "" {
+		return false
+	}
+	allowed, _ := addressBookPrivilegeDecisionFromEntries(user, book, resourceName, "read", entriesByPath)
+	return allowed
+}
+
+func (h *Handler) filterReadableAddressBookContacts(ctx context.Context, user *store.User, book *store.AddressBook, contacts []store.Contact) ([]store.Contact, error) {
+	resourceNames := make([]string, 0, len(contacts))
+	for _, contact := range contacts {
+		resourceNames = append(resourceNames, contactResourceName(contact))
+	}
+	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, resourceNames)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]store.Contact, 0, len(contacts))
+	for _, contact := range contacts {
+		if canReadAddressBookContactWithEntries(user, book, contactResourceName(contact), entriesByPath) {
 			visible = append(visible, contact)
 		}
 	}
@@ -3247,16 +3344,20 @@ func (h *Handler) addressBookSyncCollection(ctx context.Context, user *store.Use
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to list deleted contacts")
 		}
+		deletedNames := make([]string, 0, len(deleted))
 		for _, d := range deleted {
 			resourceName := d.ResourceName
 			if resourceName == "" {
 				resourceName = d.UID
 			}
-			allowed, err := h.canReadAddressBookContact(ctx, user, book, resourceName)
-			if err != nil {
-				return nil, "", err
-			}
-			if !allowed {
+			deletedNames = append(deletedNames, resourceName)
+		}
+		entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, deletedNames)
+		if err != nil {
+			return nil, "", err
+		}
+		for _, resourceName := range deletedNames {
+			if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
 				continue
 			}
 			href := collectionHref + resourceName + ".vcf"

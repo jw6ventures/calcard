@@ -51,11 +51,19 @@ app:
     user: "postgres" # Database user.
     password: "" # Database password. Stored in a generated Secret. Ignored if existingSecret.name is set.
     sslmode: "disable" # Postgres sslmode (disable, require, verify-ca, verify-full). Use a stronger mode for external databases.
+    maxOpenConns: 25 # Maximum number of open database connections.
+    maxIdleConns: 10 # Maximum number of idle database connections.
+    connMaxLifetime: "30m" # Maximum lifetime for a database connection.
     existingSecret: # Reference an existing Secret holding the DB credentials instead of generating one from the values above.
       name: "" # Name of the existing Secret. Leave empty to generate one.
       dsnKey: "APP_DB_DSN" # Key holding the full connection string (postgres://user:pass@host:port/db?sslmode=...).
       userKey: "APP_DB_USER" # Key holding the database user.
       passwordKey: "APP_DB_PASSWORD" # Key holding the database password.
+
+  http:
+    readTimeout: "15s" # Maximum duration for reading the full HTTP request.
+    writeTimeout: "15s" # Maximum duration before timing out HTTP response writes.
+    idleTimeout: "60s" # Maximum time to wait for the next request on keep-alive connections.
 
 # Kubernetes Service that fronts the app pods.
 service:

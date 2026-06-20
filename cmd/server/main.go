@@ -74,6 +74,9 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
 	defer dbManager.Close()
+	dbManager.DB.SetMaxOpenConns(cfg.DB.MaxOpenConns)
+	dbManager.DB.SetMaxIdleConns(cfg.DB.MaxIdleConns)
+	dbManager.DB.SetConnMaxLifetime(cfg.DB.ConnMaxLifetime)
 
 	store.SetLogger(&jw6utils)
 
@@ -94,9 +97,18 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.HTTP.ReadTimeout,
+		WriteTimeout: cfg.HTTP.WriteTimeout,
+		IdleTimeout:  cfg.HTTP.IdleTimeout,
+	}
+
+	if cfg.PprofEnabled {
+		pprofSrv := startPprofServer(ctx, cfg.PprofAddr, &jw6utils)
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(shutdownCtx)
+		}()
 	}
 
 	go func() {

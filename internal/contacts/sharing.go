@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -27,7 +28,7 @@ type AddressBookAccess struct {
 
 // shareManagedPrivileges are the grants the sharing UI/API own and replace when a
 // share is updated. Editor adds "write" (which subsumes the write-* / bind / unbind
-// privileges via aclPrivilegeMatches); read-only shares grant only "read".
+// privileges via the shared ACL matcher); read-only shares grant only "read".
 func sharePresetPrivileges(editor bool) []string {
 	if editor {
 		return []string{"read", "write"}
@@ -71,7 +72,7 @@ func addressBookACLCollectionPath(bookID int64) string {
 }
 
 func sharePrincipalHref(userID int64) string {
-	return fmt.Sprintf("/dav/principals/%d/", userID)
+	return acl.PrincipalHref(userID)
 }
 
 func addressBookACLResourcePaths(bookID int64, resourceName string) []string {
@@ -104,79 +105,6 @@ func contactResourceName(c store.Contact) string {
 	return c.UID
 }
 
-func applicableACLPrincipals(user *store.User) map[string]struct{} {
-	principals := map[string]struct{}{"DAV:all": {}}
-	if user != nil {
-		principals[sharePrincipalHref(user.ID)] = struct{}{}
-		principals["DAV:authenticated"] = struct{}{}
-	}
-	return principals
-}
-
-func aclPrincipalHrefs(user *store.User) []string {
-	principals := []string{"DAV:all"}
-	if user != nil {
-		principals = append(principals, "DAV:authenticated", sharePrincipalHref(user.ID))
-	}
-	return principals
-}
-
-func normalizeACLPrincipalHref(raw string) string {
-	raw = strings.TrimSpace(raw)
-	switch raw {
-	case "", "DAV:all", "DAV:authenticated":
-		return raw
-	}
-	if strings.HasPrefix(raw, "/dav/principals/") && !strings.HasSuffix(raw, "/") {
-		return raw + "/"
-	}
-	return raw
-}
-
-func aclPrivilegeMatches(granted, requested string) bool {
-	if granted == requested || granted == "all" {
-		return true
-	}
-	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
-}
-
-func aclDecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	if privilege == "write" {
-		return aclAggregateWriteDecision(entries, applicablePrincipals)
-	}
-	hasGrant := false
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
-			continue
-		}
-		if !aclPrivilegeMatches(entry.Privilege, privilege) {
-			continue
-		}
-		if !entry.IsGrant {
-			return false, true
-		}
-		hasGrant = true
-	}
-	if hasGrant {
-		return true, true
-	}
-	return false, false
-}
-
-func aclAggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
-	applicable := false
-	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
-		granted, decided := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
-		if decided {
-			applicable = true
-		}
-		if !granted {
-			return false, applicable
-		}
-	}
-	return applicable, applicable
-}
-
 func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string) ([]store.ACLEntry, error) {
 	if s == nil || s.store == nil || s.store.ACLEntries == nil {
 		return nil, nil
@@ -205,7 +133,7 @@ func (s *Service) aclDecision(ctx context.Context, user *store.User, resourcePat
 	if err != nil {
 		return false, false, err
 	}
-	granted, applicable := aclDecisionForPrivilege(entries, applicableACLPrincipals(user), privilege)
+	granted, applicable := acl.DecisionForPrivilege(entries, acl.ApplicablePrincipals(user), privilege)
 	return granted, applicable, nil
 }
 
@@ -214,13 +142,7 @@ func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.Use
 	if err != nil {
 		return false, err
 	}
-	applicablePrincipals := applicableACLPrincipals(user)
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
-			return true, nil
-		}
-	}
-	return false, nil
+	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
 }
 
 // privilegeDecision evaluates whether user holds privilege on a contact (when
@@ -272,7 +194,7 @@ func (s *Service) prefetchACLEntries(ctx context.Context, user *store.User, book
 	}
 
 	result := make(map[string][]store.ACLEntry, len(relevant))
-	for _, principalHref := range aclPrincipalHrefs(user) {
+	for _, principalHref := range acl.PrincipalHrefs(user) {
 		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
 		if err != nil {
 			return nil, err
@@ -289,13 +211,13 @@ func (s *Service) prefetchACLEntries(ctx context.Context, user *store.User, book
 }
 
 func canReadContactFromEntries(user *store.User, bookID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
-	applicable := applicableACLPrincipals(user)
+	applicable := acl.ApplicablePrincipals(user)
 	for _, p := range addressBookACLResourcePaths(bookID, resourceName) {
-		if granted, decided := aclDecisionForPrivilege(entriesByPath[p], applicable, "read"); decided {
+		if granted, decided := acl.DecisionForPrivilege(entriesByPath[p], applicable, "read"); decided {
 			return granted
 		}
 	}
-	if granted, decided := aclDecisionForPrivilege(entriesByPath[addressBookACLCollectionPath(bookID)], applicable, "read"); decided {
+	if granted, decided := acl.DecisionForPrivilege(entriesByPath[addressBookACLCollectionPath(bookID)], applicable, "read"); decided {
 		return granted
 	}
 	return false

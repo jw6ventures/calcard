@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -430,6 +431,44 @@ func TestServiceListEventsBatchesACLLookups(t *testing.T) {
 	}
 }
 
+func TestServiceListEventsPaginationOnlyPreservesLastModifiedOrder(t *testing.T) {
+	owner := &store.User{ID: 1}
+
+	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC) // oldest modification
+	t2 := time.Date(2026, 6, 2, 10, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC) // newest modification
+	janStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	febStart := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	marStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	svc := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Mine"}},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{
+			"1:early": {CalendarID: 1, UID: "early", ResourceName: "early", DTStart: &janStart, LastModified: t1},
+			"1:mid":   {CalendarID: 1, UID: "mid", ResourceName: "mid", DTStart: &febStart, LastModified: t3},
+			"1:late":  {CalendarID: 1, UID: "late", ResourceName: "late", DTStart: &marStart, LastModified: t2},
+		}},
+	})
+
+	events, err := svc.ListEvents(context.Background(), owner, 1, store.EventFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListEvents() error = %v", err)
+	}
+
+	gotUIDs := make([]string, len(events))
+	for i, ev := range events {
+		gotUIDs[i] = ev.UID
+	}
+	// A pagination-only filter must preserve ListForCalendar's last_modified DESC
+	// ordering. If it regressed to ListForCalendarFiltered (dtstart ASC), the
+	// first page would start with "early".
+	if got, want := strings.Join(gotUIDs, ","), "mid,late"; got != want {
+		t.Fatalf("ListEvents(limit=2) order = %q, want %q (last_modified DESC, not dtstart)", got, want)
+	}
+}
+
 func TestHelpersAndValidators(t *testing.T) {
 	t.Run("build structured event branches", func(t *testing.T) {
 		if _, _, err := buildStructuredEvent(&StructuredInput{}, ""); !errors.Is(err, ErrBadRequest) {
@@ -692,13 +731,70 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 			out = append(out, ev)
 		}
 	}
+	// Mirror the store's "ORDER BY last_modified DESC" so tests can rely on it.
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].LastModified.After(out[j].LastModified)
+	})
 	return out, nil
 }
-func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
-	return f.ListForCalendar(ctx, calendarID)
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	out, err := f.ListForCalendar(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	// Mirror the store's "ORDER BY dtstart ASC NULLS LAST, last_modified DESC".
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := out[i].DTStart, out[j].DTStart
+		switch {
+		case di == nil && dj == nil:
+			return out[i].LastModified.After(out[j].LastModified)
+		case di == nil:
+			return false // NULLS LAST
+		case dj == nil:
+			return true
+		case di.Equal(*dj):
+			return out[i].LastModified.After(out[j].LastModified)
+		default:
+			return di.Before(*dj)
+		}
+	})
+	// Model the LIMIT/OFFSET pushdown the real store applies in SQL so that
+	// callers relying on store-side pagination behave the same here.
+	if filter.Offset > 0 {
+		if filter.Offset >= len(out) {
+			return []store.Event{}, nil
+		}
+		out = out[filter.Offset:]
+	}
+	if filter.Limit > 0 && filter.Limit < len(out) {
+		out = out[:filter.Limit]
+	}
+	return out, nil
 }
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
-	return nil, nil
+	// Mirror the store: "ORDER BY last_modified DESC LIMIT/OFFSET".
+	all, err := f.ListForCalendar(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	total := len(all)
+	items := all
+	if offset > 0 {
+		if offset >= len(items) {
+			items = nil
+		} else {
+			items = items[offset:]
+		}
+	}
+	if limit > 0 && limit < len(items) {
+		items = items[:limit]
+	}
+	return &store.PaginatedResult[store.Event]{
+		Items:      items,
+		TotalCount: total,
+		Limit:      limit,
+		Offset:     offset,
+	}, nil
 }
 func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]store.Event, error) {
 	return nil, nil

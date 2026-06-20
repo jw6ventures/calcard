@@ -5096,6 +5096,60 @@ func TestPropfindAddressBookCollectionIncludesLockAndACLProperties(t *testing.T)
 	}
 }
 
+func TestDecoratePropfindResponsesBatchesLockDiscovery(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:cal10": {
+				Token:        "opaquelocktoken:cal10",
+				ResourcePath: "/dav/calendars/10",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &Handler{store: &store.Store{Locks: lockRepo}}
+
+	responses := []response{
+		{Href: "/dav/calendars/9/", Propstat: []propstat{{Status: httpStatusOK}}},
+		{Href: "/dav/calendars/10/", Propstat: []propstat{{Status: httpStatusOK}}},
+	}
+
+	ctx := auth.WithUser(context.Background(), user)
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	mask := propDecorationMask{lockDiscovery: true}
+	if err := h.decoratePropfindResponses(ctx, req, user, responses, mask); err != nil {
+		t.Fatalf("decoratePropfindResponses: %v", err)
+	}
+
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("expected a single batched lock query for the whole Depth:1 set, got %d", lockRepo.listByResourcesCalls)
+	}
+
+	lockCount := func(href string) int {
+		for i := range responses {
+			if responses[i].Href != href {
+				continue
+			}
+			ld := responses[i].Propstat[0].Prop.LockDiscovery
+			if ld == nil {
+				return -1
+			}
+			return len(ld.ActiveLocks)
+		}
+		return -1
+	}
+	if got := lockCount("/dav/calendars/10/"); got != 1 {
+		t.Fatalf("expected the locked collection to report its lock, got %d", got)
+	}
+	if got := lockCount("/dav/calendars/9/"); got != 0 {
+		t.Fatalf("expected the unlocked collection to report no locks, got %d", got)
+	}
+}
+
 func TestACLRejectsInvalidACEs(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{

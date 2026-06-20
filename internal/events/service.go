@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -134,31 +135,39 @@ func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID i
 		return nil, err
 	}
 
-	// Date and text predicates are pushed into SQL (calendar-scoped, indexed),
-	// but pagination is applied in Go after per-event ACL filtering so page
-	// sizes stay correct even on calendars with per-resource grants.
+	// A single principal sweep tells us whether event visibility is uniform
+	// across the calendar (owner, or a non-owner whose grants are all
+	// collection-level) and yields the ACL entries the slow path needs. When it
+	// is uniform we decide once and let SQL apply LIMIT/OFFSET, instead of
+	// fetching every row and filtering (and paginating) in Go.
+	uniform, allowed, entriesByPath, err := s.calendarReadPlan(ctx, user, cal)
+	if err != nil {
+		return nil, err
+	}
+	if uniform {
+		if !allowed {
+			return []store.Event{}, nil
+		}
+		return s.listEventsFromStore(ctx, calendarID, filter)
+	}
+
+	// Slow path: per-resource ACL grants exist, so visibility varies per event.
+	// Date and text predicates are still pushed into SQL (calendar-scoped,
+	// indexed), but pagination is applied in Go after per-event ACL filtering so
+	// page sizes stay correct.
 	limit, offset := filter.Limit, filter.Offset
 	dbFilter := filter
 	dbFilter.Limit = 0
 	dbFilter.Offset = 0
 
-	var events []store.Event
-	if dbFilter.IsZero() {
-		events, err = s.store.Events.ListForCalendar(ctx, calendarID)
-	} else {
-		events, err = s.store.Events.ListForCalendarFiltered(ctx, calendarID, dbFilter)
-	}
+	events, err := s.listEventsFromStore(ctx, calendarID, dbFilter)
 	if err != nil {
 		return nil, err
 	}
 
-	prefetchedACLEntries, err := s.prefetchCalendarACLEntries(ctx, user, calendarID, events)
-	if err != nil {
-		return nil, err
-	}
 	visible := make([]store.Event, 0, len(events))
 	for _, event := range events {
-		allowed, err := s.canReadCalendarResourceWithEntries(user, cal, eventResourceName(event), prefetchedACLEntries)
+		allowed, err := s.canReadCalendarResourceWithEntries(user, cal, eventResourceName(event), entriesByPath)
 		if err != nil {
 			return nil, err
 		}
@@ -177,6 +186,109 @@ func (s *Service) ListEvents(ctx context.Context, user *store.User, calendarID i
 		visible = visible[:limit]
 	}
 	return visible, nil
+}
+
+// listEventsFromStore fetches events for a calendar, applying any date/text
+// predicates and LIMIT/OFFSET in the filter. An empty filter returns every
+// event.
+func (s *Service) listEventsFromStore(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	if filter.IsZero() {
+		return s.store.Events.ListForCalendar(ctx, calendarID)
+	}
+	if !filter.HasPredicate() {
+		return s.listPaginatedFromStore(ctx, calendarID, filter)
+	}
+	return s.store.Events.ListForCalendarFiltered(ctx, calendarID, filter)
+}
+
+// listPaginatedFromStore returns a pagination-only slice of a calendar's events
+// in last_modified DESC order. A positive limit is pushed into SQL via
+// ListForCalendarPaginated. An offset without a limit has no upper bound to push
+// into a SQL LIMIT, so it falls back to fetching in order and skipping in Go.
+// EXPENSIVE
+func (s *Service) listPaginatedFromStore(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	if filter.Limit > 0 {
+		page, err := s.store.Events.ListForCalendarPaginated(ctx, calendarID, filter.Limit, filter.Offset)
+		if err != nil {
+			return nil, err
+		}
+		if page == nil {
+			return nil, nil
+		}
+		return page.Items, nil
+	}
+
+	events, err := s.store.Events.ListForCalendar(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	if filter.Offset > 0 {
+		if filter.Offset >= len(events) {
+			return []store.Event{}, nil
+		}
+		events = events[filter.Offset:]
+	}
+	return events, nil
+}
+
+// calendarReadPlan decides, in a single ACL principal sweep, how ListEvents
+// should read a calendar. uniform reports whether every event resolves to the
+// same read decision (so the caller can skip per-event filtering and push
+// pagination into SQL); allowed is that decision when uniform. When per-resource
+// grants exist, uniform is false and entriesByPath carries the user's
+// calendar-scoped ACL entries for the per-event slow path.
+func (s *Service) calendarReadPlan(ctx context.Context, user *store.User, cal *store.CalendarAccess) (uniform, allowed bool, entriesByPath map[string][]store.ACLEntry, err error) {
+	if cal != nil && user != nil && cal.UserID == user.ID {
+		return true, true, nil, nil
+	}
+	if s == nil || s.store == nil || s.store.ACLEntries == nil || user == nil || cal == nil {
+		// No ACL store (or no user/calendar to scope to): every event resolves to
+		// the same effective-privilege decision.
+		return true, cal.EffectivePrivileges().Allows("read"), nil, nil
+	}
+
+	entriesByPath, hasResourceEntries, err := s.collectCalendarACLEntries(ctx, user, cal.ID)
+	if err != nil {
+		return false, false, nil, err
+	}
+	if hasResourceEntries {
+		return false, false, entriesByPath, nil
+	}
+
+	// No per-resource entries: every event resolves to the collection-level
+	// decision. An empty resourceName collapses to the collection paths.
+	allowed, _ = s.canReadCalendarResourceWithEntries(user, cal, "", entriesByPath)
+	return true, allowed, entriesByPath, nil
+}
+
+// collectCalendarACLEntries returns, in one principal sweep, the ACL entries
+// applicable to the user that target this calendar's collection or a resource
+// beneath it, keyed by resource path. hasResourceEntries reports whether any
+// entry targets a per-resource path (beneath the collection), which means event
+// visibility can vary. The cost is bounded by the user's ACL entry count,
+// independent of the event count.
+func (s *Service) collectCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64) (map[string][]store.ACLEntry, bool, error) {
+	collectionPath := calendarACLCollectionPath(calendarID)
+	resourcePrefix := collectionPath + "/"
+	entriesByPath := make(map[string][]store.ACLEntry)
+	hasResourceEntries := false
+	for _, principalHref := range acl.PrincipalHrefs(user) {
+		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, entry := range entries {
+			path := strings.TrimSpace(entry.ResourcePath)
+			switch {
+			case path == collectionPath:
+				entriesByPath[path] = append(entriesByPath[path], entry)
+			case strings.HasPrefix(path, resourcePrefix):
+				entriesByPath[path] = append(entriesByPath[path], entry)
+				hasResourceEntries = true
+			}
+		}
+	}
+	return entriesByPath, hasResourceEntries, nil
 }
 
 func (s *Service) GetEvent(ctx context.Context, user *store.User, calendarID int64, uid string) (*store.Event, error) {
@@ -373,8 +485,8 @@ func (s *Service) aclDecision(ctx context.Context, user *store.User, resourcePat
 		return false, false, err
 	}
 
-	applicablePrincipals := applicableACLPrincipals(user)
-	granted, applicable := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
+	applicablePrincipals := acl.ApplicablePrincipals(user)
+	granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
 	return granted, applicable, nil
 }
 
@@ -387,13 +499,7 @@ func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.Use
 		return false, nil
 	}
 
-	applicablePrincipals := applicableACLPrincipals(user)
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
-			return true, nil
-		}
-	}
-	return false, nil
+	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
 }
 
 func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string) ([]store.ACLEntry, error) {
@@ -434,7 +540,7 @@ func (s *Service) prefetchCalendarACLEntries(ctx context.Context, user *store.Us
 	}
 
 	result := make(map[string][]store.ACLEntry, len(relevantPaths))
-	for _, principalHref := range aclPrincipalHrefs(user) {
+	for _, principalHref := range acl.PrincipalHrefs(user) {
 		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
 		if err != nil {
 			return nil, err
@@ -476,23 +582,6 @@ func eventResourceName(event store.Event) string {
 	return event.UID
 }
 
-func applicableACLPrincipals(user *store.User) map[string]struct{} {
-	principals := map[string]struct{}{"DAV:all": {}}
-	if user != nil {
-		principals[fmt.Sprintf("/dav/principals/%d/", user.ID)] = struct{}{}
-		principals["DAV:authenticated"] = struct{}{}
-	}
-	return principals
-}
-
-func aclPrincipalHrefs(user *store.User) []string {
-	principals := []string{"DAV:all"}
-	if user != nil {
-		principals = append(principals, "DAV:authenticated", fmt.Sprintf("/dav/principals/%d/", user.ID))
-	}
-	return principals
-}
-
 func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
 	if cal == nil || user == nil {
 		return false, false
@@ -522,81 +611,20 @@ func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user
 	for _, resourcePath := range resourcePaths {
 		entries = append(entries, entriesByPath[resourcePath]...)
 	}
-	return aclDecisionForPrivilege(entries, applicableACLPrincipals(user), privilege)
+	return acl.DecisionForPrivilege(entries, acl.ApplicablePrincipals(user), privilege)
 }
 
 func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string) bool {
 	if len(entriesByPath) == 0 {
 		return false
 	}
-	applicablePrincipals := applicableACLPrincipals(user)
+	applicablePrincipals := acl.ApplicablePrincipals(user)
 	for _, resourcePath := range resourcePaths {
-		for _, entry := range entriesByPath[resourcePath] {
-			if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; ok {
-				return true
-			}
+		if acl.HasApplicablePrincipal(entriesByPath[resourcePath], applicablePrincipals) {
+			return true
 		}
 	}
 	return false
-}
-
-func normalizeACLPrincipalHref(raw string) string {
-	raw = strings.TrimSpace(raw)
-	switch raw {
-	case "", "DAV:all", "DAV:authenticated":
-		return raw
-	}
-	if strings.HasPrefix(raw, "/dav/principals/") && !strings.HasSuffix(raw, "/") {
-		return raw + "/"
-	}
-	return raw
-}
-
-func aclPrivilegeMatches(granted, requested string) bool {
-	if granted == requested || granted == "all" {
-		return true
-	}
-	if granted == "read" && requested == "read-free-busy" {
-		return true
-	}
-	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
-}
-
-func aclDecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	if privilege == "write" {
-		return aclAggregateWriteDecision(entries, applicablePrincipals)
-	}
-	hasGrant := false
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[normalizeACLPrincipalHref(entry.PrincipalHref)]; !ok {
-			continue
-		}
-		if !aclPrivilegeMatches(entry.Privilege, privilege) {
-			continue
-		}
-		if !entry.IsGrant {
-			return false, true
-		}
-		hasGrant = true
-	}
-	if hasGrant {
-		return true, true
-	}
-	return false, false
-}
-
-func aclAggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
-	applicable := false
-	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
-		granted, decided := aclDecisionForPrivilege(entries, applicablePrincipals, privilege)
-		if decided {
-			applicable = true
-		}
-		if !granted {
-			return false, applicable
-		}
-	}
-	return applicable, applicable
 }
 
 func pathExt(resourceName string) string {
@@ -831,22 +859,25 @@ func validateStrictICalendar(data string) error {
 	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
 		return fmt.Errorf("%w: missing supported calendar component", ErrBadRequest)
 	}
-	if containsICalMethodProperty(data) {
+	// Unfold once and reuse the lines across every line-oriented check below,
+	// instead of re-unfolding for each pass (cost grows with attendees/lines).
+	lines := utils.UnfoldLines(data)
+	if containsICalMethodPropertyLines(lines) {
 		return fmt.Errorf("%w: METHOD property not allowed", ErrConflict)
 	}
-	if conditions := validateCalendarObjectResource(data); len(conditions) > 0 {
-		if hasMultipleDifferentUIDs(data) {
+	if conditions := validateCalendarObjectResourceLines(lines); len(conditions) > 0 {
+		if hasMultipleDifferentUIDsLines(lines) {
 			return fmt.Errorf("%w: multiple UIDs in single resource", ErrConflict)
 		}
 		return fmt.Errorf("%w: invalid calendar object resource", ErrBadRequest)
 	}
 	minDate, maxDate := caldavDateLimits()
-	for _, t := range extractICalDateTimes(data) {
+	for _, t := range extractICalDateTimesLines(lines) {
 		if t.Before(minDate) || t.After(maxDate) {
 			return fmt.Errorf("%w: date outside supported range", ErrBadRequest)
 		}
 	}
-	if attendeeCount := countICalAttendees(data); attendeeCount > caldavMaxAttendees {
+	if attendeeCount := countICalAttendeesLines(lines); attendeeCount > caldavMaxAttendees {
 		return fmt.Errorf("%w: too many attendees", ErrBadRequest)
 	}
 	if count, ok := extractICalRRULECount(data); ok && count > caldavMaxInstances {
@@ -882,14 +913,20 @@ func validateICalendar(data string) error {
 	return nil
 }
 
+// hasPrefixFold reports whether s starts with prefix, case-insensitively,
+// without allocating an uppercased copy of s (unlike strings.ToUpper). The
+// validation scanners run this per line, so avoiding the allocation matters.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
 func extractICalComponentTypes(icalData string) map[string]struct{} {
 	componentTypes := make(map[string]struct{})
 	lines := strings.Split(icalData, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		upperLine := strings.ToUpper(line)
-		if strings.HasPrefix(upperLine, "BEGIN:") {
-			componentType := strings.TrimSpace(upperLine[6:])
+		if hasPrefixFold(line, "BEGIN:") {
+			componentType := strings.ToUpper(strings.TrimSpace(line[6:]))
 			if componentType != "" {
 				componentTypes[componentType] = struct{}{}
 			}
@@ -902,8 +939,7 @@ func extractICalRRULECount(icalData string) (int, bool) {
 	lines := strings.Split(icalData, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		upperLine := strings.ToUpper(line)
-		if !strings.HasPrefix(upperLine, "RRULE:") {
+		if !hasPrefixFold(line, "RRULE:") {
 			continue
 		}
 		rrule := line[len("RRULE:"):]
@@ -924,11 +960,13 @@ func extractICalRRULECount(icalData string) (int, bool) {
 }
 
 func countICalAttendees(icalData string) int {
+	return countICalAttendeesLines(utils.UnfoldLines(icalData))
+}
+
+func countICalAttendeesLines(lines []string) int {
 	count := 0
-	lines := utils.UnfoldLines(icalData)
 	for _, line := range lines {
-		upper := strings.ToUpper(strings.TrimSpace(line))
-		if strings.HasPrefix(upper, "ATTENDEE") {
+		if hasPrefixFold(strings.TrimSpace(line), "ATTENDEE") {
 			count++
 		}
 	}
@@ -940,8 +978,7 @@ func extractUIDFromICalendar(icalData string) (string, error) {
 	seenUIDs := make(map[string]struct{})
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-		if !strings.HasPrefix(upper, "UID:") {
+		if !hasPrefixFold(trimmed, "UID:") {
 			continue
 		}
 		uid := strings.TrimSpace(trimmed[4:])
@@ -962,21 +999,41 @@ func extractUIDFromICalendar(icalData string) (string, error) {
 }
 
 func validateCalendarObjectResource(icalData string) []string {
+	return validateCalendarObjectResourceLines(utils.UnfoldLines(icalData))
+}
+
+// isComponentBoundary reports whether trimmed is exactly a "<boundary><type>"
+// marker for one of the calendar object components, case-insensitively and
+// without allocating (boundary is "BEGIN:" or "END:").
+func isComponentBoundary(trimmed, boundary string) bool {
+	if !hasPrefixFold(trimmed, boundary) {
+		return false
+	}
+	switch component := trimmed[len(boundary):]; {
+	case strings.EqualFold(component, "VEVENT"),
+		strings.EqualFold(component, "VTODO"),
+		strings.EqualFold(component, "VJOURNAL"),
+		strings.EqualFold(component, "VFREEBUSY"):
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCalendarObjectResourceLines(lines []string) []string {
 	var conditions []string
-	lines := utils.UnfoldLines(icalData)
 	inEvent := false
 	currentUID := ""
 	seenUID := false
 	seenUIDs := make(map[string]struct{})
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-		switch upper {
-		case "BEGIN:VEVENT", "BEGIN:VTODO", "BEGIN:VJOURNAL", "BEGIN:VFREEBUSY":
+		switch {
+		case isComponentBoundary(trimmed, "BEGIN:"):
 			inEvent = true
 			currentUID = ""
 			seenUID = false
-		case "END:VEVENT", "END:VTODO", "END:VJOURNAL", "END:VFREEBUSY":
+		case isComponentBoundary(trimmed, "END:"):
 			if inEvent && !seenUID {
 				conditions = append(conditions, "valid-calendar-object-resource")
 			}
@@ -985,7 +1042,7 @@ func validateCalendarObjectResource(icalData string) []string {
 			}
 			inEvent = false
 		default:
-			if inEvent && strings.HasPrefix(upper, "UID:") {
+			if inEvent && hasPrefixFold(trimmed, "UID:") {
 				currentUID = strings.TrimSpace(trimmed[4:])
 				seenUID = currentUID != ""
 			}
@@ -998,12 +1055,14 @@ func validateCalendarObjectResource(icalData string) []string {
 }
 
 func hasMultipleDifferentUIDs(icalData string) bool {
-	lines := utils.UnfoldLines(icalData)
+	return hasMultipleDifferentUIDsLines(utils.UnfoldLines(icalData))
+}
+
+func hasMultipleDifferentUIDsLines(lines []string) bool {
 	seenUIDs := make(map[string]struct{})
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-		if strings.HasPrefix(upper, "UID:") {
+		if hasPrefixFold(trimmed, "UID:") {
 			uid := strings.TrimSpace(trimmed[4:])
 			if uid != "" {
 				seenUIDs[uid] = struct{}{}
@@ -1014,11 +1073,12 @@ func hasMultipleDifferentUIDs(icalData string) bool {
 }
 
 func containsICalMethodProperty(icalData string) bool {
-	lines := utils.UnfoldLines(icalData)
+	return containsICalMethodPropertyLines(utils.UnfoldLines(icalData))
+}
+
+func containsICalMethodPropertyLines(lines []string) bool {
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-		if strings.HasPrefix(upper, "METHOD:") {
+		if hasPrefixFold(strings.TrimSpace(line), "METHOD:") {
 			return true
 		}
 	}
@@ -1026,15 +1086,17 @@ func containsICalMethodProperty(icalData string) bool {
 }
 
 func extractICalDateTimes(ical string) []time.Time {
+	return extractICalDateTimesLines(utils.UnfoldLines(ical))
+}
+
+func extractICalDateTimesLines(lines []string) []time.Time {
 	var values []time.Time
-	lines := utils.UnfoldLines(ical)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		upper := strings.ToUpper(trimmed)
-		if !strings.HasPrefix(upper, "DTSTART") && !strings.HasPrefix(upper, "DTEND") && !strings.HasPrefix(upper, "DUE") && !strings.HasPrefix(upper, "RECURRENCE-ID") {
+		if !hasPrefixFold(trimmed, "DTSTART") && !hasPrefixFold(trimmed, "DTEND") && !hasPrefixFold(trimmed, "DUE") && !hasPrefixFold(trimmed, "RECURRENCE-ID") {
 			continue
 		}
 		parts := strings.SplitN(trimmed, ":", 2)

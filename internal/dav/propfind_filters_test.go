@@ -2,8 +2,10 @@ package dav
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -14,45 +16,6 @@ func propstatWithStatus(stats []propstat, status string) *propstat {
 		}
 	}
 	return nil
-}
-
-func TestCanReadAddressBookContactBranches(t *testing.T) {
-	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
-
-	t.Run("blank resource name is skipped", func(t *testing.T) {
-		h := &Handler{}
-		allowed, err := h.canReadAddressBookContact(context.Background(), &store.User{ID: 2}, book, " ")
-		if err != nil {
-			t.Fatalf("canReadAddressBookContact returned error: %v", err)
-		}
-		if allowed {
-			t.Fatal("expected blank resource name to be rejected")
-		}
-	})
-
-	t.Run("owner is allowed", func(t *testing.T) {
-		h := &Handler{}
-		allowed, err := h.canReadAddressBookContact(context.Background(), &store.User{ID: 1}, book, "alice")
-		if err != nil {
-			t.Fatalf("canReadAddressBookContact returned error: %v", err)
-		}
-		if !allowed {
-			t.Fatal("expected owner to be allowed")
-		}
-	})
-
-	t.Run("explicit deny returns false", func(t *testing.T) {
-		h := &Handler{store: &store.Store{ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
-			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: false},
-		}}}}
-		allowed, err := h.canReadAddressBookContact(context.Background(), &store.User{ID: 2}, book, "alice")
-		if err != nil {
-			t.Fatalf("canReadAddressBookContact returned error: %v", err)
-		}
-		if allowed {
-			t.Fatal("expected denied contact read to be filtered")
-		}
-	})
 }
 
 func TestFilterReadableAddressBookContactsFiltersDeniedContacts(t *testing.T) {
@@ -76,6 +39,76 @@ func TestFilterReadableAddressBookContactsFiltersDeniedContacts(t *testing.T) {
 	}
 	if got := contactResourceName(filtered[0]); got != "public" {
 		t.Fatalf("expected public contact to remain, got %q", got)
+	}
+}
+
+func TestAddressBookPrivilegeDecisionFromEntries(t *testing.T) {
+	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
+	user := &store.User{ID: 2}
+
+	t.Run("owner is always allowed", func(t *testing.T) {
+		allowed, denied := addressBookPrivilegeDecisionFromEntries(&store.User{ID: 1}, book, "alice", "read", nil)
+		if !allowed || denied {
+			t.Fatalf("expected owner allowed, got allowed=%v denied=%v", allowed, denied)
+		}
+	})
+
+	t.Run("collection grant allows", func(t *testing.T) {
+		entries := map[string][]store.ACLEntry{
+			"/dav/addressbooks/5": {{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: true}},
+		}
+		allowed, denied := addressBookPrivilegeDecisionFromEntries(user, book, "alice", "read", entries)
+		if !allowed || denied {
+			t.Fatalf("expected collection grant to allow, got allowed=%v denied=%v", allowed, denied)
+		}
+	})
+
+	t.Run("object deny overrides collection grant", func(t *testing.T) {
+		entries := map[string][]store.ACLEntry{
+			"/dav/addressbooks/5":        {{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: true}},
+			"/dav/addressbooks/5/secret": {{ResourcePath: "/dav/addressbooks/5/secret", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: false}},
+		}
+		allowed, denied := addressBookPrivilegeDecisionFromEntries(user, book, "secret", "read", entries)
+		if allowed || !denied {
+			t.Fatalf("expected object deny to win, got allowed=%v denied=%v", allowed, denied)
+		}
+	})
+
+	t.Run("no applicable ACL is not readable", func(t *testing.T) {
+		allowed, denied := addressBookPrivilegeDecisionFromEntries(user, book, "alice", "read", nil)
+		if allowed || denied {
+			t.Fatalf("expected no decision, got allowed=%v denied=%v", allowed, denied)
+		}
+	})
+}
+
+func TestFilterReadableAddressBookContactsPrefetchesOnce(t *testing.T) {
+	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
+	repo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: true},
+	}}
+	h := &Handler{store: &store.Store{ACLEntries: repo}}
+
+	contacts := make([]store.Contact, 0, 50)
+	for i := 0; i < 50; i++ {
+		name := fmt.Sprintf("c%d", i)
+		contacts = append(contacts, store.Contact{AddressBookID: 5, UID: name, ResourceName: name})
+	}
+
+	filtered, err := h.filterReadableAddressBookContacts(context.Background(), &store.User{ID: 2}, book, contacts)
+	if err != nil {
+		t.Fatalf("filterReadableAddressBookContacts returned error: %v", err)
+	}
+	if len(filtered) != len(contacts) {
+		t.Fatalf("expected all %d contacts visible via collection grant, got %d", len(contacts), len(filtered))
+	}
+	// One sweep over the user's principals (DAV:all, DAV:authenticated, /dav/principals/2/)
+	// rather than a per-contact ListByResource lookup.
+	if repo.listByResourceCalls != 0 {
+		t.Fatalf("expected no per-resource ACL lookups, got %d", repo.listByResourceCalls)
+	}
+	if repo.listByPrincipalCalls != len(acl.PrincipalHrefs(&store.User{ID: 2})) {
+		t.Fatalf("expected one prefetch sweep (%d principal lookups), got %d", len(acl.PrincipalHrefs(&store.User{ID: 2})), repo.listByPrincipalCalls)
 	}
 }
 

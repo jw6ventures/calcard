@@ -151,6 +151,15 @@ func (f EventFilter) IsZero() bool {
 		f.Limit <= 0 && f.Offset == 0
 }
 
+// HasPredicate reports whether the filter constrains results by date or text,
+// as opposed to only paginating with Limit/Offset. Pagination-only filters must
+// preserve the ListForCalendar ordering (last_modified DESC), so callers route
+// them differently from filters that narrow the result set.
+func (f EventFilter) HasPredicate() bool {
+	return f.Start != nil || f.End != nil ||
+		f.Title != "" || f.Description != "" || f.Location != "" || f.Query != ""
+}
+
 // AddressBook belongs to a user for CardDAV.
 type AddressBook struct {
 	ID          int64

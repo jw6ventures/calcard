@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -297,7 +298,7 @@ func (s *Service) ListAccessibleAddressBooks(ctx context.Context, user *store.Us
 		return result, nil
 	}
 
-	for _, principal := range aclPrincipalHrefs(user) {
+	for _, principal := range acl.PrincipalHrefs(user) {
 		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principal)
 		if err != nil {
 			return nil, err

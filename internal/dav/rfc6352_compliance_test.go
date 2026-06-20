@@ -38,9 +38,10 @@ func buildVCard(version string, lines ...string) string {
 }
 
 type fakeLockRepo struct {
-	locks               map[string]*store.Lock
-	listByResourcesErr  error
-	moveResourcePathErr error
+	locks                map[string]*store.Lock
+	listByResourcesErr   error
+	listByResourcesCalls int
+	moveResourcePathErr  error
 }
 
 func (f *fakeLockRepo) Create(ctx context.Context, lock store.Lock) (*store.Lock, error) {
@@ -88,6 +89,7 @@ func (f *fakeLockRepo) ListByResource(ctx context.Context, resourcePath string) 
 }
 
 func (f *fakeLockRepo) ListByResources(ctx context.Context, paths []string) ([]store.Lock, error) {
+	f.listByResourcesCalls++
 	if f.listByResourcesErr != nil {
 		return nil, f.listByResourcesErr
 	}

@@ -11,7 +11,41 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response) error {
+// propDecorationMask controls which expensive DAV properties decorateDAVProp
+// computes. Each field gates a property that requires a DB query or repeated
+// privilege checks, so unrequested properties can be skipped entirely.
+type propDecorationMask struct {
+	lockDiscovery           bool
+	acl                     bool
+	currentUserPrivilegeSet bool
+}
+
+// decorationMaskFor derives the set of expensive properties worth computing for
+// a PROPFIND request. A specific <prop> request only needs the properties it
+// names; allprop, propname, and compat (nil) requests retain the previous
+// behavior of computing everything.
+func decorationMaskFor(req *propfindRequest) propDecorationMask {
+	if req == nil || req.Prop == nil {
+		return propDecorationMask{lockDiscovery: true, acl: true, currentUserPrivilegeSet: true}
+	}
+	return propDecorationMask{
+		lockDiscovery:           req.Prop.LockDiscovery != nil,
+		acl:                     req.Prop.ACLProp != nil,
+		currentUserPrivilegeSet: req.Prop.CurrentUserPrivilegeSet != nil,
+	}
+}
+
+func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response, mask propDecorationMask) error {
+	// When lock discovery is requested across multiple responses, prefetch every
+	// relevant lock in one query so each response's lockDiscoveryForPath reads
+	// from the batch index rather than issuing its own query.
+	if mask.lockDiscovery && len(responses) > 1 {
+		batchCtx, err := h.prefetchLockBatchIndex(ctx, responses)
+		if err != nil {
+			return err
+		}
+		ctx = batchCtx
+	}
 	for i := range responses {
 		if len(responses[i].Propstat) == 0 {
 			continue
@@ -21,7 +55,7 @@ func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request
 			if responses[i].Propstat[j].Status != httpStatusOK {
 				continue
 			}
-			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop); err != nil {
+			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop, mask); err != nil {
 				return err
 			}
 			if err := h.davRegistry().decoratePropfind(RequestContext{
@@ -40,22 +74,25 @@ func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request
 	return nil
 }
 
-func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop) error {
+func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop, mask propDecorationMask) error {
 	if p == nil || resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
 		return nil
 	}
 
+	// These are static or cheap to build, so always populate them.
 	p.SupportedLock = defaultSupportedLock()
 	p.SupportedPrivilegeSet = defaultSupportedPrivilegeSet()
 	p.PrincipalCollectionSet = &hrefListProp{Href: []string{"/dav/principals/"}}
 
-	lockDiscovery, err := h.lockDiscoveryForPath(ctx, resourcePath)
-	if err != nil {
-		return err
+	if mask.lockDiscovery {
+		lockDiscovery, err := h.lockDiscoveryForPath(ctx, resourcePath)
+		if err != nil {
+			return err
+		}
+		p.LockDiscovery = lockDiscovery
 	}
-	p.LockDiscovery = lockDiscovery
 
-	if h != nil && h.store != nil && h.store.ACLEntries != nil {
+	if mask.acl && h != nil && h.store != nil && h.store.ACLEntries != nil {
 		entries, err := h.aclEntriesForResource(ctx, resourcePath)
 		if err != nil {
 			return err
@@ -68,7 +105,7 @@ func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourc
 		p.CurrentUserPrincipal = &expandableHrefProp{Href: principalHref}
 		p.CurrentUserPrincipalURL = &hrefProp{Href: principalHref}
 	}
-	if user != nil && p.CurrentUserPrivilegeSet == nil {
+	if mask.currentUserPrivilegeSet && user != nil && p.CurrentUserPrivilegeSet == nil {
 		p.CurrentUserPrivilegeSet = h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
 	}
 
@@ -184,14 +221,9 @@ func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string)
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return &lockDiscoveryProp{}, nil
 	}
-	if user, ok := auth.UserFromContext(ctx); ok {
-		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
-			resourcePath = canonicalPath
-		}
-	}
+	resourcePath, paths := h.lockLookupPathsForResource(ctx, resourcePath)
 
-	paths := lockLookupPaths(resourcePath)
-	locks, err := h.store.Locks.ListByResources(ctx, paths)
+	locks, err := h.locksForLookupPaths(ctx, paths)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +243,71 @@ func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string)
 	}
 
 	return &lockDiscoveryProp{ActiveLocks: activeLocks}, nil
+}
+
+// lockLookupPathsForResource canonicalizes resourcePath (best effort) and
+// returns the canonical path together with the set of paths whose locks could
+// apply to it (the resource itself plus its ancestors and legacy aliases).
+func (h *Handler) lockLookupPathsForResource(ctx context.Context, resourcePath string) (string, []string) {
+	if user, ok := auth.UserFromContext(ctx); ok {
+		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
+			resourcePath = canonicalPath
+		}
+	}
+	return resourcePath, lockLookupPaths(resourcePath)
+}
+
+// locksForLookupPaths returns the active locks for the given lookup paths. When
+// a prefetched batch index is installed (see prefetchLockBatchIndex) it serves
+// from that index to avoid one lock query per PROPFIND response; otherwise it
+// queries directly.
+func (h *Handler) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
+	if idx := lockBatchIndexFromContext(ctx); idx != nil {
+		return idx.locksForPaths(paths), nil
+	}
+	return h.store.Locks.ListByResources(ctx, paths)
+}
+
+// prefetchLockBatchIndex fetches, in a single query, every lock that could
+// apply to any response in the batch and returns a context carrying the
+// resulting index. Per-response lockDiscoveryForPath calls then read from the
+// index instead of issuing a query each, collapsing a Depth: 1 N+1 to one query.
+func (h *Handler) prefetchLockBatchIndex(ctx context.Context, responses []response) (context.Context, error) {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return ctx, nil
+	}
+	seen := make(map[string]struct{})
+	var union []string
+	for i := range responses {
+		if len(responses[i].Propstat) == 0 {
+			continue
+		}
+		resourcePath := normalizeDAVHref(responses[i].Href)
+		if resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
+			continue
+		}
+		_, paths := h.lockLookupPathsForResource(ctx, resourcePath)
+		for _, p := range paths {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			union = append(union, p)
+		}
+	}
+	if len(union) == 0 {
+		return ctx, nil
+	}
+	locks, err := h.store.Locks.ListByResources(ctx, union)
+	if err != nil {
+		return nil, err
+	}
+	byPath := make(map[string][]store.Lock, len(locks))
+	for i := range locks {
+		key := normalizeDAVHref(locks[i].ResourcePath)
+		byPath[key] = append(byPath[key], locks[i])
+	}
+	return withLockBatchIndex(ctx, &lockBatchIndex{byPath: byPath}), nil
 }
 
 func (h *Handler) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {

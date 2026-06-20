@@ -12,6 +12,12 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 data:
   APP_BASE_URL: {{ required "app.baseUrl is required" .Values.app.baseUrl | quote }}
+  APP_DB_MAX_OPEN_CONNS: {{ .Values.app.db.maxOpenConns | quote }}
+  APP_DB_MAX_IDLE_CONNS: {{ .Values.app.db.maxIdleConns | quote }}
+  APP_DB_CONN_MAX_LIFETIME: {{ .Values.app.db.connMaxLifetime | quote }}
+  APP_HTTP_READ_TIMEOUT: {{ .Values.app.http.readTimeout | quote }}
+  APP_HTTP_WRITE_TIMEOUT: {{ .Values.app.http.writeTimeout | quote }}
+  APP_HTTP_IDLE_TIMEOUT: {{ .Values.app.http.idleTimeout | quote }}
   APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
