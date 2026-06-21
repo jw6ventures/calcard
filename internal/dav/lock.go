@@ -193,7 +193,7 @@ func firstIfLockToken(header string, resourcePaths ...string) string {
 	return tokens[0]
 }
 
-func (h *Handler) Lock(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -340,7 +340,7 @@ func (h *Handler) Lock(w http.ResponseWriter, r *http.Request) {
 	writeLockResponse(w, created, status)
 }
 
-func (h *Handler) canLockPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+func (h *DavServer) canLockPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	switch {
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
 		return h.canLockAddressBookPath(ctx, user, cleanPath)
@@ -351,7 +351,7 @@ func (h *Handler) canLockPath(ctx context.Context, user *store.User, cleanPath s
 	}
 }
 
-func (h *Handler) lockTargetExists(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	switch {
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
 		if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
@@ -410,7 +410,7 @@ func (h *Handler) lockTargetExists(ctx context.Context, user *store.User, cleanP
 	}
 }
 
-func (h *Handler) canLockAddressBookPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
 		if err == store.ErrNotFound || errors.Is(err, errAmbiguousAddressBook) {
 			return false, nil
@@ -476,7 +476,7 @@ func (h *Handler) canLockAddressBookPath(ctx context.Context, user *store.User, 
 	return true, nil
 }
 
-func (h *Handler) canLockCalendarPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	if calendarID, _, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
 		if err == store.ErrNotFound || errors.Is(err, errAmbiguousCalendar) {
 			return false, nil
@@ -551,7 +551,7 @@ func (h *Handler) canLockCalendarPath(ctx context.Context, user *store.User, cle
 	return true, nil
 }
 
-func (h *Handler) hasAnyCalendarWritePrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string) (bool, error) {
+func (h *DavServer) hasAnyCalendarWritePrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string) (bool, error) {
 	for _, privilege := range []string{"write", "bind", "write-content", "write-properties", "unbind"} {
 		if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, privilege); err == nil {
 			return true, nil
@@ -587,7 +587,7 @@ func writeLockResponse(w http.ResponseWriter, lock *store.Lock, status int) {
 	_ = xml.NewEncoder(w).Encode(resp)
 }
 
-func (h *Handler) Unlock(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -646,7 +646,7 @@ func (h *Handler) Unlock(w http.ResponseWriter, r *http.Request) {
 // checkLock verifies that a write operation is allowed on a resource.
 // Returns true if the operation can proceed, false if the resource is locked
 // and the request doesn't include a valid lock token.
-func (h *Handler) checkLock(r *http.Request, resourcePath string) (bool, error) {
+func (h *DavServer) checkLock(r *http.Request, resourcePath string) (bool, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return true, nil
 	}
@@ -695,7 +695,7 @@ func (h *Handler) checkLock(r *http.Request, resourcePath string) (bool, error) 
 	return !hasActiveLock, nil
 }
 
-func (h *Handler) checkLocks(r *http.Request, resourcePaths ...string) (bool, error) {
+func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, error) {
 	seen := make(map[string]struct{}, len(resourcePaths))
 	for _, resourcePath := range resourcePaths {
 		resourcePath = path.Clean(resourcePath)
@@ -717,7 +717,7 @@ func (h *Handler) checkLocks(r *http.Request, resourcePaths ...string) (bool, er
 	return true, nil
 }
 
-func (h *Handler) requireLock(w http.ResponseWriter, r *http.Request, resourcePath, lockedMessage string) bool {
+func (h *DavServer) requireLock(w http.ResponseWriter, r *http.Request, resourcePath, lockedMessage string) bool {
 	allowed, err := h.checkLock(r, resourcePath)
 	if err != nil {
 		http.Error(w, "failed to verify lock state", http.StatusInternalServerError)
@@ -730,7 +730,7 @@ func (h *Handler) requireLock(w http.ResponseWriter, r *http.Request, resourcePa
 	return true
 }
 
-func (h *Handler) requireLocks(w http.ResponseWriter, r *http.Request, lockedMessage string, resourcePaths ...string) bool {
+func (h *DavServer) requireLocks(w http.ResponseWriter, r *http.Request, lockedMessage string, resourcePaths ...string) bool {
 	allowed, err := h.checkLocks(r, resourcePaths...)
 	if err != nil {
 		http.Error(w, "failed to verify lock state", http.StatusInternalServerError)

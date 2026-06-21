@@ -3,8 +3,6 @@ package dav
 import (
 	"context"
 	"errors"
-	"fmt"
-	"path"
 	"strconv"
 	"strings"
 
@@ -13,19 +11,10 @@ import (
 )
 
 func calendarCollectionPath(cleanPath string) string {
-	cleanPath = normalizeDAVHref(cleanPath)
-	if !strings.HasPrefix(cleanPath, "/dav/calendars/") {
-		return cleanPath
-	}
-	trimmed := strings.TrimPrefix(cleanPath, "/dav/calendars/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return "/dav/calendars"
-	}
-	return path.Join("/dav/calendars", parts[0])
+	return collectionPathForPrefix(cleanPath, calendarPrefix)
 }
 
-func (h *Handler) getCalendar(ctx context.Context, id int64) (*store.Calendar, error) {
+func (h *DavServer) getCalendar(ctx context.Context, id int64) (*store.Calendar, error) {
 	if h == nil || h.store == nil || h.store.Calendars == nil {
 		return nil, store.ErrNotFound
 	}
@@ -39,7 +28,7 @@ func (h *Handler) getCalendar(ctx context.Context, id int64) (*store.Calendar, e
 	return cal, nil
 }
 
-func (h *Handler) legacyLoadCalendarByName(ctx context.Context, user *store.User, name string) (*store.CalendarAccess, error) {
+func (h *DavServer) legacyLoadCalendarByName(ctx context.Context, user *store.User, name string) (*store.CalendarAccess, error) {
 	normalizedName := strings.ToLower(name)
 	accessible, err := h.store.Calendars.ListAccessible(ctx, user.ID)
 	if err != nil {
@@ -80,7 +69,7 @@ func (h *Handler) legacyLoadCalendarByName(ctx context.Context, user *store.User
 	return nil, store.ErrNotFound
 }
 
-func (h *Handler) accessibleCalendars(ctx context.Context, user *store.User) ([]store.CalendarAccess, error) {
+func (h *DavServer) accessibleCalendars(ctx context.Context, user *store.User) ([]store.CalendarAccess, error) {
 	if h == nil || h.store == nil || h.store.Calendars == nil || user == nil {
 		return nil, nil
 	}
@@ -172,7 +161,7 @@ func (h *Handler) accessibleCalendars(ctx context.Context, user *store.User) ([]
 	return result, nil
 }
 
-func (h *Handler) hasDiscoverableCalendarObjectGrant(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
+func (h *DavServer) hasDiscoverableCalendarObjectGrant(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
 	entries, err := h.aclEntriesForResource(ctx, resourcePath)
 	if err != nil || len(entries) == 0 {
 		return false, err
@@ -188,7 +177,7 @@ func (h *Handler) hasDiscoverableCalendarObjectGrant(ctx context.Context, user *
 	return false, nil
 }
 
-func (h *Handler) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) (bool, bool, error) {
+func (h *DavServer) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) (bool, bool, error) {
 	if cal == nil {
 		return false, false, nil
 	}
@@ -228,21 +217,11 @@ func (h *Handler) calendarPrivilegeDecision(ctx context.Context, user *store.Use
 	return false, hasApplicable, nil
 }
 
-func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) error {
-	allowed, denied, err := h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, privilege)
-	if err != nil {
-		return err
-	}
-	if allowed {
-		return nil
-	}
-	if denied {
-		return errForbidden
-	}
-	return store.ErrNotFound
+func (h *DavServer) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) error {
+	return requirePrivilegeDecision(h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, privilege))
 }
 
-func (h *Handler) calendarAccessForPath(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) (*store.CalendarAccess, error) {
+func (h *DavServer) calendarAccessForPath(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) (*store.CalendarAccess, error) {
 	privileges := store.CalendarPrivileges{}
 	for _, candidate := range []struct {
 		name string
@@ -278,7 +257,7 @@ func (h *Handler) calendarAccessForPath(ctx context.Context, user *store.User, c
 	}, nil
 }
 
-func (h *Handler) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
+func (h *DavServer) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
 	if h == nil || h.store == nil || h.store.ACLEntries == nil {
 		return false, nil
 	}
@@ -291,7 +270,7 @@ func (h *Handler) aclHasApplicablePrincipal(ctx context.Context, user *store.Use
 	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
 }
 
-func (h *Handler) loadCalendarWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.CalendarAccess, error) {
+func (h *DavServer) loadCalendarWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.CalendarAccess, error) {
 	var legacy *store.CalendarAccess
 	if user != nil && h != nil && h.store != nil && h.store.Calendars != nil {
 		legacyAccess, legacyErr := h.store.Calendars.GetAccessible(ctx, id, user.ID)
@@ -320,11 +299,11 @@ func (h *Handler) loadCalendarWithPrivilege(ctx context.Context, user *store.Use
 	return access, nil
 }
 
-func (h *Handler) canAccessCalendarObject(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) (bool, error) {
+func (h *DavServer) canAccessCalendarObject(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) (bool, error) {
 	if cal == nil {
 		return false, nil
 	}
-	resourcePath := path.Join("/dav/calendars", fmt.Sprint(cal.ID), resourceName)
+	resourcePath := objectResourcePath(calendarPrefix, cal.ID, resourceName)
 	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, resourcePath, privilege); err != nil {
 		if err == store.ErrNotFound || errors.Is(err, errForbidden) {
 			return false, nil
@@ -334,42 +313,23 @@ func (h *Handler) canAccessCalendarObject(ctx context.Context, user *store.User,
 	return true, nil
 }
 
-func (h *Handler) canReadCalendarObject(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName string) (bool, error) {
+func (h *DavServer) canReadCalendarObject(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName string) (bool, error) {
 	return h.canAccessCalendarObject(ctx, user, cal, resourceName, "read")
 }
 
-func (h *Handler) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
-	if h == nil || h.store == nil || h.store.ACLEntries == nil || user == nil {
-		return nil, nil
-	}
-
+func (h *DavServer) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
 	relevantPaths := map[string]struct{}{
-		calendarCollectionResourcePath(calendarID): {},
+		normalizeDAVHref(calendarCollectionResourcePath(calendarID)): {},
 	}
 	for _, event := range events {
 		for _, resourcePath := range calendarObjectACLPaths(calendarID, eventResourceName(event)) {
-			relevantPaths[resourcePath] = struct{}{}
+			relevantPaths[normalizeDAVHref(resourcePath)] = struct{}{}
 		}
 	}
-
-	result := make(map[string][]store.ACLEntry, len(relevantPaths))
-	for _, principalHref := range acl.PrincipalHrefs(user) {
-		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principalHref)
-		if err != nil {
-			return nil, err
-		}
-		for _, entry := range entries {
-			resourcePath := normalizeDAVHref(entry.ResourcePath)
-			if _, ok := relevantPaths[resourcePath]; !ok {
-				continue
-			}
-			result[resourcePath] = append(result[resourcePath], entry)
-		}
-	}
-	return result, nil
+	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
 
-func (h *Handler) canAccessCalendarObjectWithEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, error) {
+func (h *DavServer) canAccessCalendarObjectWithEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, error) {
 	allowed, denied := calendarPrivilegeDecisionFromEntries(user, cal, resourceName, privilege, entriesByPath)
 	if allowed {
 		return true, nil
@@ -380,7 +340,7 @@ func (h *Handler) canAccessCalendarObjectWithEntries(user *store.User, cal *stor
 	return cal != nil && cal.EffectivePrivileges().Allows(privilege), nil
 }
 
-func (h *Handler) filterCalendarEventsByPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event, privilege string) ([]store.Event, error) {
+func (h *DavServer) filterCalendarEventsByPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event, privilege string) ([]store.Event, error) {
 	prefetchedACLEntries, err := h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
 	if err != nil {
 		return nil, err
@@ -398,11 +358,11 @@ func (h *Handler) filterCalendarEventsByPrivilege(ctx context.Context, user *sto
 	return visible, nil
 }
 
-func (h *Handler) filterReadableCalendarEvents(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event) ([]store.Event, error) {
+func (h *DavServer) filterReadableCalendarEvents(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event) ([]store.Event, error) {
 	return h.filterCalendarEventsByPrivilege(ctx, user, cal, events, "read")
 }
 
-func (h *Handler) loadCalendarWithAnyPrivilege(ctx context.Context, user *store.User, id int64, cleanPath string) (*store.CalendarAccess, error) {
+func (h *DavServer) loadCalendarWithAnyPrivilege(ctx context.Context, user *store.User, id int64, cleanPath string) (*store.CalendarAccess, error) {
 	var legacy *store.CalendarAccess
 	if user != nil && h != nil && h.store != nil && h.store.Calendars != nil {
 		legacyAccess, legacyErr := h.store.Calendars.GetAccessible(ctx, id, user.ID)
@@ -437,7 +397,7 @@ func (h *Handler) loadCalendarWithAnyPrivilege(ctx context.Context, user *store.
 	return access, nil
 }
 
-func (h *Handler) requireAnyCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) error {
+func (h *DavServer) requireAnyCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) error {
 	sawForbidden := false
 	for _, privilege := range []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"} {
 		err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, privilege)
@@ -479,43 +439,70 @@ func mergeCalendarAccessWithLegacy(access, legacy *store.CalendarAccess) {
 }
 
 func calendarCollectionResourcePath(calendarID int64) string {
-	return path.Join("/dav/calendars", fmt.Sprint(calendarID))
+	return collectionResourcePath(calendarPrefix, calendarID)
 }
 
 func calendarObjectACLPaths(calendarID int64, resourceName string) []string {
-	resourceName = strings.TrimSpace(resourceName)
-	if resourceName == "" {
-		return nil
-	}
-	base := path.Join("/dav/calendars", fmt.Sprint(calendarID), resourceName)
-	paths := []string{base}
-	if strings.EqualFold(path.Ext(resourceName), ".ics") {
-		paths = append(paths, strings.TrimSuffix(base, path.Ext(resourceName)))
-	} else {
-		paths = append(paths, base+".ics")
-	}
-	return paths
+	return objectACLPaths(calendarPrefix, calendarID, resourceName, ".ics")
 }
 
 func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
 	if cal == nil || user == nil {
 		return false, false
 	}
-	if cal.UserID == user.ID {
-		return true, false
-	}
-
 	resourcePaths := calendarObjectACLPaths(cal.ID, resourceName)
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, resourcePaths, privilege); applicable {
-		return granted, !granted
-	}
-
 	collectionPaths := []string{calendarCollectionResourcePath(cal.ID)}
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, collectionPaths, privilege); applicable {
-		return granted, !granted
+	if granted, denied, decided := aclEntriesPrivilegeDecision(entriesByPath, user, cal.UserID, resourcePaths, collectionPaths, privilege); decided {
+		return granted, denied
 	}
-
 	return false, aclHasApplicablePrincipalForPaths(entriesByPath, user, resourcePaths) || aclHasApplicablePrincipalForPaths(entriesByPath, user, collectionPaths)
+}
+
+// prefetchACLEntries sweeps the user's principals once and collects the ACL
+// entries whose resource path is in relevantPaths, keyed by normalized path.
+// Both calendar and address-book prefetch helpers build their relevant-path set
+// and delegate here, replacing per-object ListByResource lookups that would make
+// a single REPORT/sync O(N) in ACL repository queries.
+func (h *DavServer) prefetchACLEntries(ctx context.Context, user *store.User, relevantPaths map[string]struct{}) (map[string][]store.ACLEntry, error) {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil || user == nil {
+		return nil, nil
+	}
+	result := make(map[string][]store.ACLEntry, len(relevantPaths))
+	for _, principalHref := range acl.PrincipalHrefs(user) {
+		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principalHref)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			resourcePath := normalizeDAVHref(entry.ResourcePath)
+			if _, ok := relevantPaths[resourcePath]; !ok {
+				continue
+			}
+			result[resourcePath] = append(result[resourcePath], entry)
+		}
+	}
+	return result, nil
+}
+
+// aclEntriesPrivilegeDecision is the shared core of the calendar and
+// address-book *PrivilegeDecisionFromEntries helpers. It returns the owner /
+// object / collection decision; decided is false when nothing applied, leaving
+// the per-domain fallback (calendars allow an EffectivePrivileges fallback,
+// address books do not) to the caller.
+func aclEntriesPrivilegeDecision(entriesByPath map[string][]store.ACLEntry, user *store.User, ownerID int64, objectPaths, collectionPaths []string, privilege string) (granted, denied, decided bool) {
+	if user == nil {
+		return false, false, false
+	}
+	if ownerID == user.ID {
+		return true, false, true
+	}
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, objectPaths, privilege); applicable {
+		return granted, !granted, true
+	}
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, collectionPaths, privilege); applicable {
+		return granted, !granted, true
+	}
+	return false, false, false
 }
 
 func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string, privilege string) (bool, bool) {
@@ -540,4 +527,29 @@ func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry
 		}
 	}
 	return false
+}
+
+func (h *DavServer) loadCalendar(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {
+	return h.loadCalendarWithAnyPrivilege(ctx, user, id, collectionResourcePath(calendarPrefix, id))
+}
+
+func (h *DavServer) loadCalendarByName(ctx context.Context, user *store.User, name string) (*store.CalendarAccess, error) {
+	accessible, err := h.accessibleCalendars(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	var match *store.CalendarAccess
+	for _, c := range accessible {
+		if (c.Slug != nil && *c.Slug == strings.ToLower(name)) || c.Name == name {
+			if match != nil {
+				return nil, errAmbiguousCalendar
+			}
+			copy := c
+			match = &copy
+		}
+	}
+	if match == nil {
+		return nil, store.ErrNotFound
+	}
+	return match, nil
 }

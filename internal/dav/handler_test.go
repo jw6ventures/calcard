@@ -65,7 +65,7 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{
+	h := &DavServer{
 		store: &store.Store{Contacts: contactRepo},
 	}
 
@@ -94,7 +94,7 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 
 func TestBirthdayCalendarReadOnly(t *testing.T) {
 	cfg := &config.Config{}
-	h := NewServer(Options{Config: cfg, Store: &store.Store{}})
+	h := NewDavServer(Options{Config: cfg, Store: &store.Store{}})
 
 	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
 
@@ -150,7 +150,7 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
@@ -177,7 +177,7 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
@@ -221,7 +221,7 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
@@ -250,7 +250,7 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 			{ID: 1, ResourceType: "event", CollectionID: 2, UID: "deleted-uid", ResourceName: "deleted-resource", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: deletedRepo}}
 
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
@@ -283,7 +283,7 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 	now := store.Now()
 	repo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
@@ -322,7 +322,7 @@ func TestAddressBookMultiGetReportHandlesRelativeHrefAgainstResourceBase(t *test
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
 
 	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil)
@@ -362,7 +362,7 @@ func TestParseSyncTokenRejectsGarbage(t *testing.T) {
 }
 
 func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodOptions, "/dav", nil)
 
@@ -384,7 +384,7 @@ func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
 }
 
 func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 
 	tests := []struct {
 		path          string
@@ -418,7 +418,7 @@ func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
 }
 
 func TestGetAdvertisesCurrentDAVCapabilities(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 
 	t.Run("positive root request advertises current capabilities", func(t *testing.T) {
 		rr := httptest.NewRecorder()
@@ -508,7 +508,7 @@ func TestCanLockCalendarPath(t *testing.T) {
 			"11:event": {CalendarID: 11, UID: "event", ResourceName: "event"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	tests := []struct {
 		name string
@@ -565,7 +565,7 @@ func TestDefaultSupportedLock(t *testing.T) {
 }
 
 func TestPropfindRootIncludesPrincipalAndHomes(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav", nil)
@@ -603,7 +603,7 @@ func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -644,7 +644,7 @@ func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "e1", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/3/", nil)
@@ -685,7 +685,7 @@ func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -724,7 +724,7 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/event.ics", nil)
@@ -747,7 +747,7 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 }
 
 func TestPropfindPrincipalsDepth0OmitsUserPrincipal(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/principals", nil)
@@ -776,7 +776,7 @@ func TestPropfindCalendarsRootListsCollections(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Two"}},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars", nil)
 	req.Header.Set("Depth", "1")
@@ -801,7 +801,7 @@ func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
 			2: {ID: 2, UserID: 1, Name: "Shared"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks", nil)
 	req.Header.Set("Depth", "1")
@@ -825,7 +825,7 @@ func TestCalendarReportFallsBackToQueryForUnknownType(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Events: eventRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
@@ -847,7 +847,7 @@ func TestAddressBookReportFallsBackToQueryForUnknownType(t *testing.T) {
 			"4:alice": {AddressBookID: 4, UID: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	book := &store.AddressBook{ID: 4, UserID: 1, Name: "Contacts"}
 	user := &store.User{ID: 1}
@@ -875,7 +875,7 @@ func TestGetServesCalendarEvent(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICALDATA", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
@@ -909,7 +909,7 @@ func TestGetServesContact(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "VCARD", ETag: "etag2"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
@@ -949,7 +949,7 @@ func TestGetRejectsWildcardAcceptRangeWithZeroQuality(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
@@ -985,7 +985,7 @@ func TestGetAddressBookResourceReturnsInternalServerErrorWhenACLLookupFails(t *t
 		},
 	}
 	aclRepo := &fakeACLRepo{listByResourceErr: errors.New("acl lookup failed")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "reader@example.com"}))
@@ -999,7 +999,7 @@ func TestGetAddressBookResourceReturnsInternalServerErrorWhenACLLookupFails(t *t
 }
 
 func TestGetRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/e.ics", nil)
 	rr := httptest.NewRecorder()
 
@@ -1026,7 +1026,7 @@ func TestGetRequiresUserEvenForDAVAllAddressBookRead(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	rr := httptest.NewRecorder()
 
@@ -1051,7 +1051,7 @@ func TestDeleteRemovesContactFromAddressBook(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1081,7 +1081,7 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -1104,7 +1104,7 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 			getByResourceNameErr:    errors.New("lookup failed"),
 			getByResourceNameErrKey: "5:alice",
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -1125,7 +1125,7 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 }
 
 func TestReportRequiresAuthentication(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`))
 	rr := httptest.NewRecorder()
 
@@ -1142,7 +1142,7 @@ func TestReportRejectsTooLargeBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", nil)
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1166,7 +1166,7 @@ func TestReportCalendarQueryReturnsEvents(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1193,7 +1193,7 @@ func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "1")
@@ -1211,7 +1211,7 @@ func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 }
 
 func TestReportInvalidCalendarIDReturnsBadRequest(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/notanint/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1230,7 +1230,7 @@ func TestReportAddressBookRejectsInvalidSyncToken(t *testing.T) {
 			3: {ID: 3, UserID: 1, Name: "Contacts", CTag: 1, UpdatedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"><D:sync-token>urn:calcard-sync:cal:3:0</D:sync-token></D:sync-collection>`))
 	req.Header.Set("Content-Type", "application/xml")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1251,7 +1251,7 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -1281,7 +1281,7 @@ func TestPutRejectsCalendarWriteWithoutEditor(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"))
@@ -1303,7 +1303,7 @@ func TestPutCreatesContact(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	validVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
@@ -1338,7 +1338,7 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 			"2:old": {CalendarID: 2, UID: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/old.ics", nil)
@@ -1371,7 +1371,7 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 
 func TestMkcolCreatesAddressBook(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/NewBook", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1389,7 +1389,7 @@ func TestMkcolCreatesAddressBook(t *testing.T) {
 
 func TestMkcalendarCreatesCalendar(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1407,7 +1407,7 @@ func TestMkcalendarCreatesCalendar(t *testing.T) {
 
 func TestMkcalendarParsesChunkedRequestBody(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -1440,7 +1440,7 @@ func TestMkcalendarRejectsSlugNameCollisions(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work", Slug: &slug}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
@@ -1475,7 +1475,7 @@ func TestMkcalendarRequiresParentCollectionLockToken(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
@@ -1513,7 +1513,7 @@ func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
 		2: {ID: 2, UserID: 1, Name: "Book"},
 	}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/keep.vcf", "/dav/addressbooks/3/skip.vcf"}
 	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
 	if err != nil {
@@ -1542,7 +1542,7 @@ func TestAddressBookMultiGetMissingReturns404(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
 		2: {ID: 2, UserID: 1, Name: "Book"},
 	}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/present.vcf", "/dav/addressbooks/2/missing.vcf"}
 	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
 	if err != nil {
@@ -1568,7 +1568,7 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 5, UID: "gone", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contacts, DeletedResources: deleted}}
+	h := &DavServer{store: &store.Store{Contacts: contacts, DeletedResources: deleted}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 5, now.Add(-time.Hour)),
@@ -1608,7 +1608,7 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 			"2:new": {CalendarID: 2, UID: "new", RawICAL: "NEW", ETag: "2", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("cal", 2, then),
@@ -1630,7 +1630,7 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 func TestNewServerInitializesFields(t *testing.T) {
 	cfg := &config.Config{}
 	s := &store.Store{}
-	h := NewServer(Options{Config: cfg, Store: s})
+	h := NewDavServer(Options{Config: cfg, Store: s})
 	if h.cfg != cfg || h.store != s {
 		t.Fatal("server fields not initialized")
 	}
@@ -1647,7 +1647,7 @@ func TestHeadDelegatesToGet(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICALDATA", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	req := httptest.NewRequest(http.MethodHead, "/dav/calendars/2/event.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1663,7 +1663,7 @@ func TestHeadDelegatesToGet(t *testing.T) {
 }
 
 func TestProppatchRequiresAuth(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/1", nil)
 	rr := httptest.NewRecorder()
 	h.Proppatch(rr, req)
@@ -1681,7 +1681,7 @@ func TestProppatchCalendarUpdatesProperties(t *testing.T) {
 			2: {ID: 2, UserID: 1, Name: "Old Name"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1710,7 +1710,7 @@ func TestProppatchCalendarUpdatesProperties(t *testing.T) {
 }
 
 func TestProppatchCalendarRejectsSlugPath(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{}}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/work", nil)
@@ -1736,7 +1736,7 @@ func TestPropfindRejectsAmbiguousCalendarSlug(t *testing.T) {
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/work/", nil)
@@ -1756,7 +1756,7 @@ func TestGetNotFoundReturns404(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/missing.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1769,7 +1769,7 @@ func TestGetNotFoundReturns404(t *testing.T) {
 }
 
 func TestGetRejectsUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodGet, "/unknown", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1782,7 +1782,7 @@ func TestGetRejectsUnsupportedPath(t *testing.T) {
 }
 
 func TestDeleteUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/unknown", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1795,7 +1795,7 @@ func TestDeleteUnsupportedPath(t *testing.T) {
 }
 
 func TestDeleteRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/e.ics", nil)
 	rr := httptest.NewRecorder()
 
@@ -1807,7 +1807,7 @@ func TestDeleteRequiresUser(t *testing.T) {
 }
 
 func TestReportInvalidXMLReturnsBadRequest(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader("<bad"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1820,7 +1820,7 @@ func TestReportInvalidXMLReturnsBadRequest(t *testing.T) {
 }
 
 func TestReportUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/unknown", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1838,7 +1838,7 @@ func TestReportCalendarInvalidSyncToken(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"><D:sync-token>urn:calcard-sync:card:1:0</D:sync-token></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1861,7 +1861,7 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	newIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(newIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1875,7 +1875,7 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 }
 
 func TestPutUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodPut, "/dav/unknown", strings.NewReader("data"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1888,7 +1888,7 @@ func TestPutUnsupportedPath(t *testing.T) {
 }
 
 func TestPutTooLarge(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", nil)
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1902,7 +1902,7 @@ func TestPutTooLarge(t *testing.T) {
 }
 
 func TestMkcolValidatesPathAndName(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1}
 	// unsupported path
 	req := httptest.NewRequest("MKCOL", "/dav/calendars/bad", nil)
@@ -1924,7 +1924,7 @@ func TestMkcolValidatesPathAndName(t *testing.T) {
 }
 
 func TestMkcalendarValidatesPathAndName(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1}
 	// unsupported path
 	req := httptest.NewRequest("MKCALENDAR", "/dav/addressbooks/bad", nil)
@@ -1955,7 +1955,7 @@ func TestMkcalendarValidatesPathAndName(t *testing.T) {
 }
 
 func TestLoadCalendarNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}}}
 	if _, err := h.loadCalendar(context.Background(), &store.User{ID: 1}, 10); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -1967,14 +1967,14 @@ func TestLoadAddressBookWrongUser(t *testing.T) {
 			1: {ID: 1, UserID: 2, Name: "Other"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	if _, err := h.loadAddressBook(context.Background(), &store.User{ID: 1}, 1); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
 func TestPrincipalResponsesRejectsOtherPrincipal(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	_, err := h.principalResponses("/dav/principals/999", "0", &store.User{ID: 1}, func(s string) string { return s })
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
@@ -1994,7 +1994,7 @@ func TestCdataStringEmptySkipsEncoding(t *testing.T) {
 }
 
 func TestPropfindRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPFIND", "/dav", nil)
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, req)
@@ -2004,7 +2004,7 @@ func TestPropfindRequiresUser(t *testing.T) {
 }
 
 func TestPropfindUnsupportedPathReturnsNotFound(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPFIND", "/invalid", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2020,7 +2020,7 @@ func TestGetAddressBookNotFoundForWrongUser(t *testing.T) {
 			5: {ID: 5, UserID: 2, Name: "Other"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2031,7 +2031,7 @@ func TestGetAddressBookNotFoundForWrongUser(t *testing.T) {
 }
 
 func TestPutRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", strings.NewReader("data"))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -2042,7 +2042,7 @@ func TestPutRequiresUser(t *testing.T) {
 
 func TestPutAddressBookNotFound(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/9/alice.vcf", strings.NewReader("VCARD"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2053,7 +2053,7 @@ func TestPutAddressBookNotFound(t *testing.T) {
 }
 
 func TestDeleteCalendarNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/e.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2080,7 +2080,7 @@ func TestReportCalendarSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "event", CollectionID: 2, UID: "gone", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2114,7 +2114,7 @@ func TestReportCalendarSyncCollectionReturnsTombstoneForACLHiddenEvent(t *testin
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars:        calRepo,
 		Events:           eventRepo,
 		DeletedResources: &fakeDeletedResourceRepo{},
@@ -2162,7 +2162,7 @@ func TestReportCalendarSyncCollectionDoesNotRepeatACLHiddenTombstoneAfterTokenAd
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars:        calRepo,
 		Events:           eventRepo,
 		DeletedResources: &fakeDeletedResourceRepo{},
@@ -2204,7 +2204,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 			{ResourcePath: "/dav/calendars/2/hidden", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Events: &fakeEventRepo{events: map[string]*store.Event{
 			"2:visible": {CalendarID: 2, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-visible"},
 			"2:hidden":  {CalendarID: 2, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-hidden"},
@@ -2251,7 +2251,7 @@ func TestReportAddressBookSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "bob", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2283,7 +2283,7 @@ func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "gone-uid", ResourceName: "former", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2342,7 +2342,7 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 		DeletedAt:    now,
 	})
 
-	h := &Handler{store: st}
+	h := &DavServer{store: st}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}))
@@ -2361,7 +2361,7 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 }
 
 func TestMkcolRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/Book", nil)
 	rr := httptest.NewRecorder()
 	h.Mkcol(rr, req)
@@ -2371,7 +2371,7 @@ func TestMkcolRequiresUser(t *testing.T) {
 }
 
 func TestMkcalendarRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/Cal", nil)
 	rr := httptest.NewRecorder()
 	h.Mkcalendar(rr, req)
@@ -2382,7 +2382,7 @@ func TestMkcalendarRequiresUser(t *testing.T) {
 
 func TestPutCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := newCalendarPutRequest("/dav/calendars/9/e.ics", strings.NewReader("ICAL"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2402,7 +2402,7 @@ func TestPutReadErrorReturnsBadRequest(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", io.NopCloser(errReader{}))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2423,7 +2423,7 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	newVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice Updated\r\nEMAIL:alice@example.com\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2435,7 +2435,7 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 }
 
 func TestDeleteAddressBookNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{AddressBooks: &fakeAddressBookRepo{}, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: &fakeAddressBookRepo{}, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/9/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2447,7 +2447,7 @@ func TestDeleteAddressBookNotFound(t *testing.T) {
 
 func TestReportCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/9/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2460,7 +2460,7 @@ func TestReportCalendarNotFound(t *testing.T) {
 
 func TestReportAddressBookNotFound(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
 	req.Header.Set("Depth", "1")
@@ -2483,7 +2483,7 @@ func TestReportAddressBookAliasResolutionDistinguishesMissingAndPresentAliases(t
 			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("positive alias resolves to address book", func(t *testing.T) {
 		body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
@@ -2523,7 +2523,7 @@ func TestReportAddressBookQueryDepthZeroRequiresAccess(t *testing.T) {
 			9: {ID: 9, UserID: 1, Name: "Private"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2548,7 +2548,7 @@ func TestReportCalendarMultiGetPath(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	body := `<cal:calendar-multiget xmlns:cal="urn:ietf:params:xml:ns:caldav"><D:href xmlns:D="DAV:">/dav/calendars/2/event.ics</D:href></cal:calendar-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2573,7 +2573,7 @@ func TestReportAddressBookMultiGetPath(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/3/alice.vcf</D:href></card:addressbook-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2599,7 +2599,7 @@ func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testi
 			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/Contacts/alice.vcf</D:href></card:addressbook-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2620,7 +2620,7 @@ func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testi
 
 func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	brokenRepo := &errorEventRepo{}
-	h := &Handler{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
 	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", nil)
 	if err == nil {
@@ -2643,7 +2643,7 @@ func TestCalendarCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 					"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-event"},
 				},
 			}
-			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 			req := httptest.NewRequest(method, "/dav/calendars/2/event.ics", nil)
 			req.Header.Set("Destination", "https://example.com/dav/calendars/2/event.ics")
@@ -2682,7 +2682,7 @@ func TestContactCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 					"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 				},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/alice.vcf")
@@ -2729,7 +2729,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			copyErr: errors.New("copy failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -2756,7 +2756,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			moveErr: errors.New("move failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2783,7 +2783,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			copyErr: errors.New("copy failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -2810,7 +2810,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			moveErr: errors.New("move failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -2850,7 +2850,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2900,7 +2900,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2948,7 +2948,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -2998,7 +2998,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -3057,7 +3057,7 @@ func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) 
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -3093,7 +3093,7 @@ func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t 
 			5: {ID: 5, UserID: owner.ID, Name: "Shared", UpdatedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/", nil)
 	req.Header.Set("Depth", "0")
@@ -3136,7 +3136,7 @@ func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T)
 		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	privilegeSet := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
 	if privilegeSet == nil {
@@ -3177,7 +3177,7 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/8", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3249,7 +3249,7 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 		{ResourcePath: "/dav/calendars/10", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
 		{ResourcePath: "/dav/calendars/11", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3330,7 +3330,7 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/12/special", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3399,7 +3399,7 @@ func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/13/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3438,7 +3438,7 @@ func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
 				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req1 := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req1.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3472,7 +3472,7 @@ func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
 				"6:alice": {AddressBookID: 6, UID: "alice", ResourceName: "copied", RawVCard: buildVCard("3.0", "UID:alice", "FN:Old Alice"), ETag: "etag-dest"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req1 := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req1.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -3515,7 +3515,7 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3540,7 +3540,7 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 			getByResourceNameErr: errors.New("resource lookup failed"),
 			getByResourceNameKey: "3:copied",
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3569,7 +3569,7 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 			getByUIDErr:    errors.New("uid lookup failed"),
 			getByUIDErrKey: "3:event",
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -3604,7 +3604,7 @@ func TestCopyWithinSameCollectionRejectsRebindingSameUID(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/original.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3640,7 +3640,7 @@ func TestCopyWithinSameCollectionRejectsRebindingSameUID(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "original", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/original.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/renamed.vcf")
@@ -3686,7 +3686,7 @@ func TestCalendarCopyAndMoveRejectDestinationUIDConflict(t *testing.T) {
 					"3:event": {CalendarID: 3, UID: "event", ResourceName: "existing", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
 				},
 			}
-			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 			req := httptest.NewRequest(method, "/dav/calendars/2/original.ics", nil)
 			req.Header.Set("Destination", "https://example.com/dav/calendars/3/renamed.ics")
@@ -3735,7 +3735,7 @@ func TestMoveCalendarEventOverwriteWithinSameCalendarReplacesDestination(t *test
 			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:destination\r\nSUMMARY:Destination\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3779,7 +3779,7 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 		},
 		overwriteMoveDeletedRepo: deletedRepo,
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3803,7 +3803,7 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 
 func TestCanonicalDAVPathUsesExtensionlessResourceIdentity(t *testing.T) {
 	slug := "work"
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: &fakeCalendarRepo{
 			accessible: []store.CalendarAccess{
 				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Slug: &slug}, Editor: true},
@@ -3875,7 +3875,7 @@ func TestDeleteRejectsCanonicalResourceLockAcrossExtensions(t *testing.T) {
 			"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice", UserID: 2, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.txt", nil)
@@ -3905,7 +3905,7 @@ func TestGetRejectsCanonicalResourceACLAcrossExtensions(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 	user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.txt", nil)
@@ -3928,7 +3928,7 @@ func TestLockAndACLRejectOversizedBodies(t *testing.T) {
 	}
 
 	t.Run("lock", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: &fakeLockRepo{locks: map[string]*store.Lock{}}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: &fakeLockRepo{locks: map[string]*store.Lock{}}}}
 		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -3942,7 +3942,7 @@ func TestLockAndACLRejectOversizedBodies(t *testing.T) {
 	})
 
 	t.Run("acl", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: &fakeACLRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: &fakeACLRepo{}}}
 		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
 		req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(body))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -3984,7 +3984,7 @@ func TestCalendarCopyRequiresReadAccessToSource(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest("COPY", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -4028,7 +4028,7 @@ func TestCalendarMoveRejectsUnauthorizedSourceBeforeEventLookup(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -4067,7 +4067,7 @@ func TestContactCopyAndMoveRejectUnauthorizedSourceBeforeContactLookup(t *testin
 					},
 				},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/9/secret.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/2/copied.vcf")
@@ -4098,7 +4098,7 @@ func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
@@ -4133,7 +4133,7 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", strings.NewReader(lockBody))
@@ -4234,7 +4234,7 @@ func TestACLNormalizesPrincipalHrefWithoutTrailingSlash(t *testing.T) {
 		},
 	}
 	aclRepo := &fakeACLRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
@@ -4328,7 +4328,7 @@ func TestACLRejectsInvalidPrivileges(t *testing.T) {
 					Privilege:     "read",
 				}},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
 			req = req.WithContext(auth.WithUser(req.Context(), owner))
@@ -4364,7 +4364,7 @@ func TestLockAndACLCanonicalizeAddressBookAliases(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4416,7 +4416,7 @@ func TestLockAndACLCanonicalizeAddressBookAliases(t *testing.T) {
 			},
 		}
 		aclRepo := &fakeACLRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
@@ -4461,7 +4461,7 @@ func TestLockResponseUsesServedResourceHref(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4496,7 +4496,7 @@ func TestLockCreateRequiresRequestBody(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4520,7 +4520,7 @@ func TestLockRejectsInvalidRequestBodies(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	tests := []struct {
 		name string
@@ -4568,7 +4568,7 @@ func TestLockOnUnmappedCollectionReturnsCreated(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4602,7 +4602,7 @@ func TestLockDoesNotPersistWhenTargetResolutionFails(t *testing.T) {
 		getByResourceNameErrKey: "5:alice",
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4628,7 +4628,7 @@ func TestMkcolRebindsPendingCollectionLocks(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4700,7 +4700,7 @@ func TestMkcolRebindsPendingCollectionLocks(t *testing.T) {
 
 func TestMkcolAppliesExtendedBodyProperties(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -4737,7 +4737,7 @@ func TestMkcolAppliesExtendedBodyProperties(t *testing.T) {
 
 func TestMkcolRejectsOversizedRequestBody(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4760,7 +4760,7 @@ func TestMkcolReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
 		locks:               map[string]*store.Lock{},
 		moveResourcePathErr: errors.New("rebind failed"),
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4795,7 +4795,7 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	calRepo := &fakeCalendarRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4867,7 +4867,7 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 
 func TestMkcalendarRejectsInvalidBodyAndDoesNotCreate(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(`<d:mkcalendar xmlns:d="DAV:"><d:set>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4885,7 +4885,7 @@ func TestMkcalendarRejectsInvalidBodyAndDoesNotCreate(t *testing.T) {
 
 func TestMkcalendarRejectsOversizedRequestBody(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4908,7 +4908,7 @@ func TestMkcalendarReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
 		locks:               map[string]*store.Lock{},
 		moveResourcePathErr: errors.New("rebind failed"),
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4947,7 +4947,7 @@ func TestPutAddressBookMapsUpsertConflictsToCardDAVConflict(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{upsertErr: store.ErrConflict}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
 
 	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4971,7 +4971,7 @@ func TestPutAddressBookPreservesInternalErrorsFromUpsert(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{upsertErr: errors.New("db unavailable")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
 
 	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -5022,7 +5022,7 @@ func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -5066,7 +5066,7 @@ func TestPropfindAddressBookCollectionIncludesLockAndACLProperties(t *testing.T)
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5111,7 +5111,7 @@ func TestDecoratePropfindResponsesBatchesLockDiscovery(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
 
 	responses := []response{
 		{Href: "/dav/calendars/9/", Propstat: []propstat{{Status: httpStatusOK}}},
@@ -5208,7 +5208,7 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 					Privilege:     "read",
 				}},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
 			req = req.WithContext(auth.WithUser(req.Context(), owner))
@@ -5245,7 +5245,7 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/"); privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
@@ -5288,7 +5288,7 @@ func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/"); privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
@@ -5323,7 +5323,7 @@ func TestCalendarCurrentUserPrivilegeSetForReadFreeBusyDelegate(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
 	if privs == nil {
@@ -5350,7 +5350,7 @@ func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenie
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
 	if privs == nil {
@@ -5381,7 +5381,7 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	t.Run("calendar home discovery", func(t *testing.T) {
 		req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -5429,7 +5429,7 @@ func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
 			5: {ID: 5, UserID: owner.ID, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
@@ -5475,7 +5475,7 @@ func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5500,7 +5500,7 @@ func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 }
 
 func TestPropfindGenericCollectionReportsUnsupportedRequestedPropertiesAs404(t *testing.T) {
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -5567,7 +5567,7 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 			{ResourcePath: "/dav/calendars/5/event.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5620,7 +5620,7 @@ func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5684,7 +5684,7 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 			{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5717,7 +5717,7 @@ func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
 	now := store.Now()
 	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 
-	newHandler := func(denySecret bool) *Handler {
+	newHandler := func(denySecret bool) *DavServer {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now},
@@ -5740,7 +5740,7 @@ func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
 				Privilege:     "read",
 			})
 		}
-		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+		return &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
 	}
 
 	t.Run("positive_includes_visible_members", func(t *testing.T) {
@@ -5787,7 +5787,7 @@ func TestAddressBookReportsFilterDeniedContacts(t *testing.T) {
 	now := store.Now()
 	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 
-	newHandler := func(denySecret bool) *Handler {
+	newHandler := func(denySecret bool) *DavServer {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now, CTag: 2},
@@ -5810,7 +5810,7 @@ func TestAddressBookReportsFilterDeniedContacts(t *testing.T) {
 				Privilege:     "read",
 			})
 		}
-		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+		return &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
 	}
 
 	tests := []struct {
@@ -5915,7 +5915,7 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("positive_empty_address_data_returns_full_card", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -5978,7 +5978,7 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	t.Run("positive_supported_addressbook_property_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -6037,7 +6037,7 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 
 func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	t.Run("positive_supported_principal_property_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -6094,7 +6094,7 @@ func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 
 func TestIsResourceOwnerParsesPrincipalIDPositionally(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	if !h.isResourceOwner(context.Background(), user, "/dav/principals/1/") {
 		t.Fatal("expected authenticated principal path to be owned by the matching user")
@@ -6131,7 +6131,7 @@ func TestPutAddressBookUIDConflictEscapesHref(t *testing.T) {
 				},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/"+resourceName+".vcf", strings.NewReader(buildVCard("3.0", "UID:new", "FN:New")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -6163,7 +6163,7 @@ func TestPutAddressBookUIDConflictEscapesHref(t *testing.T) {
 
 func TestMkcolRejectsNumericDisplayNameFromBody(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -6189,7 +6189,7 @@ func TestMkcolRejectsNumericDisplayNameFromBody(t *testing.T) {
 
 func TestMkcolRejectsInvalidExtendedBodyAndDoesNotCreate(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(`<d:mkcol xmlns:d="DAV:"><d:set>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -6211,7 +6211,7 @@ func TestMkcolRejectsDuplicateAddressBookName(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/contacts", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -6236,7 +6236,7 @@ func TestAddressBookHandlersRejectExtraResourcePathSegments(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("get", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf/extra", nil)
@@ -6283,7 +6283,7 @@ func TestAddressBookCopyAndMoveOverwriteReplaceDifferentUIDDestination(t *testin
 				},
 			}
 			lockRepo := &fakeLockRepo{}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6334,7 +6334,7 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 		},
 		overwriteMoveDeletedRepo: deletedRepo,
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6385,7 +6385,7 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 					Privilege:     "unbind",
 				})
 			}
-			h := &Handler{store: &store.Store{
+			h := &DavServer{store: &store.Store{
 				AddressBooks: bookRepo,
 				Contacts:     contactRepo,
 				Locks:        &fakeLockRepo{},
@@ -6462,7 +6462,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 					Privilege:     "unbind",
 				})
 			}
-			h := &Handler{store: &store.Store{
+			h := &DavServer{store: &store.Store{
 				Calendars:  calRepo,
 				Events:     eventRepo,
 				Locks:      &fakeLockRepo{},
@@ -6524,7 +6524,7 @@ func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -6611,7 +6611,7 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6681,7 +6681,7 @@ func TestDeleteContactRemovesDirectLockState(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	deleteReq.Header.Set("If", "(<"+lockToken+">)")
@@ -6723,7 +6723,7 @@ func TestMoveContactRebindsACLToDestination(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -6781,7 +6781,7 @@ func TestDeleteContactRemovesResourceACLState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	deleteReq = deleteReq.WithContext(auth.WithUser(deleteReq.Context(), owner))
@@ -6846,7 +6846,7 @@ func TestCopyContactOverwriteClearsDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     contactRepo,
 		Locks:        lockRepo,
@@ -6920,7 +6920,7 @@ func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars:  calRepo,
 		Events:     eventRepo,
 		Locks:      lockRepo,
@@ -6968,7 +6968,7 @@ func TestPropfindACLUsesSpecialPrincipalElements(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: false, Privilege: "write"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -7031,7 +7031,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 			contacts:             map[string]*store.Contact{},
 			getByResourceNameErr: errors.New("resource lookup failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -7052,7 +7052,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 			getByUIDErr:    errors.New("uid lookup failed"),
 			getByUIDErrKey: "5:alice",
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -7082,7 +7082,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByResourceNameErr:    errors.New("destination lookup failed"),
 				getByResourceNameErrKey: "6:copied",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7119,7 +7119,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByResourceNameErr:    errors.New("source lookup failed"),
 				getByResourceNameErrKey: "5:alice",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7153,7 +7153,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByUIDErr:    errors.New("destination uid lookup failed"),
 				getByUIDErrKey: "6:alice",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7185,7 +7185,7 @@ func TestCanLockAddressBookCollectionRequiresMoreThanBind(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     &fakeContactRepo{},
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -7214,7 +7214,7 @@ func TestLockScopesDirectChildCollectionCreationPathsPerUser(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			lockRepo := &fakeLockRepo{}
-			h := &Handler{store: &store.Store{Locks: lockRepo}}
+			h := &DavServer{store: &store.Store{Locks: lockRepo}}
 			lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7254,7 +7254,7 @@ func TestLockScopesDirectChildCollectionCreationPathsPerUser(t *testing.T) {
 func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
 	lockRepo := &fakeLockRepo{}
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{Locks: lockRepo, AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{Locks: lockRepo, AddressBooks: bookRepo}}
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7289,7 +7289,7 @@ func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) 
 func TestMkcalendarIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
 	lockRepo := &fakeLockRepo{}
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Locks: lockRepo, Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Locks: lockRepo, Calendars: calRepo}}
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7328,7 +7328,7 @@ func TestPutReturnsInternalServerErrorWhenLockLookupFails(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{listByResourcesErr: errors.New("lock lookup failed")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req.Header.Set("Content-Type", "text/vcard")
@@ -7362,7 +7362,7 @@ func TestProppatchIgnoresParentCollectionLock(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -7400,7 +7400,7 @@ func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -8238,7 +8238,7 @@ func TestCalendarQueryWithCompFilter(t *testing.T) {
 			"1:todo1":  {CalendarID: 1, UID: "todo1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:todo1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n", ETag: "t1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	// Filter for VEVENT only
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
@@ -8280,7 +8280,7 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	// Query for events in June 2024 - filter should apply to VEVENT component
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
@@ -8316,7 +8316,7 @@ func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -8355,7 +8355,7 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
@@ -8394,7 +8394,7 @@ func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8440,7 +8440,7 @@ func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8487,7 +8487,7 @@ func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testin
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8535,7 +8535,7 @@ func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8576,7 +8576,7 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "event1", ResourceName: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8623,7 +8623,7 @@ func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8661,7 +8661,7 @@ func TestPutWithIfMatchFailure(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
@@ -8683,7 +8683,7 @@ func TestPutWithIfNoneMatchStar(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(icalData))
@@ -8709,7 +8709,7 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
@@ -8741,7 +8741,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 			},
 		}
 		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8772,7 +8772,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 			},
 		}
 		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8808,7 +8808,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8845,7 +8845,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8886,7 +8886,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8924,7 +8924,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8961,7 +8961,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -9002,7 +9002,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -9036,7 +9036,7 @@ func TestDeleteWithIfMatchSuccess(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
 	req.Header.Set("If-Match", `"current"`)
@@ -9061,7 +9061,7 @@ func TestDeleteWithIfMatchFailure(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
 	req.Header.Set("If-Match", `"wrong"`)
@@ -9081,7 +9081,7 @@ func TestPutRejectsInvalidICalendar(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
 	tests := []struct {
 		name string
@@ -9117,7 +9117,7 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
 	validData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := newCalendarPutRequest("/dav/calendars/2/test.ics", strings.NewReader(validData))
@@ -9132,7 +9132,7 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 }
 
 func TestValidateICalendarDetectsVEVENT(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	data := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	if err := h.validateICalendar(data); err != nil {
 		t.Fatalf("expected valid iCalendar, got error: %v", err)
@@ -9145,7 +9145,7 @@ func TestPutRejectsInvalidVCard(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	invalidData := "NOT A VCARD"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(invalidData))
@@ -9168,7 +9168,7 @@ func TestPutAcceptsValidVCard(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	validData := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validData))
@@ -9235,7 +9235,7 @@ func TestFreeBusyQueryReport(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
@@ -9272,7 +9272,7 @@ func TestPropfindParsesRequestBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9306,7 +9306,7 @@ func TestPropfindParsesChunkedRequestBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9340,7 +9340,7 @@ func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Old Name"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9374,7 +9374,7 @@ func TestProppatchAddressBookRejectsDuplicateDisplayName(t *testing.T) {
 			6: {ID: 6, UserID: 1, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9406,7 +9406,7 @@ func TestProppatchAddressBookProtectedPropertyIsAtomic(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9448,7 +9448,7 @@ func TestCalendarPropertiesIncludeLimits(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -9487,7 +9487,7 @@ func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Color: &color, CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9521,7 +9521,7 @@ func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9563,7 +9563,7 @@ func TestProppatchRejectsForbidden(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9602,7 +9602,7 @@ func TestProppatchSharedCalendarWritePropertiesGrantPersistsChange(t *testing.T)
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -9645,7 +9645,7 @@ func TestProppatchCalendarColorPersistsChange(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9685,7 +9685,7 @@ func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Work", Color: &color},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9731,7 +9731,7 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "ICAL", ETag: "e1", DTStart: &start, DTEnd: &end},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
@@ -9777,7 +9777,7 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
@@ -9842,7 +9842,7 @@ func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
@@ -9869,7 +9869,7 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
 	testCases := []struct {
 		name         string
@@ -9922,7 +9922,7 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 			3: {ID: 3, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	testCases := []struct {
 		name       string

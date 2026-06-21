@@ -26,7 +26,7 @@ func TestRFC6638_ScheduleTagHeader(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/meeting.ics", nil)

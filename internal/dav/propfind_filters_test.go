@@ -20,7 +20,7 @@ func propstatWithStatus(stats []propstat, status string) *propstat {
 
 func TestFilterReadableAddressBookContactsFiltersDeniedContacts(t *testing.T) {
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
-	h := &Handler{store: &store.Store{ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/addressbooks/5/public", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: true},
 		{ResourcePath: "/dav/addressbooks/5/secret", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: false},
 	}}}}
@@ -87,7 +87,7 @@ func TestFilterReadableAddressBookContactsPrefetchesOnce(t *testing.T) {
 	repo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", Privilege: "read", IsGrant: true},
 	}}
-	h := &Handler{store: &store.Store{ACLEntries: repo}}
+	h := &DavServer{store: &store.Store{ACLEntries: repo}}
 
 	contacts := make([]store.Contact, 0, 50)
 	for i := 0; i < 50; i++ {

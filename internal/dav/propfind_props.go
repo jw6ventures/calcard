@@ -35,7 +35,7 @@ func decorationMaskFor(req *propfindRequest) propDecorationMask {
 	}
 }
 
-func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response, mask propDecorationMask) error {
+func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response, mask propDecorationMask) error {
 	// When lock discovery is requested across multiple responses, prefetch every
 	// relevant lock in one query so each response's lockDiscoveryForPath reads
 	// from the batch index rather than issuing its own query.
@@ -74,7 +74,7 @@ func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request
 	return nil
 }
 
-func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop, mask propDecorationMask) error {
+func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop, mask propDecorationMask) error {
 	if p == nil || resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
 		return nil
 	}
@@ -112,7 +112,7 @@ func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourc
 	return nil
 }
 
-func (h *Handler) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
+func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
 	if user == nil {
 		return nil
 	}
@@ -217,7 +217,7 @@ func (h *Handler) currentUserPrivilegeSetForPath(ctx context.Context, user *stor
 	return &currentUserPrivilegeSet{Privileges: privileges}
 }
 
-func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string) (*lockDiscoveryProp, error) {
+func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath string) (*lockDiscoveryProp, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return &lockDiscoveryProp{}, nil
 	}
@@ -248,7 +248,7 @@ func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string)
 // lockLookupPathsForResource canonicalizes resourcePath (best effort) and
 // returns the canonical path together with the set of paths whose locks could
 // apply to it (the resource itself plus its ancestors and legacy aliases).
-func (h *Handler) lockLookupPathsForResource(ctx context.Context, resourcePath string) (string, []string) {
+func (h *DavServer) lockLookupPathsForResource(ctx context.Context, resourcePath string) (string, []string) {
 	if user, ok := auth.UserFromContext(ctx); ok {
 		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
 			resourcePath = canonicalPath
@@ -261,7 +261,7 @@ func (h *Handler) lockLookupPathsForResource(ctx context.Context, resourcePath s
 // a prefetched batch index is installed (see prefetchLockBatchIndex) it serves
 // from that index to avoid one lock query per PROPFIND response; otherwise it
 // queries directly.
-func (h *Handler) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
+func (h *DavServer) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
 	if idx := lockBatchIndexFromContext(ctx); idx != nil {
 		return idx.locksForPaths(paths), nil
 	}
@@ -272,7 +272,7 @@ func (h *Handler) locksForLookupPaths(ctx context.Context, paths []string) ([]st
 // apply to any response in the batch and returns a context carrying the
 // resulting index. Per-response lockDiscoveryForPath calls then read from the
 // index instead of issuing a query each, collapsing a Depth: 1 N+1 to one query.
-func (h *Handler) prefetchLockBatchIndex(ctx context.Context, responses []response) (context.Context, error) {
+func (h *DavServer) prefetchLockBatchIndex(ctx context.Context, responses []response) (context.Context, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return ctx, nil
 	}
@@ -310,7 +310,7 @@ func (h *Handler) prefetchLockBatchIndex(ctx context.Context, responses []respon
 	return withLockBatchIndex(ctx, &lockBatchIndex{byPath: byPath}), nil
 }
 
-func (h *Handler) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {
+func (h *DavServer) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {
 	owned, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
 	if err != nil {
 		return nil, err

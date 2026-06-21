@@ -11,7 +11,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Get(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -147,7 +147,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
+func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
 	contact, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
 		h.logger().Error("writeAddressBookContact", "failed to load contact %q from address book %d: %v", resourceName, addressBookID, err)

@@ -21,22 +21,19 @@ type Options struct {
 	Logger     logging.Sink
 }
 
-// Server contains the DAV server state shared by default modules and
-// registered extensions.
-type Server struct {
+// DavServer contains the DAV server state shared by default modules and
+// registered extensions. It serves HTTP via ServeHTTP and dispatches each
+// WebDAV/CalDAV/CardDAV method to the matching handler.
+type DavServer struct {
 	cfg      *config.Config
 	store    *store.Store
 	registry *Registry
 	log      *logging.Logger
 }
 
-// Handler is kept as a package compatibility alias while the DAV entrypoints
-// move to Server.
-type Handler = Server
-
-// NewServer creates a DAV server with the Community DAV modules and any
+// NewDavServer creates a DAV server with the Community DAV modules and any
 // caller-provided extensions registered in order.
-func NewServer(opts Options) *Server {
+func NewDavServer(opts Options) *DavServer {
 	registry := NewRegistry()
 	registerDefaultDAVModules(registry)
 	for _, ext := range opts.Extensions {
@@ -44,19 +41,19 @@ func NewServer(opts Options) *Server {
 			ext.RegisterDAV(registry)
 		}
 	}
-	return &Server{cfg: opts.Config, store: opts.Store, registry: registry, log: logging.New(opts.Logger, logClass)}
+	return &DavServer{cfg: opts.Config, store: opts.Store, registry: registry, log: logging.New(opts.Logger, logClass)}
 }
 
 // logger returns a usable logger, lazily creating a no-op one so handlers never
 // need to nil-check before logging.
-func (h *Handler) logger() *logging.Logger {
+func (h *DavServer) logger() *logging.Logger {
 	if h.log == nil {
 		h.log = logging.New(nil, logClass)
 	}
 	return h.log
 }
 
-func (h *Handler) davRegistry() *Registry {
+func (h *DavServer) davRegistry() *Registry {
 	if h.registry == nil {
 		h.registry = NewRegistry()
 		registerDefaultDAVModules(h.registry)
@@ -64,14 +61,14 @@ func (h *Handler) davRegistry() *Registry {
 	return h.registry
 }
 
-func (h *Handler) RegisteredMethods() []string {
+func (h *DavServer) RegisteredMethods() []string {
 	return h.davRegistry().RegisteredMethods()
 }
 
 // RouteRequiresAuth reports whether the registered extension route matching the
 // given method and path requires authentication. Routes with no match default
 // to requiring auth so callers fail closed.
-func (h *Handler) RouteRequiresAuth(method, requestPath string) bool {
+func (h *DavServer) RouteRequiresAuth(method, requestPath string) bool {
 	route, ok := h.davRegistry().methodRoute(method, path.Clean(requestPath))
 	if !ok {
 		return true
@@ -79,7 +76,7 @@ func (h *Handler) RouteRequiresAuth(method, requestPath string) bool {
 	return route.options.Auth != MethodAuthNone
 }
 
-func (h *Handler) handleRegisteredMethod(w http.ResponseWriter, r *http.Request) bool {
+func (h *DavServer) handleRegisteredMethod(w http.ResponseWriter, r *http.Request) bool {
 	if r == nil {
 		return false
 	}
@@ -102,7 +99,7 @@ func (h *Handler) handleRegisteredMethod(w http.ResponseWriter, r *http.Request)
 	return true
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger().Debug("ServeHTTP", "%s %s", r.Method, r.URL.Path)
 	switch r.Method {
 	case http.MethodOptions:

@@ -17,7 +17,7 @@ import (
 )
 
 func TestRFC4791_OptionsAdvertisesCalendarAccess(t *testing.T) {
-	h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+	h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 	req := httptest.NewRequest(http.MethodOptions, "/dav/calendars/1/", nil)
 	rr := httptest.NewRecorder()
 
@@ -49,7 +49,7 @@ func TestRFC4791_CalendarCollectionMustHaveResourceType(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -77,7 +77,7 @@ func TestRFC4791_SupportedCalendarComponentSetRequired(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -111,7 +111,7 @@ func TestRFC4791_CalendarDataContentTypeTextCalendar(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/event.ics", nil)
@@ -130,7 +130,7 @@ func TestRFC4791_CalendarDataContentTypeTextCalendar(t *testing.T) {
 // Section 5.3.1: MKCALENDAR Method
 func TestRFC4791_MkcalendarCreatesCalendarCollection(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/newcal", nil)
@@ -147,7 +147,7 @@ func TestRFC4791_MkcalendarCreatesCalendarCollection(t *testing.T) {
 
 func TestRFC4791_MKCALENDAR_ResourcetypeIsCollectionAndCalendar(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/newcal", nil)
@@ -184,7 +184,7 @@ func TestRFC4791_MKCALENDAR_ResourcetypeIsCollectionAndCalendar(t *testing.T) {
 
 func TestRFC4791_MKCALENDAR_BodySetsPropertiesOrReturns207WithPropstat(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -250,7 +250,7 @@ func TestRFC4791_MkcalendarOnExistingResourceFails(t *testing.T) {
 	// Note: This test verifies expected behavior even though our implementation
 	// doesn't fully track duplicates. A stricter implementation would return 405.
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	// Create first time - should succeed
@@ -283,7 +283,7 @@ func TestRFC4791_PutWithIfNoneMatchStarCreatesNew(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -312,7 +312,7 @@ func TestRFC4791_PutWithIfMatchRequiresMatchingETag(t *testing.T) {
 			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "OLD", ETag: "correct-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -341,7 +341,7 @@ func TestRFC4791_PutWithIfMatchSucceedsAndUpdatesETag(t *testing.T) {
 			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "OLD", ETag: "old-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -372,7 +372,7 @@ func TestRFC4791_PutIdenticalBodyKeepsETag(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:same-body\r\nSUMMARY:Same\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -417,7 +417,7 @@ func TestRFC4791_PutWithIfMatchOnMissingResourceFails(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:missing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -441,7 +441,7 @@ func TestRFC4791_PutReturnsETagHeader(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -465,7 +465,7 @@ func TestRFC4791_PutReturnsETagHeader(t *testing.T) {
 
 // Section 6.2.1: calendar-home-set Property
 func TestRFC4791_PrincipalHasCalendarHomeSet(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -494,7 +494,7 @@ func TestRFC4791_PrincipalHasCalendarHomeSet(t *testing.T) {
 
 // RFC 4791 Section 6.2.1: calendar-home-set is protected and SHOULD NOT appear in allprop
 func TestRFC4791_PrincipalCalendarHomeSetNotInAllprop(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/principals/1/", nil)
@@ -520,7 +520,7 @@ func TestRFC4791_CalendarHomeListsCalendars(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Personal", UpdatedAt: now, CTag: 20}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	// RFC 4791 Section 6.2.1: PROPFIND on calendar-home-set with Depth: 1 lists calendars
@@ -568,7 +568,7 @@ func TestRFC4791_EmptyCalendarHomeReturnsNoCalendars(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{}, // No calendars
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -612,7 +612,7 @@ func TestRFC4791_CalendarCollectionHasRequiredProperties(t *testing.T) {
 			}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// Request common properties that clients need
@@ -665,7 +665,7 @@ func TestRFC4791_CalendarHomeDepthZero(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Personal", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -699,7 +699,7 @@ func TestRFC4791_CalendarDiscoverySequence(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Home", UpdatedAt: now, CTag: 20}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	// Step 1: PROPFIND on root to get current-user-principal (RFC 5397)
@@ -837,7 +837,7 @@ func TestRFC4791_SharedCalendarsAreDiscoverable(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -872,7 +872,7 @@ func TestRFC4791_ExpandPropertyReportWorks(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -917,7 +917,7 @@ func TestRFC4791_CalendarQueryReportBasic(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 7.8: calendar-query with filter
@@ -1020,7 +1020,7 @@ func TestRFC4791_TimeRangeFilteringAccuracy(t *testing.T) {
 					},
 				},
 			}
-			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 			user := &store.User{ID: 1}
 
 			body := fmt.Sprintf(`<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -1063,7 +1063,7 @@ func TestRFC4791_CalendarMultigetReport(t *testing.T) {
 			"1:event2": {CalendarID: 1, UID: "event2", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 7.9: calendar-multiget with specific hrefs
@@ -1115,7 +1115,7 @@ func TestRFC4791_CalendarQuery_OnNonCalendarCollection_Fails(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1158,7 +1158,7 @@ func TestRFC4791_CalendarMultiget_OnNonCalendarCollection_Fails(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1208,7 +1208,7 @@ func TestRFC4791_FreeBusyQueryReport(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 7.10: free-busy-query REPORT
@@ -1263,7 +1263,7 @@ func TestRFC4791_FreeBusyQueryNoMatches(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1302,7 +1302,7 @@ func TestRFC4791_FreeBusyQueryOnCalendarObjectForbidden(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1329,7 +1329,7 @@ func TestRFC4791_FreeBusyQueryOnCalendarObjectForbidden(t *testing.T) {
 // Section 7.10: free-busy-query without privileges must return 404
 func TestRFC4791_FreeBusyQueryUnauthorizedReturnsNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1355,7 +1355,7 @@ func TestRFC4791_FreeBusyQueryUnauthorizedReturnsNotFound(t *testing.T) {
 
 // Section 9: XML Namespace Compliance
 func TestRFC4791_XMLNamespacesCorrect(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav", nil)
@@ -1394,7 +1394,7 @@ func TestRFC4791_ReportCalendarData_ReturnsValidICalendar(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1444,7 +1444,7 @@ func TestRFC4791_CalendarQuery_CalendarDataComponentFiltering_Works(t *testing.T
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -1497,7 +1497,7 @@ func TestRFC4791_ETagFormatCompliance(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "abc123"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// GET should return ETag header
@@ -1536,7 +1536,7 @@ func TestRFC4791_PropfindDepthHeaderHandling(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "e", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	tests := []struct {
@@ -1590,7 +1590,7 @@ func TestRFC4791_SyncCollectionReport(t *testing.T) {
 		},
 	}
 	deletedRepo := &fakeDeletedResourceRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
 	user := &store.User{ID: 1}
 
 	// Initial sync (no sync-token)
@@ -1640,7 +1640,7 @@ func TestRFC4791_RejectMalformedICalendar(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	tests := []struct {
@@ -1689,7 +1689,7 @@ func TestRFC4791_SupportedReportSetProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -1739,7 +1739,7 @@ func TestRFC4791_SupportedReportSetOnCalendarObjectResource(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -1785,7 +1785,7 @@ func TestRFC4791_SupportedReportSet_AdvertisedReportsActuallyWork(t *testing.T) 
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -1874,7 +1874,7 @@ func TestRFC4791_SupportedReportSet_AdvertisedReportsActuallyWork(t *testing.T) 
 // Test that calendar collections cannot contain other calendar collections
 func TestRFC4791_NoNestedCalendarCollections(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	// Try to create a calendar inside another calendar
@@ -1898,7 +1898,7 @@ func TestRFC4791_PutContentTypeValidation(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -1919,7 +1919,7 @@ func TestRFC4791_PutContentTypeValidation(t *testing.T) {
 
 // Test current-user-principal property (RFC 5397, required for CalDAV)
 func TestRFC4791_CurrentUserPrincipalProperty(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/", nil)
@@ -1950,7 +1950,7 @@ func TestRFC4791_VTODOComponentSupport(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791: Calendars should support VTODO components
@@ -1974,7 +1974,7 @@ func TestRFC4791_VJOURNALComponentSupport(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791: Calendars should support VJOURNAL components
@@ -1998,7 +1998,7 @@ func TestRFC4791_UIDMustMatchResourceName(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 4.1: UID in calendar data should match the resource name
@@ -2026,7 +2026,7 @@ func TestRFC4791_CalendarDescriptionProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "My Calendar", Description: util.StrPtr("Personal events"), UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2057,7 +2057,7 @@ func TestRFC4791_CalendarCollection_Propfind_CalendarTimezone_PresentAndValid(t 
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2094,7 +2094,7 @@ func TestRFC4791_CalendarCollection_CalendarTimezone_NotInAllprop(t *testing.T) 
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -2116,7 +2116,7 @@ func TestRFC4791_CalendarCollection_Propfind_SupportedCalendarData_Advertised(t 
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2153,7 +2153,7 @@ func TestRFC4791_CalendarCollection_SupportedCalendarData_NotInAllprop(t *testin
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
@@ -2175,7 +2175,7 @@ func TestRFC4791_CalendarCollection_Propfind_MaxResourceSize_AdvertisedOrExplici
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2212,7 +2212,7 @@ func TestRFC4791_CalendarCollection_Propfind_MinMaxDateTime_AdvertisedOrExplicit
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2262,7 +2262,7 @@ func TestRFC4791_CalendarTimezoneProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2298,7 +2298,7 @@ func TestRFC4791_MaxResourceSizeProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2330,7 +2330,7 @@ func TestRFC4791_DateTimeRangeLimitsProperties(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -2365,7 +2365,7 @@ func TestRFC4791_Precondition_SupportedCalendarData_RejectUnsupportedMediaType(t
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -2407,7 +2407,7 @@ func TestRFC4791_Precondition_MaxResourceSize_RejectTooLargeObject(t *testing.T)
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -2463,7 +2463,7 @@ func TestRFC4791_Precondition_MinDateTime_RejectEarlierDates(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -2512,7 +2512,7 @@ func TestRFC4791_Precondition_MinDateTime_RejectEarlierDatesWithTZID(t *testing.
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	loc, err := time.LoadLocation("America/New_York")
@@ -2566,7 +2566,7 @@ func TestRFC4791_Precondition_MaxDateTime_RejectLaterDates(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -2615,7 +2615,7 @@ func TestRFC4791_Precondition_MaxDateTime_RejectLaterDatesWithOffset(t *testing.
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -2665,7 +2665,7 @@ func TestRFC4791_PutBeforeMinDateTimeRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-old\r\nDTSTART:18000101T000000Z\r\nDTEND:18000101T010000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -2688,7 +2688,7 @@ func TestRFC4791_PutAfterMaxDateTimeRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-far\r\nDTSTART:22000101T000000Z\r\nDTEND:22000101T010000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -2716,7 +2716,7 @@ func TestRFC4791_DeleteCalendarObject(t *testing.T) {
 			"1:to-delete": {CalendarID: 1, UID: "to-delete", RawICAL: "ICAL", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/to-delete.ics", nil)
@@ -2758,7 +2758,7 @@ func TestRFC4791_DeleteWithIfMatchPrecondition(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "correct-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// Try to delete with wrong ETag
@@ -2793,7 +2793,7 @@ func TestRFC4791_DeleteWithIfMatchSucceeds(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "correct-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/event.ics", nil)
@@ -2819,7 +2819,7 @@ func TestRFC4791_DeleteMissingResource(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/missing.ics", nil)
@@ -2856,7 +2856,7 @@ func TestRFC4791_TextMatchFilterInQuery(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.5: Text match filter
@@ -2915,7 +2915,7 @@ func TestRFC4791_PropFilterIsNotDefined(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.2: is-not-defined test
@@ -2967,7 +2967,7 @@ func TestRFC4791_PartialCalendarDataRetrieval(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.6.1: Request only specific properties
@@ -3047,7 +3047,7 @@ func TestRFC4791_PreventDuplicateUIDInDifferentResources(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "duplicate-uid", RawICAL: "ICAL1", ETag: "e1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 4.1: A calendar collection MUST NOT contain more than one
@@ -3093,7 +3093,7 @@ func TestRFC4791_LimitRecurrenceSetInCalendarData(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.6.5: limit-recurrence-set restricts recurring events to time range
@@ -3143,7 +3143,7 @@ func TestRFC4791_ExpandRecurringEventsInCalendarData(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.6.6: expand converts recurring events to individual instances
@@ -3193,7 +3193,7 @@ func TestRFC4791_TimeRangeFilteringWithRecurringEvents(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	body := `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -3239,7 +3239,7 @@ func TestRFC4791_GetReturnsLastModifiedHeader(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/event.ics", nil)
@@ -3267,7 +3267,7 @@ func TestRFC4791_PutWithIfNoneMatchOnExistingResource(t *testing.T) {
 			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "OLD", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -3291,7 +3291,7 @@ func TestRFC4791_ReadFreeBusyPrivilege(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -3326,7 +3326,7 @@ func TestRFC4791_CurrentUserPrivilegeSetIncludesReadFreeBusy(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: false},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	propBody := `<?xml version="1.0" encoding="utf-8"?>
@@ -3388,7 +3388,7 @@ func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	freeBusyBody := `<?xml version="1.0" encoding="utf-8" ?>
@@ -3447,7 +3447,7 @@ func TestRFC4791_ScheduleCalendarTranspProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3504,7 +3504,7 @@ func TestRFC4791_CalendarQueryWithMultipleFilters(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// Combining time-range and text-match filters
@@ -3549,7 +3549,7 @@ func TestRFC4791_TimezoneXMLElement(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3596,7 +3596,7 @@ func TestRFC4791_FilterWithinCalendarData(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// Request to limit returned components
@@ -3633,7 +3633,7 @@ func TestRFC4791_FilterWithinCalendarData(t *testing.T) {
 // Section 5.3.1: MKCALENDAR with Request Body
 func TestRFC4791_MkcalendarWithProperties(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 5.3.1: MKCALENDAR can include property updates
@@ -3670,7 +3670,7 @@ func TestInteroperability_CalendarObjectResourceNaming(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -3711,7 +3711,7 @@ func TestRFC4791_PropFilterIsDefined(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.3: Filter for events that HAVE a description
@@ -3752,7 +3752,7 @@ func TestRFC4791_GetCTagProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", CTag: 42, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3799,7 +3799,7 @@ func TestRFC4791_NegateConditionInFilter(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.5: negate-condition attribute inverts the match
@@ -3840,7 +3840,7 @@ func TestRFC4791_MaxAttendeesPerInstanceProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3872,7 +3872,7 @@ func TestRFC4791_MaxInstancesProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3903,7 +3903,7 @@ func TestRFC4791_PutExceedsMaxAttendeesPerInstance(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	var sb strings.Builder
@@ -3932,7 +3932,7 @@ func TestRFC4791_PutExceedsMaxInstances(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-many\r\nDTSTART:20240101T000000Z\r\nRRULE:FREQ=DAILY;COUNT=2001\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -3954,7 +3954,7 @@ func TestRFC4791_PutExceedsMaxInstancesLowercaseParams(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:too-many-lower\r\nDTSTART:20240101T000000Z\r\nRRULE:freq=daily;count=2001\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -3978,7 +3978,7 @@ func TestRFC4791_ProppatchOnReadOnlyProperties(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 5.2.10: Attempt to modify read-only property
@@ -4012,7 +4012,7 @@ func TestRFC4791_PutWithUnsupportedMediaType(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// Try to PUT with unsupported content type (e.g., JSON instead of iCalendar)
@@ -4038,7 +4038,7 @@ func TestRFC4791_PutWithoutContentTypeRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:no-ctype\r\nSUMMARY:No Content-Type\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4063,7 +4063,7 @@ func TestRFC4791_PutWithTextPlainRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:plain-text\r\nSUMMARY:Plain Text\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4087,7 +4087,7 @@ func TestRFC4791_PutWithUnsupportedComponent(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// Try to PUT a mix of supported and unsupported components.
@@ -4112,7 +4112,7 @@ func TestRFC4791_PutExceedsMaxResourceSize(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// Create a very large iCalendar object
@@ -4139,7 +4139,7 @@ func TestRFC4791_ValidCalendarObject_RejectMethodProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:method-reject\r\nSUMMARY:Method\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4161,7 +4161,7 @@ func TestRFC4791_ValidCalendarObject_RejectMultipleTopLevelComponents(t *testing
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:one\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:two\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4183,7 +4183,7 @@ func TestRFC4791_ValidCalendarObject_RejectMissingUID(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:Missing UID\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4206,7 +4206,7 @@ func TestRFC4791_UIDUniqueness_SameUIDMustBeSameResource(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:dup-uid\r\nSUMMARY:First\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4238,7 +4238,7 @@ func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:uid-one\r\nSUMMARY:Original\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4270,7 +4270,7 @@ func TestRFC4791_PutWithDifferentUIDsRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 4.1: Calendar object resource MUST NOT mix different UIDs in one resource
@@ -4294,7 +4294,7 @@ func TestRFC4791_PutWithRecurrenceSetSameUIDAccepted(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:recurring\r\nDTSTART:20240101T100000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:recurring\r\nRECURRENCE-ID:20240102T100000Z\r\nSUMMARY:Override\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4316,7 +4316,7 @@ func TestRFC4791_PutCalendarObjectAtCalendarHomeRejected(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:home-root\r\nSUMMARY:Home Root\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -4334,7 +4334,7 @@ func TestRFC4791_PutCalendarObjectAtCalendarHomeRejected(t *testing.T) {
 
 // Section 7.2: REPORT on Non-Calendar Collections
 func TestRFC4791_ReportOnOrdinaryCollection(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{}, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{}, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 7.2: calendar-query on non-calendar collection should work on descendants
@@ -4370,7 +4370,7 @@ func TestRFC4791_SupportedCollationSetProperty(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -4413,7 +4413,7 @@ func TestRFC4791_TextMatchWithCollation(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 7.5: Test with explicit collation
@@ -4458,7 +4458,7 @@ func TestHTTP_GetReturnsContentLength(t *testing.T) {
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: icalData, ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/event.ics", nil)
@@ -4488,7 +4488,7 @@ func TestRFC4791_PutPreservesComponentType(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// Store VTODO
@@ -4522,7 +4522,7 @@ func TestRFC4791_PutPreservesComponentType(t *testing.T) {
 // Section 5.3.1: MKCALENDAR on Invalid Path
 func TestRFC4791_MkcalendarInvalidPath(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	user := &store.User{ID: 1}
 
 	// Try to create calendar with invalid path (e.g., missing name)
@@ -4555,7 +4555,7 @@ func TestRFC4791_CompFilterWithTestAttribute(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.1: comp-filter with test="allof" or test="anyof"
@@ -4608,7 +4608,7 @@ func TestRFC4791_ParamFilterInQuery(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
 	// RFC 4791 Section 9.7.4: param-filter tests property parameters

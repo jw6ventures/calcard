@@ -10,7 +10,7 @@ import (
 var davAllowMethods = []string{"OPTIONS", "HEAD", "GET", "PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "PUT", "DELETE", "REPORT", "LOCK", "UNLOCK", "ACL"}
 var davAllowMethodsWithCopyMove = []string{"OPTIONS", "HEAD", "GET", "PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "PUT", "DELETE", "REPORT", "COPY", "MOVE", "LOCK", "UNLOCK", "ACL"}
 
-func (h *Handler) davHeaderForPath(cleanPath string) string {
+func (h *DavServer) davHeaderForPath(cleanPath string) string {
 	if cleanPath == "/dav" || cleanPath == "/dav/" {
 		return "1, 2, 3, access-control, calendar-access, addressbook"
 	}
@@ -20,7 +20,7 @@ func (h *Handler) davHeaderForPath(cleanPath string) string {
 	return "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"
 }
 
-func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -39,14 +39,14 @@ func (h *Handler) Options(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Head(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
 	h.Get(w, r)
 }
 
-func (h *Handler) allowHeaderForPath(cleanPath string) string {
+func (h *DavServer) allowHeaderForPath(cleanPath string) string {
 	methods := davAllowMethods
 	if supportsCopyMove(cleanPath) {
 		methods = davAllowMethodsWithCopyMove

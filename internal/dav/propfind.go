@@ -10,7 +10,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}

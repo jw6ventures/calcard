@@ -232,7 +232,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Delete("/addressbooks/{id}/contacts/{uid}", apiHandler.DeleteContact)
 	})
 
-	davHandler := dav.NewServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions, Logger: opts.Logger})
+	davHandler := dav.NewDavServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions, Logger: opts.Logger})
 	registerDAVMethods(davHandler.RegisteredMethods())
 	davAuth := opts.DAVAuthMiddleware
 	if davAuth == nil && authService != nil {
@@ -305,7 +305,7 @@ func registerDAVMethods(methods []string) {
 
 // extensionMethodHandler serves an extension-registered DAV method, applying
 // davAuth only when the matched route declares that it requires authentication.
-func extensionMethodHandler(davHandler *dav.Server, davAuth func(http.Handler) http.Handler) http.Handler {
+func extensionMethodHandler(davHandler *dav.DavServer, davAuth func(http.Handler) http.Handler) http.Handler {
 	authed := davAuth(http.HandlerFunc(davHandler.ServeHTTP))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if davHandler.RouteRequiresAuth(r.Method, r.URL.Path) {

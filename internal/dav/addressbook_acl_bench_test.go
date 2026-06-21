@@ -25,7 +25,7 @@ func BenchmarkFilterReadableAddressBookContacts(b *testing.B) {
 			name := fmt.Sprintf("contact-%d", i)
 			contacts = append(contacts, store.Contact{AddressBookID: 1, UID: name, ResourceName: name})
 		}
-		h := &Handler{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
+		h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
 		b.Run(fmt.Sprintf("contacts=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {

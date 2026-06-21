@@ -11,7 +11,7 @@ import (
 
 const pendingCollectionSegment = ".pending"
 
-func (h *Handler) canonicalDAVPath(ctx context.Context, user *store.User, rawPath string) (string, error) {
+func (h *DavServer) canonicalDAVPath(ctx context.Context, user *store.User, rawPath string) (string, error) {
 	cleanPath := normalizeDAVHref(rawPath)
 	switch {
 	case cleanPath == "", cleanPath == "/":
@@ -27,7 +27,7 @@ func (h *Handler) canonicalDAVPath(ctx context.Context, user *store.User, rawPat
 	}
 }
 
-func (h *Handler) canonicalCollectionPath(ctx context.Context, user *store.User, cleanPath, prefix string, resolve func(context.Context, *store.User, string) (int64, bool, error)) (string, error) {
+func (h *DavServer) canonicalCollectionPath(ctx context.Context, user *store.User, cleanPath, prefix string, resolve func(context.Context, *store.User, string) (int64, bool, error)) (string, error) {
 	trimmed := strings.Trim(strings.TrimPrefix(cleanPath, prefix), "/")
 	if trimmed == "" {
 		return prefix, nil

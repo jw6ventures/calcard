@@ -16,7 +16,7 @@ import (
 
 var allPrivileges = []string{"read", "write", "write-content", "write-properties", "read-acl", "write-acl", "bind", "unbind"}
 
-func (h *Handler) Acl(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -209,7 +209,7 @@ func extractACEPrivilegeNames(priv acePrivilege) []string {
 }
 
 // checkACLPrivilege verifies a user has a specific privilege on a resource.
-func (h *Handler) checkACLPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, error) {
+func (h *DavServer) checkACLPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, error) {
 	if h.store.ACLEntries == nil {
 		return true, nil
 	}
@@ -254,7 +254,7 @@ func (h *Handler) checkACLPrivilege(ctx context.Context, user *store.User, resou
 	return false, nil
 }
 
-func (h *Handler) aclDecision(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
+func (h *DavServer) aclDecision(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
 	if h == nil || h.store == nil || h.store.ACLEntries == nil {
 		return false, false, nil
 	}
@@ -269,11 +269,11 @@ func (h *Handler) aclDecision(ctx context.Context, user *store.User, resourcePat
 	return granted, applicable, nil
 }
 
-func (h *Handler) aclDecisionMatchingPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
+func (h *DavServer) aclDecisionMatchingPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
 	return h.aclDecision(ctx, user, resourcePath, privilege)
 }
 
-func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
 	resourcePath = normalizeDAVResourceIdentity(resourcePath)
 
 	// Within a read request the same resource path is resolved once per
@@ -309,7 +309,7 @@ func (h *Handler) aclEntriesForResource(ctx context.Context, resourcePath string
 	return result, nil
 }
 
-func (h *Handler) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) bool {
+func (h *DavServer) isResourceOwner(ctx context.Context, user *store.User, resourcePath string) bool {
 	cleanPath := path.Clean(resourcePath)
 
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {

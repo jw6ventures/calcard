@@ -11,7 +11,7 @@ func TestACLEntriesForResourceMemoizesWithinRequest(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/3", PrincipalHref: "/dav/principals/4/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{ACLEntries: aclRepo}}
 
 	// With a request-scoped cache, resolving the same path repeatedly (as the
 	// per-privilege current-user-privilege-set computation does) hits the store

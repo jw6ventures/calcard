@@ -40,7 +40,7 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 	return destPath, overwrite, nil
 }
 
-func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -87,7 +87,7 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unsupported copy source", http.StatusForbidden)
 }
 
-func (h *Handler) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
+func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
 	_, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read")
 	if err != nil {
 		status := http.StatusNotFound
@@ -195,7 +195,7 @@ func (h *Handler) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user
 	}
 }
 
-func (h *Handler) copyContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
+func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -311,7 +311,7 @@ func (h *Handler) copyContact(w http.ResponseWriter, r *http.Request, user *stor
 	}
 }
 
-func (h *Handler) Move(w http.ResponseWriter, r *http.Request) {
+func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -358,7 +358,7 @@ func (h *Handler) Move(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unsupported move source", http.StatusForbidden)
 }
 
-func (h *Handler) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
+func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
 	srcCal, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read")
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -483,7 +483,7 @@ func (h *Handler) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user
 	}
 }
 
-func (h *Handler) moveContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
+func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -598,7 +598,7 @@ func (h *Handler) moveContact(w http.ResponseWriter, r *http.Request, user *stor
 	}
 }
 
-func (h *Handler) requireAddressBookDestinationWritePrivileges(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, existing *store.Contact, sourceUID string) error {
+func (h *DavServer) requireAddressBookDestinationWritePrivileges(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, existing *store.Contact, sourceUID string) error {
 	if existing == nil {
 		return h.requireAddressBookPrivilege(ctx, user, book, cleanPath, "bind")
 	}
@@ -613,7 +613,7 @@ func (h *Handler) requireAddressBookDestinationWritePrivileges(ctx context.Conte
 	return nil
 }
 
-func (h *Handler) requireCalendarDestinationWritePrivileges(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, existing *store.Event, sourceUID string) error {
+func (h *DavServer) requireCalendarDestinationWritePrivileges(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, existing *store.Event, sourceUID string) error {
 	if existing == nil {
 		return h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, "bind")
 	}
@@ -635,7 +635,7 @@ func srcPath(r *http.Request) string {
 	return path.Clean(r.URL.Path)
 }
 
-func (h *Handler) rollbackCalendarMove(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
+func (h *DavServer) rollbackCalendarMove(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
 	if err := h.store.Events.MoveToCalendar(ctx, currentCalendarID, src.CalendarID, src.UID, eventResourceName(src)); err != nil {
 		return err
 	}
@@ -649,7 +649,7 @@ func (h *Handler) rollbackCalendarMove(ctx context.Context, currentCalendarID in
 	return h.cleanupRollbackEventTombstones(ctx, currentCalendarID, currentResourceName, src, replaced)
 }
 
-func (h *Handler) rollbackContactMove(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
+func (h *DavServer) rollbackContactMove(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
 	if err := h.store.Contacts.MoveToAddressBook(ctx, currentAddressBookID, src.AddressBookID, src.UID, contactResourceName(src)); err != nil {
 		return err
 	}
@@ -671,21 +671,21 @@ func newCopyETag(raw string, destinationID int64) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(raw+fmt.Sprint(destinationID)+hex.EncodeToString(entropy))))
 }
 
-func (h *Handler) clearOverwrittenEventTombstone(ctx context.Context, calendarID int64, replaced *store.Event, resourceName string) error {
+func (h *DavServer) clearOverwrittenEventTombstone(ctx context.Context, calendarID int64, replaced *store.Event, resourceName string) error {
 	if replaced == nil || h == nil || h.store == nil || h.store.DeletedResources == nil {
 		return nil
 	}
 	return h.store.DeletedResources.DeleteByIdentity(ctx, "event", calendarID, replaced.UID, resourceName)
 }
 
-func (h *Handler) clearOverwrittenContactTombstone(ctx context.Context, addressBookID int64, replaced *store.Contact, resourceName string) error {
+func (h *DavServer) clearOverwrittenContactTombstone(ctx context.Context, addressBookID int64, replaced *store.Contact, resourceName string) error {
 	if replaced == nil || h == nil || h.store == nil || h.store.DeletedResources == nil {
 		return nil
 	}
 	return h.store.DeletedResources.DeleteByIdentity(ctx, "contact", addressBookID, replaced.UID, resourceName)
 }
 
-func (h *Handler) cleanupRollbackEventTombstones(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
+func (h *DavServer) cleanupRollbackEventTombstones(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
 	if h.store == nil || h.store.DeletedResources == nil {
 		return nil
 	}
@@ -707,7 +707,7 @@ func (h *Handler) cleanupRollbackEventTombstones(ctx context.Context, currentCal
 	return h.store.DeletedResources.DeleteByIdentity(ctx, "event", currentCalendarID, replaced.UID, eventResourceName(*replaced))
 }
 
-func (h *Handler) cleanupRollbackContactTombstones(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
+func (h *DavServer) cleanupRollbackContactTombstones(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
 	if h.store == nil || h.store.DeletedResources == nil {
 		return nil
 	}
