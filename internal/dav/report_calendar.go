@@ -125,20 +125,9 @@ func (h *DavServer) hasComponent(icalData, componentType string) bool {
 }
 
 func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
-	start, err := parseICalDateTime(tr.Start)
-	if err != nil {
-		return true // If we can't parse filter, include the event
-	}
-
-	var end time.Time
-	if tr.End != "" {
-		end, err = parseICalDateTime(tr.End)
-		if err != nil {
-			return true
-		}
-	} else {
-		// No end means unbounded
-		end = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	start, end, ok := calendarTimeRangeBounds(tr)
+	if !ok {
+		return false
 	}
 
 	if strings.Contains(strings.ToUpper(event.RawICAL), "RRULE:") {
@@ -156,6 +145,57 @@ func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
 	}
 
 	return true
+}
+
+func validCalendarFilterTimeRanges(filter *calFilter) bool {
+	if filter == nil {
+		return true
+	}
+	return validCompFilterTimeRanges(&filter.CompFilter)
+}
+
+func validCompFilterTimeRanges(filter *compFilter) bool {
+	if filter.TimeRange != nil {
+		if _, _, ok := calendarTimeRangeBounds(filter.TimeRange); !ok {
+			return false
+		}
+	}
+	for i := range filter.CompFilter {
+		if !validCompFilterTimeRanges(&filter.CompFilter[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func calendarTimeRangeBounds(tr *timeRange) (time.Time, time.Time, bool) {
+	if tr == nil {
+		return time.Time{}, time.Time{}, false
+	}
+
+	var start time.Time
+	var err error
+	if strings.TrimSpace(tr.Start) != "" {
+		start, err = parseICalDateTime(tr.Start)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+
+	end := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	if strings.TrimSpace(tr.End) != "" {
+		end, err = parseICalDateTime(tr.End)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+	if start.IsZero() && strings.TrimSpace(tr.End) == "" {
+		return time.Time{}, time.Time{}, false
+	}
+	if !start.IsZero() && !end.After(start) {
+		return time.Time{}, time.Time{}, false
+	}
+	return start, end, true
 }
 
 func (h *DavServer) recurringEventInTimeRange(event store.Event, rangeStart, rangeEnd time.Time) bool {

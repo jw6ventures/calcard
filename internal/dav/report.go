@@ -56,6 +56,10 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if (report.XMLName.Local == "calendar-query" || report.XMLName.Local == "free-busy-query") && !validCalendarFilterTimeRanges(report.Filter) {
+		http.Error(w, "invalid time-range", http.StatusBadRequest)
+		return
+	}
 	if handler, ok := h.davRegistry().reportHandler(cleanPath, report.XMLName.Local); ok {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		if handler(w, r, RequestContext{

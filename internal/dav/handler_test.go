@@ -1819,6 +1819,29 @@ func TestReportInvalidXMLReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestReportRejectsMutatedXMLDeclarationPayloads(t *testing.T) {
+	h := &DavServer{}
+	body := `<?xml version="1.0' OR '1'='1"?>
+<D:sync-collection xmlns:D="DAV:"/>`
+
+	for _, path := range []string{"/dav/", "/dav/principals/"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", path, strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Report(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for mutated XML declaration, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "invalid REPORT body") {
+				t.Fatalf("expected stable invalid REPORT body error, got %s", rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestReportUnsupportedPath(t *testing.T) {
 	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/unknown", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"></D:sync-collection>`))
@@ -2011,6 +2034,29 @@ func TestPropfindUnsupportedPathReturnsNotFound(t *testing.T) {
 	h.Propfind(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestPropfindCardNamespaceMutationDoesNotMatchCardDAVProperty(t *testing.T) {
+	h := &DavServer{}
+	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
+	body := `<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav' OR '1'='1">
+  <d:prop>
+    <card:addressbook-home-set/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/principals/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207 for namespace mutation handled as DAV property mismatch, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "<card:addressbook-home-set>") {
+		t.Fatalf("mutated CardDAV namespace must not satisfy addressbook-home-set, got %s", rr.Body.String())
 	}
 }
 
@@ -8306,6 +8352,45 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	}
 	if strings.Contains(respBody, "out-range.ics") {
 		t.Errorf("should not include out-range event, got %s", respBody)
+	}
+}
+
+func TestCalendarQueryRejectsSQLLookingTimeRangeStart(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VEVENT">
+				<cal:time-range start="20240601T000000Z' OR '1'='1" end="20240630T235959Z"/>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid time-range to return 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "in-range.ics") || strings.Contains(rr.Body.String(), "out-range.ics") {
+		t.Fatalf("invalid time-range must not broaden query results, got %s", rr.Body.String())
 	}
 }
 
