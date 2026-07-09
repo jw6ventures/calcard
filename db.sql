@@ -349,3 +349,18 @@ CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
 
 CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
     ON events (object_acl_path);
+
+-- recurrence_start/recurrence_until make calendar-query time-range bounds
+-- indexable for recurring events. They hold a recurring event's earliest
+-- instance start and last instance end (sentinels when not precisely bounded)
+-- and are NULL for non-recurring events, so COALESCE falls back to the
+-- single-instance dtstart/dtend window. The application recomputes them on every
+-- write.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
+    ON events (calendar_id, COALESCE(recurrence_start, dtstart));
+
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
+    ON events (calendar_id, COALESCE(recurrence_until, dtend, dtstart));

@@ -429,13 +429,14 @@ type eventRepo struct {
 
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
 	summary, description, location, dtstart, dtend, allDay := parseICalFields(event.RawICAL)
+	recurrenceStart, recurrenceUntil := recurrenceBoundsFromICal(event.RawICAL)
 	if event.ResourceName == "" {
 		event.ResourceName = event.UID
 	}
 
 	const q = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
@@ -446,11 +447,13 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
         last_modified = NOW()
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, description, location, dtstart, dtend, allDay)
+	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, description, location, dtstart, dtend, allDay, recurrenceStart, recurrenceUntil)
 	ev, err := scanEvent(row.Scan)
 	if err != nil {
 		return nil, err
@@ -546,9 +549,9 @@ func likeEscape(s string) string {
 }
 
 // ListForCalendarFiltered returns calendar events matching f. Every query is
-// scoped to a single calendar_id (served by the calendar/dtstart indexes), so
-// it never triggers a full table scan; the date range uses the
-// (calendar_id, dtstart) index and text predicates run over that narrowed set.
+// scoped to a single calendar_id, so it never triggers a full table scan; date
+// ranges use recurrence window indexes and text predicates run over that
+// narrowed set.
 func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error) {
 	var sb strings.Builder
 	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1`)
@@ -559,11 +562,16 @@ func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int6
 	}
 
 	if f.Start != nil {
-		// Keep events that end at or after Start; undated dtend falls back to dtstart.
-		sb.WriteString(` AND COALESCE(dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
+		// Keep events whose last instance ends at or after Start. recurrence_until
+		// holds that end for recurring events (a far-future sentinel when
+		// unbounded) and is NULL for non-recurring events, so COALESCE falls back
+		// to dtend, then dtstart.
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
 	}
 	if f.End != nil {
-		sb.WriteString(` AND dtstart <= ` + placeholder(f.End.UTC()))
+		// Keep events whose earliest instance starts at or before End. recurrence_start
+		// captures RDATEs and moved overrides that can occur before the master dtstart.
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= ` + placeholder(f.End.UTC()))
 	}
 	if f.Title != "" {
 		sb.WriteString(` AND summary ILIKE ` + placeholder("%"+likeEscape(f.Title)+"%"))
@@ -839,8 +847,8 @@ func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalend
 	}
 
 	const insertQ = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
@@ -851,10 +859,13 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
         last_modified = NOW()
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
-	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.Description, src.Location, src.DTStart, src.DTEnd, src.AllDay)
+	recurrenceStart, recurrenceUntil := recurrenceBoundsFromICal(src.RawICAL)
+	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.Description, src.Location, src.DTStart, src.DTEnd, src.AllDay, recurrenceStart, recurrenceUntil)
 	ev, err := scanEvent(insertRow.Scan)
 	if err != nil {
 		return nil, err
@@ -2485,6 +2496,480 @@ func parseICalFields(ical string) (summary, description, location *string, dtsta
 	}
 
 	return summary, description, location, dtstart, dtend, allDay
+}
+
+// recurrenceStartSentinel and recurrenceUntilSentinel mark recurrence bounds that
+// cannot be computed precisely. They keep SQL time-range pushdown as a safe
+// superset so the in-memory recurrence expansion can make the exact decision.
+var recurrenceStartSentinel = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+var recurrenceUntilSentinel = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
+func recurrenceStartFromICal(ical string) *time.Time {
+	start, _ := recurrenceBoundsFromICal(ical)
+	return start
+}
+
+func recurrenceUntilFromICal(ical string) *time.Time {
+	_, until := recurrenceBoundsFromICal(ical)
+	return until
+}
+
+// recurrenceBoundsFromICal computes the recurrence_start and recurrence_until
+// values persisted for an event. The start is the earliest known recurring
+// instance start, or a low sentinel when it cannot be computed safely. The until
+// is the end of the last recurring instance, a far-future sentinel for unbounded
+// or not-confidently-bounded rules, or nil for non-recurring events. Neither
+// value may exclude a row that in-memory recurrence expansion would match.
+func recurrenceBoundsFromICal(ical string) (*time.Time, *time.Time) {
+	components := recurringICalComponents(ical)
+	if len(components) == 0 {
+		return nil, nil
+	}
+
+	var minStart *time.Time
+	var maxUntil *time.Time
+	for _, component := range components {
+		if !component.hasRecurrence() {
+			continue
+		}
+
+		starts := component.recurrenceStarts()
+		if len(starts) == 0 {
+			minStart = recurrenceStartSentinelPtr()
+		}
+		for _, start := range starts {
+			setMinTime(&minStart, start)
+		}
+		if component.unsafeStart {
+			minStart = recurrenceStartSentinelPtr()
+		}
+
+		if component.hasRDate || component.unsafeUntil {
+			maxUntil = recurrenceUntilSentinelPtr()
+		}
+		if component.rangeThisAndFuture {
+			maxUntil = recurrenceUntilSentinelPtr()
+		}
+
+		if component.recurrenceID != nil && component.rrule == "" && !component.hasRDate {
+			until := component.overrideUntil()
+			if until == nil {
+				maxUntil = recurrenceUntilSentinelPtr()
+			} else if maxUntil == nil || until.After(*maxUntil) {
+				u := *until
+				maxUntil = &u
+			}
+		}
+
+		if component.rrule != "" {
+			if component.dtstart == nil {
+				maxUntil = recurrenceUntilSentinelPtr()
+				continue
+			}
+			until := recurrenceUntil(*component.dtstart, component.dtend, component.duration, component.allDay, component.rrule)
+			if until == nil {
+				continue
+			}
+			if until.Equal(recurrenceUntilSentinel) {
+				maxUntil = recurrenceUntilSentinelPtr()
+				continue
+			}
+			if maxUntil == nil || until.After(*maxUntil) {
+				u := *until
+				maxUntil = &u
+			}
+		}
+	}
+	return minStart, maxUntil
+}
+
+func setMinTime(target **time.Time, value time.Time) {
+	if target == nil || value.IsZero() {
+		return
+	}
+	if *target == nil || value.Before(**target) {
+		v := value
+		*target = &v
+	}
+}
+
+func recurrenceStartSentinelPtr() *time.Time {
+	s := recurrenceStartSentinel
+	return &s
+}
+
+func (c recurringICalComponent) hasRecurrence() bool {
+	return c.rrule != "" || c.hasRDate || c.recurrenceID != nil
+}
+
+func (c recurringICalComponent) recurrenceStarts() []time.Time {
+	starts := make([]time.Time, 0, 2+len(c.rdateStarts))
+	if c.dtstart != nil {
+		starts = append(starts, *c.dtstart)
+	}
+	if c.recurrenceID != nil && c.dtstart == nil {
+		starts = append(starts, *c.recurrenceID)
+	}
+	starts = append(starts, c.rdateStarts...)
+	return starts
+}
+
+func (c recurringICalComponent) overrideUntil() *time.Time {
+	if c.recurrenceID == nil {
+		return nil
+	}
+	start := c.recurrenceID
+	if c.dtstart != nil {
+		start = c.dtstart
+	}
+	if c.dtend == nil {
+		if c.duration == nil || *c.duration <= 0 {
+			return nil
+		}
+		u := start.Add(*c.duration)
+		return &u
+	}
+	if !c.dtend.After(*start) {
+		return nil
+	}
+	u := *c.dtend
+	return &u
+}
+
+func rdateStartsFromLine(keyPart, value string) ([]time.Time, bool) {
+	var starts []time.Time
+	ok := true
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			period := strings.SplitN(part, "/", 2)
+			part = strings.TrimSpace(period[0])
+		}
+		if start, _ := parseICalDateTime(part, keyPart); start != nil {
+			starts = append(starts, *start)
+			continue
+		}
+		ok = false
+	}
+	return starts, ok
+}
+
+type recurringICalComponent struct {
+	dtstart            *time.Time
+	dtend              *time.Time
+	duration           *time.Duration
+	recurrenceID       *time.Time
+	rrule              string
+	hasRDate           bool
+	rdateStarts        []time.Time
+	unsafeStart        bool
+	unsafeUntil        bool
+	allDay             bool
+	rangeThisAndFuture bool
+	depth              int
+	name               string
+}
+
+func recurrenceUntilSentinelPtr() *time.Time {
+	s := recurrenceUntilSentinel
+	return &s
+}
+
+// recurringICalComponents returns direct recurring components whose recurrence
+// can affect calendar-query time-range pushdown. Nested components such as
+// VTIMEZONE STANDARD/DAYLIGHT and VALARM are intentionally ignored.
+func recurringICalComponents(ical string) []recurringICalComponent {
+	var components []recurringICalComponent
+	depth := 0
+	var current *recurringICalComponent
+	for _, line := range unfoldICalLines(ical) {
+		switch {
+		case hasICalPrefixFold(line, "BEGIN:"):
+			depth++
+			name := strings.TrimSpace(line[len("BEGIN:"):])
+			if current == nil && depth == 2 && isRecurringComponentName(name) {
+				current = &recurringICalComponent{depth: depth, name: strings.ToUpper(name)}
+			}
+		case hasICalPrefixFold(line, "END:"):
+			if current != nil && current.depth == depth &&
+				strings.EqualFold(strings.TrimSpace(line[len("END:"):]), current.name) {
+				components = append(components, *current)
+				current = nil
+			}
+			depth--
+			if depth < 0 {
+				depth = 0
+			}
+		default:
+			if current == nil || current.depth != depth {
+				continue
+			}
+			switch strings.ToUpper(icalPropertyName(line)) {
+			case "DTSTART":
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					if t, allDay := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
+						current.dtstart = t
+						current.allDay = allDay
+					}
+				}
+			case "DTEND":
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					if t, _ := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
+						current.dtend = t
+					}
+				}
+			case "DURATION":
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					if d, ok := parseICalDuration(line[idx+1:]); ok && d > 0 {
+						current.duration = &d
+					}
+				}
+			case "RECURRENCE-ID":
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					if t, _ := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
+						current.recurrenceID = t
+						current.rangeThisAndFuture = icalParamEquals(line[:idx], "RANGE", "THISANDFUTURE")
+					} else {
+						current.unsafeStart = true
+						current.unsafeUntil = true
+					}
+				}
+			case "RRULE":
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					if current.rrule != "" {
+						current.unsafeUntil = true
+					}
+					current.rrule = strings.TrimSpace(line[idx+1:])
+				}
+			case "RDATE":
+				current.hasRDate = true
+				if idx := strings.IndexByte(line, ':'); idx >= 0 {
+					starts, ok := rdateStartsFromLine(line[:idx], line[idx+1:])
+					current.rdateStarts = append(current.rdateStarts, starts...)
+					if !ok {
+						current.unsafeStart = true
+					}
+				} else {
+					current.unsafeStart = true
+				}
+			}
+		}
+	}
+	return components
+}
+
+func isRecurringComponentName(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "VEVENT", "VTODO", "VJOURNAL":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasICalPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func icalParamEquals(keyPart, param, value string) bool {
+	parts := strings.Split(keyPart, ";")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts[1:] {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(kv[0]), param) && strings.EqualFold(strings.TrimSpace(kv[1]), value) {
+			return true
+		}
+	}
+	return false
+}
+
+// icalPropertyName returns the property name from a content line, i.e. the text
+// before the first ';' (parameters) or ':' (value).
+func icalPropertyName(line string) string {
+	end := len(line)
+	if i := strings.IndexAny(line, ";:"); i >= 0 {
+		end = i
+	}
+	return line[:end]
+}
+
+// recurrenceUntilPad is added to a COUNT-derived bound so that wall-clock vs UTC
+// drift (the stored dtstart is in UTC, while a recurrence is anchored to its
+// local wall-clock time across DST transitions) cannot turn the estimate into an
+// underestimate. One day dwarfs any timezone offset.
+const recurrenceUntilPad = 24 * time.Hour
+const recurrenceDefaultDuration = time.Hour
+
+func recurrenceUntil(dtstart time.Time, dtend *time.Time, durationProp *time.Duration, allDay bool, rrule string) *time.Time {
+	params := parseRRuleParams(rrule)
+
+	duration := recurrenceDefaultDuration
+	if dtend != nil {
+		if d := dtend.Sub(dtstart); d > 0 {
+			duration = d
+		}
+	} else if durationProp != nil && *durationProp > 0 {
+		duration = *durationProp
+	} else if allDay {
+		duration = 24 * time.Hour
+	}
+
+	sentinel := func() *time.Time {
+		return recurrenceUntilSentinelPtr()
+	}
+
+	// UNTIL is an absolute (UTC) ceiling on instance start times, so the last
+	// instance ends no later than UNTIL + duration regardless of FREQ or BY* parts.
+	if until, ok := params["UNTIL"]; ok {
+		if t, _ := parseICalDateTime(until, "UNTIL"); t != nil {
+			end := t.Add(duration)
+			return &end
+		}
+		return sentinel()
+	}
+
+	countStr, ok := params["COUNT"]
+	if !ok {
+		// No COUNT and no UNTIL: the recurrence is unbounded.
+		return sentinel()
+	}
+	count, err := strconv.Atoi(countStr)
+	if err != nil || count <= 0 {
+		return sentinel()
+	}
+
+	// Only DAILY/WEEKLY rules with no BY* parts can be bounded by simple stepping:
+	// day arithmetic never skips periods, and without BY* parts each period yields
+	// exactly one instance. MONTHLY/YEARLY can skip periods (e.g. the 31st, or a
+	// Feb 29 leap day), any BY* part can move or thin out instances so the COUNTth
+	// lands later than naive stepping suggests, and sub-daily frequencies are
+	// effectively unbounded. We also can't trust dtstart's day-of-month for a
+	// MONTHLY/YEARLY check because it is stored in UTC. All of these fall back to
+	// the sentinel so the value is never an underestimate.
+	if hasRRuleByPart(params) {
+		return sentinel()
+	}
+	interval := 1
+	if v, ok := params["INTERVAL"]; ok {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			interval = i
+		}
+	}
+	steps := (count - 1) * interval
+	var lastStart time.Time
+	switch strings.ToUpper(params["FREQ"]) {
+	case "DAILY":
+		lastStart = dtstart.AddDate(0, 0, steps)
+	case "WEEKLY":
+		lastStart = dtstart.AddDate(0, 0, 7*steps)
+	default:
+		return sentinel()
+	}
+	end := lastStart.Add(duration + recurrenceUntilPad)
+	return &end
+}
+
+func hasRRuleByPart(params map[string]string) bool {
+	for k := range params {
+		if strings.HasPrefix(k, "BY") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseRRuleParams(rrule string) map[string]string {
+	params := make(map[string]string)
+	for _, part := range strings.Split(rrule, ";") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) == 2 {
+			params[strings.ToUpper(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
+		}
+	}
+	return params
+}
+
+func parseICalDuration(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(strings.ToUpper(value))
+	if value == "" {
+		return 0, false
+	}
+	sign := time.Duration(1)
+	if strings.HasPrefix(value, "-") {
+		sign = -1
+		value = strings.TrimPrefix(value, "-")
+	} else {
+		value = strings.TrimPrefix(value, "+")
+	}
+	if !strings.HasPrefix(value, "P") {
+		return 0, false
+	}
+	value = strings.TrimPrefix(value, "P")
+	if value == "" {
+		return 0, false
+	}
+
+	var total time.Duration
+	var number strings.Builder
+	inTime := false
+	consume := func(unit byte) bool {
+		if number.Len() == 0 {
+			return false
+		}
+		n, err := strconv.Atoi(number.String())
+		number.Reset()
+		if err != nil {
+			return false
+		}
+		switch unit {
+		case 'W':
+			total += time.Duration(n) * 7 * 24 * time.Hour
+		case 'D':
+			total += time.Duration(n) * 24 * time.Hour
+		case 'H':
+			total += time.Duration(n) * time.Hour
+		case 'M':
+			if !inTime {
+				return false
+			}
+			total += time.Duration(n) * time.Minute
+		case 'S':
+			total += time.Duration(n) * time.Second
+		default:
+			return false
+		}
+		return true
+	}
+
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch >= '0' && ch <= '9' {
+			number.WriteByte(ch)
+			continue
+		}
+		if ch == 'T' {
+			if inTime || number.Len() != 0 {
+				return 0, false
+			}
+			inTime = true
+			continue
+		}
+		if !consume(ch) {
+			return 0, false
+		}
+	}
+	if number.Len() != 0 || total < 0 {
+		return 0, false
+	}
+	return sign * total, true
 }
 
 func unfoldICalLines(ical string) []string {

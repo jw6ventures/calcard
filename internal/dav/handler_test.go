@@ -9841,6 +9841,69 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 	}
 }
 
+func TestFreeBusyQueryUsesTopLevelTimeRange(t *testing.T) {
+	inRangeStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	inRangeEnd := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	outOfRangeStart := time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)
+	outOfRangeEnd := time.Date(2024, 7, 1, 11, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:in-range": {
+				CalendarID:   1,
+				UID:          "in-range",
+				ResourceName: "in-range",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "e1",
+				DTStart:      &inRangeStart,
+				DTEnd:        &inRangeEnd,
+			},
+			"1:out-of-range": {
+				CalendarID:   1,
+				UID:          "out-of-range",
+				ResourceName: "out-of-range",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-of-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "e2",
+				DTStart:      &outOfRangeStart,
+				DTEnd:        &outOfRangeEnd,
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "DTSTART:20240601T000000Z") {
+		t.Fatalf("expected top-level DTSTART in freebusy, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
+		t.Fatalf("expected top-level DTEND in freebusy, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "FREEBUSY:20240601T100000Z/20240601T120000Z") {
+		t.Fatalf("expected in-range busy slot, got %s", respBody)
+	}
+	if strings.Contains(respBody, "FREEBUSY:20240701T100000Z/20240701T110000Z") {
+		t.Fatalf("expected out-of-range busy slot to be omitted, got %s", respBody)
+	}
+}
+
 func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 	visibleStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	visibleEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)

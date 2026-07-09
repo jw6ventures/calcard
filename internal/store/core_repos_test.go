@@ -341,8 +341,8 @@ func TestEventRepoUpsertParsesFieldsAndPagination(t *testing.T) {
 
 	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test-uid\r\nSUMMARY:Planning Day\r\nDTSTART;VALUE=DATE:20260412\r\nDTEND;VALUE=DATE:20260413\r\nEND:VEVENT\r\nEND:VCALENDAR"
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
@@ -353,10 +353,12 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
         last_modified = NOW()
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `)).
-		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true).
+		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(1), int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, now))
 

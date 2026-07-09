@@ -1,4 +1,4 @@
--- v1.1.5: speed up object-level ACL visibility checks (calendars.list_accessible
+-- v1.1.6: speed up object-level ACL visibility checks (calendars.list_accessible
 -- and get_accessible). These previously matched ACL resource paths against events
 -- with a per-row regexp_replace, which is unindexable and forced a scan of every
 -- event in each calendar on PROPFIND of /dav/calendars/.
@@ -23,4 +23,4 @@ CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
 CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
     ON events (object_acl_path);
 
-UPDATE application SET value = 'v1.1.5' WHERE key = 'version';
+UPDATE application SET value = 'v1.1.6' WHERE key = 'version';

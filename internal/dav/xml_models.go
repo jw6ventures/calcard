@@ -133,6 +133,7 @@ type reportRequest struct {
 	Hrefs        []string          `xml:"DAV: href"`
 	SyncToken    string            `xml:"DAV: sync-token"`
 	Filter       *calFilter        `xml:"urn:ietf:params:xml:ns:caldav filter"`
+	TimeRange    *timeRange        `xml:"urn:ietf:params:xml:ns:caldav time-range"`
 	CardFilter   *cardFilter       `xml:"urn:ietf:params:xml:ns:carddav filter"`
 	CalendarData *calendarDataEl   `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
 	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`

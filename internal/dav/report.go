@@ -60,6 +60,10 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid time-range", http.StatusBadRequest)
 		return
 	}
+	if report.XMLName.Local == "free-busy-query" && !validTimeRange(report.TimeRange) {
+		http.Error(w, "invalid time-range", http.StatusBadRequest)
+		return
+	}
 	if handler, ok := h.davRegistry().reportHandler(cleanPath, report.XMLName.Local); ok {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		if handler(w, r, RequestContext{
@@ -160,7 +164,10 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 				if report.Filter != nil {
 					events = h.applyCalendarFilter(events, report.Filter)
 				}
-				freeBusyData := h.generateFreeBusy(events, report.Filter)
+				if report.TimeRange != nil {
+					events = h.filterCalendarEventsByTimeRange(events, report.TimeRange)
+				}
+				freeBusyData := h.generateFreeBusy(events, report.Filter, report.TimeRange)
 				w.Header().Set("Content-Type", "text/calendar")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(freeBusyData))
@@ -230,7 +237,7 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if report.XMLName.Local == "free-busy-query" {
-			responses, err := h.freeBusyQuery(r.Context(), user, cal, canonicalPath, report.Filter)
+			responses, err := h.freeBusyQuery(r.Context(), user, cal, canonicalPath, report.Filter, report.TimeRange)
 			if err != nil {
 				http.Error(w, "failed to list events", http.StatusInternalServerError)
 				return

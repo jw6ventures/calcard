@@ -123,7 +123,10 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
-		freeBusyData := h.generateFreeBusy(events, report.Filter)
+		if report.TimeRange != nil {
+			events = h.filterCalendarEventsByTimeRange(events, report.TimeRange)
+		}
+		freeBusyData := h.generateFreeBusy(events, report.Filter, report.TimeRange)
 		href := strings.TrimSuffix(cleanPath, "/") + "/freebusy.ics"
 		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(freeBusyData)))
 		return []response{resourceResponse(href, etagProp(etag, freeBusyData, true))}, "", nil

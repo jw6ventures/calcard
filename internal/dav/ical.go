@@ -89,7 +89,7 @@ func extractRRule(icalData string) string {
 		line = strings.TrimSuffix(line, "\r")
 		upperLine := strings.ToUpper(line)
 		if strings.HasPrefix(upperLine, "RRULE:") {
-			return strings.TrimPrefix(line, "RRULE:")
+			return strings.TrimSpace(line[strings.Index(line, ":")+1:])
 		}
 	}
 	return ""

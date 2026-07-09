@@ -32,7 +32,7 @@ Copy the .env.template file from the root of this repository, rename to .env, an
 |--------------------------------------- |------------	|-----------------------------	|
 | ghcr.io/jw6ventures/calcard:latest 	 | main       	| Latest stable release. 	|
 | ghcr.io/jw6ventures/calcard:beta   	 | develop    	| Pre-release.	|
-| ghcr.io/jw6ventures/calcard:v1.0.x 	 | tag/v1.0.x 	| Refer to github release for latest patch version |
+| ghcr.io/jw6ventures/calcard:v1.2.x 	 | tag/v1.2.x 	| Refer to github release for latest patch version |
 
 #### Docker Run
 
@@ -107,12 +107,20 @@ Environment variables:
 | `APP_DB_PASSWORD` | true | Required when not providing `APP_DB_DSN`. |
 | `APP_DB_PORT` | false | (Default `5432`) Used when not providing `APP_DB_DSN`. |
 | `APP_DB_SSLMODE` | false | (Default `disable`) Used when not providing `APP_DB_DSN`. |
+| `APP_DB_MAX_OPEN_CONNS` | false | (Default `25`) Maximum number of open database connections. |
+| `APP_DB_MAX_IDLE_CONNS` | false | (Default `10`) Maximum number of idle database connections kept in the pool. |
+| `APP_DB_CONN_MAX_LIFETIME` | false | (Default `30m`) Maximum lifetime of a database connection before it is recycled (Go duration, ex. `30m`). |
 | `APP_OAUTH_CLIENT_ID` | true | Provided from IDP |
 | `APP_OAUTH_CLIENT_SECRET` | true | Provided from IDP |
 | `APP_OAUTH_ISSUER_URL` | one of two | Provided from IDP. Used if `APP_OAUTH_DISCOVERY_URL` is not set. |
 | `APP_OAUTH_DISCOVERY_URL` | one of two | Provided from IDP. Overrides `APP_OAUTH_ISSUER_URL` when set. |
 | `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
 | `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for public environments |
+| `APP_HTTP_READ_TIMEOUT` | false | (Default `15s`) Maximum duration for reading an entire request, including the body (Go duration). |
+| `APP_HTTP_WRITE_TIMEOUT` | false | (Default `15s`) Maximum duration before timing out writes of the response (Go duration). |
+| `APP_HTTP_IDLE_TIMEOUT` | false | (Default `60s`) Maximum time to wait for the next request on a keep-alive connection (Go duration). |
+| `APP_PPROF_ENABLED` | false | (Default `false`) Exposes `net/http/pprof` profiling on a dedicated debug listener (`APP_PPROF_ADDR`). The endpoints leak runtime internals and can be used to DoS the process - keep the listener on loopback and reach it via an SSH tunnel. |
+| `APP_PPROF_ADDR` | false | (Default `127.0.0.1:6060`) Bind address for the pprof debug listener when `APP_PPROF_ENABLED` is true. Keep on loopback. |
 
 
 ## Connecting a CalDAV/CardDAV client
