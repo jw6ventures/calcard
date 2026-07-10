@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,7 +38,7 @@ func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.
 			}
 			return []response{buildAddressObjectExpandPropertyResponse(collectionHref, *contact, expandReq)}, "", nil
 		}
-		resp := addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, buildSyncToken("card", book.ID, book.UpdatedAt), fmt.Sprintf("%d", book.CTag))
+		resp := addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, buildSyncToken("card", book.ID, book.UpdatedAt), strconv.FormatInt(book.CTag, 10))
 		selections := expandPropertySelections(expandReq)
 		if len(resp.Propstat) > 0 {
 			expanded := h.expandedPrincipalProp(user, selections)
@@ -52,8 +53,9 @@ func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.
 	case "sync-collection":
 		return h.addressBookSyncCollection(ctx, user, book, principalHref, cleanPath, report)
 	default:
-		res, err := h.addressBookQuery(ctx, user, book, cleanPath, report.CardFilter, report.Prop, addressDataReq, report.Limit)
-		return res, "", err
+		// RFC 3253 §3.6: unknown report types must be refused, not answered
+		// with a full dump of the collection.
+		return nil, "", errUnsupportedReport
 	}
 }
 
@@ -106,14 +108,6 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 		})
 	}
 	return responses, nil
-}
-
-func (h *DavServer) addressBookMultiGet(ctx context.Context, user *store.User, bookID int64, hrefs []string, cleanPath string) ([]response, error) {
-	book, err := h.getAddressBook(ctx, bookID)
-	if err != nil {
-		return nil, err
-	}
-	return h.addressBookMultiGetReport(ctx, user, book, hrefs, cleanPath, nil, nil)
 }
 
 func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.User, book *store.AddressBook, hrefs []string, cleanPath string, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
@@ -217,7 +211,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	}
 
 	responses := []response{
-		addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, fmt.Sprintf("%d", book.CTag)),
+		addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, strconv.FormatInt(book.CTag, 10)),
 	}
 	responses = append(responses, addressBookResourceResponses(collectionHref, contacts)...)
 

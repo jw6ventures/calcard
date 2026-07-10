@@ -3,7 +3,6 @@ package dav
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"path"
 	"strconv"
@@ -94,7 +93,7 @@ func (h *DavServer) Mkcol(w http.ResponseWriter, r *http.Request) {
 		location := path.Join("/dav/addressbooks", fmt.Sprint(created.ID)) + "/"
 		if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
 			if deleteErr := h.store.AddressBooks.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
-				log.Printf("failed to roll back address book %d after lock rebind failure: %v", created.ID, deleteErr)
+				h.logger().Error("Mkcol", "failed to roll back address book %d after lock rebind failure: %v", created.ID, deleteErr)
 			}
 			http.Error(w, "failed to rebind collection locks", http.StatusInternalServerError)
 			return
@@ -228,7 +227,7 @@ func (h *DavServer) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 	location := path.Join("/dav/calendars", fmt.Sprint(created.ID)) + "/"
 	if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
 		if deleteErr := h.store.Calendars.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {
-			log.Printf("failed to roll back calendar %d after lock rebind failure: %v", created.ID, deleteErr)
+			h.logger().Error("Mkcalendar", "failed to roll back calendar %d after lock rebind failure: %v", created.ID, deleteErr)
 		}
 		http.Error(w, "failed to rebind collection locks", http.StatusInternalServerError)
 		return

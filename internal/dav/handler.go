@@ -5,6 +5,7 @@ import (
 )
 
 var errInvalidSyncToken = errors.New("invalid sync token")
+var errUnsupportedReport = errors.New("unsupported report")
 var errInvalidPath = errors.New("invalid path")
 var errAmbiguousCalendar = errors.New("ambiguous calendar path")
 var errAmbiguousAddressBook = errors.New("ambiguous address book path")

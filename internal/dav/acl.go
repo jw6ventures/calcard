@@ -14,8 +14,6 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-var allPrivileges = []string{"read", "write", "write-content", "write-properties", "read-acl", "write-acl", "bind", "unbind"}
-
 func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return

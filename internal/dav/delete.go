@@ -50,7 +50,7 @@ func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(err, errForbidden) {
 				status = http.StatusForbidden
 			}
-			http.Error(w, "not found", status)
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		if !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
@@ -101,7 +101,7 @@ func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
 			if err == store.ErrNotFound {
 				status = http.StatusNotFound
 			}
-			http.Error(w, "not found", status)
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		existing, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)

@@ -40,6 +40,20 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 	return destPath, overwrite, nil
 }
 
+// writeSourceResolutionError maps COPY/MOVE source-path resolution failures to
+// the same statuses PUT/DELETE/GET use, instead of flattening them all to 404.
+func writeSourceResolutionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "source not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, "failed to resolve source", http.StatusInternalServerError)
+}
+
 func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 	if h.handleRegisteredMethod(w, r) {
 		return
@@ -68,7 +82,7 @@ func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 
 	// Handle calendar event copy
 	if srcCalID, srcUID, srcMatched, err := h.parseCalendarResourcePath(r.Context(), user, srcPath); err != nil {
-		http.Error(w, "source not found", http.StatusNotFound)
+		writeSourceResolutionError(w, err)
 		return
 	} else if srcMatched && srcUID != "" {
 		h.copyCalendarEvent(w, r, user, srcCalID, srcUID, destPath, overwrite)
@@ -77,7 +91,7 @@ func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 
 	// Handle contact copy
 	if srcBookID, srcUID, srcMatched, err := h.parseAddressBookResourcePath(r.Context(), user, srcPath); err != nil {
-		http.Error(w, "source not found", http.StatusNotFound)
+		writeSourceResolutionError(w, err)
 		return
 	} else if srcMatched && srcUID != "" {
 		h.copyContact(w, r, user, srcBookID, srcUID, destPath, overwrite)
@@ -339,7 +353,7 @@ func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
 
 	// Handle calendar event move
 	if srcCalID, srcUID, srcMatched, err := h.parseCalendarResourcePath(r.Context(), user, srcPath); err != nil {
-		http.Error(w, "source not found", http.StatusNotFound)
+		writeSourceResolutionError(w, err)
 		return
 	} else if srcMatched && srcUID != "" {
 		h.moveCalendarEvent(w, r, user, srcCalID, srcUID, destPath, overwrite)
@@ -348,7 +362,7 @@ func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
 
 	// Handle contact move
 	if srcBookID, srcUID, srcMatched, err := h.parseAddressBookResourcePath(r.Context(), user, srcPath); err != nil {
-		http.Error(w, "source not found", http.StatusNotFound)
+		writeSourceResolutionError(w, err)
 		return
 	} else if srcMatched && srcUID != "" {
 		h.moveContact(w, r, user, srcBookID, srcUID, destPath, overwrite)

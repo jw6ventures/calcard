@@ -49,6 +49,17 @@ func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...stri
 	_, _ = fmt.Fprint(w, buildCalDAVErrorXML(conditions))
 }
 
+// writeDAVError writes a DAV:-namespace precondition error body (RFC 4918 §16),
+// e.g. DAV:supported-report or DAV:propfind-finite-depth.
+func writeDAVError(w http.ResponseWriter, status int, condition string) {
+	if !isValidCalDAVCondition(condition) {
+		condition = "invalid-condition"
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:"><D:%s/></D:error>`, condition)
+}
+
 func buildCalDAVErrorXML(conditions []string) string {
 	var builder strings.Builder
 	builder.WriteString(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">`)

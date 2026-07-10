@@ -133,7 +133,8 @@ func (h *DavServer) Get(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if errors.Is(err, errForbidden) {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				// Non-disclosure: an unreadable resource looks like a missing one
+				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
 			http.Error(w, "failed to load address book", http.StatusInternalServerError)
@@ -143,8 +144,7 @@ func (h *DavServer) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("DAV", h.davHeaderForPath(cleanPath))
-	w.WriteHeader(http.StatusOK)
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {

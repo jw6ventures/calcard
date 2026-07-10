@@ -27,9 +27,9 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
 	default:
-		// Fallback: return all events to keep clients moving even if they send unsupported report types.
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, nil, calData)
-		return res, "", err
+		// RFC 3253 §3.6: unknown report types must be refused, not answered
+		// with a full dump of the collection.
+		return nil, "", errUnsupportedReport
 	}
 }
 
@@ -1920,7 +1920,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	}
 
 	responses := []response{
-		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, fmt.Sprintf("%d", cal.CTag), cal.EffectivePrivileges()),
+		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
 	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 

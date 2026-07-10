@@ -829,6 +829,52 @@ func TestContactRepoMoveToAddressBookOverwriteWithinSameBookDeletesDestination(t
 	}
 }
 
+func TestEventRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-1\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR"
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+ON CONFLICT (calendar_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_ical = EXCLUDED.raw_ical,
+        etag = EXCLUDED.etag,
+        summary = EXCLUDED.summary,
+        description = EXCLUDED.description,
+        location = EXCLUDED.location,
+        dtstart = EXCLUDED.dtstart,
+        dtend = EXCLUDED.dtend,
+        all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
+        last_modified = NOW()
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
+`)).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "events_calendar_resource_name_unique"})
+
+	_, err = repo.Upsert(context.Background(), Event{
+		CalendarID:   7,
+		UID:          "ev-1",
+		ResourceName: "renamed",
+		RawICAL:      rawICAL,
+		ETag:         "etag-1",
+	})
+	if err != ErrConflict {
+		t.Fatalf("Upsert() error = %v, want ErrConflict", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestContactRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

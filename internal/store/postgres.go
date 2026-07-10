@@ -456,6 +456,9 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, descript
 	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, description, location, dtstart, dtend, allDay, recurrenceStart, recurrenceUntil)
 	ev, err := scanEvent(row.Scan)
 	if err != nil {
+		if isEventResourceNameConflict(err) {
+			return nil, ErrConflict
+		}
 		return nil, err
 	}
 	return &ev, nil
@@ -890,6 +893,11 @@ func isAddressBookNameConflict(err error) bool {
 func isContactResourceNameConflict(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "idx_contacts_resource_name"
+}
+
+func isEventResourceNameConflict(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "events_calendar_resource_name_unique"
 }
 
 func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]AddressBook, error) {

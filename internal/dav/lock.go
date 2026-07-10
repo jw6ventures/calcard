@@ -24,9 +24,7 @@ const (
 func generateLockToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		if _, err = rand.Read(b); err != nil {
-			return "", fmt.Errorf("generate lock token: %w", err)
-		}
+		return "", fmt.Errorf("generate lock token: %w", err)
 	}
 	return fmt.Sprintf("opaquelocktoken:%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
@@ -741,22 +739,6 @@ func (h *DavServer) requireLocks(w http.ResponseWriter, r *http.Request, lockedM
 		return false
 	}
 	return true
-}
-
-func lockCoversPath(lockPath, depth, requestPath string) bool {
-	lockPath = normalizeDAVResourceIdentity(lockPath)
-	requestPath = normalizeDAVResourceIdentity(requestPath)
-	if lockPath == requestPath {
-		return true
-	}
-	if depth != "infinity" {
-		return false
-	}
-	lockPath = strings.TrimSuffix(lockPath, "/")
-	if lockPath == "" {
-		return false
-	}
-	return strings.HasPrefix(requestPath, lockPath+"/")
 }
 
 func sameLockRoot(lockPath, requestPath string) bool {

@@ -16,13 +16,26 @@ func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request) {
 	}
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	if depth == "" {
-		depth = "1"
+		// RFC 4918 §9.1: a missing Depth header means Depth: infinity.
+		depth = "infinity"
 	}
 	h.logger().Trace("Propfind", "PROPFIND %s depth=%s", r.URL.Path, depth)
 
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
+		return
+	}
+
+	switch depth {
+	case "0", "1":
+	case "infinity":
+		// RFC 4918 §9.1.1: servers may refuse infinite-depth PROPFIND, but
+		// must say so instead of silently degrading the depth.
+		writeDAVError(w, http.StatusForbidden, "propfind-finite-depth")
+		return
+	default:
+		http.Error(w, "invalid Depth header", http.StatusBadRequest)
 		return
 	}
 
@@ -38,7 +51,10 @@ func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := safeUnmarshalXML(body, &propfindReq); err != nil {
-			propfindReq.AllProp = &struct{}{}
+			// RFC 4918 §9.1: a request body that is not valid XML is a 400,
+			// not an implicit allprop.
+			http.Error(w, "invalid PROPFIND body", http.StatusBadRequest)
+			return
 		}
 	} else {
 		propfindReq.AllProp = &struct{}{}

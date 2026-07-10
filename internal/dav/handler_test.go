@@ -378,8 +378,8 @@ func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
 	if dav := res.Header.Get("DAV"); dav != "1, 2, 3, access-control, calendar-access, addressbook" {
 		t.Fatalf("DAV header = %q", dav)
 	}
-	if patch := res.Header.Get("Accept-Patch"); patch != "application/xml" {
-		t.Fatalf("Accept-Patch header = %q", patch)
+	if patch := res.Header.Get("Accept-Patch"); patch != "" {
+		t.Fatalf("Accept-Patch must not be advertised while PATCH is unimplemented, got %q", patch)
 	}
 }
 
@@ -417,35 +417,19 @@ func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
 	}
 }
 
-func TestGetAdvertisesCurrentDAVCapabilities(t *testing.T) {
+func TestGetRootReturnsNotFound(t *testing.T) {
+	// GET has no defined body for collections; capability discovery belongs
+	// to OPTIONS. A 200 with an empty body confuses client probes.
 	h := &DavServer{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dav", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 
-	t.Run("positive root request advertises current capabilities", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
-		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	h.Get(rr, req)
 
-		h.Get(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rr.Code)
-		}
-		if got := rr.Header().Get("DAV"); got != "1, 2, 3, access-control, calendar-access, addressbook" {
-			t.Fatalf("GET DAV header = %q", got)
-		}
-	})
-
-	t.Run("negative root request does not advertise collection-only extensions", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
-		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
-
-		h.Get(rr, req)
-
-		if got := rr.Header().Get("DAV"); strings.Contains(got, "extended-mkcol") {
-			t.Fatalf("GET DAV header should not include extended-mkcol, got %q", got)
-		}
-	})
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rr.Code)
+	}
 }
 
 func TestSupportsCopyMove(t *testing.T) {
@@ -819,7 +803,7 @@ func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
 	}
 }
 
-func TestCalendarReportFallsBackToQueryForUnknownType(t *testing.T) {
+func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "e"},
@@ -830,18 +814,15 @@ func TestCalendarReportFallsBackToQueryForUnknownType(t *testing.T) {
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
 	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", report)
-	if err != nil {
-		t.Fatalf("calendarReportResponses returned error: %v", err)
+	if !errors.Is(err, errUnsupportedReport) {
+		t.Fatalf("calendarReportResponses error = %v, want errUnsupportedReport", err)
 	}
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
-	}
-	if responses[0].Propstat[0].Prop.GetContentType != "text/calendar; charset=utf-8" {
-		t.Fatalf("unexpected content type %q", responses[0].Propstat[0].Prop.GetContentType)
+	if len(responses) != 0 {
+		t.Fatalf("unknown report must not return data, got %d responses", len(responses))
 	}
 }
 
-func TestAddressBookReportFallsBackToQueryForUnknownType(t *testing.T) {
+func TestAddressBookReportUnknownTypeIsRefused(t *testing.T) {
 	contactRepo := &fakeContactRepo{
 		contacts: map[string]*store.Contact{
 			"4:alice": {AddressBookID: 4, UID: "alice", RawVCard: "VCARD", ETag: "e"},
@@ -853,14 +834,11 @@ func TestAddressBookReportFallsBackToQueryForUnknownType(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, nil)
-	if err != nil {
-		t.Fatalf("addressBookReportResponses returned error: %v", err)
+	if !errors.Is(err, errUnsupportedReport) {
+		t.Fatalf("addressBookReportResponses error = %v, want errUnsupportedReport", err)
 	}
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
-	}
-	if responses[0].Propstat[0].Prop.GetContentType != "text/vcard; charset=utf-8" {
-		t.Fatalf("unexpected content type %q", responses[0].Propstat[0].Prop.GetContentType)
+	if len(responses) != 0 {
+		t.Fatalf("unknown report must not return data, got %d responses", len(responses))
 	}
 }
 
@@ -1515,9 +1493,10 @@ func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 	}}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/keep.vcf", "/dav/addressbooks/3/skip.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
+	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil)
 	if err != nil {
-		t.Fatalf("addressBookMultiGet returned error: %v", err)
+		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
@@ -1544,9 +1523,10 @@ func TestAddressBookMultiGetMissingReturns404(t *testing.T) {
 	}}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/present.vcf", "/dav/addressbooks/2/missing.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
+	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil)
 	if err != nil {
-		t.Fatalf("addressBookMultiGet returned error: %v", err)
+		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
@@ -1740,6 +1720,7 @@ func TestPropfindRejectsAmbiguousCalendarSlug(t *testing.T) {
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/work/", nil)
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -2029,6 +2010,7 @@ func TestPropfindRequiresUser(t *testing.T) {
 func TestPropfindUnsupportedPathReturnsNotFound(t *testing.T) {
 	h := &DavServer{}
 	req := httptest.NewRequest("PROPFIND", "/invalid", nil)
+	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, req)
@@ -3960,8 +3942,8 @@ func TestGetRejectsCanonicalResourceACLAcrossExtensions(t *testing.T) {
 
 	h.Get(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected canonical ACL check to reject GET with 403, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected canonical ACL check to reject GET with non-disclosing 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -4246,29 +4228,6 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 			t.Fatalf("expected lock-root UNLOCK to succeed, got %d: %s", unlockRR.Code, unlockRR.Body.String())
 		}
 	})
-}
-
-func TestLockCoversPath(t *testing.T) {
-	tests := []struct {
-		name        string
-		lockPath    string
-		depth       string
-		requestPath string
-		want        bool
-	}{
-		{name: "exact match", lockPath: "/dav/addressbooks/5/alice", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
-		{name: "descendant covered by infinity", lockPath: "/dav/addressbooks/5", depth: "infinity", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
-		{name: "descendant not covered by depth zero", lockPath: "/dav/addressbooks/5", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: false},
-		{name: "sibling not covered", lockPath: "/dav/addressbooks/5/alice", depth: "infinity", requestPath: "/dav/addressbooks/5/bob.vcf", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := lockCoversPath(tc.lockPath, tc.depth, tc.requestPath); got != tc.want {
-				t.Fatalf("lockCoversPath(%q, %q, %q) = %t, want %t", tc.lockPath, tc.depth, tc.requestPath, got, tc.want)
-			}
-		})
-	}
 }
 
 func TestACLNormalizesPrincipalHrefWithoutTrailingSlash(t *testing.T) {
@@ -7478,6 +7437,7 @@ type fakeEventRepo struct {
 	deleted                  []string
 	copyErr                  error
 	moveErr                  error
+	upsertErr                error
 	getByUIDErr              error
 	getByUIDErrKey           string
 	getByResourceNameErr     error
@@ -7491,6 +7451,9 @@ func (f *fakeEventRepo) key(calendarID int64, uid string) string {
 }
 
 func (f *fakeEventRepo) Upsert(ctx context.Context, event store.Event) (*store.Event, error) {
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
 	if f.events == nil {
 		f.events = map[string]*store.Event{}
 	}

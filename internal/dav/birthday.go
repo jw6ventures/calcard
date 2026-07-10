@@ -33,18 +33,9 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		// Generate UID for this birthday event (based on contact UID to be stable)
 		uid := fmt.Sprintf("birthday-%s@calcard", c.UID)
 
-		var summaryAge string
-		if c.Birthday.Year() > 1900 {
-			birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
-			var ageAtNextBirthday int
-			if birthdayThisYear.After(now) {
-				ageAtNextBirthday = currentYear - c.Birthday.Year()
-			} else {
-				ageAtNextBirthday = (currentYear + 1) - c.Birthday.Year()
-			}
-			summaryAge = fmt.Sprintf(" (turning %d)", ageAtNextBirthday)
-		}
-		summary := fmt.Sprintf("🎂 %s's Birthday%s", displayName, summaryAge)
+		// No age in the summary: the event recurs yearly, so a baked-in
+		// "(turning N)" would be wrong every year after the first.
+		summary := fmt.Sprintf("🎂 %s's Birthday", displayName)
 
 		startYear := currentYear
 		birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
@@ -62,7 +53,14 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		sb.WriteString("PRODID:-//CalCard//Birthdays//EN\r\n")
 		sb.WriteString("BEGIN:VEVENT\r\n")
 		sb.WriteString(fmt.Sprintf("UID:%s\r\n", uid))
-		sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", time.Now().UTC().Format("20060102T150405Z")))
+		// DTSTAMP derives from the contact so the generated iCal (and its
+		// ETag) stays stable across requests; time.Now() here would force
+		// clients to re-download every birthday on every sync.
+		dtstamp := c.LastModified.UTC()
+		if c.LastModified.IsZero() {
+			dtstamp = time.Unix(0, 0).UTC()
+		}
+		sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", dtstamp.Format("20060102T150405Z")))
 		sb.WriteString(fmt.Sprintf("DTSTART;VALUE=DATE:%s\r\n", dtstartStr))
 		sb.WriteString(fmt.Sprintf("SUMMARY:%s\r\n", escapeICalText(summary)))
 		sb.WriteString("RRULE:FREQ=YEARLY\r\n")  // Recurring yearly
@@ -149,8 +147,9 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
 		return responses, syncToken, nil
 	default:
-		// Fallback: return all events
-		return calendarResourceResponses(cleanPath, events), "", nil
+		// RFC 3253 §3.6: unknown report types must be refused, not answered
+		// with a full dump of the collection.
+		return nil, "", errUnsupportedReport
 	}
 }
 

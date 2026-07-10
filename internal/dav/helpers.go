@@ -1,7 +1,7 @@
 package dav
 
 import (
-	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -40,11 +40,11 @@ func calendarCollectionResponse(href, name string, description, timezone, color 
 	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
 	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet(readOnly)
 
-	p.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.MaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
 	p.MinDateTime = caldavMinDateTime
 	p.MaxDateTime = caldavMaxDateTime
-	p.MaxInstances = fmt.Sprintf("%d", caldavMaxInstances)
-	p.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
+	p.MaxInstances = strconv.Itoa(caldavMaxInstances)
+	p.MaxAttendeesPerInstance = strconv.Itoa(caldavMaxAttendees)
 
 	if readOnly {
 		p.CalendarServerReadOnly = &struct{}{}
@@ -78,11 +78,11 @@ func calendarCollectionResponseWithPrivileges(href, name string, description, ti
 	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
 	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSetForCalendar(privileges)
 
-	p.MaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.MaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
 	p.MinDateTime = caldavMinDateTime
 	p.MaxDateTime = caldavMaxDateTime
-	p.MaxInstances = fmt.Sprintf("%d", caldavMaxInstances)
-	p.MaxAttendeesPerInstance = fmt.Sprintf("%d", caldavMaxAttendees)
+	p.MaxInstances = strconv.Itoa(caldavMaxInstances)
+	p.MaxAttendeesPerInstance = strconv.Itoa(caldavMaxAttendees)
 
 	if !privileges.AllowsAnyWrite() {
 		p.CalendarServerReadOnly = &struct{}{}
@@ -107,7 +107,7 @@ func addressBookCollectionResponse(href, name string, description *string, princ
 		p.AddressBookDesc = *description
 	}
 	p.SupportedAddressData = supportedAddressDataProp()
-	p.AddressBookMaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+	p.AddressBookMaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
 	p.SupportedCollationSet = supportedCollationSetProp()
 	return resp
 }

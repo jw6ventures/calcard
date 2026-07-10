@@ -30,12 +30,7 @@ func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger().Trace("Options", "OPTIONS %s", cleanPath)
 	w.Header().Set("Allow", h.allowHeaderForPath(cleanPath))
-	davHeader := h.davHeaderForPath("")
-	if r != nil {
-		davHeader = h.davHeaderForPath(path.Clean(r.URL.Path))
-	}
-	w.Header().Set("DAV", davHeader)
-	w.Header().Set("Accept-Patch", "application/xml")
+	w.Header().Set("DAV", h.davHeaderForPath(cleanPath))
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -176,6 +177,10 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 
 			responses, syncToken, err := h.birthdayCalendarReportResponses(r.Context(), user, h.principalURL(user), cleanPath, report)
 			if err != nil {
+				if errors.Is(err, errUnsupportedReport) {
+					writeDAVError(w, http.StatusForbidden, "supported-report")
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -216,7 +221,7 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 		if report.XMLName.Local == "expand-property" {
 			principalHref := h.principalURL(user)
 			href := ensureCollectionHref(canonicalPath)
-			ctag := fmt.Sprintf("%d", cal.CTag)
+			ctag := strconv.FormatInt(cal.CTag, 10)
 			syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 			responses := []response{
 				calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges()),
@@ -253,7 +258,9 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 		}
 		responses, syncToken, err := h.calendarReportResponses(r.Context(), user, cal, h.principalURL(user), cleanPath, canonicalPath, report)
 		if err != nil {
-			if errors.Is(err, errInvalidSyncToken) {
+			if errors.Is(err, errUnsupportedReport) {
+				writeDAVError(w, http.StatusForbidden, "supported-report")
+			} else if errors.Is(err, errInvalidSyncToken) {
 				http.Error(w, "invalid sync token", http.StatusForbidden)
 			} else {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -390,7 +397,9 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 		}
 		responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, expandReq)
 		if err != nil {
-			if errors.Is(err, errInvalidSyncToken) {
+			if errors.Is(err, errUnsupportedReport) {
+				writeDAVError(w, http.StatusForbidden, "supported-report")
+			} else if errors.Is(err, errInvalidSyncToken) {
 				http.Error(w, "invalid sync token", http.StatusForbidden)
 			} else {
 				http.Error(w, err.Error(), http.StatusInternalServerError)

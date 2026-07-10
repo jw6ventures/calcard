@@ -235,15 +235,12 @@ func (h *DavServer) calendarAccessForPath(ctx context.Context, user *store.User,
 		{name: "bind", set: func() { privileges.Bind = true }},
 		{name: "unbind", set: func() { privileges.Unbind = true }},
 	} {
-		allowed, denied, err := h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, candidate.name)
+		allowed, _, err := h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, candidate.name)
 		if err != nil {
 			return nil, err
 		}
 		if allowed {
 			candidate.set()
-		}
-		if denied {
-			continue
 		}
 	}
 	privileges = privileges.Normalized()

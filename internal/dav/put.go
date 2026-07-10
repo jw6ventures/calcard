@@ -13,64 +13,68 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// checkConditionalHeaders validates If-Match and If-None-Match headers for events
-func (h *DavServer) checkConditionalHeaders(r *http.Request, existing *store.Event) bool {
-	ifMatch := r.Header.Get("If-Match")
-	ifNoneMatch := r.Header.Get("If-None-Match")
-
-	// If-None-Match: * means "only create if doesn't exist"
-	if ifNoneMatch == "*" {
-		return existing == nil
-	}
-
-	// If-Match requires the resource to exist and match the given ETag
-	if ifMatch != "" {
-		if existing == nil {
+// checkConditional validates If-Match and If-None-Match headers per RFC 7232.
+func checkConditional(r *http.Request, etag string, exists bool) bool {
+	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
+		if !exists || !etagListMatches(ifMatch, etag) {
 			return false
 		}
-		requestETag := strings.Trim(ifMatch, "\"")
-		return requestETag == existing.ETag
 	}
+	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
+		if exists && etagListMatches(ifNoneMatch, etag) {
+			return false
+		}
+	}
+	return true
+}
 
-	// If-None-Match with specific ETag means "only update if ETag doesn't match"
-	if ifNoneMatch != "" {
-		if existing == nil {
+// etagListMatches reports whether any entity-tag in a comma-separated
+// If-Match/If-None-Match value matches etag. "*" matches any existing
+// resource. Weak validators (W/"...") compare by their opaque tag because
+// stored ETags are strong content hashes that clients may echo back weakened.
+func etagListMatches(headerValue, etag string) bool {
+	if headerValue == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(headerValue, ",") {
+		candidate = strings.TrimSpace(candidate)
+		candidate = strings.TrimPrefix(candidate, "W/")
+		candidate = strings.Trim(candidate, "\"")
+		if candidate != "" && candidate == etag {
 			return true
 		}
-		requestETag := strings.Trim(ifNoneMatch, "\"")
-		return requestETag != existing.ETag
 	}
+	return false
+}
 
-	// No conditional headers, allow the request
-	return true
+// checkConditionalHeaders validates If-Match and If-None-Match headers for events
+func (h *DavServer) checkConditionalHeaders(r *http.Request, existing *store.Event) bool {
+	etag := ""
+	if existing != nil {
+		etag = existing.ETag
+	}
+	return checkConditional(r, etag, existing != nil)
 }
 
 // checkConditionalHeadersContact validates If-Match and If-None-Match headers for contacts
 func (h *DavServer) checkConditionalHeadersContact(r *http.Request, existing *store.Contact) bool {
-	ifMatch := r.Header.Get("If-Match")
-	ifNoneMatch := r.Header.Get("If-None-Match")
-
-	if ifNoneMatch == "*" {
-		return existing == nil
+	etag := ""
+	if existing != nil {
+		etag = existing.ETag
 	}
+	return checkConditional(r, etag, existing != nil)
+}
 
-	if ifMatch != "" {
-		if existing == nil {
-			return false
-		}
-		requestETag := strings.Trim(ifMatch, "\"")
-		return requestETag == existing.ETag
-	}
-
-	if ifNoneMatch != "" {
-		if existing == nil {
-			return true
-		}
-		requestETag := strings.Trim(ifNoneMatch, "\"")
-		return requestETag != existing.ETag
-	}
-
-	return true
+var allowedCalendarComponents = map[string]struct{}{
+	"VCALENDAR": {},
+	"VEVENT":    {},
+	"VTODO":     {},
+	"VJOURNAL":  {},
+	"VFREEBUSY": {},
+	"VTIMEZONE": {},
+	"STANDARD":  {},
+	"DAYLIGHT":  {},
+	"VALARM":    {},
 }
 
 func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +132,7 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	etag := fmt.Sprintf("%x", sha256.Sum256(body))
+	bodyText := string(body)
 
 	if calendarID, resourceUID, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
 		if err == store.ErrNotFound {
@@ -178,25 +183,14 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := h.validateICalendar(string(body)); err != nil {
+		if err := h.validateICalendar(bodyText); err != nil {
 			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
 			return
 		}
 
-		componentTypes := extractICalComponentTypes(string(body))
-		allowedComponents := map[string]struct{}{
-			"VCALENDAR": {},
-			"VEVENT":    {},
-			"VTODO":     {},
-			"VJOURNAL":  {},
-			"VFREEBUSY": {},
-			"VTIMEZONE": {},
-			"STANDARD":  {},
-			"DAYLIGHT":  {},
-			"VALARM":    {},
-		}
+		componentTypes := extractICalComponentTypes(bodyText)
 		for comp := range componentTypes {
-			if _, ok := allowedComponents[comp]; !ok {
+			if _, ok := allowedCalendarComponents[comp]; !ok {
 				writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
 				return
 			}
@@ -210,13 +204,13 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if containsICalMethodProperty(string(body)) {
+		if containsICalMethodProperty(bodyText) {
 			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
 			return
 		}
 
-		if conditions := validateCalendarObjectResource(string(body)); len(conditions) > 0 {
-			if hasMultipleDifferentUIDs(string(body)) {
+		if conditions := validateCalendarObjectResource(bodyText); len(conditions) > 0 {
+			if hasMultipleDifferentUIDs(bodyText) {
 				writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
 				return
 			}
@@ -225,7 +219,7 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 		}
 
 		minDate, maxDate := caldavDateLimits()
-		for _, t := range extractICalDateTimes(string(body)) {
+		for _, t := range extractICalDateTimes(bodyText) {
 			if t.Before(minDate) {
 				writeCalDAVError(w, http.StatusForbidden, "min-date-time")
 				return
@@ -236,11 +230,11 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if attendeeCount := countICalAttendees(string(body)); attendeeCount > caldavMaxAttendees {
+		if attendeeCount := countICalAttendees(bodyText); attendeeCount > caldavMaxAttendees {
 			writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
 			return
 		}
-		if count, ok := extractICalRRULECount(string(body)); ok && count > caldavMaxInstances {
+		if count, ok := extractICalRRULECount(bodyText); ok && count > caldavMaxInstances {
 			writeCalDAVError(w, http.StatusForbidden, "max-instances")
 			return
 		}
@@ -250,21 +244,12 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		uid, err := extractUIDFromICalendar(string(body))
+		uid, err := extractUIDFromICalendar(bodyText)
 		if err != nil {
 			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
 			return
 		}
 		resourceName := resourceUID
-		if resourceName == "" {
-			resourceName = uid
-		}
-
-		existingByResource, err = h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
-		}
 		if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
 			return
 		}
@@ -305,7 +290,11 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: string(body), ETag: etag}); err != nil {
+		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag}); err != nil {
+			if errors.Is(err, store.ErrConflict) {
+				writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+				return
+			}
 			h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
 			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
@@ -349,12 +338,12 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := h.validateVCard(string(body)); err != nil {
+		if err := h.validateVCard(bodyText); err != nil {
 			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
 			return
 		}
 
-		uid, err := extractUIDFromVCard(string(body))
+		uid, err := extractUIDFromVCard(bodyText)
 		if err != nil {
 			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
 			return
@@ -431,7 +420,7 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: string(body), ETag: etag}); err != nil {
+		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: bodyText, ETag: etag}); err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				writeCardDAVUIDConflict(w, cleanPath)
 				return

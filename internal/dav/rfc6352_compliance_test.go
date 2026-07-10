@@ -524,8 +524,8 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 
 		h.Get(rr, req)
 
-		if rr.Code != http.StatusForbidden {
-			t.Fatalf("RFC 6352 Sections 3 and 7: deny ACEs must be enforced by GET handlers, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("RFC 6352 Sections 3 and 7: deny ACEs must be enforced by GET handlers with a non-disclosing 404, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 

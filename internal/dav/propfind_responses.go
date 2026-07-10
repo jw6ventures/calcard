@@ -211,7 +211,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 			// Add regular calendars
 			for _, c := range cals {
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
-				ctag := fmt.Sprintf("%d", c.CTag)
+				ctag := strconv.FormatInt(c.CTag, 10)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
 				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges()))
 			}
@@ -285,7 +285,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	}
 
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
-	ctag := fmt.Sprintf("%d", cal.CTag)
+	ctag := strconv.FormatInt(cal.CTag, 10)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
 	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
@@ -339,7 +339,7 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 			principalHref := h.principalURL(user)
 			for _, b := range books {
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
-				ctag := fmt.Sprintf("%d", b.CTag)
+				ctag := strconv.FormatInt(b.CTag, 10)
 				syncToken := buildSyncToken("card", b.ID, b.UpdatedAt)
 				res = append(res, addressBookCollectionResponse(href, b.Name, b.Description, principalHref, syncToken, ctag))
 			}
@@ -385,7 +385,7 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 		return []response{resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard, true))}, nil
 	}
 	href := collectionHref
-	ctag := fmt.Sprintf("%d", book.CTag)
+	ctag := strconv.FormatInt(book.CTag, 10)
 	syncToken := buildSyncToken("card", book.ID, book.UpdatedAt)
 	principalHref := h.principalURL(user)
 	res := []response{addressBookCollectionResponse(href, book.Name, book.Description, principalHref, syncToken, ctag)}

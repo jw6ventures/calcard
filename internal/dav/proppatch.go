@@ -5,7 +5,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"path"
 	"strconv"
@@ -176,7 +175,7 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cle
 
 		err := h.store.Calendars.UpdateProperties(ctx, calID, updateName, updateDescription, updateTimezone, updateColor)
 		if err != nil {
-			log.Printf("failed to update calendar properties for calendar %d: %v", calID, err)
+			h.logger().Error("Proppatch", "failed to update calendar properties for calendar %d: %v", calID, err)
 			return []response{{
 				Href: cleanPath,
 				Propstat: []propstat{{
@@ -262,7 +261,7 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 			hasProtected = true
 		}
 		if req.Set.Prop.AddressBookMaxResourceSize != nil {
-			protectedProp.AddressBookMaxResourceSize = fmt.Sprintf("%d", maxDAVBodyBytes)
+			protectedProp.AddressBookMaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
 			hasProtected = true
 		}
 		if req.Set.Prop.SupportedCollationSet != nil {
@@ -309,7 +308,7 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 			if errors.Is(err, store.ErrConflict) {
 				status = httpStatusConflict
 			}
-			log.Printf("failed to update address book properties for book %d: %v", bookID, err)
+			h.logger().Error("Proppatch", "failed to update address book properties for book %d: %v", bookID, err)
 			return []response{{
 				Href: cleanPath,
 				Propstat: []propstat{{
