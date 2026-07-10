@@ -97,6 +97,19 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, bookID int64, r
 	}
 	return nil, nil
 }
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, bookID int64, resourceNames []string) ([]store.Contact, error) {
+	var out []store.Contact
+	for _, name := range resourceNames {
+		c, err := f.GetByResourceName(ctx, bookID, name)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
 func (f *fakeContactRepo) ListForBook(ctx context.Context, bookID int64) ([]store.Contact, error) {
 	var out []store.Contact
 	for _, c := range f.contacts {

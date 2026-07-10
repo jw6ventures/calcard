@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"sync"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -17,6 +18,30 @@ import (
 // store.Locks.ListByResources would have returned for that resource.
 type lockBatchIndex struct {
 	byPath map[string][]store.Lock
+
+	mu    sync.Mutex
+	stale bool
+}
+
+func (idx *lockBatchIndex) markStale() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.stale = true
+}
+
+func (idx *lockBatchIndex) isStale() bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.stale
+}
+
+// markLockBatchIndexStale flags the request's prefetched lock index, if any, so
+// later lock checks in the same request query the store directly. Any code path
+// that writes lock rows must call it.
+func markLockBatchIndexStale(ctx context.Context) {
+	if idx := lockBatchIndexFromContext(ctx); idx != nil {
+		idx.markStale()
+	}
 }
 
 type lockBatchIndexKeyType struct{}

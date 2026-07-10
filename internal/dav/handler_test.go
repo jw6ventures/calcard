@@ -7443,6 +7443,7 @@ type fakeEventRepo struct {
 	getByResourceNameErr     error
 	getByResourceNameKey     string
 	resourceLookupCount      int
+	batchResourceLookupCount int
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -7501,6 +7502,28 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 		}
 	}
 	return nil, nil
+}
+
+func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	f.batchResourceLookupCount++
+	wanted := make(map[string]struct{}, len(resourceNames))
+	for _, name := range resourceNames {
+		wanted[name] = struct{}{}
+	}
+	var result []store.Event
+	for _, ev := range f.events {
+		if ev.CalendarID != calendarID {
+			continue
+		}
+		name := ev.ResourceName
+		if name == "" {
+			name = ev.UID
+		}
+		if _, ok := wanted[name]; ok {
+			result = append(result, *ev)
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
@@ -7639,6 +7662,10 @@ func (e *errorEventRepo) GetByResourceName(ctx context.Context, calendarID int64
 	return nil, errors.New("fail")
 }
 
+func (e *errorEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	return nil, errors.New("fail")
+}
+
 func (e *errorEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	return nil, errors.New("fail")
 }
@@ -7686,6 +7713,7 @@ type fakeContactRepo struct {
 	getByResourceNameErr     error
 	getByResourceNameErrKey  string
 	resourceLookupCount      int
+	batchResourceLookupCount int
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -7831,6 +7859,28 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 		}
 	}
 	return nil, nil
+}
+
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]store.Contact, error) {
+	f.batchResourceLookupCount++
+	wanted := make(map[string]struct{}, len(resourceNames))
+	for _, name := range resourceNames {
+		wanted[name] = struct{}{}
+	}
+	var result []store.Contact
+	for _, c := range f.contacts {
+		if c.AddressBookID != addressBookID {
+			continue
+		}
+		name := c.ResourceName
+		if name == "" {
+			name = c.UID
+		}
+		if _, ok := wanted[name]; ok {
+			result = append(result, *c)
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
@@ -10071,5 +10121,554 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 				t.Errorf("expected error message about resource path, got %s", rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestCheckConditionalETagHandling(t *testing.T) {
+	tests := []struct {
+		name        string
+		ifMatch     string
+		ifNoneMatch string
+		etag        string
+		exists      bool
+		want        bool
+	}{
+		{name: "if-match star with existing resource", ifMatch: "*", etag: "abc", exists: true, want: true},
+		{name: "if-match star without resource", ifMatch: "*", exists: false, want: false},
+		{name: "if-match list with match", ifMatch: `"other", "abc"`, etag: "abc", exists: true, want: true},
+		{name: "if-match list without match", ifMatch: `"other", "third"`, etag: "abc", exists: true, want: false},
+		{name: "if-match weak validator", ifMatch: `W/"abc"`, etag: "abc", exists: true, want: true},
+		{name: "if-none-match star with existing resource", ifNoneMatch: "*", etag: "abc", exists: true, want: false},
+		{name: "if-none-match star without resource", ifNoneMatch: "*", exists: false, want: true},
+		{name: "if-none-match list with match", ifNoneMatch: `"x", "abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-none-match weak validator with match", ifNoneMatch: `W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-none-match list without match", ifNoneMatch: `"x"`, etag: "abc", exists: true, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/x.ics", nil)
+			if tc.ifMatch != "" {
+				req.Header.Set("If-Match", tc.ifMatch)
+			}
+			if tc.ifNoneMatch != "" {
+				req.Header.Set("If-None-Match", tc.ifNoneMatch)
+			}
+			if got := checkConditional(req, tc.etag, tc.exists); got != tc.want {
+				t.Fatalf("checkConditional(If-Match=%q, If-None-Match=%q, etag=%q, exists=%t) = %t, want %t",
+					tc.ifMatch, tc.ifNoneMatch, tc.etag, tc.exists, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPutWithIfMatchStarUpdatesExistingEvent(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", "*")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("PUT with If-Match: * against existing resource = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestReportUnknownCalendarReportReturns403(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:secret": {CalendarID: 1, UID: "secret", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unknown calendar REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "supported-report") {
+		t.Fatalf("unknown calendar REPORT body missing supported-report precondition: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "secret") {
+		t.Fatalf("unknown calendar REPORT leaked event data: %s", rr.Body.String())
+	}
+}
+
+func TestReportUnknownAddressBookReportReturns403(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		2: {ID: 2, UserID: 1, Name: "Book"},
+	}}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"2:secret": {AddressBookID: 2, UID: "secret", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:secret\r\nFN:Secret\r\nEND:VCARD\r\n", ETag: "e"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unknown address-book REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "supported-report") {
+		t.Fatalf("unknown address-book REPORT body missing supported-report precondition: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "secret") {
+		t.Fatalf("unknown address-book REPORT leaked contact data: %s", rr.Body.String())
+	}
+}
+
+func TestReportUnknownBirthdayReportReturns403(t *testing.T) {
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/-1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unknown birthday REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "supported-report") {
+		t.Fatalf("unknown birthday REPORT body missing supported-report precondition: %s", rr.Body.String())
+	}
+}
+
+func TestPropfindMalformedXMLReturns400(t *testing.T) {
+	h := &DavServer{}
+	req := httptest.NewRequest("PROPFIND", "/dav/", strings.NewReader("<not-xml"))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("PROPFIND with malformed XML = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPropfindDepthHandling(t *testing.T) {
+	disabledCfg := &config.Config{}
+	enabledCfg := &config.Config{}
+	enabledCfg.DAV.PropfindInfinityEnabled = true
+
+	tests := []struct {
+		name     string
+		cfg      *config.Config
+		depth    string
+		setDepth bool
+		want     int
+	}{
+		{name: "explicit infinity served by default", depth: "infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "missing depth means infinity", setDepth: false, want: http.StatusMultiStatus},
+		{name: "explicit infinity served when enabled", cfg: enabledCfg, depth: "infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "explicit infinity refused when disabled", cfg: disabledCfg, depth: "infinity", setDepth: true, want: http.StatusForbidden},
+		{name: "missing depth refused when disabled", cfg: disabledCfg, setDepth: false, want: http.StatusForbidden},
+		{name: "invalid depth", depth: "2", setDepth: true, want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &DavServer{cfg: tc.cfg}
+			req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+			if tc.setDepth {
+				req.Header.Set("Depth", tc.depth)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Propfind(rr, req)
+
+			if rr.Code != tc.want {
+				t.Fatalf("PROPFIND depth=%q = %d, want %d: %s", tc.depth, rr.Code, tc.want, rr.Body.String())
+			}
+			if tc.want == http.StatusForbidden && !strings.Contains(rr.Body.String(), "propfind-finite-depth") {
+				t.Fatalf("PROPFIND infinity refusal missing propfind-finite-depth precondition: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestCalendarMultiGetBatchesEventLookups(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
+			"1:event2": {CalendarID: 1, UID: "event2", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
+  <D:href>/dav/calendars/1/event1.ics</D:href>
+  <D:href>/dav/calendars/1/event2.ics</D:href>
+  <D:href>/dav/calendars/1/missing.ics</D:href>
+</C:calendar-multiget>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("calendar-multiget = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, want := range []string{"event1.ics", "event2.ics", "missing.ics", "404"} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("calendar-multiget response missing %q: %s", want, respBody)
+		}
+	}
+	if eventRepo.resourceLookupCount != 0 {
+		t.Fatalf("calendar-multiget issued %d per-href event lookups, want 0 (batched)", eventRepo.resourceLookupCount)
+	}
+	if eventRepo.batchResourceLookupCount != 1 {
+		t.Fatalf("calendar-multiget issued %d batch event lookups, want 1", eventRepo.batchResourceLookupCount)
+	}
+}
+
+func TestAddressBookMultiGetBatchesContactLookups(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nUID:alice\r\nEND:VCARD\r\n", ETag: "e1"},
+			"5:bob":   {AddressBookID: 5, UID: "bob", RawVCard: "BEGIN:VCARD\r\nUID:bob\r\nEND:VCARD\r\n", ETag: "e2"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
+  <D:prop><D:getetag/></D:prop>
+  <D:href>/dav/addressbooks/5/alice.vcf</D:href>
+  <D:href>/dav/addressbooks/5/bob.vcf</D:href>
+  <D:href>/dav/addressbooks/5/missing.vcf</D:href>
+</card:addressbook-multiget>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("addressbook-multiget = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, want := range []string{"alice.vcf", "bob.vcf", "missing.vcf", "404"} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("addressbook-multiget response missing %q: %s", want, respBody)
+		}
+	}
+	if contactRepo.resourceLookupCount != 0 {
+		t.Fatalf("addressbook-multiget issued %d per-href contact lookups, want 0 (batched)", contactRepo.resourceLookupCount)
+	}
+	if contactRepo.batchResourceLookupCount != 1 {
+		t.Fatalf("addressbook-multiget issued %d batch contact lookups, want 1", contactRepo.batchResourceLookupCount)
+	}
+}
+
+func TestCheckLocksBatchesLockQueries(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/addressbooks/5", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/5/new", nil)
+
+	allowed, err := h.checkLocks(req, "/dav/addressbooks/5/new.vcf", "/dav/addressbooks/5")
+	if err != nil {
+		t.Fatalf("checkLocks returned error: %v", err)
+	}
+	if allowed {
+		t.Fatal("checkLocks must block writes covered by an active depth-infinity lock")
+	}
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("checkLocks issued %d lock queries for 2 paths, want 1 (batched)", lockRepo.listByResourcesCalls)
+	}
+}
+
+func TestCopyMoveLockPrefetchServesLockChecks(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/calendars/2", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MOVE", "/dav/calendars/1/event.ics", nil)
+
+	req = h.prefetchCopyMoveLocks(req, "/dav/calendars/1/event.ics", "/dav/calendars/2/event.ics")
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("prefetch issued %d lock queries, want 1", lockRepo.listByResourcesCalls)
+	}
+
+	allowed, err := h.checkLock(req, "/dav/calendars/1/event.ics")
+	if err != nil {
+		t.Fatalf("checkLock returned error: %v", err)
+	}
+	if !allowed {
+		t.Fatal("unlocked source must be writable")
+	}
+	allowed, err = h.checkLock(req, "/dav/calendars/2/event.ics")
+	if err != nil {
+		t.Fatalf("checkLock returned error: %v", err)
+	}
+	if allowed {
+		t.Fatal("destination under an active depth-infinity lock must be blocked")
+	}
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("lock checks after prefetch issued %d extra queries, want 0", lockRepo.listByResourcesCalls-1)
+	}
+}
+
+func TestPropfindDepthInfinityListsCollectionsAndResources(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Contacts: contactRepo}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	req.Header.Set("Depth", "infinity")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND Depth: infinity = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "<d:href>/dav/calendars/</d:href>") {
+		t.Fatalf("infinity response missing home-set collection: %s", body)
+	}
+	if !strings.Contains(body, "<d:href>/dav/calendars/2/</d:href>") {
+		t.Fatalf("infinity response missing calendar collection: %s", body)
+	}
+	if !strings.Contains(body, "<d:href>/dav/calendars/2/event.ics</d:href>") {
+		t.Fatalf("infinity response missing event resource two levels down: %s", body)
+	}
+}
+
+func TestBirthdayEventsUseStableDTStampAndSummary(t *testing.T) {
+	lastMod := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	name := "John Doe"
+	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"1:c1": {AddressBookID: 1, UID: "c1", DisplayName: &name, Birthday: &birthday, LastModified: lastMod},
+		},
+	}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents returned error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if !strings.Contains(events[0].RawICAL, "DTSTAMP:20260102T030405Z") {
+		t.Errorf("DTSTAMP must derive from the contact's LastModified, got: %s", events[0].RawICAL)
+	}
+	if strings.Contains(events[0].RawICAL, "turning") {
+		t.Errorf("summary must not bake an age into a yearly recurring event, got: %s", events[0].RawICAL)
+	}
+
+	again, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents returned error: %v", err)
+	}
+	if again[0].ETag != events[0].ETag {
+		t.Errorf("birthday event ETag must be stable across requests: %q != %q", again[0].ETag, events[0].ETag)
+	}
+}
+
+func TestPutEventUpsertConflictReturnsNoUIDConflict(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{upsertErr: store.ErrConflict}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("PUT with store conflict = %d, want 409: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "no-uid-conflict") {
+		t.Fatalf("PUT conflict body missing no-uid-conflict precondition: %s", rr.Body.String())
+	}
+}
+
+func TestCopyMoveAmbiguousSourceCalendarReturns409(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Dup"}, Editor: true},
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Dup"}, Editor: true},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/dav/calendars/Dup/event.ics", nil)
+			req.Header.Set("Destination", "/dav/calendars/1/copy.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("%s with ambiguous source calendar = %d, want 409: %s", method, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestDeleteEventWithoutUnbindReturns403WithConsistentBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 2, Name: "Shared"}, Shared: true, Editor: false},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "DATA", ETag: "e"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1/existing", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "unbind"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/existing.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("DELETE without unbind = %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(strings.ToLower(rr.Body.String()), "not found") {
+		t.Fatalf("403 response must not carry a not-found body: %s", rr.Body.String())
+	}
+}
+
+func TestGetUnknownDavPathReturns404(t *testing.T) {
+	h := &DavServer{store: &store.Store{}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/unknown-collection", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("GET on unknown /dav path = %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutEventFetchesResourceOnce(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201: %s", rr.Code, rr.Body.String())
+	}
+	if eventRepo.resourceLookupCount != 1 {
+		t.Fatalf("PUT performed %d GetByResourceName lookups, want 1", eventRepo.resourceLookupCount)
 	}
 }

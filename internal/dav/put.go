@@ -78,6 +78,7 @@ var allowedCalendarComponents = map[string]struct{}{
 }
 
 func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}

@@ -14,6 +14,7 @@ func (h *DavServer) rebindCollectionLocks(ctx context.Context, fromPath, toPath 
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return nil
 	}
+	markLockBatchIndexStale(ctx)
 	return h.store.Locks.MoveResourcePath(ctx, fromPath, toPath)
 }
 
@@ -34,12 +35,14 @@ func (h *DavServer) moveDAVResourceState(ctx context.Context, user *store.User, 
 	}
 	movedACL := false
 	if h.store.ACLEntries != nil {
+		defer invalidateACLEntryCache(ctx)
 		if err := h.store.ACLEntries.MoveResourcePath(ctx, fromCanonical, toCanonical); err != nil {
 			return err
 		}
 		movedACL = true
 	}
 	if h.store.Locks != nil {
+		markLockBatchIndexStale(ctx)
 		if err := h.store.Locks.MoveResourcePath(ctx, fromCanonical, toCanonical); err != nil {
 			if movedACL && h.store.ACLEntries != nil {
 				if rollbackErr := h.store.ACLEntries.MoveResourcePath(ctx, toCanonical, fromCanonical); rollbackErr != nil {
@@ -64,6 +67,7 @@ func (h *DavServer) deleteDAVACLState(ctx context.Context, user *store.User, res
 	if canonicalPath == "" || h == nil || h.store == nil || h.store.ACLEntries == nil {
 		return nil
 	}
+	defer invalidateACLEntryCache(ctx)
 	for _, statePath := range davStatePaths(canonicalPath) {
 		if err := h.store.ACLEntries.Delete(ctx, statePath); err != nil {
 			return err
@@ -82,6 +86,10 @@ func (h *DavServer) deleteDAVResourceState(ctx context.Context, user *store.User
 	}
 	if h == nil || h.store == nil {
 		return nil
+	}
+	defer invalidateACLEntryCache(ctx)
+	if h.store.Locks != nil {
+		markLockBatchIndexStale(ctx)
 	}
 	for _, statePath := range davStatePaths(canonicalPath) {
 		if h.store.Locks != nil {

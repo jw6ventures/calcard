@@ -43,6 +43,14 @@ type Config struct {
 	PrometheusEnabled bool
 	TrustedProxies    []string
 
+	DAV struct {
+		// PropfindInfinityEnabled allows Depth: infinity PROPFIND requests
+		// (RFC 4918 §9.1). Enabled by default; when disabled the server
+		// refuses them with 403 DAV:propfind-finite-depth, which §9.1.1
+		// permits for deployments where deep listings are a DoS concern.
+		PropfindInfinityEnabled bool
+	}
+
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
 	// (PprofAddr). It is off by default and the listener should stay bound to
 	// loopback: the profiling handlers leak runtime internals and the
@@ -118,6 +126,7 @@ func Load() (*Config, error) {
 	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
+	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
 	cfg.PprofEnabled = getenvBool("APP_PPROF_ENABLED", false)
 	cfg.PprofAddr = getenvDefault("APP_PPROF_ADDR", "127.0.0.1:6060")
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")

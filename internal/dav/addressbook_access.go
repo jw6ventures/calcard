@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -84,32 +85,80 @@ func (h *DavServer) loadAddressBookWithPrivilege(ctx context.Context, user *stor
 	return book, nil
 }
 
-func (h *DavServer) addressBookPrivilegeDecision(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) (bool, bool, error) {
+// addressBookPrivilegeNames is every privilege an address-book access decision
+// can resolve, in DAV:acl document order.
+var addressBookPrivilegeNames = []string{"read", "write", "write-content", "write-properties", "bind", "unbind"}
+
+// addressBookPrivilegeContext mirrors calendarPrivilegeContext: one resolution
+// of canonical path, ownership, and ACL entries that several privilege
+// decisions can share. Unlike calendars there is no applicable-principal
+// fallback — a non-owner with no applicable decision is simply not allowed.
+type addressBookPrivilegeContext struct {
+	owner             bool
+	principals        map[string]struct{}
+	resourceEntries   []store.ACLEntry
+	collectionEntries []store.ACLEntry
+	sameCollection    bool
+}
+
+func (h *DavServer) addressBookPrivilegeContextFor(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string) (*addressBookPrivilegeContext, error) {
 	if book == nil {
-		return false, false, nil
+		return nil, nil
 	}
 	if canonicalPath, err := h.canonicalDAVPath(ctx, user, cleanPath); err == nil && canonicalPath != "" {
 		cleanPath = canonicalPath
 	} else if err != nil {
-		return false, false, err
+		return nil, err
 	}
+	pc := &addressBookPrivilegeContext{principals: acl.ApplicablePrincipals(user)}
 	if user != nil && book.UserID == user.ID {
-		return true, false, nil
+		pc.owner = true
+		return pc, nil
 	}
-	if granted, decided, err := h.aclDecisionMatchingPrivilege(ctx, user, cleanPath, privilege); err != nil {
-		return false, false, err
-	} else if decided {
-		return granted, !granted, nil
+
+	hasACLStore := h != nil && h.store != nil && h.store.ACLEntries != nil
+	if hasACLStore {
+		entries, err := h.aclEntriesForResource(ctx, cleanPath)
+		if err != nil {
+			return nil, err
+		}
+		pc.resourceEntries = entries
 	}
+
 	collectionPath := addressBookCollectionPath(cleanPath)
-	if collectionPath != cleanPath {
-		if granted, decided, err := h.aclDecisionMatchingPrivilege(ctx, user, collectionPath, privilege); err != nil {
-			return false, false, err
-		} else if decided {
-			return granted, !granted, nil
+	pc.sameCollection = collectionPath == cleanPath
+	if !pc.sameCollection && hasACLStore {
+		entries, err := h.aclEntriesForResource(ctx, collectionPath)
+		if err != nil {
+			return nil, err
+		}
+		pc.collectionEntries = entries
+	}
+	return pc, nil
+}
+
+func (pc *addressBookPrivilegeContext) decide(privilege string) (allowed, denied bool) {
+	if pc.owner {
+		return true, false
+	}
+	if granted, applicable := acl.DecisionForPrivilege(pc.resourceEntries, pc.principals, privilege); applicable {
+		return granted, !granted
+	}
+	if !pc.sameCollection {
+		if granted, applicable := acl.DecisionForPrivilege(pc.collectionEntries, pc.principals, privilege); applicable {
+			return granted, !granted
 		}
 	}
-	return false, false, nil
+	return false, false
+}
+
+func (h *DavServer) addressBookPrivilegeDecision(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) (bool, bool, error) {
+	pc, err := h.addressBookPrivilegeContextFor(ctx, user, book, cleanPath)
+	if err != nil || pc == nil {
+		return false, false, err
+	}
+	allowed, denied := pc.decide(privilege)
+	return allowed, denied, nil
 }
 
 func (h *DavServer) requireAddressBookPrivilege(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) error {

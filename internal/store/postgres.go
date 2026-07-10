@@ -499,6 +499,29 @@ func (r *eventRepo) GetByResourceName(ctx context.Context, calendarID int64, res
 	return &ev, nil
 }
 
+func (r *eventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]Event, error) {
+	if len(resourceNames) == 0 {
+		return []Event{}, nil
+	}
+	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND resource_name = ANY($2)`
+	defer observeDB(ctx, "events.list_by_resource_names")()
+	rows, err := r.pool.QueryContext(ctx, q, calendarID, pq.Array(resourceNames))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ev)
+	}
+	return result, rows.Err()
+}
+
 func (r *eventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error) {
 	if len(uids) == 0 {
 		return []Event{}, nil
@@ -1385,6 +1408,29 @@ func (r *contactRepo) GetByResourceName(ctx context.Context, addressBookID int64
 		return nil, err
 	}
 	return &c, nil
+}
+
+func (r *contactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]Contact, error) {
+	if len(resourceNames) == 0 {
+		return []Contact{}, nil
+	}
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND resource_name = ANY($2)`
+	defer observeDB(ctx, "contacts.list_by_resource_names")()
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, pq.Array(resourceNames))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Contact
+	for rows.Next() {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
 }
 
 func (r *contactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*Contact, error) {

@@ -120,18 +120,48 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 		targetResourceName = resourceName
 	}
 	resourceNames := make([]string, 0, len(hrefs))
+	seenNames := make(map[string]struct{}, len(hrefs))
 	for _, href := range hrefs {
 		cleanHref := resolveDAVHref(cleanPath, href)
 		if cleanHref == "" {
 			continue
 		}
 		if _, resourceName, ok := parseAddressBookResourceSegments(cleanHref); ok {
+			if _, ok := seenNames[resourceName]; ok {
+				continue
+			}
+			seenNames[resourceName] = struct{}{}
 			resourceNames = append(resourceNames, resourceName)
 		}
 	}
 	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, bookID, resourceNames)
 	if err != nil {
 		return nil, err
+	}
+	// Batch-fetch the contacts and memoize collection-segment resolution: a
+	// multiget of hundreds of hrefs otherwise issues one contact query and one
+	// segment lookup per href.
+	contacts, err := h.store.Contacts.ListByResourceNames(ctx, bookID, resourceNames)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch contact")
+	}
+	contactsByName := make(map[string]*store.Contact, len(contacts))
+	for i := range contacts {
+		contactsByName[contactResourceName(contacts[i])] = &contacts[i]
+	}
+	type segmentResolution struct {
+		id int64
+		ok bool
+	}
+	segmentIDs := make(map[string]segmentResolution)
+	resolveSegment := func(segment string) (int64, bool) {
+		if resolution, ok := segmentIDs[segment]; ok {
+			return resolution.id, resolution.ok
+		}
+		id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+		resolution := segmentResolution{id: id, ok: ok && err == nil}
+		segmentIDs[segment] = resolution
+		return resolution.id, resolution.ok
 	}
 	var responses []response
 	for _, href := range hrefs {
@@ -152,19 +182,12 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		id, ok, err := h.resolveAddressBookID(ctx, user, segment)
-		if err != nil || !ok {
+		id, ok := resolveSegment(segment)
+		if !ok || id != bookID {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		if id != bookID {
-			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
-			continue
-		}
-		c, err := h.store.Contacts.GetByResourceName(ctx, bookID, resourceName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch contact")
-		}
+		c := contactsByName[resourceName]
 		if c == nil {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue

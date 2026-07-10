@@ -99,8 +99,32 @@ func (h *DavServer) handleRegisteredMethod(w http.ResponseWriter, r *http.Reques
 	return true
 }
 
+// ensureRequestCaches installs the request-scoped ACL entry cache and
+// canonical-path memo unless the request already carries them. Both are read
+// many times per request by privilege evaluation; the few DAV-internal
+// mutation sites invalidate them explicitly, so every method can share them
+// safely. The HTTP router wires each DAV method function directly rather than
+// through ServeHTTP, so every public handler calls this on entry.
+func ensureRequestCaches(r *http.Request) *http.Request {
+	ctx := r.Context()
+	installed := false
+	if aclEntryCacheFromContext(ctx) == nil {
+		ctx = withACLEntryCache(ctx)
+		installed = true
+	}
+	if davPathMemoFromContext(ctx) == nil {
+		ctx = withDAVPathMemo(ctx)
+		installed = true
+	}
+	if !installed {
+		return r
+	}
+	return r.WithContext(ctx)
+}
+
 func (h *DavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger().Debug("ServeHTTP", "%s %s", r.Method, r.URL.Path)
+	r = ensureRequestCaches(r)
 	switch r.Method {
 	case http.MethodOptions:
 		h.Options(w, r)
@@ -109,7 +133,7 @@ func (h *DavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		h.Get(w, r)
 	case "PROPFIND":
-		h.Propfind(w, r.WithContext(withACLEntryCache(r.Context())))
+		h.Propfind(w, r)
 	case "PROPPATCH":
 		h.Proppatch(w, r)
 	case "MKCOL":
@@ -121,7 +145,7 @@ func (h *DavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		h.Delete(w, r)
 	case "REPORT":
-		h.Report(w, r.WithContext(withACLEntryCache(r.Context())))
+		h.Report(w, r)
 	case "COPY":
 		h.Copy(w, r)
 	case "MOVE":

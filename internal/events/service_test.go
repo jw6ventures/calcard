@@ -724,6 +724,19 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 	}
 	return nil, nil
 }
+func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	var out []store.Event
+	for _, name := range resourceNames {
+		ev, err := f.GetByResourceName(ctx, calendarID, name)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			out = append(out, *ev)
+		}
+	}
+	return out, nil
+}
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	var out []store.Event
 	for _, ev := range f.events {

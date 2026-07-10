@@ -40,6 +40,45 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 	return destPath, overwrite, nil
 }
 
+// prefetchCopyMoveLocks fetches, in one query, every lock that could apply to
+// the source, destination, or their parent collections, and installs the batch
+// index so the 4-6 requireLock checks a COPY/MOVE performs read from it
+// instead of issuing one lock query each. On prefetch failure it returns the
+// request unchanged and the individual checks fall back to direct queries.
+func (h *DavServer) prefetchCopyMoveLocks(r *http.Request, srcPath, destPath string) *http.Request {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return r
+	}
+	seen := make(map[string]struct{})
+	var union []string
+	for _, p := range []string{srcPath, destPath, path.Dir(srcPath), path.Dir(destPath)} {
+		if p == "" || p == "." || p == "/" {
+			continue
+		}
+		target := h.resolveLockTarget(r, p)
+		for _, lookupPath := range target.lookupPaths {
+			if _, ok := seen[lookupPath]; ok {
+				continue
+			}
+			seen[lookupPath] = struct{}{}
+			union = append(union, lookupPath)
+		}
+	}
+	if len(union) == 0 {
+		return r
+	}
+	locks, err := h.store.Locks.ListByResources(r.Context(), union)
+	if err != nil {
+		return r
+	}
+	byPath := make(map[string][]store.Lock, len(locks))
+	for i := range locks {
+		key := normalizeDAVHref(locks[i].ResourcePath)
+		byPath[key] = append(byPath[key], locks[i])
+	}
+	return r.WithContext(withLockBatchIndex(r.Context(), &lockBatchIndex{byPath: byPath}))
+}
+
 // writeSourceResolutionError maps COPY/MOVE source-path resolution failures to
 // the same statuses PUT/DELETE/GET use, instead of flattening them all to 404.
 func writeSourceResolutionError(w http.ResponseWriter, err error) {
@@ -55,6 +94,7 @@ func writeSourceResolutionError(w http.ResponseWriter, err error) {
 }
 
 func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -73,6 +113,7 @@ func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check locks on source and destination
+	r = h.prefetchCopyMoveLocks(r, srcPath, destPath)
 	if !h.requireLock(w, r, srcPath, "source is locked") {
 		return
 	}
@@ -326,6 +367,7 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 }
 
 func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -344,6 +386,7 @@ func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check locks on both source and destination
+	r = h.prefetchCopyMoveLocks(r, srcPath, destPath)
 	if !h.requireLock(w, r, srcPath, "source is locked") {
 		return
 	}

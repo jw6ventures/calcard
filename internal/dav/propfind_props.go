@@ -138,28 +138,16 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 			return nil
 		}
 
-		privileges := make([]privilege, 0, 7)
-		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read"); err == nil {
-			privileges = append(privileges, privilege{Read: &readPrivilege{}})
+		// Resolve the ACL state once and decide every privilege from it
+		// instead of one full path/entry resolution per privilege name.
+		pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
+		if err != nil || pc == nil {
+			return nil
 		}
-		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read-free-busy"); err == nil {
-			privileges = append(privileges, privilege{ReadFreeBusy: &struct{}{}})
-		}
-		for _, name := range []string{"write", "write-content", "write-properties", "bind", "unbind"} {
-			if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, name); err != nil {
-				continue
-			}
-			switch name {
-			case "write":
-				privileges = append(privileges, privilege{Write: &struct{}{}})
-			case "write-content":
-				privileges = append(privileges, privilege{WriteContent: &struct{}{}})
-			case "write-properties":
-				privileges = append(privileges, privilege{WriteProperties: &struct{}{}})
-			case "bind":
-				privileges = append(privileges, privilege{Bind: &struct{}{}})
-			case "unbind":
-				privileges = append(privileges, privilege{Unbind: &struct{}{}})
+		privileges := make([]privilege, 0, len(calendarPrivilegeNames))
+		for _, name := range calendarPrivilegeNames {
+			if allowed, _ := pc.decide(name); allowed {
+				privileges = append(privileges, privilegeElementForName(name))
 			}
 		}
 		if len(privileges) == 0 {
@@ -191,30 +179,41 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		return nil
 	}
 
-	privileges := make([]privilege, 0, 6)
-	for _, name := range []string{"read", "write", "write-content", "write-properties", "bind", "unbind"} {
-		if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, name); err != nil {
-			continue
-		}
-		switch name {
-		case "read":
-			privileges = append(privileges, privilege{Read: &readPrivilege{}})
-		case "write":
-			privileges = append(privileges, privilege{Write: &struct{}{}})
-		case "write-content":
-			privileges = append(privileges, privilege{WriteContent: &struct{}{}})
-		case "write-properties":
-			privileges = append(privileges, privilege{WriteProperties: &struct{}{}})
-		case "bind":
-			privileges = append(privileges, privilege{Bind: &struct{}{}})
-		case "unbind":
-			privileges = append(privileges, privilege{Unbind: &struct{}{}})
+	pc, err := h.addressBookPrivilegeContextFor(ctx, user, book, cleanPath)
+	if err != nil || pc == nil {
+		return nil
+	}
+	privileges := make([]privilege, 0, len(addressBookPrivilegeNames))
+	for _, name := range addressBookPrivilegeNames {
+		if allowed, _ := pc.decide(name); allowed {
+			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
 	if len(privileges) == 0 {
 		return nil
 	}
 	return &currentUserPrivilegeSet{Privileges: privileges}
+}
+
+// privilegeElementForName maps a privilege name to its XML response element.
+func privilegeElementForName(name string) privilege {
+	switch name {
+	case "read":
+		return privilege{Read: &readPrivilege{}}
+	case "read-free-busy":
+		return privilege{ReadFreeBusy: &struct{}{}}
+	case "write":
+		return privilege{Write: &struct{}{}}
+	case "write-content":
+		return privilege{WriteContent: &struct{}{}}
+	case "write-properties":
+		return privilege{WriteProperties: &struct{}{}}
+	case "bind":
+		return privilege{Bind: &struct{}{}}
+	case "unbind":
+		return privilege{Unbind: &struct{}{}}
+	}
+	return privilege{}
 }
 
 func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath string) (*lockDiscoveryProp, error) {
@@ -262,7 +261,7 @@ func (h *DavServer) lockLookupPathsForResource(ctx context.Context, resourcePath
 // from that index to avoid one lock query per PROPFIND response; otherwise it
 // queries directly.
 func (h *DavServer) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
-	if idx := lockBatchIndexFromContext(ctx); idx != nil {
+	if idx := lockBatchIndexFromContext(ctx); idx != nil && !idx.isStale() {
 		return idx.locksForPaths(paths), nil
 	}
 	return h.store.Locks.ListByResources(ctx, paths)
@@ -311,11 +310,14 @@ func (h *DavServer) prefetchLockBatchIndex(ctx context.Context, responses []resp
 }
 
 func (h *DavServer) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {
+	if h == nil || h.store == nil || h.store.AddressBooks == nil || user == nil {
+		return nil, nil
+	}
 	owned, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
 	if err != nil {
 		return nil, err
 	}
-	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+	if h.store.ACLEntries == nil {
 		return owned, nil
 	}
 

@@ -13,6 +13,14 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
+// depthIncludesChildren reports whether a PROPFIND depth asks for a
+// collection's members. Depth: infinity includes them at every level; the
+// builders that own multi-level hierarchies additionally recurse when the
+// depth is "infinity".
+func depthIncludesChildren(depth string) bool {
+	return depth == "1" || depth == "infinity"
+}
+
 func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request, reqPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
 	cleanPath := path.Clean(reqPath)
 	if !strings.HasPrefix(cleanPath, "/dav") {
@@ -32,12 +40,27 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		href := ensureCollectionHref(cleanPath)
 		principalHref := h.principalURL(user)
 		res := []response{rootCollectionResponse(href, user, principalHref)}
-		if depth == "1" {
+		switch depth {
+		case "1":
 			res = append(res,
 				collectionResponse(ensureCollectionHref("/dav/calendars"), "Calendars"),
 				collectionResponse(ensureCollectionHref("/dav/addressbooks"), "Address Books"),
 				principalResponse(ensureCollectionHref(principalHref), user),
 			)
+		case "infinity":
+			// Recurse into each home set; their builders emit the collection
+			// response followed by every member.
+			calendarRes, err := h.calendarResponses(ctx, "/dav/calendars", depth, user, ensureCollectionHref)
+			if err != nil {
+				return nil, err
+			}
+			res = append(res, calendarRes...)
+			addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, ensureCollectionHref, propfindReq)
+			if err != nil {
+				return nil, err
+			}
+			res = append(res, addressBookRes...)
+			res = append(res, principalResponse(ensureCollectionHref(principalHref), user))
 		}
 		res, err := h.appendCollectionContributors(ctx, r, user, cleanPath, depth, res)
 		if err != nil {
@@ -45,6 +68,10 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if err := h.decoratePropfindResponses(ctx, r, user, res, decorationMaskFor(propfindReq)); err != nil {
 			return nil, err
+		}
+		if propfindReq != nil && propfindReq.AllProp != nil {
+			stripCalendarAllprop(res)
+			stripAddressBookAllprop(res)
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range res {
@@ -159,7 +186,7 @@ func stripCalendarAllprop(responses []response) {
 }
 
 func (h *DavServer) appendCollectionContributors(ctx context.Context, r *http.Request, user *store.User, cleanPath, depth string, responses []response) ([]response, error) {
-	if depth != "1" {
+	if !depthIncludesChildren(depth) {
 		return responses, nil
 	}
 	collections, err := h.davRegistry().contributeCollections(RequestContext{
@@ -193,7 +220,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/calendars")
 		res := []response{collectionResponse(base, "Calendars")}
-		if depth == "1" {
+		if depthIncludesChildren(depth) {
 			cals, err := h.accessibleCalendars(ctx, user)
 			if err != nil {
 				return nil, err
@@ -207,13 +234,32 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 			// Use stable sync-token (epoch) for birthday calendar to ensure consistency
 			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, nil, principalHref, birthdayToken, "0", true))
+			if depth == "infinity" && h.store != nil && h.store.Contacts != nil {
+				events, err := h.generateBirthdayEvents(ctx, user.ID)
+				if err != nil {
+					return nil, err
+				}
+				res = append(res, calendarResourceResponses(birthdayHref, events)...)
+			}
 
 			// Add regular calendars
-			for _, c := range cals {
+			for i := range cals {
+				c := &cals[i]
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := strconv.FormatInt(c.CTag, 10)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
 				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges()))
+				if depth == "infinity" {
+					events, err := h.store.Events.ListForCalendar(ctx, c.ID)
+					if err != nil {
+						return nil, err
+					}
+					events, err = h.filterReadableCalendarEvents(ctx, user, c, events)
+					if err != nil {
+						return nil, err
+					}
+					res = append(res, calendarResourceResponses(href, events)...)
+				}
 			}
 		}
 		return res, nil
@@ -233,7 +279,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 		principalHref := h.principalURL(user)
 		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true)}
 
-		if depth == "1" {
+		if depthIncludesChildren(depth) {
 			events, err := h.generateBirthdayEvents(ctx, user.ID)
 			if err != nil {
 				return nil, err
@@ -289,7 +335,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
 	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
-	if depth == "1" {
+	if depthIncludesChildren(depth) {
 		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
 		if err != nil {
 			return nil, err
@@ -331,17 +377,29 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/addressbooks")
 		res := []response{collectionResponse(base, "Address Books")}
-		if depth == "1" {
+		if depthIncludesChildren(depth) {
 			books, err := h.accessibleAddressBooks(ctx, user)
 			if err != nil {
 				return nil, err
 			}
 			principalHref := h.principalURL(user)
-			for _, b := range books {
+			for i := range books {
+				b := &books[i]
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
 				ctag := strconv.FormatInt(b.CTag, 10)
 				syncToken := buildSyncToken("card", b.ID, b.UpdatedAt)
 				res = append(res, addressBookCollectionResponse(href, b.Name, b.Description, principalHref, syncToken, ctag))
+				if depth == "infinity" {
+					contacts, err := h.store.Contacts.ListForBook(ctx, b.ID)
+					if err != nil {
+						return nil, err
+					}
+					contacts, err = h.filterReadableAddressBookContacts(ctx, user, b, contacts)
+					if err != nil {
+						return nil, err
+					}
+					res = append(res, addressBookResourceResponses(href, contacts)...)
+				}
 			}
 		}
 		return res, nil
@@ -389,7 +447,7 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 	syncToken := buildSyncToken("card", book.ID, book.UpdatedAt)
 	principalHref := h.principalURL(user)
 	res := []response{addressBookCollectionResponse(href, book.Name, book.Description, principalHref, syncToken, ctag)}
-	if depth == "1" {
+	if depthIncludesChildren(depth) {
 		contacts, err := h.store.Contacts.ListForBook(ctx, book.ID)
 		if err != nil {
 			return nil, err
@@ -416,7 +474,7 @@ func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User
 	// Only the authenticated user's principal is exposed.
 	if relPath == "" {
 		res := []response{collectionResponse(ensureCollectionHref("/dav/principals"), "Principals")}
-		if depth == "1" {
+		if depthIncludesChildren(depth) {
 			res = append(res, principalResponse(principalHref, user))
 		}
 		return res, nil

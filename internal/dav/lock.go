@@ -192,6 +192,7 @@ func firstIfLockToken(header string, resourcePaths ...string) string {
 }
 
 func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -586,6 +587,7 @@ func writeLockResponse(w http.ResponseWriter, lock *store.Lock, status int) {
 }
 
 func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -641,13 +643,15 @@ func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// checkLock verifies that a write operation is allowed on a resource.
-// Returns true if the operation can proceed, false if the resource is locked
-// and the request doesn't include a valid lock token.
-func (h *DavServer) checkLock(r *http.Request, resourcePath string) (bool, error) {
-	if h == nil || h.store == nil || h.store.Locks == nil {
-		return true, nil
-	}
+// resolvedLockTarget carries one write target's request path, canonical path,
+// and the lookup paths whose locks could block a write to it.
+type resolvedLockTarget struct {
+	requestPath   string
+	canonicalPath string
+	lookupPaths   []string
+}
+
+func (h *DavServer) resolveLockTarget(r *http.Request, resourcePath string) resolvedLockTarget {
 	requestPath := normalizeDAVHref(resourcePath)
 	canonicalPath := requestPath
 	if user, ok := auth.UserFromContext(r.Context()); ok {
@@ -655,46 +659,67 @@ func (h *DavServer) checkLock(r *http.Request, resourcePath string) (bool, error
 			canonicalPath = canonical
 		}
 	}
+	return resolvedLockTarget{requestPath: requestPath, canonicalPath: canonicalPath, lookupPaths: lockLookupPaths(canonicalPath)}
+}
 
-	// Batch-fetch locks for the resource and all ancestors in a single query.
-	paths := lockLookupPaths(canonicalPath)
-	allLocks, err := h.store.Locks.ListByResources(r.Context(), paths)
-	if err != nil {
-		return false, err
+// lockAllowsWrite reports whether the write may proceed given the locks that
+// could apply to the target: active locks on the resource itself and
+// depth-infinity locks on its ancestors block the write unless the request's
+// If header carries a matching token.
+func lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.Lock) bool {
+	if len(locks) == 0 {
+		return true
 	}
-	if len(allLocks) == 0 {
-		return true, nil
-	}
-
-	// Collect active locks: direct locks on the resource, plus
-	// depth-infinity locks on ancestor paths.
 	now := time.Now()
 	ifHeader := r.Header.Get("If")
 
 	hasActiveLock := false
-	for _, lock := range allLocks {
+	for _, lock := range locks {
 		if lock.ExpiresAt.Before(now) {
 			continue
 		}
 		lockPath := normalizeDAVResourceIdentity(lock.ResourcePath)
 		// Ancestor locks only apply if they have depth-infinity.
-		if lockPath != canonicalPath && lock.Depth != "infinity" {
+		if lockPath != target.canonicalPath && lock.Depth != "infinity" {
 			continue
 		}
 		hasActiveLock = true
-		for _, token := range ifLockTokensForPaths(ifHeader, requestPath, canonicalPath, lock.ResourcePath, lockPath) {
+		for _, token := range ifLockTokensForPaths(ifHeader, target.requestPath, target.canonicalPath, lock.ResourcePath, lockPath) {
 			if lock.Token == token {
-				return true, nil
+				return true
 			}
 		}
 	}
 
 	// If there are active locks but none matched the token, block the write.
-	return !hasActiveLock, nil
+	return !hasActiveLock
 }
 
+// checkLock verifies that a write operation is allowed on a resource.
+// Returns true if the operation can proceed, false if the resource is locked
+// and the request doesn't include a valid lock token.
+func (h *DavServer) checkLock(r *http.Request, resourcePath string) (bool, error) {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return true, nil
+	}
+	target := h.resolveLockTarget(r, resourcePath)
+	locks, err := h.locksForLookupPaths(r.Context(), target.lookupPaths)
+	if err != nil {
+		return false, err
+	}
+	return lockAllowsWrite(r, target, locks), nil
+}
+
+// checkLocks verifies several write targets at once, fetching the union of
+// their lock lookup paths in a single query instead of one query per target.
 func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, error) {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return true, nil
+	}
 	seen := make(map[string]struct{}, len(resourcePaths))
+	targets := make([]resolvedLockTarget, 0, len(resourcePaths))
+	seenLookup := make(map[string]struct{})
+	var union []string
 	for _, resourcePath := range resourcePaths {
 		resourcePath = path.Clean(resourcePath)
 		if resourcePath == "." || resourcePath == "/" {
@@ -704,11 +729,35 @@ func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, 
 			continue
 		}
 		seen[resourcePath] = struct{}{}
-		allowed, err := h.checkLock(r, resourcePath)
-		if err != nil {
-			return false, err
+		target := h.resolveLockTarget(r, resourcePath)
+		targets = append(targets, target)
+		for _, p := range target.lookupPaths {
+			if _, ok := seenLookup[p]; ok {
+				continue
+			}
+			seenLookup[p] = struct{}{}
+			union = append(union, p)
 		}
-		if !allowed {
+	}
+	if len(targets) == 0 {
+		return true, nil
+	}
+
+	locks, err := h.locksForLookupPaths(r.Context(), union)
+	if err != nil {
+		return false, err
+	}
+	byPath := make(map[string][]store.Lock, len(locks))
+	for i := range locks {
+		key := normalizeDAVHref(locks[i].ResourcePath)
+		byPath[key] = append(byPath[key], locks[i])
+	}
+	for _, target := range targets {
+		var targetLocks []store.Lock
+		for _, p := range target.lookupPaths {
+			targetLocks = append(targetLocks, byPath[p]...)
+		}
+		if !lockAllowsWrite(r, target, targetLocks) {
 			return false, nil
 		}
 	}

@@ -15,6 +15,7 @@ import (
 )
 
 func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -131,6 +132,7 @@ func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to set ACL", http.StatusInternalServerError)
 		return
 	}
+	invalidateACLEntryCache(r.Context())
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -265,10 +267,6 @@ func (h *DavServer) aclDecision(ctx context.Context, user *store.User, resourceP
 	applicablePrincipals := acl.ApplicablePrincipals(user)
 	granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
 	return granted, applicable, nil
-}
-
-func (h *DavServer) aclDecisionMatchingPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, bool, error) {
-	return h.aclDecision(ctx, user, resourcePath, privilege)
 }
 
 func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {

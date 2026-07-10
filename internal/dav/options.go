@@ -21,6 +21,7 @@ func (h *DavServer) davHeaderForPath(cleanPath string) string {
 }
 
 func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -35,6 +36,7 @@ func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) Head(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}

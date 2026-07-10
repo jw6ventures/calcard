@@ -2418,6 +2418,20 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 	return nil, nil
 }
 
+func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	var out []store.Event
+	for _, name := range resourceNames {
+		ev, err := f.GetByResourceName(ctx, calendarID, name)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			out = append(out, *ev)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	var result []store.Event
 	for _, ev := range f.events {
@@ -2600,6 +2614,19 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 		}
 	}
 	return nil, nil
+}
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]store.Contact, error) {
+	var out []store.Contact
+	for _, name := range resourceNames {
+		c, err := f.GetByResourceName(ctx, addressBookID, name)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
 }
 func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
 	return nil, nil

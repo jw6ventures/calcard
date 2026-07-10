@@ -48,12 +48,14 @@ func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter)
 }
 
 func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
-	return h.matchesCompFilter(event, &filter.CompFilter)
+	// Uppercase the body once per event; the matchers below run once per
+	// filter node and would otherwise each re-uppercase the full iCal text.
+	return h.matchesCompFilter(event, strings.ToUpper(event.RawICAL), &filter.CompFilter)
 }
 
-func (h *DavServer) matchesCompFilter(event store.Event, compFilter *compFilter) bool {
+func (h *DavServer) matchesCompFilter(event store.Event, upperICAL string, compFilter *compFilter) bool {
 	compType := compFilter.Name
-	if compType != "" && !h.hasComponent(event.RawICAL, compType) {
+	if compType != "" && !h.hasComponent(upperICAL, compType) {
 		return false
 	}
 
@@ -64,19 +66,19 @@ func (h *DavServer) matchesCompFilter(event store.Event, compFilter *compFilter)
 	}
 
 	for _, nestedFilter := range compFilter.CompFilter {
-		if !h.matchesCompFilter(event, &nestedFilter) {
+		if !h.matchesCompFilter(event, upperICAL, &nestedFilter) {
 			return false
 		}
 	}
 
 	for _, propFilter := range compFilter.PropFilter {
-		if !h.matchesPropFilter(event, &propFilter) {
+		if !h.matchesPropFilter(upperICAL, &propFilter) {
 			return false
 		}
 	}
 
 	if compFilter.TextMatch != nil {
-		if !h.matchesTextMatch(event.RawICAL, compFilter.TextMatch) {
+		if !h.matchesTextMatch(upperICAL, compFilter.TextMatch) {
 			return false
 		}
 	}
@@ -84,9 +86,9 @@ func (h *DavServer) matchesCompFilter(event store.Event, compFilter *compFilter)
 	return true
 }
 
-func (h *DavServer) matchesPropFilter(event store.Event, propFilter *propFilter) bool {
+func (h *DavServer) matchesPropFilter(upperICAL string, propFilter *propFilter) bool {
 	propName := strings.ToUpper(propFilter.Name)
-	hasProp := strings.Contains(strings.ToUpper(event.RawICAL), propName+":")
+	hasProp := strings.Contains(upperICAL, propName+":")
 
 	if propFilter.IsNotDefined != nil {
 		return !hasProp
@@ -97,20 +99,21 @@ func (h *DavServer) matchesPropFilter(event store.Event, propFilter *propFilter)
 	}
 
 	if propFilter.TextMatch != nil {
-		return h.matchesTextMatch(event.RawICAL, propFilter.TextMatch)
+		return h.matchesTextMatch(upperICAL, propFilter.TextMatch)
 	}
 
 	return true
 }
 
-func (h *DavServer) matchesTextMatch(icalData string, textMatch *textMatch) bool {
+// matchesTextMatch expects icalData already uppercased by the caller.
+func (h *DavServer) matchesTextMatch(upperICAL string, textMatch *textMatch) bool {
 	text := strings.TrimSpace(textMatch.Text)
 	if text == "" {
 		return true
 	}
 
 	// Case-insensitive contains check (simplified - RFC 4790 has more complex rules)
-	matches := strings.Contains(strings.ToUpper(icalData), strings.ToUpper(text))
+	matches := strings.Contains(upperICAL, strings.ToUpper(text))
 
 	if textMatch.NegateCondition == "yes" {
 		return !matches
@@ -119,10 +122,9 @@ func (h *DavServer) matchesTextMatch(icalData string, textMatch *textMatch) bool
 	return matches
 }
 
-func (h *DavServer) hasComponent(icalData, componentType string) bool {
-	componentType = strings.ToUpper(componentType)
-	beginMarker := "BEGIN:" + componentType
-	return strings.Contains(strings.ToUpper(icalData), beginMarker)
+// hasComponent expects icalData already uppercased by the caller.
+func (h *DavServer) hasComponent(upperICAL, componentType string) bool {
+	return strings.Contains(upperICAL, "BEGIN:"+strings.ToUpper(componentType))
 }
 
 func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
@@ -1843,6 +1845,44 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 		return h.calendarQuery(ctx, user, cal, responsePath, nil, calData)
 	}
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
+
+	// Apple clients multiget hundreds of hrefs after a sync; fetch the events
+	// and the relevant ACL entries in one batch each instead of one event
+	// query plus one full privilege evaluation per href.
+	uids := make([]string, 0, len(hrefs))
+	seen := make(map[string]struct{}, len(hrefs))
+	for _, href := range hrefs {
+		cleanHref := resolveDAVHref(resolvePath, href)
+		if cleanHref == "" {
+			continue
+		}
+		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
+		if !ok || !calendarSegmentMatches(cal, segment) {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		uids = append(uids, uid)
+	}
+	if len(uids) == 0 {
+		return nil, nil
+	}
+
+	events, err := h.store.Events.ListByResourceNames(ctx, cal.ID, uids)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event")
+	}
+	eventsByName := make(map[string]*store.Event, len(events))
+	for i := range events {
+		eventsByName[eventResourceName(events[i])] = &events[i]
+	}
+	prefetchedACLEntries, err := h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
+	if err != nil {
+		return nil, err
+	}
+
 	var responses []response
 	for _, href := range hrefs {
 		cleanHref := resolveDAVHref(resolvePath, href)
@@ -1854,15 +1894,12 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			continue
 		}
 		responseHref := responseBase + uid + ".ics"
-		ev, err := h.store.Events.GetByResourceName(ctx, cal.ID, uid)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch event")
-		}
+		ev := eventsByName[uid]
 		if ev == nil {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		allowed, err := h.canReadCalendarObject(ctx, user, cal, uid)
+		allowed, err := h.canAccessCalendarObjectWithEntries(user, cal, uid, "read", prefetchedACLEntries)
 		if err != nil {
 			return nil, err
 		}

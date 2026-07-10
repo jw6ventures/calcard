@@ -15,6 +15,7 @@ import (
 )
 
 func (h *DavServer) Proppatch(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}
@@ -184,6 +185,8 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cle
 				}},
 			}}, nil
 		}
+		// A rename changes name/slug-based path resolution.
+		invalidateDAVPathMemo(ctx)
 	}
 
 	// Return success response
@@ -317,6 +320,8 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 				}},
 			}}, nil
 		}
+		// A rename changes name-based path resolution.
+		invalidateDAVPathMemo(ctx)
 	}
 
 	return []response{{

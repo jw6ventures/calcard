@@ -168,7 +168,7 @@ func (h *DavServer) hasDiscoverableCalendarObjectGrant(ctx context.Context, user
 	}
 
 	applicablePrincipals := acl.ApplicablePrincipals(user)
-	for _, privilege := range []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"} {
+	for _, privilege := range calendarPrivilegeNames {
 		granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
 		if applicable && granted {
 			return true, nil
@@ -177,70 +177,126 @@ func (h *DavServer) hasDiscoverableCalendarObjectGrant(ctx context.Context, user
 	return false, nil
 }
 
-func (h *DavServer) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) (bool, bool, error) {
+// calendarPrivilegeNames is every privilege a calendar access decision can
+// resolve, in DAV:acl document order.
+var calendarPrivilegeNames = []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"}
+
+// calendarPrivilegeContext carries one resolution of everything a calendar
+// privilege decision depends on — canonical path, ownership, and the ACL
+// entries for the resource and its collection — so callers evaluating several
+// privileges (privilege sets, any-privilege probes) resolve the path and read
+// the entries once instead of once per privilege.
+type calendarPrivilegeContext struct {
+	owner                bool
+	principals           map[string]struct{}
+	resourceEntries      []store.ACLEntry
+	collectionEntries    []store.ACLEntry
+	sameCollection       bool
+	hasApplicable        bool
+	collectionApplicable bool
+}
+
+func (h *DavServer) calendarPrivilegeContextFor(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) (*calendarPrivilegeContext, error) {
 	if cal == nil {
-		return false, false, nil
+		return nil, nil
 	}
 	if canonicalPath, err := h.canonicalDAVPath(ctx, user, cleanPath); err == nil && canonicalPath != "" {
 		cleanPath = canonicalPath
 	} else if err != nil {
-		return false, false, err
+		return nil, err
 	}
+	pc := &calendarPrivilegeContext{principals: acl.ApplicablePrincipals(user)}
 	if user != nil && cal.UserID == user.ID {
-		return true, false, nil
+		pc.owner = true
+		return pc, nil
 	}
 
-	hasApplicable, err := h.aclHasApplicablePrincipal(ctx, user, cleanPath)
-	if err != nil {
-		return false, false, err
-	}
-	if granted, applicable, err := h.aclDecision(ctx, user, cleanPath, privilege); err != nil {
-		return false, false, err
-	} else if applicable {
-		return granted, !granted, nil
+	hasACLStore := h != nil && h.store != nil && h.store.ACLEntries != nil
+	if hasACLStore {
+		entries, err := h.aclEntriesForResource(ctx, cleanPath)
+		if err != nil {
+			return nil, err
+		}
+		pc.resourceEntries = entries
+		pc.hasApplicable = acl.HasApplicablePrincipal(entries, pc.principals)
 	}
 
 	collectionPath := calendarCollectionPath(cleanPath)
-	if collectionPath != cleanPath {
-		collectionApplicable, err := h.aclHasApplicablePrincipal(ctx, user, collectionPath)
+	pc.sameCollection = collectionPath == cleanPath
+	if !pc.sameCollection && hasACLStore {
+		entries, err := h.aclEntriesForResource(ctx, collectionPath)
 		if err != nil {
-			return false, false, err
+			return nil, err
 		}
-		if granted, applicable, err := h.aclDecision(ctx, user, collectionPath, privilege); err != nil {
-			return false, false, err
-		} else if applicable {
-			return granted, !granted, nil
-		}
-		return false, hasApplicable || collectionApplicable, nil
+		pc.collectionEntries = entries
+		pc.collectionApplicable = acl.HasApplicablePrincipal(entries, pc.principals)
 	}
+	return pc, nil
+}
 
-	return false, hasApplicable, nil
+// decide evaluates one privilege against the resolved context. The second
+// result reports an applicable deny: object entries win over collection
+// entries, and with no applicable decision the caller's fallback sees denied
+// only when some entry named an applicable principal without granting.
+func (pc *calendarPrivilegeContext) decide(privilege string) (allowed, denied bool) {
+	if pc.owner {
+		return true, false
+	}
+	if granted, applicable := acl.DecisionForPrivilege(pc.resourceEntries, pc.principals, privilege); applicable {
+		return granted, !granted
+	}
+	if !pc.sameCollection {
+		if granted, applicable := acl.DecisionForPrivilege(pc.collectionEntries, pc.principals, privilege); applicable {
+			return granted, !granted
+		}
+		return false, pc.hasApplicable || pc.collectionApplicable
+	}
+	return false, pc.hasApplicable
+}
+
+func (h *DavServer) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) (bool, bool, error) {
+	pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
+	if err != nil || pc == nil {
+		return false, false, err
+	}
+	allowed, denied := pc.decide(privilege)
+	return allowed, denied, nil
 }
 
 func (h *DavServer) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) error {
 	return requirePrivilegeDecision(h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, privilege))
 }
 
+func setCalendarPrivilege(privileges *store.CalendarPrivileges, name string) {
+	switch name {
+	case "read":
+		privileges.Read = true
+	case "read-free-busy":
+		privileges.ReadFreeBusy = true
+	case "write":
+		privileges.Write = true
+	case "write-content":
+		privileges.WriteContent = true
+	case "write-properties":
+		privileges.WriteProperties = true
+	case "bind":
+		privileges.Bind = true
+	case "unbind":
+		privileges.Unbind = true
+	}
+}
+
 func (h *DavServer) calendarAccessForPath(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) (*store.CalendarAccess, error) {
+	pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
+	if err != nil {
+		return nil, err
+	}
 	privileges := store.CalendarPrivileges{}
-	for _, candidate := range []struct {
-		name string
-		set  func()
-	}{
-		{name: "read", set: func() { privileges.Read = true }},
-		{name: "read-free-busy", set: func() { privileges.ReadFreeBusy = true }},
-		{name: "write", set: func() { privileges.Write = true }},
-		{name: "write-content", set: func() { privileges.WriteContent = true }},
-		{name: "write-properties", set: func() { privileges.WriteProperties = true }},
-		{name: "bind", set: func() { privileges.Bind = true }},
-		{name: "unbind", set: func() { privileges.Unbind = true }},
-	} {
-		allowed, _, err := h.calendarPrivilegeDecision(ctx, user, cal, cleanPath, candidate.name)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
-			candidate.set()
+	if pc != nil {
+		for _, name := range calendarPrivilegeNames {
+			if allowed, _ := pc.decide(name); allowed {
+				setCalendarPrivilege(&privileges, name)
+			}
 		}
 	}
 	privileges = privileges.Normalized()
@@ -252,19 +308,6 @@ func (h *DavServer) calendarAccessForPath(ctx context.Context, user *store.User,
 		Privileges:         privileges,
 		PrivilegesResolved: true,
 	}, nil
-}
-
-func (h *DavServer) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePath string) (bool, error) {
-	if h == nil || h.store == nil || h.store.ACLEntries == nil {
-		return false, nil
-	}
-
-	entries, err := h.aclEntriesForResource(ctx, resourcePath)
-	if err != nil || len(entries) == 0 {
-		return false, err
-	}
-
-	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
 }
 
 func (h *DavServer) loadCalendarWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.CalendarAccess, error) {
@@ -395,18 +438,21 @@ func (h *DavServer) loadCalendarWithAnyPrivilege(ctx context.Context, user *stor
 }
 
 func (h *DavServer) requireAnyCalendarPrivilege(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath string) error {
+	pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
+	if err != nil {
+		return err
+	}
+	if pc == nil {
+		return store.ErrNotFound
+	}
 	sawForbidden := false
-	for _, privilege := range []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"} {
-		err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, privilege)
-		switch {
-		case err == nil:
+	for _, privilege := range calendarPrivilegeNames {
+		allowed, denied := pc.decide(privilege)
+		if allowed {
 			return nil
-		case err == store.ErrNotFound:
-			continue
-		case errors.Is(err, errForbidden):
+		}
+		if denied {
 			sawForbidden = true
-		default:
-			return err
 		}
 	}
 	if sawForbidden {

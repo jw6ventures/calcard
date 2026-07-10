@@ -17,6 +17,7 @@ import (
 )
 
 func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestCaches(r)
 	if h.handleRegisteredMethod(w, r) {
 		return
 	}

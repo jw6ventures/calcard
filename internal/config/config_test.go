@@ -49,6 +49,26 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.HTTP.IdleTimeout != 60*time.Second {
 		t.Fatalf("HTTP.IdleTimeout = %s, want 60s", cfg.HTTP.IdleTimeout)
 	}
+	if !cfg.DAV.PropfindInfinityEnabled {
+		t.Fatal("expected DAV.PropfindInfinityEnabled to default to true")
+	}
+}
+
+func TestLoadDisablesPropfindInfinity(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_PROPFIND_INFINITY_ENABLED", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DAV.PropfindInfinityEnabled {
+		t.Fatal("expected APP_DAV_PROPFIND_INFINITY_ENABLED=false to disable Depth: infinity PROPFIND")
+	}
 }
 
 func TestLoadParsesPoolAndHTTPTimeoutConfig(t *testing.T) {
