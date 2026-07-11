@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -78,15 +77,7 @@ func (h *DavServer) Proppatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload := multistatus{
-		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:    "DAV:",
-		XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-		XmlnsICAL: "http://apple.com/ns/ical/",
-		Response:  responses,
-	}
-	writeMultiStatus(w, payload)
+	writeMultiStatus(w, newMultistatus(responses, ""))
 }
 
 func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {

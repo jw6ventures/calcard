@@ -27,14 +27,6 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		return nil, http.ErrNotSupported
 	}
 
-	// Ensure trailing slash on collections for predictable href values.
-	ensureCollectionHref := func(p string) string {
-		if !strings.HasSuffix(p, "/") {
-			return p + "/"
-		}
-		return p
-	}
-
 	switch {
 	case cleanPath == "/dav" || cleanPath == "/dav/":
 		href := ensureCollectionHref(cleanPath)
@@ -50,12 +42,12 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		case "infinity":
 			// Recurse into each home set; their builders emit the collection
 			// response followed by every member.
-			calendarRes, err := h.calendarResponses(ctx, "/dav/calendars", depth, user, ensureCollectionHref)
+			calendarRes, err := h.calendarResponses(ctx, "/dav/calendars", depth, user)
 			if err != nil {
 				return nil, err
 			}
 			res = append(res, calendarRes...)
-			addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, ensureCollectionHref, propfindReq)
+			addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, propfindReq)
 			if err != nil {
 				return nil, err
 			}
@@ -80,7 +72,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		return res, nil
 	case strings.HasPrefix(cleanPath, "/dav/principals"):
-		responses, err := h.principalResponses(cleanPath, depth, user, ensureCollectionHref)
+		responses, err := h.principalResponses(cleanPath, depth, user)
 		if err != nil {
 			return nil, err
 		}
@@ -96,12 +88,12 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				responses[i] = filterPrincipalPropfindResponse(responses[i], propfindReq)
+				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/calendars"):
-		responses, err := h.calendarResponses(ctx, cleanPath, depth, user, ensureCollectionHref)
+		responses, err := h.calendarResponses(ctx, cleanPath, depth, user)
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +114,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
-		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user, ensureCollectionHref, propfindReq)
+		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user, propfindReq)
 		if err != nil {
 			return nil, err
 		}
@@ -215,7 +207,7 @@ func (h *DavServer) appendCollectionContributors(ctx context.Context, r *http.Re
 	return responses, nil
 }
 
-func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string) ([]response, error) {
+func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth string, user *store.User) ([]response, error) {
 	relPath := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/calendars")
@@ -372,7 +364,7 @@ func (h *DavServer) loadDiscoverableCalendar(ctx context.Context, user *store.Us
 	return nil, store.ErrNotFound
 }
 
-func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string, propfindReq *propfindRequest) ([]response, error) {
+func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
 	relPath := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/addressbooks")
@@ -467,7 +459,7 @@ func (h *DavServer) principalURL(user *store.User) string {
 	return fmt.Sprintf("/dav/principals/%d/", user.ID)
 }
 
-func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User, ensureCollectionHref func(string) string) ([]response, error) {
+func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User) ([]response, error) {
 	relPath := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals"), "/")
 	principalHref := ensureCollectionHref(h.principalURL(user))
 
@@ -519,14 +511,14 @@ func (h *DavServer) expandedPrincipalProp(user *store.User, selections expandPro
 	if selections.CurrentUserPrincipal != nil {
 		filtered := principalResp
 		if selections.CurrentUserPrincipal.Prop != nil {
-			filtered = filterPrincipalPropfindResponse(principalResp, selections.CurrentUserPrincipal)
+			filtered = filterPropfindResponseForKind(principalResp, selections.CurrentUserPrincipal, kindPrincipal)
 		}
 		result.CurrentUserPrincipal = &expandableHrefProp{Response: []response{filtered}}
 	}
 	if selections.PrincipalURL != nil {
 		filtered := principalResp
 		if selections.PrincipalURL.Prop != nil {
-			filtered = filterPrincipalPropfindResponse(principalResp, selections.PrincipalURL)
+			filtered = filterPropfindResponseForKind(principalResp, selections.PrincipalURL, kindPrincipal)
 		}
 		result.PrincipalURL = &expandableHrefProp{Response: []response{filtered}}
 	}

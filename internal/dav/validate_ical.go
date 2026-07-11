@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // validateICalendar performs basic validation of iCalendar data (RFC 5545)
@@ -69,7 +71,7 @@ func validateBalancedTags(data string) error {
 
 func extractICalComponentTypes(icalData string) map[string]struct{} {
 	types := make(map[string]struct{})
-	lines := unfoldICalLines(icalData)
+	lines := ical.UnfoldLines(icalData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -87,7 +89,7 @@ func extractICalComponentTypes(icalData string) map[string]struct{} {
 }
 
 func extractICalRRULECount(icalData string) (int, bool) {
-	lines := unfoldICalLines(icalData)
+	lines := ical.UnfoldLines(icalData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -124,7 +126,7 @@ func extractICalRRULECount(icalData string) (int, bool) {
 }
 
 func countICalAttendees(icalData string) int {
-	lines := unfoldICalLines(icalData)
+	lines := ical.UnfoldLines(icalData)
 	targets := map[string]struct{}{
 		"VEVENT":   {},
 		"VTODO":    {},
@@ -247,7 +249,7 @@ func validateCalendarObjectResource(icalData string) []string {
 }
 
 func parseCalendarTopLevelComponents(icalData string) []calendarTopLevelComponent {
-	lines := unfoldICalLines(icalData)
+	lines := ical.UnfoldLines(icalData)
 	var stack []string
 	var current *calendarTopLevelComponent
 	var components []calendarTopLevelComponent
@@ -320,7 +322,7 @@ func isTopLevelComponentType(componentType string) bool {
 }
 
 func containsICalMethodProperty(icalData string) bool {
-	lines := unfoldICalLines(icalData)
+	lines := ical.UnfoldLines(icalData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {

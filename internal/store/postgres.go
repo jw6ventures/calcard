@@ -749,6 +749,13 @@ func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalend
 	}
 	defer tx.Rollback()
 
+	if err := moveEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func moveEventTx(ctx context.Context, tx queryExecContext, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
 	if destResourceName == "" {
 		destResourceName = uid
 	}
@@ -806,7 +813,7 @@ func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalend
 				return err
 			}
 		}
-		return tx.Commit()
+		return nil
 	}
 
 	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
@@ -819,7 +826,7 @@ func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalend
 		return err
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error) {
@@ -1106,6 +1113,13 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 	}
 	defer tx.Rollback()
 
+	if err := moveContactTx(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func moveContactTx(ctx context.Context, tx queryExecContext, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
 	if destResourceName == "" {
 		destResourceName = uid
 	}
@@ -1151,7 +1165,7 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 				return err
 			}
 		}
-		return tx.Commit()
+		return nil
 	}
 
 	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`
@@ -1164,7 +1178,7 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 		return err
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func (r *contactRepo) GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error) {

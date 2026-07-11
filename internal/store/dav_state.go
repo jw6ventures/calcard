@@ -154,3 +154,119 @@ func davStatePaths(resourcePath string) []string {
 type execContext interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
+
+type queryExecContext interface {
+	execContext
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// MoveEventAndState moves an event between calendars and, in the same
+// transaction, rebinds DAV lock/ACL state from fromStatePath to toStatePath
+// and clears any tombstone left by a previously deleted resource at the
+// destination (replacedUID; empty means nothing was overwritten). Without a
+// connection pool (unit-test fakes) it falls back to sequential repository
+// calls with no rollback.
+func (s *Store) MoveEventAndState(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string) error {
+	if s == nil || s.Events == nil {
+		return ErrNotFound
+	}
+	if s.pool == nil {
+		if err := s.Events.MoveToCalendar(ctx, fromCalendarID, toCalendarID, uid, destResourceName); err != nil {
+			return err
+		}
+		return s.moveDAVStateFallback(ctx, fromStatePath, toStatePath, "event", toCalendarID, replacedUID, destResourceName)
+	}
+
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := moveEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName); err != nil {
+		return err
+	}
+	if err := moveDAVStateTx(ctx, tx, fromStatePath, toStatePath); err != nil {
+		return err
+	}
+	if err := clearReplacedTombstoneTx(ctx, tx, "event", toCalendarID, replacedUID, destResourceName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MoveContactAndState is the contact counterpart of MoveEventAndState.
+func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string) error {
+	if s == nil || s.Contacts == nil {
+		return ErrNotFound
+	}
+	if s.pool == nil {
+		if err := s.Contacts.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
+			return err
+		}
+		return s.moveDAVStateFallback(ctx, fromStatePath, toStatePath, "contact", toAddressBookID, replacedUID, destResourceName)
+	}
+
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := moveContactTx(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
+		return err
+	}
+	if err := moveDAVStateTx(ctx, tx, fromStatePath, toStatePath); err != nil {
+		return err
+	}
+	if err := clearReplacedTombstoneTx(ctx, tx, "contact", toAddressBookID, replacedUID, destResourceName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func moveDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
+	if fromPath == "" || toPath == "" || fromPath == toPath {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, toPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`, toPath, fromPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`, toPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`, toPath, fromPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func clearReplacedTombstoneTx(ctx context.Context, tx execContext, resourceType string, collectionID int64, replacedUID, resourceName string) error {
+	if replacedUID == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND uid=$3 AND resource_name=$4`, resourceType, collectionID, replacedUID, resourceName)
+	return err
+}
+
+func (s *Store) moveDAVStateFallback(ctx context.Context, fromPath, toPath, resourceType string, collectionID int64, replacedUID, resourceName string) error {
+	if fromPath != "" && toPath != "" && fromPath != toPath {
+		if s.ACLEntries != nil {
+			if err := s.ACLEntries.MoveResourcePath(ctx, fromPath, toPath); err != nil {
+				return err
+			}
+		}
+		if s.Locks != nil {
+			if err := s.Locks.MoveResourcePath(ctx, fromPath, toPath); err != nil {
+				return err
+			}
+		}
+	}
+	if replacedUID != "" && s.DeletedResources != nil {
+		return s.DeletedResources.DeleteByIdentity(ctx, resourceType, collectionID, replacedUID, resourceName)
+	}
+	return nil
+}

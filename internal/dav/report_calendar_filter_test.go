@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -186,11 +187,11 @@ func TestGenerateFreeBusyExpandsRRuleByParts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			start, err := parseICalDateTime(tt.dtstart)
+			start, err := ical.ParseDateTime(tt.dtstart)
 			if err != nil {
 				t.Fatalf("parse dtstart: %v", err)
 			}
-			end, err := parseICalDateTime(tt.dtend)
+			end, err := ical.ParseDateTime(tt.dtend)
 			if err != nil {
 				t.Fatalf("parse dtend: %v", err)
 			}

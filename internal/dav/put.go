@@ -147,167 +147,7 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
-		if calendarID == birthdayCalendarID {
-			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
-			return
-		}
-
-		existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceUID)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
-		}
-		requiredPrivilege := "bind"
-		if existingByResource != nil {
-			requiredPrivilege = "write-content"
-		}
-		_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
-		if err != nil {
-			status := http.StatusInternalServerError
-			if err == store.ErrNotFound {
-				status = http.StatusNotFound
-			}
-			if errors.Is(err, errForbidden) {
-				status = http.StatusForbidden
-			}
-			http.Error(w, http.StatusText(status), status)
-			return
-		}
-
-		contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
-		missingContentType := contentType == ""
-		if contentType != "" &&
-			!strings.HasPrefix(contentType, "text/calendar") &&
-			!strings.HasPrefix(contentType, "application/ical") &&
-			!strings.HasPrefix(contentType, "application/ics") {
-			writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
-			return
-		}
-
-		if err := h.validateICalendar(bodyText); err != nil {
-			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
-			return
-		}
-
-		componentTypes := extractICalComponentTypes(bodyText)
-		for comp := range componentTypes {
-			if _, ok := allowedCalendarComponents[comp]; !ok {
-				writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
-				return
-			}
-		}
-		_, hasEvent := componentTypes["VEVENT"]
-		_, hasTodo := componentTypes["VTODO"]
-		_, hasJournal := componentTypes["VJOURNAL"]
-		_, hasFreeBusy := componentTypes["VFREEBUSY"]
-		if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
-			writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
-			return
-		}
-
-		if containsICalMethodProperty(bodyText) {
-			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
-			return
-		}
-
-		if conditions := validateCalendarObjectResource(bodyText); len(conditions) > 0 {
-			if hasMultipleDifferentUIDs(bodyText) {
-				writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
-				return
-			}
-			writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)
-			return
-		}
-
-		minDate, maxDate := caldavDateLimits()
-		for _, t := range extractICalDateTimes(bodyText) {
-			if t.Before(minDate) {
-				writeCalDAVError(w, http.StatusForbidden, "min-date-time")
-				return
-			}
-			if t.After(maxDate) {
-				writeCalDAVError(w, http.StatusForbidden, "max-date-time")
-				return
-			}
-		}
-
-		if attendeeCount := countICalAttendees(bodyText); attendeeCount > caldavMaxAttendees {
-			writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
-			return
-		}
-		if count, ok := extractICalRRULECount(bodyText); ok && count > caldavMaxInstances {
-			writeCalDAVError(w, http.StatusForbidden, "max-instances")
-			return
-		}
-
-		if missingContentType {
-			writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
-			return
-		}
-
-		uid, err := extractUIDFromICalendar(bodyText)
-		if err != nil {
-			writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
-			return
-		}
-		resourceName := resourceUID
-		if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
-			return
-		}
-		if existingByResource != nil && existingByResource.UID != uid {
-			// Reject: client trying to change UID of existing resource
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
-			return
-		}
-
-		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
-		}
-		if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
-			// Reject: client trying to use same UID at different path
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
-			return
-		}
-
-		if !h.checkConditionalHeaders(r, existing) {
-			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
-			return
-		}
-
-		if err := h.davRegistry().validatePut(PutValidation{
-			Context:      r.Context(),
-			User:         user,
-			Request:      r,
-			Path:         cleanPath,
-			ResourceType: ResourceTypeCalendarObject,
-			CollectionID: calendarID,
-			ResourceName: resourceName,
-			ContentType:  contentType,
-			Body:         body,
-			ETag:         etag,
-		}); writeResponseError(w, err) {
-			return
-		}
-
-		if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag}); err != nil {
-			if errors.Is(err, store.ErrConflict) {
-				writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
-				return
-			}
-			h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
-			http.Error(w, "failed to save event", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
-		if existing == nil {
-			h.logger().Info("Put", "created event %q in calendar %d", uid, calendarID)
-			w.WriteHeader(http.StatusCreated)
-		} else {
-			h.logger().Info("Put", "updated event %q in calendar %d", uid, calendarID)
-			w.WriteHeader(http.StatusNoContent)
-		}
+		h.putCalendarObject(w, r, user, calendarID, resourceUID, cleanPath, body, bodyText, etag)
 		return
 	}
 
@@ -323,123 +163,291 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load address book", http.StatusInternalServerError)
 		return
 	} else if matched {
-		book, err := h.getAddressBook(r.Context(), addressBookID)
-		if err != nil {
-			status := http.StatusInternalServerError
-			if err == store.ErrNotFound {
-				status = http.StatusNotFound
-			}
-			http.Error(w, "address book not found", status)
-			return
-		}
-
-		contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
-		if contentType != "" && !strings.HasPrefix(contentType, "text/vcard") {
-			writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
-			return
-		}
-
-		if err := h.validateVCard(bodyText); err != nil {
-			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
-			return
-		}
-
-		uid, err := extractUIDFromVCard(bodyText)
-		if err != nil {
-			writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
-			return
-		}
-
-		// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
-		_, resourceName, _ := parseAddressBookResourceSegments(cleanPath)
-
-		// Check if an existing resource at this path has a different UID
-		existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
-		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
-			return
-		}
-		if existingByName == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
-			return
-		}
-		requiredPrivilege := "bind"
-		if existingByName != nil {
-			requiredPrivilege = "write-content"
-		}
-		if err := h.requireAddressBookPrivilege(r.Context(), user, book, cleanPath, requiredPrivilege); err != nil {
-			status := http.StatusForbidden
-			if err == store.ErrNotFound {
-				status = http.StatusNotFound
-			}
-			http.Error(w, http.StatusText(status), status)
-			return
-		}
-		if existingByName != nil && existingByName.UID != uid {
-			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByName))
-			writeCardDAVUIDConflict(w, conflictHref)
-			return
-		}
-
-		// Check if another resource already uses this UID
-		existingByUID, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
-		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
-			return
-		}
-		if existingByUID != nil && contactResourceName(*existingByUID) != resourceName {
-			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByUID))
-			writeCardDAVUIDConflict(w, conflictHref)
-			return
-		}
-
-		existing := existingByUID
-
-		if !h.checkConditionalHeadersContact(r, existing) {
-			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
-			return
-		}
-
-		if err := h.davRegistry().validatePut(PutValidation{
-			Context:      r.Context(),
-			User:         user,
-			Request:      r,
-			Path:         cleanPath,
-			ResourceType: ResourceTypeAddressObject,
-			CollectionID: addressBookID,
-			ResourceName: resourceName,
-			ContentType:  contentType,
-			Body:         body,
-			ETag:         etag,
-		}); writeResponseError(w, err) {
-			return
-		}
-
-		if existingByName == nil {
-			if err := h.deleteDAVACLState(r.Context(), user, cleanPath); err != nil {
-				http.Error(w, "failed to reset resource ACL state", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: bodyText, ETag: etag}); err != nil {
-			if errors.Is(err, store.ErrConflict) {
-				writeCardDAVUIDConflict(w, cleanPath)
-				return
-			}
-			h.logger().Error("Put", "failed to save contact %q in address book %d: %v", uid, addressBookID, err)
-			http.Error(w, "failed to save contact", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
-		if existing == nil {
-			h.logger().Info("Put", "created contact %q in address book %d", uid, addressBookID)
-			w.WriteHeader(http.StatusCreated)
-		} else {
-			h.logger().Info("Put", "updated contact %q in address book %d", uid, addressBookID)
-			w.WriteHeader(http.StatusNoContent)
-		}
+		h.putContact(w, r, user, addressBookID, cleanPath, body, bodyText, etag)
 		return
 	}
 
 	http.Error(w, "unsupported path", http.StatusBadRequest)
+}
+
+func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string, body []byte, bodyText, etag string) {
+	if calendarID == birthdayCalendarID {
+		http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
+		return
+	}
+
+	existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceUID)
+	if err != nil {
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		return
+	}
+	requiredPrivilege := "bind"
+	if existingByResource != nil {
+		requiredPrivilege = "write-content"
+	}
+	_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		if errors.Is(err, errForbidden) {
+			status = http.StatusForbidden
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	missingContentType := contentType == ""
+	if contentType != "" &&
+		!strings.HasPrefix(contentType, "text/calendar") &&
+		!strings.HasPrefix(contentType, "application/ical") &&
+		!strings.HasPrefix(contentType, "application/ics") {
+		writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
+		return
+	}
+
+	if err := h.validateICalendar(bodyText); err != nil {
+		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
+		return
+	}
+
+	componentTypes := extractICalComponentTypes(bodyText)
+	for comp := range componentTypes {
+		if _, ok := allowedCalendarComponents[comp]; !ok {
+			writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
+			return
+		}
+	}
+	_, hasEvent := componentTypes["VEVENT"]
+	_, hasTodo := componentTypes["VTODO"]
+	_, hasJournal := componentTypes["VJOURNAL"]
+	_, hasFreeBusy := componentTypes["VFREEBUSY"]
+	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
+		return
+	}
+
+	if containsICalMethodProperty(bodyText) {
+		writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
+		return
+	}
+
+	if conditions := validateCalendarObjectResource(bodyText); len(conditions) > 0 {
+		if hasMultipleDifferentUIDs(bodyText) {
+			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
+			return
+		}
+		writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)
+		return
+	}
+
+	minDate, maxDate := caldavDateLimits()
+	for _, t := range extractICalDateTimes(bodyText) {
+		if t.Before(minDate) {
+			writeCalDAVError(w, http.StatusForbidden, "min-date-time")
+			return
+		}
+		if t.After(maxDate) {
+			writeCalDAVError(w, http.StatusForbidden, "max-date-time")
+			return
+		}
+	}
+
+	if attendeeCount := countICalAttendees(bodyText); attendeeCount > caldavMaxAttendees {
+		writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
+		return
+	}
+	if count, ok := extractICalRRULECount(bodyText); ok && count > caldavMaxInstances {
+		writeCalDAVError(w, http.StatusForbidden, "max-instances")
+		return
+	}
+
+	if missingContentType {
+		writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
+		return
+	}
+
+	uid, err := extractUIDFromICalendar(bodyText)
+	if err != nil {
+		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
+		return
+	}
+	resourceName := resourceUID
+	if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+		return
+	}
+	if existingByResource != nil && existingByResource.UID != uid {
+		// Reject: client trying to change UID of existing resource
+		writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+		return
+	}
+
+	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+	if err != nil {
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		return
+	}
+	if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
+		// Reject: client trying to use same UID at different path
+		writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+		return
+	}
+
+	if !h.checkConditionalHeaders(r, existing) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	}
+
+	if err := h.davRegistry().validatePut(PutValidation{
+		Context:      r.Context(),
+		User:         user,
+		Request:      r,
+		Path:         cleanPath,
+		ResourceType: ResourceTypeCalendarObject,
+		CollectionID: calendarID,
+		ResourceName: resourceName,
+		ContentType:  contentType,
+		Body:         body,
+		ETag:         etag,
+	}); writeResponseError(w, err) {
+		return
+	}
+
+	if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag}); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			return
+		}
+		h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
+		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
+	if existing == nil {
+		h.logger().Info("Put", "created event %q in calendar %d", uid, calendarID)
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		h.logger().Info("Put", "updated event %q in calendar %d", uid, calendarID)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string) {
+	book, err := h.getAddressBook(r.Context(), addressBookID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, "address book not found", status)
+		return
+	}
+
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if contentType != "" && !strings.HasPrefix(contentType, "text/vcard") {
+		writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
+		return
+	}
+
+	if err := h.validateVCard(bodyText); err != nil {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
+
+	uid, err := extractUIDFromVCard(bodyText)
+	if err != nil {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
+
+	// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
+	_, resourceName, _ := parseAddressBookResourceSegments(cleanPath)
+
+	// Check if an existing resource at this path has a different UID
+	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
+	if err != nil {
+		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		return
+	}
+	if existingByName == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+		return
+	}
+	requiredPrivilege := "bind"
+	if existingByName != nil {
+		requiredPrivilege = "write-content"
+	}
+	if err := h.requireAddressBookPrivilege(r.Context(), user, book, cleanPath, requiredPrivilege); err != nil {
+		status := http.StatusForbidden
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if existingByName != nil && existingByName.UID != uid {
+		conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByName))
+		writeCardDAVUIDConflict(w, conflictHref)
+		return
+	}
+
+	// Check if another resource already uses this UID
+	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
+	if err != nil {
+		http.Error(w, "failed to load contact", http.StatusInternalServerError)
+		return
+	}
+	if existingByUID != nil && contactResourceName(*existingByUID) != resourceName {
+		conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByUID))
+		writeCardDAVUIDConflict(w, conflictHref)
+		return
+	}
+
+	existing := existingByUID
+
+	if !h.checkConditionalHeadersContact(r, existing) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	}
+
+	if err := h.davRegistry().validatePut(PutValidation{
+		Context:      r.Context(),
+		User:         user,
+		Request:      r,
+		Path:         cleanPath,
+		ResourceType: ResourceTypeAddressObject,
+		CollectionID: addressBookID,
+		ResourceName: resourceName,
+		ContentType:  contentType,
+		Body:         body,
+		ETag:         etag,
+	}); writeResponseError(w, err) {
+		return
+	}
+
+	if existingByName == nil {
+		if err := h.deleteDAVACLState(r.Context(), user, cleanPath); err != nil {
+			http.Error(w, "failed to reset resource ACL state", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: bodyText, ETag: etag}); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeCardDAVUIDConflict(w, cleanPath)
+			return
+		}
+		h.logger().Error("Put", "failed to save contact %q in address book %d: %v", uid, addressBookID, err)
+		http.Error(w, "failed to save contact", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
+	if existing == nil {
+		h.logger().Info("Put", "created contact %q in address book %d", uid, addressBookID)
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		h.logger().Info("Put", "updated contact %q in address book %d", uid, addressBookID)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }

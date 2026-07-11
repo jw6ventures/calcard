@@ -1,12 +1,10 @@
-package dav
+package ical
 
 import (
 	"fmt"
 	"strings"
 	"time"
 )
-
-// Shared iCalendar helpers used by DAV handlers.
 
 var icalDateTimeFormats = []string{
 	"20060102",             // Date only
@@ -26,7 +24,8 @@ var icalLocalFormats = []string{
 	"2006-01-02T15:04:05",
 }
 
-func parseICalDateTime(s string) (time.Time, error) {
+// ParseDateTime parses an iCalendar DATE or DATE-TIME value in UTC.
+func ParseDateTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, fmt.Errorf("empty datetime")
 	}
@@ -40,9 +39,11 @@ func parseICalDateTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
 }
 
-func parseICalDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
-	if loc == nil || hasICalZoneSuffix(s) {
-		return parseICalDateTime(s)
+// ParseDateTimeInLocation parses a floating DATE or DATE-TIME value in loc;
+// values carrying their own zone information ignore loc.
+func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
+	if loc == nil || hasZoneSuffix(s) {
+		return ParseDateTime(s)
 	}
 
 	for _, format := range icalLocalFormats {
@@ -54,7 +55,7 @@ func parseICalDateTimeInLocation(s string, loc *time.Location) (time.Time, error
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
 }
 
-func hasICalZoneSuffix(s string) bool {
+func hasZoneSuffix(s string) bool {
 	if strings.HasSuffix(s, "Z") {
 		return true
 	}
@@ -82,9 +83,9 @@ func isDigits(s string) bool {
 	return s != ""
 }
 
-// extractRRuleParam extracts a parameter value from an RRULE string
-// Example: "FREQ=WEEKLY;BYDAY=MO,WE,FR" -> extractRRuleParam(rrule, "FREQ") returns "WEEKLY"
-func extractRRuleParam(rrule, param string) string {
+// ExtractRRuleParam extracts a parameter value from an RRULE string.
+// Example: "FREQ=WEEKLY;BYDAY=MO,WE,FR" -> ExtractRRuleParam(rrule, "FREQ") returns "WEEKLY".
+func ExtractRRuleParam(rrule, param string) string {
 	parts := strings.Split(rrule, ";")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -98,4 +99,21 @@ func extractRRuleParam(rrule, param string) string {
 		}
 	}
 	return ""
+}
+
+// UnfoldLines normalizes line endings and unfolds RFC 5545 folded content
+// lines (continuations starting with a space or tab).
+func UnfoldLines(raw string) []string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	rawLines := strings.Split(raw, "\n")
+	var lines []string
+	for _, line := range rawLines {
+		if len(lines) > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
+			lines[len(lines)-1] += strings.TrimLeft(line, " \t")
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }

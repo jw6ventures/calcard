@@ -507,28 +507,23 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if err := h.store.Events.MoveToCalendar(r.Context(), srcCalID, destCalID, src.UID, destResourceName); err != nil {
+	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		return
+	}
+	replacedUID := ""
+	if existing != nil {
+		replacedUID = existing.UID
+	}
+	markLockBatchIndexStale(r.Context())
+	defer invalidateACLEntryCache(r.Context())
+	if err := h.store.MoveEventAndState(r.Context(), srcCalID, destCalID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
 		if err == store.ErrConflict {
 			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
 			return
 		}
 		http.Error(w, "failed to move event", http.StatusInternalServerError)
-		return
-	}
-	if err := h.rebindMovedDAVResourceState(r.Context(), user, srcPath(r), destPath, existing != nil); err != nil {
-		if rollbackErr := h.rollbackCalendarMove(r.Context(), destCalID, destResourceName, *src, existing); rollbackErr != nil {
-			http.Error(w, "failed to roll back move after state rebind failure", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "failed to rebind resource state", http.StatusInternalServerError)
-		return
-	}
-	if err := h.clearOverwrittenEventTombstone(r.Context(), destCalID, existing, destResourceName); err != nil {
-		if rollbackErr := h.rollbackCalendarMove(r.Context(), destCalID, destResourceName, *src, existing); rollbackErr != nil {
-			http.Error(w, "failed to roll back move after tombstone cleanup failure", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "failed to finalize move", http.StatusInternalServerError)
 		return
 	}
 
@@ -626,24 +621,19 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 		}
 	}
 
-	if err := h.store.Contacts.MoveToAddressBook(r.Context(), srcBookID, destBookID, src.UID, destResourceName); err != nil {
+	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		return
+	}
+	replacedUID := ""
+	if existingByName != nil {
+		replacedUID = existingByName.UID
+	}
+	markLockBatchIndexStale(r.Context())
+	defer invalidateACLEntryCache(r.Context())
+	if err := h.store.MoveContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
 		http.Error(w, "failed to move contact", http.StatusInternalServerError)
-		return
-	}
-	if err := h.rebindMovedDAVResourceState(r.Context(), user, srcPath(r), destPath, existingByName != nil); err != nil {
-		if rollbackErr := h.rollbackContactMove(r.Context(), destBookID, destResourceName, *src, existingByName); rollbackErr != nil {
-			http.Error(w, "failed to roll back move after state rebind failure", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "failed to rebind resource state", http.StatusInternalServerError)
-		return
-	}
-	if err := h.clearOverwrittenContactTombstone(r.Context(), destBookID, existingByName, destResourceName); err != nil {
-		if rollbackErr := h.rollbackContactMove(r.Context(), destBookID, destResourceName, *src, existingByName); rollbackErr != nil {
-			http.Error(w, "failed to roll back move after tombstone cleanup failure", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "failed to finalize move", http.StatusInternalServerError)
 		return
 	}
 
@@ -692,96 +682,10 @@ func srcPath(r *http.Request) string {
 	return path.Clean(r.URL.Path)
 }
 
-func (h *DavServer) rollbackCalendarMove(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
-	if err := h.store.Events.MoveToCalendar(ctx, currentCalendarID, src.CalendarID, src.UID, eventResourceName(src)); err != nil {
-		return err
-	}
-	if replaced == nil {
-		return h.cleanupRollbackEventTombstones(ctx, currentCalendarID, currentResourceName, src, nil)
-	}
-	restore := *replaced
-	if _, err := h.store.Events.Upsert(ctx, restore); err != nil {
-		return err
-	}
-	return h.cleanupRollbackEventTombstones(ctx, currentCalendarID, currentResourceName, src, replaced)
-}
-
-func (h *DavServer) rollbackContactMove(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
-	if err := h.store.Contacts.MoveToAddressBook(ctx, currentAddressBookID, src.AddressBookID, src.UID, contactResourceName(src)); err != nil {
-		return err
-	}
-	if replaced == nil {
-		return h.cleanupRollbackContactTombstones(ctx, currentAddressBookID, currentResourceName, src, nil)
-	}
-	restore := *replaced
-	if _, err := h.store.Contacts.Upsert(ctx, restore); err != nil {
-		return err
-	}
-	return h.cleanupRollbackContactTombstones(ctx, currentAddressBookID, currentResourceName, src, replaced)
-}
-
 func newCopyETag(raw string, destinationID int64) string {
 	entropy := make([]byte, 16)
 	if _, err := rand.Read(entropy); err != nil {
 		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", raw, destinationID, store.Now().UnixNano()))))
 	}
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(raw+fmt.Sprint(destinationID)+hex.EncodeToString(entropy))))
-}
-
-func (h *DavServer) clearOverwrittenEventTombstone(ctx context.Context, calendarID int64, replaced *store.Event, resourceName string) error {
-	if replaced == nil || h == nil || h.store == nil || h.store.DeletedResources == nil {
-		return nil
-	}
-	return h.store.DeletedResources.DeleteByIdentity(ctx, "event", calendarID, replaced.UID, resourceName)
-}
-
-func (h *DavServer) clearOverwrittenContactTombstone(ctx context.Context, addressBookID int64, replaced *store.Contact, resourceName string) error {
-	if replaced == nil || h == nil || h.store == nil || h.store.DeletedResources == nil {
-		return nil
-	}
-	return h.store.DeletedResources.DeleteByIdentity(ctx, "contact", addressBookID, replaced.UID, resourceName)
-}
-
-func (h *DavServer) cleanupRollbackEventTombstones(ctx context.Context, currentCalendarID int64, currentResourceName string, src store.Event, replaced *store.Event) error {
-	if h.store == nil || h.store.DeletedResources == nil {
-		return nil
-	}
-	for _, tombstone := range []struct {
-		collectionID int64
-		uid          string
-		resourceName string
-	}{
-		{collectionID: src.CalendarID, uid: src.UID, resourceName: eventResourceName(src)},
-		{collectionID: currentCalendarID, uid: src.UID, resourceName: currentResourceName},
-	} {
-		if err := h.store.DeletedResources.DeleteByIdentity(ctx, "event", tombstone.collectionID, tombstone.uid, tombstone.resourceName); err != nil {
-			return err
-		}
-	}
-	if replaced == nil {
-		return nil
-	}
-	return h.store.DeletedResources.DeleteByIdentity(ctx, "event", currentCalendarID, replaced.UID, eventResourceName(*replaced))
-}
-
-func (h *DavServer) cleanupRollbackContactTombstones(ctx context.Context, currentAddressBookID int64, currentResourceName string, src store.Contact, replaced *store.Contact) error {
-	if h.store == nil || h.store.DeletedResources == nil {
-		return nil
-	}
-	for _, tombstone := range []struct {
-		collectionID int64
-		uid          string
-		resourceName string
-	}{
-		{collectionID: src.AddressBookID, uid: src.UID, resourceName: contactResourceName(src)},
-		{collectionID: currentAddressBookID, uid: src.UID, resourceName: currentResourceName},
-	} {
-		if err := h.store.DeletedResources.DeleteByIdentity(ctx, "contact", tombstone.collectionID, tombstone.uid, tombstone.resourceName); err != nil {
-			return err
-		}
-	}
-	if replaced == nil {
-		return nil
-	}
-	return h.store.DeletedResources.DeleteByIdentity(ctx, "contact", currentAddressBookID, replaced.UID, contactResourceName(*replaced))
 }

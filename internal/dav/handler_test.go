@@ -15,6 +15,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -1979,7 +1980,7 @@ func TestLoadAddressBookWrongUser(t *testing.T) {
 
 func TestPrincipalResponsesRejectsOtherPrincipal(t *testing.T) {
 	h := &DavServer{}
-	_, err := h.principalResponses("/dav/principals/999", "0", &store.User{ID: 1}, func(s string) string { return s })
+	_, err := h.principalResponses("/dav/principals/999", "0", &store.User{ID: 1})
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -2858,7 +2859,10 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 	})
 }
 
-func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
+// Move atomicity (move + state rebind + tombstone cleanup in one transaction)
+// is covered by the store-level MoveEventAndState/MoveContactAndState tests;
+// these tests cover the handler-visible behavior via the store fallback path.
+func TestMoveRebindsACLStateAndSurfacesRebindFailure(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	t.Run("calendar move rebinding succeeds", func(t *testing.T) {
@@ -2903,7 +2907,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("calendar move rolls back when ACL rebind fails", func(t *testing.T) {
+	t.Run("calendar move surfaces ACL rebind failure", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			accessible: []store.CalendarAccess{
 				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
@@ -2915,20 +2919,13 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
 			},
 		}
-		deletedRepo := &fakeDeletedResourceRepo{}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
-			moveResourcePathHook: func(fromPath, toPath string) {
-				deletedRepo.deleted = []store.DeletedResource{
-					{ResourceType: "event", CollectionID: 2, UID: "event", ResourceName: "event", DeletedAt: time.Now()},
-					{ResourceType: "event", CollectionID: 3, UID: "event", ResourceName: "moved", DeletedAt: time.Now()},
-				}
-			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2939,23 +2936,8 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		if rr.Code != http.StatusInternalServerError {
 			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src == nil || src.ETag != "etag-source" {
-			t.Fatalf("expected source event to be restored, got %#v", src)
-		}
-		if dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); dest != nil {
-			t.Fatalf("expected destination event creation to be rolled back, got %#v", dest)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/2/event"); len(entries) != 1 {
-			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
-		}
 		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/3/moved"); len(entries) != 0 {
-			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected source event tombstones to be removed during rollback, got %#v", tombstones)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 3, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected destination event tombstones to be removed during rollback, got %#v", tombstones)
+			t.Fatalf("expected no destination ACL entry after failed rebind, got %#v", entries)
 		}
 	})
 
@@ -3001,7 +2983,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("contact move rolls back when ACL rebind fails", func(t *testing.T) {
+	t.Run("contact move surfaces ACL rebind failure", func(t *testing.T) {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Contacts"},
@@ -3013,20 +2995,13 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
 			},
 		}
-		deletedRepo := &fakeDeletedResourceRepo{}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
-			moveResourcePathHook: func(fromPath, toPath string) {
-				deletedRepo.deleted = []store.DeletedResource{
-					{ResourceType: "contact", CollectionID: 5, UID: "alice", ResourceName: "alice", DeletedAt: time.Now()},
-					{ResourceType: "contact", CollectionID: 6, UID: "alice", ResourceName: "moved", DeletedAt: time.Now()},
-				}
-			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -3037,23 +3012,8 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		if rr.Code != http.StatusInternalServerError {
 			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if src, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); src == nil || src.ETag != "etag-source" {
-			t.Fatalf("expected source contact to be restored, got %#v", src)
-		}
-		if dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "moved"); dest != nil {
-			t.Fatalf("expected destination contact creation to be rolled back, got %#v", dest)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/5/alice"); len(entries) != 1 {
-			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
-		}
 		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/6/moved"); len(entries) != 0 {
-			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 5, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected source contact tombstones to be removed during rollback, got %#v", tombstones)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected destination contact tombstones to be removed during rollback, got %#v", tombstones)
+			t.Fatalf("expected no destination ACL entry after failed rebind, got %#v", entries)
 		}
 	})
 }
@@ -9296,7 +9256,7 @@ func TestParseICalDateTime(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result, err := parseICalDateTime(tt.input)
+			result, err := ical.ParseDateTime(tt.input)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error for %q", tt.input)
@@ -9644,8 +9604,8 @@ func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
 	if strings.Contains(respBody, `HTTP/1.1 200 OK`) {
 		t.Fatalf("did not expect empty 200 propstat for missing color, got %s", respBody)
 	}
-	if !strings.Contains(respBody, `<ical:calendar-color>calendar-color</ical:calendar-color>`) {
-		t.Fatalf("expected calendar-color in 404 propstat, got %s", respBody)
+	if !strings.Contains(respBody, `<ical:calendar-color></ical:calendar-color>`) {
+		t.Fatalf("expected empty calendar-color element in 404 propstat, got %s", respBody)
 	}
 }
 

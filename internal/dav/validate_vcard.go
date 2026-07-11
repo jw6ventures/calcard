@@ -3,12 +3,14 @@ package dav
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // extractUIDFromVCard extracts the UID property from vCard data
 func extractUIDFromVCard(vcardData string) (string, error) {
 	// Unfold lines per RFC 6350 (same as RFC 5545)
-	lines := unfoldICalLines(vcardData)
+	lines := ical.UnfoldLines(vcardData)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -54,7 +56,7 @@ func (h *DavServer) validateVCard(data string) error {
 		return fmt.Errorf("address object resources must contain exactly one VCARD")
 	}
 
-	lines := unfoldICalLines(trimmed)
+	lines := ical.UnfoldLines(trimmed)
 	versionCount := 0
 	hasFN := false
 	uidCount := 0

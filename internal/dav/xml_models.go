@@ -33,8 +33,42 @@ type responseError struct {
 }
 
 type propstat struct {
-	Prop   prop   `xml:"d:prop"`
-	Status string `xml:"d:status"`
+	Prop prop `xml:"d:prop"`
+	// PropNames renders the prop element as a list of empty property
+	// elements instead of Prop — used for 404 propstats and propname
+	// responses, where RFC 4918 requires names without values.
+	PropNames []xml.Name `xml:"-"`
+	Status    string     `xml:"d:status"`
+}
+
+func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if len(p.PropNames) == 0 {
+		type propstatNoMarshal propstat
+		return e.EncodeElement(propstatNoMarshal(p), start)
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	propStart := xml.StartElement{Name: xml.Name{Local: "d:prop"}}
+	if err := e.EncodeToken(propStart); err != nil {
+		return err
+	}
+	for _, name := range p.PropNames {
+		el := xml.StartElement{Name: name}
+		if err := e.EncodeToken(el); err != nil {
+			return err
+		}
+		if err := e.EncodeToken(el.End()); err != nil {
+			return err
+		}
+	}
+	if err := e.EncodeToken(propStart.End()); err != nil {
+		return err
+	}
+	if err := e.EncodeElement(p.Status, xml.StartElement{Name: xml.Name{Local: "d:status"}}); err != nil {
+		return err
+	}
+	return e.EncodeToken(start.End())
 }
 
 type prop struct {

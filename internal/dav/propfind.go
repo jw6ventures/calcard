@@ -1,7 +1,6 @@
 package dav
 
 import (
-	"encoding/xml"
 	"errors"
 	"net/http"
 	"strings"
@@ -88,14 +87,13 @@ func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))
 
-	payload := multistatus{
-		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:    "DAV:",
-		XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-		XmlnsCS:   "http://calendarserver.org/ns/",
-		XmlnsICAL: "http://apple.com/ns/ical/",
-		Response:  responses,
+	// RFC 4918 §9.1: <propname/> asks for the names of the resource's
+	// properties, not their values.
+	if propfindReq.PropName != nil {
+		for i := range responses {
+			responses[i] = propnamePropfindResponse(responses[i])
+		}
 	}
-	writeMultiStatus(w, payload)
+
+	writeMultiStatus(w, newMultistatus(responses, ""))
 }

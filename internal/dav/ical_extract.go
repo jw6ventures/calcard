@@ -3,10 +3,12 @@ package dav
 import (
 	"strings"
 	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
-func extractICalDateTimes(ical string) []time.Time {
-	lines := unfoldICalLines(ical)
+func extractICalDateTimes(raw string) []time.Time {
+	lines := ical.UnfoldLines(raw)
 	var times []time.Time
 	for _, line := range lines {
 		if line == "" {
@@ -39,31 +41,16 @@ func extractICalDateTimes(ical string) []time.Time {
 		var err error
 		if tzid != "" {
 			if loc, locErr := time.LoadLocation(tzid); locErr == nil {
-				parsed, err = parseICalDateTimeInLocation(value, loc)
+				parsed, err = ical.ParseDateTimeInLocation(value, loc)
 			} else {
-				parsed, err = parseICalDateTime(value)
+				parsed, err = ical.ParseDateTime(value)
 			}
 		} else {
-			parsed, err = parseICalDateTime(value)
+			parsed, err = ical.ParseDateTime(value)
 		}
 		if err == nil {
 			times = append(times, parsed)
 		}
 	}
 	return times
-}
-
-func unfoldICalLines(ical string) []string {
-	ical = strings.ReplaceAll(ical, "\r\n", "\n")
-	ical = strings.ReplaceAll(ical, "\r", "\n")
-	rawLines := strings.Split(ical, "\n")
-	var lines []string
-	for _, line := range rawLines {
-		if len(lines) > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
-			lines[len(lines)-1] += strings.TrimLeft(line, " \t")
-			continue
-		}
-		lines = append(lines, line)
-	}
-	return lines
 }

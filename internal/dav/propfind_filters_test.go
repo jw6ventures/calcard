@@ -2,10 +2,15 @@ package dav
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jw6ventures/calcard/internal/acl"
+	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -112,20 +117,39 @@ func TestFilterReadableAddressBookContactsPrefetchesOnce(t *testing.T) {
 	}
 }
 
-func TestPropstatForAddressObjectPropfindCoversSupportedAndMissingProperties(t *testing.T) {
-	src := prop{
-		GetETag:                `"etag-alice"`,
-		GetContentType:         "text/vcard; charset=utf-8",
-		AddressData:            cdataString(buildVCard("3.0", "UID:alice", "FN:Alice Example", "EMAIL:alice@example.com")),
-		SupportedReportSet:     addressbookSupportedReports(),
-		LockDiscovery:          &lockDiscoveryProp{},
-		SupportedLock:          defaultSupportedLock(),
-		ACL:                    &aclProp{},
-		SupportedPrivilegeSet:  defaultSupportedPrivilegeSet(),
-		PrincipalCollectionSet: &hrefListProp{Href: []string{"/dav/principals/"}},
+func propstatNotFoundNameSet(stats []propstat) map[xml.Name]bool {
+	names := map[xml.Name]bool{}
+	for i := range stats {
+		if stats[i].Status != httpStatusNotFound {
+			continue
+		}
+		for _, name := range stats[i].PropNames {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+func TestFilterAddressObjectPropfindCoversSupportedAndMissingProperties(t *testing.T) {
+	resp := response{
+		Href: "/dav/addressbooks/5/alice.vcf",
+		Propstat: []propstat{{
+			Prop: prop{
+				GetETag:                `"etag-alice"`,
+				GetContentType:         "text/vcard; charset=utf-8",
+				AddressData:            cdataString(buildVCard("3.0", "UID:alice", "FN:Alice Example", "EMAIL:alice@example.com")),
+				SupportedReportSet:     addressbookSupportedReports(),
+				LockDiscovery:          &lockDiscoveryProp{},
+				SupportedLock:          defaultSupportedLock(),
+				ACL:                    &aclProp{},
+				SupportedPrivilegeSet:  defaultSupportedPrivilegeSet(),
+				PrincipalCollectionSet: &hrefListProp{Href: []string{"/dav/principals/"}},
+			},
+			Status: httpStatusOK,
+		}},
 	}
 
-	req := &propfindPropQuery{
+	filtered := filterAddressObjectPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
 		GetETag:                &struct{}{},
 		GetContentType:         &struct{}{},
 		AddressData:            &addressDataQuery{Prop: []addressDataProp{{Name: "FN"}}},
@@ -136,27 +160,25 @@ func TestPropstatForAddressObjectPropfindCoversSupportedAndMissingProperties(t *
 		SupportedPrivilegeSet:  &struct{}{},
 		PrincipalCollectionSet: &struct{}{},
 		DisplayName:            &struct{}{},
+	}})
+	if len(filtered.Propstat) != 2 {
+		t.Fatalf("expected 2 propstats, got %#v", filtered.Propstat)
 	}
-
-	stats := propstatForAddressObjectPropfind(req, src)
-	if len(stats) != 2 {
-		t.Fatalf("expected 2 propstats, got %d", len(stats))
-	}
-	okStat := propstatWithStatus(stats, httpStatusOK)
+	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
 	if okStat == nil {
 		t.Fatal("expected 200 propstat")
 	}
 	if string(okStat.Prop.AddressData) == "" || okStat.Prop.SupportedLock == nil || okStat.Prop.ACL == nil {
 		t.Fatalf("expected supported properties in 200 propstat, got %#v", okStat.Prop)
 	}
-	notFound := propstatWithStatus(stats, httpStatusNotFound)
-	if notFound == nil || notFound.Prop.DisplayName != "displayname" {
-		t.Fatalf("expected displayname in 404 propstat, got %#v", notFound)
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	if !notFound[xml.Name{Local: "d:displayname"}] {
+		t.Fatalf("expected displayname in 404 propstat names, got %#v", notFound)
 	}
 
-	emptyStats := propstatForAddressObjectPropfind(&propfindPropQuery{}, src)
-	if len(emptyStats) != 1 || emptyStats[0].Status != httpStatusOK {
-		t.Fatalf("expected empty request to produce empty 200 propstat, got %#v", emptyStats)
+	empty := filterAddressObjectPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{}})
+	if len(empty.Propstat) != 1 || empty.Propstat[0].Status != httpStatusOK {
+		t.Fatalf("expected empty request to produce empty 200 propstat, got %#v", empty.Propstat)
 	}
 }
 
@@ -222,44 +244,16 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:                   &struct{}{},
-		ResourceType:                  &struct{}{},
-		CurrentUserPrincipal:          &struct{}{},
-		CurrentUserPrincipalURL:       &struct{}{},
-		PrincipalURL:                  &struct{}{},
-		CalendarHomeSet:               &struct{}{},
-		AddressbookHomeSet:            &struct{}{},
-		SupportedReportSet:            &struct{}{},
-		LockDiscovery:                 &struct{}{},
-		SupportedLock:                 &struct{}{},
-		ACLProp:                       &struct{}{},
-		SupportedPrivilegeSet:         &struct{}{},
-		PrincipalCollectionSet:        &struct{}{},
-		GetETag:                       &struct{}{},
-		GetContentType:                &struct{}{},
-		CalendarData:                  &struct{}{},
-		AddressData:                   &addressDataQuery{},
-		CalendarDescription:           &struct{}{},
-		CalendarTimezone:              &struct{}{},
-		AddressBookDesc:               &struct{}{},
-		SupportedAddressData:          &struct{}{},
-		AddressBookMaxResourceSize:    &struct{}{},
-		SupportedCollationSet:         &struct{}{},
-		SyncToken:                     &struct{}{},
-		CTag:                          &struct{}{},
-		PrincipalAddress:              &struct{}{},
-		SupportedCalendarComponentSet: &struct{}{},
-		MaxResourceSize:               &struct{}{},
-		MinDateTime:                   &struct{}{},
-		MaxDateTime:                   &struct{}{},
-		MaxInstances:                  &struct{}{},
-		MaxAttendeesPerInstance:       &struct{}{},
-		ScheduleCalendarTransp:        &struct{}{},
-		SupportedCalendarData:         &struct{}{},
-		CalendarServerReadOnly:        &struct{}{},
-		CurrentUserPrivilegeSet:       &struct{}{},
-		Owner:                         &struct{}{},
+	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+		DisplayName:             &struct{}{},
+		ResourceType:            &struct{}{},
+		PrincipalURL:            &struct{}{},
+		ACLProp:                 &struct{}{},
+		GetETag:                 &struct{}{},
+		CalendarTimezone:        &struct{}{},
+		ScheduleCalendarTransp:  &struct{}{},
+		CurrentUserPrivilegeSet: &struct{}{},
+		Owner:                   &struct{}{},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -269,9 +263,11 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 	if okStat == nil || okStat.Prop.PrincipalURL == nil || okStat.Prop.ACL == nil {
 		t.Fatalf("expected supported principal props in 200 propstat, got %#v", okStat)
 	}
-	notFound := propstatWithStatus(filtered.Propstat, httpStatusNotFound)
-	if notFound == nil || notFound.Prop.CalendarTimezone == nil || notFound.Prop.ScheduleCalendarTransp == nil {
-		t.Fatalf("expected unsupported principal props in 404 propstat, got %#v", notFound)
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	for _, name := range []string{"d:getetag", "cal:calendar-timezone", "cal:schedule-calendar-transp", "d:owner"} {
+		if !notFound[xml.Name{Local: name}] {
+			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
+		}
 	}
 }
 
@@ -286,57 +282,20 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 			SupportedCollationSet:      supportedCollationSetProp(),
 			SyncToken:                  "sync-token",
 			CTag:                       "5",
-			CurrentUserPrincipal:       &expandableHrefProp{Href: "/dav/principals/1/"},
-			CurrentUserPrincipalURL:    &hrefProp{Href: "/dav/principals/1/"},
-			AddressbookHomeSet:         &hrefListProp{Href: []string{"/dav/addressbooks/"}},
 			SupportedReportSet:         addressbookSupportedReports(),
-			LockDiscovery:              &lockDiscoveryProp{},
-			SupportedLock:              defaultSupportedLock(),
 			ACL:                        &aclProp{},
-			SupportedPrivilegeSet:      defaultSupportedPrivilegeSet(),
-			PrincipalCollectionSet:     &hrefListProp{Href: []string{"/dav/principals/"}},
 		},
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterAddressBookCollectionPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:                   &struct{}{},
-		ResourceType:                  &struct{}{},
-		AddressBookDesc:               &struct{}{},
-		SupportedAddressData:          &struct{}{},
-		AddressBookMaxResourceSize:    &struct{}{},
-		SupportedCollationSet:         &struct{}{},
-		SyncToken:                     &struct{}{},
-		CTag:                          &struct{}{},
-		CurrentUserPrincipal:          &struct{}{},
-		CurrentUserPrincipalURL:       &struct{}{},
-		AddressbookHomeSet:            &struct{}{},
-		SupportedReportSet:            &struct{}{},
-		LockDiscovery:                 &struct{}{},
-		SupportedLock:                 &struct{}{},
-		ACLProp:                       &struct{}{},
-		SupportedPrivilegeSet:         &struct{}{},
-		PrincipalCollectionSet:        &struct{}{},
-		GetETag:                       &struct{}{},
-		GetContentType:                &struct{}{},
-		CalendarData:                  &struct{}{},
-		AddressData:                   &addressDataQuery{},
-		CalendarDescription:           &struct{}{},
-		CalendarTimezone:              &struct{}{},
-		PrincipalURL:                  &struct{}{},
-		CalendarHomeSet:               &struct{}{},
-		PrincipalAddress:              &struct{}{},
-		SupportedCalendarComponentSet: &struct{}{},
-		MaxResourceSize:               &struct{}{},
-		MinDateTime:                   &struct{}{},
-		MaxDateTime:                   &struct{}{},
-		MaxInstances:                  &struct{}{},
-		MaxAttendeesPerInstance:       &struct{}{},
-		ScheduleCalendarTransp:        &struct{}{},
-		SupportedCalendarData:         &struct{}{},
-		CalendarServerReadOnly:        &struct{}{},
-		CurrentUserPrivilegeSet:       &struct{}{},
-		Owner:                         &struct{}{},
+	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+		DisplayName:          &struct{}{},
+		SupportedAddressData: &struct{}{},
+		ACLProp:              &struct{}{},
+		GetETag:              &struct{}{},
+		PrincipalURL:         &struct{}{},
+		CalendarTimezone:     &struct{}{},
+		CalendarHomeSet:      &struct{}{},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -346,81 +305,42 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 	if okStat == nil || okStat.Prop.SupportedAddressData == nil || okStat.Prop.ACL == nil {
 		t.Fatalf("expected supported address book props in 200 propstat, got %#v", okStat)
 	}
-	notFound := propstatWithStatus(filtered.Propstat, httpStatusNotFound)
-	if notFound == nil || notFound.Prop.PrincipalURL == nil || notFound.Prop.CalendarTimezone == nil {
-		t.Fatalf("expected unsupported address book props in 404 propstat, got %#v", notFound)
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	for _, name := range []string{"d:getetag", "d:principal-URL", "cal:calendar-timezone", "cal:calendar-home-set"} {
+		if !notFound[xml.Name{Local: name}] {
+			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
+		}
 	}
 }
 
 func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testing.T) {
 	resp := response{Href: "/dav/calendars/1/", Propstat: []propstat{{
 		Prop: prop{
-			DisplayName:                   "Calendar",
-			ResourceType:                  resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
-			CalendarDescription:           "Primary calendar",
-			CalendarTimezone:              stringPtr("BEGIN:VTIMEZONE\r\nEND:VTIMEZONE\r\n"),
-			SyncToken:                     "sync-token",
-			CTag:                          "9",
-			CurrentUserPrincipal:          &expandableHrefProp{Href: "/dav/principals/1/"},
-			CurrentUserPrincipalURL:       &hrefProp{Href: "/dav/principals/1/"},
-			SupportedReportSet:            calendarSupportedReports(),
-			SupportedCalendarComponentSet: supportedCalendarComponents(),
-			MaxResourceSize:               "10485760",
-			MinDateTime:                   caldavMinDateTime,
-			MaxDateTime:                   caldavMaxDateTime,
-			MaxInstances:                  "1000",
-			MaxAttendeesPerInstance:       "100",
-			ScheduleCalendarTransp:        &scheduleCalendarTransp{Opaque: &struct{}{}},
-			SupportedCalendarData:         supportedCalendarDataProp(),
-			CalendarServerReadOnly:        &struct{}{},
-			CurrentUserPrivilegeSet:       calendarCurrentUserPrivilegeSet(true),
-			LockDiscovery:                 &lockDiscoveryProp{},
-			SupportedLock:                 defaultSupportedLock(),
-			ACL:                           &aclProp{},
-			SupportedPrivilegeSet:         defaultSupportedPrivilegeSet(),
-			PrincipalCollectionSet:        &hrefListProp{Href: []string{"/dav/principals/"}},
+			DisplayName:             "Calendar",
+			ResourceType:            resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
+			CalendarDescription:     "Primary calendar",
+			CalendarTimezone:        stringPtr("BEGIN:VTIMEZONE\r\nEND:VTIMEZONE\r\n"),
+			SyncToken:               "sync-token",
+			CTag:                    "9",
+			ScheduleCalendarTransp:  &scheduleCalendarTransp{Opaque: &struct{}{}},
+			CurrentUserPrivilegeSet: calendarCurrentUserPrivilegeSet(true),
+			ACL:                     &aclProp{},
 		},
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterCalendarCollectionPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:                   &struct{}{},
-		ResourceType:                  &struct{}{},
-		CalendarDescription:           &struct{}{},
-		CalendarTimezone:              &struct{}{},
-		SyncToken:                     &struct{}{},
-		CTag:                          &struct{}{},
-		CurrentUserPrincipal:          &struct{}{},
-		CurrentUserPrincipalURL:       &struct{}{},
-		SupportedReportSet:            &struct{}{},
-		SupportedCalendarComponentSet: &struct{}{},
-		MaxResourceSize:               &struct{}{},
-		MinDateTime:                   &struct{}{},
-		MaxDateTime:                   &struct{}{},
-		MaxInstances:                  &struct{}{},
-		MaxAttendeesPerInstance:       &struct{}{},
-		ScheduleCalendarTransp:        &struct{}{},
-		SupportedCalendarData:         &struct{}{},
-		CalendarServerReadOnly:        &struct{}{},
-		CurrentUserPrivilegeSet:       &struct{}{},
-		LockDiscovery:                 &struct{}{},
-		SupportedLock:                 &struct{}{},
-		ACLProp:                       &struct{}{},
-		SupportedPrivilegeSet:         &struct{}{},
-		PrincipalCollectionSet:        &struct{}{},
-		GetETag:                       &struct{}{},
-		GetContentType:                &struct{}{},
-		CalendarData:                  &struct{}{},
-		AddressData:                   &addressDataQuery{},
-		AddressBookDesc:               &struct{}{},
-		SupportedAddressData:          &struct{}{},
-		AddressBookMaxResourceSize:    &struct{}{},
-		SupportedCollationSet:         &struct{}{},
-		PrincipalURL:                  &struct{}{},
-		CalendarHomeSet:               &struct{}{},
-		AddressbookHomeSet:            &struct{}{},
-		PrincipalAddress:              &struct{}{},
-		Owner:                         &struct{}{},
+	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+		DisplayName:             &struct{}{},
+		CalendarDescription:     &struct{}{},
+		CalendarTimezone:        &struct{}{},
+		CalendarColor:           &struct{}{},
+		ScheduleCalendarTransp:  &struct{}{},
+		CurrentUserPrivilegeSet: &struct{}{},
+		ACLProp:                 &struct{}{},
+		GetETag:                 &struct{}{},
+		AddressBookDesc:         &struct{}{},
+		PrincipalURL:            &struct{}{},
+		Owner:                   &struct{}{},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -430,8 +350,79 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 	if okStat == nil || okStat.Prop.ScheduleCalendarTransp == nil || okStat.Prop.CurrentUserPrivilegeSet == nil {
 		t.Fatalf("expected supported calendar props in 200 propstat, got %#v", okStat)
 	}
-	notFound := propstatWithStatus(filtered.Propstat, httpStatusNotFound)
-	if notFound == nil || notFound.Prop.AddressBookDesc == "" || notFound.Prop.PrincipalURL == nil {
-		t.Fatalf("expected unsupported calendar props in 404 propstat, got %#v", notFound)
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	// calendar-color was requested but is unset on this calendar: 404, not junk.
+	for _, name := range []string{"d:getetag", "card:addressbook-description", "d:principal-URL", "d:owner", "ical:calendar-color"} {
+		if !notFound[xml.Name{Local: name}] {
+			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
+		}
+	}
+}
+
+// A17 regression: 404 propstats must contain empty property elements, not
+// sentinel values like <d:getetag>getetag</d:getetag>.
+func TestPropfindNotFoundPropstatHasNoSentinelValues(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", UpdatedAt: now}, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 1, Name: "Work", UpdatedAt: now},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
+
+	body := `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getetag/></d:prop></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	got := rr.Body.String()
+	if !strings.Contains(got, "<d:getetag></d:getetag>") {
+		t.Fatalf("expected empty getetag element in 404 propstat, got %s", got)
+	}
+	if strings.Contains(got, ">getetag</d:getetag>") && strings.Contains(got, "<d:getetag>getetag") {
+		t.Fatalf("404 propstat still carries sentinel value, got %s", got)
+	}
+	if !strings.Contains(got, "Work") {
+		t.Fatalf("expected displayname value in 200 propstat, got %s", got)
+	}
+}
+
+// A4 regression: <propname/> must return property names without values.
+func TestPropfindPropnameReturnsNamesWithoutValues(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", UpdatedAt: now}, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 1, Name: "Work", UpdatedAt: now},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
+
+	body := `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	got := rr.Body.String()
+	if !strings.Contains(got, "<d:displayname></d:displayname>") {
+		t.Fatalf("expected empty displayname element for propname, got %s", got)
+	}
+	if strings.Contains(got, "Work") {
+		t.Fatalf("propname response must not contain property values, got %s", got)
 	}
 }

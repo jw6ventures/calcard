@@ -3,6 +3,8 @@ package dav
 import (
 	"fmt"
 	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 const (
@@ -20,11 +22,11 @@ var (
 
 func init() {
 	var err error
-	caldavMinTime, err = parseICalDateTime(caldavMinDateTime)
+	caldavMinTime, err = ical.ParseDateTime(caldavMinDateTime)
 	if err != nil {
 		panic(fmt.Sprintf("invalid caldavMinDateTime constant: %v", err))
 	}
-	caldavMaxTime, err = parseICalDateTime(caldavMaxDateTime)
+	caldavMaxTime, err = ical.ParseDateTime(caldavMaxDateTime)
 	if err != nil {
 		panic(fmt.Sprintf("invalid caldavMaxDateTime constant: %v", err))
 	}
