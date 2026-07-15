@@ -703,7 +703,7 @@ func stripAddressBookAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
-			if prop.ResourceType.AddressBook == nil {
+			if prop.ResourceType == nil || prop.ResourceType.AddressBook == nil {
 				continue
 			}
 			prop.AddressBookDesc = ""
@@ -718,7 +718,7 @@ func stripPrincipalAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
-			if prop.ResourceType.Principal == nil {
+			if prop.ResourceType == nil || prop.ResourceType.Principal == nil {
 				continue
 			}
 			prop.CalendarHomeSet = nil

@@ -6,9 +6,8 @@ import (
 )
 
 // propfindResourceKind classifies a PROPFIND response so the property table
-// can decide, per property, whether the resource defines it (200), lacks it
-// (404), or ignores the request entirely (legacy behavior for a handful of
-// property/kind pairs).
+// can decide, per property, whether the resource defines it (200) or lacks it
+// (404).
 type propfindResourceKind uint8
 
 const (
@@ -34,10 +33,9 @@ type propfindPropertySpec struct {
 	// as an empty element (404 propstats and propname responses).
 	emptyName xml.Name
 	requested func(q *propfindPropQuery) bool
-	// ok lists the kinds that define the property; notFound the kinds that
-	// answer 404. Kinds in neither set ignore the request.
-	ok       propfindResourceKind
-	notFound propfindResourceKind
+	// ok lists the kinds that define the property; every other kind answers
+	// 404 per RFC 4918 §9.1.
+	ok propfindResourceKind
 	// present, when set, gates ok kinds: a requested property whose value is
 	// absent from the source moves to the 404 propstat (e.g. calendar-color).
 	present   func(src *prop) bool
@@ -50,37 +48,44 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("d:displayname"),
 		requested: func(q *propfindPropQuery) bool { return q.DisplayName != nil },
-		ok:        kindCollections, notFound: kindObjects,
+		ok:        kindCollections,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.DisplayName = src.DisplayName },
 	},
 	{
+		// RFC 4918 §15.9: resourcetype is defined on every resource; object
+		// resources answer with an empty value rather than a 404.
 		emptyName: davName("d:resourcetype"),
 		requested: func(q *propfindPropQuery) bool { return q.ResourceType != nil },
-		ok:        kindCollections,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.ResourceType = src.ResourceType },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.ResourceType = src.ResourceType
+			if dst.ResourceType == nil {
+				dst.ResourceType = &resourceType{}
+			}
+		},
 	},
 	{
 		emptyName: davName("d:getetag"),
 		requested: func(q *propfindPropQuery) bool { return q.GetETag != nil },
-		ok:        kindObjects, notFound: kindCollections,
+		ok:        kindObjects,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.GetETag = src.GetETag },
 	},
 	{
 		emptyName: davName("d:getcontenttype"),
 		requested: func(q *propfindPropQuery) bool { return q.GetContentType != nil },
-		ok:        kindObjects, notFound: kindCollections,
+		ok:        kindObjects,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.GetContentType = src.GetContentType },
 	},
 	{
 		emptyName: davName("cal:calendar-data"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarData != nil },
-		ok:        kindCalendarObject, notFound: kindCollections,
+		ok:        kindCalendarObject,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarData = src.CalendarData },
 	},
 	{
 		emptyName: davName("card:address-data"),
 		requested: func(q *propfindPropQuery) bool { return q.AddressData != nil },
-		ok:        kindAddressObject, notFound: kindCollections,
+		ok:        kindAddressObject,
 		copyValue: func(dst, src *prop, q *propfindPropQuery) {
 			dst.AddressData = cdataString(filterVCardData(string(src.AddressData), q.AddressData))
 		},
@@ -88,38 +93,38 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("cal:calendar-description"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
 	},
 	{
 		emptyName: davName("cal:calendar-timezone"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarTimezone != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarTimezone = src.CalendarTimezone },
 	},
 	{
 		emptyName: davName("ical:calendar-color"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarColor != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection,
+		ok:        kindCalendarCollection,
 		present:   func(src *prop) bool { return src.CalendarColor != nil },
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarColor = src.CalendarColor },
 	},
 	{
 		emptyName: davName("card:addressbook-description"),
 		requested: func(q *propfindPropQuery) bool { return q.AddressBookDesc != nil },
-		ok:        kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal | kindCalendarCollection,
+		ok:        kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.AddressBookDesc = src.AddressBookDesc },
 	},
 	{
 		emptyName: davName("card:supported-address-data"),
 		requested: func(q *propfindPropQuery) bool { return q.SupportedAddressData != nil },
-		ok:        kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal | kindCalendarCollection,
+		ok:        kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedAddressData = src.SupportedAddressData },
 	},
 	{
 		emptyName: davName("card:max-resource-size"),
 		requested: func(q *propfindPropQuery) bool { return q.AddressBookMaxResourceSize != nil },
-		ok:        kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal | kindCalendarCollection,
+		ok:        kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
 			dst.AddressBookMaxResourceSize = src.AddressBookMaxResourceSize
 		},
@@ -127,19 +132,19 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("card:supported-collation-set"),
 		requested: func(q *propfindPropQuery) bool { return q.SupportedCollationSet != nil },
-		ok:        kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal | kindCalendarCollection,
+		ok:        kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedCollationSet = src.SupportedCollationSet },
 	},
 	{
 		emptyName: davName("d:sync-token"),
 		requested: func(q *propfindPropQuery) bool { return q.SyncToken != nil },
-		ok:        kindCalendarCollection | kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal,
+		ok:        kindCalendarCollection | kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SyncToken = src.SyncToken },
 	},
 	{
 		emptyName: davName("cs:getctag"),
 		requested: func(q *propfindPropQuery) bool { return q.CTag != nil },
-		ok:        kindCalendarCollection | kindAddressBookCollection, notFound: kindGenericCollection | kindPrincipal,
+		ok:        kindCalendarCollection | kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CTag = src.CTag },
 	},
 	{
@@ -159,25 +164,24 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("d:principal-URL"),
 		requested: func(q *propfindPropQuery) bool { return q.PrincipalURL != nil },
-		ok:        kindPrincipal, notFound: kindGenericCollection | kindCalendarCollection | kindAddressBookCollection,
+		ok:        kindPrincipal,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalURL = src.PrincipalURL },
 	},
 	{
 		emptyName: davName("cal:calendar-home-set"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarHomeSet != nil },
-		ok:        kindPrincipal, notFound: kindGenericCollection | kindCalendarCollection | kindAddressBookCollection,
+		ok:        kindPrincipal,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarHomeSet = src.CalendarHomeSet },
 	},
 	{
 		emptyName: davName("card:addressbook-home-set"),
 		requested: func(q *propfindPropQuery) bool { return q.AddressbookHomeSet != nil },
-		ok:        kindPrincipal | kindAddressBookCollection, notFound: kindGenericCollection | kindCalendarCollection,
+		ok:        kindPrincipal | kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.AddressbookHomeSet = src.AddressbookHomeSet },
 	},
 	{
 		emptyName: davName("card:principal-address"),
 		requested: func(q *propfindPropQuery) bool { return q.PrincipalAddress != nil },
-		notFound:  kindCollections,
 	},
 	{
 		emptyName: davName("d:supported-report-set"),
@@ -188,7 +192,7 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("cal:supported-calendar-component-set"),
 		requested: func(q *propfindPropQuery) bool { return q.SupportedCalendarComponentSet != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
 			dst.SupportedCalendarComponentSet = src.SupportedCalendarComponentSet
 		},
@@ -196,31 +200,31 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("cal:max-resource-size"),
 		requested: func(q *propfindPropQuery) bool { return q.MaxResourceSize != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxResourceSize = src.MaxResourceSize },
 	},
 	{
 		emptyName: davName("cal:min-date-time"),
 		requested: func(q *propfindPropQuery) bool { return q.MinDateTime != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MinDateTime = src.MinDateTime },
 	},
 	{
 		emptyName: davName("cal:max-date-time"),
 		requested: func(q *propfindPropQuery) bool { return q.MaxDateTime != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxDateTime = src.MaxDateTime },
 	},
 	{
 		emptyName: davName("cal:max-instances"),
 		requested: func(q *propfindPropQuery) bool { return q.MaxInstances != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxInstances = src.MaxInstances },
 	},
 	{
 		emptyName: davName("cal:max-attendees-per-instance"),
 		requested: func(q *propfindPropQuery) bool { return q.MaxAttendeesPerInstance != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
 			dst.MaxAttendeesPerInstance = src.MaxAttendeesPerInstance
 		},
@@ -228,19 +232,19 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("cal:schedule-calendar-transp"),
 		requested: func(q *propfindPropQuery) bool { return q.ScheduleCalendarTransp != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.ScheduleCalendarTransp = src.ScheduleCalendarTransp },
 	},
 	{
 		emptyName: davName("cal:supported-calendar-data"),
 		requested: func(q *propfindPropQuery) bool { return q.SupportedCalendarData != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedCalendarData = src.SupportedCalendarData },
 	},
 	{
 		emptyName: davName("cs:read-only"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarServerReadOnly != nil },
-		ok:        kindCalendarCollection, notFound: kindGenericCollection | kindPrincipal | kindAddressBookCollection,
+		ok:        kindCalendarCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarServerReadOnly = src.CalendarServerReadOnly },
 	},
 	{
@@ -266,7 +270,6 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("d:owner"),
 		requested: func(q *propfindPropQuery) bool { return q.Owner != nil },
-		notFound:  kindCollections,
 	},
 	{
 		emptyName: davName("d:acl"),
@@ -292,12 +295,16 @@ var propfindPropertyTable = []propfindPropertySpec{
 // to the href extension for object resources.
 func propfindKindOf(resp response) propfindResourceKind {
 	src := resp.Propstat[0].Prop
+	rtype := src.ResourceType
+	if rtype == nil {
+		rtype = &resourceType{}
+	}
 	switch {
-	case src.ResourceType.Principal != nil:
+	case rtype.Principal != nil:
 		return kindPrincipal
-	case src.ResourceType.Calendar != nil:
+	case rtype.Calendar != nil:
 		return kindCalendarCollection
-	case src.ResourceType.AddressBook != nil:
+	case rtype.AddressBook != nil:
 		return kindAddressBookCollection
 	case strings.HasSuffix(normalizeDAVHref(resp.Href), ".ics"):
 		return kindCalendarObject
@@ -325,11 +332,10 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 		if !spec.requested(req.Prop) {
 			continue
 		}
-		switch {
-		case spec.ok&kind != 0 && (spec.present == nil || spec.present(&src)):
+		if spec.ok&kind != 0 && (spec.present == nil || spec.present(&src)) {
 			spec.copyValue(&okProp, &src, req.Prop)
 			okSet = true
-		case spec.notFound&kind != 0 || spec.ok&kind != 0:
+		} else {
 			notFoundNames = append(notFoundNames, spec.emptyName)
 		}
 	}

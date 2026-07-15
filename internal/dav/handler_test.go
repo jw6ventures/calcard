@@ -10097,7 +10097,9 @@ func TestCheckConditionalETagHandling(t *testing.T) {
 		{name: "if-match star without resource", ifMatch: "*", exists: false, want: false},
 		{name: "if-match list with match", ifMatch: `"other", "abc"`, etag: "abc", exists: true, want: true},
 		{name: "if-match list without match", ifMatch: `"other", "third"`, etag: "abc", exists: true, want: false},
-		{name: "if-match weak validator", ifMatch: `W/"abc"`, etag: "abc", exists: true, want: true},
+		{name: "if-match weak validator", ifMatch: `W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-match list with only weak match", ifMatch: `"other", W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-match list with weak and strong match", ifMatch: `W/"abc", "abc"`, etag: "abc", exists: true, want: true},
 		{name: "if-none-match star with existing resource", ifNoneMatch: "*", etag: "abc", exists: true, want: false},
 		{name: "if-none-match star without resource", ifNoneMatch: "*", exists: false, want: true},
 		{name: "if-none-match list with match", ifNoneMatch: `"x", "abc"`, etag: "abc", exists: true, want: false},
@@ -10145,6 +10147,108 @@ func TestPutWithIfMatchStarUpdatesExistingEvent(t *testing.T) {
 
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("PUT with If-Match: * against existing resource = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutEventWeakIfMatchPreconditionFails(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", `W/"old-etag"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("PUT event with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteEventWeakIfMatchPreconditionFails(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+	req.Header.Set("If-Match", `W/"current"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE event with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutContactWeakIfMatchPreconditionFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	newVCard := buildVCard("3.0", "UID:alice", "FN:Alice Updated")
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
+	req.Header.Set("If-Match", `W/"etag-alice"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("PUT contact with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteContactWeakIfMatchPreconditionFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+	req.Header.Set("If-Match", `W/"etag-alice"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE contact with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
 	}
 }
 

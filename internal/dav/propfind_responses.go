@@ -168,7 +168,7 @@ func stripCalendarAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
-			if prop.ResourceType.Calendar == nil {
+			if prop.ResourceType == nil || prop.ResourceType.Calendar == nil {
 				continue
 			}
 			prop.CalendarTimezone = nil
@@ -482,7 +482,7 @@ func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User
 func principalResponse(href string, user *store.User) response {
 	p := prop{
 		DisplayName:             user.PrimaryEmail,
-		ResourceType:            resourceType{Principal: &struct{}{}},
+		ResourceType:            &resourceType{Principal: &struct{}{}},
 		PrincipalURL:            &expandableHrefProp{Href: href},
 		CurrentUserPrincipal:    &expandableHrefProp{Href: href},
 		CurrentUserPrincipalURL: &hrefProp{Href: href},
@@ -496,7 +496,7 @@ func principalResponse(href string, user *store.User) response {
 func rootCollectionResponse(href string, user *store.User, principalHref string) response {
 	p := prop{
 		DisplayName:             "CalCard DAV",
-		ResourceType:            resourceType{Collection: &struct{}{}},
+		ResourceType:            &resourceType{Collection: &struct{}{}},
 		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
 		SupportedReportSet:      combinedSupportedReports(),

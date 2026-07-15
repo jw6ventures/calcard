@@ -13,15 +13,16 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// checkConditional validates If-Match and If-None-Match headers per RFC 7232.
+// checkConditional validates If-Match and If-None-Match headers per RFC 7232:
+// If-Match requires strong comparison, If-None-Match uses weak comparison.
 func checkConditional(r *http.Request, etag string, exists bool) bool {
 	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
-		if !exists || !etagListMatches(ifMatch, etag) {
+		if !exists || !etagListMatches(ifMatch, etag, false) {
 			return false
 		}
 	}
 	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
-		if exists && etagListMatches(ifNoneMatch, etag) {
+		if exists && etagListMatches(ifNoneMatch, etag, true) {
 			return false
 		}
 	}
@@ -30,15 +31,21 @@ func checkConditional(r *http.Request, etag string, exists bool) bool {
 
 // etagListMatches reports whether any entity-tag in a comma-separated
 // If-Match/If-None-Match value matches etag. "*" matches any existing
-// resource. Weak validators (W/"...") compare by their opaque tag because
-// stored ETags are strong content hashes that clients may echo back weakened.
-func etagListMatches(headerValue, etag string) bool {
+// resource. Stored ETags are strong, so a weak candidate (W/"...") can only
+// weak-compare equal (RFC 7232 §2.3.2); it never matches under the strong
+// comparison If-Match requires.
+func etagListMatches(headerValue, etag string, allowWeak bool) bool {
 	if headerValue == "*" {
 		return true
 	}
 	for _, candidate := range strings.Split(headerValue, ",") {
 		candidate = strings.TrimSpace(candidate)
-		candidate = strings.TrimPrefix(candidate, "W/")
+		if strings.HasPrefix(candidate, "W/") {
+			if !allowWeak {
+				continue
+			}
+			candidate = strings.TrimPrefix(candidate, "W/")
+		}
 		candidate = strings.Trim(candidate, "\"")
 		if candidate != "" && candidate == etag {
 			return true

@@ -116,7 +116,7 @@ func statusOKProp(name string, rtype resourceType) propstat {
 	return propstat{
 		Prop: prop{
 			DisplayName:  name,
-			ResourceType: rtype,
+			ResourceType: &rtype,
 		},
 		Status: httpStatusOK,
 	}
@@ -125,7 +125,7 @@ func statusOKProp(name string, rtype resourceType) propstat {
 func statusOKPropWithExtras(name string, rtype resourceType, principalHref string, includeCalendarHome, includeAddressHome bool) propstat {
 	p := prop{
 		DisplayName:             name,
-		ResourceType:            rtype,
+		ResourceType:            &rtype,
 		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
 	}
@@ -148,7 +148,9 @@ func etagProp(etag, data string, calendar bool) propstat {
 }
 
 func etagPropWithData(etag, data string, calendar bool, includeData bool) propstat {
-	propVal := prop{GetETag: "\"" + etag + "\""}
+	// Object resources carry an explicit empty resourcetype so allprop
+	// responses keep advertising it (RFC 4918 §15.9).
+	propVal := prop{GetETag: "\"" + etag + "\"", ResourceType: &resourceType{}}
 	if includeData {
 		if calendar {
 			propVal.CalendarData = cdataString(data)

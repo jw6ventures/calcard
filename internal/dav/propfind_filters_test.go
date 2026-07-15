@@ -228,7 +228,7 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 	resp := response{Href: "/dav/principals/1/", Propstat: []propstat{{
 		Prop: prop{
 			DisplayName:             "User One",
-			ResourceType:            resourceType{Principal: &struct{}{}},
+			ResourceType:            &resourceType{Principal: &struct{}{}},
 			CurrentUserPrincipal:    &expandableHrefProp{Href: "/dav/principals/1/"},
 			CurrentUserPrincipalURL: &hrefProp{Href: "/dav/principals/1/"},
 			PrincipalURL:            &expandableHrefProp{Href: "/dav/principals/1/"},
@@ -275,7 +275,7 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 	resp := response{Href: "/dav/addressbooks/5/", Propstat: []propstat{{
 		Prop: prop{
 			DisplayName:                "Contacts",
-			ResourceType:               resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}},
+			ResourceType:               &resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}},
 			AddressBookDesc:            "Shared contacts",
 			SupportedAddressData:       supportedAddressDataProp(),
 			AddressBookMaxResourceSize: "1024",
@@ -317,7 +317,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 	resp := response{Href: "/dav/calendars/1/", Propstat: []propstat{{
 		Prop: prop{
 			DisplayName:             "Calendar",
-			ResourceType:            resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
+			ResourceType:            &resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
 			CalendarDescription:     "Primary calendar",
 			CalendarTimezone:        stringPtr("BEGIN:VTIMEZONE\r\nEND:VTIMEZONE\r\n"),
 			SyncToken:               "sync-token",
@@ -392,6 +392,171 @@ func TestPropfindNotFoundPropstatHasNoSentinelValues(t *testing.T) {
 	}
 	if !strings.Contains(got, "Work") {
 		t.Fatalf("expected displayname value in 200 propstat, got %s", got)
+	}
+}
+
+func calendarObjectPropfindResponse() response {
+	return response{
+		Href: "/dav/calendars/1/event.ics",
+		Propstat: []propstat{{
+			Prop: prop{
+				GetETag:            `"etag-event"`,
+				GetContentType:     "text/calendar; charset=utf-8",
+				CalendarData:       cdataString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"),
+				ResourceType:       &resourceType{},
+				SupportedReportSet: &supportedReportSet{},
+			},
+			Status: httpStatusOK,
+		}},
+	}
+}
+
+func TestFilterCalendarObjectPropfindReportsCrossKindPropertiesNotFound(t *testing.T) {
+	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+		GetETag:              &struct{}{},
+		AddressData:          &addressDataQuery{},
+		SupportedAddressData: &struct{}{},
+		CalendarHomeSet:      &struct{}{},
+	}})
+
+	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
+	if okStat == nil || okStat.Prop.GetETag == "" {
+		t.Fatalf("expected 200 propstat with getetag, got %#v", filtered.Propstat)
+	}
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	for _, name := range []string{"card:address-data", "card:supported-address-data", "cal:calendar-home-set"} {
+		if !notFound[xml.Name{Local: name}] {
+			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
+		}
+	}
+}
+
+func TestFilterAddressObjectPropfindReportsCalendarDataNotFound(t *testing.T) {
+	resp := response{
+		Href: "/dav/addressbooks/5/alice.vcf",
+		Propstat: []propstat{{
+			Prop: prop{
+				GetETag:      `"etag-alice"`,
+				AddressData:  cdataString(buildVCard("3.0", "UID:alice", "FN:Alice Example")),
+				ResourceType: &resourceType{},
+			},
+			Status: httpStatusOK,
+		}},
+	}
+
+	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+		GetETag:      &struct{}{},
+		CalendarData: &struct{}{},
+	}})
+
+	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
+	if okStat == nil || okStat.Prop.GetETag == "" {
+		t.Fatalf("expected 200 propstat with getetag, got %#v", filtered.Propstat)
+	}
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	if !notFound[xml.Name{Local: "cal:calendar-data"}] {
+		t.Fatalf("expected cal:calendar-data in 404 propstat names, got %#v", notFound)
+	}
+}
+
+func TestFilterObjectPropfindOnlyUnsupportedPropertyReturnsOnly404(t *testing.T) {
+	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+		AddressData: &addressDataQuery{},
+	}})
+
+	if len(filtered.Propstat) != 1 || filtered.Propstat[0].Status != httpStatusNotFound {
+		t.Fatalf("expected single 404 propstat, got %#v", filtered.Propstat)
+	}
+	notFound := propstatNotFoundNameSet(filtered.Propstat)
+	if !notFound[xml.Name{Local: "card:address-data"}] {
+		t.Fatalf("expected card:address-data in 404 propstat names, got %#v", notFound)
+	}
+}
+
+func TestFilterPropfindOmitsUnrequestedResourceType(t *testing.T) {
+	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+		GetETag: &struct{}{},
+	}})
+
+	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
+	if okStat == nil || okStat.Prop.GetETag == "" {
+		t.Fatalf("expected 200 propstat with getetag, got %#v", filtered.Propstat)
+	}
+	if okStat.Prop.ResourceType != nil {
+		t.Fatalf("expected no resourcetype for getetag-only request, got %#v", okStat.Prop.ResourceType)
+	}
+	out, err := xml.Marshal(*okStat)
+	if err != nil {
+		t.Fatalf("marshal propstat: %v", err)
+	}
+	if strings.Contains(string(out), "<d:resourcetype") {
+		t.Fatalf("getetag-only response must not serialize resourcetype, got %s", out)
+	}
+}
+
+// RFC 4918 §15.9: resourcetype is defined on every resource; object resources
+// answer it with an empty value, not a 404.
+func TestFilterObjectPropfindReturnsEmptyResourceType(t *testing.T) {
+	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+		GetETag:      &struct{}{},
+		ResourceType: &struct{}{},
+	}})
+
+	if len(filtered.Propstat) != 1 {
+		t.Fatalf("expected single 200 propstat, got %#v", filtered.Propstat)
+	}
+	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
+	if okStat == nil || okStat.Prop.ResourceType == nil {
+		t.Fatalf("expected empty resourcetype in 200 propstat, got %#v", filtered.Propstat)
+	}
+	out, err := xml.Marshal(*okStat)
+	if err != nil {
+		t.Fatalf("marshal propstat: %v", err)
+	}
+	if !strings.Contains(string(out), "<d:resourcetype></d:resourcetype>") {
+		t.Fatalf("expected empty resourcetype element, got %s", out)
+	}
+}
+
+func TestPropfindGetETagOnlyOnObjectOmitsResourceType(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", UpdatedAt: now}, Editor: true},
+		},
+		calendars: map[int64]*store.Calendar{
+			2: {ID: 2, UserID: 1, Name: "Work", UpdatedAt: now},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {
+				CalendarID:   2,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/event.ics", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	got := rr.Body.String()
+	if !strings.Contains(got, "etag-event") {
+		t.Fatalf("expected getetag in response, got %s", got)
+	}
+	if strings.Contains(got, "<d:resourcetype") {
+		t.Fatalf("getetag-only PROPFIND must not include resourcetype, got %s", got)
 	}
 }
 

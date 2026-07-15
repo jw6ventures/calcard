@@ -73,7 +73,7 @@ func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 
 type prop struct {
 	DisplayName                   string                         `xml:"d:displayname,omitempty"`
-	ResourceType                  resourceType                   `xml:"d:resourcetype"`
+	ResourceType                  *resourceType                  `xml:"d:resourcetype,omitempty"`
 	GetETag                       string                         `xml:"d:getetag,omitempty"`
 	GetContentType                string                         `xml:"d:getcontenttype,omitempty"`
 	CalendarData                  cdataString                    `xml:"cal:calendar-data,omitempty"`
