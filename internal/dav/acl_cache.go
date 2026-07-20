@@ -13,24 +13,18 @@ import (
 // rows; for a shared collection that turns one PROPFIND into ~18 identical
 // acl.list_by_resource queries. The entries cannot change within a request
 // except at the few DAV-internal mutation sites (ACL, MOVE rebind, DELETE
-// cleanup), each of which calls invalidateACLEntryCache, so caching them
+// cleanup), each of which invalidates the shared DAV request state, so caching them
 // collapses those to one query per distinct path.
 type aclEntryCache struct {
 	mu      sync.Mutex
 	entries map[string][]store.ACLEntry
 }
 
-type aclEntryCacheKeyType struct{}
-
-var aclEntryCacheKey = aclEntryCacheKeyType{}
-
-func withACLEntryCache(ctx context.Context) context.Context {
-	return context.WithValue(ctx, aclEntryCacheKey, &aclEntryCache{entries: make(map[string][]store.ACLEntry)})
-}
-
 func aclEntryCacheFromContext(ctx context.Context) *aclEntryCache {
-	cache, _ := ctx.Value(aclEntryCacheKey).(*aclEntryCache)
-	return cache
+	if state := davRequestStateFromContext(ctx); state != nil {
+		return state.aclEntries
+	}
+	return nil
 }
 
 func (c *aclEntryCache) get(key string) ([]store.ACLEntry, bool) {
@@ -50,13 +44,4 @@ func (c *aclEntryCache) invalidate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string][]store.ACLEntry)
-}
-
-// invalidateACLEntryCache drops every cached ACL entry for the current request.
-// Any code path that writes acl_entries must call it so later reads within the
-// same request see the mutation.
-func invalidateACLEntryCache(ctx context.Context) {
-	if cache := aclEntryCacheFromContext(ctx); cache != nil {
-		cache.invalidate()
-	}
 }

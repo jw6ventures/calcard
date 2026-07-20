@@ -177,12 +177,19 @@ type reportRequest struct {
 
 // reportProp captures the prop element in reports for partial retrieval
 type reportProp struct {
-	DisplayName     *struct{}         `xml:"DAV: displayname"`
-	GetETag         *struct{}         `xml:"DAV: getetag"`
-	GetContentType  *struct{}         `xml:"DAV: getcontenttype"`
-	SupportedReport *struct{}         `xml:"DAV: supported-report-set"`
-	CalendarData    *calendarDataEl   `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-	AddressData     *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
+	DisplayName            *struct{}         `xml:"DAV: displayname"`
+	ResourceType           *struct{}         `xml:"DAV: resourcetype"`
+	GetETag                *struct{}         `xml:"DAV: getetag"`
+	GetContentType         *struct{}         `xml:"DAV: getcontenttype"`
+	SupportedReport        *struct{}         `xml:"DAV: supported-report-set"`
+	LockDiscovery          *struct{}         `xml:"DAV: lockdiscovery"`
+	SupportedLock          *struct{}         `xml:"DAV: supportedlock"`
+	ACLProp                *struct{}         `xml:"DAV: acl"`
+	SupportedPrivilegeSet  *struct{}         `xml:"DAV: supported-privilege-set"`
+	PrincipalCollectionSet *struct{}         `xml:"DAV: principal-collection-set"`
+	CalendarData           *calendarDataEl   `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
+	AddressData            *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
+	CustomXML              []xml.Name        `xml:",any"`
 }
 
 // calendarDataEl specifies what calendar data to return (RFC 4791 Section 9.6)
@@ -347,6 +354,7 @@ type proppatchProp struct {
 	SupportedAddressData       *supportedAddressData  `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
 	AddressBookMaxResourceSize *string                `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`
 	SupportedCollationSet      *supportedCollationSet `xml:"urn:ietf:params:xml:ns:carddav supported-collation-set"`
+	CustomXML                  []xml.Name             `xml:",any"`
 }
 
 type hrefProp struct {

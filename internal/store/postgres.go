@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	icalpkg "github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/util"
 	"github.com/lib/pq"
 )
@@ -2511,58 +2512,31 @@ func scanSession(scan rowScanner) (Session, error) {
 
 // parseICalFields extracts summary, description, location, dtstart, dtend, and
 // all_day from raw iCalendar data.
-func parseICalFields(ical string) (summary, description, location *string, dtstart, dtend *time.Time, allDay bool) {
-
-	lines := unfoldICalLines(ical)
-	inEvent := false
-
-	for _, line := range lines {
-		if line == "BEGIN:VEVENT" {
-			inEvent = true
-			continue
-		}
-		if line == "END:VEVENT" {
-			break
-		}
-		if !inEvent {
-			continue
-		}
-
-		colonIdx := strings.Index(line, ":")
-		if colonIdx == -1 {
-			continue
-		}
-
-		keyPart := line[:colonIdx]
-		value := line[colonIdx+1:]
-
-		// Remove parameters (e.g., DTSTART;VALUE=DATE:20231225)
-		key := keyPart
-		if semiIdx := strings.Index(keyPart, ";"); semiIdx != -1 {
-			key = keyPart[:semiIdx]
-		}
-
-		switch key {
-		case "SUMMARY":
-			summary = util.StrPtr(unescapeICalValue(value))
-		case "DESCRIPTION":
-			description = util.StrPtr(unescapeICalValue(value))
-		case "LOCATION":
-			location = util.StrPtr(unescapeICalValue(value))
-		case "DTSTART":
-			t, isAllDay := parseICalDateTime(value, keyPart)
-			if t != nil {
-				dtstart = t
-				allDay = isAllDay
-			}
-		case "DTEND":
-			t, _ := parseICalDateTime(value, keyPart)
-			if t != nil {
-				dtend = t
-			}
+func parseICalFields(raw string) (summary, description, location *string, dtstart, dtend *time.Time, allDay bool) {
+	component := icalpkg.PrimaryVEventComponent(raw)
+	if component == nil {
+		return nil, nil, nil, nil, nil, false
+	}
+	if property, ok := icalpkg.ComponentProperty(component, "SUMMARY"); ok {
+		summary = util.StrPtr(unescapeICalValue(property.Value))
+	}
+	if property, ok := icalpkg.ComponentProperty(component, "DESCRIPTION"); ok {
+		description = util.StrPtr(unescapeICalValue(property.Value))
+	}
+	if property, ok := icalpkg.ComponentProperty(component, "LOCATION"); ok {
+		location = util.StrPtr(unescapeICalValue(property.Value))
+	}
+	if property, ok := icalpkg.ComponentProperty(component, "DTSTART"); ok {
+		if parsed, ok := icalpkg.ParsePropertyDateTimeLocal(property.KeyPart, property.Value); ok {
+			dtstart = &parsed
+			allDay = len(strings.TrimSpace(property.Value)) == len("20060102") || icalpkg.PropertyParamEquals(property.KeyPart, "VALUE", "DATE")
 		}
 	}
-
+	if property, ok := icalpkg.ComponentProperty(component, "DTEND"); ok {
+		if parsed, ok := icalpkg.ParsePropertyDateTimeLocal(property.KeyPart, property.Value); ok {
+			dtend = &parsed
+		}
+	}
 	return summary, description, location, dtstart, dtend, allDay
 }
 
@@ -2572,16 +2546,6 @@ func parseICalFields(ical string) (summary, description, location *string, dtsta
 var recurrenceStartSentinel = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
 var recurrenceUntilSentinel = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 
-func recurrenceStartFromICal(ical string) *time.Time {
-	start, _ := recurrenceBoundsFromICal(ical)
-	return start
-}
-
-func recurrenceUntilFromICal(ical string) *time.Time {
-	_, until := recurrenceBoundsFromICal(ical)
-	return until
-}
-
 // recurrenceBoundsFromICal computes the recurrence_start and recurrence_until
 // values persisted for an event. The start is the earliest known recurring
 // instance start, or a low sentinel when it cannot be computed safely. The until
@@ -2589,464 +2553,21 @@ func recurrenceUntilFromICal(ical string) *time.Time {
 // or not-confidently-bounded rules, or nil for non-recurring events. Neither
 // value may exclude a row that in-memory recurrence expansion would match.
 func recurrenceBoundsFromICal(ical string) (*time.Time, *time.Time) {
-	components := recurringICalComponents(ical)
-	if len(components) == 0 {
+	bounds := icalpkg.ConservativeRecurrenceBounds(ical)
+	if !bounds.Recurring {
 		return nil, nil
 	}
-
-	var minStart *time.Time
-	var maxUntil *time.Time
-	for _, component := range components {
-		if !component.hasRecurrence() {
-			continue
-		}
-
-		starts := component.recurrenceStarts()
-		if len(starts) == 0 {
-			minStart = recurrenceStartSentinelPtr()
-		}
-		for _, start := range starts {
-			setMinTime(&minStart, start)
-		}
-		if component.unsafeStart {
-			minStart = recurrenceStartSentinelPtr()
-		}
-
-		if component.hasRDate || component.unsafeUntil {
-			maxUntil = recurrenceUntilSentinelPtr()
-		}
-		if component.rangeThisAndFuture {
-			maxUntil = recurrenceUntilSentinelPtr()
-		}
-
-		if component.recurrenceID != nil && component.rrule == "" && !component.hasRDate {
-			until := component.overrideUntil()
-			if until == nil {
-				maxUntil = recurrenceUntilSentinelPtr()
-			} else if maxUntil == nil || until.After(*maxUntil) {
-				u := *until
-				maxUntil = &u
-			}
-		}
-
-		if component.rrule != "" {
-			if component.dtstart == nil {
-				maxUntil = recurrenceUntilSentinelPtr()
-				continue
-			}
-			until := recurrenceUntil(*component.dtstart, component.dtend, component.duration, component.allDay, component.rrule)
-			if until == nil {
-				continue
-			}
-			if until.Equal(recurrenceUntilSentinel) {
-				maxUntil = recurrenceUntilSentinelPtr()
-				continue
-			}
-			if maxUntil == nil || until.After(*maxUntil) {
-				u := *until
-				maxUntil = &u
-			}
-		}
+	start := bounds.Start
+	until := bounds.Until
+	if bounds.StartUnknown {
+		sentinel := recurrenceStartSentinel
+		start = &sentinel
 	}
-	return minStart, maxUntil
-}
-
-func setMinTime(target **time.Time, value time.Time) {
-	if target == nil || value.IsZero() {
-		return
+	if bounds.UntilUnknown {
+		sentinel := recurrenceUntilSentinel
+		until = &sentinel
 	}
-	if *target == nil || value.Before(**target) {
-		v := value
-		*target = &v
-	}
-}
-
-func recurrenceStartSentinelPtr() *time.Time {
-	s := recurrenceStartSentinel
-	return &s
-}
-
-func (c recurringICalComponent) hasRecurrence() bool {
-	return c.rrule != "" || c.hasRDate || c.recurrenceID != nil
-}
-
-func (c recurringICalComponent) recurrenceStarts() []time.Time {
-	starts := make([]time.Time, 0, 2+len(c.rdateStarts))
-	if c.dtstart != nil {
-		starts = append(starts, *c.dtstart)
-	}
-	if c.recurrenceID != nil && c.dtstart == nil {
-		starts = append(starts, *c.recurrenceID)
-	}
-	starts = append(starts, c.rdateStarts...)
-	return starts
-}
-
-func (c recurringICalComponent) overrideUntil() *time.Time {
-	if c.recurrenceID == nil {
-		return nil
-	}
-	start := c.recurrenceID
-	if c.dtstart != nil {
-		start = c.dtstart
-	}
-	if c.dtend == nil {
-		if c.duration == nil || *c.duration <= 0 {
-			return nil
-		}
-		u := start.Add(*c.duration)
-		return &u
-	}
-	if !c.dtend.After(*start) {
-		return nil
-	}
-	u := *c.dtend
-	return &u
-}
-
-func rdateStartsFromLine(keyPart, value string) ([]time.Time, bool) {
-	var starts []time.Time
-	ok := true
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if strings.Contains(part, "/") {
-			period := strings.SplitN(part, "/", 2)
-			part = strings.TrimSpace(period[0])
-		}
-		if start, _ := parseICalDateTime(part, keyPart); start != nil {
-			starts = append(starts, *start)
-			continue
-		}
-		ok = false
-	}
-	return starts, ok
-}
-
-type recurringICalComponent struct {
-	dtstart            *time.Time
-	dtend              *time.Time
-	duration           *time.Duration
-	recurrenceID       *time.Time
-	rrule              string
-	hasRDate           bool
-	rdateStarts        []time.Time
-	unsafeStart        bool
-	unsafeUntil        bool
-	allDay             bool
-	rangeThisAndFuture bool
-	depth              int
-	name               string
-}
-
-func recurrenceUntilSentinelPtr() *time.Time {
-	s := recurrenceUntilSentinel
-	return &s
-}
-
-// recurringICalComponents returns direct recurring components whose recurrence
-// can affect calendar-query time-range pushdown. Nested components such as
-// VTIMEZONE STANDARD/DAYLIGHT and VALARM are intentionally ignored.
-func recurringICalComponents(ical string) []recurringICalComponent {
-	var components []recurringICalComponent
-	depth := 0
-	var current *recurringICalComponent
-	for _, line := range unfoldICalLines(ical) {
-		switch {
-		case hasICalPrefixFold(line, "BEGIN:"):
-			depth++
-			name := strings.TrimSpace(line[len("BEGIN:"):])
-			if current == nil && depth == 2 && isRecurringComponentName(name) {
-				current = &recurringICalComponent{depth: depth, name: strings.ToUpper(name)}
-			}
-		case hasICalPrefixFold(line, "END:"):
-			if current != nil && current.depth == depth &&
-				strings.EqualFold(strings.TrimSpace(line[len("END:"):]), current.name) {
-				components = append(components, *current)
-				current = nil
-			}
-			depth--
-			if depth < 0 {
-				depth = 0
-			}
-		default:
-			if current == nil || current.depth != depth {
-				continue
-			}
-			switch strings.ToUpper(icalPropertyName(line)) {
-			case "DTSTART":
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					if t, allDay := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
-						current.dtstart = t
-						current.allDay = allDay
-					}
-				}
-			case "DTEND":
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					if t, _ := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
-						current.dtend = t
-					}
-				}
-			case "DURATION":
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					if d, ok := parseICalDuration(line[idx+1:]); ok && d > 0 {
-						current.duration = &d
-					}
-				}
-			case "RECURRENCE-ID":
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					if t, _ := parseICalDateTime(line[idx+1:], line[:idx]); t != nil {
-						current.recurrenceID = t
-						current.rangeThisAndFuture = icalParamEquals(line[:idx], "RANGE", "THISANDFUTURE")
-					} else {
-						current.unsafeStart = true
-						current.unsafeUntil = true
-					}
-				}
-			case "RRULE":
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					if current.rrule != "" {
-						current.unsafeUntil = true
-					}
-					current.rrule = strings.TrimSpace(line[idx+1:])
-				}
-			case "RDATE":
-				current.hasRDate = true
-				if idx := strings.IndexByte(line, ':'); idx >= 0 {
-					starts, ok := rdateStartsFromLine(line[:idx], line[idx+1:])
-					current.rdateStarts = append(current.rdateStarts, starts...)
-					if !ok {
-						current.unsafeStart = true
-					}
-				} else {
-					current.unsafeStart = true
-				}
-			}
-		}
-	}
-	return components
-}
-
-func isRecurringComponentName(name string) bool {
-	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "VEVENT", "VTODO", "VJOURNAL":
-		return true
-	default:
-		return false
-	}
-}
-
-func hasICalPrefixFold(s, prefix string) bool {
-	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
-}
-
-func icalParamEquals(keyPart, param, value string) bool {
-	parts := strings.Split(keyPart, ";")
-	if len(parts) < 2 {
-		return false
-	}
-	for _, part := range parts[1:] {
-		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(kv[0]), param) && strings.EqualFold(strings.TrimSpace(kv[1]), value) {
-			return true
-		}
-	}
-	return false
-}
-
-// icalPropertyName returns the property name from a content line, i.e. the text
-// before the first ';' (parameters) or ':' (value).
-func icalPropertyName(line string) string {
-	end := len(line)
-	if i := strings.IndexAny(line, ";:"); i >= 0 {
-		end = i
-	}
-	return line[:end]
-}
-
-// recurrenceUntilPad is added to a COUNT-derived bound so that wall-clock vs UTC
-// drift (the stored dtstart is in UTC, while a recurrence is anchored to its
-// local wall-clock time across DST transitions) cannot turn the estimate into an
-// underestimate. One day dwarfs any timezone offset.
-const recurrenceUntilPad = 24 * time.Hour
-const recurrenceDefaultDuration = time.Hour
-
-func recurrenceUntil(dtstart time.Time, dtend *time.Time, durationProp *time.Duration, allDay bool, rrule string) *time.Time {
-	params := parseRRuleParams(rrule)
-
-	duration := recurrenceDefaultDuration
-	if dtend != nil {
-		if d := dtend.Sub(dtstart); d > 0 {
-			duration = d
-		}
-	} else if durationProp != nil && *durationProp > 0 {
-		duration = *durationProp
-	} else if allDay {
-		duration = 24 * time.Hour
-	}
-
-	sentinel := func() *time.Time {
-		return recurrenceUntilSentinelPtr()
-	}
-
-	// UNTIL is an absolute (UTC) ceiling on instance start times, so the last
-	// instance ends no later than UNTIL + duration regardless of FREQ or BY* parts.
-	if until, ok := params["UNTIL"]; ok {
-		if t, _ := parseICalDateTime(until, "UNTIL"); t != nil {
-			end := t.Add(duration)
-			return &end
-		}
-		return sentinel()
-	}
-
-	countStr, ok := params["COUNT"]
-	if !ok {
-		// No COUNT and no UNTIL: the recurrence is unbounded.
-		return sentinel()
-	}
-	count, err := strconv.Atoi(countStr)
-	if err != nil || count <= 0 {
-		return sentinel()
-	}
-
-	// Only DAILY/WEEKLY rules with no BY* parts can be bounded by simple stepping:
-	// day arithmetic never skips periods, and without BY* parts each period yields
-	// exactly one instance. MONTHLY/YEARLY can skip periods (e.g. the 31st, or a
-	// Feb 29 leap day), any BY* part can move or thin out instances so the COUNTth
-	// lands later than naive stepping suggests, and sub-daily frequencies are
-	// effectively unbounded. We also can't trust dtstart's day-of-month for a
-	// MONTHLY/YEARLY check because it is stored in UTC. All of these fall back to
-	// the sentinel so the value is never an underestimate.
-	if hasRRuleByPart(params) {
-		return sentinel()
-	}
-	interval := 1
-	if v, ok := params["INTERVAL"]; ok {
-		if i, err := strconv.Atoi(v); err == nil && i > 0 {
-			interval = i
-		}
-	}
-	steps := (count - 1) * interval
-	var lastStart time.Time
-	switch strings.ToUpper(params["FREQ"]) {
-	case "DAILY":
-		lastStart = dtstart.AddDate(0, 0, steps)
-	case "WEEKLY":
-		lastStart = dtstart.AddDate(0, 0, 7*steps)
-	default:
-		return sentinel()
-	}
-	end := lastStart.Add(duration + recurrenceUntilPad)
-	return &end
-}
-
-func hasRRuleByPart(params map[string]string) bool {
-	for k := range params {
-		if strings.HasPrefix(k, "BY") {
-			return true
-		}
-	}
-	return false
-}
-
-func parseRRuleParams(rrule string) map[string]string {
-	params := make(map[string]string)
-	for _, part := range strings.Split(rrule, ";") {
-		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-		if len(kv) == 2 {
-			params[strings.ToUpper(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
-		}
-	}
-	return params
-}
-
-func parseICalDuration(value string) (time.Duration, bool) {
-	value = strings.TrimSpace(strings.ToUpper(value))
-	if value == "" {
-		return 0, false
-	}
-	sign := time.Duration(1)
-	if strings.HasPrefix(value, "-") {
-		sign = -1
-		value = strings.TrimPrefix(value, "-")
-	} else {
-		value = strings.TrimPrefix(value, "+")
-	}
-	if !strings.HasPrefix(value, "P") {
-		return 0, false
-	}
-	value = strings.TrimPrefix(value, "P")
-	if value == "" {
-		return 0, false
-	}
-
-	var total time.Duration
-	var number strings.Builder
-	inTime := false
-	consume := func(unit byte) bool {
-		if number.Len() == 0 {
-			return false
-		}
-		n, err := strconv.Atoi(number.String())
-		number.Reset()
-		if err != nil {
-			return false
-		}
-		switch unit {
-		case 'W':
-			total += time.Duration(n) * 7 * 24 * time.Hour
-		case 'D':
-			total += time.Duration(n) * 24 * time.Hour
-		case 'H':
-			total += time.Duration(n) * time.Hour
-		case 'M':
-			if !inTime {
-				return false
-			}
-			total += time.Duration(n) * time.Minute
-		case 'S':
-			total += time.Duration(n) * time.Second
-		default:
-			return false
-		}
-		return true
-	}
-
-	for i := 0; i < len(value); i++ {
-		ch := value[i]
-		if ch >= '0' && ch <= '9' {
-			number.WriteByte(ch)
-			continue
-		}
-		if ch == 'T' {
-			if inTime || number.Len() != 0 {
-				return 0, false
-			}
-			inTime = true
-			continue
-		}
-		if !consume(ch) {
-			return 0, false
-		}
-	}
-	if number.Len() != 0 || total < 0 {
-		return 0, false
-	}
-	return sign * total, true
-}
-
-func unfoldICalLines(ical string) []string {
-	// Unfold continuation lines (lines starting with space or tab)
-	unfolded := regexp.MustCompile(`\r?\n[ \t]`).ReplaceAllString(ical, "")
-	// Normalize line endings and split
-	unfolded = strings.ReplaceAll(unfolded, "\r\n", "\n")
-	unfolded = strings.ReplaceAll(unfolded, "\r", "\n")
-	return strings.Split(unfolded, "\n")
+	return start, until
 }
 
 func unescapeICalValue(s string) string {
@@ -3056,73 +2577,6 @@ func unescapeICalValue(s string) string {
 	s = strings.ReplaceAll(s, "\\;", ";")
 	s = strings.ReplaceAll(s, "\\\\", "\\")
 	return s
-}
-
-func parseICalDateTime(value, keyPart string) (*time.Time, bool) {
-	value = strings.TrimSpace(value)
-	isAllDay := false
-
-	// Check for VALUE=DATE parameter (all-day event)
-	if strings.Contains(strings.ToUpper(keyPart), "VALUE=DATE") && !strings.Contains(strings.ToUpper(keyPart), "VALUE=DATE-TIME") {
-		isAllDay = true
-	}
-
-	// Handle timezone identifier parameter (e.g., DTSTART;TZID=America/New_York)
-	if tzid := paramValue(keyPart, "TZID"); tzid != "" {
-		if loc, err := time.LoadLocation(tzid); err == nil {
-			if t, err := time.ParseInLocation("20060102T150405", strings.TrimSuffix(value, "Z"), loc); err == nil {
-				utc := t.In(time.UTC)
-				return &utc, isAllDay
-			}
-		}
-	}
-
-	// Handle explicit numeric offsets (e.g., 20240201T120000-0500 or 20240201T120000-05:00)
-	for _, layout := range []string{"20060102T150405-0700", "20060102T150405-07:00"} {
-		if t, err := time.Parse(layout, value); err == nil {
-			utc := t.UTC()
-			return &utc, isAllDay
-		}
-	}
-
-	// Remove trailing Z for UTC and parse as basic datetime
-	value = strings.TrimSuffix(value, "Z")
-
-	var t time.Time
-	var err error
-
-	if len(value) == 8 {
-		// All-day: YYYYMMDD
-		t, err = time.Parse("20060102", value)
-		isAllDay = true
-	} else if len(value) == 15 {
-		// Date-time: YYYYMMDDTHHmmss
-		t, err = time.Parse("20060102T150405", value)
-	} else {
-		return nil, false
-	}
-
-	if err != nil {
-		return nil, false
-	}
-	return &t, isAllDay
-}
-
-func paramValue(keyPart, param string) string {
-	parts := strings.Split(keyPart, ";")
-	if len(parts) < 2 {
-		return ""
-	}
-
-	paramUpper := strings.ToUpper(param)
-	for _, p := range parts[1:] {
-		if strings.HasPrefix(strings.ToUpper(p), paramUpper+"=") {
-			if pieces := strings.SplitN(p, "=", 2); len(pieces) == 2 {
-				return pieces[1]
-			}
-		}
-	}
-	return ""
 }
 
 // parseVCardFields extracts display_name, primary_email, and birthday from raw vCard data.

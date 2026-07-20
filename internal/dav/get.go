@@ -11,11 +11,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) Get(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Get", "handling GET %s", r.URL.Path)
 	cleanPath := path.Clean(r.URL.Path)
 	if !strings.HasPrefix(cleanPath, "/dav") {

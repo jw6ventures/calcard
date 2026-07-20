@@ -83,9 +83,7 @@ func isDigits(s string) bool {
 	return s != ""
 }
 
-// ExtractRRuleParam extracts a parameter value from an RRULE string.
-// Example: "FREQ=WEEKLY;BYDAY=MO,WE,FR" -> ExtractRRuleParam(rrule, "FREQ") returns "WEEKLY".
-func ExtractRRuleParam(rrule, param string) string {
+func extractRRuleParam(rrule, param string) string {
 	parts := strings.Split(rrule, ";")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -110,7 +108,7 @@ func UnfoldLines(raw string) []string {
 	var lines []string
 	for _, line := range rawLines {
 		if len(lines) > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
-			lines[len(lines)-1] += strings.TrimLeft(line, " \t")
+			lines[len(lines)-1] += line[1:]
 			continue
 		}
 		lines = append(lines, line)

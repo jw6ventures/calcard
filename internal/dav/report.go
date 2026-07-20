@@ -9,17 +9,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
@@ -27,6 +22,7 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	target := parsedDAVTarget(r.Context(), cleanPath)
 	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
 		if errors.Is(err, errRequestTooLarge) {
@@ -74,7 +70,7 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "calendar-multiget" {
-		if _, _, ok := parseCalendarResourceSegments(cleanPath); ok {
+		if target.Domain == davPathCalendar && target.Resource {
 			http.Error(w, "calendar reports not allowed on calendar object resources", http.StatusForbidden)
 			return
 		}
@@ -85,7 +81,7 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if report.XMLName.Local == "free-busy-query" {
-		if _, _, ok := parseCalendarResourceSegments(cleanPath); ok {
+		if target.Domain == davPathCalendar && target.Resource {
 			http.Error(w, "free-busy-query not allowed on calendar object resources", http.StatusForbidden)
 			return
 		}
@@ -110,19 +106,17 @@ func (h *DavServer) Report(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, report reportRequest) {
+	target := parsedDAVTarget(r.Context(), cleanPath)
 	// Reject REPORT requests on resource paths (only allow on collection)
-	if _, _, isResource := parseCalendarResourceSegments(cleanPath); isResource {
+	if target.Domain == davPathCalendar && target.Resource {
 		http.Error(w, "REPORT not allowed on calendar object resources", http.StatusForbidden)
 		return
 	}
-
-	rel := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
-	parts := strings.Split(rel, "/")
-	if len(parts) < 1 || strings.TrimSpace(parts[0]) == "" {
+	if !target.Valid || target.Domain != davPathCalendar || target.CollectionSegment == "" {
 		http.Error(w, "invalid calendar path", http.StatusBadRequest)
 		return
 	}
-	calID, ok, err := h.resolveCalendarID(r.Context(), user, strings.TrimSpace(parts[0]))
+	calID, ok, err := h.resolveCalendarID(r.Context(), user, target.CollectionSegment)
 	if err != nil {
 		if errors.Is(err, errAmbiguousCalendar) {
 			http.Error(w, "ambiguous calendar path", http.StatusConflict)
@@ -203,12 +197,8 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, report reportRequest) {
 	if report.XMLName.Local == "expand-property" {
 		principalHref := h.principalURL(user)
-		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
-		birthdayName := "Birthdays"
-		birthdayDesc := "Contact birthdays from your address books"
-		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
 		responses := []response{
-			calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true),
+			birthdayCalendarCollection(birthdayCalendarHref(), principalHref),
 			principalResponse(ensureCollectionHref(principalHref), user),
 		}
 		writeMultiStatus(w, newMultistatus(responses, ""))
@@ -283,13 +273,12 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+	target := parsedDAVTarget(r.Context(), cleanPath)
+	if !target.Valid || target.Domain != davPathAddressBook || target.CollectionSegment == "" {
 		http.Error(w, "invalid address book path", http.StatusBadRequest)
 		return
 	}
-	bookID, ok, err := h.resolveAddressBookID(r.Context(), user, strings.TrimSpace(parts[0]))
+	bookID, ok, err := h.resolveAddressBookID(r.Context(), user, target.CollectionSegment)
 	if err != nil {
 		if errors.Is(err, errAmbiguousAddressBook) {
 			http.Error(w, "ambiguous address book path", http.StatusConflict)
@@ -306,12 +295,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		http.Error(w, "invalid address book id", http.StatusBadRequest)
 		return
 	}
-	if len(parts) > 2 {
-		http.Error(w, "invalid address book path", http.StatusBadRequest)
-		return
-	}
-	isResource := len(parts) == 2 && parts[1] != ""
-	if isResource {
+	if target.Resource {
 		switch report.XMLName.Local {
 		case "addressbook-query", "addressbook-multiget", "expand-property":
 			if !hasDepth {
@@ -343,7 +327,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 	// Depth:0 on a collection for addressbook-query means only the collection
 	// itself, not its children — return empty multistatus after access checks.
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
-	if report.XMLName.Local == "addressbook-query" && !isResource && depth == "0" {
+	if report.XMLName.Local == "addressbook-query" && !target.Resource && depth == "0" {
 		writeMultiStatus(w, newMultistatus(nil, ""))
 		return
 	}

@@ -99,70 +99,85 @@ func (h *DavServer) handleRegisteredMethod(w http.ResponseWriter, r *http.Reques
 	return true
 }
 
-// ensureRequestCaches installs the request-scoped ACL entry cache and
-// canonical-path memo unless the request already carries them. Both are read
-// many times per request by privilege evaluation; the few DAV-internal
-// mutation sites invalidate them explicitly, so every method can share them
-// safely. The HTTP router wires each DAV method function directly rather than
-// through ServeHTTP, so every public handler calls this on entry.
+// ensureRequestCaches installs the shared request state used by ACL, lock and
+// collection-resolution lookups unless the request already carries it.
 func ensureRequestCaches(r *http.Request) *http.Request {
-	ctx := r.Context()
-	installed := false
-	if aclEntryCacheFromContext(ctx) == nil {
-		ctx = withACLEntryCache(ctx)
-		installed = true
-	}
-	if davPathMemoFromContext(ctx) == nil {
-		ctx = withDAVPathMemo(ctx)
-		installed = true
-	}
-	if !installed {
+	if davRequestStateFromContext(r.Context()) != nil {
 		return r
 	}
+	ctx := withDAVRequestState(r.Context())
+	davRequestStateFromContext(ctx).setPrimaryDAVTarget(parseDAVTarget(r.URL.Path))
 	return r.WithContext(ctx)
 }
 
 func (h *DavServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger().Debug("ServeHTTP", "%s %s", r.Method, r.URL.Path)
+	h.serveRequest(w, r)
+}
+
+func (h *DavServer) serveRequest(w http.ResponseWriter, r *http.Request) {
 	r = ensureRequestCaches(r)
-	switch r.Method {
-	case http.MethodOptions:
-		h.Options(w, r)
-	case http.MethodHead:
-		h.Head(w, r)
-	case http.MethodGet:
-		h.Get(w, r)
-	case "PROPFIND":
-		h.Propfind(w, r)
-	case "PROPPATCH":
-		h.Proppatch(w, r)
-	case "MKCOL":
-		h.Mkcol(w, r)
-	case "MKCALENDAR":
-		h.Mkcalendar(w, r)
-	case http.MethodPut:
-		h.Put(w, r)
-	case http.MethodDelete:
-		h.Delete(w, r)
-	case "REPORT":
-		h.Report(w, r)
-	case "COPY":
-		h.Copy(w, r)
-	case "MOVE":
-		h.Move(w, r)
-	case "LOCK":
-		h.Lock(w, r)
-	case "UNLOCK":
-		h.Unlock(w, r)
-	case "ACL":
-		h.Acl(w, r)
-	default:
-		if h.handleRegisteredMethod(w, r) {
+	if _, authenticated := auth.UserFromContext(r.Context()); authenticated {
+		if rejectBirthdayCalendarMutation(w, r) {
 			return
 		}
+	}
+	if h.handleRegisteredMethod(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodOptions:
+		h.options(w, r)
+	case http.MethodHead:
+		h.head(w, r)
+	case http.MethodGet:
+		h.get(w, r)
+	case "PROPFIND":
+		h.propfind(w, r)
+	case "PROPPATCH":
+		h.proppatch(w, r)
+	case "MKCOL":
+		h.mkcol(w, r)
+	case "MKCALENDAR":
+		h.mkcalendar(w, r)
+	case http.MethodPut:
+		h.put(w, r)
+	case http.MethodDelete:
+		h.delete(w, r)
+	case "REPORT":
+		h.report(w, r)
+	case "COPY":
+		h.copy(w, r)
+	case "MOVE":
+		h.move(w, r)
+	case "LOCK":
+		h.lock(w, r)
+	case "UNLOCK":
+		h.unlock(w, r)
+	case "ACL":
+		h.acl(w, r)
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
+
+// The named method entry points are retained for callers that mount or test a
+// single DAV method. All of them use the same dispatcher as ServeHTTP.
+func (h *DavServer) Options(w http.ResponseWriter, r *http.Request)    { h.serveRequest(w, r) }
+func (h *DavServer) Head(w http.ResponseWriter, r *http.Request)       { h.serveRequest(w, r) }
+func (h *DavServer) Get(w http.ResponseWriter, r *http.Request)        { h.serveRequest(w, r) }
+func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request)   { h.serveRequest(w, r) }
+func (h *DavServer) Proppatch(w http.ResponseWriter, r *http.Request)  { h.serveRequest(w, r) }
+func (h *DavServer) Mkcol(w http.ResponseWriter, r *http.Request)      { h.serveRequest(w, r) }
+func (h *DavServer) Mkcalendar(w http.ResponseWriter, r *http.Request) { h.serveRequest(w, r) }
+func (h *DavServer) Put(w http.ResponseWriter, r *http.Request)        { h.serveRequest(w, r) }
+func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request)     { h.serveRequest(w, r) }
+func (h *DavServer) Report(w http.ResponseWriter, r *http.Request)     { h.serveRequest(w, r) }
+func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request)       { h.serveRequest(w, r) }
+func (h *DavServer) Move(w http.ResponseWriter, r *http.Request)       { h.serveRequest(w, r) }
+func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request)       { h.serveRequest(w, r) }
+func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request)     { h.serveRequest(w, r) }
+func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request)        { h.serveRequest(w, r) }
 
 func registerDefaultDAVModules(r *Registry) {
 	for _, prefix := range []string{

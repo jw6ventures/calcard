@@ -100,6 +100,16 @@ func mustParseRFC3339(t *testing.T, s string) time.Time {
 	return parsed
 }
 
+func recurrenceStartFromICal(raw string) *time.Time {
+	start, _ := recurrenceBoundsFromICal(raw)
+	return start
+}
+
+func recurrenceUntilFromICal(raw string) *time.Time {
+	_, until := recurrenceBoundsFromICal(raw)
+	return until
+}
+
 func TestRecurrenceUntilFromICal(t *testing.T) {
 	base := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e1\r\nDTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\n%sEND:VEVENT\r\nEND:VCALENDAR\r\n"
 

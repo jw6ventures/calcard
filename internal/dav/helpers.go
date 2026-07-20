@@ -144,33 +144,27 @@ func statusOKPropWithExtras(name string, rtype resourceType, principalHref strin
 }
 
 func etagProp(etag, data string, calendar bool) propstat {
-	return etagPropWithData(etag, data, calendar, true)
-}
-
-func etagPropWithData(etag, data string, calendar bool, includeData bool) propstat {
 	// Object resources carry an explicit empty resourcetype so allprop
 	// responses keep advertising it (RFC 4918 §15.9).
 	propVal := prop{GetETag: "\"" + etag + "\"", ResourceType: &resourceType{}}
-	if includeData {
-		if calendar {
-			propVal.CalendarData = cdataString(data)
-			propVal.GetContentType = "text/calendar; charset=utf-8"
-		} else {
-			propVal.AddressData = cdataString(data)
-			propVal.GetContentType = "text/vcard; charset=utf-8"
-		}
+	if calendar {
+		propVal.CalendarData = cdataString(data)
+		propVal.GetContentType = "text/calendar; charset=utf-8"
+	} else {
+		propVal.AddressData = cdataString(data)
+		propVal.GetContentType = "text/vcard; charset=utf-8"
 	}
 	return propstat{Prop: propVal, Status: httpStatusOK}
 }
 
-func calendarResourcePropstat(etag, data string, includeData bool) propstat {
-	ps := etagPropWithData(etag, data, true, includeData)
+func calendarResourcePropstat(etag, data string) propstat {
+	ps := etagProp(etag, data, true)
 	ps.Prop.SupportedReportSet = &supportedReportSet{}
 	return ps
 }
 
-func addressBookResourcePropstat(etag, data string, includeData bool) propstat {
-	ps := etagPropWithData(etag, data, false, includeData)
+func addressBookResourcePropstat(etag, data string) propstat {
+	ps := etagProp(etag, data, false)
 	ps.Prop.SupportedReportSet = addressbookSupportedReports()
 	return ps
 }

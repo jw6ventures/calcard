@@ -20,11 +20,7 @@ func (h *DavServer) davHeaderForPath(cleanPath string) string {
 	return "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"
 }
 
-func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) options(w http.ResponseWriter, r *http.Request) {
 	cleanPath := ""
 	if r != nil {
 		cleanPath = path.Clean(r.URL.Path)
@@ -35,12 +31,8 @@ func (h *DavServer) Options(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *DavServer) Head(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
-	h.Get(w, r)
+func (h *DavServer) head(w http.ResponseWriter, r *http.Request) {
+	h.get(w, r)
 }
 
 func (h *DavServer) allowHeaderForPath(cleanPath string) string {

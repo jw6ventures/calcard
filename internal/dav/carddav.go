@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -613,10 +614,6 @@ func reportAddressData(report reportRequest) *addressDataQuery {
 	return report.AddressData
 }
 
-func hasAddressObjectRequestedProps(req *reportProp, topLevelAddressData *addressDataQuery) bool {
-	return topLevelAddressData != nil || (req != nil && (req.GetETag != nil || req.GetContentType != nil || req.AddressData != nil || req.DisplayName != nil || req.SupportedReport != nil))
-}
-
 func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDataQuery) *addressDataQuery {
 	if req != nil && req.AddressData != nil {
 		return req.AddressData
@@ -624,61 +621,36 @@ func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDa
 	return topLevelAddressData
 }
 
-func buildAddressObjectReportResponse(href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) response {
+func (h *DavServer) buildAddressObjectReportResponse(ctx context.Context, user *store.User, href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) (response, error) {
 	addressDataReq := effectiveAddressDataRequest(req, topLevelAddressData)
 	if addressDataReq != nil && !canServeRequestedAddressData(contact.RawVCard, addressDataReq) {
 		return response{
 			Href:   href,
 			Status: httpStatusNotAcceptable,
 			Error:  &responseError{SupportedAddressDataConversion: &struct{}{}},
+		}, nil
+	}
+
+	rawData := contact.RawVCard
+	if addressDataReq != nil {
+		rawData = filterVCardData(rawData, addressDataReq)
+	}
+	propertyStatus := etagProp(contact.ETag, rawData, false)
+	if req != nil && req.SupportedReport != nil {
+		propertyStatus.Prop.SupportedReportSet = addressbookSupportedReports()
+	}
+	resp := resourceResponse(href, propertyStatus)
+	request := propfindRequestForReport(req, false, addressDataReq)
+	if request != nil {
+		if err := h.decorateDAVProp(ctx, user, href, &resp.Propstat[0].Prop, decorationMaskFor(request)); err != nil {
+			return response{}, err
 		}
 	}
-
-	if !hasAddressObjectRequestedProps(req, topLevelAddressData) {
-		return resourceResponse(href, etagProp(contact.ETag, contact.RawVCard, false))
-	}
-	if req == nil {
-		return resourceResponse(href, etagProp(contact.ETag, filterVCardData(contact.RawVCard, addressDataReq), false))
-	}
-
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-
-	if req.GetETag != nil {
-		okProp.GetETag = `"` + contact.ETag + `"`
-		okSet = true
-	}
-	if req.GetContentType != nil {
-		okProp.GetContentType = "text/vcard; charset=utf-8"
-		okSet = true
-	}
-	if addressDataReq != nil {
-		okProp.AddressData = cdataString(filterVCardData(contact.RawVCard, addressDataReq))
-		okSet = true
-	}
-	if req.SupportedReport != nil {
-		okProp.SupportedReportSet = addressbookSupportedReports()
-		okSet = true
-	}
-	if req.DisplayName != nil {
-		notFoundProp.DisplayName = "displayname"
-		notFoundSet = true
-	}
-
-	resp := response{Href: href}
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	return resp
+	return filterAddressObjectPropfindResponse(resp, request), nil
 }
 
 func buildAddressObjectExpandPropertyResponse(href string, contact store.Contact, req *expandPropertyRequest) response {
-	resp := resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard, true))
+	resp := resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard))
 	if req == nil {
 		return resp
 	}

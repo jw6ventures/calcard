@@ -980,13 +980,14 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	allDay := r.FormValue("all_day") == "on"
+
 	// Validate date format and range
-	if err := validateEventDates(dtstart, dtend); err != nil {
+	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
 		return
 	}
 
-	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
 	opts := parseEventOptions(r)
@@ -1081,13 +1082,14 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	allDay := r.FormValue("all_day") == "on"
+
 	// Validate date format and range
-	if err := validateEventDates(dtstart, dtend); err != nil {
+	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
 		return
 	}
 
-	allDay := r.FormValue("all_day") == "on"
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
 	opts := parseEventOptions(r)
@@ -2011,8 +2013,8 @@ func formatCalendarEventTimes(times []time.Time) []string {
 	return formatted
 }
 
-// validateEventDates validates that the date strings are parseable and end is after start
-func validateEventDates(dtstart, dtend string) error {
+// validateEventDates validates that the date strings are parseable and the range is valid.
+func validateEventDates(dtstart, dtend string, allDay bool) error {
 	// Try parsing as datetime-local format (YYYY-MM-DDTHH:MM)
 	layouts := []string{
 		"2006-01-02T15:04",          // datetime-local
@@ -2046,8 +2048,7 @@ func validateEventDates(dtstart, dtend string) error {
 		return fmt.Errorf("invalid end date format")
 	}
 
-	// Validate that end is after start
-	if !endTime.After(startTime) {
+	if endTime.Before(startTime) || (!allDay && endTime.Equal(startTime)) {
 		return fmt.Errorf("end date must be after start date")
 	}
 

@@ -11,6 +11,75 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
+type davPathDomain uint8
+
+const (
+	davPathUnknown davPathDomain = iota
+	davPathCalendar
+	davPathAddressBook
+)
+
+type davTarget struct {
+	CleanPath         string
+	Domain            davPathDomain
+	CollectionSegment string
+	ResourceName      string
+	Resource          bool
+	Valid             bool
+}
+
+func parseDAVTarget(rawPath string) davTarget {
+	cleanPath := normalizeDAVHref(rawPath)
+	target := davTarget{CleanPath: cleanPath}
+	for _, candidate := range []struct {
+		prefix string
+		domain davPathDomain
+	}{
+		{prefix: calendarPrefix, domain: davPathCalendar},
+		{prefix: addressBookPrefix, domain: davPathAddressBook},
+	} {
+		if cleanPath == candidate.prefix {
+			target.Domain = candidate.domain
+			target.Valid = true
+			return target
+		}
+		if !strings.HasPrefix(cleanPath, candidate.prefix+"/") {
+			continue
+		}
+		target.Domain = candidate.domain
+		parts := strings.Split(strings.TrimPrefix(cleanPath, candidate.prefix+"/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			return target
+		}
+		target.CollectionSegment = parts[0]
+		if len(parts) == 1 {
+			target.Valid = true
+			return target
+		}
+		if len(parts) != 2 || parts[1] == "" {
+			return target
+		}
+		target.ResourceName = strings.TrimSuffix(parts[1], path.Ext(parts[1]))
+		if target.ResourceName == "" {
+			return target
+		}
+		target.Resource = true
+		target.Valid = true
+		return target
+	}
+	return target
+}
+
+func parsedDAVTarget(ctx context.Context, rawPath string) davTarget {
+	cleanPath := normalizeDAVHref(rawPath)
+	if state := davRequestStateFromContext(ctx); state != nil {
+		if target, ok := state.primaryDAVTarget(cleanPath); ok {
+			return target
+		}
+	}
+	return parseDAVTarget(cleanPath)
+}
+
 func (h *DavServer) resolveAddressBookID(ctx context.Context, user *store.User, segment string) (int64, bool, error) {
 	if segment == "" {
 		return 0, false, nil
@@ -21,17 +90,30 @@ func (h *DavServer) resolveAddressBookID(ctx context.Context, user *store.User, 
 	if user == nil {
 		return 0, false, store.ErrNotFound
 	}
+	key := collectionResolutionKey{userID: user.ID, prefix: addressBookPrefix, segment: segment}
+	if state := davRequestStateFromContext(ctx); state != nil {
+		if result, ok := state.collectionResolution(key); ok {
+			return result.id, result.ok, result.err
+		}
+	}
 	book, err := h.loadAddressBookByName(ctx, user, segment)
+	result := collectionResolutionResult{}
 	if err != nil {
 		if errors.Is(err, errAmbiguousAddressBook) {
-			return 0, false, errAmbiguousAddressBook
+			result.err = errAmbiguousAddressBook
+		} else if err == store.ErrNotFound {
+			result.err = store.ErrNotFound
+		} else {
+			return 0, false, err
 		}
-		if err == store.ErrNotFound {
-			return 0, false, store.ErrNotFound
-		}
-		return 0, false, err
+	} else {
+		result.id = book.ID
+		result.ok = true
 	}
-	return book.ID, true, nil
+	if state := davRequestStateFromContext(ctx); state != nil {
+		state.putCollectionResolution(key, result)
+	}
+	return result.id, result.ok, result.err
 }
 
 func (h *DavServer) resolveCalendarID(ctx context.Context, user *store.User, segment string) (int64, bool, error) {
@@ -44,100 +126,105 @@ func (h *DavServer) resolveCalendarID(ctx context.Context, user *store.User, seg
 	if h.store == nil || h.store.Calendars == nil {
 		return 0, false, nil
 	}
+	userID := int64(0)
+	if user != nil {
+		userID = user.ID
+	}
+	key := collectionResolutionKey{userID: userID, prefix: calendarPrefix, segment: segment}
+	if state := davRequestStateFromContext(ctx); state != nil {
+		if result, ok := state.collectionResolution(key); ok {
+			return result.id, result.ok, result.err
+		}
+	}
 	cal, err := h.loadCalendarByName(ctx, user, segment)
+	result := collectionResolutionResult{}
 	if err != nil {
 		if errors.Is(err, errAmbiguousCalendar) {
-			return 0, false, errAmbiguousCalendar
+			result.err = errAmbiguousCalendar
+		} else if err == store.ErrNotFound {
+			result.err = store.ErrNotFound
+		} else {
+			return 0, false, err
 		}
-		if err == store.ErrNotFound {
-			return 0, false, store.ErrNotFound
-		}
-		return 0, false, err
+	} else {
+		result.id = cal.ID
+		result.ok = true
 	}
-	return cal.ID, true, nil
+	if state := davRequestStateFromContext(ctx); state != nil {
+		state.putCollectionResolution(key, result)
+	}
+	return result.id, result.ok, result.err
 }
 
 func (h *DavServer) parseCalendarResourcePath(ctx context.Context, user *store.User, rawPath string) (int64, string, bool, error) {
-	segment, resource, ok := parseCalendarResourceSegments(rawPath)
-	if !ok {
+	target := parsedDAVTarget(ctx, rawPath)
+	if !target.Valid || target.Domain != davPathCalendar || !target.Resource {
 		return 0, "", false, nil
 	}
-	id, ok, err := h.resolveCalendarID(ctx, user, segment)
+	id, ok, err := h.resolveCalendarID(ctx, user, target.CollectionSegment)
 	if err != nil {
 		if errors.Is(err, errAmbiguousCalendar) {
-			return 0, resource, true, errAmbiguousCalendar
+			return 0, target.ResourceName, true, errAmbiguousCalendar
 		}
 		if err == store.ErrNotFound {
-			return 0, resource, true, err
+			return 0, target.ResourceName, true, err
 		}
 		return 0, "", false, err
 	}
 	if !ok {
-		return 0, resource, true, store.ErrNotFound
+		return 0, target.ResourceName, true, store.ErrNotFound
 	}
-	return id, resource, true, nil
+	return id, target.ResourceName, true, nil
 }
 
 func parseAddressBookResourceSegments(rawPath string) (string, string, bool) {
-	cleanPath := normalizeDAVHref(rawPath)
-	if cleanPath == "" || !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+	target := parseDAVTarget(rawPath)
+	if !target.Valid || target.Domain != davPathAddressBook || !target.Resource {
 		return "", "", false
 	}
-	trimmed := strings.TrimPrefix(cleanPath, "/dav/addressbooks/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
-	}
-	uid := strings.TrimSuffix(parts[1], path.Ext(parts[1]))
-	if uid == "" {
-		return "", "", false
-	}
-	return parts[0], uid, true
+	return target.CollectionSegment, target.ResourceName, true
 }
 
 func (h *DavServer) parseAddressBookResourcePath(ctx context.Context, user *store.User, rawPath string) (int64, string, bool, error) {
-	segment, resource, ok := parseAddressBookResourceSegments(rawPath)
-	if !ok {
+	target := parsedDAVTarget(ctx, rawPath)
+	if !target.Valid || target.Domain != davPathAddressBook || !target.Resource {
 		return 0, "", false, nil
 	}
-	id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+	id, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
 	if err != nil {
 		if errors.Is(err, errAmbiguousAddressBook) {
-			return 0, resource, true, errAmbiguousAddressBook
+			return 0, target.ResourceName, true, errAmbiguousAddressBook
 		}
 		if err == store.ErrNotFound {
-			return 0, resource, true, err
+			return 0, target.ResourceName, true, err
 		}
 		return 0, "", false, err
 	}
 	if !ok {
-		return 0, resource, true, store.ErrNotFound
+		return 0, target.ResourceName, true, store.ErrNotFound
 	}
-	return id, resource, true, nil
+	return id, target.ResourceName, true, nil
 }
 
 // parseResourcePath extracts the numeric collection ID and resource name from a DAV resource path.
 // The returned boolean indicates whether the path matched the expected prefix and contained both parts.
 func parseResourcePath(rawPath, prefix string) (int64, string, bool) {
-	cleanPath := normalizeDAVHref(rawPath)
-	if cleanPath == "" || !strings.HasPrefix(cleanPath, prefix) {
+	target := parseDAVTarget(rawPath)
+	wantedDomain := davPathUnknown
+	switch prefix {
+	case calendarPrefix:
+		wantedDomain = davPathCalendar
+	case addressBookPrefix:
+		wantedDomain = davPathAddressBook
+	}
+	if !target.Valid || !target.Resource || target.Domain != wantedDomain {
 		return 0, "", false
 	}
-	trimmed := strings.TrimPrefix(cleanPath, prefix)
-	trimmed = strings.TrimPrefix(trimmed, "/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-		return 0, "", false
-	}
-	id, err := strconv.ParseInt(parts[0], 10, 64)
+	id, err := strconv.ParseInt(target.CollectionSegment, 10, 64)
 	if err != nil {
 		return 0, "", false
 	}
-	uid := strings.TrimSuffix(parts[1], path.Ext(parts[1]))
-	if uid == "" {
-		return 0, "", false
-	}
-	return id, uid, true
+	return id, target.ResourceName, true
 }
 
 func normalizeDAVHref(raw string) string {

@@ -8,7 +8,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -220,12 +219,8 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 			principalHref := h.principalURL(user)
 
 			// Add the virtual birthday calendar first
-			birthdayHref := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
-			birthdayName := "Birthdays"
-			birthdayDesc := "Contact birthdays from your address books"
-			// Use stable sync-token (epoch) for birthday calendar to ensure consistency
-			birthdayToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
-			res = append(res, calendarCollectionResponse(birthdayHref, birthdayName, &birthdayDesc, nil, nil, principalHref, birthdayToken, "0", true))
+			birthdayHref := birthdayCalendarHref()
+			res = append(res, birthdayCalendarCollection(birthdayHref, principalHref))
 			if depth == "infinity" && h.store != nil && h.store.Contacts != nil {
 				events, err := h.generateBirthdayEvents(ctx, user.ID)
 				if err != nil {
@@ -263,13 +258,9 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	}
 	calID, err := strconv.ParseInt(segments[0], 10, 64)
 	if calID == birthdayCalendarID {
-		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(birthdayCalendarID)))
-		birthdayName := "Birthdays"
-		birthdayDesc := "Contact birthdays from your address books"
-		// Use stable sync-token (epoch) for birthday calendar to ensure consistency
-		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+		href := birthdayCalendarHref()
 		principalHref := h.principalURL(user)
-		res := []response{calendarCollectionResponse(href, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true)}
+		res := []response{birthdayCalendarCollection(href, principalHref)}
 
 		if depthIncludesChildren(depth) {
 			events, err := h.generateBirthdayEvents(ctx, user.ID)
@@ -319,7 +310,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 		if event == nil {
 			return []response{{Href: resourceHref, Status: httpStatusNotFound}}, nil
 		}
-		return []response{resourceResponse(resourceHref, calendarResourcePropstat(event.ETag, event.RawICAL, true))}, nil
+		return []response{resourceResponse(resourceHref, calendarResourcePropstat(event.ETag, event.RawICAL))}, nil
 	}
 
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
@@ -432,7 +423,7 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 		if contact == nil {
 			return []response{{Href: href, Status: httpStatusNotFound}}, nil
 		}
-		return []response{resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard, true))}, nil
+		return []response{resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard))}, nil
 	}
 	href := collectionHref
 	ctag := strconv.FormatInt(book.CTag, 10)

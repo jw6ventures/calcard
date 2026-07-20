@@ -191,11 +191,7 @@ func firstIfLockToken(header string, resourcePaths ...string) string {
 	return tokens[0]
 }
 
-func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Lock", "LOCK %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -241,6 +237,7 @@ func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "lock token does not match request URI", http.StatusPreconditionFailed)
 			return
 		}
+		defer invalidateDAVRequestState(r.Context())
 		refreshed, err := h.store.Locks.Refresh(r.Context(), ifToken, timeout, expiresAt)
 		if err != nil {
 			http.Error(w, "failed to refresh lock", http.StatusInternalServerError)
@@ -325,6 +322,7 @@ func (h *DavServer) Lock(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 
+	defer invalidateDAVRequestState(r.Context())
 	created, err := h.store.Locks.Create(r.Context(), newLock)
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
@@ -586,11 +584,7 @@ func writeLockResponse(w http.ResponseWriter, lock *store.Lock, status int) {
 	_ = xml.NewEncoder(w).Encode(resp)
 }
 
-func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Unlock", "UNLOCK %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -635,6 +629,7 @@ func (h *DavServer) Unlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.Locks.Delete(r.Context(), token); err != nil {
 		http.Error(w, "failed to unlock", http.StatusInternalServerError)
 		return

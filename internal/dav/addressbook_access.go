@@ -12,10 +12,6 @@ func addressBookCollectionPath(cleanPath string) string {
 	return collectionPathForPrefix(cleanPath, addressBookPrefix)
 }
 
-func addressBookContactPath(bookID int64, resourceName string) string {
-	return objectResourcePath(addressBookPrefix, bookID, resourceName)
-}
-
 func addressBookCollectionResourcePath(bookID int64) string {
 	return collectionResourcePath(addressBookPrefix, bookID)
 }

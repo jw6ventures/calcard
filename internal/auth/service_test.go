@@ -38,7 +38,7 @@ func (m *userRepoMock) GetByID(ctx context.Context, id int64) (*store.User, erro
 func (m *userRepoMock) GetByEmail(ctx context.Context, email string) (*store.User, error) {
 	return m.getByEmailFn(ctx, email)
 }
-func (m *userRepoMock) ListActive(context.Context) ([]store.User, error) { return nil, nil }
+func (m *userRepoMock) ListActive(context.Context) ([]store.User, error)    { return nil, nil }
 func (m *userRepoMock) MarkOnboardingComplete(context.Context, int64) error { return nil }
 
 type appPasswordRepoMock struct {

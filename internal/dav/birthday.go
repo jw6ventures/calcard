@@ -4,11 +4,58 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+const birthdayCalendarName = "Birthdays"
+const birthdayCalendarDescription = "Contact birthdays from your address books"
+
+func birthdayCalendarHref() string {
+	return ensureCollectionHref(fmt.Sprintf("/dav/calendars/%d", birthdayCalendarID))
+}
+
+func birthdayCalendarSyncToken() string {
+	return buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+}
+
+func birthdayCalendarCollection(href, principalHref string) response {
+	description := birthdayCalendarDescription
+	return calendarCollectionResponse(href, birthdayCalendarName, &description, nil, nil, principalHref, birthdayCalendarSyncToken(), "0", true)
+}
+
+func isBirthdayCalendarTarget(target davTarget) bool {
+	if !target.Valid || target.Domain != davPathCalendar {
+		return false
+	}
+	calendarID, err := strconv.ParseInt(target.CollectionSegment, 10, 64)
+	return err == nil && calendarID == birthdayCalendarID
+}
+
+func isBirthdayCalendarPath(ctx context.Context, rawPath string) bool {
+	return isBirthdayCalendarTarget(parsedDAVTarget(ctx, rawPath))
+}
+
+func isBirthdayCalendarMutation(method string) bool {
+	switch method {
+	case http.MethodPut, http.MethodDelete, "MKCOL", "MKCALENDAR", "COPY", "MOVE", "LOCK", "UNLOCK", "ACL":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectBirthdayCalendarMutation(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || !isBirthdayCalendarMutation(r.Method) || !isBirthdayCalendarPath(r.Context(), r.URL.Path) {
+		return false
+	}
+	http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
+	return true
+}
 
 func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([]store.Event, error) {
 	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(ctx, userID)
@@ -110,13 +157,14 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.birthdayCalendarMultiGet(ctx, events, report.Hrefs, cleanPath)
+		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, cleanPath, report.Prop, reportCalendarData(report))
 		return res, "", err
 	case "calendar-query":
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
-		return calendarResourceResponses(cleanPath, events), "", nil
+		res, err := h.calendarResourceReportResponses(ctx, user, cleanPath, events, report.Prop, reportCalendarData(report))
+		return res, "", err
 	case "free-busy-query":
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
@@ -137,14 +185,16 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		}
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 		// Use a stable sync-token (epoch time) since we always return all events
-		syncToken := buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
-		birthdayName := "Birthdays"
-		birthdayDesc := "Contact birthdays from your address books"
+		syncToken := birthdayCalendarSyncToken()
 		calData := reportCalendarData(report)
 		responses := []response{
-			calendarCollectionResponse(collectionHref, birthdayName, &birthdayDesc, nil, nil, principalHref, syncToken, "0", true),
+			birthdayCalendarCollection(collectionHref, principalHref),
 		}
-		responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
+		resourceResponses, err := h.calendarResourceReportResponses(ctx, user, collectionHref, events, report.Prop, calData)
+		if err != nil {
+			return nil, "", err
+		}
+		responses = append(responses, resourceResponses...)
 		return responses, syncToken, nil
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
@@ -153,9 +203,9 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	}
 }
 
-func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, events []store.Event, hrefs []string, cleanPath string) ([]response, error) {
+func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, cleanPath string, requested *reportProp, calData *calendarDataEl) ([]response, error) {
 	if len(hrefs) == 0 {
-		return calendarResourceResponses(cleanPath, events), nil
+		return h.calendarResourceReportResponses(ctx, user, cleanPath, events, requested, calData)
 	}
 
 	eventsByUID := make(map[string]store.Event)
@@ -179,7 +229,11 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, events []store
 			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, resourceResponse(cleanHref, etagProp(ev.ETag, ev.RawICAL, true)))
+		resp, err := h.calendarResourceReportResponse(ctx, user, cleanHref, ev, requested, calData)
+		if err != nil {
+			return nil, err
+		}
+		responses = append(responses, resp)
 	}
 	return responses, nil
 }

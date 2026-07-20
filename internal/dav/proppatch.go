@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,11 +14,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) Proppatch(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Proppatch", "PROPPATCH %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -90,16 +87,8 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cle
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid calendar id", errInvalidPath)
 	}
-
-	// Block property changes on birthday calendar
 	if calID == birthdayCalendarID {
-		return []response{{
-			Href: cleanPath,
-			Propstat: []propstat{{
-				Prop:   prop{},
-				Status: httpStatusForbidden,
-			}},
-		}}, nil
+		return forbiddenProppatchResponses(cleanPath, req), nil
 	}
 
 	calAccess, err := h.loadCalendar(ctx, user, calID)
@@ -177,7 +166,7 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cle
 			}}, nil
 		}
 		// A rename changes name/slug-based path resolution.
-		invalidateDAVPathMemo(ctx)
+		invalidateDAVRequestState(ctx)
 	}
 
 	// Return success response
@@ -205,6 +194,64 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cle
 			Status: httpStatusOK,
 		}},
 	}}, nil
+}
+
+func forbiddenProppatchResponses(cleanPath string, req *proppatchRequest) []response {
+	return []response{{
+		Href: cleanPath,
+		Propstat: []propstat{{
+			PropNames: requestedProppatchPropertyNames(req),
+			Status:    httpStatusForbidden,
+		}},
+	}}
+}
+
+func requestedProppatchPropertyNames(req *proppatchRequest) []xml.Name {
+	if req == nil {
+		return nil
+	}
+	var names []xml.Name
+	seen := make(map[xml.Name]struct{})
+	appendName := func(name xml.Name) {
+		if name.Local == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	appendProp := func(value proppatchProp) {
+		for _, property := range []struct {
+			present bool
+			name    xml.Name
+		}{
+			{value.DisplayName != nil, xml.Name{Local: "d:displayname"}},
+			{value.ResourceType != nil, xml.Name{Local: "d:resourcetype"}},
+			{value.CalendarDescription != nil, xml.Name{Local: "cal:calendar-description"}},
+			{value.CalendarTimezone != nil, xml.Name{Local: "cal:calendar-timezone"}},
+			{value.CalendarColor != nil, xml.Name{Local: "ical:calendar-color"}},
+			{value.AddressBookDesc != nil, xml.Name{Local: "card:addressbook-description"}},
+			{value.SupportedAddressData != nil, xml.Name{Local: "card:supported-address-data"}},
+			{value.AddressBookMaxResourceSize != nil, xml.Name{Local: "card:max-resource-size"}},
+			{value.SupportedCollationSet != nil, xml.Name{Local: "card:supported-collation-set"}},
+		} {
+			if property.present {
+				appendName(property.name)
+			}
+		}
+		for _, name := range value.CustomXML {
+			appendName(name)
+		}
+	}
+	if req.Set != nil {
+		appendProp(req.Set.Prop)
+	}
+	if req.Remove != nil {
+		appendProp(req.Remove.Prop)
+	}
+	return names
 }
 
 func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
@@ -312,7 +359,7 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 			}}, nil
 		}
 		// A rename changes name-based path resolution.
-		invalidateDAVPathMemo(ctx)
+		invalidateDAVRequestState(ctx)
 	}
 
 	return []response{{

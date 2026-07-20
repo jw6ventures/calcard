@@ -93,11 +93,7 @@ func writeSourceResolutionError(w http.ResponseWriter, err error) {
 	http.Error(w, "failed to resolve source", http.StatusInternalServerError)
 }
 
-func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Copy", "COPY %s -> %s", r.URL.Path, r.Header.Get("Destination"))
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -109,6 +105,10 @@ func (h *DavServer) Copy(w http.ResponseWriter, r *http.Request) {
 	destPath, overwrite, err := parseDestinationHeader(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if isBirthdayCalendarPath(r.Context(), destPath) {
+		http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
 		return
 	}
 
@@ -366,11 +366,7 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 	}
 }
 
-func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) move(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Move", "MOVE %s -> %s", r.URL.Path, r.Header.Get("Destination"))
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -382,6 +378,10 @@ func (h *DavServer) Move(w http.ResponseWriter, r *http.Request) {
 	destPath, overwrite, err := parseDestinationHeader(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if isBirthdayCalendarPath(r.Context(), destPath) {
+		http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
 		return
 	}
 
@@ -516,8 +516,7 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 	if existing != nil {
 		replacedUID = existing.UID
 	}
-	markLockBatchIndexStale(r.Context())
-	defer invalidateACLEntryCache(r.Context())
+	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveEventAndState(r.Context(), srcCalID, destCalID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
 		if err == store.ErrConflict {
 			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
@@ -630,8 +629,7 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 	if existingByName != nil {
 		replacedUID = existingByName.UID
 	}
-	markLockBatchIndexStale(r.Context())
-	defer invalidateACLEntryCache(r.Context())
+	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
 		http.Error(w, "failed to move contact", http.StatusInternalServerError)
 		return

@@ -13,22 +13,7 @@ const pendingCollectionSegment = ".pending"
 
 func (h *DavServer) canonicalDAVPath(ctx context.Context, user *store.User, rawPath string) (string, error) {
 	cleanPath := normalizeDAVHref(rawPath)
-	memo := davPathMemoFromContext(ctx)
-	var key davPathMemoKey
-	if memo != nil {
-		key = davPathMemoKey{path: cleanPath}
-		if user != nil {
-			key.userID = user.ID
-		}
-		if canonical, ok := memo.get(key); ok {
-			return canonical, nil
-		}
-	}
-	canonical, err := h.resolveCanonicalDAVPath(ctx, user, cleanPath)
-	if err == nil && memo != nil {
-		memo.put(key, canonical)
-	}
-	return canonical, err
+	return h.resolveCanonicalDAVPath(ctx, user, cleanPath)
 }
 
 func (h *DavServer) resolveCanonicalDAVPath(ctx context.Context, user *store.User, cleanPath string) (string, error) {

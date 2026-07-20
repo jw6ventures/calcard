@@ -3183,6 +3183,61 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 	}
 }
 
+func TestUpdateAllDayEventAllowsSameStartAndEndDate(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+		},
+	}
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{
+			events: map[string]*store.Event{
+				"1:test-event-uid": {
+					ID:           1,
+					CalendarID:   1,
+					UID:          "test-event-uid",
+					ResourceName: "test-event-uid.ics",
+					RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-event-uid\r\nSUMMARY:Original Summary\r\nDTSTART;VALUE=DATE:20260724\r\nDTEND;VALUE=DATE:20260725\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+					ETag:         "original-etag",
+				},
+			},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+	}, nil)
+
+	formData := url.Values{
+		"summary":    {"Updated Summary"},
+		"dtstart":    {"2026-07-25"},
+		"dtend":      {"2026-07-25"},
+		"all_day":    {"on"},
+		"edit_scope": {"series"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 100}))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "test-event-uid")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	rec := httptest.NewRecorder()
+	handler.UpdateEvent(rec, req)
+
+	if location := rec.Header().Get("Location"); !strings.Contains(location, "status=event_updated") {
+		t.Fatalf("UpdateEvent() redirect = %q, want successful update", location)
+	}
+	updated := eventRepo.events["1:test-event-uid"]
+	if !strings.Contains(updated.RawICAL, "DTSTART;VALUE=DATE:20260725\r\n") {
+		t.Errorf("updated event missing expected start date:\n%s", updated.RawICAL)
+	}
+	if !strings.Contains(updated.RawICAL, "DTEND;VALUE=DATE:20260726\r\n") {
+		t.Errorf("updated event missing exclusive end date:\n%s", updated.RawICAL)
+	}
+}
+
 func TestUpdateEventRequiresDates(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		calendars: map[int64]*store.Calendar{

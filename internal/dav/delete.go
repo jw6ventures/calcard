@@ -9,11 +9,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) delete(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Delete", "DELETE %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -37,11 +33,6 @@ func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
-		if calendarID == birthdayCalendarID {
-			http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
-			return
-		}
-
 		_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "unbind")
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -75,6 +66,7 @@ func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 			return
 		}
+		defer invalidateDAVRequestState(r.Context())
 		if err := h.store.DeleteEventAndState(r.Context(), calendarID, existing.UID, canonicalPath); err != nil {
 			h.logger().Error("Delete", "failed to delete event %q from calendar %d: %v", existing.UID, calendarID, err)
 			http.Error(w, "failed to delete", http.StatusInternalServerError)
@@ -134,6 +126,7 @@ func (h *DavServer) Delete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 			return
 		}
+		defer invalidateDAVRequestState(r.Context())
 		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, existing.UID, canonicalPath); err != nil {
 			h.logger().Error("Delete", "failed to delete contact %q from address book %d: %v", existing.UID, addressBookID, err)
 			http.Error(w, "failed to delete", http.StatusInternalServerError)

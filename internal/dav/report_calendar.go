@@ -15,10 +15,10 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	calData := reportCalendarData(report)
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, calData)
+		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, calData, report.Prop)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, report.Filter, calData)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, report.Filter, calData, report.Prop)
 		return res, "", err
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
@@ -453,7 +453,7 @@ func recurringEventDuration(event store.Event, component *ical.VEventComponent, 
 	return time.Hour
 }
 
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter, calData *calendarDataEl) ([]response, error) {
+func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
 	events, err := h.listCalendarEventsForFilter(ctx, cal.ID, filter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events")
@@ -467,12 +467,12 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		return nil, err
 	}
 
-	return calendarResourceResponsesFiltered(cleanPath, events, calData), nil
+	return h.calendarResourceReportResponses(ctx, user, cleanPath, events, requested, calData)
 }
 
-func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl) ([]response, error) {
+func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl, requested *reportProp) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.calendarQuery(ctx, user, cal, responsePath, nil, calData)
+		return h.calendarQuery(ctx, user, cal, responsePath, nil, calData, requested)
 	}
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 
@@ -537,8 +537,11 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		rawData := filterICalendarData(ev.RawICAL, calData)
-		responses = append(responses, resourceResponse(responseHref, etagProp(ev.ETag, rawData, true)))
+		resp, err := h.calendarResourceReportResponse(ctx, user, responseHref, *ev, requested, calData)
+		if err != nil {
+			return nil, err
+		}
+		responses = append(responses, resp)
 	}
 	return responses, nil
 }
@@ -589,7 +592,11 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	responses := []response{
 		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
-	responses = append(responses, calendarResourceResponsesFiltered(collectionHref, events, calData)...)
+	resourceResponses, err := h.calendarResourceReportResponses(ctx, user, collectionHref, events, report.Prop, calData)
+	if err != nil {
+		return nil, "", err
+	}
+	responses = append(responses, resourceResponses...)
 
 	// Include deleted resources if this is an incremental sync
 	if !since.IsZero() {

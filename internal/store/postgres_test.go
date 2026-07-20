@@ -151,6 +151,20 @@ END:VCALENDAR`
 	}
 }
 
+func TestParseICalFieldsPreservesWhitespaceAtFoldBoundary(t *testing.T) {
+	ical := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"DESCRIPTION:Room A,\r\n" +
+		"  second floor \r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	_, description, _, _, _, _ := parseICalFields(ical)
+	if description == nil || *description != "Room A, second floor " {
+		t.Fatalf("description = %v, want %q", description, "Room A, second floor ")
+	}
+}
+
 func TestParseVCardFields(t *testing.T) {
 	vcard := `BEGIN:VCARD
 VERSION:3.0

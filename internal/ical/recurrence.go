@@ -48,7 +48,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 		periods = append(periods, period)
 	}
 
-	if rrule := ComponentPropertyValue(component, "RRULE"); rrule != "" {
+	if rrule := componentPropertyValue(component, "RRULE"); rrule != "" {
 		scanStart, scanEnd := rangeStart, rangeEnd
 		var transform func(BusyPeriod) (BusyPeriod, bool)
 		if hasThisAndFutureOverrides(overrides) {
@@ -96,15 +96,15 @@ type rdatePeriod struct {
 
 func EventHasRecurrence(ical string) bool {
 	component := PrimaryVEventComponent(ical)
-	return ComponentPropertyValue(component, "RRULE") != "" || len(eventRDatePeriods(ical)) > 0
+	return componentPropertyValue(component, "RRULE") != "" || len(eventRDatePeriods(ical)) > 0
 }
 
 func SupportedEventRecurrence(ical string) bool {
-	rrule := ComponentPropertyValue(PrimaryVEventComponent(ical), "RRULE")
+	rrule := componentPropertyValue(PrimaryVEventComponent(ical), "RRULE")
 	if rrule == "" {
 		return true
 	}
-	return supportedRecurrenceFreq(ExtractRRuleParam(rrule, "FREQ"))
+	return supportedRecurrenceFreq(extractRRuleParam(rrule, "FREQ"))
 }
 
 func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, maxInstances int, transform func(BusyPeriod) (BusyPeriod, bool)) ([]BusyPeriod, bool) {
@@ -256,7 +256,7 @@ func eventRDatePeriods(ical string) []rdatePeriod {
 
 func eventExDates(component *VEventComponent) []time.Time {
 	var dates []time.Time
-	for _, prop := range ComponentProperties(component, "EXDATE") {
+	for _, prop := range componentProperties(component, "EXDATE") {
 		for _, value := range strings.Split(prop.Value, ",") {
 			if parsed, ok := parsePropertyDateTime(prop.KeyPart, strings.TrimSpace(value)); ok {
 				dates = append(dates, parsed)
@@ -275,7 +275,7 @@ type recurrenceOverride struct {
 
 func eventRecurrenceOverrides(ical string, fallbackDuration time.Duration) []recurrenceOverride {
 	var overrides []recurrenceOverride
-	for _, component := range VEventComponents(ical) {
+	for _, component := range vEventComponents(ical) {
 		recurrenceIDProp, ok := ComponentProperty(&component, "RECURRENCE-ID")
 		if !ok {
 			continue
@@ -382,7 +382,8 @@ func isOverrideRecurrenceID(start time.Time, overrides []recurrenceOverride) boo
 
 // VEventComponent is one VEVENT block's parsed content lines.
 type VEventComponent struct {
-	properties []PropertyValue
+	properties          []PropertyValue
+	malformedProperties []string
 }
 
 // PropertyValue is one content line of a component: the part before the
@@ -393,11 +394,11 @@ type PropertyValue struct {
 }
 
 func eventPropertyValues(ical, name string) []PropertyValue {
-	return ComponentProperties(PrimaryVEventComponent(ical), name)
+	return componentProperties(PrimaryVEventComponent(ical), name)
 }
 
 func PrimaryVEventComponent(ical string) *VEventComponent {
-	components := VEventComponents(ical)
+	components := vEventComponents(ical)
 	for i := range components {
 		if !componentHasProperty(&components[i], "RECURRENCE-ID") {
 			return &components[i]
@@ -409,27 +410,37 @@ func PrimaryVEventComponent(ical string) *VEventComponent {
 	return &components[0]
 }
 
-func VEventComponents(ical string) []VEventComponent {
+func vEventComponents(ical string) []VEventComponent {
+	return topLevelComponents(ical, func(name string) bool {
+		return strings.EqualFold(name, "VEVENT")
+	})
+}
+
+func topLevelComponents(ical string, accept func(string) bool) []VEventComponent {
 	var components []VEventComponent
 	depth := 0
 	componentDepth := 0
+	componentName := ""
 	var current *VEventComponent
 	for _, rawLine := range UnfoldLines(ical) {
-		line := strings.TrimSpace(rawLine)
-		upper := strings.ToUpper(line)
+		controlLine := strings.TrimSpace(rawLine)
+		upper := strings.ToUpper(controlLine)
 		switch {
 		case strings.HasPrefix(upper, "BEGIN:"):
 			depth++
-			if current == nil && depth == 2 && strings.EqualFold(strings.TrimSpace(line[len("BEGIN:"):]), "VEVENT") {
+			name := strings.TrimSpace(controlLine[len("BEGIN:"):])
+			if current == nil && depth == 2 && accept(name) {
 				componentDepth = depth
+				componentName = name
 				current = &VEventComponent{}
 			}
 			continue
 		case strings.HasPrefix(upper, "END:"):
-			if current != nil && componentDepth == depth && strings.EqualFold(strings.TrimSpace(line[len("END:"):]), "VEVENT") {
+			if current != nil && componentDepth == depth && strings.EqualFold(strings.TrimSpace(controlLine[len("END:"):]), componentName) {
 				components = append(components, *current)
 				current = nil
 				componentDepth = 0
+				componentName = ""
 			}
 			depth--
 			if depth < 0 {
@@ -440,19 +451,20 @@ func VEventComponents(ical string) []VEventComponent {
 		if current == nil || componentDepth != depth {
 			continue
 		}
-		colonIdx := strings.IndexByte(line, ':')
+		colonIdx := strings.IndexByte(rawLine, ':')
 		if colonIdx < 0 {
+			current.malformedProperties = append(current.malformedProperties, rawLine)
 			continue
 		}
 		current.properties = append(current.properties, PropertyValue{
-			KeyPart: line[:colonIdx],
-			Value:   strings.TrimSpace(line[colonIdx+1:]),
+			KeyPart: rawLine[:colonIdx],
+			Value:   rawLine[colonIdx+1:],
 		})
 	}
 	return components
 }
 
-func ComponentProperties(component *VEventComponent, name string) []PropertyValue {
+func componentProperties(component *VEventComponent, name string) []PropertyValue {
 	var values []PropertyValue
 	if component == nil {
 		return values
@@ -467,19 +479,19 @@ func ComponentProperties(component *VEventComponent, name string) []PropertyValu
 }
 
 func ComponentProperty(component *VEventComponent, name string) (PropertyValue, bool) {
-	values := ComponentProperties(component, name)
+	values := componentProperties(component, name)
 	if len(values) == 0 {
 		return PropertyValue{}, false
 	}
 	return values[0], true
 }
 
-func ComponentPropertyValue(component *VEventComponent, name string) string {
+func componentPropertyValue(component *VEventComponent, name string) string {
 	prop, ok := ComponentProperty(component, name)
 	if !ok {
 		return ""
 	}
-	return prop.Value
+	return strings.TrimSpace(prop.Value)
 }
 
 func componentHasProperty(component *VEventComponent, name string) bool {
@@ -1187,51 +1199,15 @@ func hasOrdinalWeekday(specifiers []weekdaySpecifier) bool {
 }
 
 func daysByWeekdayInYear(year int, specifiers []weekdaySpecifier, loc *time.Location) []time.Time {
-	var days []time.Time
-	for _, spec := range specifiers {
-		if spec.Ordinal == 0 {
-			for day := 1; day <= daysInYear(year); day++ {
-				t := time.Date(year, 1, day, 0, 0, 0, 0, loc)
-				if t.Weekday() == spec.Day {
-					days = append(days, t)
-				}
-			}
-			continue
-		}
-		if t, ok := nthWeekdayInYear(year, spec, loc); ok {
-			days = append(days, t)
-		}
-	}
-	return days
+	return daysByWeekday(daysInYear(year), specifiers, func(day int) time.Time {
+		return time.Date(year, 1, day, 0, 0, 0, 0, loc)
+	})
 }
 
 func nthWeekdayInYear(year int, spec weekdaySpecifier, loc *time.Location) (time.Time, bool) {
-	if spec.Ordinal > 0 {
-		count := 0
-		for day := 1; day <= daysInYear(year); day++ {
-			t := time.Date(year, 1, day, 0, 0, 0, 0, loc)
-			if t.Weekday() != spec.Day {
-				continue
-			}
-			count++
-			if count == spec.Ordinal {
-				return t, true
-			}
-		}
-		return time.Time{}, false
-	}
-	count := 0
-	for day := daysInYear(year); day >= 1; day-- {
-		t := time.Date(year, 1, day, 0, 0, 0, 0, loc)
-		if t.Weekday() != spec.Day {
-			continue
-		}
-		count--
-		if count == spec.Ordinal {
-			return t, true
-		}
-	}
-	return time.Time{}, false
+	return nthWeekday(daysInYear(year), spec, func(day int) time.Time {
+		return time.Date(year, 1, day, 0, 0, 0, 0, loc)
+	})
 }
 
 func resolveMonthDay(year int, month time.Month, monthDay int, loc *time.Location) (time.Time, bool) {
@@ -1247,48 +1223,53 @@ func resolveMonthDay(year int, month time.Month, monthDay int, loc *time.Locatio
 }
 
 func daysByWeekdayInMonth(year int, month time.Month, specifiers []weekdaySpecifier, loc *time.Location) []time.Time {
+	return daysByWeekday(daysInMonth(year, month), specifiers, func(day int) time.Time {
+		return time.Date(year, month, day, 0, 0, 0, 0, loc)
+	})
+}
+
+func nthWeekdayInMonth(year int, month time.Month, spec weekdaySpecifier, loc *time.Location) (time.Time, bool) {
+	return nthWeekday(daysInMonth(year, month), spec, func(day int) time.Time {
+		return time.Date(year, month, day, 0, 0, 0, 0, loc)
+	})
+}
+
+func daysByWeekday(dayCount int, specifiers []weekdaySpecifier, dayAt func(int) time.Time) []time.Time {
 	var days []time.Time
 	for _, spec := range specifiers {
-		if spec.Ordinal == 0 {
-			for day := 1; day <= daysInMonth(year, month); day++ {
-				t := time.Date(year, month, day, 0, 0, 0, 0, loc)
-				if t.Weekday() == spec.Day {
-					days = append(days, t)
-				}
+		if spec.Ordinal != 0 {
+			if day, ok := nthWeekday(dayCount, spec, dayAt); ok {
+				days = append(days, day)
 			}
 			continue
 		}
-		if t, ok := nthWeekdayInMonth(year, month, spec, loc); ok {
-			days = append(days, t)
+		for day := 1; day <= dayCount; day++ {
+			candidate := dayAt(day)
+			if candidate.Weekday() == spec.Day {
+				days = append(days, candidate)
+			}
 		}
 	}
 	return days
 }
 
-func nthWeekdayInMonth(year int, month time.Month, spec weekdaySpecifier, loc *time.Location) (time.Time, bool) {
-	if spec.Ordinal > 0 {
-		count := 0
-		for day := 1; day <= daysInMonth(year, month); day++ {
-			t := time.Date(year, month, day, 0, 0, 0, 0, loc)
-			if t.Weekday() != spec.Day {
-				continue
-			}
-			count++
-			if count == spec.Ordinal {
-				return t, true
-			}
-		}
+func nthWeekday(dayCount int, spec weekdaySpecifier, dayAt func(int) time.Time) (time.Time, bool) {
+	if spec.Ordinal == 0 {
 		return time.Time{}, false
 	}
+	day, step, countStep := 1, 1, 1
+	if spec.Ordinal < 0 {
+		day, step, countStep = dayCount, -1, -1
+	}
 	count := 0
-	for day := daysInMonth(year, month); day >= 1; day-- {
-		t := time.Date(year, month, day, 0, 0, 0, 0, loc)
-		if t.Weekday() != spec.Day {
+	for ; day >= 1 && day <= dayCount; day += step {
+		candidate := dayAt(day)
+		if candidate.Weekday() != spec.Day {
 			continue
 		}
-		count--
+		count += countStep
 		if count == spec.Ordinal {
-			return t, true
+			return candidate, true
 		}
 	}
 	return time.Time{}, false

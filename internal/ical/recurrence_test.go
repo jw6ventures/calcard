@@ -52,14 +52,16 @@ func TestParseDuration(t *testing.T) {
 }
 
 func TestUnfoldLines(t *testing.T) {
-	raw := "DESCRIPTION:line one\r\n continues here\r\nSUMMARY:next"
+	raw := "DESCRIPTION:line one\r\n continues here\r\nLOCATION:first\r\n  second"
 	lines := UnfoldLines(raw)
 	if len(lines) != 2 {
 		t.Fatalf("UnfoldLines() = %d lines, want 2: %#v", len(lines), lines)
 	}
-	// Continuation whitespace is stripped entirely (existing behavior).
 	if lines[0] != "DESCRIPTION:line onecontinues here" {
 		t.Fatalf("UnfoldLines() first line = %q", lines[0])
+	}
+	if lines[1] != "LOCATION:first second" {
+		t.Fatalf("UnfoldLines() second line = %q", lines[1])
 	}
 }
 

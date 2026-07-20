@@ -250,25 +250,25 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Use(davRateLimiter.Middleware())
 
 		// OPTIONS and root PROPFIND must be accessible without authentication for CalDAV client discovery
-		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
+		r.Method("OPTIONS", "/*", davHandler)
 
 		// All other methods require authentication
 		r.Group(func(r chi.Router) {
 			r.Use(davAuth)
-			r.MethodFunc("HEAD", "/*", davHandler.Head)
-			r.MethodFunc("GET", "/*", davHandler.Get)
-			r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
-			r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
-			r.MethodFunc("MKCOL", "/*", davHandler.Mkcol)
-			r.MethodFunc("MKCALENDAR", "/*", davHandler.Mkcalendar)
-			r.MethodFunc("PUT", "/*", davHandler.Put)
-			r.MethodFunc("DELETE", "/*", davHandler.Delete)
-			r.MethodFunc("REPORT", "/*", davHandler.Report)
-			r.MethodFunc("COPY", "/*", davHandler.Copy)
-			r.MethodFunc("MOVE", "/*", davHandler.Move)
-			r.MethodFunc("LOCK", "/*", davHandler.Lock)
-			r.MethodFunc("UNLOCK", "/*", davHandler.Unlock)
-			r.MethodFunc("ACL", "/*", davHandler.Acl)
+			r.Method("HEAD", "/*", davHandler)
+			r.Method("GET", "/*", davHandler)
+			r.Method("PROPFIND", "/*", davHandler)
+			r.Method("PROPPATCH", "/*", davHandler)
+			r.Method("MKCOL", "/*", davHandler)
+			r.Method("MKCALENDAR", "/*", davHandler)
+			r.Method("PUT", "/*", davHandler)
+			r.Method("DELETE", "/*", davHandler)
+			r.Method("REPORT", "/*", davHandler)
+			r.Method("COPY", "/*", davHandler)
+			r.Method("MOVE", "/*", davHandler)
+			r.Method("LOCK", "/*", davHandler)
+			r.Method("UNLOCK", "/*", davHandler)
+			r.Method("ACL", "/*", davHandler)
 		})
 
 		// Extension-registered methods carry their own per-route auth policy.

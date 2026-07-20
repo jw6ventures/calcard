@@ -35,26 +35,17 @@ func (idx *lockBatchIndex) isStale() bool {
 	return idx.stale
 }
 
-// markLockBatchIndexStale flags the request's prefetched lock index, if any, so
-// later lock checks in the same request query the store directly. Any code path
-// that writes lock rows must call it.
-func markLockBatchIndexStale(ctx context.Context) {
-	if idx := lockBatchIndexFromContext(ctx); idx != nil {
-		idx.markStale()
-	}
-}
-
-type lockBatchIndexKeyType struct{}
-
-var lockBatchIndexKey = lockBatchIndexKeyType{}
-
 func withLockBatchIndex(ctx context.Context, idx *lockBatchIndex) context.Context {
-	return context.WithValue(ctx, lockBatchIndexKey, idx)
+	ctx = withDAVRequestState(ctx)
+	davRequestStateFromContext(ctx).setLockIndex(idx)
+	return ctx
 }
 
 func lockBatchIndexFromContext(ctx context.Context) *lockBatchIndex {
-	idx, _ := ctx.Value(lockBatchIndexKey).(*lockBatchIndex)
-	return idx
+	if state := davRequestStateFromContext(ctx); state != nil {
+		return state.currentLockIndex()
+	}
+	return nil
 }
 
 // locksForPaths returns the locks whose resource path matches one of paths,

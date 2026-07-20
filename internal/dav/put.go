@@ -84,11 +84,7 @@ var allowedCalendarComponents = map[string]struct{}{
 	"VALARM":    {},
 }
 
-func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Put", "PUT %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -97,21 +93,16 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	target := parsedDAVTarget(r.Context(), cleanPath)
 	if !h.requireLock(w, r, cleanPath, "resource is locked") {
 		return
 	}
-	if cleanPath == "/dav/calendars" || cleanPath == "/dav/calendars/" {
+	if target.Domain == davPathCalendar && !target.Resource {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
-		if _, _, ok := parseCalendarResourceSegments(cleanPath); !ok {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-	}
-	_, _, isCalendar := parseCalendarResourceSegments(cleanPath)
-	_, _, isAddressBook := parseAddressBookResourceSegments(cleanPath)
+	isCalendar := target.Valid && target.Domain == davPathCalendar && target.Resource
+	isAddressBook := target.Valid && target.Domain == davPathAddressBook && target.Resource
 	if r.ContentLength > maxDAVBodyBytes {
 		if isCalendar {
 			writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
@@ -178,11 +169,6 @@ func (h *DavServer) Put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string, body []byte, bodyText, etag string) {
-	if calendarID == birthdayCalendarID {
-		http.Error(w, "birthday calendar is read-only", http.StatusForbidden)
-		return
-	}
-
 	existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceUID)
 	if err != nil {
 		http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -370,7 +356,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 	}
 
 	// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
-	_, resourceName, _ := parseAddressBookResourceSegments(cleanPath)
+	resourceName := parsedDAVTarget(r.Context(), cleanPath).ResourceName
 
 	// Check if an existing resource at this path has a different UID
 	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)

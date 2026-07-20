@@ -16,11 +16,7 @@ func (h *DavServer) propfindInfinityEnabled() bool {
 	return h == nil || h.cfg == nil || h.cfg.DAV.PropfindInfinityEnabled
 }
 
-func (h *DavServer) Propfind(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	if depth == "" {
 		// RFC 4918 §9.1: a missing Depth header means Depth: infinity.

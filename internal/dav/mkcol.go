@@ -13,11 +13,7 @@ import (
 	"github.com/lib/pq"
 )
 
-func (h *DavServer) Mkcol(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Mkcol", "MKCOL %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -90,7 +86,7 @@ func (h *DavServer) Mkcol(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to create", http.StatusInternalServerError)
 		return
 	}
-	invalidateDAVPathMemo(r.Context())
+	invalidateDAVRequestState(r.Context())
 	if created != nil {
 		location := path.Join("/dav/addressbooks", fmt.Sprint(created.ID)) + "/"
 		if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
@@ -105,11 +101,7 @@ func (h *DavServer) Mkcol(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (h *DavServer) Mkcalendar(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Mkcalendar", "MKCALENDAR %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -227,7 +219,7 @@ func (h *DavServer) Mkcalendar(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to create", http.StatusInternalServerError)
 		return
 	}
-	invalidateDAVPathMemo(r.Context())
+	invalidateDAVRequestState(r.Context())
 	location := path.Join("/dav/calendars", fmt.Sprint(created.ID)) + "/"
 	if err := h.rebindCollectionLocks(r.Context(), pendingLockPath, strings.TrimSuffix(location, "/")); err != nil {
 		if deleteErr := h.store.Calendars.Delete(r.Context(), user.ID, created.ID); deleteErr != nil && !errors.Is(deleteErr, store.ErrNotFound) {

@@ -14,11 +14,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
-	r = ensureRequestCaches(r)
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Acl", "ACL %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -132,7 +128,7 @@ func (h *DavServer) Acl(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to set ACL", http.StatusInternalServerError)
 		return
 	}
-	invalidateACLEntryCache(r.Context())
+	invalidateDAVRequestState(r.Context())
 
 	w.WriteHeader(http.StatusOK)
 }

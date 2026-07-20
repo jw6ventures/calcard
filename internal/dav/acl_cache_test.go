@@ -17,7 +17,7 @@ func TestACLEntriesForResourceMemoizesWithinRequest(t *testing.T) {
 	// With a request-scoped cache, resolving the same path repeatedly (as the
 	// per-privilege current-user-privilege-set computation does) hits the store
 	// only on the first call.
-	ctx := withACLEntryCache(context.Background())
+	ctx := withDAVRequestState(context.Background())
 	if _, err := h.aclEntriesForResource(ctx, "/dav/calendars/3"); err != nil {
 		t.Fatalf("aclEntriesForResource() error = %v", err)
 	}
@@ -47,15 +47,12 @@ func TestACLEntriesForResourceMemoizesWithinRequest(t *testing.T) {
 	}
 }
 
-func TestEnsureRequestCachesInstallsOnceAndInvalidates(t *testing.T) {
+func TestEnsureRequestCachesInstallsOnce(t *testing.T) {
 	req := httptest.NewRequest("PUT", "/dav/calendars/1/e.ics", nil)
 
 	cached := ensureRequestCaches(req)
 	if aclEntryCacheFromContext(cached.Context()) == nil {
 		t.Fatal("ensureRequestCaches must install the ACL entry cache")
-	}
-	if davPathMemoFromContext(cached.Context()) == nil {
-		t.Fatal("ensureRequestCaches must install the canonical-path memo")
 	}
 	// A second call (ServeHTTP followed by the method handler) must reuse the
 	// installed caches instead of replacing them mid-request.
@@ -63,19 +60,27 @@ func TestEnsureRequestCachesInstallsOnceAndInvalidates(t *testing.T) {
 	if again != cached {
 		t.Fatal("ensureRequestCaches must be idempotent for a request that already carries the caches")
 	}
+}
 
-	// Mutation sites clear the caches so later reads in the same request see
-	// fresh state.
-	cache := aclEntryCacheFromContext(cached.Context())
-	cache.put("/dav/calendars/1", []store.ACLEntry{{ResourcePath: "/dav/calendars/1"}})
-	invalidateACLEntryCache(cached.Context())
-	if entries, ok := cache.get("/dav/calendars/1"); ok || len(entries) != 0 {
-		t.Fatal("invalidateACLEntryCache must drop cached entries")
+func TestInvalidateDAVRequestStateInvalidatesEveryRequestCache(t *testing.T) {
+	req := ensureRequestCaches(httptest.NewRequest("GET", "/dav/calendars/work/event.ics", nil))
+	aclCache := aclEntryCacheFromContext(req.Context())
+	aclCache.put("/dav/calendars/2/event", []store.ACLEntry{{Privilege: "read"}})
+	state := davRequestStateFromContext(req.Context())
+	resolutionKey := collectionResolutionKey{userID: 1, prefix: calendarPrefix, segment: "work"}
+	state.putCollectionResolution(resolutionKey, collectionResolutionResult{id: 2, ok: true})
+	lockIndex := &lockBatchIndex{byPath: map[string][]store.Lock{"/dav/calendars/2/event": nil}}
+	ctx := withLockBatchIndex(req.Context(), lockIndex)
+
+	invalidateDAVRequestState(ctx)
+
+	if _, ok := aclCache.get("/dav/calendars/2/event"); ok {
+		t.Fatal("ACL cache survived request-state invalidation")
 	}
-	memo := davPathMemoFromContext(cached.Context())
-	memo.put(davPathMemoKey{userID: 1, path: "/dav/calendars/work"}, "/dav/calendars/1")
-	invalidateDAVPathMemo(cached.Context())
-	if _, ok := memo.get(davPathMemoKey{userID: 1, path: "/dav/calendars/work"}); ok {
-		t.Fatal("invalidateDAVPathMemo must drop memoized resolutions")
+	if _, ok := state.collectionResolution(resolutionKey); ok {
+		t.Fatal("collection resolution survived request-state invalidation")
+	}
+	if !lockIndex.isStale() {
+		t.Fatal("lock batch index was not marked stale")
 	}
 }

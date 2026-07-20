@@ -121,8 +121,8 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
 		if segment == "" {
-			if parsedSegment, _, ok := parseCalendarResourceSegments(cleanPath); ok {
-				segment = parsedSegment
+			if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathCalendar && target.Resource {
+				segment = target.CollectionSegment
 			}
 		}
 		if segment == "" {
@@ -162,8 +162,8 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 
 	segment := singleCollectionSegment(cleanPath, "/dav/addressbooks/")
 	if segment == "" {
-		if parsedSegment, _, ok := parseAddressBookResourceSegments(cleanPath); ok {
-			segment = parsedSegment
+		if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathAddressBook && target.Resource {
+			segment = target.CollectionSegment
 		}
 	}
 	if segment == "" {
