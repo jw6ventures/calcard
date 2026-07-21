@@ -179,6 +179,8 @@ type fakeACLRepo struct {
 	listByPrincipalErr   error
 	listByResourceCalls  int
 	listByPrincipalCalls int
+	listByResourcesCalls int
+	listScopedACLCalls   int
 	moveResourcePathHook func(fromPath, toPath string)
 	moveResourcePathErr  error
 }

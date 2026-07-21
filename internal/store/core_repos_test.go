@@ -720,6 +720,9 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("contact-1"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
 		WithArgs(int64(9), "contact-1-copy", "contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -1045,7 +1048,19 @@ func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) 
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1.vcf").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -1059,7 +1074,7 @@ func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) 
 	}
 }
 
-func TestStoreDeleteContactAndStatePreservesACLState(t *testing.T) {
+func TestStoreDeleteContactAndStateDeletesACLState(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -1075,7 +1090,19 @@ func TestStoreDeleteContactAndStatePreservesACLState(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1.vcf").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -1289,6 +1316,9 @@ ORDER BY c.display_name
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "uid-rollback").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "uid-rollback").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
 		WithArgs(int64(9), "renamed-contact", "uid-rollback").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -1627,20 +1657,14 @@ func TestStoreMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(2)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
-		WithArgs("/dav/calendars/3/moved").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`)).
-		WithArgs("/dav/calendars/3/moved", "/dav/calendars/2/event").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`)).
-		WithArgs("/dav/calendars/3/moved").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`)).
-		WithArgs("/dav/calendars/3/moved", "/dav/calendars/2/event").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND uid=$3 AND resource_name=$4`)).
-		WithArgs("event", int64(3), "replaced-uid", "moved").
+	for _, paths := range [][2]string{
+		{"/dav/calendars/2/event", "/dav/calendars/3/moved"},
+		{"/dav/calendars/2/event.ics", "/dav/calendars/3/moved.ics"},
+	} {
+		expectDAVStateMove(mock, paths[0], paths[1])
+	}
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("event", int64(3), "moved").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -1716,6 +1740,9 @@ func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "alice").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("alice"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(6), "alice").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
 		WithArgs(int64(6), "moved", "alice").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -1731,17 +1758,14 @@ func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
-		WithArgs("/dav/addressbooks/6/moved").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`)).
-		WithArgs("/dav/addressbooks/6/moved", "/dav/addressbooks/5/alice").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`)).
-		WithArgs("/dav/addressbooks/6/moved").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`)).
-		WithArgs("/dav/addressbooks/6/moved", "/dav/addressbooks/5/alice").
+	for _, paths := range [][2]string{
+		{"/dav/addressbooks/5/alice", "/dav/addressbooks/6/moved"},
+		{"/dav/addressbooks/5/alice.vcf", "/dav/addressbooks/6/moved.vcf"},
+	} {
+		expectDAVStateMove(mock, paths[0], paths[1])
+	}
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("contact", int64(6), "moved").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -1750,6 +1774,142 @@ func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
 		t.Fatalf("MoveContactAndState() error = %v", err)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreMoveContactAndStateRejectsLateDestinationUIDConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(5), "alice").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("alice"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(6), "alice").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("other-path"))
+	mock.ExpectRollback()
+
+	err = st.MoveContactAndState(context.Background(), 5, 6, "alice", "moved", "/dav/addressbooks/5/alice", "/dav/addressbooks/6/moved", "")
+	if err != ErrConflict {
+		t.Fatalf("MoveContactAndState() error = %v, want ErrConflict", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func expectDAVStateMove(mock sqlmock.Sqlmock, fromPath, toPath string) {
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs(toPath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`)).
+		WithArgs(toPath, fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs(toPath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`)).
+		WithArgs(toPath, fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs(toPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE dav_dead_properties SET resource_path=$1, updated_at=NOW() WHERE resource_path=$2`)).
+		WithArgs(toPath, fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func TestStoreCopyEventAndStateCopiesDeadPropertiesAndClearsDestinationState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(2), "event").
+		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(2), "event", "event", raw, "old-etag", nil, nil, nil, nil, nil, false, now))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("copied"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(3), "copied", "event").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`INSERT INTO events`).
+		WithArgs(int64(3), "event", "copied", raw, "new-etag", nil, nil, nil, nil, nil, false, nil, nil).
+		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(11), int64(3), "event", "copied", raw, "new-etag", nil, nil, nil, nil, nil, false, now))
+	for _, statePath := range []string{"/dav/calendars/3/copied", "/dav/calendars/3/copied.ics"} {
+		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).WithArgs(statePath).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).WithArgs(statePath).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).WithArgs(statePath).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	mock.ExpectExec(`INSERT INTO dav_dead_properties`).
+		WithArgs("/dav/calendars/3/copied", "/dav/calendars/2/event").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("event", int64(3), "copied").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	copied, err := st.CopyEventAndState(context.Background(), 2, 3, "event", "copied", "new-etag", "/dav/calendars/2/event", "/dav/calendars/3/copied", "")
+	if err != nil {
+		t.Fatalf("CopyEventAndState() error = %v", err)
+	}
+	if copied == nil || copied.CalendarID != 3 || copied.ResourceName != "copied" {
+		t.Fatalf("CopyEventAndState() = %#v", copied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreCopyEventAndStateRollsBackWhenDestinationStateClearFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(2), "event").
+		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(2), "event", "event", raw, "old-etag", nil, nil, nil, nil, nil, false, now))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("copied"))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(3), "copied", "event").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`INSERT INTO events`).
+		WithArgs(int64(3), "event", "copied", raw, "new-etag", nil, nil, nil, nil, nil, false, nil, nil).
+		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(11), int64(3), "event", "copied", raw, "new-etag", nil, nil, nil, nil, nil, false, now))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs("/dav/calendars/3/copied").
+		WillReturnError(errors.New("lock delete failed"))
+	mock.ExpectRollback()
+
+	_, err = st.CopyEventAndState(context.Background(), 2, 3, "event", "copied", "new-etag", "/dav/calendars/2/event", "/dav/calendars/3/copied", "event")
+	if err == nil {
+		t.Fatal("CopyEventAndState() error = nil, want rollback error")
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
 	}

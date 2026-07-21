@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -473,7 +474,21 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Contacts.DeleteByUID(r.Context(), bookID, uid); err != nil {
+	contact, err := h.store.Contacts.GetByUID(r.Context(), bookID, uid)
+	if err != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to delete contact"})
+		return
+	}
+	if contact == nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_deleted"})
+		return
+	}
+	resourceName := contact.ResourceName
+	if resourceName == "" {
+		resourceName = contact.UID
+	}
+	resourcePath := path.Join("/dav/addressbooks", strconv.FormatInt(bookID, 10), resourceName)
+	if err := h.store.DeleteContactAndState(r.Context(), bookID, uid, resourcePath); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to delete contact"})
 		return
 	}

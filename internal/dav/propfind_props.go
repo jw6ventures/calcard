@@ -2,8 +2,9 @@ package dav
 
 import (
 	"context"
+	"encoding/xml"
 	"net/http"
-	"strconv"
+	"path"
 	"strings"
 	"time"
 
@@ -22,9 +23,12 @@ type propDecorationMask struct {
 
 // decorationMaskFor derives the set of expensive properties worth computing for
 // a PROPFIND request. A specific <prop> request only needs the properties it
-// names; allprop, propname, and compat (nil) requests retain the previous
-// behavior of computing everything.
+// names; allprop and compatibility (nil) requests retain the previous
+// behavior of computing every value.
 func decorationMaskFor(req *propfindRequest) propDecorationMask {
+	if req != nil && req.PropName != nil {
+		return propDecorationMask{}
+	}
 	if req == nil || req.Prop == nil {
 		return propDecorationMask{lockDiscovery: true, acl: true, currentUserPrivilegeSet: true}
 	}
@@ -36,6 +40,18 @@ func decorationMaskFor(req *propfindRequest) propDecorationMask {
 }
 
 func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response, mask propDecorationMask) error {
+	if _, exceeded := h.capMultistatusResponses(responses); exceeded {
+		return nil
+	}
+	deadByPath, err := h.deadPropertiesForResponses(ctx, user, responses)
+	if err != nil {
+		return err
+	}
+	if (mask.acl || mask.currentUserPrivilegeSet) && len(responses) > 1 {
+		if err := h.prefetchPropfindACLEntries(ctx, user, responses); err != nil {
+			return err
+		}
+	}
 	// When lock discovery is requested across multiple responses, prefetch every
 	// relevant lock in one query so each response's lockDiscoveryForPath reads
 	// from the batch index rather than issuing its own query.
@@ -51,6 +67,10 @@ func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Reque
 			continue
 		}
 		resourcePath := normalizeDAVHref(responses[i].Href)
+		canonicalPath, canonicalErr := h.canonicalDAVPath(ctx, user, resourcePath)
+		if canonicalErr == nil && canonicalPath != "" {
+			resourcePath = canonicalPath
+		}
 		for j := range responses[i].Propstat {
 			if responses[i].Propstat[j].Status != httpStatusOK {
 				continue
@@ -58,20 +78,122 @@ func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Reque
 			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop, mask); err != nil {
 				return err
 			}
-			if err := h.davRegistry().decoratePropfind(RequestContext{
-				Context: ctx,
-				User:    user,
-				Request: r,
-				Path:    resourcePath,
-			}, &PropfindProperties{
-				href: resourcePath,
-				prop: &responses[i].Propstat[j].Prop,
-			}); err != nil {
-				return err
+			for _, property := range deadByPath[resourcePath] {
+				responses[i].Propstat[j].Prop.setCustomXMLProperty(XMLProperty{
+					Name:  xml.Name{Space: property.NamespaceURI, Local: property.LocalName},
+					Value: rawXMLValue(property.InnerXML),
+				})
+			}
+			if r != nil {
+				if err := h.davRegistry().decoratePropfind(RequestContext{
+					Context: ctx,
+					User:    user,
+					Request: r,
+					Path:    resourcePath,
+				}, &PropfindProperties{
+					href: resourcePath,
+					prop: &responses[i].Propstat[j].Prop,
+				}); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.User, responses []response) error {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return nil
+	}
+	canonicalSeen := make(map[string]struct{})
+	var canonicalPaths []string
+	addCanonical := func(resourcePath string) {
+		resourcePath = normalizeDAVHref(resourcePath)
+		if resourcePath == "" {
+			return
+		}
+		if _, ok := canonicalSeen[resourcePath]; ok {
+			return
+		}
+		canonicalSeen[resourcePath] = struct{}{}
+		canonicalPaths = append(canonicalPaths, resourcePath)
+	}
+	for _, response := range responses {
+		resourcePath, err := h.canonicalDAVPath(ctx, user, response.Href)
+		if err != nil {
+			return err
+		}
+		addCanonical(resourcePath)
+		if target := parseDAVTarget(resourcePath); target.Valid && target.Resource {
+			addCanonical(path.Dir(resourcePath))
+		}
+	}
+
+	querySeen := make(map[string]struct{})
+	var queryPaths []string
+	for _, resourcePath := range canonicalPaths {
+		for _, statePath := range davStatePaths(resourcePath) {
+			if _, ok := querySeen[statePath]; ok {
+				continue
+			}
+			querySeen[statePath] = struct{}{}
+			queryPaths = append(queryPaths, statePath)
+		}
+	}
+	entries, err := h.store.ACLEntries.ListByResources(ctx, queryPaths)
+	if err != nil {
+		return err
+	}
+	byPath := make(map[string][]store.ACLEntry, len(queryPaths))
+	for _, entry := range entries {
+		key := normalizeDAVHref(entry.ResourcePath)
+		byPath[key] = append(byPath[key], entry)
+	}
+	cache := aclEntryCacheFromContext(ctx)
+	if cache == nil {
+		return nil
+	}
+	for _, resourcePath := range canonicalPaths {
+		var resourceEntries []store.ACLEntry
+		for _, statePath := range davStatePaths(resourcePath) {
+			resourceEntries = append(resourceEntries, byPath[statePath]...)
+		}
+		cache.put(resourcePath, resourceEntries)
+	}
+	return nil
+}
+
+func (h *DavServer) deadPropertiesForResponses(ctx context.Context, user *store.User, responses []response) (map[string][]store.DeadProperty, error) {
+	result := make(map[string][]store.DeadProperty)
+	if h == nil || h.store == nil || h.store.DeadProperties == nil {
+		return result, nil
+	}
+	seen := make(map[string]struct{})
+	paths := make([]string, 0, len(responses))
+	for _, response := range responses {
+		resourcePath := normalizeDAVHref(response.Href)
+		if !strings.HasPrefix(resourcePath, calendarPrefix+"/") && !strings.HasPrefix(resourcePath, addressBookPrefix+"/") {
+			continue
+		}
+		canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[canonicalPath]; ok {
+			continue
+		}
+		seen[canonicalPath] = struct{}{}
+		paths = append(paths, canonicalPath)
+	}
+	properties, err := h.store.DeadProperties.ListByResources(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+	for _, property := range properties {
+		result[normalizeDAVHref(property.ResourcePath)] = append(result[normalizeDAVHref(property.ResourcePath)], property)
+	}
+	return result, nil
 }
 
 func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop, mask propDecorationMask) error {
@@ -313,63 +435,16 @@ func (h *DavServer) accessibleAddressBooks(ctx context.Context, user *store.User
 	if h == nil || h.store == nil || h.store.AddressBooks == nil || user == nil {
 		return nil, nil
 	}
-	owned, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
+	books, err := h.store.AddressBooks.ListAccessible(ctx, user.ID)
 	if err != nil {
 		return nil, err
 	}
-	if h.store.ACLEntries == nil {
-		return owned, nil
-	}
-
-	seen := make(map[int64]struct{}, len(owned))
-	for _, book := range owned {
-		seen[book.ID] = struct{}{}
-	}
-
-	principals := []string{"DAV:all", "DAV:authenticated", h.principalURL(user)}
-	for _, principal := range principals {
-		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principal)
-		if err != nil {
-			return nil, err
-		}
-		for _, entry := range entries {
-			collectionPath := addressBookCollectionPath(entry.ResourcePath)
-			if collectionPath == "/dav/addressbooks" || !strings.HasPrefix(collectionPath, "/dav/addressbooks/") {
-				continue
-			}
-			granted, err := h.checkACLPrivilege(ctx, user, collectionPath, "read")
-			if err != nil {
-				return nil, err
-			}
-			if !granted {
-				continue
-			}
-
-			segment := strings.Trim(strings.TrimPrefix(collectionPath, "/dav/addressbooks/"), "/")
-			if segment == "" || strings.Contains(segment, "/") {
-				continue
-			}
-
-			bookID, err := strconv.ParseInt(segment, 10, 64)
-			if err != nil {
-				continue
-			}
-			if _, ok := seen[bookID]; ok {
-				continue
-			}
-			book, err := h.getAddressBook(ctx, bookID)
-			if err != nil {
-				if err == store.ErrNotFound {
-					continue
-				}
-				return nil, err
-			}
-			seen[bookID] = struct{}{}
-			owned = append(owned, *book)
+	if state := davRequestStateFromContext(ctx); state != nil {
+		for i := range books {
+			state.putAddressBook(&books[i])
 		}
 	}
-
-	return owned, nil
+	return books, nil
 }
 
 func stringPtr(v string) *string {

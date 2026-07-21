@@ -13,6 +13,8 @@ type davRequestState struct {
 	mu                    sync.Mutex
 	lockIndex             *lockBatchIndex
 	collectionResolutions map[collectionResolutionKey]collectionResolutionResult
+	calendars             map[int64]*store.Calendar
+	addressBooks          map[int64]*store.AddressBook
 	primaryTarget         *davTarget
 }
 
@@ -39,7 +41,49 @@ func withDAVRequestState(ctx context.Context) context.Context {
 	return context.WithValue(ctx, davRequestStateKey, &davRequestState{
 		aclEntries:            &aclEntryCache{entries: make(map[string][]store.ACLEntry)},
 		collectionResolutions: make(map[collectionResolutionKey]collectionResolutionResult),
+		calendars:             make(map[int64]*store.Calendar),
+		addressBooks:          make(map[int64]*store.AddressBook),
 	})
+}
+
+func (s *davRequestState) calendar(id int64) (*store.Calendar, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	calendar, ok := s.calendars[id]
+	return calendar, ok
+}
+
+func (s *davRequestState) putCalendar(calendar *store.Calendar) {
+	if s == nil || calendar == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := *calendar
+	s.calendars[calendar.ID] = &copy
+}
+
+func (s *davRequestState) addressBook(id int64) (*store.AddressBook, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	book, ok := s.addressBooks[id]
+	return book, ok
+}
+
+func (s *davRequestState) putAddressBook(book *store.AddressBook) {
+	if s == nil || book == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := *book
+	s.addressBooks[book.ID] = &copy
 }
 
 func davRequestStateFromContext(ctx context.Context) *davRequestState {
@@ -122,6 +166,10 @@ func invalidateDAVRequestState(ctx context.Context) {
 	}
 	state.aclEntries.invalidate()
 	state.invalidateCollectionResolutions()
+	state.mu.Lock()
+	state.calendars = make(map[int64]*store.Calendar)
+	state.addressBooks = make(map[int64]*store.AddressBook)
+	state.mu.Unlock()
 	if index := state.currentLockIndex(); index != nil {
 		index.markStale()
 	}

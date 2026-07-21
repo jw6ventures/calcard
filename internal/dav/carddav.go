@@ -65,43 +65,6 @@ type vcardProperty struct {
 	Raw    string
 }
 
-func parseAddressBookReportPath(cleanPath string) (bookID int64, resourceUID string, isResource bool, err error) {
-	trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-	if trimmed == "" {
-		return 0, "", false, errInvalidPath
-	}
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return 0, "", false, errInvalidPath
-	}
-	bookID, err = parseCollectionID(parts[0])
-	if err != nil {
-		return 0, "", false, err
-	}
-	if len(parts) == 1 {
-		return bookID, "", false, nil
-	}
-	if len(parts) == 2 && parts[1] != "" {
-		return bookID, strings.TrimSuffix(parts[1], pathExt(parts[1])), true, nil
-	}
-	return 0, "", false, errInvalidPath
-}
-
-func parseCollectionID(raw string) (int64, error) {
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%w: invalid address book id", errInvalidPath)
-	}
-	return id, nil
-}
-
-func pathExt(raw string) string {
-	if idx := strings.LastIndexByte(raw, '.'); idx >= 0 {
-		return raw[idx:]
-	}
-	return ""
-}
-
 func validateAddressDataRequest(query *addressDataQuery) error {
 	if query == nil {
 		return nil
@@ -636,17 +599,11 @@ func (h *DavServer) buildAddressObjectReportResponse(ctx context.Context, user *
 		rawData = filterVCardData(rawData, addressDataReq)
 	}
 	propertyStatus := etagProp(contact.ETag, rawData, false)
-	if req != nil && req.SupportedReport != nil {
+	if req != nil && req.SupportedReportSet != nil {
 		propertyStatus.Prop.SupportedReportSet = addressbookSupportedReports()
 	}
 	resp := resourceResponse(href, propertyStatus)
-	request := propfindRequestForReport(req, false, addressDataReq)
-	if request != nil {
-		if err := h.decorateDAVProp(ctx, user, href, &resp.Propstat[0].Prop, decorationMaskFor(request)); err != nil {
-			return response{}, err
-		}
-	}
-	return filterAddressObjectPropfindResponse(resp, request), nil
+	return resp, nil
 }
 
 func buildAddressObjectExpandPropertyResponse(href string, contact store.Contact, req *expandPropertyRequest) response {
@@ -675,6 +632,7 @@ func stripAddressBookAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
+			prop.AddressData = ""
 			if prop.ResourceType == nil || prop.ResourceType.AddressBook == nil {
 				continue
 			}

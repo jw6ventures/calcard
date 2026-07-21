@@ -52,6 +52,53 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if !cfg.DAV.PropfindInfinityEnabled {
 		t.Fatal("expected DAV.PropfindInfinityEnabled to default to true")
 	}
+	if cfg.DAV.MaxMultistatusResponses != 10000 {
+		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 10000", cfg.DAV.MaxMultistatusResponses)
+	}
+	if cfg.DAV.MaxMultistatusBytes != 67108864 {
+		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 67108864", cfg.DAV.MaxMultistatusBytes)
+	}
+}
+
+func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_MAX_MULTISTATUS_RESPONSES", "321")
+	t.Setenv("APP_DAV_MAX_MULTISTATUS_BYTES", "654321")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DAV.MaxMultistatusResponses != 321 {
+		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 321", cfg.DAV.MaxMultistatusResponses)
+	}
+	if cfg.DAV.MaxMultistatusBytes != 654321 {
+		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 654321", cfg.DAV.MaxMultistatusBytes)
+	}
+}
+
+func TestLoadRejectsNonPositiveDAVMultistatusLimits(t *testing.T) {
+	for _, key := range []string{"APP_DAV_MAX_MULTISTATUS_RESPONSES", "APP_DAV_MAX_MULTISTATUS_BYTES"} {
+		for _, value := range []string{"0", "-1", "invalid"} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				t.Setenv("APP_DB_DSN", "postgres://dsn")
+				t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+				t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+				t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+				t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+				t.Setenv(key, value)
+
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), key+" must be a positive integer") {
+					t.Fatalf("Load() error = %v, want positive-integer validation for %s=%q", err, key, value)
+				}
+			})
+		}
+	}
 }
 
 func TestLoadDisablesPropfindInfinity(t *testing.T) {

@@ -190,11 +190,12 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		responses := []response{
 			birthdayCalendarCollection(collectionHref, principalHref),
 		}
-		resourceResponses, err := h.calendarResourceReportResponses(ctx, user, collectionHref, events, report.Prop, calData)
+		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, report.Prop, calData, h.multistatusBuildLimit()-len(responses))
+		responses = h.appendMultistatusResponses(responses, resourceResponses)
+		responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
 		if err != nil {
 			return nil, "", err
 		}
-		responses = append(responses, resourceResponses...)
 		return responses, syncToken, nil
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
@@ -215,6 +216,9 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 
 	var responses []response
 	for _, href := range hrefs {
+		if h.multistatusBuildComplete(responses) {
+			break
+		}
 		cleanHref := resolveDAVHref(cleanPath, href)
 		if cleanHref == "" {
 			continue
@@ -229,11 +233,7 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
 			continue
 		}
-		resp, err := h.calendarResourceReportResponse(ctx, user, cleanHref, ev, requested, calData)
-		if err != nil {
-			return nil, err
-		}
-		responses = append(responses, resp)
+		responses = append(responses, rawCalendarResourceReportResponse(cleanHref, ev, requested, calData))
 	}
-	return responses, nil
+	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }

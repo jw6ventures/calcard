@@ -1238,7 +1238,8 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 
 		if !masterHandled {
 			// No master to update; fall back to deleting the whole event.
-			if err := h.store.Events.DeleteByUID(r.Context(), calendarID, uid); err != nil {
+			resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
+			if err := h.store.DeleteEventAndState(r.Context(), calendarID, uid, resourcePath); err != nil {
 				h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete event"})
 				return
 			}
@@ -1276,7 +1277,8 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if err := h.store.Events.DeleteByUID(r.Context(), calendarID, uid); err != nil {
+		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
+		if err := h.store.DeleteEventAndState(r.Context(), calendarID, uid, resourcePath); err != nil {
 			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete event"})
 			return
 		}

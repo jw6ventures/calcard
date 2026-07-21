@@ -24,12 +24,20 @@ func (h *DavServer) getAddressBook(ctx context.Context, id int64) (*store.Addres
 	if h == nil || h.store == nil || h.store.AddressBooks == nil {
 		return nil, store.ErrNotFound
 	}
+	if state := davRequestStateFromContext(ctx); state != nil {
+		if book, ok := state.addressBook(id); ok {
+			return book, nil
+		}
+	}
 	book, err := h.store.AddressBooks.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if book == nil {
 		return nil, store.ErrNotFound
+	}
+	if state := davRequestStateFromContext(ctx); state != nil {
+		state.putAddressBook(book)
 	}
 	return book, nil
 }
@@ -170,9 +178,8 @@ func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.Addre
 	if book == nil || user == nil {
 		return false, false
 	}
-	objectPaths := addressBookObjectACLPaths(book.ID, resourceName)
-	collectionPaths := []string{addressBookCollectionResourcePath(book.ID)}
-	granted, denied, _ := aclEntriesPrivilegeDecision(entriesByPath, user, book.UserID, objectPaths, collectionPaths, privilege)
+	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
+	granted, denied, _ := decider.decide(resourceName, ".vcf", privilege)
 	return granted, denied
 }
 
@@ -182,13 +189,11 @@ func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.Addre
 // per-contact ListByResource lookups that otherwise make a single REPORT/sync
 // O(N) in ACL repository queries.
 func (h *DavServer) prefetchAddressBookACLEntries(ctx context.Context, user *store.User, bookID int64, resourceNames []string) (map[string][]store.ACLEntry, error) {
-	relevantPaths := map[string]struct{}{
-		normalizeDAVHref(addressBookCollectionResourcePath(bookID)): {},
-	}
+	collectionPath := addressBookCollectionResourcePath(bookID)
+	relevantPaths := make([]string, 0, 1+2*len(resourceNames))
+	relevantPaths = append(relevantPaths, collectionPath)
 	for _, resourceName := range resourceNames {
-		for _, resourcePath := range addressBookObjectACLPaths(bookID, resourceName) {
-			relevantPaths[normalizeDAVHref(resourcePath)] = struct{}{}
-		}
+		relevantPaths = appendObjectACLPaths(relevantPaths, collectionPath, resourceName, ".vcf")
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
@@ -197,7 +202,15 @@ func canReadAddressBookContactWithEntries(user *store.User, book *store.AddressB
 	if strings.TrimSpace(resourceName) == "" {
 		return false
 	}
-	allowed, _ := addressBookPrivilegeDecisionFromEntries(user, book, resourceName, "read", entriesByPath)
+	if book == nil {
+		return false
+	}
+	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
+	return canReadAddressBookContactWithDecider(resourceName, decider)
+}
+
+func canReadAddressBookContactWithDecider(resourceName string, decider *batchedObjectACLDecider) bool {
+	allowed, _, _ := decider.decide(resourceName, ".vcf", "read")
 	return allowed
 }
 
@@ -210,9 +223,10 @@ func (h *DavServer) filterReadableAddressBookContacts(ctx context.Context, user 
 	if err != nil {
 		return nil, err
 	}
+	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
 	visible := make([]store.Contact, 0, len(contacts))
 	for _, contact := range contacts {
-		if canReadAddressBookContactWithEntries(user, book, contactResourceName(contact), entriesByPath) {
+		if canReadAddressBookContactWithDecider(contactResourceName(contact), decider) {
 			visible = append(visible, contact)
 		}
 	}

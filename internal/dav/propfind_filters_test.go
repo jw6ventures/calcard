@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -107,13 +106,11 @@ func TestFilterReadableAddressBookContactsPrefetchesOnce(t *testing.T) {
 	if len(filtered) != len(contacts) {
 		t.Fatalf("expected all %d contacts visible via collection grant, got %d", len(contacts), len(filtered))
 	}
-	// One sweep over the user's principals (DAV:all, DAV:authenticated, /dav/principals/2/)
-	// rather than a per-contact ListByResource lookup.
 	if repo.listByResourceCalls != 0 {
 		t.Fatalf("expected no per-resource ACL lookups, got %d", repo.listByResourceCalls)
 	}
-	if repo.listByPrincipalCalls != len(acl.PrincipalHrefs(&store.User{ID: 2})) {
-		t.Fatalf("expected one prefetch sweep (%d principal lookups), got %d", len(acl.PrincipalHrefs(&store.User{ID: 2})), repo.listByPrincipalCalls)
+	if repo.listScopedACLCalls != 1 {
+		t.Fatalf("expected one scoped ACL prefetch, got %d", repo.listScopedACLCalls)
 	}
 }
 
@@ -150,16 +147,18 @@ func TestFilterAddressObjectPropfindCoversSupportedAndMissingProperties(t *testi
 	}
 
 	filtered := filterAddressObjectPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		GetETag:                &struct{}{},
-		GetContentType:         &struct{}{},
-		AddressData:            &addressDataQuery{Prop: []addressDataProp{{Name: "FN"}}},
-		SupportedReportSet:     &struct{}{},
-		LockDiscovery:          &struct{}{},
-		SupportedLock:          &struct{}{},
-		ACLProp:                &struct{}{},
-		SupportedPrivilegeSet:  &struct{}{},
-		PrincipalCollectionSet: &struct{}{},
-		DisplayName:            &struct{}{},
+		propertySelection: propertySelection{
+			GetETag:                &struct{}{},
+			GetContentType:         &struct{}{},
+			SupportedReportSet:     &struct{}{},
+			LockDiscovery:          &struct{}{},
+			SupportedLock:          &struct{}{},
+			ACLProp:                &struct{}{},
+			SupportedPrivilegeSet:  &struct{}{},
+			PrincipalCollectionSet: &struct{}{},
+			DisplayName:            &struct{}{},
+		},
+		AddressData: &addressDataQuery{Prop: []addressDataProp{{Name: "FN"}}},
 	}})
 	if len(filtered.Propstat) != 2 {
 		t.Fatalf("expected 2 propstats, got %#v", filtered.Propstat)
@@ -209,8 +208,8 @@ func TestFilterAddressObjectPropfindResponseBranches(t *testing.T) {
 	}
 
 	filtered := filterAddressObjectPropfindResponse(base, &propfindRequest{Prop: &propfindPropQuery{
-		GetETag:     &struct{}{},
-		AddressData: &addressDataQuery{Prop: []addressDataProp{{Name: "FN"}}},
+		propertySelection: propertySelection{GetETag: &struct{}{}},
+		AddressData:       &addressDataQuery{Prop: []addressDataProp{{Name: "FN"}}},
 	}})
 	if filtered.Status != "" || filtered.Error != nil {
 		t.Fatalf("expected successful filtered response to clear status/error, got %#v", filtered)
@@ -245,15 +244,17 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 	}}}
 
 	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:             &struct{}{},
-		ResourceType:            &struct{}{},
-		PrincipalURL:            &struct{}{},
-		ACLProp:                 &struct{}{},
-		GetETag:                 &struct{}{},
-		CalendarTimezone:        &struct{}{},
-		ScheduleCalendarTransp:  &struct{}{},
-		CurrentUserPrivilegeSet: &struct{}{},
-		Owner:                   &struct{}{},
+		propertySelection: propertySelection{
+			DisplayName:             &struct{}{},
+			ResourceType:            &struct{}{},
+			PrincipalURL:            &struct{}{},
+			ACLProp:                 &struct{}{},
+			GetETag:                 &struct{}{},
+			CalendarTimezone:        &struct{}{},
+			ScheduleCalendarTransp:  &struct{}{},
+			CurrentUserPrivilegeSet: &struct{}{},
+			Owner:                   &struct{}{},
+		},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -289,13 +290,15 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 	}}}
 
 	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:          &struct{}{},
-		SupportedAddressData: &struct{}{},
-		ACLProp:              &struct{}{},
-		GetETag:              &struct{}{},
-		PrincipalURL:         &struct{}{},
-		CalendarTimezone:     &struct{}{},
-		CalendarHomeSet:      &struct{}{},
+		propertySelection: propertySelection{
+			DisplayName:          &struct{}{},
+			SupportedAddressData: &struct{}{},
+			ACLProp:              &struct{}{},
+			GetETag:              &struct{}{},
+			PrincipalURL:         &struct{}{},
+			CalendarTimezone:     &struct{}{},
+			CalendarHomeSet:      &struct{}{},
+		},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -330,17 +333,19 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 	}}}
 
 	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		DisplayName:             &struct{}{},
-		CalendarDescription:     &struct{}{},
-		CalendarTimezone:        &struct{}{},
-		CalendarColor:           &struct{}{},
-		ScheduleCalendarTransp:  &struct{}{},
-		CurrentUserPrivilegeSet: &struct{}{},
-		ACLProp:                 &struct{}{},
-		GetETag:                 &struct{}{},
-		AddressBookDesc:         &struct{}{},
-		PrincipalURL:            &struct{}{},
-		Owner:                   &struct{}{},
+		propertySelection: propertySelection{
+			DisplayName:             &struct{}{},
+			CalendarDescription:     &struct{}{},
+			CalendarTimezone:        &struct{}{},
+			CalendarColor:           &struct{}{},
+			ScheduleCalendarTransp:  &struct{}{},
+			CurrentUserPrivilegeSet: &struct{}{},
+			ACLProp:                 &struct{}{},
+			GetETag:                 &struct{}{},
+			AddressBookDesc:         &struct{}{},
+			PrincipalURL:            &struct{}{},
+			Owner:                   &struct{}{},
+		},
 	}})
 
 	if len(filtered.Propstat) != 2 {
@@ -413,10 +418,12 @@ func calendarObjectPropfindResponse() response {
 
 func TestFilterCalendarObjectPropfindReportsCrossKindPropertiesNotFound(t *testing.T) {
 	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
-		GetETag:              &struct{}{},
-		AddressData:          &addressDataQuery{},
-		SupportedAddressData: &struct{}{},
-		CalendarHomeSet:      &struct{}{},
+		propertySelection: propertySelection{
+			GetETag:              &struct{}{},
+			SupportedAddressData: &struct{}{},
+			CalendarHomeSet:      &struct{}{},
+		},
+		AddressData: &addressDataQuery{},
 	}})
 
 	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
@@ -445,8 +452,8 @@ func TestFilterAddressObjectPropfindReportsCalendarDataNotFound(t *testing.T) {
 	}
 
 	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
-		GetETag:      &struct{}{},
-		CalendarData: &struct{}{},
+		propertySelection: propertySelection{GetETag: &struct{}{}},
+		CalendarData:      &struct{}{},
 	}})
 
 	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
@@ -475,7 +482,7 @@ func TestFilterObjectPropfindOnlyUnsupportedPropertyReturnsOnly404(t *testing.T)
 
 func TestFilterPropfindOmitsUnrequestedResourceType(t *testing.T) {
 	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
-		GetETag: &struct{}{},
+		propertySelection: propertySelection{GetETag: &struct{}{}},
 	}})
 
 	okStat := propstatWithStatus(filtered.Propstat, httpStatusOK)
@@ -498,8 +505,7 @@ func TestFilterPropfindOmitsUnrequestedResourceType(t *testing.T) {
 // answer it with an empty value, not a 404.
 func TestFilterObjectPropfindReturnsEmptyResourceType(t *testing.T) {
 	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
-		GetETag:      &struct{}{},
-		ResourceType: &struct{}{},
+		propertySelection: propertySelection{GetETag: &struct{}{}, ResourceType: &struct{}{}},
 	}})
 
 	if len(filtered.Propstat) != 1 {

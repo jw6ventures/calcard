@@ -201,12 +201,13 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if err := h.validateICalendar(bodyText); err != nil {
+	analysis, err := analyzeICalendar(bodyText)
+	if err != nil {
 		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
 		return
 	}
 
-	componentTypes := extractICalComponentTypes(bodyText)
+	componentTypes := analysis.ComponentTypes
 	for comp := range componentTypes {
 		if _, ok := allowedCalendarComponents[comp]; !ok {
 			writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
@@ -222,13 +223,13 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if containsICalMethodProperty(bodyText) {
+	if analysis.HasMethod {
 		writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
 		return
 	}
 
-	if conditions := validateCalendarObjectResource(bodyText); len(conditions) > 0 {
-		if hasMultipleDifferentUIDs(bodyText) {
+	if conditions := analysis.objectValidationConditions(); len(conditions) > 0 {
+		if len(conditions) == 2 {
 			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
 			return
 		}
@@ -237,7 +238,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	}
 
 	minDate, maxDate := caldavDateLimits()
-	for _, t := range extractICalDateTimes(bodyText) {
+	for _, t := range analysis.DateTimes {
 		if t.Before(minDate) {
 			writeCalDAVError(w, http.StatusForbidden, "min-date-time")
 			return
@@ -248,11 +249,11 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		}
 	}
 
-	if attendeeCount := countICalAttendees(bodyText); attendeeCount > caldavMaxAttendees {
+	if analysis.MaxAttendees > caldavMaxAttendees {
 		writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
 		return
 	}
-	if count, ok := extractICalRRULECount(bodyText); ok && count > caldavMaxInstances {
+	if analysis.HasRRULECount && analysis.MaxRRULECount > caldavMaxInstances {
 		writeCalDAVError(w, http.StatusForbidden, "max-instances")
 		return
 	}
@@ -262,7 +263,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	uid, err := extractUIDFromICalendar(bodyText)
+	uid, err := analysis.uid()
 	if err != nil {
 		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
 		return
@@ -308,7 +309,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag}); err != nil {
+	if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag, WriteMetadata: &analysis.Metadata}); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
 			return

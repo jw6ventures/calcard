@@ -19,7 +19,14 @@ type RecurrenceBounds struct {
 // ConservativeRecurrenceBounds computes bounds for top-level VEVENT, VTODO and
 // VJOURNAL components without under-approximating their recurrence windows.
 func ConservativeRecurrenceBounds(raw string) RecurrenceBounds {
-	components := recurringComponents(raw)
+	return ConservativeRecurrenceBoundsFromUnfoldedLines(UnfoldLines(raw))
+}
+
+// ConservativeRecurrenceBoundsFromUnfoldedLines computes the same safe bounds
+// without unfolding the payload again when a caller already performed that
+// step as part of a broader calendar analysis.
+func ConservativeRecurrenceBoundsFromUnfoldedLines(lines []string) RecurrenceBounds {
+	components := recurringComponentsFromLines(lines)
 	var bounds RecurrenceBounds
 	for _, component := range components {
 		if !component.hasRecurrence() {
@@ -144,7 +151,11 @@ func (c recurringComponent) overrideUntil() *time.Time {
 }
 
 func recurringComponents(raw string) []recurringComponent {
-	parsedComponents := topLevelComponents(raw, isRecurringComponentName)
+	return recurringComponentsFromLines(UnfoldLines(raw))
+}
+
+func recurringComponentsFromLines(lines []string) []recurringComponent {
+	parsedComponents := topLevelComponentsFromLines(lines, isRecurringComponentName)
 	components := make([]recurringComponent, 0, len(parsedComponents))
 	for _, parsed := range parsedComponents {
 		current := recurringComponent{}

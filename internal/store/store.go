@@ -24,6 +24,7 @@ type Store struct {
 	Sessions         SessionRepository
 	Locks            LockRepository
 	ACLEntries       ACLRepository
+	DeadProperties   DeadPropertyRepository
 }
 
 // New wires concrete repository implementations with shared connection pool.
@@ -40,6 +41,7 @@ func New(pool *sql.DB) *Store {
 		Sessions:         &sessionRepo{pool: pool},
 		Locks:            &lockRepo{pool: pool},
 		ACLEntries:       &aclRepo{pool: pool},
+		DeadProperties:   &deadPropertyRepo{pool: pool},
 	}
 }
 

@@ -224,15 +224,18 @@ func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, us
 		http.Error(w, http.StatusText(status), status)
 		return
 	}
-	if existing != nil {
-		if err := h.deleteDAVResourceState(r.Context(), user, destPath); err != nil {
-			http.Error(w, "failed to clear destination state", http.StatusInternalServerError)
-			return
-		}
-	}
 	etag := newCopyETag(src.RawICAL, destCalID)
-
-	_, err = h.store.Events.CopyToCalendar(r.Context(), srcCalID, destCalID, src.UID, destResourceName, etag)
+	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		return
+	}
+	replacedUID := ""
+	if existing != nil {
+		replacedUID = existing.UID
+	}
+	defer invalidateDAVRequestState(r.Context())
+	_, err = h.store.CopyEventAndState(r.Context(), srcCalID, destCalID, src.UID, destResourceName, etag, fromStatePath, toStatePath, replacedUID)
 	if err != nil {
 		if err == store.ErrConflict {
 			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
@@ -340,20 +343,23 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 	}
 	etag := newCopyETag(src.RawVCard, destBookID)
 
-	if existingByName != nil {
-		if err := h.deleteDAVResourceState(r.Context(), user, destPath); err != nil {
-			http.Error(w, "failed to clear destination state", http.StatusInternalServerError)
-			return
-		}
-	} else {
-		if err := h.deleteDAVACLState(r.Context(), user, destPath); err != nil {
-			http.Error(w, "failed to reset destination ACL state", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	_, err = h.store.Contacts.CopyToAddressBook(r.Context(), srcBookID, destBookID, src.UID, destResourceName, etag)
+	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
+		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
+		return
+	}
+	replacedUID := ""
+	if existingByName != nil {
+		replacedUID = existingByName.UID
+	}
+	defer invalidateDAVRequestState(r.Context())
+	_, err = h.store.CopyContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, etag, fromStatePath, toStatePath, replacedUID)
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", destBookID, destResourceName)
+			writeCardDAVUIDConflict(w, conflictHref)
+			return
+		}
 		http.Error(w, "failed to copy contact", http.StatusInternalServerError)
 		return
 	}
@@ -631,6 +637,11 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 	}
 	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", destBookID, destResourceName)
+			writeCardDAVUIDConflict(w, conflictHref)
+			return
+		}
 		http.Error(w, "failed to move contact", http.StatusInternalServerError)
 		return
 	}

@@ -60,10 +60,6 @@ func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.
 }
 
 func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, filter *cardFilter, reqProp *reportProp, addressDataReq *addressDataQuery, limit *addressbookLimit) ([]response, error) {
-	contacts, err := h.store.Contacts.ListForBook(ctx, book.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list contacts")
-	}
 	targetResourceName := ""
 	if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathAddressBook && target.Resource {
 		targetResourceName = target.ResourceName
@@ -72,51 +68,74 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 	if targetResourceName != "" {
 		baseHref = strings.TrimSuffix(strings.TrimSuffix(cleanPath, "/"), "/"+targetResourceName+".vcf") + "/"
 	}
-	resourceNames := make([]string, 0, len(contacts))
-	for _, contact := range contacts {
-		resourceName := contactResourceName(contact)
-		if targetResourceName != "" && resourceName != targetResourceName {
-			continue
+	stopAfter := h.multistatusBuildLimit()
+	clientLimit := 0
+	if limit != nil && limit.NResults > 0 {
+		clientLimit = limit.NResults
+		if clientLimit < stopAfter-1 {
+			stopAfter = clientLimit + 1
 		}
-		resourceNames = append(resourceNames, resourceName)
-	}
-	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, resourceNames)
-	if err != nil {
-		return nil, err
 	}
 	var responses []response
-	for _, contact := range contacts {
-		resourceName := contactResourceName(contact)
-		if targetResourceName != "" && resourceName != targetResourceName {
-			continue
+	afterID := int64(0)
+	for len(responses) < stopAfter {
+		contacts, err := h.store.Contacts.ListForBookPageAfter(ctx, book.ID, afterID, multistatusPageSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list contacts")
 		}
-		if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
-			continue
+		if len(contacts) == 0 {
+			break
 		}
-		if !contactMatchesCardFilter(contact, filter) {
-			continue
+		resourceNames := make([]string, 0, len(contacts))
+		for _, contact := range contacts {
+			resourceNames = append(resourceNames, contactResourceName(contact))
 		}
-		href := baseHref + resourceName + ".vcf"
-		resp, err := h.buildAddressObjectReportResponse(ctx, user, href, contact, reqProp, addressDataReq)
+		entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, resourceNames)
 		if err != nil {
 			return nil, err
 		}
-		responses = append(responses, resp)
+		decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
+		for _, contact := range contacts {
+			resourceName := contactResourceName(contact)
+			if targetResourceName != "" && resourceName != targetResourceName {
+				continue
+			}
+			if !canReadAddressBookContactWithDecider(resourceName, decider) || !contactMatchesCardFilter(contact, filter) {
+				continue
+			}
+			href := baseHref + resourceName + ".vcf"
+			resp, err := h.buildAddressObjectReportResponse(ctx, user, href, contact, reqProp, addressDataReq)
+			if err != nil {
+				return nil, err
+			}
+			responses = append(responses, resp)
+			if len(responses) >= stopAfter {
+				break
+			}
+		}
+		lastID := contacts[len(contacts)-1].ID
+		if lastID <= afterID || len(contacts) < multistatusPageSize {
+			break
+		}
+		afterID = lastID
 	}
-	if limit != nil && limit.NResults > 0 && len(responses) > limit.NResults {
-		responses = responses[:limit.NResults]
+	if clientLimit > 0 && len(responses) > clientLimit {
+		responses = responses[:clientLimit]
 		responses = append(responses, response{
 			Href:   cleanPath,
 			Status: "HTTP/1.1 507 Insufficient Storage",
 			Error:  &responseError{NumberOfMatchesWithinLimits: &struct{}{}},
 		})
 	}
-	return responses, nil
+	return h.finishReportResponses(ctx, user, responses, reqProp, false, addressDataReq)
 }
 
 func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.User, book *store.AddressBook, hrefs []string, cleanPath string, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
 	if len(hrefs) == 0 {
 		return nil, fmt.Errorf("href required")
+	}
+	if buildLimit := h.multistatusBuildLimit(); len(hrefs) > buildLimit {
+		hrefs = hrefs[:buildLimit]
 	}
 	bookID := book.ID
 	targetResourceName := ""
@@ -142,6 +161,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	if err != nil {
 		return nil, err
 	}
+	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
 	// Batch-fetch the contacts and memoize collection-segment resolution: a
 	// multiget of hundreds of hrefs otherwise issues one contact query and one
 	// segment lookup per href.
@@ -200,7 +220,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
+		if !canReadAddressBookContactWithDecider(resourceName, decider) {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
@@ -210,7 +230,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 		}
 		responses = append(responses, resp)
 	}
-	return responses, nil
+	return h.finishReportResponses(ctx, user, responses, reqProp, false, addressDataReq)
 }
 
 func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
@@ -246,16 +266,19 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	}
 	addressDataReq := reportAddressData(report)
 	for _, contact := range contacts {
+		if h.multistatusBuildComplete(responses) {
+			break
+		}
 		href := collectionHref + contactResourceName(contact) + ".vcf"
 		resp, err := h.buildAddressObjectReportResponse(ctx, user, href, contact, report.Prop, addressDataReq)
 		if err != nil {
 			return nil, "", err
 		}
-		responses = append(responses, resp)
+		responses = h.appendMultistatusResponses(responses, []response{resp})
 	}
 
 	// Include deleted resources if this is an incremental sync
-	if !since.IsZero() {
+	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
 		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "contact", book.ID, since)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to list deleted contacts")
@@ -272,14 +295,22 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		if err != nil {
 			return nil, "", err
 		}
+		decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
 		for _, resourceName := range deletedNames {
-			if !canReadAddressBookContactWithEntries(user, book, resourceName, entriesByPath) {
+			if h.multistatusBuildComplete(responses) {
+				break
+			}
+			if !canReadAddressBookContactWithDecider(resourceName, decider) {
 				continue
 			}
 			href := collectionHref + resourceName + ".vcf"
-			responses = append(responses, deletedResponse(href))
+			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 		}
 	}
 
+	responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, false, addressDataReq)
+	if err != nil {
+		return nil, "", err
+	}
 	return responses, syncToken, nil
 }

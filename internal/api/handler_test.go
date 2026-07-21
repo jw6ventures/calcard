@@ -1057,6 +1057,23 @@ func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID 
 	})
 	return out, nil
 }
+
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
+	events, err := f.ListForCalendarFiltered(ctx, calendarID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var result []store.Event
+	for _, event := range events {
+		if event.ID > afterID {
+			result = append(result, event)
+		}
+	}
+	if limit >= 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	return nil, nil
 }

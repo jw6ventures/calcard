@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.0.13')
+VALUES ('version', 'v1.1.8')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -364,3 +364,27 @@ CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
 
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
     ON events (calendar_id, COALESCE(recurrence_until, dtend, dtstart));
+
+-- Persistent WebDAV dead properties and batched ACL lookup support.
+CREATE TABLE IF NOT EXISTS dav_dead_properties (
+    resource_path TEXT NOT NULL,
+    namespace_uri TEXT NOT NULL,
+    local_name TEXT NOT NULL,
+    inner_xml TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (resource_path, namespace_uri, local_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
+    ON dav_dead_properties (resource_path);
+
+CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
+    ON acl_entries (resource_path, principal_href);
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
+    ON contacts (object_acl_path);

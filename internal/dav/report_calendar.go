@@ -454,20 +454,37 @@ func recurringEventDuration(event store.Event, component *ical.VEventComponent, 
 }
 
 func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
-	events, err := h.listCalendarEventsForFilter(ctx, cal.ID, filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list events")
+	databaseFilter, _ := eventFilterFromCalFilter(filter)
+	buildLimit := h.multistatusBuildLimit()
+	responses := make([]response, 0, buildLimit)
+	afterID := int64(0)
+	for len(responses) < buildLimit {
+		events, err := h.store.Events.ListForCalendarPageAfter(ctx, cal.ID, afterID, multistatusPageSize, databaseFilter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list events")
+		}
+		if len(events) == 0 {
+			break
+		}
+
+		matching := events
+		if filter != nil {
+			matching = h.applyCalendarFilter(matching, filter)
+		}
+		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
+		if err != nil {
+			return nil, err
+		}
+		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, requested, calData, buildLimit-len(responses))...)
+
+		lastID := events[len(events)-1].ID
+		if lastID <= afterID || len(events) < multistatusPageSize {
+			break
+		}
+		afterID = lastID
 	}
 
-	if filter != nil {
-		events = h.applyCalendarFilter(events, filter)
-	}
-	events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
-	if err != nil {
-		return nil, err
-	}
-
-	return h.calendarResourceReportResponses(ctx, user, cleanPath, events, requested, calData)
+	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }
 
 func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl, requested *reportProp) ([]response, error) {
@@ -479,8 +496,10 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	// Apple clients multiget hundreds of hrefs after a sync; fetch the events
 	// and the relevant ACL entries in one batch each instead of one event
 	// query plus one full privilege evaluation per href.
-	uids := make([]string, 0, len(hrefs))
-	seen := make(map[string]struct{}, len(hrefs))
+	buildLimit := h.multistatusBuildLimit()
+	uids := make([]string, 0, min(len(hrefs), buildLimit))
+	seen := make(map[string]struct{}, min(len(hrefs), buildLimit))
+	validHrefs := 0
 	for _, href := range hrefs {
 		cleanHref := resolveDAVHref(resolvePath, href)
 		if cleanHref == "" {
@@ -490,11 +509,18 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 		if !ok || !calendarSegmentMatches(cal, segment) {
 			continue
 		}
+		validHrefs++
 		if _, ok := seen[uid]; ok {
+			if validHrefs >= buildLimit {
+				break
+			}
 			continue
 		}
 		seen[uid] = struct{}{}
 		uids = append(uids, uid)
+		if validHrefs >= buildLimit {
+			break
+		}
 	}
 	if len(uids) == 0 {
 		return nil, nil
@@ -512,9 +538,13 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	if err != nil {
 		return nil, err
 	}
+	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), prefetchedACLEntries)
 
 	var responses []response
 	for _, href := range hrefs {
+		if len(responses) >= buildLimit {
+			break
+		}
 		cleanHref := resolveDAVHref(resolvePath, href)
 		if cleanHref == "" {
 			continue
@@ -529,21 +559,17 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		allowed, err := h.canAccessCalendarObjectWithEntries(user, cal, uid, "read", prefetchedACLEntries)
-		if err != nil {
-			return nil, err
+		allowed, denied := calendarPrivilegeDecisionWithDecider(cal, uid, "read", decider)
+		if !allowed && !denied {
+			allowed = cal.EffectivePrivileges().Allows("read")
 		}
 		if !allowed {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		resp, err := h.calendarResourceReportResponse(ctx, user, responseHref, *ev, requested, calData)
-		if err != nil {
-			return nil, err
-		}
-		responses = append(responses, resp)
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, requested, calData))
 	}
-	return responses, nil
+	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }
 
 func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
@@ -592,20 +618,20 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	responses := []response{
 		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
-	resourceResponses, err := h.calendarResourceReportResponses(ctx, user, collectionHref, events, report.Prop, calData)
-	if err != nil {
-		return nil, "", err
-	}
-	responses = append(responses, resourceResponses...)
+	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, report.Prop, calData, h.multistatusBuildLimit()-len(responses))
+	responses = h.appendMultistatusResponses(responses, resourceResponses)
 
 	// Include deleted resources if this is an incremental sync
-	if !since.IsZero() {
+	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
 		deletedHrefs := make(map[string]struct{})
 		visible := make(map[string]struct{}, len(events))
 		for _, event := range events {
 			visible[eventResourceName(event)] = struct{}{}
 		}
 		for _, event := range allEvents {
+			if h.multistatusBuildComplete(responses) {
+				break
+			}
 			if !event.LastModified.After(since) {
 				continue
 			}
@@ -614,14 +640,21 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 				continue
 			}
 			href := collectionHref + resourceName + ".ics"
-			responses = append(responses, deletedResponse(href))
+			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 			deletedHrefs[href] = struct{}{}
+		}
+		if h.multistatusBuildComplete(responses) {
+			responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
+			return responses, syncToken, err
 		}
 		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "event", cal.ID, since)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to list deleted events")
 		}
 		for _, d := range deleted {
+			if h.multistatusBuildComplete(responses) {
+				break
+			}
 			resourceName := d.ResourceName
 			if resourceName == "" {
 				resourceName = d.UID
@@ -630,10 +663,14 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 			if _, ok := deletedHrefs[href]; ok {
 				continue
 			}
-			responses = append(responses, deletedResponse(href))
+			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 			deletedHrefs[href] = struct{}{}
 		}
 	}
 
+	responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
+	if err != nil {
+		return nil, "", err
+	}
 	return responses, syncToken, nil
 }

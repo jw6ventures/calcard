@@ -115,19 +115,34 @@ func (c CalendarAccess) EffectivePrivileges() CalendarPrivileges {
 
 // Event stores raw iCalendar payload and metadata.
 type Event struct {
-	ID           int64
-	CalendarID   int64
-	UID          string
-	ResourceName string
-	RawICAL      string
-	ETag         string
-	Summary      *string
-	Description  *string
-	Location     *string
-	DTStart      *time.Time
-	DTEnd        *time.Time
-	AllDay       bool
-	LastModified time.Time
+	ID            int64
+	CalendarID    int64
+	UID           string
+	ResourceName  string
+	RawICAL       string
+	ETag          string
+	Summary       *string
+	Description   *string
+	Location      *string
+	DTStart       *time.Time
+	DTEnd         *time.Time
+	AllDay        bool
+	LastModified  time.Time
+	WriteMetadata *EventWriteMetadata
+}
+
+// EventWriteMetadata contains fields derived from RawICAL during validation.
+// DAV callers can provide it to avoid reparsing an already-analyzed payload;
+// other callers may omit it and use the repository's parsing fallback.
+type EventWriteMetadata struct {
+	Summary         *string
+	Description     *string
+	Location        *string
+	DTStart         *time.Time
+	DTEnd           *time.Time
+	AllDay          bool
+	RecurrenceStart *time.Time
+	RecurrenceUntil *time.Time
 }
 
 // EventFilter narrows ListForCalendarFiltered. Zero-value fields are ignored,
@@ -257,6 +272,26 @@ type ACLEntry struct {
 	IsGrant       bool
 	Privilege     string
 	CreatedAt     time.Time
+}
+
+// DeadProperty is a persistent, non-live WebDAV property bound to a canonical
+// DAV resource path.
+type DeadProperty struct {
+	ResourcePath string
+	NamespaceURI string
+	LocalName    string
+	InnerXML     string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// DeadPropertyMutation sets or removes one dead property. Remove takes
+// precedence over InnerXML; an empty InnerXML is a valid empty property value.
+type DeadPropertyMutation struct {
+	NamespaceURI string
+	LocalName    string
+	InnerXML     string
+	Remove       bool
 }
 
 // PaginatedResult wraps a paginated query result.

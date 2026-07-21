@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -841,8 +842,8 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 	if !strings.Contains(resp, "getetag") {
 		t.Fatalf("expected getetag in response, got %s", resp)
 	}
-	if !strings.Contains(resp, "BEGIN:VEVENT") {
-		t.Fatalf("expected calendar data in response, got %s", resp)
+	if strings.Contains(resp, "BEGIN:VEVENT") {
+		t.Fatalf("PROPFIND must not expose calendar data, got %s", resp)
 	}
 }
 
@@ -2602,8 +2603,8 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 	if aclRepo.listByResourceCalls != 0 {
 		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
 	}
-	if aclRepo.listByPrincipalCalls == 0 || aclRepo.listByPrincipalCalls > 3 {
-		t.Fatalf("expected batched ListByPrincipal calls, got %d", aclRepo.listByPrincipalCalls)
+	if aclRepo.listScopedACLCalls != 1 {
+		t.Fatalf("expected one scoped ACL batch lookup, got %d", aclRepo.listScopedACLCalls)
 	}
 }
 
@@ -2674,7 +2675,7 @@ func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
 	}
 }
 
-func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *testing.T) {
+func TestReportAddressBookSyncCollectionUsesCollectionACLAfterObjectDelete(t *testing.T) {
 	now := store.Now()
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -2728,8 +2729,8 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 	if !strings.Contains(respBody, "public.vcf") {
 		t.Fatalf("expected collection-level read grant to expose unrelated deleted tombstones, got %s", respBody)
 	}
-	if strings.Contains(respBody, "secret.vcf") {
-		t.Fatalf("expected object-level deny ACL to keep deleted tombstone hidden after delete, got %s", respBody)
+	if !strings.Contains(respBody, "secret.vcf") {
+		t.Fatalf("expected deleted object ACL cleanup to leave tombstone visibility governed by the collection, got %s", respBody)
 	}
 }
 
@@ -3685,6 +3686,9 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now}, Editor: true},
+			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now}, Shared: true, PrivilegesResolved: true},
 			},
 		},
 		calendars: map[int64]*store.Calendar{
@@ -5628,6 +5632,9 @@ func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
 			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{ReadFreeBusy: true}},
+			},
 		},
 		calendars: map[int64]*store.Calendar{
 			5: {ID: 5, UserID: owner.ID, Name: "Work"},
@@ -5723,6 +5730,9 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
 			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
+			},
 		},
 		calendars: map[int64]*store.Calendar{
 			5: {ID: 5, UserID: owner.ID, Name: "Work"},
@@ -5775,6 +5785,9 @@ func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
 			},
 		},
 		calendars: map[int64]*store.Calendar{
@@ -6269,7 +6282,7 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
-	t.Run("positive_empty_address_data_returns_full_card", func(t *testing.T) {
+	t.Run("empty_address_data_is_report_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -6287,14 +6300,15 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 		respBody := rr.Body.String()
-		for _, want := range []string{"FN:Alice Example", "EMAIL:alice@example.com"} {
-			if !strings.Contains(respBody, want) {
-				t.Fatalf("expected full address-data response to include %q, got %s", want, respBody)
-			}
+		if !strings.Contains(respBody, httpStatusNotFound) {
+			t.Fatalf("expected address-data to be reported as unavailable through PROPFIND, got %s", respBody)
+		}
+		if strings.Contains(respBody, "FN:Alice Example") || strings.Contains(respBody, "EMAIL:alice@example.com") {
+			t.Fatalf("PROPFIND must not expose address data, got %s", respBody)
 		}
 	})
 
-	t.Run("negative_selected_properties_exclude_unrequested_fields", func(t *testing.T) {
+	t.Run("selected_address_data_is_report_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -6314,11 +6328,11 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "FN:Alice Example") {
-			t.Fatalf("expected filtered address-data to include FN, got %s", respBody)
+		if !strings.Contains(respBody, httpStatusNotFound) {
+			t.Fatalf("expected selected address-data to be unavailable through PROPFIND, got %s", respBody)
 		}
-		if strings.Contains(respBody, "EMAIL:alice@example.com") {
-			t.Fatalf("expected filtered address-data to omit EMAIL, got %s", respBody)
+		if strings.Contains(respBody, "FN:Alice Example") || strings.Contains(respBody, "EMAIL:alice@example.com") {
+			t.Fatalf("PROPFIND must not expose selected address data, got %s", respBody)
 		}
 	})
 }
@@ -7746,6 +7760,12 @@ func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
 			2: {ID: 2, UserID: user.ID, Name: "Owned"},
 			5: {ID: 5, UserID: 1, Name: "Shared"},
 		},
+		accessibleByUser: map[int64][]store.AddressBook{
+			user.ID: {
+				{ID: 2, UserID: user.ID, Name: "Owned"},
+				{ID: 5, UserID: 1, Name: "Shared"},
+			},
+		},
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
@@ -7791,6 +7811,8 @@ type fakeEventRepo struct {
 	getByResourceNameKey     string
 	resourceLookupCount      int
 	batchResourceLookupCount int
+	listForCalendarCalls     int
+	pageLookupCount          int
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -7874,6 +7896,7 @@ func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int6
 }
 
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
+	f.listForCalendarCalls++
 	var result []store.Event
 	for _, ev := range f.events {
 		if ev.CalendarID != calendarID {
@@ -7881,6 +7904,21 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 		}
 		copy := *ev
 		result = append(result, copy)
+	}
+	return result, nil
+}
+
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, _ store.EventFilter) ([]store.Event, error) {
+	f.pageLookupCount++
+	var result []store.Event
+	for _, event := range f.events {
+		if event.CalendarID == calendarID && (event.ID > afterID || afterID == 0 && event.ID == 0) {
+			result = append(result, *event)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	if limit >= 0 && len(result) > limit {
+		result = result[:limit]
 	}
 	return result, nil
 }
@@ -8016,6 +8054,9 @@ func (e *errorEventRepo) ListByResourceNames(ctx context.Context, calendarID int
 func (e *errorEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	return nil, errors.New("fail")
 }
+func (e *errorEventRepo) ListForCalendarPageAfter(context.Context, int64, int64, int, store.EventFilter) ([]store.Event, error) {
+	return nil, errors.New("fail")
+}
 
 func (e *errorEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
 	return nil, errors.New("fail")
@@ -8061,6 +8102,7 @@ type fakeContactRepo struct {
 	getByResourceNameErrKey  string
 	resourceLookupCount      int
 	batchResourceLookupCount int
+	pageLookupCount          int
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -8308,9 +8350,11 @@ type fakeCalendarRepo struct {
 	accessibleByUser    map[int64][]store.CalendarAccess
 	calendars           map[int64]*store.Calendar
 	listAccessibleCalls int
+	getByIDCalls        int
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
+	f.getByIDCalls++
 	if f.calendars == nil {
 		return nil, nil
 	}
@@ -8417,7 +8461,10 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 }
 
 type fakeAddressBookRepo struct {
-	books map[int64]*store.AddressBook
+	books               map[int64]*store.AddressBook
+	accessibleByUser    map[int64][]store.AddressBook
+	listAccessibleCalls int
+	getByIDCalls        int
 }
 
 func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name string) bool {
@@ -8433,6 +8480,7 @@ func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name str
 }
 
 func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.AddressBook, error) {
+	f.getByIDCalls++
 	if f.books == nil {
 		return nil, nil
 	}
@@ -8490,9 +8538,7 @@ func (f *fakeAddressBookRepo) UpdateProperties(ctx context.Context, id int64, na
 		return store.ErrConflict
 	}
 	book.Name = name
-	if description != nil {
-		book.Description = description
-	}
+	book.Description = description
 	return nil
 }
 
@@ -10119,8 +10165,8 @@ func TestProppatchCalendarColorPersistsChange(t *testing.T) {
 	if updated == nil || updated.Color == nil || *updated.Color != "#22CC88FF" {
 		t.Fatalf("expected PROPPATCH to persist color, got %#v", updated)
 	}
-	if !strings.Contains(rr.Body.String(), `<ical:calendar-color>#22CC88FF</ical:calendar-color>`) {
-		t.Fatalf("expected color in PROPPATCH response, got %s", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), `<ical:calendar-color></ical:calendar-color>`) {
+		t.Fatalf("expected successful property name in PROPPATCH response, got %s", rr.Body.String())
 	}
 }
 

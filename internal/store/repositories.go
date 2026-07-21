@@ -35,6 +35,7 @@ type EventRepository interface {
 	GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error)
 	ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]Event, error)
 	ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error)
+	ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, f EventFilter) ([]Event, error)
 	ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error)
 	ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*PaginatedResult[Event], error)
 	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)
@@ -49,6 +50,7 @@ type EventRepository interface {
 type AddressBookRepository interface {
 	GetByID(ctx context.Context, id int64) (*AddressBook, error)
 	ListByUser(ctx context.Context, userID int64) ([]AddressBook, error)
+	ListAccessible(ctx context.Context, userID int64) ([]AddressBook, error)
 	Create(ctx context.Context, book AddressBook) (*AddressBook, error)
 	Update(ctx context.Context, userID, id int64, name string, description *string) error
 	UpdateProperties(ctx context.Context, id int64, name string, description *string) error
@@ -62,6 +64,7 @@ type ContactRepository interface {
 	DeleteByUID(ctx context.Context, addressBookID int64, uid string) error
 	GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error)
 	ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error)
+	ListForBookPageAfter(ctx context.Context, addressBookID, afterID int64, limit int) ([]Contact, error)
 	ListForBookFiltered(ctx context.Context, addressBookID int64, f ContactFilter) ([]Contact, error)
 	ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*PaginatedResult[Contact], error)
 	ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error)
@@ -122,9 +125,18 @@ type LockRepository interface {
 type ACLRepository interface {
 	SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error
 	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
+	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)
+	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
 	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
 	DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
+}
+
+// DeadPropertyRepository persists WebDAV properties that are not computed by
+// the server.
+type DeadPropertyRepository interface {
+	ListByResources(ctx context.Context, resourcePaths []string) ([]DeadProperty, error)
+	Apply(ctx context.Context, resourcePath string, mutations []DeadPropertyMutation) error
 }

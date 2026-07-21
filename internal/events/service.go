@@ -398,7 +398,11 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if err := s.requireCalendarPrivilege(ctx, user, cal, eventResourceName(*existing), "unbind"); err != nil {
 		return err
 	}
-	return s.store.Events.DeleteByUID(ctx, calendarID, uid)
+	resourcePaths := calendarACLResourcePaths(calendarID, eventResourceName(*existing))
+	if len(resourcePaths) == 0 {
+		return ErrNotFound
+	}
+	return s.store.DeleteEventAndState(ctx, calendarID, uid, resourcePaths[0])
 }
 
 func (s *Service) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) error {

@@ -45,18 +45,20 @@ func objectResourcePath(prefix string, id int64, resourceName string) string {
 // stored resource name and its extension-normalized variant (ext includes the
 // dot, e.g. ".ics" or ".vcf").
 func objectACLPaths(prefix string, id int64, resourceName, ext string) []string {
+	return appendObjectACLPaths(nil, collectionResourcePath(prefix, id), resourceName, ext)
+}
+
+func appendObjectACLPaths(paths []string, collectionPath, resourceName, ext string) []string {
 	resourceName = strings.TrimSpace(resourceName)
 	if resourceName == "" {
-		return nil
+		return paths
 	}
-	base := objectResourcePath(prefix, id, resourceName)
-	paths := []string{base}
+	base := strings.TrimSuffix(collectionPath, "/") + "/" + resourceName
+	paths = append(paths, base)
 	if strings.EqualFold(path.Ext(resourceName), ext) {
-		paths = append(paths, strings.TrimSuffix(base, path.Ext(resourceName)))
-	} else {
-		paths = append(paths, base+ext)
+		return append(paths, strings.TrimSuffix(base, path.Ext(resourceName)))
 	}
-	return paths
+	return append(paths, base+ext)
 }
 
 // requirePrivilegeDecision turns the (allowed, denied) result of a privilege

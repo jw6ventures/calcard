@@ -166,7 +166,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges()),
 			principalResponse(ensureCollectionHref(principalHref), user),
 		}
-		writeMultiStatus(w, newMultistatus(responses, ""))
+		h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
 		return
 	}
 	if report.XMLName.Local == "free-busy-query" {
@@ -191,7 +191,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		}
 		return
 	}
-	writeMultiStatus(w, newMultistatus(responses, syncToken))
+	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
 }
 
 func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, report reportRequest) {
@@ -201,7 +201,7 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			birthdayCalendarCollection(birthdayCalendarHref(), principalHref),
 			principalResponse(ensureCollectionHref(principalHref), user),
 		}
-		writeMultiStatus(w, newMultistatus(responses, ""))
+		h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
 		return
 	}
 
@@ -233,7 +233,7 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeMultiStatus(w, newMultistatus(responses, syncToken))
+	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
 }
 
 func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, report reportRequest, expandReq *expandPropertyRequest) {
@@ -328,7 +328,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 	// itself, not its children — return empty multistatus after access checks.
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	if report.XMLName.Local == "addressbook-query" && !target.Resource && depth == "0" {
-		writeMultiStatus(w, newMultistatus(nil, ""))
+		h.writeBoundedMultiStatus(w, newMultistatus(nil, ""))
 		return
 	}
 	responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, expandReq)
@@ -342,7 +342,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		}
 		return
 	}
-	writeMultiStatus(w, newMultistatus(responses, syncToken))
+	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
 }
 
 func (h *DavServer) reportRootExpandProperty(w http.ResponseWriter, user *store.User, expandReq *expandPropertyRequest) {
@@ -357,5 +357,5 @@ func (h *DavServer) reportRootExpandProperty(w http.ResponseWriter, user *store.
 			rootResp.Propstat[0].Prop.PrincipalURL = expanded.PrincipalURL
 		}
 	}
-	writeMultiStatus(w, newMultistatus([]response{rootResp}, ""))
+	h.writeBoundedMultiStatus(w, newMultistatus([]response{rootResp}, ""))
 }

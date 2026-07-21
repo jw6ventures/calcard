@@ -332,7 +332,8 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 		if !spec.requested(req.Prop) {
 			continue
 		}
-		if spec.ok&kind != 0 && (spec.present == nil || spec.present(&src)) {
+		dataSuppressed := req.suppressData && (spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data")
+		if !dataSuppressed && spec.ok&kind != 0 && (spec.present == nil || spec.present(&src)) {
 			spec.copyValue(&okProp, &src, req.Prop)
 			okSet = true
 		} else {
@@ -384,7 +385,7 @@ func filterAddressObjectPropfindResponse(resp response, req *propfindRequest) re
 		return resp
 	}
 	src := resp.Propstat[0].Prop
-	if req.Prop.AddressData != nil && !canServeRequestedAddressData(string(src.AddressData), req.Prop.AddressData) {
+	if !req.suppressData && req.Prop.AddressData != nil && !canServeRequestedAddressData(string(src.AddressData), req.Prop.AddressData) {
 		resp.Propstat = nil
 		resp.Status = httpStatusNotAcceptable
 		resp.Error = &responseError{SupportedAddressDataConversion: &struct{}{}}
@@ -407,6 +408,9 @@ func propnamePropfindResponse(resp response) response {
 	var names []xml.Name
 	for i := range propfindPropertyTable {
 		spec := &propfindPropertyTable[i]
+		if spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data" {
+			continue
+		}
 		if spec.ok&kind == 0 {
 			continue
 		}

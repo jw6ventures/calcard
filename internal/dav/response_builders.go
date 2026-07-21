@@ -8,7 +8,7 @@ import (
 )
 
 func calendarResourceResponses(base string, events []store.Event) []response {
-	return calendarResourceResponsesFiltered(base, events, nil)
+	return calendarResourceResponsesFilteredLimit(base, events, nil, len(events))
 }
 
 func eventResourceName(ev store.Event) string {
@@ -26,9 +26,22 @@ func contactResourceName(contact store.Contact) string {
 }
 
 func calendarResourceResponsesFiltered(base string, events []store.Event, calData *calendarDataEl) []response {
+	return calendarResourceResponsesFilteredLimit(base, events, calData, len(events))
+}
+
+func calendarResourceResponsesFilteredLimit(base string, events []store.Event, calData *calendarDataEl, limit int) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
-	var responses []response
+	if limit <= 0 {
+		return nil
+	}
+	if limit > len(events) {
+		limit = len(events)
+	}
+	responses := make([]response, 0, limit)
 	for _, ev := range events {
+		if len(responses) >= limit {
+			break
+		}
 		href := baseHref + eventResourceName(ev) + ".ics"
 		rawData := filterICalendarData(ev.RawICAL, calData)
 		responses = append(responses, resourceResponse(href, etagProp(ev.ETag, rawData, true)))
@@ -37,52 +50,47 @@ func calendarResourceResponsesFiltered(base string, events []store.Event, calDat
 }
 
 func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, requested *reportProp, calData *calendarDataEl) ([]response, error) {
-	baseHref := strings.TrimSuffix(base, "/") + "/"
-	var responses []response
-	for _, ev := range events {
-		href := baseHref + eventResourceName(ev) + ".ics"
-		resp, err := h.calendarResourceReportResponse(ctx, user, href, ev, requested, calData)
-		if err != nil {
-			return nil, err
-		}
-		responses = append(responses, resp)
-	}
-	return responses, nil
+	responses := rawCalendarResourceReportResponsesLimit(base, events, requested, calData, h.multistatusBuildLimit())
+	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }
 
-func (h *DavServer) calendarResourceReportResponse(ctx context.Context, user *store.User, href string, event store.Event, requested *reportProp, calData *calendarDataEl) (response, error) {
+func rawCalendarResourceReportResponses(base string, events []store.Event, requested *reportProp, calData *calendarDataEl) []response {
+	return rawCalendarResourceReportResponsesLimit(base, events, requested, calData, len(events))
+}
+
+func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, requested *reportProp, calData *calendarDataEl, limit int) []response {
+	baseHref := strings.TrimSuffix(base, "/") + "/"
+	if limit <= 0 {
+		return nil
+	}
+	if limit > len(events) {
+		limit = len(events)
+	}
+	responses := make([]response, 0, limit)
+	for _, ev := range events {
+		if len(responses) >= limit {
+			break
+		}
+		href := baseHref + eventResourceName(ev) + ".ics"
+		responses = append(responses, rawCalendarResourceReportResponse(href, ev, requested, calData))
+	}
+	return responses
+}
+
+func rawCalendarResourceReportResponse(href string, event store.Event, requested *reportProp, calData *calendarDataEl) response {
 	rawData := filterICalendarData(event.RawICAL, calData)
 	propertyStatus := etagProp(event.ETag, rawData, true)
-	if requested != nil && requested.SupportedReport != nil {
+	if requested != nil && requested.SupportedReportSet != nil {
 		propertyStatus.Prop.SupportedReportSet = &supportedReportSet{}
 	}
-	resp := resourceResponse(href, propertyStatus)
-	request := propfindRequestForReport(requested, calData != nil, nil)
-	if request != nil {
-		if err := h.decorateDAVProp(ctx, user, href, &resp.Propstat[0].Prop, decorationMaskFor(request)); err != nil {
-			return response{}, err
-		}
-	}
-	return filterPropfindResponseForKind(resp, request, kindCalendarObject), nil
+	return resourceResponse(href, propertyStatus)
 }
 
 func propfindRequestForReport(requested *reportProp, calendarData bool, addressData *addressDataQuery) *propfindRequest {
 	if requested == nil {
 		return nil
 	}
-	query := &propfindPropQuery{
-		DisplayName:            requested.DisplayName,
-		ResourceType:           requested.ResourceType,
-		GetETag:                requested.GetETag,
-		GetContentType:         requested.GetContentType,
-		SupportedReportSet:     requested.SupportedReport,
-		LockDiscovery:          requested.LockDiscovery,
-		SupportedLock:          requested.SupportedLock,
-		ACLProp:                requested.ACLProp,
-		SupportedPrivilegeSet:  requested.SupportedPrivilegeSet,
-		PrincipalCollectionSet: requested.PrincipalCollectionSet,
-		CustomXML:              requested.CustomXML,
-	}
+	query := &propfindPropQuery{propertySelection: requested.propertySelection}
 	if requested.CalendarData != nil || calendarData {
 		query.CalendarData = &struct{}{}
 	}
@@ -94,10 +102,43 @@ func propfindRequestForReport(requested *reportProp, calendarData bool, addressD
 	return &propfindRequest{Prop: query}
 }
 
+func (h *DavServer) finishReportResponses(ctx context.Context, user *store.User, responses []response, requested *reportProp, calendarData bool, addressData *addressDataQuery) ([]response, error) {
+	responses, limitExceeded := h.capMultistatusResponses(responses)
+	if limitExceeded {
+		return responses, nil
+	}
+	request := propfindRequestForReport(requested, calendarData, addressData)
+	if request == nil {
+		return responses, nil
+	}
+	if err := h.decoratePropfindResponses(ctx, nil, user, responses, decorationMaskFor(request)); err != nil {
+		return nil, err
+	}
+	for i := range responses {
+		if len(responses[i].Propstat) != 0 {
+			responses[i] = filterNonPrincipalPropfindResponse(responses[i], request)
+		}
+	}
+	return responses, nil
+}
+
 func addressBookResourceResponses(base string, contacts []store.Contact) []response {
+	return addressBookResourceResponsesLimit(base, contacts, len(contacts))
+}
+
+func addressBookResourceResponsesLimit(base string, contacts []store.Contact, limit int) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
-	var responses []response
+	if limit <= 0 {
+		return nil
+	}
+	if limit > len(contacts) {
+		limit = len(contacts)
+	}
+	responses := make([]response, 0, limit)
 	for _, c := range contacts {
+		if len(responses) >= limit {
+			break
+		}
 		href := baseHref + contactResourceName(c) + ".vcf"
 		responses = append(responses, resourceResponse(href, etagProp(c.ETag, c.RawVCard, false)))
 	}

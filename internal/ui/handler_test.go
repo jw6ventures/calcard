@@ -441,10 +441,14 @@ func TestDeleteEventHandler(t *testing.T) {
 			},
 		},
 	}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		"/dav/calendars/1/event-1": {{ResourcePath: "/dav/calendars/1/event-1", NamespaceURI: "urn:test", LocalName: "note"}},
+	}}
 
 	s := &store.Store{
-		Calendars: calRepo,
-		Events:    eventRepo,
+		Calendars:      calRepo,
+		Events:         eventRepo,
+		DeadProperties: deadProperties,
 	}
 
 	handler := NewHandler(&config.Config{}, s, nil)
@@ -463,6 +467,42 @@ func TestDeleteEventHandler(t *testing.T) {
 
 	if w.Code != http.StatusFound {
 		t.Errorf("DeleteEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	if len(deadProperties.properties["/dav/calendars/1/event-1"]) != 0 {
+		t.Fatalf("DeleteEvent() retained dead properties: %#v", deadProperties.properties)
+	}
+}
+
+func TestDeleteContactHandlerRemovesDAVState(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		1: {ID: 1, UserID: 100, Name: "Contacts"},
+	}}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "alice"},
+	}}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		"/dav/addressbooks/1/alice": {{ResourcePath: "/dav/addressbooks/1/alice", NamespaceURI: "urn:test", LocalName: "note"}},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks:   bookRepo,
+		Contacts:       contactRepo,
+		DeadProperties: deadProperties,
+	}, nil)
+	req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/contact-1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "contact-1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	response := httptest.NewRecorder()
+
+	handler.DeleteContact(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("DeleteContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	if len(deadProperties.properties["/dav/addressbooks/1/alice"]) != 0 {
+		t.Fatalf("DeleteContact() retained dead properties: %#v", deadProperties.properties)
 	}
 }
 
@@ -2446,6 +2486,23 @@ func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID 
 	return f.ListForCalendar(ctx, calendarID)
 }
 
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
+	events, err := f.ListForCalendarFiltered(ctx, calendarID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var result []store.Event
+	for _, event := range events {
+		if event.ID > afterID {
+			result = append(result, event)
+		}
+	}
+	if limit >= 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	events, _ := f.ListForCalendar(ctx, calendarID)
 	return &store.PaginatedResult[store.Event]{
@@ -2530,6 +2587,36 @@ func (f *fakeAddressBookRepo) Delete(ctx context.Context, userID, id int64) erro
 
 type fakeContactRepo struct {
 	contacts map[string]*store.Contact
+}
+
+type fakeDeadPropertyRepo struct {
+	properties map[string][]store.DeadProperty
+}
+
+func (f *fakeDeadPropertyRepo) ListByResources(_ context.Context, resourcePaths []string) ([]store.DeadProperty, error) {
+	var result []store.DeadProperty
+	for _, resourcePath := range resourcePaths {
+		result = append(result, f.properties[resourcePath]...)
+	}
+	return result, nil
+}
+
+func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
+	properties := f.properties[resourcePath]
+	for _, mutation := range mutations {
+		if !mutation.Remove {
+			continue
+		}
+		filtered := properties[:0]
+		for _, property := range properties {
+			if property.NamespaceURI != mutation.NamespaceURI || property.LocalName != mutation.LocalName {
+				filtered = append(filtered, property)
+			}
+		}
+		properties = filtered
+	}
+	f.properties[resourcePath] = properties
+	return nil
 }
 
 func (f *fakeContactRepo) key(bookID int64, uid string) string {

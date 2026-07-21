@@ -49,6 +49,8 @@ type Config struct {
 		// refuses them with 403 DAV:propfind-finite-depth, which §9.1.1
 		// permits for deployments where deep listings are a DoS concern.
 		PropfindInfinityEnabled bool
+		MaxMultistatusResponses int
+		MaxMultistatusBytes     int
 	}
 
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
@@ -127,6 +129,14 @@ func Load() (*Config, error) {
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
 	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
+	cfg.DAV.MaxMultistatusResponses, err = getenvPositiveIntDefault("APP_DAV_MAX_MULTISTATUS_RESPONSES", 10000)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxMultistatusBytes, err = getenvPositiveIntDefault("APP_DAV_MAX_MULTISTATUS_BYTES", 67108864)
+	if err != nil {
+		return nil, err
+	}
 	cfg.PprofEnabled = getenvBool("APP_PPROF_ENABLED", false)
 	cfg.PprofAddr = getenvDefault("APP_PPROF_ADDR", "127.0.0.1:6060")
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
@@ -184,6 +194,18 @@ func getenvIntDefault(key string, def int) (int, error) {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return n, nil
+}
+
+func getenvPositiveIntDefault(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
 	}
 	return n, nil
 }

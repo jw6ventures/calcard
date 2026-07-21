@@ -64,6 +64,7 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 	} else {
 		propfindReq.AllProp = &struct{}{}
 	}
+	propfindReq.suppressData = true
 
 	responses, err := h.buildPropfindResponses(r.Context(), r, r.URL.Path, depth, user, &propfindReq)
 	if err != nil {
@@ -82,6 +83,11 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))
+	responses, limitExceeded := h.capMultistatusResponses(responses)
+	if limitExceeded {
+		h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+		return
+	}
 
 	// RFC 4918 §9.1: <propname/> asks for the names of the resource's
 	// properties, not their values.
@@ -91,5 +97,5 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeMultiStatus(w, newMultistatus(responses, ""))
+	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
 }

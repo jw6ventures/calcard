@@ -7,12 +7,51 @@ import (
 	"fmt"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+var settableLiveProperties = map[xml.Name]string{
+	{Space: "DAV:", Local: "displayname"}:                                       "displayname",
+	{Space: "urn:ietf:params:xml:ns:caldav", Local: "calendar-description"}:     "calendar-description",
+	{Space: "urn:ietf:params:xml:ns:caldav", Local: "calendar-timezone"}:        "calendar-timezone",
+	{Space: "http://apple.com/ns/ical/", Local: "calendar-color"}:               "calendar-color",
+	{Space: "urn:ietf:params:xml:ns:carddav", Local: "addressbook-description"}: "addressbook-description",
+}
+
+var protectedLiveProperties = func() map[xml.Name]struct{} {
+	properties := map[xml.Name]struct{}{
+		{Space: "DAV:", Local: "creationdate"}:       {},
+		{Space: "DAV:", Local: "getcontentlanguage"}: {},
+		{Space: "DAV:", Local: "getcontentlength"}:   {},
+		{Space: "DAV:", Local: "getlastmodified"}:    {},
+	}
+	for _, spec := range propfindPropertyTable {
+		name := expandedPropertyName(spec.emptyName.Local)
+		if name.Local != "" {
+			properties[name] = struct{}{}
+		}
+	}
+	return properties
+}()
+
+func expandedPropertyName(prefixed string) xml.Name {
+	prefix, local, ok := strings.Cut(prefixed, ":")
+	if !ok {
+		return xml.Name{Local: prefixed}
+	}
+	spaces := map[string]string{
+		"d":    "DAV:",
+		"cal":  "urn:ietf:params:xml:ns:caldav",
+		"card": "urn:ietf:params:xml:ns:carddav",
+		"cs":   "http://calendarserver.org/ns/",
+		"ical": "http://apple.com/ns/ical/",
+	}
+	return xml.Name{Space: spaces[prefix], Local: local}
+}
 
 func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Proppatch", "PROPPATCH %s", r.URL.Path)
@@ -23,11 +62,15 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	target := parsedDAVTarget(r.Context(), cleanPath)
+	if !target.Valid || target.CollectionSegment == "" || (target.Domain != davPathCalendar && target.Domain != davPathAddressBook) {
+		http.Error(w, "unsupported path for PROPPATCH", http.StatusBadRequest)
+		return
+	}
 	if !h.requireLock(w, r, cleanPath, "resource is locked") {
 		return
 	}
 
-	// Parse PROPPATCH request body
 	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
 		if errors.Is(err, errRequestTooLarge) {
@@ -37,336 +80,389 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
-	var proppatchReq proppatchRequest
-	if err := safeUnmarshalXML(body, &proppatchReq); err != nil {
+	var request proppatchRequest
+	if err := safeUnmarshalXML(body, &request); err != nil || len(request.Instructions) == 0 {
 		http.Error(w, "invalid PROPPATCH body", http.StatusBadRequest)
 		return
 	}
 
-	// Process the property updates
 	var responses []response
-
-	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
-		resp, err := h.proppatchCalendar(r.Context(), user, cleanPath, &proppatchReq)
-		if err != nil {
-			if errors.Is(err, errInvalidPath) {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
+	switch target.Domain {
+	case davPathCalendar:
+		responses, err = h.proppatchCalendar(r.Context(), user, cleanPath, target, &request)
+	case davPathAddressBook:
+		responses, err = h.proppatchAddressBook(r.Context(), user, cleanPath, target, &request)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, errInvalidPath):
+			status = http.StatusBadRequest
+		case errors.Is(err, store.ErrNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, errAmbiguousCalendar), errors.Is(err, errAmbiguousAddressBook):
+			status = http.StatusConflict
 		}
-		responses = append(responses, resp...)
-	} else if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		resp, err := h.proppatchAddressBook(r.Context(), user, cleanPath, &proppatchReq)
-		if err != nil {
-			if errors.Is(err, errInvalidPath) {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-		responses = append(responses, resp...)
-	} else {
-		http.Error(w, "unsupported path for PROPPATCH", http.StatusBadRequest)
+		http.Error(w, err.Error(), status)
 		return
 	}
-
 	writeMultiStatus(w, newMultistatus(responses, ""))
 }
 
-func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
-	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/calendars"), "/")
-	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-		return nil, fmt.Errorf("%w: invalid calendar path", errInvalidPath)
-	}
+type calendarPatchState struct {
+	name        string
+	description *string
+	timezone    *string
+	color       *string
+}
 
-	calID, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid calendar id", errInvalidPath)
-	}
-	if calID == birthdayCalendarID {
-		return forbiddenProppatchResponses(cleanPath, req), nil
-	}
+type addressBookPatchState struct {
+	name        string
+	description *string
+}
 
-	calAccess, err := h.loadCalendar(ctx, user, calID)
+type proppatchPreflight struct {
+	dead     []store.DeadPropertyMutation
+	failures map[int][]xml.Name
+	all      []xml.Name
+}
+
+func (p *proppatchPreflight) record(property proppatchProperty, status int) {
+	p.all = append(p.all, property.Name)
+	if status != 0 {
+		if p.failures == nil {
+			p.failures = make(map[int][]xml.Name)
+		}
+		p.failures[status] = append(p.failures[status], property.Name)
+	}
+}
+
+func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest) ([]response, error) {
+	calendarID, ok, err := h.resolveCalendarID(ctx, user, target.CollectionSegment)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.requireCalendarPrivilege(ctx, user, &calAccess.Calendar, cleanPath, "write-properties"); err != nil {
-		return []response{{
-			Href: cleanPath,
-			Propstat: []propstat{{
-				Prop:   prop{},
-				Status: httpStatusForbidden,
-			}},
-		}}, nil
-	}
-
-	var name *string
-	var description *string
-	var timezone *string
-	var color *string
-	colorChanged := false
-
-	if req.Set != nil {
-		name = req.Set.Prop.DisplayName
-		description = req.Set.Prop.CalendarDescription
-		timezone = req.Set.Prop.CalendarTimezone
-		if req.Set.Prop.CalendarColor != nil {
-			colorChanged = true
-			color, err = store.NormalizeCalendarColor(*req.Set.Prop.CalendarColor)
-			if err != nil {
-				return []response{{
-					Href: cleanPath,
-					Propstat: []propstat{{
-						Prop:   prop{CalendarColor: req.Set.Prop.CalendarColor},
-						Status: httpStatusForbidden,
-					}},
-				}}, nil
-			}
+	if !ok || calendarID == birthdayCalendarID {
+		if calendarID == birthdayCalendarID {
+			return forbiddenProppatchResponse(href, requestedProppatchPropertyNames(request)), nil
 		}
+		return nil, store.ErrNotFound
 	}
-	if req.Remove != nil && req.Remove.Prop.CalendarColor != nil {
-		colorChanged = true
-		color = nil
-	}
-
-	if name != nil || description != nil || timezone != nil || colorChanged {
-		// Use existing name if not being updated
-		updateName := calAccess.Name
-		if name != nil {
-			updateName = *name
-		}
-
-		updateDescription := description
-		if updateDescription == nil {
-			updateDescription = calAccess.Description
-		}
-		updateTimezone := timezone
-		if updateTimezone == nil {
-			updateTimezone = calAccess.Timezone
-		}
-		updateColor := color
-		if !colorChanged {
-			updateColor = calAccess.Color
-		}
-
-		err := h.store.Calendars.UpdateProperties(ctx, calID, updateName, updateDescription, updateTimezone, updateColor)
-		if err != nil {
-			h.logger().Error("Proppatch", "failed to update calendar properties for calendar %d: %v", calID, err)
-			return []response{{
-				Href: cleanPath,
-				Propstat: []propstat{{
-					Prop:   prop{},
-					Status: httpStatusInternalServerError,
-				}},
-			}}, nil
-		}
-		// A rename changes name/slug-based path resolution.
-		invalidateDAVRequestState(ctx)
-	}
-
-	// Return success response
-	successProp := prop{}
-	if name != nil {
-		successProp.DisplayName = *name
-	}
-	if description != nil {
-		successProp.CalendarDescription = *description
-	}
-	if timezone != nil {
-		successProp.CalendarTimezone = timezone
-	}
-	if colorChanged {
-		successProp.CalendarColor = color
-		if successProp.CalendarColor == nil {
-			successProp.CalendarColor = stringPtr("")
-		}
-	}
-
-	return []response{{
-		Href: cleanPath,
-		Propstat: []propstat{{
-			Prop:   successProp,
-			Status: httpStatusOK,
-		}},
-	}}, nil
-}
-
-func forbiddenProppatchResponses(cleanPath string, req *proppatchRequest) []response {
-	return []response{{
-		Href: cleanPath,
-		Propstat: []propstat{{
-			PropNames: requestedProppatchPropertyNames(req),
-			Status:    httpStatusForbidden,
-		}},
-	}}
-}
-
-func requestedProppatchPropertyNames(req *proppatchRequest) []xml.Name {
-	if req == nil {
-		return nil
-	}
-	var names []xml.Name
-	seen := make(map[xml.Name]struct{})
-	appendName := func(name xml.Name) {
-		if name.Local == "" {
-			return
-		}
-		if _, ok := seen[name]; ok {
-			return
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	appendProp := func(value proppatchProp) {
-		for _, property := range []struct {
-			present bool
-			name    xml.Name
-		}{
-			{value.DisplayName != nil, xml.Name{Local: "d:displayname"}},
-			{value.ResourceType != nil, xml.Name{Local: "d:resourcetype"}},
-			{value.CalendarDescription != nil, xml.Name{Local: "cal:calendar-description"}},
-			{value.CalendarTimezone != nil, xml.Name{Local: "cal:calendar-timezone"}},
-			{value.CalendarColor != nil, xml.Name{Local: "ical:calendar-color"}},
-			{value.AddressBookDesc != nil, xml.Name{Local: "card:addressbook-description"}},
-			{value.SupportedAddressData != nil, xml.Name{Local: "card:supported-address-data"}},
-			{value.AddressBookMaxResourceSize != nil, xml.Name{Local: "card:max-resource-size"}},
-			{value.SupportedCollationSet != nil, xml.Name{Local: "card:supported-collation-set"}},
-		} {
-			if property.present {
-				appendName(property.name)
-			}
-		}
-		for _, name := range value.CustomXML {
-			appendName(name)
-		}
-	}
-	if req.Set != nil {
-		appendProp(req.Set.Prop)
-	}
-	if req.Remove != nil {
-		appendProp(req.Remove.Prop)
-	}
-	return names
-}
-
-func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, cleanPath string, req *proppatchRequest) ([]response, error) {
-	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-		return nil, fmt.Errorf("%w: invalid address book path", errInvalidPath)
-	}
-
-	bookID, ok, err := h.resolveAddressBookID(ctx, user, strings.TrimSpace(parts[1]))
+	canonicalPath, err := h.canonicalDAVPath(ctx, user, href)
 	if err != nil {
-		if errors.Is(err, errAmbiguousAddressBook) {
-			return nil, errAmbiguousAddressBook
+		return nil, err
+	}
+	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, canonicalPath, "write-properties")
+	if err != nil {
+		if errors.Is(err, errForbidden) {
+			return forbiddenProppatchResponse(href, requestedProppatchPropertyNames(request)), nil
 		}
-		return nil, fmt.Errorf("%w: invalid address book id", errInvalidPath)
+		return nil, err
+	}
+	if target.Resource {
+		event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
+		if err != nil {
+			return nil, err
+		}
+		if event == nil {
+			return nil, store.ErrNotFound
+		}
+	}
+
+	state := calendarPatchState{name: cal.Name, description: cal.Description, timezone: cal.Timezone, color: cal.Color}
+	preflight := preflightCalendarPatch(request, target.Resource, &state)
+	if len(preflight.failures) != 0 {
+		return failedProppatchResponse(href, preflight), nil
+	}
+	if target.Resource {
+		err = h.store.PatchDeadProperties(ctx, canonicalPath, preflight.dead)
+	} else {
+		err = h.store.PatchCalendarProperties(ctx, calendarID, state.name, state.description, state.timezone, state.color, canonicalPath, preflight.dead)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			failed := proppatchPreflight{all: preflight.all, failures: map[int][]xml.Name{http.StatusConflict: preflight.all}}
+			return failedProppatchResponse(href, failed), nil
+		}
+		return nil, err
+	}
+	invalidateDAVRequestState(ctx)
+	return successfulProppatchResponse(href, preflight.all), nil
+}
+
+func preflightCalendarPatch(request *proppatchRequest, object bool, state *calendarPatchState) proppatchPreflight {
+	var result proppatchPreflight
+	for _, instruction := range request.Instructions {
+		for _, property := range instruction.Properties {
+			status := 0
+			kind, settable := settableLiveProperties[property.Name]
+			if object && settable {
+				status = http.StatusForbidden
+			} else if settable {
+				status = applyCalendarLivePatch(state, kind, property, instruction.Remove)
+			} else if _, protected := protectedLiveProperties[property.Name]; protected {
+				status = http.StatusForbidden
+			} else {
+				result.dead = append(result.dead, deadPropertyMutation(property, instruction.Remove))
+			}
+			result.record(property, status)
+		}
+	}
+	return result
+}
+
+func applyCalendarLivePatch(state *calendarPatchState, kind string, property proppatchProperty, remove bool) int {
+	if property.HasElement {
+		return http.StatusConflict
+	}
+	switch kind {
+	case "displayname":
+		if remove || property.Text == "" {
+			return http.StatusConflict
+		}
+		state.name = property.Text
+	case "calendar-description":
+		state.description = optionalPatchedText(property.Text, remove)
+	case "calendar-timezone":
+		if !remove && !validCalendarTimezone(property.Text) {
+			return http.StatusConflict
+		}
+		state.timezone = optionalPatchedText(property.Text, remove)
+	case "calendar-color":
+		if remove {
+			state.color = nil
+			return 0
+		}
+		color, err := store.NormalizeCalendarColor(property.Text)
+		if err != nil {
+			return http.StatusConflict
+		}
+		state.color = color
+	default:
+		return http.StatusForbidden
+	}
+	return 0
+}
+
+func validCalendarTimezone(value string) bool {
+	lines := ical.UnfoldLines(value)
+	var stack []string
+	rootSeen := false
+	rootType := ""
+	timezoneDepth := 0
+	timezoneCount := 0
+	hasTZID := false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upper, "BEGIN:"):
+			component := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			if len(stack) == 0 {
+				if rootSeen || (component != "VTIMEZONE" && component != "VCALENDAR") {
+					return false
+				}
+				rootSeen = true
+				rootType = component
+				if component == "VTIMEZONE" {
+					timezoneCount = 1
+					timezoneDepth = 1
+				}
+			} else if len(stack) == 1 && rootType == "VCALENDAR" {
+				if component != "VTIMEZONE" || timezoneCount != 0 {
+					return false
+				}
+				timezoneCount = 1
+				timezoneDepth = 2
+			} else if component == "VTIMEZONE" {
+				return false
+			}
+			stack = append(stack, component)
+		case strings.HasPrefix(upper, "END:"):
+			component := strings.TrimSpace(strings.TrimPrefix(upper, "END:"))
+			if len(stack) == 0 || stack[len(stack)-1] != component {
+				return false
+			}
+			stack = stack[:len(stack)-1]
+		default:
+			if len(stack) == 0 {
+				return false
+			}
+			name, _, propertyValue, ok := splitICalendarProperty(line)
+			if ok && len(stack) == timezoneDepth && stack[len(stack)-1] == "VTIMEZONE" && name == "TZID" && strings.TrimSpace(propertyValue) != "" {
+				hasTZID = true
+			}
+		}
+	}
+	return rootSeen && len(stack) == 0 && timezoneCount == 1 && hasTZID
+}
+
+func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest) ([]response, error) {
+	bookID, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
+	if err != nil {
+		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%w: invalid address book id", errInvalidPath)
+		return nil, store.ErrNotFound
 	}
-
+	canonicalPath, err := h.canonicalDAVPath(ctx, user, href)
+	if err != nil {
+		return nil, err
+	}
 	book, err := h.getAddressBook(ctx, bookID)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, "write-properties"); err != nil {
-		if errors.Is(err, errForbidden) || err == store.ErrNotFound {
-			return []response{{
-				Href: cleanPath,
-				Propstat: []propstat{{
-					Prop:   prop{},
-					Status: httpStatusForbidden,
-				}},
-			}}, nil
+	if err := h.requireAddressBookPrivilege(ctx, user, book, canonicalPath, "write-properties"); err != nil {
+		if errors.Is(err, errForbidden) || errors.Is(err, store.ErrNotFound) {
+			return forbiddenProppatchResponse(href, requestedProppatchPropertyNames(request)), nil
 		}
 		return nil, err
 	}
-
-	// Extract properties to update
-	var name *string
-	var description *string
-	var protectedProp prop
-	var hasProtected bool
-
-	if req.Set != nil {
-		name = req.Set.Prop.DisplayName
-		description = req.Set.Prop.AddressBookDesc
-		if req.Set.Prop.SupportedAddressData != nil {
-			protectedProp.SupportedAddressData = supportedAddressDataProp()
-			hasProtected = true
-		}
-		if req.Set.Prop.AddressBookMaxResourceSize != nil {
-			protectedProp.AddressBookMaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
-			hasProtected = true
-		}
-		if req.Set.Prop.SupportedCollationSet != nil {
-			protectedProp.SupportedCollationSet = supportedCollationSetProp()
-			hasProtected = true
-		}
-	}
-
-	successProp := prop{}
-	if name != nil {
-		successProp.DisplayName = *name
-	}
-	if description != nil {
-		successProp.AddressBookDesc = *description
-	}
-
-	if hasProtected {
-		failedProp := protectedProp
-		if name != nil {
-			failedProp.DisplayName = *name
-		}
-		if description != nil {
-			failedProp.AddressBookDesc = *description
-		}
-		return []response{{
-			Href: cleanPath,
-			Propstat: []propstat{{
-				Prop:   failedProp,
-				Status: httpStatusForbidden,
-			}},
-		}}, nil
-	}
-
-	// Update the address book
-	if name != nil || description != nil {
-		updateName := book.Name
-		if name != nil {
-			updateName = *name
-		}
-
-		err := h.store.AddressBooks.UpdateProperties(ctx, bookID, updateName, description)
+	if target.Resource {
+		contact, err := h.store.Contacts.GetByResourceName(ctx, bookID, target.ResourceName)
 		if err != nil {
-			status := httpStatusInternalServerError
-			if errors.Is(err, store.ErrConflict) {
-				status = httpStatusConflict
-			}
-			h.logger().Error("Proppatch", "failed to update address book properties for book %d: %v", bookID, err)
-			return []response{{
-				Href: cleanPath,
-				Propstat: []propstat{{
-					Prop:   successProp,
-					Status: status,
-				}},
-			}}, nil
+			return nil, err
 		}
-		// A rename changes name-based path resolution.
-		invalidateDAVRequestState(ctx)
+		if contact == nil {
+			return nil, store.ErrNotFound
+		}
 	}
 
-	return []response{{
-		Href: cleanPath,
-		Propstat: []propstat{{
-			Prop:   successProp,
-			Status: httpStatusOK,
-		}},
-	}}, nil
+	state := addressBookPatchState{name: book.Name, description: book.Description}
+	preflight := preflightAddressBookPatch(request, target.Resource, &state)
+	if len(preflight.failures) != 0 {
+		return failedProppatchResponse(href, preflight), nil
+	}
+	if target.Resource {
+		err = h.store.PatchDeadProperties(ctx, canonicalPath, preflight.dead)
+	} else {
+		err = h.store.PatchAddressBookProperties(ctx, bookID, state.name, state.description, canonicalPath, preflight.dead)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			failed := proppatchPreflight{all: preflight.all, failures: map[int][]xml.Name{http.StatusConflict: preflight.all}}
+			return failedProppatchResponse(href, failed), nil
+		}
+		return nil, err
+	}
+	invalidateDAVRequestState(ctx)
+	return successfulProppatchResponse(href, preflight.all), nil
+}
+
+func preflightAddressBookPatch(request *proppatchRequest, object bool, state *addressBookPatchState) proppatchPreflight {
+	var result proppatchPreflight
+	for _, instruction := range request.Instructions {
+		for _, property := range instruction.Properties {
+			status := 0
+			kind, settable := settableLiveProperties[property.Name]
+			switch {
+			case object && settable:
+				status = http.StatusForbidden
+			case settable && kind == "displayname":
+				if instruction.Remove || property.HasElement || property.Text == "" {
+					status = http.StatusConflict
+				} else {
+					state.name = property.Text
+				}
+			case settable && kind == "addressbook-description":
+				if property.HasElement {
+					status = http.StatusConflict
+				} else {
+					state.description = optionalPatchedText(property.Text, instruction.Remove)
+				}
+			case settable:
+				status = http.StatusForbidden
+			default:
+				if _, protected := protectedLiveProperties[property.Name]; protected {
+					status = http.StatusForbidden
+				} else {
+					result.dead = append(result.dead, deadPropertyMutation(property, instruction.Remove))
+				}
+			}
+			result.record(property, status)
+		}
+	}
+	return result
+}
+
+func optionalPatchedText(value string, remove bool) *string {
+	if remove {
+		return nil
+	}
+	return stringPtr(value)
+}
+
+func deadPropertyMutation(property proppatchProperty, remove bool) store.DeadPropertyMutation {
+	return store.DeadPropertyMutation{
+		NamespaceURI: property.Name.Space,
+		LocalName:    property.Name.Local,
+		InnerXML:     property.InnerXML,
+		Remove:       remove,
+	}
+}
+
+func requestedProppatchPropertyNames(request *proppatchRequest) []xml.Name {
+	if request == nil {
+		return nil
+	}
+	var names []xml.Name
+	for _, instruction := range request.Instructions {
+		for _, property := range instruction.Properties {
+			names = append(names, property.Name)
+		}
+	}
+	return names
+}
+
+func forbiddenProppatchResponse(href string, names []xml.Name) []response {
+	return []response{{Href: href, Propstat: []propstat{{PropNames: names, Status: httpStatusForbidden}}}}
+}
+
+func failedProppatchResponse(href string, preflight proppatchPreflight) []response {
+	failed := make(map[xml.Name]struct{})
+	var propstats []propstat
+	for _, status := range []int{http.StatusForbidden, http.StatusConflict} {
+		names := preflight.failures[status]
+		if len(names) == 0 {
+			continue
+		}
+		for _, name := range names {
+			failed[name] = struct{}{}
+		}
+		propstats = append(propstats, propstat{PropNames: uniqueXMLNames(names), Status: fmt.Sprintf("HTTP/1.1 %d %s", status, http.StatusText(status))})
+	}
+	var dependencies []xml.Name
+	for _, name := range preflight.all {
+		if _, ok := failed[name]; !ok {
+			dependencies = append(dependencies, name)
+		}
+	}
+	if len(dependencies) != 0 {
+		propstats = append(propstats, propstat{PropNames: uniqueXMLNames(dependencies), Status: "HTTP/1.1 424 Failed Dependency"})
+	}
+	return []response{{Href: href, Propstat: propstats}}
+}
+
+func successfulProppatchResponse(href string, names []xml.Name) []response {
+	return []response{{Href: href, Propstat: []propstat{{PropNames: uniqueXMLNames(names), Status: httpStatusOK}}}}
+}
+
+func uniqueXMLNames(names []xml.Name) []xml.Name {
+	seen := make(map[xml.Name]struct{}, len(names))
+	result := make([]xml.Name, 0, len(names))
+	for _, name := range names {
+		if name.Local == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+	return result
 }

@@ -41,6 +41,42 @@ func (f *fakeAB) Delete(context.Context, int64, int64) error                    
 
 type fakeContacts struct{ items map[string]store.Contact } // key bookID:uid
 
+type fakeDeadProperties struct{ properties []store.DeadProperty }
+
+func (f *fakeDeadProperties) ListByResources(_ context.Context, paths []string) ([]store.DeadProperty, error) {
+	wanted := make(map[string]struct{}, len(paths))
+	for _, resourcePath := range paths {
+		wanted[resourcePath] = struct{}{}
+	}
+	var result []store.DeadProperty
+	for _, property := range f.properties {
+		if _, ok := wanted[property.ResourcePath]; ok {
+			result = append(result, property)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeDeadProperties) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
+	remove := make(map[string]struct{}, len(mutations))
+	for _, mutation := range mutations {
+		if mutation.Remove {
+			remove[mutation.NamespaceURI+"\x00"+mutation.LocalName] = struct{}{}
+		}
+	}
+	kept := f.properties[:0]
+	for _, property := range f.properties {
+		if property.ResourcePath == resourcePath {
+			if _, ok := remove[property.NamespaceURI+"\x00"+property.LocalName]; ok {
+				continue
+			}
+		}
+		kept = append(kept, property)
+	}
+	f.properties = kept
+	return nil
+}
+
 func ckey(bookID int64, uid string) string { return strconv.FormatInt(bookID, 10) + ":" + uid }
 
 func (f *fakeContacts) Upsert(_ context.Context, c store.Contact) (*store.Contact, error) {
@@ -297,6 +333,24 @@ func TestEditorShareGrantsWrite(t *testing.T) {
 	}
 	if !access.Shared || !access.Editor {
 		t.Fatalf("editor access = %+v, want shared+editor", access)
+	}
+}
+
+func TestDeleteContactRemovesDAVState(t *testing.T) {
+	dead := &fakeDeadProperties{properties: []store.DeadProperty{{ResourcePath: "/dav/addressbooks/1/c1", NamespaceURI: "urn:test", LocalName: "note"}}}
+	st := &store.Store{
+		AddressBooks: &fakeAB{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 1, Name: "Owner book"}}},
+		Contacts: &fakeContacts{items: map[string]store.Contact{
+			"1:c1": {AddressBookID: 1, UID: "c1", ResourceName: "c1", ETag: "e1"},
+		}},
+		DeadProperties: dead,
+	}
+
+	if err := NewService(st).DeleteContact(context.Background(), owner, 1, "c1", "", ""); err != nil {
+		t.Fatalf("DeleteContact() error = %v", err)
+	}
+	if len(dead.properties) != 0 {
+		t.Fatalf("DeleteContact retained dead properties: %#v", dead.properties)
 	}
 }
 

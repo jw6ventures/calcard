@@ -54,7 +54,7 @@ func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		return err
 	}
 	for _, name := range p.PropNames {
-		el := xml.StartElement{Name: name}
+		el := xml.StartElement{Name: wirePropertyName(name)}
 		if err := e.EncodeToken(el); err != nil {
 			return err
 		}
@@ -69,6 +69,20 @@ func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		return err
 	}
 	return e.EncodeToken(start.End())
+}
+
+func wirePropertyName(name xml.Name) xml.Name {
+	prefixes := map[string]string{
+		"DAV:":                           "d",
+		"urn:ietf:params:xml:ns:caldav":  "cal",
+		"urn:ietf:params:xml:ns:carddav": "card",
+		"http://calendarserver.org/ns/":  "cs",
+		"http://apple.com/ns/ical/":      "ical",
+	}
+	if prefix := prefixes[name.Space]; prefix != "" {
+		return xml.Name{Local: prefix + ":" + name.Local}
+	}
+	return name
 }
 
 type prop struct {
@@ -143,6 +157,52 @@ func (p XMLProperty) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 	return enc.EncodeElement(p.Value, start)
 }
 
+type rawXMLValue string
+
+func (r rawXMLValue) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
+	if err := enc.EncodeToken(start); err != nil {
+		return err
+	}
+	wrapped := "<dead-property>" + string(r) + "</dead-property>"
+	dec := xml.NewDecoder(strings.NewReader(wrapped))
+	depth := 0
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			depth++
+			if depth == 1 {
+				continue
+			}
+			if err := enc.EncodeToken(token); err != nil {
+				return err
+			}
+		case xml.EndElement:
+			if depth == 1 {
+				depth--
+				continue
+			}
+			if err := enc.EncodeToken(token); err != nil {
+				return err
+			}
+			depth--
+		default:
+			if depth > 0 {
+				if err := enc.EncodeToken(token); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return enc.EncodeToken(start.End())
+}
+
 // cdataString wraps string content in CDATA for raw XML output.
 type cdataString string
 
@@ -175,21 +235,53 @@ type reportRequest struct {
 	Limit        *addressbookLimit `xml:"urn:ietf:params:xml:ns:carddav limit"`
 }
 
-// reportProp captures the prop element in reports for partial retrieval
+// propertySelection is the shared live/dead property model used by PROPFIND
+// and REPORT. The two methods add only their method-specific data selectors.
+type propertySelection struct {
+	DisplayName                   *struct{}  `xml:"DAV: displayname"`
+	ResourceType                  *struct{}  `xml:"DAV: resourcetype"`
+	GetETag                       *struct{}  `xml:"DAV: getetag"`
+	GetContentType                *struct{}  `xml:"DAV: getcontenttype"`
+	CalendarDescription           *struct{}  `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
+	CalendarTimezone              *struct{}  `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
+	CalendarColor                 *struct{}  `xml:"http://apple.com/ns/ical/ calendar-color"`
+	AddressBookDesc               *struct{}  `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
+	SupportedAddressData          *struct{}  `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
+	AddressBookMaxResourceSize    *struct{}  `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`
+	SupportedCollationSet         *struct{}  `xml:"urn:ietf:params:xml:ns:carddav supported-collation-set"`
+	SyncToken                     *struct{}  `xml:"DAV: sync-token"`
+	CTag                          *struct{}  `xml:"http://calendarserver.org/ns/ getctag"`
+	CurrentUserPrincipal          *struct{}  `xml:"DAV: current-user-principal"`
+	CurrentUserPrincipalURL       *struct{}  `xml:"DAV: current-user-principal-URL"`
+	PrincipalURL                  *struct{}  `xml:"DAV: principal-URL"`
+	CalendarHomeSet               *struct{}  `xml:"urn:ietf:params:xml:ns:caldav calendar-home-set"`
+	AddressbookHomeSet            *struct{}  `xml:"urn:ietf:params:xml:ns:carddav addressbook-home-set"`
+	PrincipalAddress              *struct{}  `xml:"urn:ietf:params:xml:ns:carddav principal-address"`
+	SupportedReportSet            *struct{}  `xml:"DAV: supported-report-set"`
+	SupportedCalendarComponentSet *struct{}  `xml:"urn:ietf:params:xml:ns:caldav supported-calendar-component-set"`
+	MaxResourceSize               *struct{}  `xml:"urn:ietf:params:xml:ns:caldav max-resource-size"`
+	MinDateTime                   *struct{}  `xml:"urn:ietf:params:xml:ns:caldav min-date-time"`
+	MaxDateTime                   *struct{}  `xml:"urn:ietf:params:xml:ns:caldav max-date-time"`
+	MaxInstances                  *struct{}  `xml:"urn:ietf:params:xml:ns:caldav max-instances"`
+	MaxAttendeesPerInstance       *struct{}  `xml:"urn:ietf:params:xml:ns:caldav max-attendees-per-instance"`
+	ScheduleCalendarTransp        *struct{}  `xml:"urn:ietf:params:xml:ns:caldav schedule-calendar-transp"`
+	SupportedCalendarData         *struct{}  `xml:"urn:ietf:params:xml:ns:caldav supported-calendar-data"`
+	CalendarServerReadOnly        *struct{}  `xml:"http://calendarserver.org/ns/ read-only"`
+	CurrentUserPrivilegeSet       *struct{}  `xml:"DAV: current-user-privilege-set"`
+	LockDiscovery                 *struct{}  `xml:"DAV: lockdiscovery"`
+	SupportedLock                 *struct{}  `xml:"DAV: supportedlock"`
+	Owner                         *struct{}  `xml:"DAV: owner"`
+	ACLProp                       *struct{}  `xml:"DAV: acl"`
+	SupportedPrivilegeSet         *struct{}  `xml:"DAV: supported-privilege-set"`
+	PrincipalCollectionSet        *struct{}  `xml:"DAV: principal-collection-set"`
+	CustomXML                     []xml.Name `xml:",any"`
+}
+
+// reportProp captures the prop element in reports for partial retrieval.
 type reportProp struct {
-	DisplayName            *struct{}         `xml:"DAV: displayname"`
-	ResourceType           *struct{}         `xml:"DAV: resourcetype"`
-	GetETag                *struct{}         `xml:"DAV: getetag"`
-	GetContentType         *struct{}         `xml:"DAV: getcontenttype"`
-	SupportedReport        *struct{}         `xml:"DAV: supported-report-set"`
-	LockDiscovery          *struct{}         `xml:"DAV: lockdiscovery"`
-	SupportedLock          *struct{}         `xml:"DAV: supportedlock"`
-	ACLProp                *struct{}         `xml:"DAV: acl"`
-	SupportedPrivilegeSet  *struct{}         `xml:"DAV: supported-privilege-set"`
-	PrincipalCollectionSet *struct{}         `xml:"DAV: principal-collection-set"`
-	CalendarData           *calendarDataEl   `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-	AddressData            *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
-	CustomXML              []xml.Name        `xml:",any"`
+	propertySelection
+	CalendarData *calendarDataEl   `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
+	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 }
 
 // calendarDataEl specifies what calendar data to return (RFC 4791 Section 9.6)
@@ -219,53 +311,18 @@ type expandEl struct {
 
 // propfindRequest represents a PROPFIND request body (RFC 4918 Section 9.1)
 type propfindRequest struct {
-	XMLName  xml.Name
-	AllProp  *struct{}          `xml:"DAV: allprop"`
-	PropName *struct{}          `xml:"DAV: propname"`
-	Prop     *propfindPropQuery `xml:"DAV: prop"`
+	XMLName      xml.Name
+	AllProp      *struct{}          `xml:"DAV: allprop"`
+	PropName     *struct{}          `xml:"DAV: propname"`
+	Prop         *propfindPropQuery `xml:"DAV: prop"`
+	suppressData bool
 }
 
 // propfindPropQuery lists specific properties requested
 type propfindPropQuery struct {
-	DisplayName                   *struct{}         `xml:"DAV: displayname"`
-	ResourceType                  *struct{}         `xml:"DAV: resourcetype"`
-	GetETag                       *struct{}         `xml:"DAV: getetag"`
-	GetContentType                *struct{}         `xml:"DAV: getcontenttype"`
-	CalendarData                  *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
-	AddressData                   *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
-	CalendarDescription           *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
-	CalendarTimezone              *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-timezone"`
-	CalendarColor                 *struct{}         `xml:"http://apple.com/ns/ical/ calendar-color"`
-	AddressBookDesc               *struct{}         `xml:"urn:ietf:params:xml:ns:carddav addressbook-description"`
-	SupportedAddressData          *struct{}         `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
-	AddressBookMaxResourceSize    *struct{}         `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`
-	SupportedCollationSet         *struct{}         `xml:"urn:ietf:params:xml:ns:carddav supported-collation-set"`
-	SyncToken                     *struct{}         `xml:"DAV: sync-token"`
-	CTag                          *struct{}         `xml:"http://calendarserver.org/ns/ getctag"`
-	CurrentUserPrincipal          *struct{}         `xml:"DAV: current-user-principal"`
-	CurrentUserPrincipalURL       *struct{}         `xml:"DAV: current-user-principal-URL"`
-	PrincipalURL                  *struct{}         `xml:"DAV: principal-URL"`
-	CalendarHomeSet               *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-home-set"`
-	AddressbookHomeSet            *struct{}         `xml:"urn:ietf:params:xml:ns:carddav addressbook-home-set"`
-	PrincipalAddress              *struct{}         `xml:"urn:ietf:params:xml:ns:carddav principal-address"`
-	SupportedReportSet            *struct{}         `xml:"DAV: supported-report-set"`
-	SupportedCalendarComponentSet *struct{}         `xml:"urn:ietf:params:xml:ns:caldav supported-calendar-component-set"`
-	MaxResourceSize               *struct{}         `xml:"urn:ietf:params:xml:ns:caldav max-resource-size"`
-	MinDateTime                   *struct{}         `xml:"urn:ietf:params:xml:ns:caldav min-date-time"`
-	MaxDateTime                   *struct{}         `xml:"urn:ietf:params:xml:ns:caldav max-date-time"`
-	MaxInstances                  *struct{}         `xml:"urn:ietf:params:xml:ns:caldav max-instances"`
-	MaxAttendeesPerInstance       *struct{}         `xml:"urn:ietf:params:xml:ns:caldav max-attendees-per-instance"`
-	ScheduleCalendarTransp        *struct{}         `xml:"urn:ietf:params:xml:ns:caldav schedule-calendar-transp"`
-	SupportedCalendarData         *struct{}         `xml:"urn:ietf:params:xml:ns:caldav supported-calendar-data"`
-	CalendarServerReadOnly        *struct{}         `xml:"http://calendarserver.org/ns/ read-only"`
-	CurrentUserPrivilegeSet       *struct{}         `xml:"DAV: current-user-privilege-set"`
-	LockDiscovery                 *struct{}         `xml:"DAV: lockdiscovery"`
-	SupportedLock                 *struct{}         `xml:"DAV: supportedlock"`
-	Owner                         *struct{}         `xml:"DAV: owner"`
-	ACLProp                       *struct{}         `xml:"DAV: acl"`
-	SupportedPrivilegeSet         *struct{}         `xml:"DAV: supported-privilege-set"`
-	PrincipalCollectionSet        *struct{}         `xml:"DAV: principal-collection-set"`
-	CustomXML                     []xml.Name        `xml:",any"`
+	propertySelection
+	CalendarData *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
+	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 }
 
 // calFilter represents a CalDAV calendar-query filter (RFC 4791 Section 9.7)
@@ -322,9 +379,144 @@ type cardParamFilter struct {
 }
 
 type proppatchRequest struct {
-	XMLName xml.Name
-	Set     *proppatchSet    `xml:"DAV: set"`
-	Remove  *proppatchRemove `xml:"DAV: remove"`
+	XMLName      xml.Name
+	Instructions []proppatchInstruction
+}
+
+type proppatchInstruction struct {
+	Remove     bool
+	Properties []proppatchProperty
+}
+
+type proppatchProperty struct {
+	Name       xml.Name
+	InnerXML   string
+	Text       string
+	HasElement bool
+}
+
+func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	if start.Name.Space != "DAV:" || start.Name.Local != "propertyupdate" {
+		return fmt.Errorf("unexpected PROPPATCH root %q", xmlNameString(start.Name))
+	}
+	*r = proppatchRequest{XMLName: start.Name}
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			if token.Name.Space != "DAV:" || (token.Name.Local != "set" && token.Name.Local != "remove") {
+				return fmt.Errorf("unexpected PROPPATCH instruction %q", xmlNameString(token.Name))
+			}
+			instruction, err := decodeProppatchInstruction(dec, token, token.Name.Local == "remove")
+			if err != nil {
+				return err
+			}
+			r.Instructions = append(r.Instructions, instruction)
+		case xml.EndElement:
+			if token.Name == start.Name {
+				return nil
+			}
+		}
+	}
+}
+
+func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove bool) (proppatchInstruction, error) {
+	instruction := proppatchInstruction{Remove: remove}
+	seenProp := false
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return instruction, err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			if seenProp || token.Name.Space != "DAV:" || token.Name.Local != "prop" {
+				return instruction, fmt.Errorf("PROPPATCH instruction must contain one DAV:prop")
+			}
+			seenProp = true
+			properties, err := decodeProppatchProperties(dec, token)
+			if err != nil {
+				return instruction, err
+			}
+			instruction.Properties = properties
+		case xml.EndElement:
+			if token.Name == start.Name {
+				if !seenProp {
+					return instruction, fmt.Errorf("PROPPATCH instruction is missing DAV:prop")
+				}
+				if len(instruction.Properties) == 0 {
+					return instruction, fmt.Errorf("PROPPATCH DAV:prop is empty")
+				}
+				return instruction, nil
+			}
+		}
+	}
+}
+
+func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement) ([]proppatchProperty, error) {
+	var properties []proppatchProperty
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			property, err := decodeProppatchProperty(dec, token)
+			if err != nil {
+				return nil, err
+			}
+			properties = append(properties, property)
+		case xml.EndElement:
+			if token.Name == start.Name {
+				return properties, nil
+			}
+		}
+	}
+}
+
+func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement) (proppatchProperty, error) {
+	var inner strings.Builder
+	enc := xml.NewEncoder(&inner)
+	var text strings.Builder
+	property := proppatchProperty{Name: start.Name}
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return property, err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			property.HasElement = true
+			if err := enc.EncodeToken(token); err != nil {
+				return property, err
+			}
+		case xml.EndElement:
+			if token.Name == start.Name {
+				if err := enc.Flush(); err != nil {
+					return property, err
+				}
+				property.InnerXML = inner.String()
+				property.Text = strings.TrimSpace(text.String())
+				return property, nil
+			}
+			if err := enc.EncodeToken(token); err != nil {
+				return property, err
+			}
+		case xml.CharData:
+			text.Write([]byte(token))
+			if err := enc.EncodeToken(token); err != nil {
+				return property, err
+			}
+		case xml.Comment, xml.Directive, xml.ProcInst:
+			if err := enc.EncodeToken(token); err != nil {
+				return property, err
+			}
+		}
+	}
 }
 
 type mkcalendarRequest struct {

@@ -417,12 +417,16 @@ func vEventComponents(ical string) []VEventComponent {
 }
 
 func topLevelComponents(ical string, accept func(string) bool) []VEventComponent {
+	return topLevelComponentsFromLines(UnfoldLines(ical), accept)
+}
+
+func topLevelComponentsFromLines(lines []string, accept func(string) bool) []VEventComponent {
 	var components []VEventComponent
 	depth := 0
 	componentDepth := 0
 	componentName := ""
 	var current *VEventComponent
-	for _, rawLine := range UnfoldLines(ical) {
+	for _, rawLine := range lines {
 		controlLine := strings.TrimSpace(rawLine)
 		upper := strings.ToUpper(controlLine)
 		switch {

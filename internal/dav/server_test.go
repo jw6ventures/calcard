@@ -165,6 +165,64 @@ func TestExtensionPropfindCustomXMLPropertyCanBeRequestedExplicitly(t *testing.T
 	}
 }
 
+func TestExtensionPropfindDecoratorReceivesRequestAndContributesPropname(t *testing.T) {
+	var decoratorRequest *http.Request
+	s := NewDavServer(Options{
+		Config: &config.Config{},
+		Store:  &store.Store{},
+		Extensions: []Extension{extensionFunc(func(r *Registry) {
+			r.RegisterCollection("/dav/pro")
+			r.RegisterPropfindDecorator("/dav/pro", func(ctx RequestContext, props *PropfindProperties) error {
+				decoratorRequest = ctx.Request
+				props.SetXMLProperty(XMLProperty{Name: xml.Name{Space: "urn:calcard:pro", Local: "enabled"}, Value: true})
+				return nil
+			})
+		})},
+	})
+
+	body := `<d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/pro/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 1}))
+	rec := httptest.NewRecorder()
+
+	s.Propfind(rec, req)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND status = %d, want %d: %s", rec.Code, http.StatusMultiStatus, rec.Body.String())
+	}
+	if decoratorRequest == nil || decoratorRequest.Method != "PROPFIND" || decoratorRequest.URL.Path != "/dav/pro/" {
+		t.Fatalf("decorator request = %#v, want non-nil PROPFIND /dav/pro/ request", decoratorRequest)
+	}
+	if !strings.Contains(rec.Body.String(), `enabled xmlns="urn:calcard:pro"`) {
+		t.Fatalf("PROPFIND propname omitted extension property: %s", rec.Body.String())
+	}
+}
+
+func TestReportPropertyDecorationDoesNotInvokePropfindDecorator(t *testing.T) {
+	decoratorCalls := 0
+	s := NewDavServer(Options{
+		Store: &store.Store{},
+		Extensions: []Extension{extensionFunc(func(r *Registry) {
+			r.RegisterPropfindDecorator("/dav/calendars", func(ctx RequestContext, props *PropfindProperties) error {
+				decoratorCalls++
+				if ctx.Request == nil {
+					t.Fatal("REPORT invoked PROPFIND decorator with nil request")
+				}
+				return nil
+			})
+		})},
+	})
+	responses := []response{resourceResponse("/dav/calendars/1/event.ics", etagProp("etag", "", true))}
+
+	if _, err := s.finishReportResponses(context.Background(), &store.User{ID: 1}, responses, &reportProp{propertySelection: propertySelection{GetETag: &struct{}{}}}, false, nil); err != nil {
+		t.Fatalf("finishReportResponses() error = %v", err)
+	}
+	if decoratorCalls != 0 {
+		t.Fatalf("PROPFIND decorator calls during REPORT = %d, want 0", decoratorCalls)
+	}
+}
+
 func TestExtensionRegisteredCollectionHandlesPropfind(t *testing.T) {
 	s := NewDavServer(Options{
 		Config: &config.Config{},

@@ -36,6 +36,12 @@ func NormalizePrincipalHref(raw string) string {
 	case "", "DAV:all", "DAV:authenticated":
 		return raw
 	}
+	if isCanonicalPrincipalHref(raw) {
+		if !strings.HasSuffix(raw, "/") {
+			return raw + "/"
+		}
+		return raw
+	}
 
 	normalized := normalizeHref(raw)
 	if strings.HasPrefix(normalized, "/dav/principals/") {
@@ -45,6 +51,23 @@ func NormalizePrincipalHref(raw string) string {
 		return normalized
 	}
 	return raw
+}
+
+func isCanonicalPrincipalHref(raw string) bool {
+	const prefix = "/dav/principals/"
+	if !strings.HasPrefix(raw, prefix) {
+		return false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(raw, prefix), "/")
+	if id == "" || strings.ContainsRune(id, '/') {
+		return false
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func PrivilegeMatches(granted, requested string) bool {
@@ -59,28 +82,11 @@ func PrivilegeMatches(granted, requested string) bool {
 	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
 }
 
-type applicableACE struct {
-	privilege string
-	isGrant   bool
-}
-
-func filterApplicableACEs(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) []applicableACE {
-	aces := make([]applicableACE, 0, len(entries))
-	for _, entry := range entries {
-		if _, ok := applicablePrincipals[NormalizePrincipalHref(entry.PrincipalHref)]; !ok {
-			continue
-		}
-		aces = append(aces, applicableACE{privilege: entry.Privilege, isGrant: entry.IsGrant})
-	}
-	return aces
-}
-
 func DecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	aces := filterApplicableACEs(entries, applicablePrincipals)
 	if privilege == "write" {
-		return aggregateWriteDecision(aces)
+		return aggregateWriteDecision(entries, applicablePrincipals)
 	}
-	return decidePrivilege(aces, privilege)
+	return decidePrivilege(entries, applicablePrincipals, privilege)
 }
 
 func HasApplicablePrincipal(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) bool {
@@ -92,13 +98,16 @@ func HasApplicablePrincipal(entries []store.ACLEntry, applicablePrincipals map[s
 	return false
 }
 
-func decidePrivilege(aces []applicableACE, privilege string) (bool, bool) {
+func decidePrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
 	hasGrant := false
-	for _, ace := range aces {
-		if !PrivilegeMatches(ace.privilege, privilege) {
+	for _, entry := range entries {
+		if _, ok := applicablePrincipals[NormalizePrincipalHref(entry.PrincipalHref)]; !ok {
 			continue
 		}
-		if !ace.isGrant {
+		if !PrivilegeMatches(entry.Privilege, privilege) {
+			continue
+		}
+		if !entry.IsGrant {
 			return false, true
 		}
 		hasGrant = true
@@ -109,10 +118,10 @@ func decidePrivilege(aces []applicableACE, privilege string) (bool, bool) {
 	return false, false
 }
 
-func aggregateWriteDecision(aces []applicableACE) (bool, bool) {
+func aggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
 	applicable := false
 	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
-		granted, decided := decidePrivilege(aces, privilege)
+		granted, decided := decidePrivilege(entries, applicablePrincipals, privilege)
 		if decided {
 			applicable = true
 		}

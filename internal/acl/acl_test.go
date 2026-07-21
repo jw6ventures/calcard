@@ -39,6 +39,7 @@ func TestNormalizePrincipalHrefCanonicalizesEquivalentPrincipalURLs(t *testing.T
 		{name: "all sentinel", raw: "DAV:all", want: "DAV:all"},
 		{name: "authenticated sentinel", raw: "DAV:authenticated", want: "DAV:authenticated"},
 		{name: "adds trailing slash", raw: "/dav/principals/42", want: "/dav/principals/42/"},
+		{name: "cleans traversal", raw: "/dav/principals/42/../7", want: "/dav/principals/7/"},
 		{name: "absolute url", raw: "https://example.test/dav/principals/42", want: "/dav/principals/42/"},
 		{name: "cleaned path", raw: "/dav/users/../principals/42", want: "/dav/principals/42/"},
 		{name: "relative principal path", raw: "dav/principals/42", want: "/dav/principals/42/"},

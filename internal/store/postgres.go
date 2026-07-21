@@ -429,8 +429,13 @@ type eventRepo struct {
 }
 
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
-	summary, description, location, dtstart, dtend, allDay := parseICalFields(event.RawICAL)
-	recurrenceStart, recurrenceUntil := recurrenceBoundsFromICal(event.RawICAL)
+	var metadata EventWriteMetadata
+	if event.WriteMetadata != nil {
+		metadata = *event.WriteMetadata
+	} else {
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(event.RawICAL)
+		metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(event.RawICAL)
+	}
 	if event.ResourceName == "" {
 		event.ResourceName = event.UID
 	}
@@ -454,7 +459,7 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, summary, description, location, dtstart, dtend, allDay, recurrenceStart, recurrenceUntil)
+	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay, metadata.RecurrenceStart, metadata.RecurrenceUntil)
 	ev, err := scanEvent(row.Scan)
 	if err != nil {
 		if isEventResourceNameConflict(err) {
@@ -635,6 +640,55 @@ func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int6
 			return nil, err
 		}
 		result = append(result, ev)
+	}
+	return result, rows.Err()
+}
+
+func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, f EventFilter) ([]Event, error) {
+	if limit <= 0 {
+		return []Event{}, nil
+	}
+	var sb strings.Builder
+	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND id>$2`)
+	args := []any{calendarID, afterID}
+	placeholder := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+	if f.Start != nil {
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
+	}
+	if f.End != nil {
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= ` + placeholder(f.End.UTC()))
+	}
+	if f.Title != "" {
+		sb.WriteString(` AND summary ILIKE ` + placeholder("%"+likeEscape(f.Title)+"%"))
+	}
+	if f.Description != "" {
+		sb.WriteString(` AND description ILIKE ` + placeholder("%"+likeEscape(f.Description)+"%"))
+	}
+	if f.Location != "" {
+		sb.WriteString(` AND location ILIKE ` + placeholder("%"+likeEscape(f.Location)+"%"))
+	}
+	if f.Query != "" {
+		p := placeholder("%" + likeEscape(f.Query) + "%")
+		sb.WriteString(` AND (summary ILIKE ` + p + ` OR description ILIKE ` + p + ` OR location ILIKE ` + p + `)`)
+	}
+	sb.WriteString(` ORDER BY id ASC LIMIT ` + placeholder(limit))
+
+	defer observeDB(ctx, "events.list_for_calendar_page_after")()
+	rows, err := r.pool.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Event
+	for rows.Next() {
+		event, err := scanEvent(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, event)
 	}
 	return result, rows.Err()
 }
@@ -953,6 +1007,67 @@ func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]Addre
 	return result, rows.Err()
 }
 
+func (r *addressBookRepo) ListAccessible(ctx context.Context, userID int64) ([]AddressBook, error) {
+	const q = `
+SELECT b.id, b.user_id, b.name, b.description, b.ctag, b.created_at, b.updated_at
+FROM address_books b
+WHERE b.user_id=$1
+   OR (
+       b.user_id<>$1
+       AND (
+           (
+               NOT EXISTS (
+                   SELECT 1 FROM acl_entries d
+                   WHERE d.resource_path='/dav/addressbooks/' || b.id::text
+                     AND d.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
+                     AND d.is_grant=FALSE
+                     AND d.privilege IN ('read', 'all')
+               )
+               AND EXISTS (
+                   SELECT 1 FROM acl_entries g
+                   WHERE g.resource_path='/dav/addressbooks/' || b.id::text
+                     AND g.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
+                     AND g.is_grant=TRUE
+                     AND g.privilege IN ('read', 'all')
+               )
+           )
+           OR EXISTS (
+               SELECT 1
+               FROM acl_entries g0
+               JOIN contacts c ON c.address_book_id=b.id AND c.object_acl_path=g0.resource_path_norm
+               WHERE g0.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
+                 AND g0.is_grant=TRUE
+                 AND g0.privilege IN ('read', 'all')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM acl_entries d
+                     WHERE d.resource_path_norm=c.object_acl_path
+                       AND d.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
+                       AND d.is_grant=FALSE
+                       AND d.privilege IN ('read', 'all')
+                 )
+           )
+       )
+   )
+ORDER BY (b.user_id<>$1), b.name`
+	defer observeDB(ctx, "address_books.list_accessible")()
+	rows, err := r.pool.QueryContext(ctx, q, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AddressBook
+	for rows.Next() {
+		var book AddressBook
+		var description sql.NullString
+		if err := rows.Scan(&book.ID, &book.UserID, &book.Name, &description, &book.CTag, &book.CreatedAt, &book.UpdatedAt); err != nil {
+			return nil, err
+		}
+		book.Description = nullableString(description)
+		result = append(result, book)
+	}
+	return result, rows.Err()
+}
+
 func (r *addressBookRepo) GetByID(ctx context.Context, id int64) (*AddressBook, error) {
 	const q = `SELECT id, user_id, name, description, ctag, created_at, updated_at FROM address_books WHERE id=$1`
 	defer observeDB(ctx, "address_books.get_by_id")()
@@ -1133,6 +1248,18 @@ func moveContactTx(ctx context.Context, tx queryExecContext, fromAddressBookID, 
 		}
 		return err
 	}
+	if fromAddressBookID != toAddressBookID {
+		var existingDestResourceName string
+		switch err := tx.QueryRowContext(ctx, selectQ, toAddressBookID, uid).Scan(&existingDestResourceName); {
+		case err == nil:
+			if existingDestResourceName != "" && existingDestResourceName != destResourceName {
+				return ErrConflict
+			}
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return err
+		}
+	}
 
 	const deleteDestByNameQ = `DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`
 	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toAddressBookID, destResourceName, uid); err != nil {
@@ -1235,6 +1362,28 @@ func (r *contactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]C
 			return nil, err
 		}
 		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+func (r *contactRepo) ListForBookPageAfter(ctx context.Context, addressBookID, afterID int64, limit int) ([]Contact, error) {
+	if limit <= 0 {
+		return []Contact{}, nil
+	}
+	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`
+	defer observeDB(ctx, "contacts.list_for_book_page_after")()
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Contact
+	for rows.Next() {
+		contact, err := scanContact(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, contact)
 	}
 	return result, rows.Err()
 }
@@ -2233,6 +2382,46 @@ func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]AC
 			return nil, err
 		}
 		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+func (r *aclRepo) ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error) {
+	if len(resourcePaths) == 0 {
+		return []ACLEntry{}, nil
+	}
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY resource_path, created_at, id`
+	defer observeDB(ctx, "acl.list_by_resources")()
+	rows, err := r.pool.QueryContext(ctx, q, pq.Array(resourcePaths))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanACLEntries(rows)
+}
+
+func (r *aclRepo) ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error) {
+	if len(resourcePaths) == 0 || len(principalHrefs) == 0 {
+		return []ACLEntry{}, nil
+	}
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path = ANY($1) AND principal_href = ANY($2) ORDER BY resource_path, created_at, id`
+	defer observeDB(ctx, "acl.list_by_resources_and_principals")()
+	rows, err := r.pool.QueryContext(ctx, q, pq.Array(resourcePaths), pq.Array(principalHrefs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanACLEntries(rows)
+}
+
+func scanACLEntries(rows *sql.Rows) ([]ACLEntry, error) {
+	var result []ACLEntry
+	for rows.Next() {
+		var entry ACLEntry
+		if err := rows.Scan(&entry.ID, &entry.ResourcePath, &entry.PrincipalHref, &entry.IsGrant, &entry.Privilege, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, entry)
 	}
 	return result, rows.Err()
 }

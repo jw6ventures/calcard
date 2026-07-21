@@ -66,6 +66,33 @@ func TestListForCalendarFilteredEndBound(t *testing.T) {
 	}
 }
 
+func TestListForCalendarPageAfterUsesKeysetAndFilter(t *testing.T) {
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`(?s)FROM events WHERE calendar_id=\$1 AND id>\$2.*COALESCE\(recurrence_until, dtend, dtstart\) >= \$3.*summary ILIKE \$4.*ORDER BY id ASC LIMIT \$5`).
+		WithArgs(int64(7), int64(100), start, `%planning%`, 256).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag",
+			"summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified",
+		}).AddRow(int64(101), int64(7), "one", "one", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "etag", "Planning", nil, nil, nil, nil, false, time.Now().UTC()))
+
+	events, err := (&eventRepo{pool: db}).ListForCalendarPageAfter(context.Background(), 7, 100, 256, EventFilter{Start: &start, Title: "planning"})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter() error = %v", err)
+	}
+	if len(events) != 1 || events[0].ID != 101 {
+		t.Fatalf("ListForCalendarPageAfter() = %#v", events)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestRecurrenceBackfillScopesToEventLikeComponents(t *testing.T) {
 	sql, err := os.ReadFile("../../migrations/v1.1.7.sql")
 	if err != nil {

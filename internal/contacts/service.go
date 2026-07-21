@@ -235,7 +235,11 @@ func (s *Service) DeleteContact(ctx context.Context, user *store.User, bookID in
 	if existing == nil {
 		return ErrNotFound
 	}
-	return s.store.Contacts.DeleteByUID(ctx, bookID, uid)
+	resourcePaths := addressBookACLResourcePaths(bookID, contactResourceName(*existing))
+	if len(resourcePaths) == 0 {
+		return ErrNotFound
+	}
+	return s.store.DeleteContactAndState(ctx, bookID, uid, resourcePaths[0])
 }
 
 func (s *Service) requireOwnedBook(ctx context.Context, user *store.User, bookID int64) (*store.AddressBook, error) {

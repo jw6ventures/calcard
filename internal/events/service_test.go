@@ -169,10 +169,17 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{
 			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "etag-1"},
 		}}
-		svc := newServiceWithRepos(true, repo)
+		dead := &fakeDeadPropertyRepo{properties: []store.DeadProperty{{ResourcePath: "/dav/calendars/1/uid-1", NamespaceURI: "urn:test", LocalName: "note"}}}
+		svc := NewService(&store.Store{
+			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true}}},
+			Events:    repo, DeadProperties: dead,
+		})
 		err := svc.DeleteEvent(context.Background(), user, 1, "uid-1", `"etag-1"`, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(dead.properties) != 0 {
+			t.Fatalf("DeleteEvent retained dead properties: %#v", dead.properties)
 		}
 	})
 
@@ -650,6 +657,44 @@ type fakeCalendarRepo struct {
 	calendars map[int64]*store.CalendarAccess
 }
 
+type fakeDeadPropertyRepo struct {
+	properties []store.DeadProperty
+}
+
+func (f *fakeDeadPropertyRepo) ListByResources(_ context.Context, paths []string) ([]store.DeadProperty, error) {
+	wanted := make(map[string]struct{}, len(paths))
+	for _, resourcePath := range paths {
+		wanted[resourcePath] = struct{}{}
+	}
+	var result []store.DeadProperty
+	for _, property := range f.properties {
+		if _, ok := wanted[property.ResourcePath]; ok {
+			result = append(result, property)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
+	remove := make(map[string]struct{}, len(mutations))
+	for _, mutation := range mutations {
+		if mutation.Remove {
+			remove[mutation.NamespaceURI+"\x00"+mutation.LocalName] = struct{}{}
+		}
+	}
+	kept := f.properties[:0]
+	for _, property := range f.properties {
+		if property.ResourcePath == resourcePath {
+			if _, ok := remove[property.NamespaceURI+"\x00"+property.LocalName]; ok {
+				continue
+			}
+		}
+		kept = append(kept, property)
+	}
+	f.properties = kept
+	return nil
+}
+
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
 	if cal, ok := f.calendars[id]; ok {
 		copy := cal.Calendar
@@ -783,6 +828,23 @@ func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID 
 		out = out[:filter.Limit]
 	}
 	return out, nil
+}
+
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
+	events, err := f.ListForCalendarFiltered(ctx, calendarID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var result []store.Event
+	for _, event := range events {
+		if event.ID > afterID {
+			result = append(result, event)
+		}
+	}
+	if limit >= 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
 }
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
 	// Mirror the store: "ORDER BY last_modified DESC LIMIT/OFFSET".

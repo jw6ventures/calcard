@@ -33,11 +33,11 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		res := []response{rootCollectionResponse(href, user, principalHref)}
 		switch depth {
 		case "1":
-			res = append(res,
+			res = h.appendMultistatusResponses(res, []response{
 				collectionResponse(ensureCollectionHref("/dav/calendars"), "Calendars"),
 				collectionResponse(ensureCollectionHref("/dav/addressbooks"), "Address Books"),
 				principalResponse(ensureCollectionHref(principalHref), user),
-			)
+			})
 		case "infinity":
 			// Recurse into each home set; their builders emit the collection
 			// response followed by every member.
@@ -45,13 +45,17 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 			if err != nil {
 				return nil, err
 			}
-			res = append(res, calendarRes...)
-			addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, propfindReq)
-			if err != nil {
-				return nil, err
+			res = h.appendMultistatusResponses(res, calendarRes)
+			if !h.multistatusBuildComplete(res) {
+				addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, propfindReq)
+				if err != nil {
+					return nil, err
+				}
+				res = h.appendMultistatusResponses(res, addressBookRes)
 			}
-			res = append(res, addressBookRes...)
-			res = append(res, principalResponse(ensureCollectionHref(principalHref), user))
+			if !h.multistatusBuildComplete(res) {
+				res = h.appendMultistatusResponses(res, []response{principalResponse(ensureCollectionHref(principalHref), user)})
+			}
 		}
 		res, err := h.appendCollectionContributors(ctx, r, user, cleanPath, depth, res)
 		if err != nil {
@@ -167,6 +171,7 @@ func stripCalendarAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
+			prop.CalendarData = ""
 			if prop.ResourceType == nil || prop.ResourceType.Calendar == nil {
 				continue
 			}
@@ -177,7 +182,7 @@ func stripCalendarAllprop(responses []response) {
 }
 
 func (h *DavServer) appendCollectionContributors(ctx context.Context, r *http.Request, user *store.User, cleanPath, depth string, responses []response) ([]response, error) {
-	if !depthIncludesChildren(depth) {
+	if !depthIncludesChildren(depth) || h.multistatusBuildComplete(responses) {
 		return responses, nil
 	}
 	collections, err := h.davRegistry().contributeCollections(RequestContext{
@@ -201,7 +206,10 @@ func (h *DavServer) appendCollectionContributors(ctx context.Context, r *http.Re
 		if c.Name == "" {
 			c.Name = path.Base(strings.TrimSuffix(href, "/"))
 		}
-		responses = append(responses, collectionResponse(href, c.Name))
+		responses = h.appendMultistatusResponses(responses, []response{collectionResponse(href, c.Name)})
+		if h.multistatusBuildComplete(responses) {
+			break
+		}
 	}
 	return responses, nil
 }
@@ -220,32 +228,30 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 
 			// Add the virtual birthday calendar first
 			birthdayHref := birthdayCalendarHref()
-			res = append(res, birthdayCalendarCollection(birthdayHref, principalHref))
-			if depth == "infinity" && h.store != nil && h.store.Contacts != nil {
+			res = h.appendMultistatusResponses(res, []response{birthdayCalendarCollection(birthdayHref, principalHref)})
+			if depth == "infinity" && !h.multistatusBuildComplete(res) && h.store != nil && h.store.Contacts != nil {
 				events, err := h.generateBirthdayEvents(ctx, user.ID)
 				if err != nil {
 					return nil, err
 				}
-				res = append(res, calendarResourceResponses(birthdayHref, events)...)
+				res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(birthdayHref, events, nil, h.multistatusBuildLimit()-len(res)))
 			}
 
 			// Add regular calendars
 			for i := range cals {
+				if h.multistatusBuildComplete(res) {
+					break
+				}
 				c := &cals[i]
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := strconv.FormatInt(c.CTag, 10)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = append(res, calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges()))
-				if depth == "infinity" {
-					events, err := h.store.Events.ListForCalendar(ctx, c.ID)
+				res = h.appendMultistatusResponses(res, []response{calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges())})
+				if depth == "infinity" && !h.multistatusBuildComplete(res) {
+					res, err = h.appendCalendarPropfindPages(ctx, user, c, href, res)
 					if err != nil {
 						return nil, err
 					}
-					events, err = h.filterReadableCalendarEvents(ctx, user, c, events)
-					if err != nil {
-						return nil, err
-					}
-					res = append(res, calendarResourceResponses(href, events)...)
 				}
 			}
 		}
@@ -268,7 +274,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 				return nil, err
 			}
 			base := ensureCollectionHref(href)
-			res = append(res, calendarResourceResponses(base, events)...)
+			res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(base, events, nil, h.multistatusBuildLimit()-len(res)))
 		}
 		return res, nil
 	}
@@ -319,16 +325,10 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	principalHref := h.principalURL(user)
 	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
 	if depthIncludesChildren(depth) {
-		events, err := h.store.Events.ListForCalendar(ctx, cal.ID)
+		res, err = h.appendCalendarPropfindPages(ctx, user, cal, ensureCollectionHref(href), res)
 		if err != nil {
 			return nil, err
 		}
-		events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
-		if err != nil {
-			return nil, err
-		}
-		base := ensureCollectionHref(href)
-		res = append(res, calendarResourceResponses(base, events)...)
 	}
 	return res, nil
 }
@@ -367,21 +367,19 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 			}
 			principalHref := h.principalURL(user)
 			for i := range books {
+				if h.multistatusBuildComplete(res) {
+					break
+				}
 				b := &books[i]
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
 				ctag := strconv.FormatInt(b.CTag, 10)
 				syncToken := buildSyncToken("card", b.ID, b.UpdatedAt)
-				res = append(res, addressBookCollectionResponse(href, b.Name, b.Description, principalHref, syncToken, ctag))
-				if depth == "infinity" {
-					contacts, err := h.store.Contacts.ListForBook(ctx, b.ID)
+				res = h.appendMultistatusResponses(res, []response{addressBookCollectionResponse(href, b.Name, b.Description, principalHref, syncToken, ctag)})
+				if depth == "infinity" && !h.multistatusBuildComplete(res) {
+					res, err = h.appendAddressBookPropfindPages(ctx, user, b, href, res)
 					if err != nil {
 						return nil, err
 					}
-					contacts, err = h.filterReadableAddressBookContacts(ctx, user, b, contacts)
-					if err != nil {
-						return nil, err
-					}
-					res = append(res, addressBookResourceResponses(href, contacts)...)
 				}
 			}
 		}
@@ -431,19 +429,60 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 	principalHref := h.principalURL(user)
 	res := []response{addressBookCollectionResponse(href, book.Name, book.Description, principalHref, syncToken, ctag)}
 	if depthIncludesChildren(depth) {
-		contacts, err := h.store.Contacts.ListForBook(ctx, book.ID)
+		res, err = h.appendAddressBookPropfindPages(ctx, user, book, ensureCollectionHref(href), res)
 		if err != nil {
 			return nil, err
 		}
-		contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
-		if err != nil {
-			return nil, err
-		}
-		base := ensureCollectionHref(href)
-		resourceResponses := addressBookResourceResponses(base, contacts)
-		res = append(res, resourceResponses...)
 	}
 	return res, nil
+}
+
+func (h *DavServer) appendCalendarPropfindPages(ctx context.Context, user *store.User, cal *store.CalendarAccess, baseHref string, responses []response) ([]response, error) {
+	afterID := int64(0)
+	for !h.multistatusBuildComplete(responses) {
+		events, err := h.store.Events.ListForCalendarPageAfter(ctx, cal.ID, afterID, multistatusPageSize, store.EventFilter{})
+		if err != nil {
+			return nil, err
+		}
+		if len(events) == 0 {
+			break
+		}
+		visible, err := h.filterReadableCalendarEvents(ctx, user, cal, events)
+		if err != nil {
+			return nil, err
+		}
+		responses = h.appendMultistatusResponses(responses, calendarResourceResponsesFilteredLimit(baseHref, visible, nil, h.multistatusBuildLimit()-len(responses)))
+		lastID := events[len(events)-1].ID
+		if lastID <= afterID || len(events) < multistatusPageSize {
+			break
+		}
+		afterID = lastID
+	}
+	return responses, nil
+}
+
+func (h *DavServer) appendAddressBookPropfindPages(ctx context.Context, user *store.User, book *store.AddressBook, baseHref string, responses []response) ([]response, error) {
+	afterID := int64(0)
+	for !h.multistatusBuildComplete(responses) {
+		contacts, err := h.store.Contacts.ListForBookPageAfter(ctx, book.ID, afterID, multistatusPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(contacts) == 0 {
+			break
+		}
+		visible, err := h.filterReadableAddressBookContacts(ctx, user, book, contacts)
+		if err != nil {
+			return nil, err
+		}
+		responses = h.appendMultistatusResponses(responses, addressBookResourceResponsesLimit(baseHref, visible, h.multistatusBuildLimit()-len(responses)))
+		lastID := contacts[len(contacts)-1].ID
+		if lastID <= afterID || len(contacts) < multistatusPageSize {
+			break
+		}
+		afterID = lastID
+	}
+	return responses, nil
 }
 
 func (h *DavServer) principalURL(user *store.User) string {
