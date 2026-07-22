@@ -33,6 +33,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test workflow helpers
+        run: bash .github/scripts/tag-source-branch_test.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -202,7 +207,7 @@ jobs:
           if [[ "${REF}" == refs/tags/* ]]; then
             IS_TAG=true
             TAG_NAME="${GITHUB_REF_NAME}"
-            BRANCH="${DEFAULT_BRANCH}"
+            BRANCH="$(bash .github/scripts/tag-source-branch.sh "${GITHUB_SHA}")"
             if [[ "${TAG_NAME}" =~ -rc[0-9]+$ ]]; then
               IS_RC_TAG=true
             fi
@@ -211,9 +216,13 @@ jobs:
           fi
 
           IMAGE="ghcr.io/${GHCR_OWNER}/${GHCR_REPOSITORY}"
+          SAFE_BRANCH="$(echo "${BRANCH}" | tr '[:upper:]' '[:lower:]' | tr '/' '-' | sed 's/[^0-9a-z.-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')"
+          if [ -z "${SAFE_BRANCH}" ]; then
+            SAFE_BRANCH="branch"
+          fi
 
           TAG_ARGS=(
-            -t "${IMAGE}:${BRANCH}-${SHORT_SHA}"
+            -t "${IMAGE}:${SAFE_BRANCH}-${SHORT_SHA}"
           )
 
           # Tag special channels
@@ -227,7 +236,7 @@ jobs:
             TAG_ARGS+=(-t "${IMAGE}:${TAG_NAME}")
           fi
 
-          PRIMARY_TAG="${IMAGE}:${BRANCH}-${SHORT_SHA}"
+          PRIMARY_TAG="${IMAGE}:${SAFE_BRANCH}-${SHORT_SHA}"
           echo "PRIMARY_TAG=${PRIMARY_TAG}" >> "${GITHUB_ENV}"
           echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
           echo "IS_RC_TAG=${IS_RC_TAG}" >> "${GITHUB_ENV}"
