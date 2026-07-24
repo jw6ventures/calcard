@@ -40,8 +40,9 @@ type Config struct {
 		Secret string
 	}
 
-	PrometheusEnabled bool
-	TrustedProxies    []string
+	PrometheusEnabled  bool
+	TrustedProxies     []string
+	TrafficCaptureFile string
 
 	DAV struct {
 		// PropfindInfinityEnabled allows Depth: infinity PROPFIND requests
@@ -140,6 +141,7 @@ func Load() (*Config, error) {
 	cfg.PprofEnabled = getenvBool("APP_PPROF_ENABLED", false)
 	cfg.PprofAddr = getenvDefault("APP_PPROF_ADDR", "127.0.0.1:6060")
 	cfg.TrustedProxies = getenvList("APP_TRUSTED_PROXIES")
+	cfg.TrafficCaptureFile = strings.TrimSpace(os.Getenv("APP_TRAFFIC_CAPTURE_FILE"))
 
 	if cfg.DB.DSN == "" {
 		return nil, errors.New("APP_DB_DSN is required (or set APP_DB_HOST, APP_DB_NAME, APP_DB_USER, and APP_DB_PASSWORD)")

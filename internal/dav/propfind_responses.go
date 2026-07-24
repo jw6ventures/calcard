@@ -511,7 +511,7 @@ func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User
 
 func principalResponse(href string, user *store.User) response {
 	p := prop{
-		DisplayName:             user.PrimaryEmail,
+		DisplayName:             user.DisplayName(),
 		ResourceType:            &resourceType{Principal: &struct{}{}},
 		PrincipalURL:            &expandableHrefProp{Href: href},
 		CurrentUserPrincipal:    &expandableHrefProp{Href: href},

@@ -214,7 +214,7 @@ func (f *fakeACL) Delete(context.Context, string) error                   { retu
 
 type fakeUsers struct{ users map[int64]*store.User }
 
-func (f *fakeUsers) UpsertOAuthUser(context.Context, string, string) (*store.User, error) {
+func (f *fakeUsers) UpsertOAuthUser(context.Context, string, string, string, string) (*store.User, error) {
 	return nil, nil
 }
 func (f *fakeUsers) GetByID(_ context.Context, id int64) (*store.User, error) {

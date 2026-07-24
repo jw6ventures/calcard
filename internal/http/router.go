@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/http/csrf"
 	"github.com/jw6ventures/calcard/internal/http/ratelimit"
+	"github.com/jw6ventures/calcard/internal/http/trafficcapture"
 	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/metrics"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -68,6 +70,9 @@ type RouterOptions struct {
 	// Logger is the leveled log sink handed to the DAV server. A nil sink
 	// disables DAV logging.
 	Logger logging.Sink
+	// TrafficCaptureWriter receives replay-compatible JSONL request records.
+	// A nil writer disables traffic capture.
+	TrafficCaptureWriter io.Writer
 }
 
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
@@ -81,11 +86,21 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 
 	// Auth endpoints: 5 requests per second, burst of 10
 	authRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(5), 10, 5*time.Minute, cfg.TrustedProxies)
-	// DAV endpoints: 20 requests per second, burst of 50 (more permissive for sync clients)
-	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 50, 5*time.Minute, cfg.TrustedProxies)
+	// DAV endpoints: 20 requests per second, burst of 100 (more permissive for
+	// sync clients, which fan out many small PROPFIND/REPORT requests at once)
+	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 100, 5*time.Minute, cfg.TrustedProxies)
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	if opts.TrafficCaptureWriter != nil {
+		captureLogger := logging.New(opts.Logger, "HTTP")
+		r.Use(trafficcapture.Middleware(trafficcapture.Options{
+			Writer: opts.TrafficCaptureWriter,
+			OnError: func(err error) {
+				captureLogger.Error("TrafficCapture", "%v", err)
+			},
+		}))
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(overrideMethod)
 	r.Use(metrics.Middleware())

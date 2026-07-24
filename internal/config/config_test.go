@@ -58,6 +58,26 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.MaxMultistatusBytes != 67108864 {
 		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 67108864", cfg.DAV.MaxMultistatusBytes)
 	}
+	if cfg.TrafficCaptureFile != "" {
+		t.Fatalf("TrafficCaptureFile = %q, want disabled by default", cfg.TrafficCaptureFile)
+	}
+}
+
+func TestLoadEnablesTrafficCaptureWhenFileIsConfigured(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_TRAFFIC_CAPTURE_FILE", "/tmp/calcard-traffic.jsonl")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TrafficCaptureFile != "/tmp/calcard-traffic.jsonl" {
+		t.Fatalf("TrafficCaptureFile = %q", cfg.TrafficCaptureFile)
+	}
 }
 
 func TestLoadParsesDAVMultistatusLimits(t *testing.T) {

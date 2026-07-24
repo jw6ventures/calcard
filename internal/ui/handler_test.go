@@ -1141,7 +1141,12 @@ func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
 	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "new@example.com"}))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{
+		ID:           100,
+		PrimaryEmail: "new@example.com",
+		FullName:     "Dana Lee",
+		FirstName:    "Dana",
+	}))
 	w := httptest.NewRecorder()
 
 	handler.Dashboard(w, req)
@@ -1151,6 +1156,9 @@ func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Welcome to CalCard") {
 		t.Fatalf("expected welcome tour for first-login user, got %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Welcome, Dana") || !strings.Contains(w.Body.String(), "Hi Dana") {
+		t.Fatalf("expected dashboard to use OAuth first name, got %s", w.Body.String())
 	}
 }
 
@@ -2753,7 +2761,7 @@ func (f *fakeAppPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error
 	return nil
 }
 
-func (f *fakeUserRepo) UpsertOAuthUser(ctx context.Context, subject, email string) (*store.User, error) {
+func (f *fakeUserRepo) UpsertOAuthUser(ctx context.Context, subject, email, fullName, firstName string) (*store.User, error) {
 	return nil, nil
 }
 

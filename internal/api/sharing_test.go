@@ -71,7 +71,7 @@ func (f *fakeACLRepo) Delete(context.Context, string) error                   { 
 
 type fakeUserRepo struct{ users map[int64]*store.User }
 
-func (f *fakeUserRepo) UpsertOAuthUser(context.Context, string, string) (*store.User, error) {
+func (f *fakeUserRepo) UpsertOAuthUser(context.Context, string, string, string, string) (*store.User, error) {
 	return nil, nil
 }
 func (f *fakeUserRepo) GetByID(_ context.Context, id int64) (*store.User, error) {

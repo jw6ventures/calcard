@@ -119,6 +119,7 @@ Environment variables:
 | `APP_HTTP_READ_TIMEOUT` | false | (Default `15s`) Maximum duration for reading an entire request, including the body (Go duration). |
 | `APP_HTTP_WRITE_TIMEOUT` | false | (Default `15s`) Maximum duration before timing out writes of the response (Go duration). |
 | `APP_HTTP_IDLE_TIMEOUT` | false | (Default `60s`) Maximum time to wait for the next request on a keep-alive connection (Go duration). |
+| `APP_TRAFFIC_CAPTURE_FILE` | false | Enables diagnostic request capture when set to a JSONL file path. Captures method, path, headers, request body (up to 10 MiB), client IP, timing offset, and response status. Basic credentials are replaced with `${CALCARD_DAV_BASIC_AUTH}` and cookies/tokens are redacted, but calendar, contact, and other body data remains sensitive. The file is appended with `0600` permissions; move or remove it before starting a distinct capture session. |
 | `APP_PPROF_ENABLED` | false | (Default `false`) Exposes `net/http/pprof` profiling on a dedicated debug listener (`APP_PPROF_ADDR`). The endpoints leak runtime internals and can be used to DoS the process - keep the listener on loopback and reach it via an SSH tunnel. |
 | `APP_PPROF_ADDR` | false | (Default `127.0.0.1:6060`) Bind address for the pprof debug listener when `APP_PPROF_ENABLED` is true. Keep on loopback. |
 

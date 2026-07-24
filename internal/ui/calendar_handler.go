@@ -499,7 +499,7 @@ func (h *Handler) calendarShareViews(ctx context.Context, calendarID int64, user
 		})
 	}
 	sort.Slice(shares, func(i, j int) bool {
-		return shares[i].User.PrimaryEmail < shares[j].User.PrimaryEmail
+		return shares[i].User.ReferenceName() < shares[j].User.ReferenceName()
 	})
 	return shares, nil
 }

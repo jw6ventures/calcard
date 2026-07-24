@@ -109,15 +109,15 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oauthSubject, email, err := s.userIdentity(ctx, token)
+	identity, err := s.userIdentity(ctx, token)
 	if err != nil {
 		http.Error(w, "failed to fetch user identity", http.StatusBadRequest)
 		return
 	}
 
-	user, err := s.store.Users.UpsertOAuthUser(ctx, oauthSubject, email)
+	user, err := s.store.Users.UpsertOAuthUser(ctx, identity.Subject, identity.Email, identity.FullName, identity.FirstName)
 	if err != nil {
-		log.Printf("failed to persist user for subject %q: %v", oauthSubject, err)
+		log.Printf("failed to persist user for subject %q: %v", identity.Subject, err)
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
 		return
 	}
@@ -333,18 +333,39 @@ func discoverOIDC(issuerOrDiscovery string) (*oidcConfiguration, error) {
 }
 
 type userInfo struct {
-	Subject string `json:"sub"`
-	Email   string `json:"email"`
+	Subject   string `json:"sub"`
+	Email     string `json:"email"`
+	FullName  string `json:"name"`
+	FirstName string `json:"given_name"`
 }
 
-func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string, string, error) {
+type oauthIdentity struct {
+	Subject   string
+	Email     string
+	FullName  string
+	FirstName string
+}
+
+func identityFromClaims(claims userInfo) (oauthIdentity, error) {
+	if claims.Subject == "" || claims.Email == "" {
+		return oauthIdentity{}, errors.New("identity missing subject or email")
+	}
+	return oauthIdentity{
+		Subject:   claims.Subject,
+		Email:     claims.Email,
+		FullName:  strings.TrimSpace(claims.FullName),
+		FirstName: strings.TrimSpace(claims.FirstName),
+	}, nil
+}
+
+func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (oauthIdentity, error) {
 	if s.provider != nil {
 		info, err := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
 		if err == nil {
 			var claims userInfo
 			if err := info.Claims(&claims); err == nil {
-				if claims.Subject != "" && claims.Email != "" {
-					return claims.Subject, claims.Email, nil
+				if identity, err := identityFromClaims(claims); err == nil {
+					return identity, nil
 				}
 			}
 		}
@@ -352,26 +373,22 @@ func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string
 
 	rawIDToken, _ := token.Extra("id_token").(string)
 	if rawIDToken == "" {
-		return "", "", errors.New("no userinfo or id_token available")
+		return oauthIdentity{}, errors.New("no userinfo or id_token available")
 	}
 
 	if s.verifier == nil {
-		return "", "", errors.New("id_token verification unavailable")
+		return oauthIdentity{}, errors.New("id_token verification unavailable")
 	}
 
 	idToken, err := s.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return "", "", err
+		return oauthIdentity{}, err
 	}
 
 	var claims userInfo
 	if err := idToken.Claims(&claims); err != nil {
-		return "", "", err
+		return oauthIdentity{}, err
 	}
 
-	if claims.Subject == "" || claims.Email == "" {
-		return "", "", errors.New("id_token missing subject or email")
-	}
-
-	return claims.Subject, claims.Email, nil
+	return identityFromClaims(claims)
 }

@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.8')
+VALUES ('version', 'v1.1.9')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -14,6 +14,8 @@ CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     oauth_subject TEXT NOT NULL UNIQUE,
     primary_email TEXT NOT NULL,
+    full_name TEXT NOT NULL DEFAULT '',
+    first_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     onboarding_completed_at TIMESTAMPTZ NULL

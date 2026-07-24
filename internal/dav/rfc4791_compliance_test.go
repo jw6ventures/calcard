@@ -873,7 +873,7 @@ func TestRFC4791_ExpandPropertyReportWorks(t *testing.T) {
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
+	user := &store.User{ID: 1, PrimaryEmail: "user@example.com", FullName: "Dana Lee"}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:expand-property xmlns:d="DAV:">
@@ -897,7 +897,7 @@ func TestRFC4791_ExpandPropertyReportWorks(t *testing.T) {
 	}
 
 	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "displayname") || !strings.Contains(respBody, user.PrimaryEmail) {
+	if !strings.Contains(respBody, "displayname") || !strings.Contains(respBody, user.FullName) {
 		t.Errorf("RFC 4791 Section 7.1: expand-property must include expanded properties, got: %s", respBody)
 	}
 	if !strings.Contains(respBody, "/dav/principals/1/") {

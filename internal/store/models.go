@@ -1,15 +1,46 @@
 package store
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // User represents a person authenticated via OAuth.
 type User struct {
 	ID                    int64
 	OAuthSubject          string
 	PrimaryEmail          string
+	FullName              string
+	FirstName             string
 	CreatedAt             time.Time
 	LastLoginAt           time.Time
 	OnboardingCompletedAt *time.Time
+}
+
+// DisplayName returns the OAuth full name, falling back to the login email.
+func (u User) DisplayName() string {
+	if name := strings.TrimSpace(u.FullName); name != "" {
+		return name
+	}
+	return u.PrimaryEmail
+}
+
+// GreetingName returns the user's first name when the OAuth provider supplies it.
+func (u User) GreetingName() string {
+	if name := strings.TrimSpace(u.FirstName); name != "" {
+		return name
+	}
+	return u.DisplayName()
+}
+
+// ReferenceName includes the email when a full name is available so users with
+// the same name remain distinguishable in sharing controls.
+func (u User) ReferenceName() string {
+	name := u.DisplayName()
+	if name == u.PrimaryEmail || u.PrimaryEmail == "" {
+		return name
+	}
+	return name + " (" + u.PrimaryEmail + ")"
 }
 
 // Calendar is a CalDAV calendar belonging to a user.

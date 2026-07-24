@@ -405,7 +405,7 @@
             <select name="user_id" required>
                 <option value="">Select user to share with</option>
                 {{range .ShareCandidates}}
-                <option value="{{.ID}}">{{.PrimaryEmail}}</option>
+                <option value="{{.ID}}">{{.ReferenceName}}</option>
                 {{end}}
             </select>
             <div class="share-controls">
@@ -421,8 +421,8 @@
         <div class="shares-list">
             {{range .Shares}}
             <div class="share-item">
-                <span class="share-email">{{.User.PrimaryEmail}} <span class="badge">{{if .Editor}}Editor{{else}}Read-only{{end}}</span></span>
-                <form method="post" action="/addressbooks/{{$book.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Remove access for {{.User.PrimaryEmail}}?')">
+                <span class="share-email">{{.User.ReferenceName}} <span class="badge">{{if .Editor}}Editor{{else}}Read-only{{end}}</span></span>
+                <form method="post" action="/addressbooks/{{$book.ID}}/shares/{{.User.ID}}/delete" onsubmit="return confirm('Remove access for {{.User.DisplayName}}?')">
                     <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                     <button type="submit" class="btn-sm btn-danger">Remove</button>
                 </form>

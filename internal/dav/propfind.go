@@ -64,6 +64,8 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 	} else {
 		propfindReq.AllProp = &struct{}{}
 	}
+	// calendar-data and address-data are REPORT selectors, not WebDAV
+	// properties, so PROPFIND must never return their values.
 	propfindReq.suppressData = true
 
 	responses, err := h.buildPropfindResponses(r.Context(), r, r.URL.Path, depth, user, &propfindReq)

@@ -60,6 +60,19 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
+	if cfg.TrafficCaptureFile != "" && opts.Router.TrafficCaptureWriter == nil {
+		captureFile, err := openTrafficCaptureFile(cfg.TrafficCaptureFile)
+		if err != nil {
+			return fmt.Errorf("failed to open traffic capture file: %w", err)
+		}
+		defer func() {
+			if err := captureFile.Close(); err != nil {
+				jw6utils.Log("Main", "runServer", jw6_utils.Error, fmt.Sprintf("failed to close traffic capture file: %v", err))
+			}
+		}()
+		opts.Router.TrafficCaptureWriter = captureFile
+		jw6utils.Log("Main", "runServer", jw6_utils.Warn, fmt.Sprintf("request traffic capture enabled: %s", cfg.TrafficCaptureFile))
+	}
 
 	dbManager := database.NewManager(database.Config{
 		Driver:           "postgres",
@@ -131,4 +144,16 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		log.Printf("graceful shutdown failed: %v", err)
 	}
 	return nil
+}
+
+func openTrafficCaptureFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }

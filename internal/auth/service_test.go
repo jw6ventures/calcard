@@ -29,7 +29,7 @@ type userRepoMock struct {
 	getByEmailFn func(context.Context, string) (*store.User, error)
 }
 
-func (m *userRepoMock) UpsertOAuthUser(context.Context, string, string) (*store.User, error) {
+func (m *userRepoMock) UpsertOAuthUser(context.Context, string, string, string, string) (*store.User, error) {
 	return nil, nil
 }
 func (m *userRepoMock) GetByID(ctx context.Context, id int64) (*store.User, error) {
@@ -374,3 +374,28 @@ func TestCookieSecureAndHelpers(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+func TestIdentityFromClaimsIncludesProfileNames(t *testing.T) {
+	identity, err := identityFromClaims(userInfo{
+		Subject:   "oauth-subject",
+		Email:     "dana@example.com",
+		FullName:  " Dana Lee ",
+		FirstName: " Dana ",
+	})
+	if err != nil {
+		t.Fatalf("identityFromClaims() error = %v", err)
+	}
+	if identity.Subject != "oauth-subject" || identity.Email != "dana@example.com" || identity.FullName != "Dana Lee" || identity.FirstName != "Dana" {
+		t.Fatalf("identityFromClaims() = %#v", identity)
+	}
+}
+
+func TestIdentityFromClaimsAllowsMissingOptionalNames(t *testing.T) {
+	identity, err := identityFromClaims(userInfo{Subject: "oauth-subject", Email: "dana@example.com"})
+	if err != nil {
+		t.Fatalf("identityFromClaims() error = %v", err)
+	}
+	if identity.FullName != "" || identity.FirstName != "" {
+		t.Fatalf("identityFromClaims() = %#v", identity)
+	}
+}

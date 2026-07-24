@@ -18,6 +18,7 @@ data:
   APP_HTTP_READ_TIMEOUT: {{ .Values.app.http.readTimeout | quote }}
   APP_HTTP_WRITE_TIMEOUT: {{ .Values.app.http.writeTimeout | quote }}
   APP_HTTP_IDLE_TIMEOUT: {{ .Values.app.http.idleTimeout | quote }}
+  APP_TRAFFIC_CAPTURE_FILE: {{ .Values.app.trafficCaptureFile | quote }}
   APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}

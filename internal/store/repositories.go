@@ -7,7 +7,7 @@ import (
 
 // UserRepository defines persistence operations for users.
 type UserRepository interface {
-	UpsertOAuthUser(ctx context.Context, subject, email string) (*User, error)
+	UpsertOAuthUser(ctx context.Context, subject, email, fullName, firstName string) (*User, error)
 	GetByID(ctx context.Context, id int64) (*User, error)
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	ListActive(ctx context.Context) ([]User, error)

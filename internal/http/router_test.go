@@ -289,6 +289,33 @@ func TestNewRouterDoesNotWriteRequestLogs(t *testing.T) {
 	}
 }
 
+func TestNewRouterWithOptionsCapturesPublicDiscoveryTraffic(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	var capture bytes.Buffer
+	r := NewRouterWithOptions(&config.Config{BaseURL: "http://localhost:8080"}, store.New(db), nil, RouterOptions{
+		TrafficCaptureWriter: &capture,
+	})
+	req := httptest.NewRequest("PROPFIND", "/.well-known/caldav", strings.NewReader("<propfind/>"))
+	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("discovery status = %d, want %d", rec.Code, http.StatusMovedPermanently)
+	}
+	if got := capture.String(); !strings.Contains(got, `"path":"/.well-known/caldav"`) ||
+		!strings.Contains(got, `"body":"<propfind/>"`) ||
+		!strings.Contains(got, `"Authorization":"Basic ${CALCARD_DAV_BASIC_AUTH}"`) {
+		t.Fatalf("traffic capture = %q", got)
+	}
+}
+
 type davExtensionFunc func(*dav.Registry)
 
 func (f davExtensionFunc) RegisterDAV(r *dav.Registry) {
