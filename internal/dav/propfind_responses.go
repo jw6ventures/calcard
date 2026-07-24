@@ -30,7 +30,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	case cleanPath == "/dav" || cleanPath == "/dav/":
 		href := ensureCollectionHref(cleanPath)
 		principalHref := h.principalURL(user)
-		res := []response{rootCollectionResponse(href, user, principalHref)}
+		res := []response{rootCollectionResponse(href, principalHref)}
 		switch depth {
 		case "1":
 			res = h.appendMultistatusResponses(res, []response{
@@ -47,7 +47,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 			}
 			res = h.appendMultistatusResponses(res, calendarRes)
 			if !h.multistatusBuildComplete(res) {
-				addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user, propfindReq)
+				addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user)
 				if err != nil {
 					return nil, err
 				}
@@ -117,7 +117,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
-		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user, propfindReq)
+		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user)
 		if err != nil {
 			return nil, err
 		}
@@ -355,7 +355,7 @@ func (h *DavServer) loadDiscoverableCalendar(ctx context.Context, user *store.Us
 	return nil, store.ErrNotFound
 }
 
-func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User, propfindReq *propfindRequest) ([]response, error) {
+func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth string, user *store.User) ([]response, error) {
 	relPath := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
 	if relPath == "" {
 		base := ensureCollectionHref("/dav/addressbooks")
@@ -523,7 +523,7 @@ func principalResponse(href string, user *store.User) response {
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
 }
 
-func rootCollectionResponse(href string, user *store.User, principalHref string) response {
+func rootCollectionResponse(href string, principalHref string) response {
 	p := prop{
 		DisplayName:             "CalCard DAV",
 		ResourceType:            &resourceType{Collection: &struct{}{}},

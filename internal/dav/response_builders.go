@@ -7,10 +7,6 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func calendarResourceResponses(base string, events []store.Event) []response {
-	return calendarResourceResponsesFilteredLimit(base, events, nil, len(events))
-}
-
 func eventResourceName(ev store.Event) string {
 	if ev.ResourceName != "" {
 		return ev.ResourceName
@@ -23,10 +19,6 @@ func contactResourceName(contact store.Contact) string {
 		return contact.ResourceName
 	}
 	return contact.UID
-}
-
-func calendarResourceResponsesFiltered(base string, events []store.Event, calData *calendarDataEl) []response {
-	return calendarResourceResponsesFilteredLimit(base, events, calData, len(events))
 }
 
 func calendarResourceResponsesFilteredLimit(base string, events []store.Event, calData *calendarDataEl, limit int) []response {
@@ -52,10 +44,6 @@ func calendarResourceResponsesFilteredLimit(base string, events []store.Event, c
 func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, requested *reportProp, calData *calendarDataEl) ([]response, error) {
 	responses := rawCalendarResourceReportResponsesLimit(base, events, requested, calData, h.multistatusBuildLimit())
 	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
-}
-
-func rawCalendarResourceReportResponses(base string, events []store.Event, requested *reportProp, calData *calendarDataEl) []response {
-	return rawCalendarResourceReportResponsesLimit(base, events, requested, calData, len(events))
 }
 
 func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, requested *reportProp, calData *calendarDataEl, limit int) []response {
@@ -120,10 +108,6 @@ func (h *DavServer) finishReportResponses(ctx context.Context, user *store.User,
 		}
 	}
 	return responses, nil
-}
-
-func addressBookResourceResponses(base string, contacts []store.Contact) []response {
-	return addressBookResourceResponsesLimit(base, contacts, len(contacts))
 }
 
 func addressBookResourceResponsesLimit(base string, contacts []store.Contact, limit int) []response {

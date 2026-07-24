@@ -5587,7 +5587,7 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 }
 
 func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -5625,7 +5625,7 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 }
 
 func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -5723,7 +5723,7 @@ func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenie
 }
 
 func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -5779,7 +5779,7 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 }
 
 func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8864,7 +8864,7 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 }
 
 func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8910,7 +8910,7 @@ func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
 }
 
 func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8957,7 +8957,7 @@ func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *
 }
 
 func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -9000,7 +9000,7 @@ func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testin
 }
 
 func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -9052,7 +9052,7 @@ func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
 }
 
 func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -9093,7 +9093,7 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 }
 
 func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{

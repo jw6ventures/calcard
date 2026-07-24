@@ -31,7 +31,7 @@ func benchACLEntries(userID int64, n int) []store.ACLEntry {
 func BenchmarkApplicableACLPrincipals(b *testing.B) {
 	user := &store.User{ID: 42}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = acl.ApplicablePrincipals(user)
 	}
 }
@@ -41,7 +41,7 @@ func BenchmarkACLDecisionForPrivilege_Read(b *testing.B) {
 	principals := acl.ApplicablePrincipals(user)
 	entries := benchACLEntries(user.ID, 16)
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = acl.DecisionForPrivilege(entries, principals, "read")
 	}
 }
@@ -65,7 +65,7 @@ func BenchmarkACLDecisionForPrivilege_Write(b *testing.B) {
 
 func BenchmarkNormalizeACLPrincipalHref(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = acl.NormalizePrincipalHref("/dav/principals/42")
 	}
 }

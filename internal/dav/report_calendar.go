@@ -225,17 +225,6 @@ func (h *DavServer) listCalendarEventsForTimeRange(ctx context.Context, calendar
 	return h.store.Events.ListForCalendar(ctx, calendarID)
 }
 
-// listCalendarEventsForFilter narrows the database read using the calendar-query
-// time-range when one is present, otherwise falls back to listing every event.
-// The returned rows are a superset; callers must still apply applyCalendarFilter
-// for an exact match.
-func (h *DavServer) listCalendarEventsForFilter(ctx context.Context, calendarID int64, filter *calFilter) ([]store.Event, error) {
-	if ef, ok := eventFilterFromCalFilter(filter); ok {
-		return h.store.Events.ListForCalendarFiltered(ctx, calendarID, ef)
-	}
-	return h.store.Events.ListForCalendar(ctx, calendarID)
-}
-
 func validCalendarFilterTimeRanges(filter *calFilter) bool {
 	if filter == nil {
 		return true
@@ -587,7 +576,7 @@ func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
 }
 
 func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, calData *calendarDataEl) ([]response, string, error) {
-	syncToken, _ := h.calendarSyncTokenValue(ctx, cal)
+	syncToken, _ := h.calendarSyncTokenValue(cal)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
 	var since time.Time

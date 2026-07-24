@@ -48,30 +48,3 @@ func (h *DavServer) deleteDAVACLState(ctx context.Context, user *store.User, res
 	}
 	return nil
 }
-
-func (h *DavServer) deleteDAVResourceState(ctx context.Context, user *store.User, resourcePath string) error {
-	canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
-	if err != nil {
-		return err
-	}
-	if canonicalPath == "" {
-		return nil
-	}
-	if h == nil || h.store == nil {
-		return nil
-	}
-	defer invalidateDAVRequestState(ctx)
-	for _, statePath := range davStatePaths(canonicalPath) {
-		if h.store.Locks != nil {
-			if err := h.store.Locks.DeleteByResourcePath(ctx, statePath); err != nil {
-				return err
-			}
-		}
-		if h.store.ACLEntries != nil {
-			if err := h.store.ACLEntries.Delete(ctx, statePath); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}

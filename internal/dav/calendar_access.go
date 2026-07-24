@@ -243,21 +243,6 @@ func (h *DavServer) prefetchCalendarACLEntries(ctx context.Context, user *store.
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
 
-func (h *DavServer) canAccessCalendarObjectWithEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, error) {
-	if cal == nil {
-		return false, nil
-	}
-	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), entriesByPath)
-	allowed, denied := calendarPrivilegeDecisionWithDecider(cal, resourceName, privilege, decider)
-	if allowed {
-		return true, nil
-	}
-	if denied {
-		return false, nil
-	}
-	return cal != nil && cal.EffectivePrivileges().Allows(privilege), nil
-}
-
 func (h *DavServer) filterCalendarEventsByPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event, privilege string) ([]store.Event, error) {
 	prefetchedACLEntries, err := h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
 	if err != nil {
@@ -362,18 +347,6 @@ func mergeCalendarAccessWithLegacy(access, legacy *store.CalendarAccess) {
 
 func calendarCollectionResourcePath(calendarID int64) string {
 	return collectionResourcePath(calendarPrefix, calendarID)
-}
-
-func calendarObjectACLPaths(calendarID int64, resourceName string) []string {
-	return objectACLPaths(calendarPrefix, calendarID, resourceName, ".ics")
-}
-
-func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) (bool, bool) {
-	if cal == nil || user == nil {
-		return false, false
-	}
-	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), entriesByPath)
-	return calendarPrivilegeDecisionWithDecider(cal, resourceName, privilege, decider)
 }
 
 func calendarPrivilegeDecisionWithDecider(cal *store.CalendarAccess, resourceName, privilege string, decider *batchedObjectACLDecider) (bool, bool) {

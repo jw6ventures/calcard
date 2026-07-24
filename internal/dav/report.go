@@ -346,7 +346,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 }
 
 func (h *DavServer) reportRootExpandProperty(w http.ResponseWriter, user *store.User, expandReq *expandPropertyRequest) {
-	rootResp := rootCollectionResponse("/dav/", user, h.principalURL(user))
+	rootResp := rootCollectionResponse("/dav/", h.principalURL(user))
 	selections := expandPropertySelections(expandReq)
 	if len(rootResp.Propstat) > 0 {
 		expanded := h.expandedPrincipalProp(user, selections)

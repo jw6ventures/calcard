@@ -12,7 +12,7 @@ import (
 // hot path for every DAV request, so it's worth keeping an eye on.
 func BenchmarkAuthCacheKey(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = authCacheKey("user@example.com", "correct-horse-battery-staple")
 	}
 }
@@ -26,7 +26,7 @@ func BenchmarkAuthCacheGet_Hit(b *testing.B) {
 	s.authCachePut(key, user, 1)
 
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, ok := s.authCacheGet(key); !ok {
 			b.Fatal("expected cache hit")
 		}

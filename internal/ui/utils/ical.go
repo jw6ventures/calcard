@@ -423,7 +423,8 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 
 	sb.WriteString("BEGIN:VEVENT\r\n")
 	for _, line := range eventLines {
-		sb.WriteString(line + "\r\n")
+		sb.WriteString(line)
+		sb.WriteString("\r\n")
 	}
 	sb.WriteString("END:VEVENT\r\n")
 	sb.WriteString("END:VCALENDAR\r\n")
@@ -629,7 +630,8 @@ func BuildFromComponents(header []string, events [][]string, footer []string) st
 			sb.WriteString(line)
 			return
 		}
-		sb.WriteString(line + "\r\n")
+		sb.WriteString(line)
+		sb.WriteString("\r\n")
 	}
 
 	for _, line := range header {
@@ -656,7 +658,8 @@ func writeICalLine(sb *strings.Builder, line string) {
 		sb.WriteString(line)
 		return
 	}
-	sb.WriteString(line + "\r\n")
+	sb.WriteString(line)
+	sb.WriteString("\r\n")
 }
 
 // RecurrenceIDValue extracts the RECURRENCE-ID value from event lines.

@@ -1,7 +1,6 @@
 package dav
 
 import (
-	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -584,7 +583,7 @@ func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDa
 	return topLevelAddressData
 }
 
-func (h *DavServer) buildAddressObjectReportResponse(ctx context.Context, user *store.User, href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) (response, error) {
+func (h *DavServer) buildAddressObjectReportResponse(href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) (response, error) {
 	addressDataReq := effectiveAddressDataRequest(req, topLevelAddressData)
 	if addressDataReq != nil && !canServeRequestedAddressData(contact.RawVCard, addressDataReq) {
 		return response{

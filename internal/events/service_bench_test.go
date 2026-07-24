@@ -84,7 +84,7 @@ func BenchmarkListEvents_Paginated(b *testing.B) {
 	svc := newSharedListService(benchEvents(n))
 	filter := store.EventFilter{Limit: 50}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		page, err := svc.ListEvents(context.Background(), user, 1, filter)
 		if err != nil {
 			b.Fatal(err)

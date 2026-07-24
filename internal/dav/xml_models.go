@@ -528,14 +528,6 @@ type mkcalendarSet struct {
 	Prop proppatchProp `xml:"DAV: prop"`
 }
 
-type proppatchSet struct {
-	Prop proppatchProp `xml:"DAV: prop"`
-}
-
-type proppatchRemove struct {
-	Prop proppatchProp `xml:"DAV: prop"`
-}
-
 type proppatchProp struct {
 	DisplayName                *string                `xml:"DAV: displayname"`
 	ResourceType               *resourceType          `xml:"DAV: resourcetype"`

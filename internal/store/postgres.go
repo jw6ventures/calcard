@@ -600,32 +600,45 @@ func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int6
 		// holds that end for recurring events (a far-future sentinel when
 		// unbounded) and is NULL for non-recurring events, so COALESCE falls back
 		// to dtend, then dtstart.
-		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= `)
+		sb.WriteString(placeholder(f.Start.UTC()))
 	}
 	if f.End != nil {
 		// Keep events whose earliest instance starts at or before End. recurrence_start
 		// captures RDATEs and moved overrides that can occur before the master dtstart.
-		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= ` + placeholder(f.End.UTC()))
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= `)
+		sb.WriteString(placeholder(f.End.UTC()))
 	}
 	if f.Title != "" {
-		sb.WriteString(` AND summary ILIKE ` + placeholder("%"+likeEscape(f.Title)+"%"))
+		sb.WriteString(` AND summary ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Title) + "%"))
 	}
 	if f.Description != "" {
-		sb.WriteString(` AND description ILIKE ` + placeholder("%"+likeEscape(f.Description)+"%"))
+		sb.WriteString(` AND description ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Description) + "%"))
 	}
 	if f.Location != "" {
-		sb.WriteString(` AND location ILIKE ` + placeholder("%"+likeEscape(f.Location)+"%"))
+		sb.WriteString(` AND location ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Location) + "%"))
 	}
 	if f.Query != "" {
 		p := placeholder("%" + likeEscape(f.Query) + "%")
-		sb.WriteString(` AND (summary ILIKE ` + p + ` OR description ILIKE ` + p + ` OR location ILIKE ` + p + `)`)
+		sb.WriteString(` AND (summary ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(` OR description ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(` OR location ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(`)`)
 	}
 	sb.WriteString(` ORDER BY dtstart ASC NULLS LAST, last_modified DESC`)
 	if f.Limit > 0 {
-		sb.WriteString(` LIMIT ` + placeholder(f.Limit))
+		sb.WriteString(` LIMIT `)
+		sb.WriteString(placeholder(f.Limit))
 	}
 	if f.Offset > 0 {
-		sb.WriteString(` OFFSET ` + placeholder(f.Offset))
+		sb.WriteString(` OFFSET `)
+		sb.WriteString(placeholder(f.Offset))
 	}
 
 	defer observeDB(ctx, "events.list_for_calendar_filtered")()
@@ -658,25 +671,37 @@ func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, af
 		return "$" + strconv.Itoa(len(args))
 	}
 	if f.Start != nil {
-		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= ` + placeholder(f.Start.UTC()))
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= `)
+		sb.WriteString(placeholder(f.Start.UTC()))
 	}
 	if f.End != nil {
-		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= ` + placeholder(f.End.UTC()))
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= `)
+		sb.WriteString(placeholder(f.End.UTC()))
 	}
 	if f.Title != "" {
-		sb.WriteString(` AND summary ILIKE ` + placeholder("%"+likeEscape(f.Title)+"%"))
+		sb.WriteString(` AND summary ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Title) + "%"))
 	}
 	if f.Description != "" {
-		sb.WriteString(` AND description ILIKE ` + placeholder("%"+likeEscape(f.Description)+"%"))
+		sb.WriteString(` AND description ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Description) + "%"))
 	}
 	if f.Location != "" {
-		sb.WriteString(` AND location ILIKE ` + placeholder("%"+likeEscape(f.Location)+"%"))
+		sb.WriteString(` AND location ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Location) + "%"))
 	}
 	if f.Query != "" {
 		p := placeholder("%" + likeEscape(f.Query) + "%")
-		sb.WriteString(` AND (summary ILIKE ` + p + ` OR description ILIKE ` + p + ` OR location ILIKE ` + p + `)`)
+		sb.WriteString(` AND (summary ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(` OR description ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(` OR location ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(`)`)
 	}
-	sb.WriteString(` ORDER BY id ASC LIMIT ` + placeholder(limit))
+	sb.WriteString(` ORDER BY id ASC LIMIT `)
+	sb.WriteString(placeholder(limit))
 
 	defer observeDB(ctx, "events.list_for_calendar_page_after")()
 	rows, err := r.pool.QueryContext(ctx, sb.String(), args...)
@@ -1407,21 +1432,29 @@ func (r *contactRepo) ListForBookFiltered(ctx context.Context, addressBookID int
 	}
 
 	if f.Name != "" {
-		sb.WriteString(` AND display_name ILIKE ` + placeholder("%"+likeEscape(f.Name)+"%"))
+		sb.WriteString(` AND display_name ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Name) + "%"))
 	}
 	if f.Email != "" {
-		sb.WriteString(` AND primary_email ILIKE ` + placeholder("%"+likeEscape(f.Email)+"%"))
+		sb.WriteString(` AND primary_email ILIKE `)
+		sb.WriteString(placeholder("%" + likeEscape(f.Email) + "%"))
 	}
 	if f.Query != "" {
 		p := placeholder("%" + likeEscape(f.Query) + "%")
-		sb.WriteString(` AND (display_name ILIKE ` + p + ` OR primary_email ILIKE ` + p + `)`)
+		sb.WriteString(` AND (display_name ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(` OR primary_email ILIKE `)
+		sb.WriteString(p)
+		sb.WriteString(`)`)
 	}
 	sb.WriteString(` ORDER BY LOWER(COALESCE(display_name, '')) ASC, id ASC`)
 	if f.Limit > 0 {
-		sb.WriteString(` LIMIT ` + placeholder(f.Limit))
+		sb.WriteString(` LIMIT `)
+		sb.WriteString(placeholder(f.Limit))
 	}
 	if f.Offset > 0 {
-		sb.WriteString(` OFFSET ` + placeholder(f.Offset))
+		sb.WriteString(` OFFSET `)
+		sb.WriteString(placeholder(f.Offset))
 	}
 
 	defer observeDB(ctx, "contacts.list_for_book_filtered")()

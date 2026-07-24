@@ -41,13 +41,6 @@ func objectResourcePath(prefix string, id int64, resourceName string) string {
 	return path.Join(prefix, fmt.Sprint(id), resourceName)
 }
 
-// objectACLPaths returns the ACL lookup paths for an object, covering both the
-// stored resource name and its extension-normalized variant (ext includes the
-// dot, e.g. ".ics" or ".vcf").
-func objectACLPaths(prefix string, id int64, resourceName, ext string) []string {
-	return appendObjectACLPaths(nil, collectionResourcePath(prefix, id), resourceName, ext)
-}
-
 func appendObjectACLPaths(paths []string, collectionPath, resourceName, ext string) []string {
 	resourceName = strings.TrimSpace(resourceName)
 	if resourceName == "" {

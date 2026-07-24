@@ -694,7 +694,7 @@ func srcPath(r *http.Request) string {
 func newCopyETag(raw string, destinationID int64) string {
 	entropy := make([]byte, 16)
 	if _, err := rand.Read(entropy); err != nil {
-		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", raw, destinationID, store.Now().UnixNano()))))
+		return fmt.Sprintf("%x", sha256.Sum256(fmt.Appendf(nil, "%s:%d:%d", raw, destinationID, store.Now().UnixNano())))
 	}
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(raw+fmt.Sprint(destinationID)+hex.EncodeToString(entropy))))
 }

@@ -3654,9 +3654,10 @@ func TestRFC4791_MkcalendarWithProperties(t *testing.T) {
 	h.Mkcalendar(rr, req)
 
 	// RFC 4791 Section 5.3.1.2: Server may support setting properties during creation
-	if rr.Code == http.StatusCreated {
+	switch rr.Code {
+	case http.StatusCreated:
 		t.Log("RFC 4791 Section 5.3.1: Server supports MKCALENDAR with property initialization")
-	} else if rr.Code == http.StatusMultiStatus {
+	case http.StatusMultiStatus:
 		t.Log("RFC 4791 Section 5.3.1: Server created calendar but some properties may have failed")
 	}
 }

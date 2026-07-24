@@ -1139,7 +1139,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	etag := utils.GenerateETag(ical)
 
 	resourceName := uid
-	if existing != nil && existing.ResourceName != "" {
+	if existing.ResourceName != "" {
 		resourceName = existing.ResourceName
 	}
 	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
@@ -1249,7 +1249,7 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 
 		updatedICAL := utils.BuildFromComponents(header, newComponents, footer)
 		resourceName := uid
-		if existing != nil && existing.ResourceName != "" {
+		if existing.ResourceName != "" {
 			resourceName = existing.ResourceName
 		}
 		if _, err := h.store.Events.Upsert(r.Context(), store.Event{

@@ -116,7 +116,7 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 
 	if cfg.PprofEnabled {
-		pprofSrv := startPprofServer(ctx, cfg.PprofAddr, &jw6utils)
+		pprofSrv := startPprofServer(cfg.PprofAddr, &jw6utils)
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()

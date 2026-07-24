@@ -150,10 +150,6 @@ func (c recurringComponent) overrideUntil() *time.Time {
 	return &until
 }
 
-func recurringComponents(raw string) []recurringComponent {
-	return recurringComponentsFromLines(UnfoldLines(raw))
-}
-
 func recurringComponentsFromLines(lines []string) []recurringComponent {
 	parsedComponents := topLevelComponentsFromLines(lines, isRecurringComponentName)
 	components := make([]recurringComponent, 0, len(parsedComponents))

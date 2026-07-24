@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"strings"
 
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -14,10 +13,6 @@ func addressBookCollectionPath(cleanPath string) string {
 
 func addressBookCollectionResourcePath(bookID int64) string {
 	return collectionResourcePath(addressBookPrefix, bookID)
-}
-
-func addressBookObjectACLPaths(bookID int64, resourceName string) []string {
-	return objectACLPaths(addressBookPrefix, bookID, resourceName, ".vcf")
 }
 
 func (h *DavServer) getAddressBook(ctx context.Context, id int64) (*store.AddressBook, error) {
@@ -196,17 +191,6 @@ func (h *DavServer) prefetchAddressBookACLEntries(ctx context.Context, user *sto
 		relevantPaths = appendObjectACLPaths(relevantPaths, collectionPath, resourceName, ".vcf")
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
-}
-
-func canReadAddressBookContactWithEntries(user *store.User, book *store.AddressBook, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
-	if strings.TrimSpace(resourceName) == "" {
-		return false
-	}
-	if book == nil {
-		return false
-	}
-	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
-	return canReadAddressBookContactWithDecider(resourceName, decider)
 }
 
 func canReadAddressBookContactWithDecider(resourceName string, decider *batchedObjectACLDecider) bool {

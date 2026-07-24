@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
@@ -21,7 +20,7 @@ import (
 //
 // It returns the server so the caller can shut it down on exit. A nil return
 // means profiling was not enabled.
-func startPprofServer(ctx context.Context, addr string, log *jw6_utils.Utils) *http.Server {
+func startPprofServer(addr string, log *jw6_utils.Utils) *http.Server {
 	// Enable contention profiling. Without these, the mutex/block profiles are
 	// empty. The sampling rates are light enough to leave on in production.
 	runtime.SetMutexProfileFraction(5)

@@ -1,7 +1,6 @@
 package dav
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -49,10 +48,10 @@ func parseSyncToken(token string) (syncTokenInfo, error) {
 	return info, nil
 }
 
-func (h *DavServer) calendarSyncTokenValue(ctx context.Context, cal *store.CalendarAccess) (string, time.Time) {
+func (h *DavServer) calendarSyncTokenValue(cal *store.CalendarAccess) (string, time.Time) {
 	return buildSyncToken("cal", cal.ID, cal.UpdatedAt), cal.UpdatedAt
 }
 
-func (h *DavServer) addressBookSyncTokenValue(ctx context.Context, book *store.AddressBook) (string, time.Time) {
+func (h *DavServer) addressBookSyncTokenValue(book *store.AddressBook) (string, time.Time) {
 	return buildSyncToken("card", book.ID, book.UpdatedAt), book.UpdatedAt
 }

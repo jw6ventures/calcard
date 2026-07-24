@@ -104,7 +104,7 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 				continue
 			}
 			href := baseHref + resourceName + ".vcf"
-			resp, err := h.buildAddressObjectReportResponse(ctx, user, href, contact, reqProp, addressDataReq)
+			resp, err := h.buildAddressObjectReportResponse(href, contact, reqProp, addressDataReq)
 			if err != nil {
 				return nil, err
 			}
@@ -224,7 +224,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		resp, err := h.buildAddressObjectReportResponse(ctx, user, responseHref, *c, reqProp, addressDataReq)
+		resp, err := h.buildAddressObjectReportResponse(responseHref, *c, reqProp, addressDataReq)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +234,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 }
 
 func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
-	syncToken, _ := h.addressBookSyncTokenValue(ctx, book)
+	syncToken, _ := h.addressBookSyncTokenValue(book)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
 	var since time.Time
@@ -270,7 +270,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 			break
 		}
 		href := collectionHref + contactResourceName(contact) + ".vcf"
-		resp, err := h.buildAddressObjectReportResponse(ctx, user, href, contact, report.Prop, addressDataReq)
+		resp, err := h.buildAddressObjectReportResponse(href, contact, report.Prop, addressDataReq)
 		if err != nil {
 			return nil, "", err
 		}
