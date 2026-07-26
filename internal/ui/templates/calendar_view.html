@@ -49,7 +49,150 @@
         color: var(--primary);
         box-shadow: var(--shadow-sm);
     }
-    
+
+    /* Day/Week time grid */
+    .time-nav {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+    }
+    .time-nav button {
+        background: none;
+        border: 1px solid var(--border-secondary);
+        padding: 0.25rem 0.75rem;
+        cursor: pointer;
+        border-radius: 4px;
+        color: var(--text-primary);
+    }
+    .time-nav button:hover { background: var(--bg-tertiary); }
+    .time-nav-title {
+        min-width: 260px;
+        text-align: center;
+        font-size: 1.1rem;
+        font-weight: 600;
+    }
+    .time-grid-shell {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
+        border-radius: var(--border-radius-lg);
+        overflow: hidden;
+    }
+    .time-grid-header,
+    .time-grid-all-day,
+    .time-grid-body {
+        display: grid;
+        grid-template-columns: 64px repeat(var(--day-count), minmax(110px, 1fr));
+    }
+    .time-grid-header {
+        background: var(--bg-tertiary);
+        border-bottom: 1px solid var(--border-primary);
+    }
+    .time-grid-header-cell {
+        min-width: 0;
+        padding: 0.55rem 0.25rem;
+        text-align: center;
+        border-left: 1px solid var(--border-primary);
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .time-grid-header-cell.today {
+        color: var(--primary);
+    }
+    .time-grid-all-day {
+        min-height: 42px;
+        border-bottom: 1px solid var(--border-primary);
+    }
+    .time-grid-label {
+        padding: 0.45rem 0.35rem;
+        color: var(--text-secondary);
+        font-size: 0.7rem;
+        text-align: right;
+    }
+    .all-day-lane {
+        position: relative;
+        min-width: 0;
+        padding: 3px;
+        border-left: 1px solid var(--border-primary);
+        cursor: pointer;
+    }
+    .all-day-event {
+        margin-bottom: 2px;
+        padding: 2px 4px;
+        border-radius: 3px;
+        color: #fff;
+        font-size: 0.68rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+    }
+    .time-grid-scroll {
+        max-height: 68vh;
+        overflow: auto;
+    }
+    .time-gutter,
+    .time-day-lane {
+        position: relative;
+        height: 1344px;
+    }
+    .time-gutter {
+        background: var(--bg-secondary);
+    }
+    .time-label {
+        position: absolute;
+        right: 6px;
+        transform: translateY(-50%);
+        color: var(--text-secondary);
+        font-size: 0.65rem;
+    }
+    .time-day-lane {
+        min-width: 0;
+        border-left: 1px solid var(--border-primary);
+        user-select: none;
+        background: repeating-linear-gradient(
+            to bottom,
+            transparent 0,
+            transparent 27px,
+            var(--border-primary) 28px
+        );
+    }
+    .time-day-lane.today {
+        background-color: rgba(59, 130, 246, 0.08);
+    }
+    .time-slot {
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 28px;
+        cursor: pointer;
+    }
+    .time-slot:hover {
+        background: rgba(99, 102, 241, 0.12);
+    }
+    .time-slot.selected {
+        background: rgba(99, 102, 241, 0.2);
+        box-shadow: inset 0 0 0 1px var(--primary);
+    }
+    .all-day-lane.selected {
+        background: rgba(99, 102, 241, 0.18);
+        box-shadow: inset 0 0 0 1px var(--primary);
+    }
+    .timed-event {
+        position: absolute;
+        z-index: 2;
+        min-height: 20px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        color: #fff;
+        font-size: 0.68rem;
+        line-height: 1.2;
+        overflow: hidden;
+        cursor: pointer;
+        box-shadow: var(--shadow-sm);
+    }
+
     /* Month Calendar View */
     .month-nav {
         display: flex;
@@ -159,7 +302,46 @@
     .day-number.has-events:hover {
         color: var(--primary);
     }
-    
+    .calendar-grid .day-cell.selected {
+        background: rgba(99, 102, 241, 0.15);
+        box-shadow: inset 0 0 0 2px var(--primary);
+    }
+    .day-cell-actions {
+        display: none;
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        gap: 4px;
+        z-index: 3;
+    }
+    .day-cell.selected .day-cell-actions {
+        display: flex;
+    }
+    .day-cell-action {
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: none;
+        border-radius: 4px;
+        background: var(--primary);
+        color: #fff;
+        cursor: pointer;
+        line-height: 1;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+        transition: background 0.15s;
+    }
+    .day-cell-action:hover {
+        background: var(--primary-dark);
+    }
+    .day-cell-action svg {
+        width: 14px;
+        height: 14px;
+        display: block;
+    }
+
     /* Day Events Modal */
     .day-modal-date {
         font-size: 0.875rem;
@@ -434,6 +616,18 @@
         padding-top: 1rem;
         border-top: 1px solid var(--border-primary);
     }
+
+    @media (max-width: 768px) {
+        .time-grid-scroll {
+            overflow-x: auto;
+        }
+        #time-grid-view {
+            overflow-x: auto;
+        }
+        .time-grid-shell {
+            min-width: 720px;
+        }
+    }
 </style>
 
 <div class="calendar-header">
@@ -462,8 +656,26 @@
 </div>
 
 <div class="view-toggle">
+    <button class="view-btn" data-view="day">Day</button>
+    <button class="view-btn" data-view="week">Week</button>
     <button class="view-btn active" data-view="month">Month</button>
     <button class="view-btn" data-view="list">List</button>
+</div>
+
+<div id="time-grid-view" style="display:none">
+    <div class="time-nav">
+        <button id="prev-time-range">&larr;</button>
+        <span class="time-nav-title" id="time-nav-title"></span>
+        <button id="next-time-range">&rarr;</button>
+        <button id="time-today-btn" style="margin-left:0.5rem">Today</button>
+    </div>
+    <div class="time-grid-shell" id="time-grid-shell">
+        <div class="time-grid-header" id="time-grid-header"></div>
+        <div class="time-grid-all-day" id="time-grid-all-day"></div>
+        <div class="time-grid-scroll" id="time-grid-scroll">
+            <div class="time-grid-body" id="time-grid-body"></div>
+        </div>
+    </div>
 </div>
 
 <div id="month-view">
@@ -521,6 +733,7 @@
         </div>
         <form method="POST" action="/calendars/{{.Calendar.ID}}/events">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="create-return-to" name="return_to">
             <div class="form-group">
                 <label for="create-summary">Title *</label>
                 <input type="text" id="create-summary" name="summary" required>
@@ -701,6 +914,7 @@
         <form id="edit-event-form" method="POST">
             <input type="hidden" name="_method" value="PUT">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="edit-return-to" name="return_to">
             <input type="hidden" id="edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="edit-recurrence-id" name="recurrence_id" value="">
             <input type="hidden" id="edit-recurrence-all-day" name="recurrence_all_day" value="">
@@ -883,6 +1097,7 @@
         </form>
         <form id="delete-event-form" method="POST" style="display: none;">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="delete-return-to" name="return_to">
             <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="delete-recurrence-id" name="recurrence_id" value="">
             <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day" value="">
@@ -1462,9 +1677,31 @@
         window.baseEvents = baseEvents;
     }
     
-    // Fetch events for a specific month
-    function fetchEventsForMonth(year, month, callback) {
-        var url = '/calendars/' + calendarID + '/events.json?year=' + year + '&month=' + month;
+    // Local-date helpers shared across the month/week/day views.
+    function formatLocalDate(date) {
+        return date.getFullYear() + '-' +
+            String(date.getMonth() + 1).padStart(2, '0') + '-' +
+            String(date.getDate()).padStart(2, '0');
+    }
+    function startOfDay(date) {
+        return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    }
+    function startOfWeek(date) {
+        var result = startOfDay(date);
+        result.setDate(result.getDate() - result.getDay());
+        return result;
+    }
+    function addDays(date, count) {
+        var result = new Date(date);
+        result.setDate(result.getDate() + count);
+        return result;
+    }
+
+    // Fetch events for an explicit date range (used by every view).
+    function fetchEventsForRange(start, end, callback) {
+        var url = '/calendars/' + calendarID + '/events.json?start=' +
+            encodeURIComponent(formatLocalDate(start)) + '&end=' +
+            encodeURIComponent(formatLocalDate(end));
         fetch(url)
             .then(function(response) {
                 if (!response.ok) throw new Error('Failed to fetch events');
@@ -1482,64 +1719,161 @@
                 if (callback) callback();
             });
     }
-    
+
     // Current view state
+    var canCreate = {{if .CalendarCapabilities.Bind}}true{{else}}false{{end}};
+    var CAL_COLOR = {{toJSON .CalendarColor}};
     var urlParams = new URLSearchParams(window.location.search);
     var eventUid = urlParams.get('event');
     var initialYear = parseInt(urlParams.get('year'), 10);
     var initialMonth = parseInt(urlParams.get('month'), 10);
+    var requestedDate = urlParams.get('date');
     var currentDate = new Date();
-    if (initialYear && initialMonth >= 1 && initialMonth <= 12) {
+    if (requestedDate) {
+        var parsedRequested = new Date(requestedDate + 'T12:00:00');
+        if (!isNaN(parsedRequested.getTime())) currentDate = parsedRequested;
+    } else if (initialYear && initialMonth >= 1 && initialMonth <= 12) {
         currentDate = new Date(initialYear, initialMonth - 1, 1);
     }
     var currentListMonth = new Date(currentDate);
-    var currentView = 'month';
-    
+    var requestedView = urlParams.get('view');
+    var currentView = ['day', 'week', 'month', 'list'].indexOf(requestedView) !== -1 ? requestedView : 'month';
+
+    function currentReturnPath() {
+        var activeDate = currentView === 'list' ? currentListMonth : currentDate;
+        return '/calendars/' + calendarID + '?view=' + encodeURIComponent(currentView) +
+            '&date=' + encodeURIComponent(formatLocalDate(activeDate));
+    }
+    function setReturnTo(target) {
+        ['create-return-to', 'edit-return-to', 'delete-return-to'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.value = target;
+        });
+    }
+    function updateViewURL() {
+        var target = currentReturnPath();
+        window.history.replaceState({}, '', target);
+        setReturnTo(target);
+    }
+    // Exposed so the create/edit modal helpers (defined outside this IIFE) can read the
+    // current view/date when populating their return_to fields.
+    window.calcardReturnPath = currentReturnPath;
+
+    function visibleRange() {
+        if (currentView === 'day') {
+            var dayStart = startOfDay(currentDate);
+            return { start: dayStart, end: addDays(dayStart, 1) };
+        }
+        if (currentView === 'week') {
+            var weekStart = startOfWeek(currentDate);
+            return { start: weekStart, end: addDays(weekStart, 7) };
+        }
+        if (currentView === 'list') {
+            var listStart = new Date(currentListMonth.getFullYear(), currentListMonth.getMonth(), 1);
+            return { start: listStart, end: new Date(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, 1) };
+        }
+        var monthStart = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+        var gridStart = startOfWeek(monthStart);
+        return { start: gridStart, end: addDays(gridStart, 42) };
+    }
+
+    var linkedEventHandled = false;
+    function renderCurrentView() {
+        if (currentView === 'day' || currentView === 'week') {
+            renderTimeGridView();
+        } else if (currentView === 'month') {
+            renderMonthView();
+        } else {
+            renderListView();
+        }
+        if (!linkedEventHandled) {
+            linkedEventHandled = true;
+            openLinkedEvent();
+        }
+    }
+
+    function loadCurrentView() {
+        updateViewURL();
+        var range = visibleRange();
+        fetchEventsForRange(range.start, range.end, renderCurrentView);
+    }
+
+    function setView(view) {
+        if (currentView === 'list' && view !== 'list') {
+            currentDate = new Date(currentListMonth);
+        } else if (view === 'list') {
+            currentListMonth = new Date(currentDate);
+        }
+        currentView = view;
+        document.querySelectorAll('.view-btn').forEach(function(button) {
+            button.classList.toggle('active', button.dataset.view === view);
+        });
+        document.getElementById('time-grid-view').style.display =
+            view === 'day' || view === 'week' ? 'block' : 'none';
+        document.getElementById('month-view').style.display = view === 'month' ? 'block' : 'none';
+        document.getElementById('list-view').style.display = view === 'list' ? 'block' : 'none';
+        loadCurrentView();
+    }
+
     // View toggle
     document.querySelectorAll('.view-btn').forEach(function(btn) {
         btn.addEventListener('click', function() {
-            document.querySelectorAll('.view-btn').forEach(function(b) { b.classList.remove('active'); });
-            this.classList.add('active');
-            currentView = this.dataset.view;
-            
-            document.getElementById('month-view').style.display = currentView === 'month' ? 'block' : 'none';
-            document.getElementById('list-view').style.display = currentView === 'list' ? 'block' : 'none';
-            
-            if (currentView === 'list') {
-                currentListMonth = new Date();
-                fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
-            }
+            setView(this.dataset.view);
         });
     });
-    
+
+    // Clicking outside a highlighted day cell or time slot clears the selection.
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.day-cell')) {
+            clearDayCellSelection();
+        }
+        if (!e.target.closest('.time-day-lane, .all-day-lane')) {
+            clearTimeSlotSelection();
+        }
+    });
+
     // Month navigation
     document.getElementById('prev-month').addEventListener('click', function() {
         currentDate.setMonth(currentDate.getMonth() - 1);
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
     document.getElementById('next-month').addEventListener('click', function() {
         currentDate.setMonth(currentDate.getMonth() + 1);
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
     document.getElementById('today-btn').addEventListener('click', function() {
         currentDate = new Date();
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
-    
+
     // List navigation
     document.getElementById('prev-list-month').addEventListener('click', function() {
         currentListMonth.setMonth(currentListMonth.getMonth() - 1);
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
     });
     document.getElementById('next-list-month').addEventListener('click', function() {
         currentListMonth.setMonth(currentListMonth.getMonth() + 1);
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
     });
     document.getElementById('list-this-month-btn').addEventListener('click', function() {
         currentListMonth = new Date();
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
     });
-    
+
+    // Day/week navigation
+    document.getElementById('prev-time-range').addEventListener('click', function() {
+        currentDate.setDate(currentDate.getDate() - (currentView === 'week' ? 7 : 1));
+        loadCurrentView();
+    });
+    document.getElementById('next-time-range').addEventListener('click', function() {
+        currentDate.setDate(currentDate.getDate() + (currentView === 'week' ? 7 : 1));
+        loadCurrentView();
+    });
+    document.getElementById('time-today-btn').addEventListener('click', function() {
+        currentDate = new Date();
+        loadCurrentView();
+    });
+
     // Event Modal
     var modal = document.getElementById('event-modal');
     document.getElementById('modal-close').addEventListener('click', function() {
@@ -1872,7 +2206,290 @@
     
     // Expanded events for calendar view (includes recurring occurrences)
     var expandedEvents = [];
-    
+
+    var EYE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    var PLUS_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+
+    // Open the existing create-event modal pre-filled for the given span.
+    function openCreateEditor(start, end, allDay) {
+        if (!canCreate) return;
+        showCreateEventModal({ start: start, end: end, allDay: allDay });
+    }
+
+    function clearDayCellSelection() {
+        var selected = document.querySelectorAll('#calendar-grid .day-cell.selected');
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+    }
+
+    function selectDayCell(cell) {
+        clearDayCellSelection();
+        cell.classList.add('selected');
+    }
+
+    // Day/Week time-grid selection. timeSelection describes the highlighted range of
+    // 30-minute slots ({lane, day, startIndex, endIndex}); slotDrag tracks an in-progress
+    // click/drag gesture. A first click (or drag) highlights slots; a second click on the
+    // highlighted range opens the event editor for that span.
+    var timeSelection = null;
+    var slotDrag = null;
+
+    function clearTimeSlotSelection() {
+        timeSelection = null;
+        var selected = document.querySelectorAll(
+            '#time-grid-body .time-slot.selected, #time-grid-all-day .all-day-lane.selected'
+        );
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+    }
+
+    function renderTimeSelection() {
+        var selected = document.querySelectorAll(
+            '#time-grid-body .time-slot.selected, #time-grid-all-day .all-day-lane.selected'
+        );
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+        if (!timeSelection) return;
+        var lo = Math.min(timeSelection.startIndex, timeSelection.endIndex);
+        var hi = Math.max(timeSelection.startIndex, timeSelection.endIndex);
+        var slots = timeSelection.lane.getElementsByClassName('time-slot');
+        for (var j = lo; j <= hi; j++) {
+            if (slots[j]) slots[j].classList.add('selected');
+        }
+    }
+
+    function slotIndexFromPointer(lane, clientY) {
+        var rect = lane.getBoundingClientRect();
+        var idx = Math.floor((clientY - rect.top) / 28);
+        return Math.max(0, Math.min(47, idx));
+    }
+
+    function openTimeSelectionEditor(selection) {
+        var lo = Math.min(selection.startIndex, selection.endIndex);
+        var hi = Math.max(selection.startIndex, selection.endIndex);
+        var start = new Date(selection.day);
+        start.setMinutes(lo * 30);
+        var end = new Date(selection.day);
+        end.setMinutes((hi + 1) * 30);
+        clearTimeSlotSelection();
+        openCreateEditor(start, end, false);
+    }
+
+    function onSlotDragMove(e) {
+        if (!slotDrag) return;
+        var idx = slotIndexFromPointer(slotDrag.lane, e.clientY);
+        if (idx !== slotDrag.anchorIndex) slotDrag.moved = true;
+        timeSelection = {
+            lane: slotDrag.lane,
+            day: slotDrag.day,
+            startIndex: slotDrag.anchorIndex,
+            endIndex: idx
+        };
+        renderTimeSelection();
+    }
+
+    function onSlotDragEnd(e) {
+        document.removeEventListener('mousemove', onSlotDragMove);
+        document.removeEventListener('mouseup', onSlotDragEnd);
+        if (!slotDrag) return;
+        var drag = slotDrag;
+        slotDrag = null;
+        if (drag.moved) {
+            // A drag: keep the highlighted range; a later click confirms it.
+            return;
+        }
+        if (drag.wasSelected && drag.prev) {
+            // Second click on an already-highlighted slot opens the editor for the range.
+            openTimeSelectionEditor(drag.prev);
+            return;
+        }
+        // First click: highlight just this slot.
+        timeSelection = {
+            lane: drag.lane,
+            day: drag.day,
+            startIndex: drag.anchorIndex,
+            endIndex: drag.anchorIndex
+        };
+        renderTimeSelection();
+    }
+
+    function beginSlotDrag(day, lane, index) {
+        var prev = timeSelection;
+        var wasSelected = !!prev && prev.lane === lane &&
+            index >= Math.min(prev.startIndex, prev.endIndex) &&
+            index <= Math.max(prev.startIndex, prev.endIndex);
+        clearDayCellSelection();
+        slotDrag = {
+            day: day,
+            lane: lane,
+            anchorIndex: index,
+            moved: false,
+            wasSelected: wasSelected,
+            prev: prev
+        };
+        document.addEventListener('mousemove', onSlotDragMove);
+        document.addEventListener('mouseup', onSlotDragEnd);
+    }
+
+    function eventIntersectsDay(event, dayStart, dayEnd) {
+        var eventEnd = event.dtend || event.dtstart;
+        return event.dtstart < dayEnd && eventEnd > dayStart;
+    }
+
+    function renderTimeGridView() {
+        var rangeStart = currentView === 'week' ? startOfWeek(currentDate) : startOfDay(currentDate);
+        var dayCount = currentView === 'week' ? 7 : 1;
+        var rangeEnd = addDays(rangeStart, dayCount);
+        var visibleEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        var shell = document.getElementById('time-grid-shell');
+        shell.style.setProperty('--day-count', dayCount);
+
+        if (currentView === 'day') {
+            document.getElementById('time-nav-title').textContent =
+                rangeStart.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+        } else {
+            var lastDay = addDays(rangeEnd, -1);
+            document.getElementById('time-nav-title').textContent =
+                rangeStart.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' – ' +
+                lastDay.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        var header = document.getElementById('time-grid-header');
+        var allDay = document.getElementById('time-grid-all-day');
+        var body = document.getElementById('time-grid-body');
+        header.innerHTML = '<div></div>';
+        allDay.innerHTML = '<div class="time-grid-label">all-day</div>';
+        body.innerHTML = '';
+        // Rebuilding the grid detaches any highlighted slots; drop the stale selection.
+        timeSelection = null;
+        slotDrag = null;
+
+        var gutter = document.createElement('div');
+        gutter.className = 'time-gutter';
+        for (var hour = 0; hour < 24; hour++) {
+            var label = document.createElement('div');
+            label.className = 'time-label';
+            label.style.top = (hour * 56) + 'px';
+            label.textContent = new Date(2026, 0, 1, hour).toLocaleTimeString(undefined, { hour: 'numeric' });
+            gutter.appendChild(label);
+        }
+        body.appendChild(gutter);
+
+        var today = startOfDay(new Date());
+        for (var dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+            var day = addDays(rangeStart, dayIndex);
+            var nextDay = addDays(day, 1);
+            var isToday = day.getTime() === today.getTime();
+
+            var headerCell = document.createElement('div');
+            headerCell.className = 'time-grid-header-cell' + (isToday ? ' today' : '');
+            headerCell.textContent = day.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+            header.appendChild(headerCell);
+
+            var allDayLane = document.createElement('div');
+            allDayLane.className = 'all-day-lane';
+            if (canCreate) {
+                allDayLane.addEventListener('click', (function(selectedDay, laneEl) {
+                    return function() {
+                        var wasSelected = laneEl.classList.contains('selected');
+                        clearDayCellSelection();
+                        clearTimeSlotSelection();
+                        if (wasSelected) {
+                            openCreateEditor(selectedDay, addDays(selectedDay, 1), true);
+                        } else {
+                            laneEl.classList.add('selected');
+                        }
+                    };
+                })(day, allDayLane));
+            }
+            visibleEvents.filter(function(event) {
+                return event.allDay && eventIntersectsDay(event, day, nextDay);
+            }).forEach(function(event) {
+                var eventElement = document.createElement('div');
+                eventElement.className = 'all-day-event';
+                eventElement.style.backgroundColor = CAL_COLOR;
+                eventElement.textContent = event.summary || 'Untitled';
+                eventElement.addEventListener('click', function(clickEvent) {
+                    clickEvent.stopPropagation();
+                    showEventModal(event);
+                });
+                allDayLane.appendChild(eventElement);
+            });
+            allDay.appendChild(allDayLane);
+
+            var lane = document.createElement('div');
+            lane.className = 'time-day-lane' + (isToday ? ' today' : '');
+            for (var slotIndex = 0; slotIndex < 48; slotIndex++) {
+                var slot = document.createElement('div');
+                slot.className = 'time-slot';
+                slot.style.top = (slotIndex * 28) + 'px';
+                if (canCreate) {
+                    slot.addEventListener('mousedown', (function(selectedDay, selectedSlot, laneEl) {
+                        return function(e) {
+                            if (e.button !== 0) return;
+                            e.preventDefault();
+                            beginSlotDrag(selectedDay, laneEl, selectedSlot);
+                        };
+                    })(day, slotIndex, lane));
+                }
+                lane.appendChild(slot);
+            }
+
+            var segments = visibleEvents.filter(function(event) {
+                return !event.allDay && eventIntersectsDay(event, day, nextDay);
+            }).map(function(event) {
+                var segmentStart = event.dtstart < day ? day : event.dtstart;
+                var eventEnd = event.dtend || new Date(event.dtstart.getTime() + 30 * 60000);
+                var segmentEnd = eventEnd > nextDay ? nextDay : eventEnd;
+                return {
+                    event: event,
+                    startMinute: Math.max(0, (segmentStart - day) / 60000),
+                    endMinute: Math.min(1440, (segmentEnd - day) / 60000)
+                };
+            }).sort(function(a, b) {
+                return a.startMinute - b.startMinute || a.endMinute - b.endMinute;
+            });
+
+            var columnEnds = [];
+            segments.forEach(function(segment) {
+                var column = columnEnds.findIndex(function(endMinute) {
+                    return endMinute <= segment.startMinute;
+                });
+                if (column === -1) column = columnEnds.length;
+                columnEnds[column] = segment.endMinute;
+                segment.column = column;
+            });
+            var columnCount = Math.max(1, columnEnds.length);
+
+            segments.forEach(function(segment) {
+                var eventElement = document.createElement('div');
+                eventElement.className = 'timed-event';
+                eventElement.style.backgroundColor = CAL_COLOR;
+                eventElement.style.top = (segment.startMinute / 30 * 28) + 'px';
+                eventElement.style.height = Math.max(20, (segment.endMinute - segment.startMinute) / 30 * 28 - 1) + 'px';
+                eventElement.style.left = 'calc(' + (segment.column * 100 / columnCount) + '% + 2px)';
+                eventElement.style.width = 'calc(' + (100 / columnCount) + '% - 4px)';
+                eventElement.textContent = segment.event.summary || 'Untitled';
+                eventElement.title = segment.event.summary || '';
+                eventElement.addEventListener('click', function(clickEvent) {
+                    clickEvent.stopPropagation();
+                    showEventModal(segment.event);
+                });
+                lane.appendChild(eventElement);
+            });
+            body.appendChild(lane);
+        }
+
+        var scroller = document.getElementById('time-grid-scroll');
+        if (!scroller.dataset.initialized) {
+            scroller.scrollTop = 8 * 56;
+            scroller.dataset.initialized = 'true';
+        }
+    }
+
     function renderMonthView() {
         var year = currentDate.getFullYear();
         var month = currentDate.getMonth();
@@ -1937,10 +2554,49 @@
         cell.className = 'day-cell';
         if (otherMonth) cell.className += ' other-month';
         if (isToday) cell.className += ' today';
-        
-        // Find events for this day from expanded events
+
         var cellDate = new Date(year, month, day);
-        var cellDateStr = cellDate.toDateString();
+        if (canCreate) {
+            cell.style.cursor = 'pointer';
+            cell.addEventListener('click', function(e) {
+                e.stopPropagation();
+                selectDayCell(cell);
+            });
+
+            var actions = document.createElement('div');
+            actions.className = 'day-cell-actions';
+
+            var viewBtn = document.createElement('button');
+            viewBtn.type = 'button';
+            viewBtn.className = 'day-cell-action';
+            viewBtn.title = 'View this day';
+            viewBtn.setAttribute('aria-label', 'View this day');
+            viewBtn.innerHTML = EYE_ICON_SVG;
+            viewBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                clearDayCellSelection();
+                currentDate = new Date(cellDate);
+                setView('day');
+            });
+            actions.appendChild(viewBtn);
+
+            var addBtn = document.createElement('button');
+            addBtn.type = 'button';
+            addBtn.className = 'day-cell-action';
+            addBtn.title = 'Add event';
+            addBtn.setAttribute('aria-label', 'Add event');
+            addBtn.innerHTML = PLUS_ICON_SVG;
+            addBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                clearDayCellSelection();
+                openCreateEditor(cellDate, addDays(cellDate, 1), true);
+            });
+            actions.appendChild(addBtn);
+
+            cell.appendChild(actions);
+        }
+
+        // Find events for this day from expanded events
         var dayEvents = expandedEvents.filter(function(e) {
             var start = new Date(e.dtstart.getFullYear(), e.dtstart.getMonth(), e.dtstart.getDate());
             var end;
@@ -2132,11 +2788,8 @@
         }
     }
 
-    // Initial load - fetch events for current month
-    fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, function() {
-        renderMonthView();
-        openLinkedEvent();
-    });
+    // Initial load - render the requested view (openLinkedEvent runs after the first render).
+    setView(currentView);
     
     // Store current event for editing
     window.currentEditEvent = null;
@@ -2147,8 +2800,35 @@
 })();
 
 // Create Event Modal
-function showCreateEventModal() {
+function showCreateEventModal(prefill) {
     document.getElementById('create-event-modal').classList.add('show');
+
+    var returnToInput = document.getElementById('create-return-to');
+    if (returnToInput && window.calcardReturnPath) {
+        returnToInput.value = window.calcardReturnPath();
+    }
+
+    var startInput = document.getElementById('create-dtstart');
+    var endInput = document.getElementById('create-dtend');
+    if (prefill && prefill.start) {
+        document.getElementById('create-all-day').checked = !!prefill.allDay;
+        if (prefill.allDay) {
+            startInput.type = 'date';
+            endInput.type = 'date';
+            startInput.value = formatDateForInput(prefill.start);
+            // The form uses an inclusive end date; prefill.end is exclusive (day after).
+            var inclusiveEnd = new Date(prefill.end);
+            inclusiveEnd.setDate(inclusiveEnd.getDate() - 1);
+            if (inclusiveEnd < prefill.start) inclusiveEnd = new Date(prefill.start);
+            endInput.value = formatDateForInput(inclusiveEnd);
+        } else {
+            startInput.type = 'datetime-local';
+            endInput.type = 'datetime-local';
+            startInput.value = formatDateTimeForInput(prefill.start);
+            endInput.value = formatDateTimeForInput(prefill.end);
+        }
+    }
+
     document.getElementById('create-summary').focus();
     var tzInput = document.getElementById('create-timezone');
     if (tzInput && !tzInput.value) {
@@ -2176,6 +2856,8 @@ function closeCreateEventModal() {
     document.getElementById('create-attendees').value = '';
     document.getElementById('create-attachments').value = '';
     document.getElementById('create-all-day').checked = false;
+    document.getElementById('create-dtstart').type = 'datetime-local';
+    document.getElementById('create-dtend').type = 'datetime-local';
     setReminderList('create', [], false);
 }
 
@@ -2190,7 +2872,14 @@ function showEditEventModal(event, scope) {
     var calendarId = {{.Calendar.ID}};
     document.getElementById('edit-event-form').action = '/calendars/' + calendarId + '/events/' + encodeURIComponent(event.uid);
     document.getElementById('delete-event-form').action = '/calendars/' + calendarId + '/events/' + encodeURIComponent(event.uid) + '/delete';
-    
+
+    if (window.calcardReturnPath) {
+        var editReturn = document.getElementById('edit-return-to');
+        var deleteReturn = document.getElementById('delete-return-to');
+        if (editReturn) editReturn.value = window.calcardReturnPath();
+        if (deleteReturn) deleteReturn.value = window.calcardReturnPath();
+    }
+
     document.getElementById('edit-summary').value = event.summary || '';
     document.getElementById('edit-location').value = event.location || '';
     document.getElementById('edit-description').value = event.description || '';

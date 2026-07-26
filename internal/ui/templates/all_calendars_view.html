@@ -232,6 +232,45 @@
     .day-number.has-events:hover {
         color: var(--primary);
     }
+    .calendar-grid .day-cell.selected {
+        background: rgba(99, 102, 241, 0.15);
+        box-shadow: inset 0 0 0 2px var(--primary);
+    }
+    .day-cell-actions {
+        display: none;
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        gap: 4px;
+        z-index: 3;
+    }
+    .day-cell.selected .day-cell-actions {
+        display: flex;
+    }
+    .day-cell-action {
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: none;
+        border-radius: 4px;
+        background: var(--primary);
+        color: #fff;
+        cursor: pointer;
+        line-height: 1;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+        transition: background 0.15s;
+    }
+    .day-cell-action:hover {
+        background: var(--primary-dark);
+    }
+    .day-cell-action svg {
+        width: 14px;
+        height: 14px;
+        display: block;
+    }
 
     /* Day Events Modal */
     .day-modal-date {
@@ -455,12 +494,216 @@
         margin-bottom: 0.5rem;
         color: var(--text-secondary);
     }
+
+    .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+    .time-nav {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+    }
+    .time-nav-title {
+        min-width: 260px;
+        text-align: center;
+        font-size: 1.1rem;
+        font-weight: 600;
+    }
+    .time-grid-shell {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
+        border-radius: var(--border-radius-lg);
+        overflow: hidden;
+    }
+    .time-grid-header,
+    .time-grid-all-day,
+    .time-grid-body {
+        display: grid;
+        grid-template-columns: 64px repeat(var(--day-count), minmax(110px, 1fr));
+    }
+    .time-grid-header {
+        background: var(--bg-tertiary);
+        border-bottom: 1px solid var(--border-primary);
+    }
+    .time-grid-header-cell {
+        min-width: 0;
+        padding: 0.55rem 0.25rem;
+        text-align: center;
+        border-left: 1px solid var(--border-primary);
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .time-grid-header-cell.today {
+        color: var(--primary);
+    }
+    .time-grid-all-day {
+        min-height: 42px;
+        border-bottom: 1px solid var(--border-primary);
+    }
+    .time-grid-label {
+        padding: 0.45rem 0.35rem;
+        color: var(--text-secondary);
+        font-size: 0.7rem;
+        text-align: right;
+    }
+    .all-day-lane {
+        position: relative;
+        min-width: 0;
+        padding: 3px;
+        border-left: 1px solid var(--border-primary);
+        cursor: pointer;
+    }
+    .all-day-event {
+        margin-bottom: 2px;
+        padding: 2px 4px;
+        border-radius: 3px;
+        color: #fff;
+        font-size: 0.68rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+    }
+    .time-grid-scroll {
+        max-height: 68vh;
+        overflow: auto;
+    }
+    .time-gutter,
+    .time-day-lane {
+        position: relative;
+        height: 1344px;
+    }
+    .time-gutter {
+        background: var(--bg-secondary);
+    }
+    .time-label {
+        position: absolute;
+        right: 6px;
+        transform: translateY(-50%);
+        color: var(--text-secondary);
+        font-size: 0.65rem;
+    }
+    .time-day-lane {
+        min-width: 0;
+        border-left: 1px solid var(--border-primary);
+        user-select: none;
+        background: repeating-linear-gradient(
+            to bottom,
+            transparent 0,
+            transparent 27px,
+            var(--border-primary) 28px
+        );
+    }
+    .time-day-lane.today {
+        background-color: rgba(59, 130, 246, 0.08);
+    }
+    .time-slot {
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 28px;
+        cursor: pointer;
+    }
+    .time-slot:hover {
+        background: rgba(99, 102, 241, 0.12);
+    }
+    .time-slot.selected {
+        background: rgba(99, 102, 241, 0.2);
+        box-shadow: inset 0 0 0 1px var(--primary);
+    }
+    .all-day-lane.selected {
+        background: rgba(99, 102, 241, 0.18);
+        box-shadow: inset 0 0 0 1px var(--primary);
+    }
+    .timed-event {
+        position: absolute;
+        z-index: 2;
+        min-height: 20px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        color: #fff;
+        font-size: 0.68rem;
+        line-height: 1.2;
+        overflow: hidden;
+        cursor: pointer;
+        box-shadow: var(--shadow-sm);
+    }
+    .modal-content.modal-lg {
+        max-width: 760px;
+        max-height: 90vh;
+        overflow-y: auto;
+    }
+    .editor-section {
+        margin: 1rem 0;
+        padding-top: 1rem;
+        border-top: 1px solid var(--border-primary);
+    }
+    .editor-section summary {
+        cursor: pointer;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+    .editor-section-body {
+        margin-top: 1rem;
+    }
+    .form-row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+    }
+    .form-actions {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.75rem;
+        margin-top: 1.25rem;
+    }
+    .form-actions-right {
+        display: flex;
+        gap: 0.75rem;
+    }
+    .reminder-row {
+        display: flex;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+    .reminder-row input {
+        flex: 1;
+    }
+    @media (max-width: 768px) {
+        .calendar-header {
+            align-items: flex-start;
+        }
+        .header-actions {
+            width: 100%;
+        }
+        .form-row {
+            grid-template-columns: 1fr;
+            gap: 0;
+        }
+        .time-grid-scroll {
+            overflow-x: auto;
+        }
+        #time-grid-view {
+            overflow-x: auto;
+        }
+        .time-grid-shell {
+            min-width: 720px;
+        }
+    }
 </style>
 
 <div class="calendar-header">
     <div>
         <a href="/calendars" class="back-link">&larr; Back to Calendars</a>
         <h1>All Calendars</h1>
+    </div>
+    <div class="header-actions">
+        <button type="button" class="btn btn-primary" id="new-event-btn">+ New Event</button>
     </div>
 </div>
 
@@ -472,8 +715,26 @@
 
     <div class="calendar-main">
         <div class="view-toggle">
+            <button class="view-btn" data-view="day">Day</button>
+            <button class="view-btn" data-view="week">Week</button>
             <button class="view-btn active" data-view="month">Month</button>
             <button class="view-btn" data-view="list">List</button>
+        </div>
+
+        <div id="time-grid-view" style="display:none">
+            <div class="time-nav">
+                <button id="prev-time-range">&larr;</button>
+                <span class="time-nav-title" id="time-nav-title"></span>
+                <button id="next-time-range">&rarr;</button>
+                <button id="time-today-btn" style="margin-left:0.5rem">Today</button>
+            </div>
+            <div class="time-grid-shell" id="time-grid-shell">
+                <div class="time-grid-header" id="time-grid-header"></div>
+                <div class="time-grid-all-day" id="time-grid-all-day"></div>
+                <div class="time-grid-scroll" id="time-grid-scroll">
+                    <div class="time-grid-body" id="time-grid-body"></div>
+                </div>
+            </div>
         </div>
 
         <div id="month-view">
@@ -502,6 +763,215 @@
         </div>
     </div>
 </div>
+
+<div class="modal-overlay" id="event-editor-modal">
+    <div class="modal-content modal-lg">
+        <div class="modal-header">
+            <span class="modal-title" id="event-editor-title">New Event</span>
+            <button class="modal-close" id="event-editor-close">&times;</button>
+        </div>
+        <form id="event-editor-form" method="POST">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="event-editor-method" name="_method" value="PUT" disabled>
+            <input type="hidden" id="event-return-to" name="return_to">
+            <input type="hidden" id="event-recurrence-id" name="recurrence_id">
+            <input type="hidden" id="event-recurrence-all-day" name="recurrence_all_day">
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="event-calendar">Calendar *</label>
+                    <select id="event-calendar" name="destination_calendar_id" required></select>
+                </div>
+                <div class="form-group" id="event-edit-scope-group" style="display:none">
+                    <label for="event-edit-scope">Editing</label>
+                    <select id="event-edit-scope" name="edit_scope">
+                        <option value="series">Entire series</option>
+                        <option value="occurrence">This occurrence</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="event-summary">Title *</label>
+                <input type="text" id="event-summary" name="summary" required>
+            </div>
+            <div class="form-check" style="margin-bottom:1rem">
+                <input type="checkbox" id="event-all-day" name="all_day">
+                <label for="event-all-day" style="display:inline; margin-left:0.35rem">All day event</label>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="event-dtstart">Start *</label>
+                    <input type="datetime-local" id="event-dtstart" name="dtstart" required>
+                </div>
+                <div class="form-group">
+                    <label for="event-dtend">End *</label>
+                    <input type="datetime-local" id="event-dtend" name="dtend" required>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="event-timezone">Time zone</label>
+                <input type="text" id="event-timezone" name="timezone" list="all-calendar-timezones" placeholder="e.g., America/Chicago">
+            </div>
+            <div class="form-group">
+                <label for="event-location">Location</label>
+                <input type="text" id="event-location" name="location">
+            </div>
+            <div class="form-group">
+                <label for="event-description">Description</label>
+                <textarea id="event-description" name="description" rows="3"></textarea>
+            </div>
+
+            <details class="editor-section">
+                <summary>Event details</summary>
+                <div class="editor-section-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="event-status">Status</label>
+                            <select id="event-status" name="status">
+                                <option value="">None</option>
+                                <option value="TENTATIVE">Tentative</option>
+                                <option value="CONFIRMED">Confirmed</option>
+                                <option value="CANCELLED">Cancelled</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="event-visibility">Visibility</label>
+                            <select id="event-visibility" name="class">
+                                <option value="">Default</option>
+                                <option value="PUBLIC">Public</option>
+                                <option value="PRIVATE">Private</option>
+                                <option value="CONFIDENTIAL">Confidential</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="event-availability">Availability</label>
+                        <select id="event-availability" name="transparency">
+                            <option value="">Default</option>
+                            <option value="OPAQUE">Busy</option>
+                            <option value="TRANSPARENT">Free</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="event-url">Link</label>
+                        <input type="url" id="event-url" name="url" placeholder="https://">
+                    </div>
+                    <div class="form-group">
+                        <label for="event-categories">Categories</label>
+                        <input type="text" id="event-categories" name="categories" placeholder="Meeting, Planning">
+                    </div>
+                    <div class="form-group">
+                        <label for="event-organizer">Organizer</label>
+                        <input type="text" id="event-organizer" name="organizer" placeholder="Name <email@example.com>">
+                    </div>
+                    <div class="form-group">
+                        <label for="event-attendees">Attendees</label>
+                        <textarea id="event-attendees" name="attendees" rows="2" placeholder="One per line or comma-separated"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="event-attachments">Attachments</label>
+                        <textarea id="event-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Reminders (minutes before)</label>
+                        <div id="event-reminders"></div>
+                        <button type="button" class="btn btn-secondary btn-sm" id="add-reminder-btn">Add reminder</button>
+                    </div>
+                </div>
+            </details>
+
+            <details class="editor-section" id="event-recurrence-section">
+                <summary>Recurrence</summary>
+                <div class="editor-section-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="event-recurrence">Repeat</label>
+                            <select id="event-recurrence" name="recurrence">
+                                <option value="">Does not repeat</option>
+                                <option value="DAILY">Daily</option>
+                                <option value="WEEKLY">Weekly</option>
+                                <option value="MONTHLY">Monthly</option>
+                                <option value="YEARLY">Yearly</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="event-recurrence-interval">Every</label>
+                            <input type="number" id="event-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Repeat on</label>
+                        <div style="display:flex; flex-wrap:wrap; gap:0.65rem">
+                            <label><input type="checkbox" name="recurrence_byday" value="MO"> Mon</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="TU"> Tue</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="WE"> Wed</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="TH"> Thu</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="FR"> Fri</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="SA"> Sat</label>
+                            <label><input type="checkbox" name="recurrence_byday" value="SU"> Sun</label>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="event-recurrence-monthday">Day of month</label>
+                            <input type="number" id="event-recurrence-monthday" name="recurrence_bymonthday" min="1" max="31">
+                        </div>
+                        <div class="form-group">
+                            <label for="event-recurrence-month">Month</label>
+                            <input type="number" id="event-recurrence-month" name="recurrence_bymonth" min="1" max="12">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="event-recurrence-end">Ends</label>
+                            <select id="event-recurrence-end" name="recurrence_end_type">
+                                <option value="never">Never</option>
+                                <option value="after">After count</option>
+                                <option value="on">On date</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="event-recurrence-count">Occurrences</label>
+                            <input type="number" id="event-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="event-recurrence-until">End date</label>
+                        <input type="date" id="event-recurrence-until" name="recurrence_until">
+                    </div>
+                </div>
+            </details>
+
+            <div class="form-actions">
+                <button type="button" class="btn btn-danger" id="delete-event-btn" style="display:none">Delete</button>
+                <div class="form-actions-right">
+                    <button type="button" class="btn btn-secondary" id="event-editor-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="event-editor-submit">Create Event</button>
+                </div>
+            </div>
+        </form>
+        <form id="delete-event-form" method="POST" style="display:none">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" id="delete-return-to" name="return_to">
+            <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
+            <input type="hidden" id="delete-recurrence-id" name="recurrence_id">
+            <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day">
+            <input type="hidden" id="delete-timezone" name="timezone">
+        </form>
+    </div>
+</div>
+
+<datalist id="all-calendar-timezones">
+    <option value="UTC"></option>
+    <option value="America/New_York"></option>
+    <option value="America/Chicago"></option>
+    <option value="America/Denver"></option>
+    <option value="America/Los_Angeles"></option>
+    <option value="Europe/London"></option>
+    <option value="Europe/Paris"></option>
+    <option value="Asia/Tokyo"></option>
+    <option value="Australia/Sydney"></option>
+</datalist>
 
 <div class="modal-overlay" id="event-modal">
     <div class="modal-content">
@@ -564,11 +1034,7 @@
         } else {
             hiddenCalendars[calendarId] = true;
         }
-        if (currentView === 'month') {
-            renderMonthView();
-        } else {
-            renderListView();
-        }
+        renderCurrentView();
     }
 
     function isEventVisible(event) {
@@ -907,6 +1373,7 @@
                         occurrence.recurrenceIdAllDay = event.allDay;
                     }
                     occurrence.isOccurrence = true;
+                    occurrence.seriesEvent = event;
                     expanded.push(occurrence);
                 }
 
@@ -993,8 +1460,32 @@
         window.baseEvents = baseEvents;
     }
 
-    function fetchEventsForMonth(year, month, callback) {
-        var url = '/calendars/all/events.json?year=' + year + '&month=' + month;
+    function formatLocalDate(date) {
+        return date.getFullYear() + '-' +
+            String(date.getMonth() + 1).padStart(2, '0') + '-' +
+            String(date.getDate()).padStart(2, '0');
+    }
+
+    function startOfDay(date) {
+        return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    }
+
+    function startOfWeek(date) {
+        var result = startOfDay(date);
+        result.setDate(result.getDate() - result.getDay());
+        return result;
+    }
+
+    function addDays(date, count) {
+        var result = new Date(date);
+        result.setDate(result.getDate() + count);
+        return result;
+    }
+
+    function fetchEventsForRange(start, end, callback) {
+        var url = '/calendars/all/events.json?start=' +
+            encodeURIComponent(formatLocalDate(start)) + '&end=' +
+            encodeURIComponent(formatLocalDate(end));
         fetch(url)
             .then(function(response) {
                 if (!response.ok) throw new Error('Failed to fetch events');
@@ -1013,53 +1504,135 @@
             });
     }
 
-    var currentDate = new Date();
-    var currentListMonth = new Date();
-    var currentView = 'month';
+    var urlParams = new URLSearchParams(window.location.search);
+    var requestedDate = urlParams.get('date');
+    var parsedRequestedDate = requestedDate ? new Date(requestedDate + 'T12:00:00') : new Date();
+    var currentDate = isNaN(parsedRequestedDate.getTime()) ? new Date() : parsedRequestedDate;
+    var currentListMonth = new Date(currentDate);
+    var requestedView = urlParams.get('view');
+    var currentView = ['day', 'week', 'month', 'list'].indexOf(requestedView) !== -1 ? requestedView : 'month';
+
+    function currentReturnPath() {
+        var activeDate = currentView === 'list' ? currentListMonth : currentDate;
+        return '/calendars/all?view=' + encodeURIComponent(currentView) +
+            '&date=' + encodeURIComponent(formatLocalDate(activeDate));
+    }
+
+    function updateViewURL() {
+        var target = currentReturnPath();
+        window.history.replaceState({}, '', target);
+        document.getElementById('event-return-to').value = target;
+        document.getElementById('delete-return-to').value = target;
+    }
+
+    function visibleRange() {
+        if (currentView === 'day') {
+            var dayStart = startOfDay(currentDate);
+            return { start: dayStart, end: addDays(dayStart, 1) };
+        }
+        if (currentView === 'week') {
+            var weekStart = startOfWeek(currentDate);
+            return { start: weekStart, end: addDays(weekStart, 7) };
+        }
+        if (currentView === 'list') {
+            var listStart = new Date(currentListMonth.getFullYear(), currentListMonth.getMonth(), 1);
+            return { start: listStart, end: new Date(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, 1) };
+        }
+        var monthStart = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+        var gridStart = startOfWeek(monthStart);
+        return { start: gridStart, end: addDays(gridStart, 42) };
+    }
+
+    function renderCurrentView() {
+        if (currentView === 'day' || currentView === 'week') {
+            renderTimeGridView();
+        } else if (currentView === 'month') {
+            renderMonthView();
+        } else {
+            renderListView();
+        }
+    }
+
+    function loadCurrentView() {
+        updateViewURL();
+        var range = visibleRange();
+        fetchEventsForRange(range.start, range.end, renderCurrentView);
+    }
+
+    function setView(view) {
+        if (currentView === 'list' && view !== 'list') {
+            currentDate = new Date(currentListMonth);
+        } else if (view === 'list') {
+            currentListMonth = new Date(currentDate);
+        }
+        currentView = view;
+        document.querySelectorAll('.view-btn').forEach(function(button) {
+            button.classList.toggle('active', button.dataset.view === view);
+        });
+        document.getElementById('time-grid-view').style.display =
+            view === 'day' || view === 'week' ? 'block' : 'none';
+        document.getElementById('month-view').style.display = view === 'month' ? 'block' : 'none';
+        document.getElementById('list-view').style.display = view === 'list' ? 'block' : 'none';
+        loadCurrentView();
+    }
 
     // View toggle
     document.querySelectorAll('.view-btn').forEach(function(btn) {
         btn.addEventListener('click', function() {
-            document.querySelectorAll('.view-btn').forEach(function(b) { b.classList.remove('active'); });
-            this.classList.add('active');
-            currentView = this.dataset.view;
-
-            document.getElementById('month-view').style.display = currentView === 'month' ? 'block' : 'none';
-            document.getElementById('list-view').style.display = currentView === 'list' ? 'block' : 'none';
-
-            if (currentView === 'list') {
-                currentListMonth = new Date();
-                fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
-            }
+            setView(this.dataset.view);
         });
+    });
+
+    // Clicking anywhere outside a highlighted day cell or time slot clears the selection.
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.day-cell')) {
+            clearDayCellSelection();
+        }
+        if (!e.target.closest('.time-day-lane, .all-day-lane')) {
+            clearTimeSlotSelection();
+        }
     });
 
     // Month navigation
     document.getElementById('prev-month').addEventListener('click', function() {
         currentDate.setMonth(currentDate.getMonth() - 1);
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
     document.getElementById('next-month').addEventListener('click', function() {
         currentDate.setMonth(currentDate.getMonth() + 1);
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
     document.getElementById('today-btn').addEventListener('click', function() {
         currentDate = new Date();
-        fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, renderMonthView);
+        loadCurrentView();
     });
 
     // List navigation
     document.getElementById('prev-list-month').addEventListener('click', function() {
         currentListMonth.setMonth(currentListMonth.getMonth() - 1);
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
     });
     document.getElementById('next-list-month').addEventListener('click', function() {
         currentListMonth.setMonth(currentListMonth.getMonth() + 1);
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
     });
     document.getElementById('list-this-month-btn').addEventListener('click', function() {
         currentListMonth = new Date();
-        fetchEventsForMonth(currentListMonth.getFullYear(), currentListMonth.getMonth() + 1, renderListView);
+        loadCurrentView();
+    });
+
+    // Day/week navigation
+    document.getElementById('prev-time-range').addEventListener('click', function() {
+        currentDate.setDate(currentDate.getDate() - (currentView === 'week' ? 7 : 1));
+        loadCurrentView();
+    });
+    document.getElementById('next-time-range').addEventListener('click', function() {
+        currentDate.setDate(currentDate.getDate() + (currentView === 'week' ? 7 : 1));
+        loadCurrentView();
+    });
+    document.getElementById('time-today-btn').addEventListener('click', function() {
+        currentDate = new Date();
+        loadCurrentView();
     });
 
     // Event Modal
@@ -1078,6 +1651,269 @@
     });
     dayModal.addEventListener('click', function(e) {
         if (e.target === dayModal) dayModal.classList.remove('show');
+    });
+
+    var editorModal = document.getElementById('event-editor-modal');
+    var editorForm = document.getElementById('event-editor-form');
+    var editorCalendar = document.getElementById('event-calendar');
+    var currentEditorEvent = null;
+
+    function formatDateInput(date) {
+        return formatLocalDate(date);
+    }
+
+    function formatDateTimeInput(date) {
+        return formatLocalDate(date) + 'T' +
+            String(date.getHours()).padStart(2, '0') + ':' +
+            String(date.getMinutes()).padStart(2, '0');
+    }
+
+    function formatRecurrenceInput(date, allDay) {
+        if (!date) return '';
+        return allDay ? formatDateInput(date) : formatDateTimeInput(date);
+    }
+
+    function setEditorDateValues(start, end, allDay) {
+        var startInput = document.getElementById('event-dtstart');
+        var endInput = document.getElementById('event-dtend');
+        startInput.type = allDay ? 'date' : 'datetime-local';
+        endInput.type = allDay ? 'date' : 'datetime-local';
+        startInput.value = allDay ? formatDateInput(start) : formatDateTimeInput(start);
+        endInput.value = allDay ? formatDateInput(end) : formatDateTimeInput(end);
+        document.getElementById('event-all-day').checked = allDay;
+    }
+
+    function addReminderRow(value) {
+        var row = document.createElement('div');
+        row.className = 'reminder-row';
+        var input = document.createElement('input');
+        input.type = 'number';
+        input.name = 'reminder_minutes';
+        input.min = '0';
+        input.placeholder = 'Minutes before';
+        input.value = value == null ? '' : value;
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn btn-secondary btn-sm';
+        remove.textContent = 'Remove';
+        remove.addEventListener('click', function() { row.remove(); });
+        row.appendChild(input);
+        row.appendChild(remove);
+        document.getElementById('event-reminders').appendChild(row);
+    }
+
+    function writableCalendars() {
+        return calendarsConfig.filter(function(calendar) { return calendar.canCreate; });
+    }
+
+    function populateEditorCalendars(event) {
+        editorCalendar.innerHTML = '';
+        var choices = writableCalendars();
+        if (event && !choices.some(function(calendar) { return calendar.id === event.calendarId; })) {
+            choices = [calendarsConfig.find(function(calendar) { return calendar.id === event.calendarId; })].concat(choices);
+        }
+        var preferred = event ? event.calendarId : null;
+        if (!event) {
+            var visibleWritable = choices.find(function(calendar) { return !hiddenCalendars[calendar.id]; });
+            preferred = (visibleWritable || choices[0] || {}).id;
+        }
+        choices.filter(Boolean).forEach(function(calendar) {
+            if (event && calendar.id !== event.calendarId && !event.canMove) return;
+            var option = document.createElement('option');
+            option.value = calendar.id;
+            option.textContent = calendar.name;
+            option.selected = calendar.id === preferred;
+            editorCalendar.appendChild(option);
+        });
+        if (!editorCalendar.value && editorCalendar.options.length) {
+            editorCalendar.options[0].selected = true;
+        }
+    }
+
+    function resetEditorFields() {
+        editorForm.reset();
+        document.getElementById('event-reminders').innerHTML = '';
+        document.querySelectorAll('#event-editor-form input[name="recurrence_byday"]').forEach(function(input) {
+            input.checked = false;
+        });
+        document.getElementById('event-recurrence-interval').value = '1';
+        document.getElementById('event-recurrence-end').value = 'never';
+        document.getElementById('event-recurrence-count').value = '10';
+        document.getElementById('event-recurrence-id').value = '';
+        document.getElementById('event-recurrence-all-day').value = '';
+        document.getElementById('event-edit-scope').value = 'series';
+        document.getElementById('event-edit-scope').querySelector('option[value="occurrence"]').disabled = false;
+    }
+
+    function openCreateEditor(start, end, allDay) {
+        var writable = writableCalendars();
+        if (!writable.length) return;
+        currentEditorEvent = null;
+        resetEditorFields();
+        populateEditorCalendars(null);
+        document.getElementById('event-editor-title').textContent = 'New Event';
+        document.getElementById('event-editor-submit').textContent = 'Create Event';
+        document.getElementById('event-editor-method').disabled = true;
+        document.getElementById('event-edit-scope-group').style.display = 'none';
+        document.getElementById('delete-event-btn').style.display = 'none';
+        document.getElementById('event-return-to').value = currentReturnPath();
+        setEditorDateValues(start, end, allDay);
+        editorForm.action = '/calendars/' + encodeURIComponent(editorCalendar.value) + '/events';
+        editorModal.classList.add('show');
+        document.getElementById('event-summary').focus();
+    }
+
+    function rruleForEvent(event) {
+        if (event.rruleParsed) return event.rruleParsed;
+        var parsed = {};
+        (event.rrule || '').split(';').forEach(function(part) {
+            var separator = part.indexOf('=');
+            if (separator !== -1) parsed[part.slice(0, separator)] = part.slice(separator + 1);
+        });
+        return parsed;
+    }
+
+    function openEditEditor(event) {
+        if (!event || !event.canEdit) return;
+        currentEditorEvent = event;
+        resetEditorFields();
+        populateEditorCalendars(event);
+        document.getElementById('event-editor-title').textContent = 'Edit Event';
+        document.getElementById('event-editor-submit').textContent = 'Save Changes';
+        document.getElementById('event-editor-method').disabled = false;
+        document.getElementById('delete-event-btn').style.display = event.canDelete ? 'inline-flex' : 'none';
+        document.getElementById('event-summary').value = event.summary || '';
+        document.getElementById('event-location').value = event.location || '';
+        document.getElementById('event-description').value = event.description || '';
+        document.getElementById('event-timezone').value = event.timezone || '';
+        document.getElementById('event-status').value = event.status || '';
+        document.getElementById('event-visibility').value = event.class || '';
+        document.getElementById('event-availability').value = event.transp || '';
+        document.getElementById('event-url').value = event.url || '';
+        document.getElementById('event-categories').value = (event.categories || []).join(', ');
+        document.getElementById('event-organizer').value = event.organizer || '';
+        document.getElementById('event-attendees').value = (event.attendees || []).join('\n');
+        document.getElementById('event-attachments').value = (event.attachments || []).join('\n');
+        (event.reminders || []).forEach(addReminderRow);
+
+        var eventEnd = event.dtend || new Date(event.dtstart.getTime() + 30 * 60000);
+        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay);
+        var recurrenceID = event.recurrenceId || (event.isOccurrence ? event.dtstart : null);
+        document.getElementById('event-recurrence-id').value =
+            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay);
+        document.getElementById('event-recurrence-all-day').value =
+            event.recurrenceIdAllDay ? 'true' : 'false';
+        document.getElementById('event-edit-scope-group').style.display = event.isOccurrence ? 'block' : 'none';
+        document.getElementById('event-edit-scope').value = event.isOccurrence ? 'occurrence' : 'series';
+
+        var rrule = rruleForEvent(event);
+        document.getElementById('event-recurrence').value = rrule.FREQ || '';
+        document.getElementById('event-recurrence-interval').value = rrule.INTERVAL || '1';
+        document.getElementById('event-recurrence-monthday').value = rrule.BYMONTHDAY || '';
+        document.getElementById('event-recurrence-month').value = rrule.BYMONTH || '';
+        if (rrule.BYDAY) {
+            rrule.BYDAY.split(',').forEach(function(day) {
+                var checkbox = document.querySelector(
+                    '#event-editor-form input[name="recurrence_byday"][value="' + day.slice(-2) + '"]'
+                );
+                if (checkbox) checkbox.checked = true;
+            });
+        }
+        if (rrule.COUNT) {
+            document.getElementById('event-recurrence-end').value = 'after';
+            document.getElementById('event-recurrence-count').value = rrule.COUNT;
+        } else if (rrule.UNTIL) {
+            document.getElementById('event-recurrence-end').value = 'on';
+            document.getElementById('event-recurrence-until').value =
+                rrule.UNTIL.slice(0, 4) + '-' + rrule.UNTIL.slice(4, 6) + '-' + rrule.UNTIL.slice(6, 8);
+        }
+
+        var encodedUID = encodeURIComponent(event.uid);
+        editorForm.action = '/calendars/' + event.calendarId + '/events/' + encodedUID;
+        document.getElementById('delete-event-form').action =
+            '/calendars/' + event.calendarId + '/events/' + encodedUID + '/delete';
+        document.getElementById('event-return-to').value = currentReturnPath();
+        document.getElementById('delete-return-to').value = currentReturnPath();
+        document.getElementById('delete-recurrence-id').value =
+            document.getElementById('event-recurrence-id').value;
+        document.getElementById('delete-recurrence-all-day').value =
+            document.getElementById('event-recurrence-all-day').value;
+        document.getElementById('delete-timezone').value = event.timezone || '';
+
+        modal.classList.remove('show');
+        editorModal.classList.add('show');
+    }
+
+    function closeEventEditor() {
+        editorModal.classList.remove('show');
+        currentEditorEvent = null;
+    }
+
+    document.getElementById('new-event-btn').addEventListener('click', function() {
+        var start = new Date();
+        start.setSeconds(0, 0);
+        start.setMinutes(Math.ceil(start.getMinutes() / 30) * 30);
+        openCreateEditor(start, new Date(start.getTime() + 30 * 60000), false);
+    });
+    document.getElementById('new-event-btn').disabled = writableCalendars().length === 0;
+    document.getElementById('event-editor-close').addEventListener('click', closeEventEditor);
+    document.getElementById('event-editor-cancel').addEventListener('click', closeEventEditor);
+    editorModal.addEventListener('click', function(event) {
+        if (event.target === editorModal) closeEventEditor();
+    });
+    document.getElementById('add-reminder-btn').addEventListener('click', function() {
+        addReminderRow('');
+    });
+    document.getElementById('event-all-day').addEventListener('change', function() {
+        var startInput = document.getElementById('event-dtstart');
+        var endInput = document.getElementById('event-dtend');
+        var wasAllDay = startInput.type === 'date';
+        var start = startInput.value ? new Date(startInput.value + (startInput.type === 'date' ? 'T00:00:00' : '')) : new Date();
+        var end = endInput.value ? new Date(endInput.value + (endInput.type === 'date' ? 'T00:00:00' : '')) : new Date(start.getTime() + 30 * 60000);
+        if (this.checked) {
+            start = startOfDay(start);
+            end = startOfDay(end);
+            if (end <= start) end = addDays(start, 1);
+        } else if (wasAllDay) {
+            end = new Date(start.getTime() + 30 * 60000);
+        }
+        setEditorDateValues(start, end, this.checked);
+    });
+    editorCalendar.addEventListener('change', function() {
+        if (!currentEditorEvent) {
+            editorForm.action = '/calendars/' + encodeURIComponent(this.value) + '/events';
+            return;
+        }
+        var moving = Number(this.value) !== Number(currentEditorEvent.calendarId);
+        if (moving && currentEditorEvent.isOccurrence && currentEditorEvent.seriesEvent) {
+            var destination = this.value;
+            openEditEditor(currentEditorEvent.seriesEvent);
+            editorCalendar.value = destination;
+            document.getElementById('event-edit-scope').value = 'series';
+            document.getElementById('event-edit-scope').querySelector('option[value="occurrence"]').disabled = true;
+            return;
+        }
+        var scope = document.getElementById('event-edit-scope');
+        if (moving) scope.value = 'series';
+        scope.querySelector('option[value="occurrence"]').disabled = moving;
+    });
+    document.getElementById('event-edit-scope').addEventListener('change', function() {
+        if (this.value === 'series' && currentEditorEvent && currentEditorEvent.isOccurrence && currentEditorEvent.seriesEvent) {
+            openEditEditor(currentEditorEvent.seriesEvent);
+        }
+    });
+    editorForm.addEventListener('submit', function() {
+        document.getElementById('event-return-to').value = currentReturnPath();
+        if (!currentEditorEvent) {
+            editorForm.action = '/calendars/' + encodeURIComponent(editorCalendar.value) + '/events';
+        }
+    });
+    document.getElementById('delete-event-btn').addEventListener('click', function() {
+        if (!currentEditorEvent || !currentEditorEvent.canDelete) return;
+        if (!window.confirm('Delete this event?')) return;
+        document.getElementById('delete-edit-scope').value =
+            document.getElementById('event-edit-scope').value;
+        document.getElementById('delete-event-form').submit();
     });
 
     function showDayModal(cellDate, dayEvents) {
@@ -1203,7 +2039,7 @@
             body += '<p><strong>Reminders:</strong> ' + escapeHtml(reminderText) + '</p>';
         }
         if (event.rrule) {
-            body += '<p><strong>Recurrence:</strong> ' + formatRRule(event.rrule) + '</p>';
+            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event.rrule)) + '</p>';
         }
         if (event.htmlDescription) {
             body += '<p><strong>Description:</strong></p><div class="event-html-desc">' + sanitizeHtml(event.htmlDescription) + '</div>';
@@ -1211,7 +2047,22 @@
             body += '<p><strong>Description:</strong></p><p style="white-space:pre-wrap">' + escapeHtml(event.description) + '</p>';
         }
 
-        document.getElementById('modal-body').innerHTML = body;
+        var modalBody = document.getElementById('modal-body');
+        modalBody.innerHTML = body;
+        if (event.canEdit) {
+            var actions = document.createElement('div');
+            actions.className = 'form-actions-right';
+            actions.style.marginTop = '1rem';
+            var editButton = document.createElement('button');
+            editButton.type = 'button';
+            editButton.className = 'btn btn-primary';
+            editButton.textContent = 'Edit Event';
+            editButton.addEventListener('click', function() {
+                openEditEditor(event);
+            });
+            actions.appendChild(editButton);
+            modalBody.appendChild(actions);
+        }
         modal.classList.add('show');
     }
 
@@ -1367,6 +2218,162 @@
 
     var expandedEvents = [];
 
+    function eventIntersectsDay(event, dayStart, dayEnd) {
+        var eventEnd = event.dtend || event.dtstart;
+        return event.dtstart < dayEnd && eventEnd > dayStart;
+    }
+
+    function renderTimeGridView() {
+        var rangeStart = currentView === 'week' ? startOfWeek(currentDate) : startOfDay(currentDate);
+        var dayCount = currentView === 'week' ? 7 : 1;
+        var rangeEnd = addDays(rangeStart, dayCount);
+        var visibleEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd).filter(isEventVisible);
+        var shell = document.getElementById('time-grid-shell');
+        shell.style.setProperty('--day-count', dayCount);
+
+        if (currentView === 'day') {
+            document.getElementById('time-nav-title').textContent =
+                rangeStart.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+        } else {
+            var lastDay = addDays(rangeEnd, -1);
+            document.getElementById('time-nav-title').textContent =
+                rangeStart.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' – ' +
+                lastDay.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        var header = document.getElementById('time-grid-header');
+        var allDay = document.getElementById('time-grid-all-day');
+        var body = document.getElementById('time-grid-body');
+        header.innerHTML = '<div></div>';
+        allDay.innerHTML = '<div class="time-grid-label">all-day</div>';
+        body.innerHTML = '';
+        // Rebuilding the grid detaches any highlighted slots; drop the stale selection.
+        timeSelection = null;
+        slotDrag = null;
+
+        var gutter = document.createElement('div');
+        gutter.className = 'time-gutter';
+        for (var hour = 0; hour < 24; hour++) {
+            var label = document.createElement('div');
+            label.className = 'time-label';
+            label.style.top = (hour * 56) + 'px';
+            label.textContent = new Date(2026, 0, 1, hour).toLocaleTimeString(undefined, { hour: 'numeric' });
+            gutter.appendChild(label);
+        }
+        body.appendChild(gutter);
+
+        var today = startOfDay(new Date());
+        for (var dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+            var day = addDays(rangeStart, dayIndex);
+            var nextDay = addDays(day, 1);
+            var isToday = day.getTime() === today.getTime();
+
+            var headerCell = document.createElement('div');
+            headerCell.className = 'time-grid-header-cell' + (isToday ? ' today' : '');
+            headerCell.textContent = day.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+            header.appendChild(headerCell);
+
+            var allDayLane = document.createElement('div');
+            allDayLane.className = 'all-day-lane';
+            if (writableCalendars().length) {
+                allDayLane.addEventListener('click', (function(selectedDay, laneEl) {
+                    return function() {
+                        var wasSelected = laneEl.classList.contains('selected');
+                        clearDayCellSelection();
+                        clearTimeSlotSelection();
+                        if (wasSelected) {
+                            openCreateEditor(selectedDay, addDays(selectedDay, 1), true);
+                        } else {
+                            laneEl.classList.add('selected');
+                        }
+                    };
+                })(day, allDayLane));
+            }
+            visibleEvents.filter(function(event) {
+                return event.allDay && eventIntersectsDay(event, day, nextDay);
+            }).forEach(function(event) {
+                var eventElement = document.createElement('div');
+                eventElement.className = 'all-day-event';
+                eventElement.style.backgroundColor = event.calendarColor || '#3b82f6';
+                eventElement.textContent = event.summary || 'Untitled';
+                eventElement.addEventListener('click', function(clickEvent) {
+                    clickEvent.stopPropagation();
+                    showEventModal(event);
+                });
+                allDayLane.appendChild(eventElement);
+            });
+            allDay.appendChild(allDayLane);
+
+            var lane = document.createElement('div');
+            lane.className = 'time-day-lane' + (isToday ? ' today' : '');
+            for (var slotIndex = 0; slotIndex < 48; slotIndex++) {
+                var slot = document.createElement('div');
+                slot.className = 'time-slot';
+                slot.style.top = (slotIndex * 28) + 'px';
+                if (writableCalendars().length) {
+                    slot.addEventListener('mousedown', (function(selectedDay, selectedSlot, laneEl) {
+                        return function(e) {
+                            if (e.button !== 0) return;
+                            e.preventDefault();
+                            beginSlotDrag(selectedDay, laneEl, selectedSlot);
+                        };
+                    })(day, slotIndex, lane));
+                }
+                lane.appendChild(slot);
+            }
+
+            var segments = visibleEvents.filter(function(event) {
+                return !event.allDay && eventIntersectsDay(event, day, nextDay);
+            }).map(function(event) {
+                var segmentStart = event.dtstart < day ? day : event.dtstart;
+                var eventEnd = event.dtend || new Date(event.dtstart.getTime() + 30 * 60000);
+                var segmentEnd = eventEnd > nextDay ? nextDay : eventEnd;
+                return {
+                    event: event,
+                    startMinute: Math.max(0, (segmentStart - day) / 60000),
+                    endMinute: Math.min(1440, (segmentEnd - day) / 60000)
+                };
+            }).sort(function(a, b) {
+                return a.startMinute - b.startMinute || a.endMinute - b.endMinute;
+            });
+
+            var columnEnds = [];
+            segments.forEach(function(segment) {
+                var column = columnEnds.findIndex(function(endMinute) {
+                    return endMinute <= segment.startMinute;
+                });
+                if (column === -1) column = columnEnds.length;
+                columnEnds[column] = segment.endMinute;
+                segment.column = column;
+            });
+            var columnCount = Math.max(1, columnEnds.length);
+
+            segments.forEach(function(segment) {
+                var eventElement = document.createElement('div');
+                eventElement.className = 'timed-event';
+                eventElement.style.backgroundColor = segment.event.calendarColor || '#3b82f6';
+                eventElement.style.top = (segment.startMinute / 30 * 28) + 'px';
+                eventElement.style.height = Math.max(20, (segment.endMinute - segment.startMinute) / 30 * 28 - 1) + 'px';
+                eventElement.style.left = 'calc(' + (segment.column * 100 / columnCount) + '% + 2px)';
+                eventElement.style.width = 'calc(' + (100 / columnCount) + '% - 4px)';
+                eventElement.textContent = segment.event.summary || 'Untitled';
+                eventElement.title = segment.event.calendarName || '';
+                eventElement.addEventListener('click', function(clickEvent) {
+                    clickEvent.stopPropagation();
+                    showEventModal(segment.event);
+                });
+                lane.appendChild(eventElement);
+            });
+            body.appendChild(lane);
+        }
+
+        var scroller = document.getElementById('time-grid-scroll');
+        if (!scroller.dataset.initialized) {
+            scroller.scrollTop = 8 * 56;
+            scroller.dataset.initialized = 'true';
+        }
+    }
+
     function renderMonthView() {
         var year = currentDate.getFullYear();
         var month = currentDate.getMonth();
@@ -1422,6 +2429,127 @@
         }
     }
 
+    var EYE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    var PLUS_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+
+    function clearDayCellSelection() {
+        var selected = document.querySelectorAll('#calendar-grid .day-cell.selected');
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+    }
+
+    function selectDayCell(cell) {
+        clearDayCellSelection();
+        cell.classList.add('selected');
+    }
+
+    // Day/Week time-grid selection. timeSelection describes the highlighted range of
+    // 30-minute slots ({lane, day, startIndex, endIndex}); slotDrag tracks an in-progress
+    // click/drag gesture. A first click (or drag) highlights slots; a second click on the
+    // highlighted range opens the event editor for that span.
+    var timeSelection = null;
+    var slotDrag = null;
+
+    function clearTimeSlotSelection() {
+        timeSelection = null;
+        var selected = document.querySelectorAll(
+            '#time-grid-body .time-slot.selected, #time-grid-all-day .all-day-lane.selected'
+        );
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+    }
+
+    function renderTimeSelection() {
+        var selected = document.querySelectorAll(
+            '#time-grid-body .time-slot.selected, #time-grid-all-day .all-day-lane.selected'
+        );
+        for (var i = 0; i < selected.length; i++) {
+            selected[i].classList.remove('selected');
+        }
+        if (!timeSelection) return;
+        var lo = Math.min(timeSelection.startIndex, timeSelection.endIndex);
+        var hi = Math.max(timeSelection.startIndex, timeSelection.endIndex);
+        var slots = timeSelection.lane.getElementsByClassName('time-slot');
+        for (var j = lo; j <= hi; j++) {
+            if (slots[j]) slots[j].classList.add('selected');
+        }
+    }
+
+    function slotIndexFromPointer(lane, clientY) {
+        var rect = lane.getBoundingClientRect();
+        var idx = Math.floor((clientY - rect.top) / 28);
+        return Math.max(0, Math.min(47, idx));
+    }
+
+    function openTimeSelectionEditor(selection) {
+        var lo = Math.min(selection.startIndex, selection.endIndex);
+        var hi = Math.max(selection.startIndex, selection.endIndex);
+        var start = new Date(selection.day);
+        start.setMinutes(lo * 30);
+        var end = new Date(selection.day);
+        end.setMinutes((hi + 1) * 30);
+        clearTimeSlotSelection();
+        openCreateEditor(start, end, false);
+    }
+
+    function onSlotDragMove(e) {
+        if (!slotDrag) return;
+        var idx = slotIndexFromPointer(slotDrag.lane, e.clientY);
+        if (idx !== slotDrag.anchorIndex) slotDrag.moved = true;
+        timeSelection = {
+            lane: slotDrag.lane,
+            day: slotDrag.day,
+            startIndex: slotDrag.anchorIndex,
+            endIndex: idx
+        };
+        renderTimeSelection();
+    }
+
+    function onSlotDragEnd(e) {
+        document.removeEventListener('mousemove', onSlotDragMove);
+        document.removeEventListener('mouseup', onSlotDragEnd);
+        if (!slotDrag) return;
+        var drag = slotDrag;
+        slotDrag = null;
+        if (drag.moved) {
+            // A drag: keep the highlighted range; a later click confirms it.
+            return;
+        }
+        if (drag.wasSelected && drag.prev) {
+            // Second click on an already-highlighted slot opens the editor for the range.
+            openTimeSelectionEditor(drag.prev);
+            return;
+        }
+        // First click: highlight just this slot.
+        timeSelection = {
+            lane: drag.lane,
+            day: drag.day,
+            startIndex: drag.anchorIndex,
+            endIndex: drag.anchorIndex
+        };
+        renderTimeSelection();
+    }
+
+    function beginSlotDrag(day, lane, index) {
+        var prev = timeSelection;
+        var wasSelected = !!prev && prev.lane === lane &&
+            index >= Math.min(prev.startIndex, prev.endIndex) &&
+            index <= Math.max(prev.startIndex, prev.endIndex);
+        clearDayCellSelection();
+        slotDrag = {
+            day: day,
+            lane: lane,
+            anchorIndex: index,
+            moved: false,
+            wasSelected: wasSelected,
+            prev: prev
+        };
+        document.addEventListener('mousemove', onSlotDragMove);
+        document.addEventListener('mouseup', onSlotDragEnd);
+    }
+
     function createDayCell(grid, day, year, month, otherMonth, isToday, visibleEvents) {
         var cell = document.createElement('div');
         cell.className = 'day-cell';
@@ -1429,6 +2557,45 @@
         if (isToday) cell.className += ' today';
 
         var cellDate = new Date(year, month, day);
+        if (writableCalendars().length) {
+            cell.style.cursor = 'pointer';
+            cell.addEventListener('click', function(e) {
+                e.stopPropagation();
+                selectDayCell(cell);
+            });
+
+            var actions = document.createElement('div');
+            actions.className = 'day-cell-actions';
+
+            var viewBtn = document.createElement('button');
+            viewBtn.type = 'button';
+            viewBtn.className = 'day-cell-action';
+            viewBtn.title = 'View this day';
+            viewBtn.setAttribute('aria-label', 'View this day');
+            viewBtn.innerHTML = EYE_ICON_SVG;
+            viewBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                clearDayCellSelection();
+                currentDate = new Date(cellDate);
+                setView('day');
+            });
+            actions.appendChild(viewBtn);
+
+            var addBtn = document.createElement('button');
+            addBtn.type = 'button';
+            addBtn.className = 'day-cell-action';
+            addBtn.title = 'Add event';
+            addBtn.setAttribute('aria-label', 'Add event');
+            addBtn.innerHTML = PLUS_ICON_SVG;
+            addBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                clearDayCellSelection();
+                openCreateEditor(cellDate, addDays(cellDate, 1), true);
+            });
+            actions.appendChild(addBtn);
+
+            cell.appendChild(actions);
+        }
         var dayEvents = visibleEvents.filter(function(e) {
             var start = new Date(e.dtstart.getFullYear(), e.dtstart.getMonth(), e.dtstart.getDate());
             var end;
@@ -1612,9 +2779,7 @@
     }
 
     // Initial load
-    fetchEventsForMonth(currentDate.getFullYear(), currentDate.getMonth() + 1, function() {
-        renderMonthView();
-    });
+    setView(currentView);
 })();
 </script>
 

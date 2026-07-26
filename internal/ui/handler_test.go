@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -197,6 +198,35 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 			t.Fatalf("did not expect import action for read-only access, got %s", body)
 		}
 	})
+}
+
+func TestViewCalendarRendersDayAndWeekViews(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Work"},
+			},
+		},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewCalendar(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewCalendar() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`data-view="day"`, `data-view="week"`, `id="time-grid-view"`, `id="prev-time-range"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected calendar view to contain %q, got %s", want, body)
+		}
+	}
 }
 
 func TestViewAddressBookHandler(t *testing.T) {
@@ -425,6 +455,70 @@ func TestCreateEventHandler(t *testing.T) {
 				t.Errorf("CreateEvent() status = %d, want %d", w.Code, tc.wantStatusCode)
 			}
 		})
+	}
+}
+
+func TestCreateEventReturnsToAllCalendars(t *testing.T) {
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		}},
+		Events: eventRepo,
+	}, nil)
+
+	form := url.Values{
+		"summary":   {"Planning"},
+		"dtstart":   {"2026-07-24T10:00"},
+		"dtend":     {"2026-07-24T10:30"},
+		"return_to": {"/calendars/all?view=week&date=2026-07-24"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.CreateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("CreateEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, "/calendars/all?") ||
+		!strings.Contains(location, "view=week") ||
+		!strings.Contains(location, "date=2026-07-24") ||
+		!strings.Contains(location, "status=event_created") {
+		t.Fatalf("CreateEvent() redirect = %q, want all-calendars state and status", location)
+	}
+}
+
+func TestEventReturnPathRejectsExternalTargets(t *testing.T) {
+	form := url.Values{"return_to": {"https://example.com/calendars/all?view=week"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1" {
+		t.Fatalf("eventReturnPath() = %q, want local calendar fallback", got)
+	}
+}
+
+func TestEventReturnPathPreservesOwnCalendarView(t *testing.T) {
+	form := url.Values{"return_to": {"/calendars/1?view=week&date=2026-07-24"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1?date=2026-07-24&view=week" {
+		t.Fatalf("eventReturnPath() = %q, want own calendar view/date preserved", got)
+	}
+}
+
+func TestEventReturnPathRejectsOtherCalendarTargets(t *testing.T) {
+	form := url.Values{"return_to": {"/calendars/2?view=week&date=2026-07-24"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1" {
+		t.Fatalf("eventReturnPath() = %q, want fallback for a different calendar target", got)
 	}
 }
 
@@ -1473,6 +1567,63 @@ func TestCalendarEventJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 	}
 }
 
+func TestCalendarEventJSONSupportsExplicitDateRange(t *testing.T) {
+	inRange := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:in":  {CalendarID: 1, UID: "in", ResourceName: "in", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &inRange},
+			"1:out": {CalendarID: 1, UID: "out", ResourceName: "out", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &outOfRange},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-03-01&end=2026-04-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"uid":"in"`) {
+		t.Fatalf("expected in-range event in JSON response, got %s", body)
+	}
+	if strings.Contains(body, `"uid":"out"`) {
+		t.Fatalf("expected out-of-range event to be omitted, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONRejectsInvalidDateRange(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-04-01&end=2026-03-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestExportCalendarDownloadsReadableEventsAsICS(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{
@@ -1926,6 +2077,112 @@ func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 	}
 	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
 		t.Fatalf("expected empty JSON array, got %s", body)
+	}
+}
+
+func TestAllCalendarEventsJSONSupportsDateRangeAndCapabilities(t *testing.T) {
+	inRange := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}},
+		}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:included": {
+				CalendarID:   1,
+				UID:          "included",
+				ResourceName: "included",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:included\r\nSUMMARY:Included\r\nDTSTART:20260801T090000Z\r\nDTEND:20260801T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart:      &inRange,
+			},
+			"1:excluded": {
+				CalendarID:   1,
+				UID:          "excluded",
+				ResourceName: "excluded",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:excluded\r\nSUMMARY:Excluded\r\nDTSTART:20260803T090000Z\r\nDTEND:20260803T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart:      &outOfRange,
+			},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-07-27&end=2026-08-03", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload) != 1 || payload[0]["uid"] != "included" {
+		t.Fatalf("GetAllCalendarEventsJSON() payload = %#v, want only included event", payload)
+	}
+	for _, key := range []string{"canEdit", "canDelete", "canMove"} {
+		if value, ok := payload[0][key].(bool); !ok || !value {
+			t.Fatalf("event capability %q = %#v, want true", key, payload[0][key])
+		}
+	}
+}
+
+func TestAllCalendarEventsJSONRejectsInvalidDateRange(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{},
+		Events:    &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-08-01&end=2026-07-31", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestViewAllCalendarsIncludesWritableCalendarMetadata(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Owned"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			{
+				Calendar:           store.Calendar{ID: 2, UserID: 200, Name: "Read only"},
+				Shared:             true,
+				Privileges:         store.CalendarPrivileges{Read: true},
+				PrivilegesResolved: true,
+			},
+		}},
+	}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewAllCalendars(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewAllCalendars() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"canCreate":true`) || !strings.Contains(body, `"canCreate":false`) {
+		t.Fatalf("ViewAllCalendars() missing writable metadata: %s", body)
+	}
+	for _, marker := range []string{
+		`data-view="day"`,
+		`data-view="week"`,
+		`id="time-grid-view"`,
+		`id="event-editor-modal"`,
+		`name="destination_calendar_id"`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("ViewAllCalendars() missing interactive UI marker %q", marker)
+		}
 	}
 }
 
@@ -2427,6 +2684,7 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 type fakeEventRepo struct {
 	events map[string]*store.Event
 	recent []store.Event
+	moves  []string
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -2545,6 +2803,17 @@ func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (
 	return time.Time{}, nil
 }
 func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	key := f.key(fromCalendarID, uid)
+	event := f.events[key]
+	if event == nil {
+		return store.ErrNotFound
+	}
+	delete(f.events, key)
+	copy := *event
+	copy.CalendarID = toCalendarID
+	copy.ResourceName = destResourceName
+	f.events[f.key(toCalendarID, uid)] = &copy
+	f.moves = append(f.moves, fmt.Sprintf("%d:%d:%s", fromCalendarID, toCalendarID, uid))
 	return nil
 }
 func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
@@ -3275,6 +3544,161 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 				t.Error("event summary should be updated")
 			}
 		})
+	}
+}
+
+func TestUpdateEventMovesSeriesToSelectedCalendar(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {
+				CalendarID:   1,
+				UID:          "event-1",
+				ResourceName: "custom-name.ics",
+				RawICAL:      raw,
+				ETag:         "old",
+			},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Source"},
+				2: {ID: 2, UserID: 100, Name: "Destination"},
+			},
+		},
+		Events: eventRepo,
+	}, nil)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"recurrence":              {"WEEKLY"},
+		"recurrence_interval":     {"1"},
+		"recurrence_end_type":     {"never"},
+		"destination_calendar_id": {"2"},
+		"return_to":               {"/calendars/all?view=week&date=2026-07-24"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	rctx := chi.RouteContext(req.Context())
+	rctx.URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UpdateEvent() status = %d, want %d: %s", w.Code, http.StatusFound, w.Body.String())
+	}
+	if eventRepo.events["1:event-1"] != nil {
+		t.Fatalf("source calendar still contains moved event: %#v", eventRepo.events["1:event-1"])
+	}
+	moved := eventRepo.events["2:event-1"]
+	if moved == nil {
+		t.Fatalf("destination calendar missing moved event: %#v", eventRepo.events)
+	}
+	if moved.ResourceName != "custom-name.ics" {
+		t.Fatalf("moved ResourceName = %q, want custom-name.ics", moved.ResourceName)
+	}
+	if !strings.Contains(moved.RawICAL, "SUMMARY:Updated") || !strings.Contains(moved.RawICAL, "RRULE:FREQ=WEEKLY") {
+		t.Fatalf("moved event did not preserve updated recurring series: %s", moved.RawICAL)
+	}
+	location := w.Header().Get("Location")
+	if !strings.Contains(location, "/calendars/all?") || !strings.Contains(location, "status=event_updated") {
+		t.Fatalf("UpdateEvent() redirect = %q, want all-calendars success", location)
+	}
+}
+
+func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+			"1:100": {
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Source"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			"2:100": {
+				Calendar:           store.Calendar{ID: 2, UserID: 200, Name: "Read only"},
+				Shared:             true,
+				Privileges:         store.CalendarPrivileges{Read: true},
+				PrivilegesResolved: true,
+			},
+		}},
+		Events: eventRepo,
+	}, nil)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"destination_calendar_id": {"2"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if eventRepo.events["1:event-1"] == nil || eventRepo.events["2:event-1"] != nil {
+		t.Fatalf("denied move mutated events: %#v", eventRepo.events)
+	}
+}
+
+func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+			"2:event-1": {CalendarID: 2, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Source"},
+			2: {ID: 2, UserID: 100, Name: "Destination"},
+		}},
+		Events: eventRepo,
+	}, nil)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"destination_calendar_id": {"2"},
+		"return_to":               {"/calendars/all?view=month&date=2026-07-24"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	if !strings.Contains(w.Header().Get("Location"), "error=destination+calendar+already+contains+this+event") {
+		t.Fatalf("UpdateEvent() redirect = %q, want destination conflict", w.Header().Get("Location"))
+	}
+	if len(eventRepo.moves) != 0 {
+		t.Fatalf("conflicting move executed: %#v", eventRepo.moves)
 	}
 }
 

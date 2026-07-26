@@ -438,6 +438,17 @@ func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User
 	return store.ErrNotFound
 }
 
+func (h *Handler) hasCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourcePath, privilege string) (bool, error) {
+	err := h.requireCalendarPrivilege(ctx, user, cal, resourcePath, privilege)
+	if err == nil {
+		return true, nil
+	}
+	if err == store.ErrNotFound {
+		return false, nil
+	}
+	return false, err
+}
+
 func (h *Handler) canReadCalendarEvent(ctx context.Context, user *store.User, cal *store.CalendarAccess, event store.Event) (bool, error) {
 	if err := h.requireCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, calendarEventResourceName(event.UID, &event)), "read"); err != nil {
 		if err == store.ErrNotFound {
@@ -550,12 +561,14 @@ func (h *Handler) ViewCalendar(w http.ResponseWriter, r *http.Request) {
 		"Title":                cal.Name + " - Calendar",
 		"User":                 user,
 		"Calendar":             cal,
+		"CalendarColor":        calendarColor(cal.Color, 0),
 		"CalendarCapabilities": calendarCapabilities,
 	})
 	h.render(w, r, "calendar_view.html", data)
 }
 
-// GetCalendarEventsJSON returns events for a specific month in JSON format.
+// GetCalendarEventsJSON returns events for a calendar in JSON format. It accepts either an
+// explicit start/end date range (day/week views) or a year/month pair (month/list views).
 func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -563,13 +576,10 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse month and year from query params
-	year, _ := strconv.Atoi(r.URL.Query().Get("year"))
-	month, _ := strconv.Atoi(r.URL.Query().Get("month"))
-	if year == 0 || month < 1 || month > 12 {
-		now := time.Now()
-		year = now.Year()
-		month = int(now.Month())
+	rangeStart, rangeEndExclusive, err := calendarEventQueryRange(r, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	user, _ := auth.UserFromContext(r.Context())
@@ -595,10 +605,9 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Filter events relevant to the requested month
-	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
-	relevantEvents := filterEventsForMonth(allEvents, monthStart, monthEnd)
+	// Filter events relevant to the requested range (end is inclusive here).
+	rangeEnd := rangeEndExclusive.Add(-time.Nanosecond)
+	relevantEvents := filterEventsForMonth(allEvents, rangeStart, rangeEnd)
 
 	// Build JSON response
 	eventsJSONData := make([]map[string]any, 0, len(relevantEvents))
@@ -636,16 +645,29 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type calendarMeta struct {
-		ID    int64  `json:"id"`
-		Name  string `json:"name"`
-		Color string `json:"color"`
+		ID        int64  `json:"id"`
+		Name      string `json:"name"`
+		Color     string `json:"color"`
+		CanCreate bool   `json:"canCreate"`
 	}
 	var metas []calendarMeta
 	for i, cal := range calendars {
+		canCreate, err := h.hasCalendarPrivilege(
+			r.Context(),
+			user,
+			&cal,
+			calendarACLResourcePath(cal.ID),
+			"bind",
+		)
+		if err != nil {
+			http.Error(w, "failed to evaluate calendar access", http.StatusInternalServerError)
+			return
+		}
 		metas = append(metas, calendarMeta{
-			ID:    cal.ID,
-			Name:  cal.Name,
-			Color: calendarColor(cal.Calendar.Color, i),
+			ID:        cal.ID,
+			Name:      cal.Name,
+			Color:     calendarColor(cal.Calendar.Color, i),
+			CanCreate: canCreate,
 		})
 	}
 
@@ -657,14 +679,48 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 	h.render(w, r, "all_calendars_view.html", data)
 }
 
-// GetAllCalendarEventsJSON returns events across all accessible calendars for a given month.
-func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Request) {
+const maxAllCalendarRangeDays = 62
+
+// calendarEventQueryRange resolves the [start, endExclusive) window an events.json
+// request targets. It accepts an explicit start/end date range (used by the day/week
+// views) and falls back to a whole-month window derived from year/month.
+func calendarEventQueryRange(r *http.Request, now time.Time) (time.Time, time.Time, error) {
+	startValue := strings.TrimSpace(r.URL.Query().Get("start"))
+	endValue := strings.TrimSpace(r.URL.Query().Get("end"))
+	if startValue != "" || endValue != "" {
+		if startValue == "" || endValue == "" {
+			return time.Time{}, time.Time{}, fmt.Errorf("start and end are required")
+		}
+		start, err := time.Parse("2006-01-02", startValue)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid start date")
+		}
+		endExclusive, err := time.Parse("2006-01-02", endValue)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid end date")
+		}
+		if !endExclusive.After(start) || endExclusive.Sub(start) > maxAllCalendarRangeDays*24*time.Hour {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid date range")
+		}
+		return start, endExclusive, nil
+	}
+
 	year, _ := strconv.Atoi(r.URL.Query().Get("year"))
 	month, _ := strconv.Atoi(r.URL.Query().Get("month"))
 	if year == 0 || month < 1 || month > 12 {
-		now := time.Now()
 		year = now.Year()
 		month = int(now.Month())
+	}
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	return start, start.AddDate(0, 1, 0), nil
+}
+
+// GetAllCalendarEventsJSON returns events across all accessible calendars for a date range.
+func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Request) {
+	rangeStart, rangeEndExclusive, err := calendarEventQueryRange(r, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	user, _ := auth.UserFromContext(r.Context())
@@ -674,8 +730,7 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
+	rangeEnd := rangeEndExclusive.Add(-time.Nanosecond)
 
 	var result = make([]map[string]any, 0)
 	for i, cal := range calendars {
@@ -690,11 +745,26 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		}
 
 		color := calendarColor(cal.Calendar.Color, i)
-		for _, ev := range filterEventsForMonth(allEvents, monthStart, monthEnd) {
+		for _, ev := range filterEventsForMonth(allEvents, rangeStart, rangeEnd) {
 			payload := calendarEventJSON(ev)
 			payload["calendarId"] = cal.ID
 			payload["calendarName"] = cal.Name
 			payload["calendarColor"] = color
+
+			resourcePath := calendarEventResourcePath(cal.ID, calendarEventResourceName(ev.UID, &ev))
+			canEdit, capabilityErr := h.hasCalendarPrivilege(r.Context(), user, &cal, resourcePath, "write-content")
+			if capabilityErr != nil {
+				http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+				return
+			}
+			canUnbind, capabilityErr := h.hasCalendarPrivilege(r.Context(), user, &cal, resourcePath, "unbind")
+			if capabilityErr != nil {
+				http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+				return
+			}
+			payload["canEdit"] = canEdit
+			payload["canDelete"] = canUnbind
+			payload["canMove"] = canEdit && canUnbind
 			result = append(result, payload)
 		}
 	}
@@ -943,6 +1013,54 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func eventReturnPath(r *http.Request, calendarID int64) string {
+	fallback := fmt.Sprintf("/calendars/%d", calendarID)
+	raw := strings.TrimSpace(r.FormValue("return_to"))
+	if raw == "" {
+		return fallback
+	}
+	target, err := url.Parse(raw)
+	if err != nil || target.IsAbs() || target.Host != "" {
+		return fallback
+	}
+	// Only the aggregated view or this calendar's own page may be returned to, and only
+	// their view/date state is preserved.
+	if target.Path != "/calendars/all" && target.Path != fallback {
+		return fallback
+	}
+
+	query := url.Values{}
+	switch target.Query().Get("view") {
+	case "day", "week", "month", "list":
+		query.Set("view", target.Query().Get("view"))
+	}
+	if date := target.Query().Get("date"); date != "" {
+		if _, err := time.Parse("2006-01-02", date); err == nil {
+			query.Set("date", date)
+		}
+	}
+	if encoded := query.Encode(); encoded != "" {
+		return target.Path + "?" + encoded
+	}
+	return target.Path
+}
+
+func (h *Handler) redirectToEventPage(w http.ResponseWriter, r *http.Request, calendarID int64, params map[string]string) {
+	target, err := url.Parse(eventReturnPath(r, calendarID))
+	if err != nil {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), params)
+		return
+	}
+	query := target.Query()
+	for key, value := range params {
+		if value != "" {
+			query.Set(key, value)
+		}
+	}
+	target.RawQuery = query.Encode()
+	http.Redirect(w, r, target.String(), http.StatusFound)
+}
+
 // CreateEvent creates a new event in a calendar.
 func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -969,14 +1087,14 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	summary := strings.TrimSpace(r.FormValue("summary"))
 	if summary == "" {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "summary is required"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "summary is required"})
 		return
 	}
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
 	if dtstart == "" || dtend == "" {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "start and end are required"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "start and end are required"})
 		return
 	}
 
@@ -984,7 +1102,7 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Validate date format and range
 	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -1010,11 +1128,11 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		RawICAL:      ical,
 		ETag:         etag,
 	}); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to create event"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to create event"})
 		return
 	}
 
-	h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "event_created"})
+	h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_created"})
 }
 
 // UpdateEvent updates an existing event.
@@ -1069,16 +1187,72 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	destinationCalendarID := calendarID
+	if rawDestinationID := strings.TrimSpace(r.FormValue("destination_calendar_id")); rawDestinationID != "" {
+		destinationCalendarID, err = strconv.ParseInt(rawDestinationID, 10, 64)
+		if err != nil || destinationCalendarID <= 0 {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid destination calendar"})
+			return
+		}
+	}
+	movingCalendar := destinationCalendarID != calendarID
+	if movingCalendar && editScope == "occurrence" {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "move the recurring series before editing one occurrence"})
+		return
+	}
+
+	resourceName := uid
+	if existing.ResourceName != "" {
+		resourceName = existing.ResourceName
+	}
+	if movingCalendar {
+		sourcePath := calendarEventResourcePath(calendarID, resourceName)
+		if err := h.requireCalendarPrivilege(r.Context(), user, cal, sourcePath, "unbind"); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		destinationCalendar, err := h.store.Calendars.GetAccessible(r.Context(), destinationCalendarID, user.ID)
+		if err != nil {
+			http.Error(w, "failed to load destination calendar", http.StatusInternalServerError)
+			return
+		}
+		if destinationCalendar == nil {
+			http.Error(w, "destination calendar not found", http.StatusNotFound)
+			return
+		}
+		destinationPath := calendarEventResourcePath(destinationCalendarID, resourceName)
+		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, destinationPath, "bind"); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		existingByUID, err := h.store.Events.GetByUID(r.Context(), destinationCalendarID, uid)
+		if err != nil {
+			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
+			return
+		}
+		existingByName, err := h.store.Events.GetByResourceName(r.Context(), destinationCalendarID, resourceName)
+		if err != nil {
+			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
+			return
+		}
+		if existingByUID != nil || existingByName != nil {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar already contains this event"})
+			return
+		}
+	}
+
 	summary := strings.TrimSpace(r.FormValue("summary"))
 	if summary == "" {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "summary is required"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "summary is required"})
 		return
 	}
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
 	if dtstart == "" || dtend == "" {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "start and end are required"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "start and end are required"})
 		return
 	}
 
@@ -1086,7 +1260,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Validate date format and range
 	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": err.Error()})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -1138,22 +1312,30 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	etag := utils.GenerateETag(ical)
 
-	resourceName := uid
-	if existing.ResourceName != "" {
-		resourceName = existing.ResourceName
-	}
-	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-		CalendarID:   calendarID,
+	updatedEvent := store.Event{
+		CalendarID:   destinationCalendarID,
 		UID:          uid,
 		ResourceName: resourceName,
 		RawICAL:      ical,
 		ETag:         etag,
-	}); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to update event"})
+	}
+	if movingCalendar {
+		fromPath := calendarEventResourcePath(calendarID, resourceName)
+		toPath := calendarEventResourcePath(destinationCalendarID, resourceName)
+		err = h.store.UpdateAndMoveEventAndState(r.Context(), calendarID, updatedEvent, fromPath, toPath)
+	} else {
+		_, err = h.store.Events.Upsert(r.Context(), updatedEvent)
+	}
+	if err != nil {
+		message := "failed to update event"
+		if err == store.ErrConflict {
+			message = "destination calendar already contains this event"
+		}
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": message})
 		return
 	}
 
-	h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "event_updated"})
+	h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_updated"})
 }
 
 // DeleteEvent removes an event from a calendar.
@@ -1208,12 +1390,12 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		timezone := strings.TrimSpace(r.FormValue("timezone"))
 		exdateLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "EXDATE", timezone)
 		if err != nil || exdateLine == "" {
-			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "invalid recurrence id"})
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
 			return
 		}
 		targetValueParts := strings.SplitN(exdateLine, ":", 2)
 		if len(targetValueParts) != 2 {
-			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "invalid recurrence id"})
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
 			return
 		}
 		targetValue := targetValueParts[1]
@@ -1240,10 +1422,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			// No master to update; fall back to deleting the whole event.
 			resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
 			if err := h.store.DeleteEventAndState(r.Context(), calendarID, uid, resourcePath); err != nil {
-				h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete event"})
+				h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
 				return
 			}
-			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "event_deleted"})
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
 			return
 		}
 
@@ -1259,10 +1441,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			RawICAL:      updatedICAL,
 			ETag:         utils.GenerateETag(updatedICAL),
 		}); err != nil {
-			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete occurrence"})
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete occurrence"})
 			return
 		}
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "occurrence_deleted"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "occurrence_deleted"})
 	} else {
 		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
 		if err != nil {
@@ -1279,10 +1461,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
 		if err := h.store.DeleteEventAndState(r.Context(), calendarID, uid, resourcePath); err != nil {
-			h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "failed to delete event"})
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
 			return
 		}
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"status": "event_deleted"})
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
 	}
 }
 

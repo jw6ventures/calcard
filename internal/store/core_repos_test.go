@@ -1727,6 +1727,115 @@ func TestStoreMoveEventAndStateRollsBackWhenStateRebindFails(t *testing.T) {
 	}
 }
 
+func TestStoreUpdateAndMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	start := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	end := start.Add(30 * time.Minute)
+	summary := "Updated"
+	event := Event{
+		CalendarID:   3,
+		UID:          "event",
+		ResourceName: "custom.ics",
+		RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		ETag:         "new-etag",
+		WriteMetadata: &EventWriteMetadata{
+			Summary: &summary,
+			DTStart: &start,
+			DTEnd:   &end,
+		},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET
+calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
+summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
+all_day=$10, recurrence_start=$11, recurrence_until=$12, last_modified=NOW()
+WHERE calendar_id=$13 AND uid=$14`)).
+		WithArgs(int64(3), "custom.ics", event.RawICAL, "new-etag", &summary, nil, nil, &start, &end, false, nil, nil, int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(2), "event", "custom.ics").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	for _, paths := range [][2]string{
+		{"/dav/calendars/2/custom.ics", "/dav/calendars/3/custom.ics"},
+		{"/dav/calendars/2/custom", "/dav/calendars/3/custom"},
+	} {
+		expectDAVStateMove(mock, paths[0], paths[1])
+	}
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("event", int64(3), "custom.ics").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = st.UpdateAndMoveEventAndState(
+		context.Background(),
+		2,
+		event,
+		"/dav/calendars/2/custom.ics",
+		"/dav/calendars/3/custom.ics",
+	)
+	if err != nil {
+		t.Fatalf("UpdateAndMoveEventAndState() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreUpdateAndMoveEventAndStateRollsBackOnDAVStateFailure(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	event := Event{
+		CalendarID:    3,
+		UID:           "event",
+		ResourceName:  "event",
+		RawICAL:       "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		ETag:          "new-etag",
+		WriteMetadata: &EventWriteMetadata{},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE events SET`).
+		WithArgs(int64(3), "event", event.RawICAL, "new-etag", nil, nil, nil, nil, nil, false, nil, nil, int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO deleted_resources`).
+		WithArgs(int64(2), "event", "event").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE calendars SET ctag`).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM acl_entries`).WithArgs("/dav/calendars/3/event").WillReturnError(errors.New("state failure"))
+	mock.ExpectRollback()
+
+	err = st.UpdateAndMoveEventAndState(
+		context.Background(),
+		2,
+		event,
+		"/dav/calendars/2/event",
+		"/dav/calendars/3/event",
+	)
+	if err == nil {
+		t.Fatal("UpdateAndMoveEventAndState() error = nil, want rollback error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

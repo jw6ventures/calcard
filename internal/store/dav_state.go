@@ -201,6 +201,106 @@ func (s *Store) MoveEventAndState(ctx context.Context, fromCalendarID, toCalenda
 	return tx.Commit()
 }
 
+// UpdateAndMoveEventAndState updates an event while moving it to another
+// calendar, keeping the event row and DAV resource state in one transaction.
+func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID int64, event Event, fromStatePath, toStatePath string) error {
+	if s == nil || s.Events == nil {
+		return ErrNotFound
+	}
+	if event.CalendarID == fromCalendarID {
+		_, err := s.Events.Upsert(ctx, event)
+		return err
+	}
+	if event.ResourceName == "" {
+		event.ResourceName = event.UID
+	}
+
+	var metadata EventWriteMetadata
+	if event.WriteMetadata != nil {
+		metadata = *event.WriteMetadata
+	} else {
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(event.RawICAL)
+		metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(event.RawICAL)
+	}
+
+	if s.pool == nil {
+		sourceEvent := event
+		sourceEvent.CalendarID = fromCalendarID
+		if _, err := s.Events.Upsert(ctx, sourceEvent); err != nil {
+			return err
+		}
+		return s.MoveEventAndState(
+			ctx,
+			fromCalendarID,
+			event.CalendarID,
+			event.UID,
+			event.ResourceName,
+			fromStatePath,
+			toStatePath,
+			"",
+		)
+	}
+
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	const updateQuery = `UPDATE events SET
+calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
+summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
+all_day=$10, recurrence_start=$11, recurrence_until=$12, last_modified=NOW()
+WHERE calendar_id=$13 AND uid=$14`
+	result, err := tx.ExecContext(
+		ctx,
+		updateQuery,
+		event.CalendarID,
+		event.ResourceName,
+		event.RawICAL,
+		event.ETag,
+		metadata.Summary,
+		metadata.Description,
+		metadata.Location,
+		metadata.DTStart,
+		metadata.DTEnd,
+		metadata.AllDay,
+		metadata.RecurrenceStart,
+		metadata.RecurrenceUntil,
+		fromCalendarID,
+		event.UID,
+	)
+	if err != nil {
+		if isEventIdentityConflict(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+
+	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
+	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromCalendarID, event.UID, event.ResourceName); err != nil {
+		return err
+	}
+	const incrementSourceCTagQuery = `UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
+	if _, err := tx.ExecContext(ctx, incrementSourceCTagQuery, fromCalendarID); err != nil {
+		return err
+	}
+	if err := moveDAVStateTx(ctx, tx, fromStatePath, toStatePath); err != nil {
+		return err
+	}
+	if err := clearDestinationTombstonesTx(ctx, tx, "event", event.CalendarID, event.ResourceName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // MoveContactAndState is the contact counterpart of MoveEventAndState.
 func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string) error {
 	if s == nil || s.Contacts == nil {

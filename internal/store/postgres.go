@@ -1012,6 +1012,15 @@ func isEventResourceNameConflict(err error) bool {
 	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "events_calendar_resource_name_unique"
 }
 
+func isEventIdentityConflict(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) || pqErr.Code != "23505" {
+		return false
+	}
+	return pqErr.Constraint == "events_calendar_resource_name_unique" ||
+		pqErr.Constraint == "events_calendar_id_uid_key"
+}
+
 func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]AddressBook, error) {
 	const q = `SELECT id, user_id, name, description, ctag, created_at, updated_at FROM address_books WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "address_books.list_by_user")()
