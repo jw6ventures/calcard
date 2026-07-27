@@ -35,17 +35,17 @@ func (p *PropfindProperties) Href() string {
 }
 
 func (p *PropfindProperties) DisplayName() string {
-	if p == nil || p.prop == nil {
+	if p == nil || p.prop == nil || p.prop.DisplayName == nil {
 		return ""
 	}
-	return p.prop.DisplayName
+	return *p.prop.DisplayName
 }
 
 func (p *PropfindProperties) SetDisplayName(name string) {
 	if p == nil || p.prop == nil {
 		return
 	}
-	p.prop.DisplayName = name
+	p.prop.DisplayName = stringPtr(name)
 }
 
 func (p *PropfindProperties) SetGetContentType(contentType string) {

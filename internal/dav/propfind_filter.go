@@ -36,20 +36,29 @@ type propfindPropertySpec struct {
 	// ok lists the kinds that define the property; every other kind answers
 	// 404 per RFC 4918 §9.1.
 	ok propfindResourceKind
-	// present, when set, gates ok kinds: a requested property whose value is
-	// absent from the source moves to the 404 propstat (e.g. calendar-color).
-	present   func(src *prop) bool
-	copyValue func(dst, src *prop, q *propfindPropQuery)
+	// present, when set, gates ok kinds: a requested property that is absent
+	// from the source moves to the 404 propstat. Presence is an explicit
+	// property of the source, independent of the property's value.
+	present func(src *prop) bool
+	// emptyValue, when set, reports that a present property carries an empty
+	// value. Such a property is rendered as an empty element in the 200
+	// propstat (RFC 4918 §9.1) rather than copied through copyValue, so the
+	// three states — absent, present-empty, present-nonempty — are decided
+	// explicitly and never by Go's zero values or xml omitempty.
+	emptyValue func(src *prop) bool
+	copyValue  func(dst, src *prop, q *propfindPropQuery)
 }
 
 func davName(local string) xml.Name { return xml.Name{Local: local} }
 
 var propfindPropertyTable = []propfindPropertySpec{
 	{
-		emptyName: davName("d:displayname"),
-		requested: func(q *propfindPropQuery) bool { return q.DisplayName != nil },
-		ok:        kindCollections,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.DisplayName = src.DisplayName },
+		emptyName:  davName("d:displayname"),
+		requested:  func(q *propfindPropQuery) bool { return q.DisplayName != nil },
+		ok:         kindCollections,
+		present:    func(src *prop) bool { return src.DisplayName != nil },
+		emptyValue: func(src *prop) bool { return src.DisplayName != nil && *src.DisplayName == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.DisplayName = src.DisplayName },
 	},
 	{
 		// RFC 4918 §15.9: resourcetype is defined on every resource; object
@@ -91,29 +100,36 @@ var propfindPropertyTable = []propfindPropertySpec{
 		},
 	},
 	{
-		emptyName: davName("cal:calendar-description"),
-		requested: func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
-		ok:        kindCalendarCollection,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
+		emptyName:  davName("cal:calendar-description"),
+		requested:  func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
+		ok:         kindCalendarCollection,
+		present:    func(src *prop) bool { return src.CalendarDescription != nil },
+		emptyValue: func(src *prop) bool { return src.CalendarDescription != nil && *src.CalendarDescription == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
 	},
 	{
-		emptyName: davName("cal:calendar-timezone"),
-		requested: func(q *propfindPropQuery) bool { return q.CalendarTimezone != nil },
-		ok:        kindCalendarCollection,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarTimezone = src.CalendarTimezone },
+		emptyName:  davName("cal:calendar-timezone"),
+		requested:  func(q *propfindPropQuery) bool { return q.CalendarTimezone != nil },
+		ok:         kindCalendarCollection,
+		present:    func(src *prop) bool { return src.CalendarTimezone != nil },
+		emptyValue: func(src *prop) bool { return src.CalendarTimezone != nil && *src.CalendarTimezone == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarTimezone = src.CalendarTimezone },
 	},
 	{
-		emptyName: davName("ical:calendar-color"),
-		requested: func(q *propfindPropQuery) bool { return q.CalendarColor != nil },
-		ok:        kindCalendarCollection,
-		present:   func(src *prop) bool { return src.CalendarColor != nil },
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarColor = src.CalendarColor },
+		emptyName:  davName("ical:calendar-color"),
+		requested:  func(q *propfindPropQuery) bool { return q.CalendarColor != nil },
+		ok:         kindCalendarCollection,
+		present:    func(src *prop) bool { return src.CalendarColor != nil },
+		emptyValue: func(src *prop) bool { return src.CalendarColor != nil && *src.CalendarColor == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarColor = src.CalendarColor },
 	},
 	{
-		emptyName: davName("card:addressbook-description"),
-		requested: func(q *propfindPropQuery) bool { return q.AddressBookDesc != nil },
-		ok:        kindAddressBookCollection,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.AddressBookDesc = src.AddressBookDesc },
+		emptyName:  davName("card:addressbook-description"),
+		requested:  func(q *propfindPropQuery) bool { return q.AddressBookDesc != nil },
+		ok:         kindAddressBookCollection,
+		present:    func(src *prop) bool { return src.AddressBookDesc != nil },
+		emptyValue: func(src *prop) bool { return src.AddressBookDesc != nil && *src.AddressBookDesc == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.AddressBookDesc = src.AddressBookDesc },
 	},
 	{
 		emptyName: davName("card:supported-address-data"),
@@ -248,9 +264,19 @@ var propfindPropertyTable = []propfindPropertySpec{
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarServerReadOnly = src.CalendarServerReadOnly },
 	},
 	{
+		// Presence follows the same explicit contract as the other properties:
+		// a nil source is absent (404); a non-nil set is present, rendered as a
+		// present-empty element when it has zero privilege children (privilege*
+		// content model) or as its value otherwise. Producers of applicable
+		// resources (see currentUserPrivilegeSetForPath) must supply a non-nil
+		// set so the property is never wrongly reported absent.
 		emptyName: davName("d:current-user-privilege-set"),
 		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrivilegeSet != nil },
 		ok:        kindGenericCollection | kindPrincipal | kindCalendarCollection,
+		present:   func(src *prop) bool { return src.CurrentUserPrivilegeSet != nil },
+		emptyValue: func(src *prop) bool {
+			return src.CurrentUserPrivilegeSet != nil && len(src.CurrentUserPrivilegeSet.Privileges) == 0
+		},
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
 			dst.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
 		},
@@ -333,12 +359,20 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 			continue
 		}
 		dataSuppressed := req.suppressData && (spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data")
-		if !dataSuppressed && spec.ok&kind != 0 && (spec.present == nil || spec.present(&src)) {
-			spec.copyValue(&okProp, &src, req.Prop)
-			okSet = true
-		} else {
+		if dataSuppressed || spec.ok&kind == 0 || (spec.present != nil && !spec.present(&src)) {
+			// Absent: the resource kind does not define the property, or the
+			// source carries no value for it.
 			notFoundNames = append(notFoundNames, spec.emptyName)
+			continue
 		}
+		okSet = true
+		if spec.emptyValue != nil && spec.emptyValue(&src) {
+			// Present-empty: render an explicit empty element in the 200
+			// propstat instead of copying a value that omitempty would drop.
+			okProp.setCustomXMLProperty(XMLProperty{Name: spec.emptyName})
+			continue
+		}
+		spec.copyValue(&okProp, &src, req.Prop)
 	}
 	for _, name := range req.Prop.CustomXML {
 		if name.Local == "" {

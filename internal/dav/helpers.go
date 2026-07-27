@@ -28,8 +28,10 @@ func calendarCollectionResponse(href, name string, description, timezone, color 
 	if ctag != "" {
 		p.CTag = ctag
 	}
-	if description != nil && *description != "" {
-		p.CalendarDescription = *description
+	// A non-nil description is present even when empty; nil means absent. The
+	// filter renders present-empty as an empty element and absent as a 404.
+	if description != nil {
+		p.CalendarDescription = description
 	}
 	if color != nil && *color != "" {
 		p.CalendarColor = color
@@ -66,8 +68,8 @@ func calendarCollectionResponseWithPrivileges(href, name string, description, ti
 	if ctag != "" {
 		p.CTag = ctag
 	}
-	if description != nil && *description != "" {
-		p.CalendarDescription = *description
+	if description != nil {
+		p.CalendarDescription = description
 	}
 	if color != nil && *color != "" {
 		p.CalendarColor = color
@@ -103,8 +105,8 @@ func addressBookCollectionResponse(href, name string, description *string, princ
 	if ctag != "" {
 		p.CTag = ctag
 	}
-	if description != nil && *description != "" {
-		p.AddressBookDesc = *description
+	if description != nil {
+		p.AddressBookDesc = description
 	}
 	p.SupportedAddressData = supportedAddressDataProp()
 	p.AddressBookMaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
@@ -113,21 +115,24 @@ func addressBookCollectionResponse(href, name string, description *string, princ
 }
 
 func statusOKProp(name string, rtype resourceType) propstat {
-	return propstat{
-		Prop: prop{
-			DisplayName:  name,
-			ResourceType: &rtype,
-		},
-		Status: httpStatusOK,
+	p := prop{ResourceType: &rtype}
+	// A plain name string carries no explicit presence bit, so an empty name
+	// is treated as absent (nil), not present-empty. Callers that need an
+	// explicit present-empty displayname use SetDisplayName.
+	if name != "" {
+		p.DisplayName = stringPtr(name)
 	}
+	return propstat{Prop: p, Status: httpStatusOK}
 }
 
 func statusOKPropWithExtras(name string, rtype resourceType, principalHref string, includeCalendarHome, includeAddressHome bool) propstat {
 	p := prop{
-		DisplayName:             name,
 		ResourceType:            &rtype,
 		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
+	}
+	if name != "" {
+		p.DisplayName = stringPtr(name)
 	}
 	if includeCalendarHome {
 		p.CalendarHomeSet = &hrefListProp{Href: []string{"/dav/calendars/"}}

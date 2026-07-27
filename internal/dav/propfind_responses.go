@@ -509,9 +509,20 @@ func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User
 	return []response{principalResponse(principalHref, user)}, nil
 }
 
+// principalDisplayName returns a guaranteed non-empty display name for a
+// principal. RFC 3744 §4 requires DAV:displayname on a principal to be a
+// non-empty human-readable name, so fall back to the principal identifier when
+// the user has neither a full name nor a login email.
+func principalDisplayName(user *store.User) string {
+	if name := strings.TrimSpace(user.DisplayName()); name != "" {
+		return name
+	}
+	return fmt.Sprintf("Principal %d", user.ID)
+}
+
 func principalResponse(href string, user *store.User) response {
 	p := prop{
-		DisplayName:             user.DisplayName(),
+		DisplayName:             stringPtr(principalDisplayName(user)),
 		ResourceType:            &resourceType{Principal: &struct{}{}},
 		PrincipalURL:            &expandableHrefProp{Href: href},
 		CurrentUserPrincipal:    &expandableHrefProp{Href: href},
@@ -525,7 +536,7 @@ func principalResponse(href string, user *store.User) response {
 
 func rootCollectionResponse(href string, principalHref string) response {
 	p := prop{
-		DisplayName:             "CalCard DAV",
+		DisplayName:             stringPtr("CalCard DAV"),
 		ResourceType:            &resourceType{Collection: &struct{}{}},
 		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},

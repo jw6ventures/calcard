@@ -86,16 +86,21 @@ func wirePropertyName(name xml.Name) xml.Name {
 }
 
 type prop struct {
-	DisplayName                   string                         `xml:"d:displayname,omitempty"`
+	// DisplayName, CalendarDescription, and AddressBookDesc are pointers so the
+	// property filter can distinguish three states explicitly (RFC 4918 §9.1):
+	// nil = absent (404), a pointer to "" = present-empty (200 empty element),
+	// and a pointer to a non-empty value = present (200). Presence must not be
+	// inferred from a Go zero value.
+	DisplayName                   *string                        `xml:"d:displayname,omitempty"`
 	ResourceType                  *resourceType                  `xml:"d:resourcetype,omitempty"`
 	GetETag                       string                         `xml:"d:getetag,omitempty"`
 	GetContentType                string                         `xml:"d:getcontenttype,omitempty"`
 	CalendarData                  cdataString                    `xml:"cal:calendar-data,omitempty"`
 	AddressData                   cdataString                    `xml:"card:address-data,omitempty"`
-	CalendarDescription           string                         `xml:"cal:calendar-description,omitempty"`
+	CalendarDescription           *string                        `xml:"cal:calendar-description,omitempty"`
 	CalendarTimezone              *string                        `xml:"cal:calendar-timezone,omitempty"`
 	CalendarColor                 *string                        `xml:"ical:calendar-color,omitempty"`
-	AddressBookDesc               string                         `xml:"card:addressbook-description,omitempty"`
+	AddressBookDesc               *string                        `xml:"card:addressbook-description,omitempty"`
 	SupportedAddressData          *supportedAddressData          `xml:"card:supported-address-data,omitempty"`
 	AddressBookMaxResourceSize    string                         `xml:"card:max-resource-size,omitempty"`
 	SupportedCollationSet         *supportedCollationSet         `xml:"card:supported-collation-set,omitempty"`

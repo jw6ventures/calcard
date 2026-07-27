@@ -226,7 +226,7 @@ func TestFilterAddressObjectPropfindResponseBranches(t *testing.T) {
 func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 	resp := response{Href: "/dav/principals/1/", Propstat: []propstat{{
 		Prop: prop{
-			DisplayName:             "User One",
+			DisplayName:             stringPtr("User One"),
 			ResourceType:            &resourceType{Principal: &struct{}{}},
 			CurrentUserPrincipal:    &expandableHrefProp{Href: "/dav/principals/1/"},
 			CurrentUserPrincipalURL: &hrefProp{Href: "/dav/principals/1/"},
@@ -275,9 +275,9 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *testing.T) {
 	resp := response{Href: "/dav/addressbooks/5/", Propstat: []propstat{{
 		Prop: prop{
-			DisplayName:                "Contacts",
+			DisplayName:                stringPtr("Contacts"),
 			ResourceType:               &resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}},
-			AddressBookDesc:            "Shared contacts",
+			AddressBookDesc:            stringPtr("Shared contacts"),
 			SupportedAddressData:       supportedAddressDataProp(),
 			AddressBookMaxResourceSize: "1024",
 			SupportedCollationSet:      supportedCollationSetProp(),
@@ -319,9 +319,9 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testing.T) {
 	resp := response{Href: "/dav/calendars/1/", Propstat: []propstat{{
 		Prop: prop{
-			DisplayName:             "Calendar",
+			DisplayName:             stringPtr("Calendar"),
 			ResourceType:            &resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
-			CalendarDescription:     "Primary calendar",
+			CalendarDescription:     stringPtr("Primary calendar"),
 			CalendarTimezone:        stringPtr("BEGIN:VTIMEZONE\r\nEND:VTIMEZONE\r\n"),
 			SyncToken:               "sync-token",
 			CTag:                    "9",

@@ -248,7 +248,9 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 			}
 		}
 		if segment == "" {
-			return nil
+			// The calendar home collection (/dav/calendars/) is a generic
+			// collection the property applies to: present-empty, not a 404.
+			return &currentUserPrivilegeSet{}
 		}
 
 		calendarID, ok, err := h.resolveCalendarID(ctx, user, segment)
@@ -272,14 +274,18 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 				privileges = append(privileges, privilegeElementForName(name))
 			}
 		}
-		if len(privileges) == 0 {
-			return nil
-		}
+		// The property applies to this resource, so it is present even when the
+		// user holds no privileges. RFC 3744 defines the content model as
+		// privilege*, so zero privileges is a present-empty 200, not a 404.
 		return &currentUserPrivilegeSet{Privileges: privileges}
 	}
 
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		return nil
+		// Neither a calendar nor an address-book path: this is a principal or a
+		// generic collection, both of which the property applies to. We do not
+		// compute per-privilege grants for them, so report a present-empty set
+		// (privilege* content model) rather than nil, which would be a 404.
+		return &currentUserPrivilegeSet{}
 	}
 
 	segment := singleCollectionSegment(cleanPath, "/dav/addressbooks/")
@@ -289,7 +295,9 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		}
 	}
 	if segment == "" {
-		return nil
+		// The address-book home collection (/dav/addressbooks/) is a generic
+		// collection the property applies to: present-empty, not a 404.
+		return &currentUserPrivilegeSet{}
 	}
 
 	bookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
@@ -311,9 +319,8 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
-	if len(privileges) == 0 {
-		return nil
-	}
+	// Present even with zero privileges (privilege* content model): return a
+	// present-empty set rather than a property-level 404.
 	return &currentUserPrivilegeSet{Privileges: privileges}
 }
 

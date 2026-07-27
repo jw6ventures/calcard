@@ -635,7 +635,7 @@ func stripAddressBookAllprop(responses []response) {
 			if prop.ResourceType == nil || prop.ResourceType.AddressBook == nil {
 				continue
 			}
-			prop.AddressBookDesc = ""
+			prop.AddressBookDesc = nil
 			prop.SupportedAddressData = nil
 			prop.AddressBookMaxResourceSize = ""
 			prop.SupportedCollationSet = nil
