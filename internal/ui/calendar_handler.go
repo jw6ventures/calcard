@@ -390,6 +390,62 @@ func shareEditorFromACLEntries(entries []store.ACLEntry) bool {
 	return false
 }
 
+// calendarApplicablePrincipalHrefs returns the principal hrefs whose ACL entries
+// apply to user when deciding calendar access. It is the single source of truth
+// shared by the per-request ACL prefetch sweep and the in-memory privilege
+// evaluator, so the two can never diverge.
+func calendarApplicablePrincipalHrefs(user *store.User) []string {
+	return []string{"DAV:all", "DAV:authenticated", calendarSharePrincipalHref(user.ID)}
+}
+
+// decideCalendarPrivilege evaluates whether user holds privilege on the resource
+// at resourcePath within cal using the ordered-candidate ACL rule: the resource
+// path (and its extension alternate) are consulted before the collection path,
+// the first candidate carrying an applicable deny denies, and the first carrying
+// an applicable grant allows. Entries for each candidate are obtained through
+// lookup, letting callers back the decision with per-candidate repository reads
+// or a prefetched in-memory map. The caller owns the no-ACL-store fallback; this
+// function assumes an ACL source is present.
+func decideCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resourcePath, privilege string, lookup func(candidate string) ([]store.ACLEntry, error)) (bool, error) {
+	if cal == nil || user == nil {
+		return false, nil
+	}
+	if cal.UserID == user.ID {
+		return true, nil
+	}
+
+	applicablePrincipals := make(map[string]struct{}, 3)
+	for _, principal := range calendarApplicablePrincipalHrefs(user) {
+		applicablePrincipals[principal] = struct{}{}
+	}
+
+	candidates := calendarACLLookupPaths(resourcePath)
+	candidates = append(candidates, calendarACLResourcePath(cal.ID))
+	for _, candidate := range candidates {
+		entries, err := lookup(candidate)
+		if err != nil {
+			return false, err
+		}
+		hasGrant := false
+		for _, entry := range entries {
+			if _, ok := applicablePrincipals[entry.PrincipalHref]; !ok {
+				continue
+			}
+			if !calendarACLPrivilegeMatches(entry.Privilege, privilege) {
+				continue
+			}
+			if !entry.IsGrant {
+				return false, nil
+			}
+			hasGrant = true
+		}
+		if hasGrant {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourcePath, privilege string) error {
 	if cal == nil || user == nil {
 		return store.ErrNotFound
@@ -404,37 +460,15 @@ func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User
 		return store.ErrNotFound
 	}
 
-	applicablePrincipals := map[string]struct{}{
-		"DAV:all":                           {},
-		"DAV:authenticated":                 {},
-		calendarSharePrincipalHref(user.ID): {},
+	allowed, err := decideCalendarPrivilege(user, cal, resourcePath, privilege, func(candidate string) ([]store.ACLEntry, error) {
+		return h.store.ACLEntries.ListByResource(ctx, candidate)
+	})
+	if err != nil {
+		return err
 	}
-	candidates := calendarACLLookupPaths(resourcePath)
-	candidates = append(candidates, calendarACLResourcePath(cal.ID))
-	for _, candidate := range candidates {
-		entries, err := h.store.ACLEntries.ListByResource(ctx, candidate)
-		if err != nil {
-			return err
-		}
-
-		hasGrant := false
-		for _, entry := range entries {
-			if _, ok := applicablePrincipals[entry.PrincipalHref]; !ok {
-				continue
-			}
-			if !calendarACLPrivilegeMatches(entry.Privilege, privilege) {
-				continue
-			}
-			if !entry.IsGrant {
-				return store.ErrNotFound
-			}
-			hasGrant = true
-		}
-		if hasGrant {
-			return nil
-		}
+	if allowed {
+		return nil
 	}
-
 	return store.ErrNotFound
 }
 
@@ -459,18 +493,92 @@ func (h *Handler) canReadCalendarEvent(ctx context.Context, user *store.User, ca
 	return true, nil
 }
 
-func (h *Handler) filterReadableCalendarEvents(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event) ([]store.Event, error) {
+// prefetchCalendarACLEntries loads, in one scoped query, the ACL entries that
+// apply to user and target the given events' resource candidate paths or the
+// calendar's collection path, keyed by exact resource path. The query is bounded
+// to exactly the paths the decider will consult, so it does not scan or transfer
+// unrelated server-wide ACL state. This mirrors the DAV batching in
+// internal/dav/calendar_access.go (prefetchCalendarACLEntries / prefetchACLEntries).
+func (h *Handler) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
+	collectionPath := calendarACLResourcePath(calendarID)
+	relevantPaths := make([]string, 0, 1+2*len(events))
+	seen := make(map[string]struct{}, 1+2*len(events))
+	addPath := func(candidate string) {
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		relevantPaths = append(relevantPaths, candidate)
+	}
+	addPath(collectionPath)
+	for _, event := range events {
+		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(event.UID, &event))
+		for _, candidate := range calendarACLLookupPaths(resourcePath) {
+			addPath(candidate)
+		}
+	}
+
+	entries, err := h.store.ACLEntries.ListByResourcesAndPrincipals(ctx, relevantPaths, calendarApplicablePrincipalHrefs(user))
+	if err != nil {
+		return nil, err
+	}
+	entriesByPath := make(map[string][]store.ACLEntry, len(relevantPaths))
+	for _, entry := range entries {
+		entriesByPath[entry.ResourcePath] = append(entriesByPath[entry.ResourcePath], entry)
+	}
+	return entriesByPath, nil
+}
+
+// calendarPrivilegeDecider prefetches the ACL state for events once (for a shared
+// calendar backed by an ACL store) and returns a closure that decides any
+// privilege for those events' resources without further repository calls. Its
+// branch structure mirrors requireCalendarPrivilege exactly: owners are always
+// allowed, the effective-privilege fallback applies only when no ACL store is
+// configured, and otherwise decisions come from the prefetched entries.
+func (h *Handler) calendarPrivilegeDecider(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event) (func(resourcePath, privilege string) bool, error) {
+	if cal == nil || user == nil {
+		return func(string, string) bool { return false }, nil
+	}
+	if cal.UserID == user.ID {
+		return func(string, string) bool { return true }, nil
+	}
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		privileges := cal.EffectivePrivileges()
+		return func(_, privilege string) bool { return privileges.Allows(privilege) }, nil
+	}
+
+	entriesByPath, err := h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
+	if err != nil {
+		return nil, err
+	}
+	lookup := func(candidate string) ([]store.ACLEntry, error) {
+		return entriesByPath[candidate], nil
+	}
+	return func(resourcePath, privilege string) bool {
+		allowed, _ := decideCalendarPrivilege(user, cal, resourcePath, privilege, lookup)
+		return allowed
+	}, nil
+}
+
+// filterReadableCalendarEventsWith keeps only the events readable under decide,
+// a privilege closure the caller has already built once for cal.
+func filterReadableCalendarEventsWith(decide func(resourcePath, privilege string) bool, cal *store.CalendarAccess, events []store.Event) []store.Event {
 	visible := make([]store.Event, 0, len(events))
 	for _, event := range events {
-		allowed, err := h.canReadCalendarEvent(ctx, user, cal, event)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
+		resourcePath := calendarEventResourcePath(cal.ID, calendarEventResourceName(event.UID, &event))
+		if decide(resourcePath, "read") {
 			visible = append(visible, event)
 		}
 	}
-	return visible, nil
+	return visible
+}
+
+func (h *Handler) filterReadableCalendarEvents(ctx context.Context, user *store.User, cal *store.CalendarAccess, events []store.Event) ([]store.Event, error) {
+	decide, err := h.calendarPrivilegeDecider(ctx, user, cal, events)
+	if err != nil {
+		return nil, err
+	}
+	return filterReadableCalendarEventsWith(decide, cal, events), nil
 }
 
 func (h *Handler) calendarShareViews(ctx context.Context, calendarID int64, userMap map[int64]store.User) ([]calendarShareView, error) {
@@ -738,30 +846,37 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		if err != nil {
 			continue
 		}
-		allEvents, err = h.filterReadableCalendarEvents(r.Context(), user, &cal, allEvents)
+
+		// Restrict to the requested window before any ACL work so large
+		// calendars only pay to resolve access for events that can appear in
+		// the response, not their entire history.
+		windowed := filterEventsForMonth(allEvents, rangeStart, rangeEnd)
+		if len(windowed) == 0 {
+			continue
+		}
+
+		// One scoped ACL prefetch per calendar then resolves read,
+		// write-content, and unbind for every windowed event in memory.
+		decide, err := h.calendarPrivilegeDecider(r.Context(), user, &cal, windowed)
 		if err != nil {
 			http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
 			return
 		}
 
 		color := calendarColor(cal.Calendar.Color, i)
-		for _, ev := range filterEventsForMonth(allEvents, rangeStart, rangeEnd) {
+		for _, ev := range windowed {
+			resourcePath := calendarEventResourcePath(cal.ID, calendarEventResourceName(ev.UID, &ev))
+			if !decide(resourcePath, "read") {
+				continue
+			}
+
 			payload := calendarEventJSON(ev)
 			payload["calendarId"] = cal.ID
 			payload["calendarName"] = cal.Name
 			payload["calendarColor"] = color
 
-			resourcePath := calendarEventResourcePath(cal.ID, calendarEventResourceName(ev.UID, &ev))
-			canEdit, capabilityErr := h.hasCalendarPrivilege(r.Context(), user, &cal, resourcePath, "write-content")
-			if capabilityErr != nil {
-				http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
-				return
-			}
-			canUnbind, capabilityErr := h.hasCalendarPrivilege(r.Context(), user, &cal, resourcePath, "unbind")
-			if capabilityErr != nil {
-				http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
-				return
-			}
+			canEdit := decide(resourcePath, "write-content")
+			canUnbind := decide(resourcePath, "unbind")
 			payload["canEdit"] = canEdit
 			payload["canDelete"] = canUnbind
 			payload["canMove"] = canEdit && canUnbind

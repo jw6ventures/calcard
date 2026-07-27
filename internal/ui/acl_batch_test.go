@@ -11,6 +11,8 @@ func (f *fakeACLRepo) ListByResources(_ context.Context, paths []string) ([]stor
 }
 
 func (f *fakeACLRepo) ListByResourcesAndPrincipals(_ context.Context, paths, principals []string) ([]store.ACLEntry, error) {
+	f.listByResourcesAndPrincipalsCalls++
+	f.batchedResourcePaths = append(f.batchedResourcePaths, paths...)
 	return uiTestBatchEntries(f.entries, paths, principals), nil
 }
 

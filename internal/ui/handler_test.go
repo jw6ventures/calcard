@@ -2144,6 +2144,280 @@ func TestAllCalendarEventsJSONRejectsInvalidDateRange(t *testing.T) {
 	}
 }
 
+// runAllCalendarEventsForCount drives GetAllCalendarEventsJSON against a single
+// shared calendar populated with eventCount in-window events and returns the fake
+// ACL repository (for call-count inspection) and the number of events in the
+// response body.
+func runAllCalendarEventsForCount(t *testing.T, eventCount int) (*fakeACLRepo, int) {
+	t.Helper()
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	events := make(map[string]*store.Event, eventCount)
+	for i := 0; i < eventCount; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return aclRepo, len(payload)
+}
+
+func TestAllCalendarEventsJSONBatchesSharedCalendarACLLookups(t *testing.T) {
+	small, retSmall := runAllCalendarEventsForCount(t, 10)
+	large, retLarge := runAllCalendarEventsForCount(t, 100)
+
+	for _, tc := range []struct {
+		name string
+		repo *fakeACLRepo
+	}{{"small", small}, {"large", large}} {
+		if tc.repo.listByResourceCalls != 0 {
+			t.Errorf("%s: expected no per-candidate ListByResource calls, got %d", tc.name, tc.repo.listByResourceCalls)
+		}
+		if tc.repo.listByPrincipalCalls != 0 {
+			t.Errorf("%s: expected no whole-principal ListByPrincipal sweeps, got %d", tc.name, tc.repo.listByPrincipalCalls)
+		}
+	}
+	if small.listByResourcesAndPrincipalsCalls != large.listByResourcesAndPrincipalsCalls {
+		t.Fatalf("scoped ACL batch calls scaled with event count: small=%d large=%d",
+			small.listByResourcesAndPrincipalsCalls, large.listByResourcesAndPrincipalsCalls)
+	}
+	if small.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch per shared calendar, got %d", small.listByResourcesAndPrincipalsCalls)
+	}
+	if retSmall != 10 || retLarge != 100 {
+		t.Fatalf("returned events small=%d large=%d, want 10 and 100", retSmall, retLarge)
+	}
+}
+
+func TestAllCalendarEventsJSONOwnedCalendarSkipsACLLookups(t *testing.T) {
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	events := make(map[string]*store.Event, 20)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	aclRepo := &fakeACLRepo{}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Owned"}},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 || aclRepo.listByResourcesAndPrincipalsCalls != 0 {
+		t.Fatalf("owned calendar made ACL repository calls: resource=%d principal=%d batched=%d",
+			aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls, aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+}
+
+func TestAllCalendarEventsJSONWindowFilteringKeepsACLCallsConstant(t *testing.T) {
+	inRange := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC)
+	events := map[string]*store.Event{}
+	for i := 0; i < 30; i++ {
+		when := inRange
+		if i%2 == 0 {
+			when = outOfRange
+		}
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &when,
+		}
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload) != 15 {
+		t.Fatalf("returned %d events, want 15 in-window events", len(payload))
+	}
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 {
+		t.Fatalf("expected no unscoped ACL reads, got resource=%d principal=%d", aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls)
+	}
+	if aclRepo.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch, got %d", aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+
+	// The ACL prefetch must be scoped to the requested window: out-of-window
+	// events must not contribute resource paths to the batch query.
+	prefetched := make(map[string]bool, len(aclRepo.batchedResourcePaths))
+	for _, path := range aclRepo.batchedResourcePaths {
+		prefetched[path] = true
+	}
+	for i := 0; i < 30; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		path := "/dav/calendars/1/" + name
+		if i%2 == 0 { // out-of-window events
+			if prefetched[path] {
+				t.Errorf("out-of-window event %q was included in the ACL prefetch", name)
+			}
+		} else if !prefetched[path] {
+			t.Errorf("in-window event %q was missing from the ACL prefetch", name)
+		}
+	}
+}
+
+func TestAllCalendarEventsJSONPerResourceCapabilities(t *testing.T) {
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	mkEvent := func(uid, resourceName string) *store.Event {
+		return &store.Event{
+			CalendarID:   1,
+			UID:          uid,
+			ResourceName: resourceName,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	events := map[string]*store.Event{
+		"1:full":        mkEvent("full", "full"),
+		"1:read-denied": mkEvent("read-denied", "read-denied"),
+		"1:edit-denied": mkEvent("edit-denied", "edit-denied"),
+		"1:del-denied":  mkEvent("del-denied", "del-denied"),
+		"1:both-denied": mkEvent("both-denied", "both-denied"),
+		"1:meeting":     mkEvent("meeting", "meeting.ics"),
+	}
+	const principal = "/dav/principals/100/"
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		// The collection grants read and write, so an event is editable and
+		// deletable unless a resource-level deny overrides that grant. This is
+		// what makes the deny assertions below meaningful: a regression that
+		// ignored resource denies would fall back to these grants and pass a
+		// missing-grant test, but not this one.
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/1/read-denied", PrincipalHref: principal, IsGrant: false, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1/edit-denied", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/1/del-denied", PrincipalHref: principal, IsGrant: false, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/1/both-denied", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/1/both-denied", PrincipalHref: principal, IsGrant: false, Privilege: "unbind"},
+		// Deny addressed to the extension-alternate path of "meeting.ics".
+		{ResourcePath: "/dav/calendars/1/meeting", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	byUID := make(map[string]map[string]any, len(payload))
+	for _, item := range payload {
+		uid, _ := item["uid"].(string)
+		byUID[uid] = item
+	}
+
+	if _, ok := byUID["read-denied"]; ok {
+		t.Fatalf("resource-level read deny did not hide event: %#v", byUID["read-denied"])
+	}
+
+	want := map[string]struct{ canEdit, canDelete, canMove bool }{
+		"full":        {true, true, true},   // collection write grant
+		"edit-denied": {false, true, false}, // explicit write-content deny over collection write
+		"del-denied":  {true, false, false}, // explicit unbind deny over collection write
+		"both-denied": {false, false, false},
+		"meeting":     {false, true, false}, // write-content deny on the .ics alternate path
+	}
+	for uid, expected := range want {
+		item, ok := byUID[uid]
+		if !ok {
+			t.Fatalf("event %q missing from response", uid)
+		}
+		if got := item["canEdit"].(bool); got != expected.canEdit {
+			t.Errorf("event %q canEdit = %v, want %v", uid, got, expected.canEdit)
+		}
+		if got := item["canDelete"].(bool); got != expected.canDelete {
+			t.Errorf("event %q canDelete = %v, want %v", uid, got, expected.canDelete)
+		}
+		if got := item["canMove"].(bool); got != expected.canMove {
+			t.Errorf("event %q canMove = %v, want %v", uid, got, expected.canMove)
+		}
+	}
+
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 {
+		t.Fatalf("expected no unscoped ACL reads, got resource=%d principal=%d", aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls)
+	}
+	if aclRepo.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch, got %d", aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+}
+
 func TestViewAllCalendarsIncludesWritableCalendarMetadata(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
@@ -3071,6 +3345,10 @@ func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64)
 type fakeACLRepo struct {
 	entries                                   []store.ACLEntry
 	deletePrincipalEntriesByResourcePrefixErr error
+	listByResourceCalls                       int
+	listByPrincipalCalls                      int
+	listByResourcesAndPrincipalsCalls         int
+	batchedResourcePaths                      []string
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
@@ -3086,6 +3364,7 @@ func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries [
 }
 
 func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	f.listByResourceCalls++
 	var result []store.ACLEntry
 	for _, entry := range f.entries {
 		if entry.ResourcePath != resourcePath {
@@ -3097,6 +3376,7 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 }
 
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
+	f.listByPrincipalCalls++
 	var result []store.ACLEntry
 	for _, entry := range f.entries {
 		if entry.PrincipalHref != principalHref {
