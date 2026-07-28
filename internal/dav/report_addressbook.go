@@ -190,13 +190,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	var responses []response
 	for _, href := range hrefs {
 		cleanHref := resolveDAVHref(cleanPath, href)
-		responseHref := cleanHref
-		if responseHref == "" {
-			responseHref = strings.TrimSpace(href)
-		}
-		if responseHref == "" {
-			responseHref = cleanPath
-		}
+		responseHref := multiGetFallbackHref(href, cleanHref, cleanPath)
 		if cleanHref == "" {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue

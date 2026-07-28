@@ -23,6 +23,124 @@ func calQueryWithTimeRange(start, end string) *calFilter {
 	}
 }
 
+func calQueryWithPropFilter(pf propFilter) *calFilter {
+	return &calFilter{
+		CompFilter: compFilter{
+			Name: "VCALENDAR",
+			CompFilter: []compFilter{
+				{
+					Name:       "VEVENT",
+					PropFilter: []propFilter{pf},
+				},
+			},
+		},
+	}
+}
+
+// RFC 4791 §9.7.2 matches a prop-filter against the property name only. A
+// substring search for "NAME:" misses parameterized lines and lets a prefixed
+// extension property satisfy the wrong filter.
+func TestPropFilterMatchesExactPropertyName(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		propFilter propFilter
+		want       bool
+	}{
+		{
+			name:       "parameterized property matches",
+			body:       "DTSTART;TZID=America/New_York:20240601T090000\r\n",
+			propFilter: propFilter{Name: "DTSTART"},
+			want:       true,
+		},
+		{
+			name:       "plain property matches",
+			body:       "SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       true,
+		},
+		{
+			name:       "prefixed extension property does not match",
+			body:       "X-SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       false,
+		},
+		{
+			name:       "suffixed extension property does not match",
+			body:       "SUMMARY-ALT:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       false,
+		},
+		{
+			name:       "filter name is case-insensitive",
+			body:       "SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "summary"},
+			want:       true,
+		},
+		{
+			name:       "property name is case-insensitive",
+			body:       "summary:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       true,
+		},
+		{
+			name:       "folded property name matches once unfolded",
+			body:       "X-CALCARD-LONG-PROPERTY-NAM\r\n E:value\r\n",
+			propFilter: propFilter{Name: "X-CALCARD-LONG-PROPERTY-NAME"},
+			want:       true,
+		},
+		{
+			name:       "property-looking text inside a folded value does not match",
+			body:       "DESCRIPTION:agenda\r\n SUMMARY:not a property\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       false,
+		},
+		{
+			name:       "property-looking text inside a value does not match",
+			body:       "DESCRIPTION:see SUMMARY:elsewhere\r\n",
+			propFilter: propFilter{Name: "SUMMARY"},
+			want:       false,
+		},
+		{
+			name:       "is-not-defined is true when only a prefixed property exists",
+			body:       "X-SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY", IsNotDefined: &struct{}{}},
+			want:       true,
+		},
+		{
+			name:       "is-not-defined is false when the property exists with parameters",
+			body:       "SUMMARY;LANGUAGE=en:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY", IsNotDefined: &struct{}{}},
+			want:       false,
+		},
+		{
+			name:       "text-match still applies to a defined property",
+			body:       "SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: "standup"}},
+			want:       true,
+		},
+		{
+			name:       "text-match miss rejects a defined property",
+			body:       "SUMMARY:Standup\r\n",
+			propFilter: propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: "retro"}},
+			want:       false,
+		},
+	}
+
+	h := &DavServer{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := store.Event{
+				UID:     "prop-filter",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:prop-filter\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
+			}
+			if got := h.eventMatchesFilter(event, calQueryWithPropFilter(tt.propFilter)); got != tt.want {
+				t.Fatalf("eventMatchesFilter = %v, want %v for body %q", got, tt.want, tt.body)
+			}
+		})
+	}
+}
+
 func TestEffectiveTimeRangeWalksNestedCompFilter(t *testing.T) {
 	tr := effectiveTimeRange(calQueryWithTimeRange("20260601T000000Z", "20260701T000000Z"))
 	if tr == nil {
@@ -96,6 +214,71 @@ func TestEventFilterFromCalFilter(t *testing.T) {
 			t.Error("expected ok=false for VTODO time-range pushdown")
 		}
 	})
+}
+
+// RFC 4791 §9.9 matches a zero-duration event with (start <= DTSTART && end >
+// DTSTART); the ordinary overlap expression wrongly excludes one sitting
+// exactly on range_start.
+func TestEventInTimeRangeBoundaryOverlap(t *testing.T) {
+	at := func(hour, minute int) time.Time {
+		return time.Date(2024, 6, 1, hour, minute, 0, 0, time.UTC)
+	}
+	rangeTR := &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"}
+
+	tests := []struct {
+		name    string
+		dtstart time.Time
+		dtend   *time.Time
+		allDay  bool
+		want    bool
+	}{
+		{name: "zero-duration at range start", dtstart: at(10, 0), want: true},
+		{name: "explicit zero-duration DTEND at range start", dtstart: at(10, 0), dtend: ptrTime(at(10, 0)), want: true},
+		{name: "zero-duration inside range", dtstart: at(10, 30), want: true},
+		{name: "zero-duration just before range start", dtstart: at(9, 59), want: false},
+		{name: "zero-duration at range end", dtstart: at(11, 0), want: false},
+		{name: "duration ending at range start", dtstart: at(9, 0), dtend: ptrTime(at(10, 0)), want: false},
+		{name: "duration starting at range end", dtstart: at(11, 0), dtend: ptrTime(at(12, 0)), want: false},
+		{name: "duration overlapping range start", dtstart: at(9, 30), dtend: ptrTime(at(10, 30)), want: true},
+		{name: "duration spanning the range", dtstart: at(9, 0), dtend: ptrTime(at(12, 0)), want: true},
+		{name: "all-day covering the range", dtstart: at(0, 0), dtend: ptrTime(time.Date(2024, 6, 2, 0, 0, 0, 0, time.UTC)), allDay: true, want: true},
+	}
+
+	h := &DavServer{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := store.Event{
+				UID:     "boundary",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:boundary\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart: &tt.dtstart,
+				DTEnd:   tt.dtend,
+				AllDay:  tt.allDay,
+			}
+			if got := h.eventInTimeRange(event, rangeTR); got != tt.want {
+				t.Fatalf("eventInTimeRange = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFreeBusyIncludesZeroDurationEventAtRangeStart(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	event := store.Event{
+		UID:     "zero-duration",
+		RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:zero-duration\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		DTStart: &start,
+	}
+
+	h := &DavServer{}
+	body := h.generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"})
+	if !strings.Contains(body, "FREEBUSY:20240601T100000Z/20240601T100000Z") {
+		t.Fatalf("expected zero-duration event at range start in free-busy output, got %s", body)
+	}
+
+	before := h.generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240601T110000Z", End: "20240601T120000Z"})
+	if strings.Contains(before, "FREEBUSY:") {
+		t.Fatalf("expected zero-duration event before the range to be omitted, got %s", before)
+	}
 }
 
 func TestGenerateFreeBusyExpandsRecurringEventsInRequestedRange(t *testing.T) {

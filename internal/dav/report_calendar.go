@@ -43,15 +43,59 @@ func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter)
 	return filtered
 }
 
-func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
-	// Uppercase the body once per event; the matchers below run once per
-	// filter node and would otherwise each re-uppercase the full iCal text.
-	return h.matchesCompFilter(event, strings.ToUpper(event.RawICAL), &filter.CompFilter)
+// filterSubject holds the per-event text the filter nodes reuse: the uppercased
+// body for substring matching, plus its unfolded content lines for exact
+// property-name matching. Both are derived at most once per event because the
+// matchers below run once per filter node. Unfolding is deferred because most
+// calendar-query filters carry no prop-filter at all.
+type filterSubject struct {
+	upperICAL  string
+	upperLines []string
+	unfolded   bool
 }
 
-func (h *DavServer) matchesCompFilter(event store.Event, upperICAL string, compFilter *compFilter) bool {
+func newFilterSubject(rawICAL string) filterSubject {
+	return filterSubject{upperICAL: strings.ToUpper(rawICAL)}
+}
+
+func (s *filterSubject) lines() []string {
+	if !s.unfolded {
+		s.upperLines = ical.UnfoldLines(s.upperICAL)
+		s.unfolded = true
+	}
+	return s.upperLines
+}
+
+// definesProperty reports whether an unfolded content line declares exactly the
+// named property. Matching the whole line name rather than a "NAME:" substring
+// keeps parameterized lines (DTSTART;TZID=...) matching, stops prefixed
+// extensions (X-SUMMARY) from satisfying a SUMMARY filter, and stops a value
+// that merely contains "NAME:" from being read as a declaration.
+func (s *filterSubject) definesProperty(name string) bool {
+	want := strings.ToUpper(strings.TrimSpace(name))
+	if want == "" {
+		return false
+	}
+	for _, line := range s.lines() {
+		// Without a parameter or value delimiter the line is not a property.
+		if !strings.ContainsAny(line, ";:") {
+			continue
+		}
+		if ical.PropertyName(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
+	subject := newFilterSubject(event.RawICAL)
+	return h.matchesCompFilter(event, &subject, &filter.CompFilter)
+}
+
+func (h *DavServer) matchesCompFilter(event store.Event, subject *filterSubject, compFilter *compFilter) bool {
 	compType := compFilter.Name
-	if compType != "" && !h.hasComponent(upperICAL, compType) {
+	if compType != "" && !h.hasComponent(subject.upperICAL, compType) {
 		return false
 	}
 
@@ -62,19 +106,19 @@ func (h *DavServer) matchesCompFilter(event store.Event, upperICAL string, compF
 	}
 
 	for _, nestedFilter := range compFilter.CompFilter {
-		if !h.matchesCompFilter(event, upperICAL, &nestedFilter) {
+		if !h.matchesCompFilter(event, subject, &nestedFilter) {
 			return false
 		}
 	}
 
 	for _, propFilter := range compFilter.PropFilter {
-		if !h.matchesPropFilter(upperICAL, &propFilter) {
+		if !h.matchesPropFilter(subject, &propFilter) {
 			return false
 		}
 	}
 
 	if compFilter.TextMatch != nil {
-		if !h.matchesTextMatch(upperICAL, compFilter.TextMatch) {
+		if !h.matchesTextMatch(subject.upperICAL, compFilter.TextMatch) {
 			return false
 		}
 	}
@@ -82,9 +126,8 @@ func (h *DavServer) matchesCompFilter(event store.Event, upperICAL string, compF
 	return true
 }
 
-func (h *DavServer) matchesPropFilter(upperICAL string, propFilter *propFilter) bool {
-	propName := strings.ToUpper(propFilter.Name)
-	hasProp := strings.Contains(upperICAL, propName+":")
+func (h *DavServer) matchesPropFilter(subject *filterSubject, propFilter *propFilter) bool {
+	hasProp := subject.definesProperty(propFilter.Name)
 
 	if propFilter.IsNotDefined != nil {
 		return !hasProp
@@ -95,7 +138,7 @@ func (h *DavServer) matchesPropFilter(upperICAL string, propFilter *propFilter) 
 	}
 
 	if propFilter.TextMatch != nil {
-		return h.matchesTextMatch(upperICAL, propFilter.TextMatch)
+		return h.matchesTextMatch(subject.upperICAL, propFilter.TextMatch)
 	}
 
 	return true
@@ -140,10 +183,20 @@ func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
 			eventEnd = event.DTStart
 		}
 
-		return event.DTStart.Before(end) && eventEnd.After(start)
+		return eventOverlapsTimeRange(*event.DTStart, *eventEnd, start, end)
 	}
 
 	return true
+}
+
+// eventOverlapsTimeRange applies the RFC 4791 §9.9 overlap tests. A
+// zero-duration event matches (start <= DTSTART && end > DTSTART); anything
+// with a duration uses the ordinary half-open overlap.
+func eventOverlapsTimeRange(eventStart, eventEnd, rangeStart, rangeEnd time.Time) bool {
+	if eventEnd.Equal(eventStart) {
+		return !eventStart.Before(rangeStart) && eventStart.Before(rangeEnd)
+	}
+	return eventStart.Before(rangeEnd) && eventEnd.After(rangeStart)
 }
 
 // effectiveTimeRange walks the comp-filter tree (VCALENDAR -> VEVENT -> ...) and
@@ -324,6 +377,15 @@ func freeBusyTimeRange(filter *calFilter, tr *timeRange) *timeRange {
 	return effectiveTimeRange(filter)
 }
 
+// freeBusyHasEffectiveTimeRange reports whether a free-busy-query carries a
+// usable time-range from either source. RFC 4791 §7.10 requires exactly one
+// CALDAV:time-range; without it the report degenerates into a full-collection
+// read and an unbounded text/calendar response.
+func freeBusyHasEffectiveTimeRange(filter *calFilter, tr *timeRange) bool {
+	_, _, ok := calendarTimeRangeBounds(freeBusyTimeRange(filter, tr))
+	return ok
+}
+
 func (h *DavServer) filterCalendarEventsByTimeRange(events []store.Event, tr *timeRange) []store.Event {
 	if tr == nil {
 		return events
@@ -384,7 +446,7 @@ func (h *DavServer) freeBusyPeriods(event store.Event, rangeStart, rangeEnd time
 	}
 
 	if !ical.EventHasRecurrence(event.RawICAL) {
-		if event.DTStart.Before(rangeEnd) && endTime.After(rangeStart) {
+		if eventOverlapsTimeRange(*event.DTStart, *endTime, rangeStart, rangeEnd) {
 			return []ical.BusyPeriod{{Start: *event.DTStart, End: *endTime}}
 		}
 		return nil
@@ -511,21 +573,24 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			break
 		}
 	}
-	if len(uids) == 0 {
-		return nil, nil
-	}
-
-	events, err := h.store.Events.ListByResourceNames(ctx, cal.ID, uids)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch event")
+	// A multiget whose hrefs all fail to resolve still owes the client a
+	// response per href, so only the repository reads are skipped here.
+	var events []store.Event
+	var prefetchedACLEntries map[string][]store.ACLEntry
+	if len(uids) > 0 {
+		var err error
+		events, err = h.store.Events.ListByResourceNames(ctx, cal.ID, uids)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch event")
+		}
+		prefetchedACLEntries, err = h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
+		if err != nil {
+			return nil, err
+		}
 	}
 	eventsByName := make(map[string]*store.Event, len(events))
 	for i := range events {
 		eventsByName[eventResourceName(events[i])] = &events[i]
-	}
-	prefetchedACLEntries, err := h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
-	if err != nil {
-		return nil, err
 	}
 	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), prefetchedACLEntries)
 
@@ -535,11 +600,12 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			break
 		}
 		cleanHref := resolveDAVHref(resolvePath, href)
-		if cleanHref == "" {
-			continue
-		}
+		// RFC 4791 §7.9: every requested href needs a DAV:response, so an
+		// unresolvable or out-of-scope one reports 404 under the best href the
+		// request gives us instead of being dropped.
 		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
-		if !ok || !calendarSegmentMatches(cal, segment) {
+		if cleanHref == "" || !ok || !calendarSegmentMatches(cal, segment) {
+			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, responsePath), Status: httpStatusNotFound})
 			continue
 		}
 		responseHref := responseBase + uid + ".ics"

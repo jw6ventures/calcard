@@ -10431,6 +10431,7 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 		name         string
 		path         string
 		reportType   string
+		body         string
 		errorMessage string
 	}{
 		{
@@ -10446,16 +10447,24 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 			errorMessage: "REPORT not allowed on calendar object resources",
 		},
 		{
-			name:         "free-busy-query on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "free-busy-query",
+			name:       "free-busy-query on resource path",
+			path:       "/dav/calendars/1/event.ics",
+			reportType: "free-busy-query",
+			// A free-busy-query needs its RFC 4791 §7.10 time-range to reach the
+			// resource-path check; a bare body is rejected as 400 first.
+			body: `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+</cal:free-busy-query>`,
 			errorMessage: "free-busy-query not allowed on calendar object resources",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`<cal:%s xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"/>`, tc.reportType)
+			body := tc.body
+			if body == "" {
+				body = fmt.Sprintf(`<cal:%s xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"/>`, tc.reportType)
+			}
 			req := httptest.NewRequest("REPORT", tc.path, strings.NewReader(body))
 			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 			rr := httptest.NewRecorder()

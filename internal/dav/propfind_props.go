@@ -241,6 +241,13 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 
 	cleanPath := normalizeDAVHref(resourcePath)
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		if isBirthdayCalendarPath(ctx, cleanPath) {
+			// The birthday calendar is virtual: there is no stored calendar to
+			// resolve privileges from, so its collection and objects report the
+			// read-only set their collection response advertises rather than
+			// reporting the property absent.
+			return calendarCurrentUserPrivilegeSet(true)
+		}
 		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
 		if segment == "" {
 			if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathCalendar && target.Resource {

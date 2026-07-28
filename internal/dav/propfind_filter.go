@@ -40,6 +40,10 @@ type propfindPropertySpec struct {
 	// from the source moves to the 404 propstat. Presence is an explicit
 	// property of the source, independent of the property's value.
 	present func(src *prop) bool
+	// alwaysDefined marks a property the server computes for every kind in ok,
+	// so a propname response lists its name even though propname skips the
+	// value decoration that present depends on (see decorationMaskFor).
+	alwaysDefined bool
 	// emptyValue, when set, reports that a present property carries an empty
 	// value. Such a property is rendered as an empty element in the 200
 	// propstat (RFC 4918 §9.1) rather than copied through copyValue, so the
@@ -270,10 +274,15 @@ var propfindPropertyTable = []propfindPropertySpec{
 		// content model) or as its value otherwise. Producers of applicable
 		// resources (see currentUserPrivilegeSetForPath) must supply a non-nil
 		// set so the property is never wrongly reported absent.
-		emptyName: davName("d:current-user-privilege-set"),
-		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrivilegeSet != nil },
-		ok:        kindGenericCollection | kindPrincipal | kindCalendarCollection,
-		present:   func(src *prop) bool { return src.CurrentUserPrivilegeSet != nil },
+		//
+		// RFC 3744 §5.4: clients discover the privileges they hold from this
+		// property, so it is defined on every DAV resource — matching d:acl —
+		// not just on calendar collections and principals.
+		emptyName:     davName("d:current-user-privilege-set"),
+		requested:     func(q *propfindPropQuery) bool { return q.CurrentUserPrivilegeSet != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		present:       func(src *prop) bool { return src.CurrentUserPrivilegeSet != nil },
 		emptyValue: func(src *prop) bool {
 			return src.CurrentUserPrivilegeSet != nil && len(src.CurrentUserPrivilegeSet.Privileges) == 0
 		},
@@ -448,7 +457,7 @@ func propnamePropfindResponse(resp response) response {
 		if spec.ok&kind == 0 {
 			continue
 		}
-		if spec.present != nil && !spec.present(&src) {
+		if spec.present != nil && !spec.alwaysDefined && !spec.present(&src) {
 			continue
 		}
 		names = append(names, spec.emptyName)

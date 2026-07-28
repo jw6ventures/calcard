@@ -51,9 +51,17 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid time-range", http.StatusBadRequest)
 		return
 	}
-	if report.XMLName.Local == "free-busy-query" && !validTimeRange(report.TimeRange) {
-		http.Error(w, "invalid time-range", http.StatusBadRequest)
-		return
+	if report.XMLName.Local == "free-busy-query" {
+		if !validTimeRange(report.TimeRange) {
+			http.Error(w, "invalid time-range", http.StatusBadRequest)
+			return
+		}
+		// Checked here, before dispatch, so every calendar type -- including the
+		// virtual birthday collection -- is covered by the single guard.
+		if !freeBusyHasEffectiveTimeRange(report.Filter, report.TimeRange) {
+			http.Error(w, "time-range required", http.StatusBadRequest)
+			return
+		}
 	}
 	if handler, ok := h.davRegistry().reportHandler(cleanPath, report.XMLName.Local); ok {
 		r.Body = io.NopCloser(bytes.NewReader(body))

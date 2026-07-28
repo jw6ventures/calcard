@@ -156,7 +156,7 @@ func recurringComponentsFromLines(lines []string) []recurringComponent {
 	for _, parsed := range parsedComponents {
 		current := recurringComponent{}
 		for _, line := range parsed.malformedProperties {
-			if strings.EqualFold(propertyName(strings.TrimSpace(line)), "RDATE") {
+			if strings.EqualFold(PropertyName(strings.TrimSpace(line)), "RDATE") {
 				current.hasRDate = true
 				current.unsafeStart = true
 				current.unsafeUntil = true
@@ -165,7 +165,7 @@ func recurringComponentsFromLines(lines []string) []recurringComponent {
 		for _, parsedProperty := range parsed.properties {
 			keyPart := strings.TrimSpace(parsedProperty.KeyPart)
 			value := strings.TrimSpace(parsedProperty.Value)
-			property := strings.ToUpper(propertyName(keyPart))
+			property := strings.ToUpper(PropertyName(keyPart))
 			switch property {
 			case "DTSTART":
 				if current.dtstartSeen {

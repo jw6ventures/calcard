@@ -474,7 +474,7 @@ func componentProperties(component *VEventComponent, name string) []PropertyValu
 		return values
 	}
 	for _, prop := range component.properties {
-		if !strings.EqualFold(propertyName(prop.KeyPart), name) {
+		if !strings.EqualFold(PropertyName(prop.KeyPart), name) {
 			continue
 		}
 		values = append(values, prop)
@@ -520,7 +520,10 @@ func PropertyParamEquals(keyPart, param, value string) bool {
 	return false
 }
 
-func propertyName(keyPart string) string {
+// PropertyName returns the property name from a content line or its key part,
+// i.e. everything before the first parameter (";") or value (":") delimiter.
+// A key part carrying neither delimiter is returned unchanged.
+func PropertyName(keyPart string) string {
 	if idx := strings.IndexAny(keyPart, ";:"); idx >= 0 {
 		return keyPart[:idx]
 	}

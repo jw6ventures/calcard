@@ -148,14 +148,18 @@ func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 			marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusNotFound))
 	}
 
+	// RFC 3744 §5.4: the property is defined on every DAV resource kind.
 	applicable := []struct {
 		name  string
 		href  string
 		rtype *resourceType
 	}{
 		{"calendar-collection", "/dav/calendars/1/", &resourceType{Collection: &struct{}{}, Calendar: &struct{}{}}},
+		{"addressbook-collection", "/dav/addressbooks/1/", &resourceType{Collection: &struct{}{}, AddressBook: &struct{}{}}},
 		{"principal", "/dav/principals/1/", &resourceType{Principal: &struct{}{}}},
 		{"generic-collection", "/dav/", &resourceType{Collection: &struct{}{}}},
+		{"calendar-object", "/dav/calendars/1/event.ics", nil},
+		{"address-object", "/dav/addressbooks/1/alice.vcf", nil},
 	}
 	for _, k := range applicable {
 		t.Run(k.name+"/nil-absent", func(t *testing.T) {
@@ -183,17 +187,6 @@ func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 			}
 		})
 	}
-
-	// A calendar object is outside the mask (until H3): 404 regardless of value.
-	t.Run("calendar-object/absent", func(t *testing.T) {
-		okXML, nfXML := filter("/dav/calendars/1/event.ics", nil, &currentUserPrivilegeSet{})
-		if strings.Contains(okXML, "<"+element) {
-			t.Fatalf("privilege set must not appear in 200 propstat on a calendar object, got %q", okXML)
-		}
-		if !strings.Contains(nfXML, "<"+element) {
-			t.Fatalf("expected privilege set in 404 propstat on a calendar object, got %q", nfXML)
-		}
-	})
 }
 
 // TestCurrentUserPrivilegeSetForPathPresentEmptyOnApplicablePaths verifies the

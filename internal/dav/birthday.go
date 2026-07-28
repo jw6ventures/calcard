@@ -220,12 +220,11 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 			break
 		}
 		cleanHref := resolveDAVHref(cleanPath, href)
-		if cleanHref == "" {
-			continue
-		}
 		// Birthday calendar uses numeric-only parsing (special virtual calendar with constant ID -1)
-		id, uid, ok := parseResourcePath(cleanHref, "/dav/calendars")
-		if !ok || id != birthdayCalendarID {
+		id, uid, ok := parseResourcePath(cleanHref, calendarPrefix)
+		// RFC 4791 §7.9: an unresolvable or out-of-scope href still owes the client a DAV:response.
+		if cleanHref == "" || !ok || id != birthdayCalendarID {
+			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, cleanPath), Status: httpStatusNotFound})
 			continue
 		}
 		ev, found := eventsByUID[uid]
