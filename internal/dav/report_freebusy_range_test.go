@@ -81,20 +81,36 @@ func TestFreeBusyQueryWithoutTimeRangeIsRejected(t *testing.T) {
 	}
 }
 
-func TestFreeBusyQueryAcceptsTimeRangeFromEitherSource(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "top-level time-range",
-			body: `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+// The RFC 4791 §9.11 request shape: `<!ELEMENT free-busy-query (time-range)>`.
+func TestFreeBusyQueryAcceptsDirectTimeRange(t *testing.T) {
+	body := `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
   <C:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-</C:free-busy-query>`,
-		},
-		{
-			name: "filter-embedded time-range only",
-			body: `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+</C:free-busy-query>`
+
+	h, _ := freeBusyCalendarServer()
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, reportRequestFor("/dav/calendars/1/", body, &store.User{ID: 1}))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("free-busy-query with a direct time-range = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "FREEBUSY:20240601T100000Z/20240601T120000Z") {
+		t.Fatalf("expected busy period in response, got %s", rr.Body.String())
+	}
+}
+
+// §7.10 requires exactly one CALDAV:time-range as a direct
+// child of CALDAV:free-busy-query, and §9.11's content model admits nothing
+// else. CalCard also honours a range buried in a CALDAV:filter, which no
+// conforming client sends. This test pins that leniency so it is inverted
+// deliberately -- at that point the body below must be rejected, exactly as
+// TestFreeBusyQueryWithoutTimeRangeIsRejected already requires of a filter
+// carrying no range at all. It is the only success fixture that uses the
+// non-conforming shape; every conforming free-busy fixture sends the §9.11
+// form.
+func TestFreeBusyQueryAcceptsFilterEmbeddedTimeRange_KnownDeviation(t *testing.T) {
+	body := `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
   <C:filter>
     <C:comp-filter name="VCALENDAR">
       <C:comp-filter name="VEVENT">
@@ -102,24 +118,19 @@ func TestFreeBusyQueryAcceptsTimeRangeFromEitherSource(t *testing.T) {
       </C:comp-filter>
     </C:comp-filter>
   </C:filter>
-</C:free-busy-query>`,
-		},
+</C:free-busy-query>`
+
+	h, _ := freeBusyCalendarServer()
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, reportRequestFor("/dav/calendars/1/", body, &store.User{ID: 1}))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("filter-embedded time-range = %d, want the current 200; if this is now 400 the §9.11 content model is enforced and this test should assert the rejection: %s",
+			rr.Code, rr.Body.String())
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h, _ := freeBusyCalendarServer()
-			rr := httptest.NewRecorder()
-
-			h.Report(rr, reportRequestFor("/dav/calendars/1/", tt.body, &store.User{ID: 1}))
-
-			if rr.Code != http.StatusOK {
-				t.Fatalf("free-busy-query with time-range = %d, want 200: %s", rr.Code, rr.Body.String())
-			}
-			if !strings.Contains(rr.Body.String(), "FREEBUSY:20240601T100000Z/20240601T120000Z") {
-				t.Fatalf("expected busy period in response, got %s", rr.Body.String())
-			}
-		})
+	if !strings.Contains(rr.Body.String(), "FREEBUSY:20240601T100000Z/20240601T120000Z") {
+		t.Fatalf("expected busy period in response, got %s", rr.Body.String())
 	}
 }
 

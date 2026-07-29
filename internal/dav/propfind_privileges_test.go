@@ -300,3 +300,35 @@ func TestCurrentUserPrivilegeSetForObjectPathsIsPresent(t *testing.T) {
 		}
 	}
 }
+
+// A calendar shared read-only through an ACL grant must appear in the owner's
+// calendar-home listing alongside calendars they own, or clients cannot
+// discover it (RFC 3744 §5.5 read privilege driving RFC 4791 §6.2.1 discovery).
+func TestSharedCalendarsAppearInCalendarHomeListing(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "My Calendar", UpdatedAt: now}, Editor: true},
+			{Calendar: store.Calendar{ID: 2, UserID: 2, Name: "Shared With Me", UpdatedAt: now}, Editor: false},
+		},
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+	}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/calendars/",
+		"/dav/calendars/-1/", // the virtual birthday collection
+		"/dav/calendars/1/",
+		"/dav/calendars/2/",
+	)
+}

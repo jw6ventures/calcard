@@ -16,8 +16,11 @@ type multistatus struct {
 	XmlnsA    string     `xml:"xmlns:card,attr"`
 	XmlnsCS   string     `xml:"xmlns:cs,attr,omitempty"`
 	XmlnsICAL string     `xml:"xmlns:ical,attr,omitempty"`
-	SyncToken string     `xml:"d:sync-token,omitempty"`
 	Response  []response `xml:"d:response"`
+	// SyncToken trails the responses because encoding/xml emits fields in
+	// declaration order and RFC 6578 §6.4 sequences the element model as
+	// (response*, responsedescription?, sync-token?).
+	SyncToken string `xml:"d:sync-token,omitempty"`
 }
 
 type response struct {

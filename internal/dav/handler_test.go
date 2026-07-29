@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -676,20 +675,12 @@ func TestPropfindRootIncludesPrincipalAndHomes(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
-	}
-	body := rr.Body.Bytes()
-	if responses := strings.Count(string(body), "<d:response>"); responses != 4 {
-		t.Fatalf("expected 4 responses (root, calendars, addressbooks, principal), got %d", responses)
-	}
-	if !strings.Contains(string(body), "<d:href>/dav/principals/1/</d:href>") {
-		t.Fatal("principal response not found")
-	}
-	if !strings.Contains(string(body), "<cal:calendar-home-set>") || !strings.Contains(string(body), "<card:addressbook-home-set>") {
-		t.Fatal("principal response missing home sets")
-	}
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/", "/dav/calendars/", "/dav/addressbooks/", "/dav/principals/1/")
+
+	principal := ms.responseForHref(t, "/dav/principals/1/")
+	principal.assertPropHrefs(t, calQN("calendar-home-set"), "/dav/calendars/")
+	principal.assertPropHrefs(t, qn(nsCardDAV, "addressbook-home-set"), "/dav/addressbooks/")
 }
 
 func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
@@ -714,23 +705,24 @@ func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/calendars/2/", "/dav/calendars/2/event.ics")
+
+	collection := ms.responseForHref(t, "/dav/calendars/2/")
+	if token := collection.assertPropStatus(t, davQN("sync-token"), http.StatusOK).Value(); token == "" {
+		t.Error("DAV:sync-token is empty")
 	}
-	body := rr.Body.Bytes()
-	if strings.Count(string(body), "<d:response>") != 2 {
-		t.Fatalf("expected collection + 1 event, got body: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:sync-token>") || !strings.Contains(string(body), "<cs:getctag>5</cs:getctag>") {
-		t.Fatalf("missing sync metadata: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:supported-report-set>") {
-		t.Fatalf("supported-report-set missing: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:getcontenttype>text/calendar; charset=utf-8</d:getcontenttype>") {
-		t.Fatalf("unexpected content type: %s", string(body))
-	}
+	collection.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "5")
+	collection.assertSupportedReports(t,
+		calQN("calendar-multiget"),
+		calQN("calendar-query"),
+		calQN("free-busy-query"),
+		davQN("sync-collection"),
+		davQN("expand-property"),
+	)
+
+	event := ms.responseForHref(t, "/dav/calendars/2/event.ics")
+	event.assertPropValue(t, davQN("getcontenttype"), http.StatusOK, "text/calendar; charset=utf-8")
 }
 
 func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
@@ -755,23 +747,23 @@ func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/addressbooks/3/", "/dav/addressbooks/3/alice.vcf")
+
+	collection := ms.responseForHref(t, "/dav/addressbooks/3/")
+	if token := collection.assertPropStatus(t, davQN("sync-token"), http.StatusOK).Value(); token == "" {
+		t.Error("DAV:sync-token is empty")
 	}
-	body := rr.Body.Bytes()
-	if strings.Count(string(body), "<d:response>") != 2 {
-		t.Fatalf("expected collection + 1 contact, got body: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:sync-token>") || !strings.Contains(string(body), "<cs:getctag>9</cs:getctag>") {
-		t.Fatalf("missing sync metadata: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:supported-report-set>") {
-		t.Fatal("supported-report-set missing")
-	}
-	if !strings.Contains(string(body), "<d:getcontenttype>text/vcard; charset=utf-8</d:getcontenttype>") {
-		t.Fatalf("unexpected content type: %s", string(body))
-	}
+	collection.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "9")
+	collection.assertSupportedReports(t,
+		qn(nsCardDAV, "addressbook-multiget"),
+		qn(nsCardDAV, "addressbook-query"),
+		davQN("sync-collection"),
+		davQN("expand-property"),
+	)
+
+	contact := ms.responseForHref(t, "/dav/addressbooks/3/alice.vcf")
+	contact.assertPropValue(t, davQN("getcontenttype"), http.StatusOK, "text/vcard; charset=utf-8")
 }
 
 func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
@@ -796,16 +788,7 @@ func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 1 {
-		t.Fatalf("expected only collection response at depth 0, got %s", body)
-	}
-	if strings.Contains(body, ".ics") {
-		t.Fatalf("expected no event resources at depth 0, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/2/")
 }
 
 func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
@@ -835,15 +818,12 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	resp := rr.Body.String()
-	if !strings.Contains(resp, "getetag") {
-		t.Fatalf("expected getetag in response, got %s", resp)
-	}
-	if strings.Contains(resp, "BEGIN:VEVENT") {
-		t.Fatalf("PROPFIND must not expose calendar data, got %s", resp)
+	ms := decodeMultistatus(t, rr)
+	resp := ms.responseForHref(t, "/dav/calendars/1/event.ics")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag1"`)
+	resp.assertPropAbsent(t, calQN("calendar-data"))
+	if body := rr.Body.String(); strings.Contains(body, "BEGIN:VEVENT") {
+		t.Fatalf("PROPFIND must not expose calendar data, got %s", body)
 	}
 }
 
@@ -858,16 +838,7 @@ func TestPropfindPrincipalsDepth0OmitsUserPrincipal(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 1 {
-		t.Fatalf("expected only collection response, got %s", body)
-	}
-	if strings.Contains(body, "<d:href>/dav/principals/1/</d:href></d:response>") {
-		t.Fatalf("depth 0 should not include principal resource response: %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/principals/")
 }
 
 func TestPropfindCalendarsRootListsCollections(t *testing.T) {
@@ -886,13 +857,12 @@ func TestPropfindCalendarsRootListsCollections(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 4 { // collection + birthday calendar + two calendars
-		t.Fatalf("expected calendar collection listings, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+		"/dav/calendars/1/",
+		"/dav/calendars/2/",
+	)
 }
 
 func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
@@ -911,13 +881,11 @@ func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 3 { // collection + two books
-		t.Fatalf("expected address book listings, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/addressbooks/",
+		"/dav/addressbooks/1/",
+		"/dav/addressbooks/2/",
+	)
 }
 
 func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
@@ -2460,12 +2428,17 @@ func TestReportCalendarSyncCollectionViaHandler(t *testing.T) {
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
+
+	// Decoding is the assertion: RFC 6578 §6.4 sequences DAV:multistatus as
+	// (response*, responsedescription?, sync-token?), so a sync token serialized
+	// ahead of the responses fails the content model rather than the href set.
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/calendars/2/", "/dav/calendars/2/event.ics", "/dav/calendars/2/gone.ics")
+	if ms.SyncToken == "" {
+		t.Errorf("sync-collection response carries no DAV:sync-token; body: %s", rr.Body.String())
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "event.ics") || !strings.Contains(respBody, "gone.ics") {
-		t.Fatalf("expected sync responses for event and deleted resource, got %s", respBody)
+	if got := ms.responseForHref(t, "/dav/calendars/2/gone.ics").Status; statusCodeFromLine(t, got) != http.StatusNotFound {
+		t.Errorf("tombstone status = %q, want 404", got)
 	}
 }
 
@@ -3478,26 +3451,9 @@ func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t 
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	body := rr.Body.String()
-	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
-	if privilegeSet == "" {
-		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
-	}
-	if !strings.Contains(privilegeSet, "bind") {
-		t.Fatalf("expected bind privilege in response, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "write-content") {
-		t.Fatalf("did not expect write-content privilege for bind-only access, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "write-properties") {
-		t.Fatalf("did not expect write-properties privilege for bind-only access, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "unbind") {
-		t.Fatalf("did not expect unbind privilege for bind-only access, got %s", privilegeSet)
-	}
+	ms := decodeMultistatus(t, rr)
+	resp := ms.responseForHref(t, "/dav/calendars/5/")
+	resp.assertPrivileges(t, davQN("read"), calQN("read-free-busy"), davQN("bind"))
 }
 
 func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T) {
@@ -3562,12 +3518,7 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/8/") {
-		t.Fatalf("expected bind-only calendar to be discoverable, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref(), "/dav/calendars/8/")
 
 	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/8/", nil)
 	calReq.Header.Set("Depth", "0")
@@ -3576,16 +3527,9 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 
 	h.Propfind(calRR, calReq)
 
-	if calRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected bind-only calendar PROPFIND to succeed, got %d: %s", calRR.Code, calRR.Body.String())
-	}
-	body := calRR.Body.String()
-	if !strings.Contains(body, "/dav/calendars/8/") {
-		t.Fatalf("expected bind-only calendar href in response, got %s", body)
-	}
-	if !strings.Contains(body, "bind") {
-		t.Fatalf("expected bind privilege in response, got %s", body)
-	}
+	calMS := decodeMultistatus(t, calRR)
+	calMS.assertHrefs(t, "/dav/calendars/8/")
+	calMS.responseForHref(t, "/dav/calendars/8/").assertPrivileges(t, davQN("bind"))
 }
 
 func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
@@ -3634,25 +3578,23 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	rootBody := rootRR.Body.String()
-	for _, href := range []string{"/dav/calendars/9/", "/dav/calendars/10/", "/dav/calendars/11/"} {
-		if !strings.Contains(rootBody, href) {
-			t.Fatalf("expected partial-access calendar %s to be discoverable, got %s", href, rootBody)
-		}
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+		"/dav/calendars/9/",
+		"/dav/calendars/10/",
+		"/dav/calendars/11/",
+	)
 
 	tests := []struct {
 		name      string
 		path      string
 		wantHref  string
-		privilege string
+		privilege xml.Name
 	}{
-		{name: "write-content by id", path: "/dav/calendars/9/", wantHref: "/dav/calendars/9/", privilege: "write-content"},
-		{name: "unbind by id", path: "/dav/calendars/10/", wantHref: "/dav/calendars/10/", privilege: "unbind"},
-		{name: "write-content by slug", path: "/dav/calendars/review/", wantHref: "/dav/calendars/11/", privilege: "write-content"},
+		{name: "write-content by id", path: "/dav/calendars/9/", wantHref: "/dav/calendars/9/", privilege: davQN("write-content")},
+		{name: "unbind by id", path: "/dav/calendars/10/", wantHref: "/dav/calendars/10/", privilege: davQN("unbind")},
+		{name: "write-content by slug", path: "/dav/calendars/review/", wantHref: "/dav/calendars/11/", privilege: davQN("write-content")},
 	}
 
 	for _, tc := range tests {
@@ -3664,16 +3606,9 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 
 			h.Propfind(rr, req)
 
-			if rr.Code != http.StatusMultiStatus {
-				t.Fatalf("expected partial-access calendar PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-			}
-			body := rr.Body.String()
-			if !strings.Contains(body, tc.wantHref) {
-				t.Fatalf("expected calendar href %s in response, got %s", tc.wantHref, body)
-			}
-			if !strings.Contains(body, tc.privilege) {
-				t.Fatalf("expected privilege %q in response, got %s", tc.privilege, body)
-			}
+			ms := decodeMultistatus(t, rr)
+			ms.assertHrefs(t, tc.wantHref)
+			ms.responseForHref(t, tc.wantHref).assertHasPrivilege(t, tc.privilege)
 		})
 	}
 }
@@ -3718,12 +3653,7 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/12/") {
-		t.Fatalf("expected object-granted calendar to be discoverable, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref(), "/dav/calendars/12/")
 
 	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/12/", nil)
 	calReq.Header.Set("Depth", "0")
@@ -3732,22 +3662,9 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 
 	h.Propfind(calRR, calReq)
 
-	if calRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected direct calendar PROPFIND to succeed for object grant, got %d: %s", calRR.Code, calRR.Body.String())
-	}
-	body := calRR.Body.String()
-	if !strings.Contains(body, "/dav/calendars/12/") {
-		t.Fatalf("expected object-granted calendar href in response, got %s", body)
-	}
-	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
-	if privilegeSet == "" {
-		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
-	}
-	for _, privilege := range []string{"<d:read", "read-free-busy", "write-content", "write-properties", "<d:bind", "<d:unbind", "<d:write"} {
-		if strings.Contains(privilegeSet, privilege) {
-			t.Fatalf("did not expect collection privilege %q for object-only calendar discovery, got %s", privilege, privilegeSet)
-		}
-	}
+	calMS := decodeMultistatus(t, calRR)
+	calMS.assertHrefs(t, "/dav/calendars/12/")
+	calMS.responseForHref(t, "/dav/calendars/12/").assertPrivileges(t)
 }
 
 func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing.T) {
@@ -3787,12 +3704,7 @@ func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if strings.Contains(rootRR.Body.String(), "/dav/calendars/13/") {
-		t.Fatalf("did not expect deny-only object ACE to surface calendar discovery, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref())
 }
 
 func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
@@ -5753,12 +5665,7 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		if !strings.Contains(rr.Body.String(), "<d:href>/dav/calendars/5/</d:href>") {
-			t.Fatalf("expected read-free-busy calendar in discovery response, got %s", rr.Body.String())
-		}
+		decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref(), "/dav/calendars/5/")
 	})
 
 	t.Run("direct collection propfind", func(t *testing.T) {
@@ -5769,12 +5676,8 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected direct PROPFIND to succeed with read-free-busy, got %d: %s", rr.Code, rr.Body.String())
-		}
-		if !strings.Contains(rr.Body.String(), "read-free-busy") {
-			t.Fatalf("expected direct PROPFIND to advertise read-free-busy, got %s", rr.Body.String())
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5/")
+		resp.assertHasPrivilege(t, calQN("read-free-busy"))
 	})
 }
 
@@ -5808,13 +5711,7 @@ func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:href>/dav/calendars/5/</d:href>") {
-		t.Fatalf("expected ACL-granted calendar in discovery response, got %s", respBody)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref(), "/dav/calendars/5/")
 }
 
 func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
@@ -5855,12 +5752,14 @@ func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/alice.vcf")
+	aces := resp.aces(t)
+	if len(aces) != 1 {
+		t.Fatalf("DAV:acl carries %d ACEs, want the one stored for the canonical resource path", len(aces))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:acl>") || !strings.Contains(respBody, "/dav/principals/2/") || !strings.Contains(respBody, "<d:read") {
-		t.Fatalf("expected PROPFIND to include the stored ACE for the canonical resource path, got %s", respBody)
+	assertSoleHref(t, aces[0].child(t, davQN("principal")), "/dav/principals/2/")
+	if got := qnList(acePrivileges(t, aces[0], davQN("grant"))); got != qnString(davQN("read")) {
+		t.Errorf("ACE grants %s, want %s", got, qnString(davQN("read")))
 	}
 }
 
@@ -5880,16 +5779,9 @@ func TestPropfindGenericCollectionReportsUnsupportedRequestedPropertiesAs404(t *
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !propstatHasStatus(respBody, "calendar-home-set", http.StatusNotFound) {
-		t.Fatalf("expected unsupported calendar-home-set to be reported with 404, got %s", respBody)
-	}
-	if propstatHasStatus(respBody, "displayname", http.StatusOK) {
-		t.Fatalf("expected PROPFIND prop response to avoid leaking unrelated default properties, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/")
+	resp.assertPropstatNames(t, http.StatusNotFound, calQN("calendar-home-set"))
+	resp.assertNoPropstatWithStatus(t, http.StatusOK)
 }
 
 func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T) {
@@ -5947,18 +5839,10 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected getetag in response, got %s", respBody)
-	}
-	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "calendar-data", "getcontenttype"} {
-		if strings.Contains(respBody, forbidden) {
-			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5/event.ics")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag-event"`)
+	resp.assertPropstatNames(t, http.StatusOK, davQN("getetag"))
+	resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 }
 
 func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
@@ -6000,15 +5884,10 @@ func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected denied object PROPFIND to hide getetag, got %s", respBody)
-	}
-	if !strings.Contains(respBody, "404 Not Found") {
-		t.Fatalf("expected denied object PROPFIND to look like not found, got %s", respBody)
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5/event.ics")
+	resp.assertPropAbsent(t, davQN("getetag"))
+	if code := statusCodeFromLine(t, resp.Status); code != http.StatusNotFound {
+		t.Errorf("denied object response status = %d, want 404 Not Found", code)
 	}
 }
 
@@ -6064,18 +5943,10 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected getetag in response, got %s", respBody)
-	}
-	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "address-data", "getcontenttype"} {
-		if strings.Contains(respBody, forbidden) {
-			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/alice.vcf")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag-alice"`)
+	resp.assertPropstatNames(t, http.StatusOK, davQN("getetag"))
+	resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 }
 
 func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
@@ -6360,18 +6231,10 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
-			t.Fatalf("expected displayname in response, got %s", respBody)
-		}
-		for _, forbidden := range []string{"addressbook-description", "supported-address-data", "supportedlock"} {
-			if strings.Contains(respBody, forbidden) {
-				t.Fatalf("did not expect %q in supported prop-only response, got %s", forbidden, respBody)
-			}
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+		resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Contacts")
+		resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"))
+		resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 	})
 
 	t.Run("negative_unsupported_addressbook_property_returns_404", func(t *testing.T) {
@@ -6388,16 +6251,9 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !propstatHasStatus(respBody, "principal-URL", http.StatusNotFound) {
-			t.Fatalf("expected unsupported principal-URL to be reported with 404, got %s", respBody)
-		}
-		if strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
-			t.Fatalf("expected unsupported prop request to avoid leaking default collection properties, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+		resp.assertPropstatNames(t, http.StatusNotFound, davQN("principal-URL"))
+		resp.assertNoPropstatWithStatus(t, http.StatusOK)
 	})
 }
 
@@ -6419,16 +6275,10 @@ func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "<d:principal-URL>") {
-			t.Fatalf("expected principal-URL in response, got %s", respBody)
-		}
-		if strings.Contains(respBody, "calendar-home-set") {
-			t.Fatalf("did not expect unrelated principal properties in prop-only response, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/principals/1/")
+		resp.assertPropHrefs(t, davQN("principal-URL"), "/dav/principals/1/")
+		resp.assertPropstatNames(t, http.StatusOK, davQN("principal-URL"))
+		resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 	})
 
 	t.Run("negative_unsupported_principal_property_returns_404", func(t *testing.T) {
@@ -6445,16 +6295,9 @@ func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !propstatHasStatus(respBody, "calendar-description", http.StatusNotFound) {
-			t.Fatalf("expected unsupported principal property to be reported with 404, got %s", respBody)
-		}
-		if strings.Contains(respBody, "<d:principal-URL>") {
-			t.Fatalf("expected unsupported prop request to avoid leaking principal defaults, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/principals/1/")
+		resp.assertPropstatNames(t, http.StatusNotFound, calQN("calendar-description"))
+		resp.assertNoPropstatWithStatus(t, http.StatusOK)
 	})
 }
 
@@ -7349,19 +7192,28 @@ func TestPropfindACLUsesSpecialPrincipalElements(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+	aces := resp.aces(t)
+	if len(aces) != 2 {
+		t.Fatalf("DAV:acl carries %d ACEs, want one per stored entry", len(aces))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:authenticated") {
-		t.Fatalf("expected DAV:authenticated principal element, got %s", respBody)
+
+	// RFC 3744 §5.5.1: DAV:all and DAV:authenticated are principal elements in
+	// their own right, so neither may be serialized as a DAV:href.
+	want := []struct {
+		principal xml.Name
+		container xml.Name
+		privilege xml.Name
+	}{
+		{principal: davQN("authenticated"), container: davQN("grant"), privilege: davQN("read")},
+		{principal: davQN("all"), container: davQN("deny"), privilege: davQN("write")},
 	}
-	if !strings.Contains(respBody, "<d:all") {
-		t.Fatalf("expected DAV:all principal element, got %s", respBody)
-	}
-	for _, invalid := range []string{"<d:href>DAV:authenticated</d:href>", "<d:href>DAV:all</d:href>"} {
-		if strings.Contains(respBody, invalid) {
-			t.Fatalf("did not expect ACL principal to be serialized as href %q, got %s", invalid, respBody)
+	for i, tc := range want {
+		if got := qnList(acePrincipals(t, aces[i])); got != qnString(tc.principal) {
+			t.Errorf("ACE %d principal = %s, want %s", i, got, qnString(tc.principal))
+		}
+		if got := qnList(acePrivileges(t, aces[i], tc.container)); got != qnString(tc.privilege) {
+			t.Errorf("ACE %d %s = %s, want %s", i, qnString(tc.container), got, qnString(tc.privilege))
 		}
 	}
 }
@@ -7788,15 +7640,11 @@ func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	for _, href := range []string{"/dav/addressbooks/2/", "/dav/addressbooks/5/"} {
-		if !strings.Contains(respBody, href) {
-			t.Fatalf("expected addressbook-home-set listing to include %s, got %s", href, respBody)
-		}
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/addressbooks/",
+		"/dav/addressbooks/2/",
+		"/dav/addressbooks/5/",
+	)
 }
 
 type fakeEventRepo struct {
@@ -8819,22 +8667,8 @@ func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "<cal:supported-calendar-component-set>") {
-		t.Errorf("missing supported-calendar-component-set: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VEVENT"`) {
-		t.Errorf("missing VEVENT component: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VTODO"`) {
-		t.Errorf("missing VTODO component: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VFREEBUSY"`) {
-		t.Errorf("missing VFREEBUSY component: %s", body)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertSupportedComponents(t, "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY")
 }
 
 func TestPutWithIfMatchSuccess(t *testing.T) {
@@ -9594,12 +9428,7 @@ func TestPutRejectsInvalidICalendar(t *testing.T) {
 
 			h.Put(rr, req)
 
-			if rr.Code != http.StatusBadRequest {
-				t.Errorf("expected 400 for invalid iCalendar, got %d", rr.Code)
-			}
-			if !strings.Contains(rr.Body.String(), "valid-calendar-data") {
-				t.Errorf("expected CalDAV error body for invalid calendar data, got %s", rr.Body.String())
-			}
+			assertErrorConditions(t, rr, http.StatusBadRequest, calQN("valid-calendar-data"))
 		})
 	}
 }
@@ -9731,11 +9560,7 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
@@ -9783,14 +9608,9 @@ func TestPropfindParsesRequestBody(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	// Response should contain displayname and resourcetype
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "displayname") {
-		t.Errorf("expected displayname in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Work")
+	resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"), davQN("resourcetype"))
 }
 
 func TestPropfindParsesChunkedRequestBody(t *testing.T) {
@@ -9818,13 +9638,9 @@ func TestPropfindParsesChunkedRequestBody(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "displayname") {
-		t.Errorf("expected displayname in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Work")
+	resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"), davQN("resourcetype"))
 }
 
 func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
@@ -9995,16 +9811,9 @@ func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, `<ical:calendar-color>#336699FF</ical:calendar-color>`) {
-		t.Fatalf("expected calendar color in response, got %s", respBody)
-	}
-	if !strings.Contains(respBody, `xmlns:ical="http://apple.com/ns/ical/"`) {
-		t.Fatalf("expected Apple calendar namespace in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "#336699FF")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
@@ -10029,19 +9838,10 @@ func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, `HTTP/1.1 404 Not Found`) {
-		t.Fatalf("expected calendar color 404 propstat, got %s", respBody)
-	}
-	if strings.Contains(respBody, `HTTP/1.1 200 OK`) {
-		t.Fatalf("did not expect empty 200 propstat for missing color, got %s", respBody)
-	}
-	if !strings.Contains(respBody, `<ical:calendar-color></ical:calendar-color>`) {
-		t.Fatalf("expected empty calendar-color element in 404 propstat, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusNotFound, "")
+	resp.assertPropstatNames(t, http.StatusNotFound, qn(nsAppleICal, "calendar-color"))
+	resp.assertNoPropstatWithStatus(t, http.StatusOK)
 }
 
 func TestProppatchRejectsForbidden(t *testing.T) {
@@ -10165,9 +9965,10 @@ func TestProppatchCalendarColorPersistsChange(t *testing.T) {
 	if updated == nil || updated.Color == nil || *updated.Color != "#22CC88FF" {
 		t.Fatalf("expected PROPPATCH to persist color, got %#v", updated)
 	}
-	if !strings.Contains(rr.Body.String(), `<ical:calendar-color></ical:calendar-color>`) {
-		t.Fatalf("expected successful property name in PROPPATCH response, got %s", rr.Body.String())
-	}
+	// PROPPATCH echoes the Request-URI, which carried no trailing slash.
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
@@ -10205,9 +10006,10 @@ func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
 	if updated == nil || updated.Color != nil {
 		t.Fatalf("expected PROPPATCH remove to clear color, got %#v", updated)
 	}
-	if !strings.Contains(rr.Body.String(), `<ical:calendar-color></ical:calendar-color>`) {
-		t.Fatalf("expected color remove in PROPPATCH response, got %s", rr.Body.String())
-	}
+	// PROPPATCH echoes the Request-URI, which carried no trailing slash.
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestFreeBusyIncludesDateRange(t *testing.T) {
@@ -10227,11 +10029,7 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
@@ -10336,11 +10134,7 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
@@ -10401,11 +10195,7 @@ func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
@@ -10718,12 +10508,7 @@ func TestReportUnknownCalendarReportReturns403(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("unknown calendar REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "supported-report") {
-		t.Fatalf("unknown calendar REPORT body missing supported-report precondition: %s", rr.Body.String())
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
 	if strings.Contains(rr.Body.String(), "secret") {
 		t.Fatalf("unknown calendar REPORT leaked event data: %s", rr.Body.String())
 	}
@@ -10749,12 +10534,7 @@ func TestReportUnknownAddressBookReportReturns403(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("unknown address-book REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "supported-report") {
-		t.Fatalf("unknown address-book REPORT body missing supported-report precondition: %s", rr.Body.String())
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
 	if strings.Contains(rr.Body.String(), "secret") {
 		t.Fatalf("unknown address-book REPORT leaked contact data: %s", rr.Body.String())
 	}
@@ -10773,12 +10553,7 @@ func TestReportUnknownBirthdayReportReturns403(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("unknown birthday REPORT = %d, want 403: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "supported-report") {
-		t.Fatalf("unknown birthday REPORT body missing supported-report precondition: %s", rr.Body.String())
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
 }
 
 func TestPropfindMalformedXMLReturns400(t *testing.T) {
@@ -11004,19 +10779,12 @@ func TestPropfindDepthInfinityListsCollectionsAndResources(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("PROPFIND Depth: infinity = %d, want 207: %s", rr.Code, rr.Body.String())
-	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "<d:href>/dav/calendars/</d:href>") {
-		t.Fatalf("infinity response missing home-set collection: %s", body)
-	}
-	if !strings.Contains(body, "<d:href>/dav/calendars/2/</d:href>") {
-		t.Fatalf("infinity response missing calendar collection: %s", body)
-	}
-	if !strings.Contains(body, "<d:href>/dav/calendars/2/event.ics</d:href>") {
-		t.Fatalf("infinity response missing event resource two levels down: %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+		"/dav/calendars/2/",
+		"/dav/calendars/2/event.ics",
+	)
 }
 
 func TestBirthdayEventsUseStableDTStampAndSummary(t *testing.T) {
@@ -11178,5 +10946,167 @@ func TestPutEventFetchesResourceOnce(t *testing.T) {
 	}
 	if eventRepo.resourceLookupCount != 1 {
 		t.Fatalf("PUT performed %d GetByResourceName lookups, want 1", eventRepo.resourceLookupCount)
+	}
+}
+
+// A single PROPFIND mixing the DAV, CalDAV and calendarserver namespaces, as
+// the clients CalCard targets send it. Every requested property must be served
+// at 200 and none may land in a 404 propstat.
+//
+// This is a client-interoperability test, not an RFC 4791 one: CS:getctag is a
+// calendarserver.org extension and DAV:sync-token is RFC 6578 §3, neither of
+// which RFC 4791 defines. The CalDAV properties it names have their own
+// coverage in rfc4791_compliance_test.go; what this pins is that the whole
+// mixed set is answered in one propstat.
+func TestCalendarCollectionServesClientDiscoveryProperties(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{
+				ID:          1,
+				UserID:      1,
+				Name:        "My Calendar",
+				Description: stringPtr("Test calendar"),
+				UpdatedAt:   now,
+				CTag:        42,
+			}, Editor: true},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <cs:getctag/>
+    <d:sync-token/>
+    <cal:calendar-description/>
+    <cal:supported-calendar-component-set/>
+    <d:supported-report-set/>
+  </d:prop>
+</d:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/1/")
+
+	resp.assertPropstatNames(t, http.StatusOK,
+		davQN("displayname"),
+		davQN("resourcetype"),
+		qn(nsCalendarServer, "getctag"),
+		davQN("sync-token"),
+		calQN("calendar-description"),
+		calQN("supported-calendar-component-set"),
+		davQN("supported-report-set"),
+	)
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "My Calendar")
+	resp.assertPropValue(t, calQN("calendar-description"), http.StatusOK, "Test calendar")
+	resp.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "42")
+	resp.assertPropChildNames(t, davQN("resourcetype"), davQN("collection"), calQN("calendar"))
+	resp.assertSupportedComponents(t, "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY")
+}
+
+// RFC 3253 §3.1.5 makes DAV:supported-report-set the set of reports a resource
+// supports, so every report named there must answer one. The advertised set on
+// a calendar collection spans three specifications — the CalDAV reports, RFC
+// 6578 §3.2 sync-collection and RFC 3253 §3.8 expand-property — which is why
+// this test lives here rather than in the RFC 4791 suite: exercising it means
+// executing reports RFC 4791 does not define.
+func TestSupportedReportSetAdvertisedReportsActuallyWork(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: store.Now()}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {
+				CalendarID: 1,
+				UID:        "event",
+				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:       "e",
+				DTStart:    &start,
+				DTEnd:      &end,
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	// Each advertised report is paired with a minimal well-formed body and the
+	// status a working implementation returns. A report that gains an
+	// advertisement without gaining an entry here fails the exactness check
+	// below rather than going silently unexercised.
+	type reportCase struct {
+		body       string
+		wantStatus int
+	}
+	cases := map[xml.Name]reportCase{
+		calQN("calendar-query"): {
+			body: `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR">` +
+				`<C:comp-filter name="VEVENT"/></C:comp-filter></C:filter></C:calendar-query>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		calQN("calendar-multiget"): {
+			body: `<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<D:prop><D:getetag/></D:prop><D:href>/dav/calendars/1/event.ics</D:href></C:calendar-multiget>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		calQN("free-busy-query"): {
+			body: `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<C:time-range start="20240601T000000Z" end="20240630T235959Z"/></C:free-busy-query>`,
+			wantStatus: http.StatusOK,
+		},
+		davQN("sync-collection"): {
+			body: `<D:sync-collection xmlns:D="DAV:"><D:sync-token/>` +
+				`<D:sync-level>1</D:sync-level><D:prop><D:getetag/></D:prop></D:sync-collection>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		davQN("expand-property"): {
+			body:       `<D:expand-property xmlns:D="DAV:"><D:property name="owner"/></D:expand-property>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+	}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Propfind(rr, req)
+
+	ms := decodeMultistatus(t, rr)
+	advertised := ms.responseForHref(t, "/dav/calendars/1/").supportedReports(t)
+
+	known := make([]xml.Name, 0, len(cases))
+	for name := range cases {
+		known = append(known, name)
+	}
+	if qnList(advertised) != qnList(known) {
+		t.Fatalf("supported-report-set advertises %s, but this test can exercise %s", qnList(advertised), qnList(known))
+	}
+
+	for _, name := range advertised {
+		t.Run(name.Local, func(t *testing.T) {
+			tc := cases[name]
+			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(tc.body))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Errorf("%s is advertised in supported-report-set but returned %d, want %d; body: %s",
+					qnString(name), rr.Code, tc.wantStatus, rr.Body.String())
+			}
+		})
 	}
 }

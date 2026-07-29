@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5409,4 +5411,28 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 			t.Errorf("RFC 6352 Section 10.3: address data MUST include VERSION property, got: %s", rr.Body.String())
 		}
 	})
+}
+
+// propstatHasStatus and extractPropInt are regex probes retained for the RFC
+// 6352 suite. The RFC 4791 suite has moved to the namespace-aware helpers in
+// dav_xml_assert_test.go; this suite has not been converted yet.
+func propstatHasStatus(body, prop string, statusCode int) bool {
+	pattern := fmt.Sprintf(`(?s)<[^>]*propstat[^>]*>.*?<[^>]*%s[^>]*>.*?<[^>]*status[^>]*>HTTP/1.1 %d`,
+		regexp.QuoteMeta(prop), statusCode)
+	re := regexp.MustCompile(pattern)
+	return re.MatchString(body)
+}
+
+func extractPropInt(body, prop string) (int, bool) {
+	pattern := fmt.Sprintf(`(?s)<[^>]*%s[^>]*>\s*([0-9]+)\s*<`, regexp.QuoteMeta(prop))
+	re := regexp.MustCompile(pattern)
+	match := re.FindStringSubmatch(body)
+	if len(match) < 2 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
