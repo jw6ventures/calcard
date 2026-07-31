@@ -202,7 +202,7 @@ func calendarObjectACLAnyAccessExpr(userParam string) string {
 }
 
 func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar, error) {
-	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
+	const q = `SELECT id, user_id, name, slug, description, description_lang, timezone, color, supported_components, ctag, created_at, updated_at FROM calendars WHERE user_id=$1 ORDER BY created_at`
 	defer observeDB(ctx, "calendars.list_by_user")()
 	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
@@ -213,25 +213,29 @@ func (r *calendarRepo) ListByUser(ctx context.Context, userID int64) ([]Calendar
 	var result []Calendar
 	for rows.Next() {
 		var c Calendar
-		var slug, description, timezone, color sql.NullString
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var slug, description, descriptionLang, timezone, color sql.NullString
+		var components pq.StringArray
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &descriptionLang, &timezone, &color, &components, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Slug = nullableString(slug)
 		c.Description = nullableString(description)
+		c.DescriptionLang = nullableString(descriptionLang)
 		c.Timezone = nullableString(timezone)
 		c.Color = nullableString(color)
+		c.SupportedComponents = components
 		result = append(result, c)
 	}
 	return result, rows.Err()
 }
 
 func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error) {
-	const q = `SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE id=$1`
+	const q = `SELECT id, user_id, name, slug, description, description_lang, timezone, color, supported_components, ctag, created_at, updated_at FROM calendars WHERE id=$1`
 	defer observeDB(ctx, "calendars.get_by_id")()
 	var c Calendar
-	var slug, description, timezone, color sql.NullString
-	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	var slug, description, descriptionLang, timezone, color sql.NullString
+	var components pq.StringArray
+	if err := r.pool.QueryRowContext(ctx, q, id).Scan(&c.ID, &c.UserID, &c.Name, &slug, &description, &descriptionLang, &timezone, &color, &components, &c.CTag, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -239,14 +243,16 @@ func (r *calendarRepo) GetByID(ctx context.Context, id int64) (*Calendar, error)
 	}
 	c.Slug = nullableString(slug)
 	c.Description = nullableString(description)
+	c.DescriptionLang = nullableString(descriptionLang)
 	c.Timezone = nullableString(timezone)
 	c.Color = nullableString(color)
+	c.SupportedComponents = components
 	return &c, nil
 }
 
 func (r *calendarRepo) ListAccessible(ctx context.Context, userID int64) ([]CalendarAccess, error) {
 	q := `
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
+SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email,
        CASE WHEN c.user_id = $1 THEN FALSE ELSE TRUE END as shared,
        CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "read", "all") + ` END as can_read,
@@ -276,17 +282,20 @@ ORDER BY shared, name
 	var result []CalendarAccess
 	for rows.Next() {
 		var c CalendarAccess
-		var slug, description, timezone, color sql.NullString
+		var slug, description, descriptionLang, timezone, color sql.NullString
+		var components pq.StringArray
 		if err := rows.Scan(
-			&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
+			&c.ID, &c.UserID, &c.Name, &slug, &description, &descriptionLang, &timezone, &color, &components, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
 			&c.Privileges.Read, &c.Privileges.ReadFreeBusy, &c.Privileges.Write, &c.Privileges.WriteContent, &c.Privileges.WriteProperties, &c.Privileges.Bind, &c.Privileges.Unbind,
 		); err != nil {
 			return nil, err
 		}
 		c.Slug = nullableString(slug)
 		c.Description = nullableString(description)
+		c.DescriptionLang = nullableString(descriptionLang)
 		c.Timezone = nullableString(timezone)
 		c.Color = nullableString(color)
+		c.SupportedComponents = components
 		c.PrivilegesResolved = true
 		c.Privileges = c.Privileges.Normalized()
 		c.Editor = c.Privileges.AllowsEventEditing()
@@ -297,7 +306,7 @@ ORDER BY shared, name
 
 func (r *calendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error) {
 	q := `
-SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,
+SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,
        u.primary_email as owner_email,
        CASE WHEN c.user_id = $2 THEN FALSE ELSE TRUE END as shared,
        CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "read", "all") + ` END as can_read,
@@ -321,9 +330,10 @@ WHERE c.id = $1
 `
 	defer observeDB(ctx, "calendars.get_accessible")()
 	var c CalendarAccess
-	var slug, description, timezone, color sql.NullString
+	var slug, description, descriptionLang, timezone, color sql.NullString
+	var components pq.StringArray
 	if err := r.pool.QueryRowContext(ctx, q, calendarID, userID).Scan(
-		&c.ID, &c.UserID, &c.Name, &slug, &description, &timezone, &color, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
+		&c.ID, &c.UserID, &c.Name, &slug, &description, &descriptionLang, &timezone, &color, &components, &c.CTag, &c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail, &c.Shared,
 		&c.Privileges.Read, &c.Privileges.ReadFreeBusy, &c.Privileges.Write, &c.Privileges.WriteContent, &c.Privileges.WriteProperties, &c.Privileges.Bind, &c.Privileges.Unbind,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -333,27 +343,37 @@ WHERE c.id = $1
 	}
 	c.Slug = nullableString(slug)
 	c.Description = nullableString(description)
+	c.DescriptionLang = nullableString(descriptionLang)
 	c.Timezone = nullableString(timezone)
 	c.Color = nullableString(color)
+	c.SupportedComponents = components
 	c.PrivilegesResolved = true
 	c.Privileges = c.Privileges.Normalized()
 	c.Editor = c.Privileges.AllowsEventEditing()
 	return &c, nil
 }
 
+const createCalendarQuery = `INSERT INTO calendars (user_id, name, slug, description, description_lang, timezone, color, supported_components) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, user_id, name, slug, description, description_lang, timezone, color, supported_components, ctag, created_at, updated_at`
+
 func (r *calendarRepo) Create(ctx context.Context, cal Calendar) (*Calendar, error) {
-	const q = `INSERT INTO calendars (user_id, name, slug, description, timezone, color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at`
 	defer observeDB(ctx, "calendars.create")()
-	row := r.pool.QueryRowContext(ctx, q, cal.UserID, cal.Name, cal.Slug, cal.Description, cal.Timezone, cal.Color)
+	return createCalendarTx(ctx, r.pool, cal)
+}
+
+func createCalendarTx(ctx context.Context, tx queryExecContext, cal Calendar) (*Calendar, error) {
+	row := tx.QueryRowContext(ctx, createCalendarQuery, cal.UserID, cal.Name, cal.Slug, cal.Description, cal.DescriptionLang, cal.Timezone, cal.Color, nullableStringArray(cal.SupportedComponents))
 	var created Calendar
-	var slug, description, timezone, color sql.NullString
-	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &slug, &description, &timezone, &color, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
+	var slug, description, descriptionLang, timezone, color sql.NullString
+	var components pq.StringArray
+	if err := row.Scan(&created.ID, &created.UserID, &created.Name, &slug, &description, &descriptionLang, &timezone, &color, &components, &created.CTag, &created.CreatedAt, &created.UpdatedAt); err != nil {
 		return nil, err
 	}
 	created.Slug = nullableString(slug)
 	created.Description = nullableString(description)
+	created.DescriptionLang = nullableString(descriptionLang)
 	created.Timezone = nullableString(timezone)
 	created.Color = nullableString(color)
+	created.SupportedComponents = components
 	return &created, nil
 }
 
@@ -374,10 +394,10 @@ func (r *calendarRepo) Update(ctx context.Context, userID, id int64, name string
 	return nil
 }
 
-func (r *calendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
-	const q = `UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5`
+func (r *calendarRepo) UpdateProperties(ctx context.Context, id int64, props CalendarProperties) error {
+	const q = `UPDATE calendars SET name=$1, description=$2, description_lang=$3, timezone=$4, color=$5, updated_at=NOW() WHERE id=$6`
 	defer observeDB(ctx, "calendars.update_properties")()
-	res, err := r.pool.ExecContext(ctx, q, name, description, timezone, color, id)
+	res, err := r.pool.ExecContext(ctx, q, props.Name, props.Description, props.DescriptionLang, props.Timezone, props.Color, id)
 	if err != nil {
 		return err
 	}
@@ -1982,6 +2002,9 @@ func (r *lockRepo) Create(ctx context.Context, lock Lock) (*Lock, error) {
 			return nil, err
 		}
 	}
+	if err := canonicalizePendingCalendarLockTx(ctx, tx, &lock); err != nil {
+		return nil, err
+	}
 
 	// Check for conflicting locks on the resource itself.
 	const conflictQ = `SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`
@@ -2069,6 +2092,43 @@ RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner
 		return nil, err
 	}
 	return &l, nil
+}
+
+func canonicalizePendingCalendarLockTx(ctx context.Context, tx *sql.Tx, lock *Lock) error {
+	if lock == nil {
+		return nil
+	}
+	userID, slug, ok := pendingCalendarLockIdentity(lock.ResourcePath)
+	if !ok || userID != lock.UserID {
+		return nil
+	}
+	var calendarID int64
+	err := tx.QueryRowContext(ctx, `SELECT id FROM calendars WHERE user_id=$1 AND LOWER(slug)=LOWER($2)`, userID, slug).Scan(&calendarID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	lock.ResourcePath = path.Join("/dav/calendars", strconv.FormatInt(calendarID, 10))
+	return nil
+}
+
+func pendingCalendarLockIdentity(resourcePath string) (int64, string, bool) {
+	const prefix = "/dav/calendars/.pending/"
+	cleanPath := path.Clean(resourcePath)
+	if !strings.HasPrefix(cleanPath, prefix) {
+		return 0, "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(cleanPath, prefix), "/")
+	if len(parts) != 2 || parts[1] == "" {
+		return 0, "", false
+	}
+	userID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, "", false
+	}
+	return userID, parts[1], true
 }
 
 func lockSerializationPaths(resourcePath string) []string {
@@ -2675,6 +2735,16 @@ func nullableString(value sql.NullString) *string {
 	}
 	v := value.String
 	return &v
+}
+
+// nullableStringArray keeps the distinction between an unset column and an empty
+// list: an empty Go slice would otherwise round-trip as '{}', which reads as a
+// collection that accepts nothing rather than one carrying no restriction.
+func nullableStringArray(values []string) any {
+	if values == nil {
+		return nil
+	}
+	return pq.StringArray(values)
 }
 
 func nullableTime(value sql.NullTime) *time.Time {

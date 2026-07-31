@@ -104,12 +104,17 @@ var propfindPropertyTable = []propfindPropertySpec{
 		},
 	},
 	{
-		emptyName:  davName("cal:calendar-description"),
-		requested:  func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
-		ok:         kindCalendarCollection,
-		present:    func(src *prop) bool { return src.CalendarDescription != nil },
-		emptyValue: func(src *prop) bool { return src.CalendarDescription != nil && *src.CalendarDescription == "" },
-		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
+		emptyName: davName("cal:calendar-description"),
+		requested: func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
+		ok:        kindCalendarCollection,
+		present:   func(src *prop) bool { return src.CalendarDescription != nil },
+		// A present-empty value still has to carry its xml:lang, so an empty
+		// description with a language tag goes through copyValue rather than
+		// being rendered as a bare empty element.
+		emptyValue: func(src *prop) bool {
+			return src.CalendarDescription != nil && src.CalendarDescription.Value == "" && src.CalendarDescription.Lang == ""
+		},
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
 	},
 	{
 		emptyName:  davName("cal:calendar-timezone"),
@@ -154,6 +159,19 @@ var propfindPropertyTable = []propfindPropertySpec{
 		requested: func(q *propfindPropQuery) bool { return q.SupportedCollationSet != nil },
 		ok:        kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedCollationSet = src.SupportedCollationSet },
+	},
+	{
+		// RFC 4791 §7.5.1: defined on every resource that supports a report doing
+		// text matching. calendar-query is the only text-matching CalDAV report,
+		// and §7 makes it available on calendar object resources as well as on
+		// the collections that hold them, so both advertise the collations it
+		// honours.
+		emptyName: davName("cal:supported-collation-set"),
+		requested: func(q *propfindPropQuery) bool { return q.CalDAVSupportedCollationSet != nil },
+		ok:        kindCalendarCollection | kindCalendarObject,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.CalDAVSupportedCollationSet = src.CalDAVSupportedCollationSet
+		},
 	},
 	{
 		emptyName: davName("d:sync-token"),

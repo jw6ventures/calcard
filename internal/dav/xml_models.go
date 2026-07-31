@@ -100,13 +100,14 @@ type prop struct {
 	GetContentType                string                         `xml:"d:getcontenttype,omitempty"`
 	CalendarData                  cdataString                    `xml:"cal:calendar-data,omitempty"`
 	AddressData                   cdataString                    `xml:"card:address-data,omitempty"`
-	CalendarDescription           *string                        `xml:"cal:calendar-description,omitempty"`
+	CalendarDescription           *langString                    `xml:"cal:calendar-description,omitempty"`
 	CalendarTimezone              *string                        `xml:"cal:calendar-timezone,omitempty"`
 	CalendarColor                 *string                        `xml:"ical:calendar-color,omitempty"`
 	AddressBookDesc               *string                        `xml:"card:addressbook-description,omitempty"`
 	SupportedAddressData          *supportedAddressData          `xml:"card:supported-address-data,omitempty"`
 	AddressBookMaxResourceSize    string                         `xml:"card:max-resource-size,omitempty"`
 	SupportedCollationSet         *supportedCollationSet         `xml:"card:supported-collation-set,omitempty"`
+	CalDAVSupportedCollationSet   *caldavSupportedCollationSet   `xml:"cal:supported-collation-set,omitempty"`
 	SyncToken                     string                         `xml:"d:sync-token,omitempty"`
 	CTag                          string                         `xml:"cs:getctag,omitempty"`
 	CurrentUserPrincipal          *expandableHrefProp            `xml:"d:current-user-principal,omitempty"`
@@ -211,6 +212,36 @@ func (r rawXMLValue) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 	return enc.EncodeToken(start.End())
 }
 
+// langString is a text property value that carries the xml:lang attribute it
+// was stored with. RFC 4918 §4.3 requires a server to return the language of a
+// property value that was set with one, so the attribute travels with the value
+// instead of being reconstructed from the request.
+//
+// The attribute name is spelled as a prefixed local name, matching the rest of
+// this file: encoding/xml writes it verbatim, whereas an xml.Name carrying the
+// "xml" namespace would make the encoder invent an xmlns declaration for it.
+type langString struct {
+	Value string
+	Lang  string
+}
+
+func (l langString) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
+	if l.Lang != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xml:lang"}, Value: l.Lang})
+	}
+	return enc.EncodeElement(l.Value, start)
+}
+
+// langStringPtr builds a present property value; a nil lang means the value
+// carries no language tag.
+func langStringPtr(value string, lang *string) *langString {
+	result := langString{Value: value}
+	if lang != nil {
+		result.Lang = *lang
+	}
+	return &result
+}
+
 // cdataString wraps string content in CDATA for raw XML output.
 type cdataString string
 
@@ -257,6 +288,7 @@ type propertySelection struct {
 	SupportedAddressData          *struct{}  `xml:"urn:ietf:params:xml:ns:carddav supported-address-data"`
 	AddressBookMaxResourceSize    *struct{}  `xml:"urn:ietf:params:xml:ns:carddav max-resource-size"`
 	SupportedCollationSet         *struct{}  `xml:"urn:ietf:params:xml:ns:carddav supported-collation-set"`
+	CalDAVSupportedCollationSet   *struct{}  `xml:"urn:ietf:params:xml:ns:caldav supported-collation-set"`
 	SyncToken                     *struct{}  `xml:"DAV: sync-token"`
 	CTag                          *struct{}  `xml:"http://calendarserver.org/ns/ getctag"`
 	CurrentUserPrincipal          *struct{}  `xml:"DAV: current-user-principal"`
@@ -397,10 +429,32 @@ type proppatchInstruction struct {
 }
 
 type proppatchProperty struct {
-	Name       xml.Name
-	InnerXML   string
-	Text       string
+	Name     xml.Name
+	InnerXML string
+	Text     string
+	// Lang is the in-scope xml:lang for this property's value, empty when none
+	// applies. RFC 4918 §4.3 scopes the attribute in the normal XML way, so a
+	// declaration on an ancestor of the property element reaches it.
+	Lang       string
 	HasElement bool
+}
+
+// xmlLangNamespace is the namespace the XML specification reserves for the
+// "xml" prefix; encoding/xml resolves xml:lang to it.
+const xmlLangNamespace = "http://www.w3.org/XML/1998/namespace"
+
+// inScopeLang returns the xml:lang declared on start, or inherited when start
+// declares none.
+func inScopeLang(start xml.StartElement, inherited string) string {
+	for _, attr := range start.Attr {
+		if attr.Name.Local != "lang" {
+			continue
+		}
+		if attr.Name.Space == xmlLangNamespace || attr.Name.Space == "xml" {
+			return strings.TrimSpace(attr.Value)
+		}
+	}
+	return inherited
 }
 
 func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
@@ -408,6 +462,7 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 		return fmt.Errorf("unexpected PROPPATCH root %q", xmlNameString(start.Name))
 	}
 	*r = proppatchRequest{XMLName: start.Name}
+	rootLang := inScopeLang(start, "")
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -418,7 +473,7 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 			if token.Name.Space != "DAV:" || (token.Name.Local != "set" && token.Name.Local != "remove") {
 				return fmt.Errorf("unexpected PROPPATCH instruction %q", xmlNameString(token.Name))
 			}
-			instruction, err := decodeProppatchInstruction(dec, token, token.Name.Local == "remove")
+			instruction, err := decodeProppatchInstruction(dec, token, token.Name.Local == "remove", rootLang)
 			if err != nil {
 				return err
 			}
@@ -431,8 +486,9 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 	}
 }
 
-func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove bool) (proppatchInstruction, error) {
+func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove bool, inheritedLang string) (proppatchInstruction, error) {
 	instruction := proppatchInstruction{Remove: remove}
+	instructionLang := inScopeLang(start, inheritedLang)
 	seenProp := false
 	for {
 		token, err := dec.Token()
@@ -445,7 +501,7 @@ func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove
 				return instruction, fmt.Errorf("PROPPATCH instruction must contain one DAV:prop")
 			}
 			seenProp = true
-			properties, err := decodeProppatchProperties(dec, token)
+			properties, err := decodeProppatchProperties(dec, token, instructionLang)
 			if err != nil {
 				return instruction, err
 			}
@@ -464,8 +520,9 @@ func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove
 	}
 }
 
-func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement) ([]proppatchProperty, error) {
+func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement, inheritedLang string) ([]proppatchProperty, error) {
 	var properties []proppatchProperty
+	propLang := inScopeLang(start, inheritedLang)
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -473,7 +530,7 @@ func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement) ([]prop
 		}
 		switch token := token.(type) {
 		case xml.StartElement:
-			property, err := decodeProppatchProperty(dec, token)
+			property, err := decodeProppatchProperty(dec, token, propLang)
 			if err != nil {
 				return nil, err
 			}
@@ -486,11 +543,11 @@ func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement) ([]prop
 	}
 }
 
-func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement) (proppatchProperty, error) {
+func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement, inheritedLang string) (proppatchProperty, error) {
 	var inner strings.Builder
 	enc := xml.NewEncoder(&inner)
 	var text strings.Builder
-	property := proppatchProperty{Name: start.Name}
+	property := proppatchProperty{Name: start.Name, Lang: inScopeLang(start, inheritedLang)}
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -527,13 +584,80 @@ func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement) (proppatc
 	}
 }
 
-type mkcalendarRequest struct {
+// mkcolRequest is the extended MKCOL body (RFC 5689). MKCALENDAR has its own
+// stricter grammar; see mkcalendarRequest.
+type mkcolRequest struct {
 	XMLName xml.Name
-	Set     *mkcalendarSet `xml:"DAV: set"`
+	Set     *mkcolSet `xml:"DAV: set"`
 }
 
-type mkcalendarSet struct {
+type mkcolSet struct {
 	Prop proppatchProp `xml:"DAV: prop"`
+}
+
+// mkcalendarRequest is the CALDAV:mkcalendar request body (RFC 4791 §9.2). The
+// content model is <!ELEMENT mkcalendar (DAV:set)>: no other root element, and
+// exactly one DAV:set. §5.3.1 requires the property instructions it carries to
+// be processed in document order, so they are decoded into an ordered list
+// rather than a struct of named fields.
+type mkcalendarRequest struct {
+	XMLName      xml.Name
+	Instructions []proppatchInstruction
+}
+
+func (r *mkcalendarRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	if start.Name.Space != "urn:ietf:params:xml:ns:caldav" || start.Name.Local != "mkcalendar" {
+		return fmt.Errorf("unexpected MKCALENDAR root %q", xmlNameString(start.Name))
+	}
+	*r = mkcalendarRequest{XMLName: start.Name}
+	rootLang := inScopeLang(start, "")
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			if token.Name.Space != "DAV:" || token.Name.Local != "set" {
+				return fmt.Errorf("unexpected MKCALENDAR instruction %q", xmlNameString(token.Name))
+			}
+			if len(r.Instructions) != 0 {
+				return fmt.Errorf("MKCALENDAR carries more than one DAV:set")
+			}
+			instruction, err := decodeProppatchInstruction(dec, token, false, rootLang)
+			if err != nil {
+				return err
+			}
+			r.Instructions = append(r.Instructions, instruction)
+		case xml.CharData:
+			// The content model is element-only, so anything but whitespace
+			// between the instructions is outside the grammar.
+			if strings.TrimSpace(string(token)) != "" {
+				return fmt.Errorf("MKCALENDAR carries character data")
+			}
+		case xml.EndElement:
+			if token.Name == start.Name {
+				if len(r.Instructions) != 1 {
+					return fmt.Errorf("MKCALENDAR carries %d DAV:set elements, want exactly 1", len(r.Instructions))
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// mkcalendarResponse is the CALDAV:mkcalendar-response body RFC 4791 §5.3.1
+// requires of a MKCALENDAR response that carries one. §9.3 declares the element
+// ANY; CalCard reports the properties it applied, mirroring a PROPPATCH
+// propstat so a client can see which instructions took effect.
+type mkcalendarResponse struct {
+	XMLName   xml.Name   `xml:"cal:mkcalendar-response"`
+	XmlnsD    string     `xml:"xmlns:d,attr"`
+	XmlnsCal  string     `xml:"xmlns:cal,attr"`
+	XmlnsCard string     `xml:"xmlns:card,attr"`
+	XmlnsCS   string     `xml:"xmlns:cs,attr"`
+	XmlnsICAL string     `xml:"xmlns:ical,attr"`
+	Propstat  []propstat `xml:"d:propstat,omitempty"`
 }
 
 type proppatchProp struct {
@@ -632,6 +756,13 @@ type addressDataType struct {
 
 type supportedCollationSet struct {
 	SupportedCollation []string `xml:"card:supported-collation"`
+}
+
+// caldavSupportedCollationSet is the CalDAV CALDAV:supported-collation-set
+// (RFC 4791 §9.4). It shares its local name with the CardDAV property but not
+// its namespace, so the two carry separate children.
+type caldavSupportedCollationSet struct {
+	SupportedCollation []string `xml:"cal:supported-collation"`
 }
 
 type addressDataQuery struct {

@@ -727,7 +727,7 @@ func (f *fakeCalendarRepo) Create(ctx context.Context, cal store.Calendar) (*sto
 func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error {
 	return nil
 }
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, props store.CalendarProperties) error {
 	return nil
 }
 func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name string) error {

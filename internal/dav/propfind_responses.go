@@ -67,6 +67,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		if propfindReq != nil && propfindReq.AllProp != nil {
 			stripCalendarAllprop(res)
 			stripAddressBookAllprop(res)
+			stripPrincipalAllprop(res)
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range res {
@@ -167,16 +168,32 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	}
 }
 
+// stripCalendarAllprop removes the CalDAV properties RFC 4791 keeps out of a
+// DAV:allprop response. §5.2.1, §5.2.2, §5.2.3, §5.2.4, §5.2.5 through §5.2.9,
+// §6.2.1 and §7.5.1 each carry a SHOULD NOT for their property, and the rule is
+// absence rather than a 404: allprop returns the properties the server chooses
+// to expose that way, so an excluded one simply is not there.
 func stripCalendarAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
 			prop.CalendarData = ""
+			// §7.5.1 applies wherever the property is defined, and it is defined
+			// on calendar object resources as well as on their collections.
+			prop.CalDAVSupportedCollationSet = nil
 			if prop.ResourceType == nil || prop.ResourceType.Calendar == nil {
 				continue
 			}
+			prop.CalendarDescription = nil
 			prop.CalendarTimezone = nil
+			prop.SupportedCalendarComponentSet = nil
 			prop.SupportedCalendarData = nil
+			prop.CalendarHomeSet = nil
+			prop.MaxResourceSize = ""
+			prop.MinDateTime = ""
+			prop.MaxDateTime = ""
+			prop.MaxInstances = ""
+			prop.MaxAttendeesPerInstance = ""
 		}
 	}
 }
@@ -246,7 +263,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := strconv.FormatInt(c.CTag, 10)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
-				res = h.appendMultistatusResponses(res, []response{calendarCollectionResponseWithPrivileges(href, c.Name, c.Description, c.Timezone, c.Color, principalHref, syncToken, ctag, c.EffectivePrivileges())})
+				res = h.appendMultistatusResponses(res, []response{calendarCollectionResponseWithPrivileges(href, c.Name, c.Calendar, principalHref, syncToken, ctag, c.EffectivePrivileges())})
 				if depth == "infinity" && !h.multistatusBuildComplete(res) {
 					res, err = h.appendCalendarPropfindPages(ctx, user, c, href, res)
 					if err != nil {
@@ -316,14 +333,14 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 		if event == nil {
 			return []response{{Href: resourceHref, Status: httpStatusNotFound}}, nil
 		}
-		return []response{resourceResponse(resourceHref, calendarResourcePropstat(event.ETag, event.RawICAL))}, nil
+		return []response{resourceResponse(resourceHref, etagProp(event.ETag, event.RawICAL, true))}, nil
 	}
 
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
 	ctag := strconv.FormatInt(cal.CTag, 10)
 	syncToken := buildSyncToken("cal", cal.ID, cal.UpdatedAt)
 	principalHref := h.principalURL(user)
-	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
+	res := []response{calendarCollectionResponseWithPrivileges(href, cal.Name, cal.Calendar, principalHref, syncToken, ctag, cal.EffectivePrivileges())}
 	if depthIncludesChildren(depth) {
 		res, err = h.appendCalendarPropfindPages(ctx, user, cal, ensureCollectionHref(href), res)
 		if err != nil {

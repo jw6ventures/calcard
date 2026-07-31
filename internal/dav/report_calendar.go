@@ -11,14 +11,30 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, resolvePath, responsePath string, report reportRequest) ([]response, string, error) {
+// calendarReportResponses runs one REPORT against a calendar collection.
+// targetResource is the resource name when the Request-URI is a calendar object
+// resource rather than the collection, which RFC 4791 §7 supports for
+// calendar-query and calendar-multiget; it is empty for a collection target.
+func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, resolvePath, responsePath, targetResource string, report reportRequest) ([]response, string, error) {
+	// RFC 4791 §7: a report whose Request-URI names a calendar object resource
+	// runs against that resource, so a URI naming none has nothing to report on.
+	// That is a request-level 404, not a 207 saying the resource matched nothing.
+	if targetResource != "" {
+		event, err := h.store.Events.GetByResourceName(ctx, cal.ID, targetResource)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to fetch event")
+		}
+		if event == nil {
+			return nil, "", store.ErrNotFound
+		}
+	}
 	calData := reportCalendarData(report)
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, calData, report.Prop)
+		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, targetResource, calData, report.Prop)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, report.Filter, calData, report.Prop)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.Prop)
 		return res, "", err
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
@@ -43,27 +59,27 @@ func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter)
 	return filtered
 }
 
-// filterSubject holds the per-event text the filter nodes reuse: the uppercased
-// body for substring matching, plus its unfolded content lines for exact
-// property-name matching. Both are derived at most once per event because the
-// matchers below run once per filter node. Unfolding is deferred because most
-// calendar-query filters carry no prop-filter at all.
+// filterSubject holds the per-event text the filter nodes reuse: the
+// case-folded body for substring matching, plus its unfolded content lines for
+// exact property-name matching. Both are derived at most once per event because
+// the matchers below run once per filter node. Line unfolding is deferred
+// because most calendar-query filters carry no prop-filter at all.
 type filterSubject struct {
-	upperICAL  string
-	upperLines []string
-	unfolded   bool
+	foldedICAL  string
+	foldedLines []string
+	unfolded    bool
 }
 
 func newFilterSubject(rawICAL string) filterSubject {
-	return filterSubject{upperICAL: strings.ToUpper(rawICAL)}
+	return filterSubject{foldedICAL: asciiCasemapFold(rawICAL)}
 }
 
 func (s *filterSubject) lines() []string {
 	if !s.unfolded {
-		s.upperLines = ical.UnfoldLines(s.upperICAL)
+		s.foldedLines = ical.UnfoldLines(s.foldedICAL)
 		s.unfolded = true
 	}
-	return s.upperLines
+	return s.foldedLines
 }
 
 // definesProperty reports whether an unfolded content line declares exactly the
@@ -72,7 +88,7 @@ func (s *filterSubject) lines() []string {
 // extensions (X-SUMMARY) from satisfying a SUMMARY filter, and stops a value
 // that merely contains "NAME:" from being read as a declaration.
 func (s *filterSubject) definesProperty(name string) bool {
-	want := strings.ToUpper(strings.TrimSpace(name))
+	want := asciiCasemapFold(strings.TrimSpace(name))
 	if want == "" {
 		return false
 	}
@@ -95,7 +111,7 @@ func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) boo
 
 func (h *DavServer) matchesCompFilter(event store.Event, subject *filterSubject, compFilter *compFilter) bool {
 	compType := compFilter.Name
-	if compType != "" && !h.hasComponent(subject.upperICAL, compType) {
+	if compType != "" && !h.hasComponent(subject.foldedICAL, compType) {
 		return false
 	}
 
@@ -118,7 +134,7 @@ func (h *DavServer) matchesCompFilter(event store.Event, subject *filterSubject,
 	}
 
 	if compFilter.TextMatch != nil {
-		if !h.matchesTextMatch(subject.upperICAL, compFilter.TextMatch) {
+		if !h.matchesTextMatch(subject.foldedICAL, compFilter.TextMatch) {
 			return false
 		}
 	}
@@ -138,21 +154,21 @@ func (h *DavServer) matchesPropFilter(subject *filterSubject, propFilter *propFi
 	}
 
 	if propFilter.TextMatch != nil {
-		return h.matchesTextMatch(subject.upperICAL, propFilter.TextMatch)
+		return h.matchesTextMatch(subject.foldedICAL, propFilter.TextMatch)
 	}
 
 	return true
 }
 
-// matchesTextMatch expects icalData already uppercased by the caller.
-func (h *DavServer) matchesTextMatch(upperICAL string, textMatch *textMatch) bool {
+// matchesTextMatch expects icalData already folded by the caller, with the same
+// collation it folds the search string with.
+func (h *DavServer) matchesTextMatch(foldedICAL string, textMatch *textMatch) bool {
 	text := strings.TrimSpace(textMatch.Text)
 	if text == "" {
 		return true
 	}
 
-	// Case-insensitive contains check (simplified - RFC 4790 has more complex rules)
-	matches := strings.Contains(upperICAL, strings.ToUpper(text))
+	matches := strings.Contains(foldedICAL, asciiCasemapFold(text))
 
 	if textMatch.NegateCondition == "yes" {
 		return !matches
@@ -161,9 +177,9 @@ func (h *DavServer) matchesTextMatch(upperICAL string, textMatch *textMatch) boo
 	return matches
 }
 
-// hasComponent expects icalData already uppercased by the caller.
-func (h *DavServer) hasComponent(upperICAL, componentType string) bool {
-	return strings.Contains(upperICAL, "BEGIN:"+strings.ToUpper(componentType))
+// hasComponent expects icalData already folded by the caller.
+func (h *DavServer) hasComponent(foldedICAL, componentType string) bool {
+	return strings.Contains(foldedICAL, "BEGIN:"+asciiCasemapFold(componentType))
 }
 
 func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
@@ -283,6 +299,36 @@ func validCalendarFilterTimeRanges(filter *calFilter) bool {
 		return true
 	}
 	return validCompFilterTimeRanges(&filter.CompFilter)
+}
+
+// validCalendarFilterCollations reports whether every CALDAV:text-match in the
+// filter names a collation the matcher implements. RFC 4791 §7.8.7
+// (CALDAV:supported-collation) forbids answering a request that asks for one
+// the server does not: silently matching under a different collation returns
+// results the client did not ask for.
+func validCalendarFilterCollations(filter *calFilter) bool {
+	if filter == nil {
+		return true
+	}
+	return validCompFilterCollations(&filter.CompFilter)
+}
+
+func validCompFilterCollations(filter *compFilter) bool {
+	if filter.TextMatch != nil && !calendarCollationSupported(filter.TextMatch.Collation) {
+		return false
+	}
+	for i := range filter.PropFilter {
+		propFilter := &filter.PropFilter[i]
+		if propFilter.TextMatch != nil && !calendarCollationSupported(propFilter.TextMatch.Collation) {
+			return false
+		}
+	}
+	for i := range filter.CompFilter {
+		if !validCompFilterCollations(&filter.CompFilter[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func validTimeRange(tr *timeRange) bool {
@@ -504,7 +550,10 @@ func recurringEventDuration(event store.Event, component *ical.VEventComponent, 
 	return time.Hour
 }
 
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+	if targetResource != "" {
+		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, requested)
+	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
 	responses := make([]response, 0, buildLimit)
@@ -538,9 +587,9 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }
 
-func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath string, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath, targetResource string, calData *calendarDataEl, requested *reportProp) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.calendarQuery(ctx, user, cal, responsePath, nil, calData, requested)
+		return h.calendarQuery(ctx, user, cal, responsePath, targetResource, nil, calData, requested)
 	}
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 
@@ -557,7 +606,7 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			continue
 		}
 		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
-		if !ok || !calendarSegmentMatches(cal, segment) {
+		if !ok || !calendarSegmentMatches(cal, segment) || !multigetHrefInScope(targetResource, uid) {
 			continue
 		}
 		validHrefs++
@@ -604,7 +653,7 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 		// unresolvable or out-of-scope one reports 404 under the best href the
 		// request gives us instead of being dropped.
 		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
-		if cleanHref == "" || !ok || !calendarSegmentMatches(cal, segment) {
+		if cleanHref == "" || !ok || !calendarSegmentMatches(cal, segment) || !multigetHrefInScope(targetResource, uid) {
 			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, responsePath), Status: httpStatusNotFound})
 			continue
 		}
@@ -624,6 +673,48 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 		}
 		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, requested, calData))
 	}
+	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
+}
+
+// eventsWithResourceName narrows a generated event set to the one resource an
+// object-resource Request-URI names.
+func eventsWithResourceName(events []store.Event, resourceName string) []store.Event {
+	for i := range events {
+		if eventResourceName(events[i]) == resourceName {
+			return []store.Event{events[i]}
+		}
+	}
+	return nil
+}
+
+// multigetHrefInScope reports whether a resolved multiget href names the
+// resource the Request-URI names. RFC 4791 §7.9 scopes a multiget run against a
+// calendar object resource to that resource, so an href naming a sibling is out
+// of scope; a collection target (empty targetResource) admits every member.
+func multigetHrefInScope(targetResource, uid string) bool {
+	return targetResource == "" || targetResource == uid
+}
+
+// calendarObjectQuery answers a calendar-query whose Request-URI is a single
+// calendar object resource (RFC 4791 §7). The filter still decides whether the
+// resource is reported, so a non-matching resource yields an empty multistatus.
+func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+	event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event")
+	}
+	var matching []store.Event
+	if event != nil {
+		matching = []store.Event{*event}
+		if filter != nil {
+			matching = h.applyCalendarFilter(matching, filter)
+		}
+		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
+		if err != nil {
+			return nil, err
+		}
+	}
+	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, requested, calData, h.multistatusBuildLimit())
 	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
 }
 
@@ -671,7 +762,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	}
 
 	responses := []response{
-		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Description, cal.Timezone, cal.Color, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
+		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Calendar, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
 	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, report.Prop, calData, h.multistatusBuildLimit()-len(responses))
 	responses = h.appendMultistatusResponses(responses, resourceResponses)

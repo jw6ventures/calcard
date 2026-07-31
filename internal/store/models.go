@@ -45,16 +45,34 @@ func (u User) ReferenceName() string {
 
 // Calendar is a CalDAV calendar belonging to a user.
 type Calendar struct {
-	ID          int64
-	UserID      int64
-	Name        string
-	Slug        *string
-	Description *string
-	Timezone    *string
-	Color       *string
-	CTag        int64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID     int64
+	UserID int64
+	Name   string
+	Slug   *string
+	// Description and DescriptionLang carry the CALDAV:calendar-description
+	// value together with the xml:lang RFC 4918 section 4.3 requires a server to
+	// return with it. A nil DescriptionLang means the value has no language tag.
+	Description     *string
+	DescriptionLang *string
+	Timezone        *string
+	Color           *string
+	// SupportedComponents lists the component names this collection accepts, as
+	// set by MKCALENDAR. Nil means the collection carries no restriction of its
+	// own and the server default applies.
+	SupportedComponents []string
+	CTag                int64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// CalendarProperties is the mutable live-property set of a calendar collection,
+// as PROPPATCH may rewrite it.
+type CalendarProperties struct {
+	Name            string
+	Description     *string
+	DescriptionLang *string
+	Timezone        *string
+	Color           *string
 }
 
 // CalendarPrivileges captures the effective collection privileges available to the current user.
@@ -293,6 +311,14 @@ type Lock struct {
 	TimeoutSeconds int
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
+}
+
+// LockPrecondition captures one write target whose active locks must be
+// satisfied inside the same transaction that performs the write.
+type LockPrecondition struct {
+	ResourcePath string
+	LookupPaths  []string
+	Tokens       []string
 }
 
 // ACLEntry represents a single access control entry (RFC 3744).

@@ -332,6 +332,9 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to create lock", http.StatusInternalServerError)
 		return
 	}
+	if created.ResourcePath != canonicalPath {
+		status = http.StatusOK
+	}
 
 	w.Header().Set("Lock-Token", "<"+token+">")
 	writeLockResponse(w, created, status)
@@ -757,6 +760,32 @@ func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, 
 		}
 	}
 	return true, nil
+}
+
+func (h *DavServer) lockPreconditions(r *http.Request, resourcePaths ...string) []store.LockPrecondition {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(resourcePaths))
+	preconditions := make([]store.LockPrecondition, 0, len(resourcePaths))
+	for _, resourcePath := range resourcePaths {
+		resourcePath = path.Clean(resourcePath)
+		if resourcePath == "." || resourcePath == "/" {
+			continue
+		}
+		if _, ok := seen[resourcePath]; ok {
+			continue
+		}
+		seen[resourcePath] = struct{}{}
+		target := h.resolveLockTarget(r, resourcePath)
+		tokenPaths := append([]string{target.requestPath, target.canonicalPath}, target.lookupPaths...)
+		preconditions = append(preconditions, store.LockPrecondition{
+			ResourcePath: target.canonicalPath,
+			LookupPaths:  append([]string(nil), target.lookupPaths...),
+			Tokens:       ifLockTokensForPaths(r.Header.Get("If"), tokenPaths...),
+		})
+	}
+	return preconditions
 }
 
 func (h *DavServer) requireLock(w http.ResponseWriter, r *http.Request, resourcePath, lockedMessage string) bool {

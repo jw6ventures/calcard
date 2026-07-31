@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -110,10 +111,21 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 }
 
 type calendarPatchState struct {
-	name        string
-	description *string
-	timezone    *string
-	color       *string
+	name            string
+	description     *string
+	descriptionLang *string
+	timezone        *string
+	color           *string
+}
+
+func (s calendarPatchState) properties() store.CalendarProperties {
+	return store.CalendarProperties{
+		Name:            s.name,
+		Description:     s.description,
+		DescriptionLang: s.descriptionLang,
+		Timezone:        s.timezone,
+		Color:           s.color,
+	}
 }
 
 type addressBookPatchState struct {
@@ -169,7 +181,7 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 		}
 	}
 
-	state := calendarPatchState{name: cal.Name, description: cal.Description, timezone: cal.Timezone, color: cal.Color}
+	state := calendarPatchState{name: cal.Name, description: cal.Description, descriptionLang: cal.DescriptionLang, timezone: cal.Timezone, color: cal.Color}
 	preflight := preflightCalendarPatch(request, target.Resource, &state)
 	if len(preflight.failures) != 0 {
 		return failedProppatchResponse(href, preflight), nil
@@ -177,7 +189,7 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 	if target.Resource {
 		err = h.store.PatchDeadProperties(ctx, canonicalPath, preflight.dead)
 	} else {
-		err = h.store.PatchCalendarProperties(ctx, calendarID, state.name, state.description, state.timezone, state.color, canonicalPath, preflight.dead)
+		err = h.store.PatchCalendarProperties(ctx, calendarID, state.properties(), canonicalPath, preflight.dead)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -223,6 +235,12 @@ func applyCalendarLivePatch(state *calendarPatchState, kind string, property pro
 		state.name = property.Text
 	case "calendar-description":
 		state.description = optionalPatchedText(property.Text, remove)
+		// RFC 4918 §4.3: the xml:lang in force for the submitted value travels
+		// with it, so PROPFIND returns the property in the language it was set.
+		state.descriptionLang = nil
+		if !remove && property.Lang != "" {
+			state.descriptionLang = stringPtr(property.Lang)
+		}
 	case "calendar-timezone":
 		if !remove && !validCalendarTimezone(property.Text) {
 			return http.StatusConflict
@@ -244,15 +262,37 @@ func applyCalendarLivePatch(state *calendarPatchState, kind string, property pro
 	return 0
 }
 
+// icalComponent is one open component while a CALDAV:calendar-timezone value is
+// being read: the properties it has declared so far and the sub-components it
+// has opened, both of which the RFC 5545 content model constrains.
+type icalComponent struct {
+	name          string
+	properties    map[string]int
+	propertyLines map[string][]calendarTimezoneProperty
+	values        map[string]string
+	children      map[string]int
+}
+
+func newICalComponent(name string) *icalComponent {
+	return &icalComponent{
+		name:          name,
+		properties:    map[string]int{},
+		propertyLines: map[string][]calendarTimezoneProperty{},
+		values:        map[string]string{},
+		children:      map[string]int{},
+	}
+}
+
+// validCalendarTimezone reports whether value is what RFC 4791 §5.2.2 and
+// §5.3.1.1 (CALDAV:valid-calendar-data) require of a CALDAV:calendar-timezone:
+// a valid iCalendar object -- so a VCALENDAR envelope carrying the properties
+// RFC 5545 §3.6 makes mandatory, not a bare component -- containing exactly one
+// VTIMEZONE built the way §3.6.5 requires. The value is stored and served back
+// verbatim, so anything accepted here is what clients later have to parse.
 func validCalendarTimezone(value string) bool {
-	lines := ical.UnfoldLines(value)
-	var stack []string
+	var stack []*icalComponent
 	rootSeen := false
-	rootType := ""
-	timezoneDepth := 0
-	timezoneCount := 0
-	hasTZID := false
-	for _, rawLine := range lines {
+	for _, rawLine := range ical.UnfoldLines(value) {
 		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
@@ -260,30 +300,25 @@ func validCalendarTimezone(value string) bool {
 		upper := strings.ToUpper(line)
 		switch {
 		case strings.HasPrefix(upper, "BEGIN:"):
-			component := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			name := strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:"))
+			if !calendarTimezoneAdmitsComponent(stack, name) {
+				return false
+			}
 			if len(stack) == 0 {
-				if rootSeen || (component != "VTIMEZONE" && component != "VCALENDAR") {
+				if rootSeen {
 					return false
 				}
 				rootSeen = true
-				rootType = component
-				if component == "VTIMEZONE" {
-					timezoneCount = 1
-					timezoneDepth = 1
-				}
-			} else if len(stack) == 1 && rootType == "VCALENDAR" {
-				if component != "VTIMEZONE" || timezoneCount != 0 {
-					return false
-				}
-				timezoneCount = 1
-				timezoneDepth = 2
-			} else if component == "VTIMEZONE" {
+			} else {
+				stack[len(stack)-1].children[name]++
+			}
+			stack = append(stack, newICalComponent(name))
+		case strings.HasPrefix(upper, "END:"):
+			name := strings.TrimSpace(strings.TrimPrefix(upper, "END:"))
+			if len(stack) == 0 || stack[len(stack)-1].name != name {
 				return false
 			}
-			stack = append(stack, component)
-		case strings.HasPrefix(upper, "END:"):
-			component := strings.TrimSpace(strings.TrimPrefix(upper, "END:"))
-			if len(stack) == 0 || stack[len(stack)-1] != component {
+			if !completeCalendarTimezoneComponent(stack[len(stack)-1]) {
 				return false
 			}
 			stack = stack[:len(stack)-1]
@@ -291,13 +326,103 @@ func validCalendarTimezone(value string) bool {
 			if len(stack) == 0 {
 				return false
 			}
-			name, _, propertyValue, ok := splitICalendarProperty(line)
-			if ok && len(stack) == timezoneDepth && stack[len(stack)-1] == "VTIMEZONE" && name == "TZID" && strings.TrimSpace(propertyValue) != "" {
-				hasTZID = true
+			property, ok := parseCalendarTimezoneProperty(line)
+			if !ok {
+				return false
+			}
+			name := property.name
+			current := stack[len(stack)-1]
+			if current.name == "VCALENDAR" && len(current.children) != 0 {
+				return false
+			}
+			current.properties[name]++
+			current.propertyLines[name] = append(current.propertyLines[name], property)
+			if _, seen := current.values[name]; !seen {
+				current.values[name] = property.value
 			}
 		}
 	}
-	return rootSeen && len(stack) == 0 && timezoneCount == 1 && hasTZID
+	return rootSeen && len(stack) == 0
+}
+
+// calendarTimezoneAdmitsComponent applies the RFC 5545 content model for the
+// only nesting a calendar-timezone value may have: one VCALENDAR holding one
+// VTIMEZONE, whose sub-components are STANDARD and DAYLIGHT.
+func calendarTimezoneAdmitsComponent(stack []*icalComponent, name string) bool {
+	switch len(stack) {
+	case 0:
+		return name == "VCALENDAR"
+	case 1:
+		// §5.2.2 admits exactly one VTIMEZONE and nothing else beside it.
+		return name == "VTIMEZONE" && stack[0].children["VTIMEZONE"] == 0
+	case 2:
+		return name == "STANDARD" || name == "DAYLIGHT"
+	default:
+		return false
+	}
+}
+
+// completeCalendarTimezoneComponent reports whether a component carries the
+// properties and sub-components RFC 5545 §3.6 and §3.6.5 make mandatory for it.
+func completeCalendarTimezoneComponent(component *icalComponent) bool {
+	if !validCalendarTimezoneComponentProperties(component) {
+		return false
+	}
+	switch component.name {
+	case "VCALENDAR":
+		// §3.6: VERSION and PRODID are required and occur once each, and §3.7.4
+		// fixes the only version this grammar describes.
+		if component.properties["VERSION"] != 1 || component.values["VERSION"] != "2.0" {
+			return false
+		}
+		if component.properties["PRODID"] != 1 || component.values["PRODID"] == "" {
+			return false
+		}
+		return component.children["VTIMEZONE"] == 1
+	case "VTIMEZONE":
+		// §3.6.5: TZID is required and occurs once, and at least one STANDARD or
+		// DAYLIGHT sub-component must be present.
+		if component.properties["TZID"] != 1 || component.values["TZID"] == "" {
+			return false
+		}
+		return component.children["STANDARD"]+component.children["DAYLIGHT"] > 0
+	case "STANDARD", "DAYLIGHT":
+		// §3.6.5: each observance declares when it starts and the offsets it
+		// moves between, once each.
+		for _, required := range []string{"DTSTART", "TZOFFSETFROM", "TZOFFSETTO"} {
+			if component.properties[required] != 1 || component.values[required] == "" {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func validUTCOffset(value string) bool {
+	if len(value) != 5 && len(value) != 7 {
+		return false
+	}
+	if value[0] != '+' && value[0] != '-' {
+		return false
+	}
+	digits := value[1:]
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	hour, _ := strconv.Atoi(digits[:2])
+	minute, _ := strconv.Atoi(digits[2:4])
+	second := 0
+	if len(digits) == 6 {
+		second, _ = strconv.Atoi(digits[4:6])
+	}
+	if hour > 23 || minute > 59 || second > 59 {
+		return false
+	}
+	return value[0] != '-' || hour != 0 || minute != 0 || second != 0
 }
 
 func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest) ([]response, error) {

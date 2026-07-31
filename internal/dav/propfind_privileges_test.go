@@ -256,7 +256,7 @@ func TestPropfindObjectPrivilegeSetPresentEmptyWithoutPrivileges(t *testing.T) {
 		href     string
 		propstat propstat
 	}{
-		{"calendar object", "/dav/calendars/5/event.ics", calendarResourcePropstat("etag-event", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")},
+		{"calendar object", "/dav/calendars/5/event.ics", etagProp("etag-event", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", true)},
 		{"address object", "/dav/addressbooks/6/alice.vcf", addressBookResourcePropstat("etag-alice", buildVCard("3.0", "UID:alice", "FN:Alice Example"))},
 	}
 	for _, tc := range cases {

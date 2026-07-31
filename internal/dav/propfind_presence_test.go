@@ -60,8 +60,8 @@ func TestFilterPropfindThreeStatePresence(t *testing.T) {
 			name: "calendar-description", href: "/dav/calendars/1/", rtype: calType, element: "cal:calendar-description",
 			sel:              propertySelection{CalendarDescription: &struct{}{}},
 			absent:           func(p *prop) { p.CalendarDescription = nil },
-			empty:            func(p *prop) { p.CalendarDescription = stringPtr("") },
-			nonEmpty:         func(p *prop) { p.CalendarDescription = stringPtr("My calendar") },
+			empty:            func(p *prop) { p.CalendarDescription = langStringPtr("", nil) },
+			nonEmpty:         func(p *prop) { p.CalendarDescription = langStringPtr("My calendar", nil) },
 			nonEmptyContains: "<cal:calendar-description>My calendar</cal:calendar-description>",
 		},
 		{

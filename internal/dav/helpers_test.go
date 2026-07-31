@@ -4,6 +4,8 @@ import (
 	"encoding/xml"
 	"strings"
 	"testing"
+
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 func TestCalendarCurrentUserPrivilegeSet_Writable(t *testing.T) {
@@ -61,7 +63,7 @@ func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
 
 func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
 	resp := calendarCollectionResponse(
-		"/dav/calendars/1/", "Test Calendar", nil, nil, nil,
+		"/dav/calendars/1/", "Test Calendar", store.Calendar{},
 		"/dav/principals/user@example.com/", "sync-token", "1", false,
 	)
 
@@ -81,7 +83,7 @@ func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
 
 func TestCalendarCollectionResponse_ReadOnlyHasFlag(t *testing.T) {
 	resp := calendarCollectionResponse(
-		"/dav/calendars/-1/", "Birthdays", nil, nil, nil,
+		"/dav/calendars/-1/", "Birthdays", store.Calendar{},
 		"/dav/principals/user@example.com/", "sync-token", "0", true,
 	)
 

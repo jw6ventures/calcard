@@ -321,7 +321,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 		Prop: prop{
 			DisplayName:             stringPtr("Calendar"),
 			ResourceType:            &resourceType{Collection: &struct{}{}, Calendar: &struct{}{}},
-			CalendarDescription:     stringPtr("Primary calendar"),
+			CalendarDescription:     langStringPtr("Primary calendar", nil),
 			CalendarTimezone:        stringPtr("BEGIN:VTIMEZONE\r\nEND:VTIMEZONE\r\n"),
 			SyncToken:               "sync-token",
 			CTag:                    "9",

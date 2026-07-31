@@ -22,9 +22,16 @@ type CalendarRepository interface {
 	GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error)
 	Create(ctx context.Context, cal Calendar) (*Calendar, error)
 	Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error
-	UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error
+	UpdateProperties(ctx context.Context, id int64, props CalendarProperties) error
 	Rename(ctx context.Context, userID, id int64, name string) error
 	Delete(ctx context.Context, userID, id int64) error
+}
+
+// CalendarStateCreator is an atomic collection-creation backend for stores
+// that do not use Store's PostgreSQL transaction. Implementations recheck the
+// supplied lock conditions immediately before creating the collection.
+type CalendarStateCreator interface {
+	CreateCalendarAndState(ctx context.Context, cal Calendar, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition, lockPath string, resourcePath func(calendarID int64) string) (*Calendar, error)
 }
 
 // EventRepository handles event storage.

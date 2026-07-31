@@ -2935,15 +2935,16 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, props store.CalendarProperties) error {
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
 	}
-	cal.Name = name
-	cal.Description = description
-	cal.Timezone = timezone
-	cal.Color = color
+	cal.Name = props.Name
+	cal.Description = props.Description
+	cal.DescriptionLang = props.DescriptionLang
+	cal.Timezone = props.Timezone
+	cal.Color = props.Color
 	return nil
 }
 

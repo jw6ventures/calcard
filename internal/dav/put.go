@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -70,6 +71,25 @@ func (h *DavServer) checkConditionalHeadersContact(r *http.Request, existing *st
 		etag = existing.ETag
 	}
 	return checkConditional(r, etag, existing != nil)
+}
+
+// calendarAcceptsComponents reports whether every top-level component type in
+// the submitted object appears in the target collection's
+// CALDAV:supported-calendar-component-set. A collection carrying no set of its
+// own falls back to the server default, which RFC 4791 §5.2.3 makes the meaning
+// of an absent property.
+func calendarAcceptsComponents(cal *store.CalendarAccess, components []calendarTopLevelComponent) bool {
+	var stored []string
+	if cal != nil {
+		stored = cal.SupportedComponents
+	}
+	allowed := calendarSupportedComponents(stored)
+	for _, component := range components {
+		if !slices.Contains(allowed, component.Type) {
+			return false
+		}
+	}
+	return true
 }
 
 var allowedCalendarComponents = map[string]struct{}{
@@ -178,7 +198,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	if existingByResource != nil {
 		requiredPrivilege = "write-content"
 	}
-	_, err = h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
+	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if err == store.ErrNotFound {
@@ -191,12 +211,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
 	missingContentType := contentType == ""
-	if contentType != "" &&
-		!strings.HasPrefix(contentType, "text/calendar") &&
-		!strings.HasPrefix(contentType, "application/ical") &&
-		!strings.HasPrefix(contentType, "application/ics") {
+	if !missingContentType && !mediaTypeAdvertised(contentType, "text/calendar", calendarDataVersions) {
 		writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
 		return
 	}
@@ -220,6 +237,12 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	_, hasFreeBusy := componentTypes["VFREEBUSY"]
 	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
 		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
+		return
+	}
+	// RFC 4791 §5.2.3 and §5.3.2.1: a component type the target collection does
+	// not list in CALDAV:supported-calendar-component-set cannot be stored there.
+	if !calendarAcceptsComponents(cal, analysis.Components) {
+		writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
 		return
 	}
 
@@ -339,8 +362,8 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 		return
 	}
 
-	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
-	if contentType != "" && !strings.HasPrefix(contentType, "text/vcard") {
+	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if contentType != "" && !mediaTypeAdvertised(contentType, "text/vcard", addressDataVersions) {
 		writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
 		return
 	}

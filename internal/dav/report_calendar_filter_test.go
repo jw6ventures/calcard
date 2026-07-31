@@ -141,6 +141,96 @@ func TestPropFilterMatchesExactPropertyName(t *testing.T) {
 	}
 }
 
+// RFC 4790 §9.2: i;ascii-casemap folds US-ASCII letters and nothing else. The
+// server advertises that collation, so text matching must not fold the
+// non-ASCII text a Unicode-aware uppercase would -- a client asking for "é"
+// would otherwise be handed events carrying "É".
+func TestTextMatchFoldsOnlyASCIICase(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  string
+		match string
+		want  bool
+	}{
+		{
+			name:  "ASCII case is folded",
+			body:  "SUMMARY:Standup\r\n",
+			match: "sTaNdUp",
+			want:  true,
+		},
+		{
+			name:  "non-ASCII case is not folded",
+			body:  "SUMMARY:CAFÉ\r\n",
+			match: "café",
+			want:  false,
+		},
+		{
+			name:  "non-ASCII matches itself exactly",
+			body:  "SUMMARY:CAFÉ\r\n",
+			match: "CAFÉ",
+			want:  true,
+		},
+		{
+			name:  "ASCII letters around non-ASCII still fold",
+			body:  "SUMMARY:Café Meeting\r\n",
+			match: "Café MEETING",
+			want:  true,
+		},
+	}
+
+	h := &DavServer{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := store.Event{
+				UID:     "collation",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:collation\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
+			}
+			filter := calQueryWithPropFilter(propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: tt.match}})
+			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+				t.Fatalf("eventMatchesFilter = %v, want %v matching %q against %q", got, tt.want, tt.match, tt.body)
+			}
+		})
+	}
+}
+
+func TestValidCalendarFilterCollations(t *testing.T) {
+	tests := map[string]struct {
+		collation string
+		want      bool
+	}{
+		"absent attribute defaults to i;ascii-casemap": {collation: "", want: true},
+		"the advertised collation":                     {collation: "i;ascii-casemap", want: true},
+		"identifiers are case-insensitive":             {collation: "I;ASCII-CASEMAP", want: true},
+		"the default alias":                            {collation: "default", want: true},
+		"an unadvertised collation":                    {collation: "i;unicode-casemap", want: false},
+		"i;octet is not implemented yet":               {collation: "i;octet", want: false},
+		"an unknown identifier":                        {collation: "i;made-up", want: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			match := &textMatch{Text: "standup", Collation: tt.collation}
+
+			propScoped := calQueryWithPropFilter(propFilter{Name: "SUMMARY", TextMatch: match})
+			if got := validCalendarFilterCollations(propScoped); got != tt.want {
+				t.Errorf("prop-filter collation %q = %v, want %v", tt.collation, got, tt.want)
+			}
+
+			compScoped := &calFilter{CompFilter: compFilter{
+				Name:       "VCALENDAR",
+				CompFilter: []compFilter{{Name: "VEVENT", TextMatch: match}},
+			}}
+			if got := validCalendarFilterCollations(compScoped); got != tt.want {
+				t.Errorf("comp-filter collation %q = %v, want %v", tt.collation, got, tt.want)
+			}
+		})
+	}
+
+	if !validCalendarFilterCollations(nil) {
+		t.Error("a calendar-query with no filter names no collation, so it is valid")
+	}
+}
+
 func TestEffectiveTimeRangeWalksNestedCompFilter(t *testing.T) {
 	tr := effectiveTimeRange(calQueryWithTimeRange("20260601T000000Z", "20260701T000000Z"))
 	if tr == nil {

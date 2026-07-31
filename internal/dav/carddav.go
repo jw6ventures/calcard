@@ -439,7 +439,7 @@ func filterVCardData(raw string, query *addressDataQuery) string {
 func collationFold(s, collation string) string {
 	switch strings.ToLower(strings.TrimSpace(collation)) {
 	case "i;ascii-casemap":
-		return strings.ToUpper(s)
+		return asciiCasemapFold(s)
 	default:
 		return cases.Fold().String(s)
 	}

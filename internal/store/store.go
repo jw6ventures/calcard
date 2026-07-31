@@ -16,6 +16,7 @@ type Store struct {
 
 	Users            UserRepository
 	Calendars        CalendarRepository
+	CalendarState    CalendarStateCreator
 	Events           EventRepository
 	AddressBooks     AddressBookRepository
 	Contacts         ContactRepository

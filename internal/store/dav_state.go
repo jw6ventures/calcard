@@ -5,7 +5,176 @@ import (
 	"database/sql"
 	"path"
 	"strings"
+	"time"
+
+	"github.com/lib/pq"
 )
+
+// CreateCalendarAndState creates a calendar collection together with the DAV
+// state bound to it at creation time: the dead properties the request set, and
+// any lock held on the Request-URI, which moves to the new collection's
+// canonical path. The transaction serializes and rechecks the supplied lock
+// conditions before writing. RFC 4791 §5.3.1 makes MKCALENDAR all-or-none, so
+// every state change shares one transaction; a failure anywhere leaves no
+// collection, no dead property rows, and the lock still on its original path.
+// resourcePath maps the new calendar's ID to that canonical path, which the
+// insert is what determines. A store without a connection pool must provide an
+// atomic CalendarState backend whenever dead properties or locks are part of
+// the operation; best-effort compensation cannot satisfy the all-or-none rule.
+func (s *Store) CreateCalendarAndState(ctx context.Context, cal Calendar, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition, lockPath string, resourcePath func(calendarID int64) string) (*Calendar, error) {
+	if s == nil || s.Calendars == nil {
+		return nil, ErrNotFound
+	}
+	if s.pool == nil {
+		if s.CalendarState != nil {
+			return s.CalendarState.CreateCalendarAndState(ctx, cal, dead, lockPreconditions, lockPath, resourcePath)
+		}
+		if len(dead) != 0 || len(lockPreconditions) != 0 || s.Locks != nil {
+			return nil, ErrAtomicStateUnsupported
+		}
+		return s.Calendars.Create(ctx, cal)
+	}
+
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return nil, err
+	}
+	created, err := createCalendarTx(ctx, tx, cal)
+	if err != nil {
+		return nil, err
+	}
+	statePath := resourcePath(created.ID)
+	if len(dead) != 0 {
+		if err := applyDeadPropertyMutationsTx(ctx, tx, statePath, dead); err != nil {
+			return nil, err
+		}
+	}
+	if err := moveLocksTx(ctx, tx, lockPath, statePath); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition) error {
+	if len(preconditions) == 0 {
+		return nil
+	}
+	serialized := make(map[string]struct{})
+	for _, precondition := range preconditions {
+		for _, resourcePath := range lockSerializationPaths(precondition.ResourcePath) {
+			if _, seen := serialized[resourcePath]; seen {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
+				return err
+			}
+			serialized[resourcePath] = struct{}{}
+		}
+	}
+
+	lookupSet := make(map[string]struct{})
+	var lookupPaths []string
+	for _, precondition := range preconditions {
+		for _, resourcePath := range precondition.LookupPaths {
+			resourcePath = path.Clean(resourcePath)
+			if resourcePath == "." {
+				continue
+			}
+			if _, seen := lookupSet[resourcePath]; seen {
+				continue
+			}
+			lookupSet[resourcePath] = struct{}{}
+			lookupPaths = append(lookupPaths, resourcePath)
+		}
+	}
+	if len(lookupPaths) == 0 {
+		return nil
+	}
+
+	const query = `SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`
+	rows, err := tx.QueryContext(ctx, query, pq.Array(lookupPaths))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var locks []Lock
+	for rows.Next() {
+		var lock Lock
+		if err := rows.Scan(&lock.Token, &lock.ResourcePath, &lock.Depth, &lock.ExpiresAt); err != nil {
+			return err
+		}
+		locks = append(locks, lock)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !LockPreconditionsSatisfied(preconditions, locks) {
+		return ErrLockConflict
+	}
+	return nil
+}
+
+// LockPreconditionsSatisfied applies the write-lock conditions captured by the
+// DAV layer. Atomic non-PostgreSQL CalendarStateCreator implementations use the
+// same check immediately before they create the collection.
+func LockPreconditionsSatisfied(preconditions []LockPrecondition, locks []Lock) bool {
+	now := time.Now()
+	for _, precondition := range preconditions {
+		lookupPaths := make(map[string]struct{}, len(precondition.LookupPaths))
+		for _, resourcePath := range precondition.LookupPaths {
+			lookupPaths[path.Clean(resourcePath)] = struct{}{}
+		}
+		tokens := make(map[string]struct{}, len(precondition.Tokens))
+		for _, token := range precondition.Tokens {
+			tokens[token] = struct{}{}
+		}
+
+		active := false
+		satisfied := false
+		resourcePath := path.Clean(precondition.ResourcePath)
+		for _, lock := range locks {
+			if !lock.ExpiresAt.IsZero() && lock.ExpiresAt.Before(now) {
+				continue
+			}
+			lockPath := path.Clean(lock.ResourcePath)
+			if _, applies := lookupPaths[lockPath]; !applies {
+				continue
+			}
+			if lockPath != resourcePath && lock.Depth != "infinity" {
+				continue
+			}
+			active = true
+			if _, ok := tokens[lock.Token]; ok {
+				satisfied = true
+				break
+			}
+		}
+		if active && !satisfied {
+			return false
+		}
+	}
+	return true
+}
+
+func moveLocksTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
+	if fromPath == "" || toPath == "" || fromPath == toPath {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`, toPath); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`, toPath, fromPath)
+	return err
+}
 
 func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, uid, resourcePath string) error {
 	if s == nil || s.pool == nil {

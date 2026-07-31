@@ -18,6 +18,10 @@ var ErrLockConflict = errors.New("lock conflict")
 // ErrConflict indicates the requested change conflicts with an existing record.
 var ErrConflict = errors.New("record conflict")
 
+// ErrAtomicStateUnsupported means a repository configuration cannot make a
+// collection and its DAV state visible as one indivisible operation.
+var ErrAtomicStateUnsupported = errors.New("atomic DAV state operation unsupported")
+
 // isConnError reports whether err indicates a database connectivity problem
 // (the server is unreachable, the connection was dropped, or the pool is
 // closed) as opposed to an ordinary query-level failure such as a constraint

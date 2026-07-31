@@ -67,11 +67,23 @@ func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, 
 
 func rawCalendarResourceReportResponse(href string, event store.Event, requested *reportProp, calData *calendarDataEl) response {
 	rawData := filterICalendarData(event.RawICAL, calData)
-	propertyStatus := etagProp(event.ETag, rawData, true)
-	if requested != nil && requested.SupportedReportSet != nil {
-		propertyStatus.Prop.SupportedReportSet = &supportedReportSet{}
+	return resourceResponse(href, etagProp(event.ETag, rawData, true))
+}
+
+func buildCalendarObjectExpandPropertyResponse(href string, event store.Event, req *expandPropertyRequest) response {
+	resp := resourceResponse(href, etagProp(event.ETag, event.RawICAL, true))
+	selections := expandPropertySelections(req)
+	var notFound prop
+	if selections.CurrentUserPrincipal != nil {
+		notFound.CurrentUserPrincipal = &expandableHrefProp{}
 	}
-	return resourceResponse(href, propertyStatus)
+	if selections.PrincipalURL != nil {
+		notFound.PrincipalURL = &expandableHrefProp{}
+	}
+	if notFound.CurrentUserPrincipal != nil || notFound.PrincipalURL != nil {
+		resp.Propstat = append(resp.Propstat, propstat{Prop: notFound, Status: httpStatusNotFound})
+	}
+	return resp
 }
 
 func propfindRequestForReport(requested *reportProp, calendarData bool, addressData *addressDataQuery) *propfindRequest {

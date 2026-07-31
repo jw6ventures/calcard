@@ -82,15 +82,15 @@ func TestPatchCalendarPropertiesRollsBackLiveChangeWhenDeadPropertyFails(t *test
 
 	st := New(db)
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5`)).
-		WithArgs("Renamed", nil, nil, nil, int64(5)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET name=$1, description=$2, description_lang=$3, timezone=$4, color=$5, updated_at=NOW() WHERE id=$6`)).
+		WithArgs("Renamed", nil, nil, nil, nil, int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO dav_dead_properties`).
 		WithArgs("/dav/calendars/5", "urn:test", "note", "value").
 		WillReturnError(errors.New("dead property write failed"))
 	mock.ExpectRollback()
 
-	err = st.PatchCalendarProperties(context.Background(), 5, "Renamed", nil, nil, nil, "/dav/calendars/5", []DeadPropertyMutation{{NamespaceURI: "urn:test", LocalName: "note", InnerXML: "value"}})
+	err = st.PatchCalendarProperties(context.Background(), 5, CalendarProperties{Name: "Renamed"}, "/dav/calendars/5", []DeadPropertyMutation{{NamespaceURI: "urn:test", LocalName: "note", InnerXML: "value"}})
 	if err == nil {
 		t.Fatal("PatchCalendarProperties() error = nil, want rollback error")
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -232,7 +233,7 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil, nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", "", nil, nil)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -259,7 +260,7 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil, nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", "", nil, nil)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -341,7 +342,7 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
-	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -373,7 +374,7 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, now.Add(-time.Hour)),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -405,7 +406,7 @@ func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
 	if !errors.Is(err, errInvalidSyncToken) {
 		t.Fatalf("expected errInvalidSyncToken, got %v", err)
 	}
@@ -679,8 +680,8 @@ func TestPropfindRootIncludesPrincipalAndHomes(t *testing.T) {
 	ms.assertHrefs(t, "/dav/", "/dav/calendars/", "/dav/addressbooks/", "/dav/principals/1/")
 
 	principal := ms.responseForHref(t, "/dav/principals/1/")
-	principal.assertPropHrefs(t, calQN("calendar-home-set"), "/dav/calendars/")
-	principal.assertPropHrefs(t, qn(nsCardDAV, "addressbook-home-set"), "/dav/addressbooks/")
+	principal.assertPropAbsent(t, calQN("calendar-home-set"))
+	principal.assertPropAbsent(t, qn(nsCardDAV, "addressbook-home-set"))
 }
 
 func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
@@ -898,7 +899,7 @@ func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", "", report)
 	if !errors.Is(err, errUnsupportedReport) {
 		t.Fatalf("calendarReportResponses error = %v, want errUnsupportedReport", err)
 	}
@@ -1767,7 +1768,9 @@ func TestMkcalendarRequiresParentCollectionLockToken(t *testing.T) {
 			},
 		},
 	}
-	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
@@ -1908,7 +1911,7 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, then),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -2241,34 +2244,20 @@ func TestMkcolValidatesPathAndName(t *testing.T) {
 	}
 }
 
-func TestMkcalendarValidatesPathAndName(t *testing.T) {
+// A Request-URI that cannot host a calendar collection fails the RFC 4791
+// §5.3.1.1 location precondition; TestRFC4791_MkcalendarInvalidPath covers the
+// error body and status split, so this case pins the slug rule CalCard adds on
+// top of it.
+func TestMkcalendarRejectsSlugUnsafeName(t *testing.T) {
 	h := &DavServer{}
 	u := &store.User{ID: 1}
-	// unsupported path
-	req := httptest.NewRequest("MKCALENDAR", "/dav/addressbooks/bad", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr := httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unsupported mkcalendar path, got %d", rr.Code)
-	}
 
-	// missing name
-	req = httptest.NewRequest("MKCALENDAR", "/dav/calendars/", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr = httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for missing calendar name, got %d", rr.Code)
-	}
-
-	// numeric name
-	req = httptest.NewRequest("MKCALENDAR", "/dav/calendars/123", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr = httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for numeric calendar name, got %d", rr.Code)
+	for _, path := range []string{"/dav/calendars/-leading-hyphen", "/dav/calendars/spaced%20name"} {
+		req := httptest.NewRequest("MKCALENDAR", path, nil)
+		req = req.WithContext(auth.WithUser(req.Context(), u))
+		rr := httptest.NewRecorder()
+		h.Mkcalendar(rr, req)
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("calendar-collection-location-ok"))
 	}
 }
 
@@ -2566,7 +2555,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", nil, nil, nil)
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -2969,7 +2958,7 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	brokenRepo := &errorEventRepo{}
 	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
-	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", nil, nil)
+	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -5063,7 +5052,9 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	calRepo := &fakeCalendarRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -5130,6 +5121,43 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 
 	if withTokenRR.Code != http.StatusMultiStatus {
 		t.Fatalf("expected PROPPATCH with the lock token to succeed after MKCALENDAR, got %d: %s", withTokenRR.Code, withTokenRR.Body.String())
+	}
+}
+
+func TestMkcalendarRechecksLocksInsideAtomicCreation(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	calRepo := &fakeCalendarRepo{}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	stateCreator := &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	stateCreator.beforeCreate = func() {
+		lockRepo.locks["opaquelocktoken:concurrent"] = &store.Lock{
+			Token:        "opaquelocktoken:concurrent",
+			ResourcePath: pendingCollectionPath("/dav/calendars", user.ID, "work"),
+			UserID:       user.ID,
+			LockScope:    "exclusive",
+			LockType:     "write",
+			Depth:        "0",
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+	}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo, CalendarState: stateCreator}
+	h := &DavServer{store: st}
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusLocked {
+		t.Fatalf("MKCALENDAR racing with LOCK = %d, want 423; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(calRepo.calendars) != 0 {
+		t.Fatalf("MKCALENDAR racing with LOCK created calendars: %#v", calRepo.calendars)
+	}
+	lock := lockRepo.locks["opaquelocktoken:concurrent"]
+	if lock == nil || lock.ResourcePath != pendingCollectionPath("/dav/calendars", user.ID, "work") {
+		t.Fatalf("concurrent lock was moved or lost: %#v", lock)
 	}
 }
 
@@ -7507,7 +7535,9 @@ func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) 
 func TestMkcalendarIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
 	lockRepo := &fakeLockRepo{}
 	calRepo := &fakeCalendarRepo{}
-	h := &DavServer{store: &store.Store{Locks: lockRepo, Calendars: calRepo}}
+	st := &store.Store{Locks: lockRepo, Calendars: calRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -8199,6 +8229,91 @@ type fakeCalendarRepo struct {
 	calendars           map[int64]*store.Calendar
 	listAccessibleCalls int
 	getByIDCalls        int
+	deleteErr           error
+}
+
+type fakeCalendarStateCreator struct {
+	calendars    *fakeCalendarRepo
+	dead         *fakeDeadPropertyRepo
+	locks        *fakeLockRepo
+	beforeCreate func()
+}
+
+func (f *fakeCalendarStateCreator) CreateCalendarAndState(ctx context.Context, cal store.Calendar, dead []store.DeadPropertyMutation, lockPreconditions []store.LockPrecondition, lockPath string, resourcePath func(calendarID int64) string) (*store.Calendar, error) {
+	if f.beforeCreate != nil {
+		f.beforeCreate()
+	}
+	calendarSnapshot := make(map[int64]*store.Calendar, len(f.calendars.calendars))
+	for id, existing := range f.calendars.calendars {
+		copy := *existing
+		calendarSnapshot[id] = &copy
+	}
+	accessibleSnapshot := append([]store.CalendarAccess(nil), f.calendars.accessible...)
+
+	var deadSnapshot map[string]map[string]store.DeadProperty
+	if f.dead != nil {
+		deadSnapshot = make(map[string]map[string]store.DeadProperty, len(f.dead.properties))
+		for resourcePath, properties := range f.dead.properties {
+			deadSnapshot[resourcePath] = make(map[string]store.DeadProperty, len(properties))
+			for name, property := range properties {
+				deadSnapshot[resourcePath][name] = property
+			}
+		}
+	}
+
+	var lockSnapshot map[string]*store.Lock
+	if f.locks != nil {
+		lockSnapshot = make(map[string]*store.Lock, len(f.locks.locks))
+		for token, lock := range f.locks.locks {
+			copy := *lock
+			lockSnapshot[token] = &copy
+		}
+	}
+
+	restore := func() {
+		f.calendars.calendars = calendarSnapshot
+		f.calendars.accessible = accessibleSnapshot
+		if f.dead != nil {
+			f.dead.properties = deadSnapshot
+		}
+		if f.locks != nil {
+			f.locks.locks = lockSnapshot
+		}
+	}
+
+	if f.locks != nil {
+		locks := make([]store.Lock, 0, len(f.locks.locks))
+		for _, lock := range f.locks.locks {
+			locks = append(locks, *lock)
+		}
+		if !store.LockPreconditionsSatisfied(lockPreconditions, locks) {
+			return nil, store.ErrLockConflict
+		}
+	}
+
+	created, err := f.calendars.Create(ctx, cal)
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	statePath := resourcePath(created.ID)
+	if len(dead) != 0 {
+		if f.dead == nil {
+			restore()
+			return nil, store.ErrNotFound
+		}
+		if err := f.dead.Apply(ctx, statePath, dead); err != nil {
+			restore()
+			return nil, err
+		}
+	}
+	if f.locks != nil {
+		if err := f.locks.MoveResourcePath(ctx, lockPath, statePath); err != nil {
+			restore()
+			return nil, err
+		}
+	}
+	return created, nil
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
@@ -8280,15 +8395,31 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, props store.CalendarProperties) error {
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
 	}
-	cal.Name = name
-	cal.Description = description
-	cal.Timezone = timezone
-	cal.Color = color
+	cal.Name = props.Name
+	cal.Description = props.Description
+	cal.DescriptionLang = props.DescriptionLang
+	cal.Timezone = props.Timezone
+	cal.Color = props.Color
+	// The accessible view holds copies, so it is updated alongside the record a
+	// PROPFIND after a PROPPATCH would otherwise read stale.
+	for i := range f.accessible {
+		if f.accessible[i].ID == id {
+			f.accessible[i].Calendar = *cal
+		}
+	}
+	for userID := range f.accessibleByUser {
+		entries := f.accessibleByUser[userID]
+		for i := range entries {
+			if entries[i].ID == id {
+				entries[i].Calendar = *cal
+			}
+		}
+	}
 	return nil
 }
 
@@ -8297,6 +8428,9 @@ func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name st
 }
 
 func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
@@ -8305,6 +8439,11 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 		return store.ErrNotFound
 	}
 	delete(f.calendars, id)
+	// Create publishes the calendar into the accessible view, so Delete has to
+	// retract it there too or a later read still sees the removed collection.
+	f.accessible = slices.DeleteFunc(f.accessible, func(access store.CalendarAccess) bool {
+		return access.ID == id
+	})
 	return nil
 }
 
@@ -8660,7 +8799,13 @@ func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	// RFC 4791 §5.2.3 keeps the property out of DAV:allprop, so it is requested
+	// by name here.
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop><cal:supported-calendar-component-set/></d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -9760,32 +9905,33 @@ func TestCalendarPropertiesIncludeLimits(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	// RFC 4791 §5.2.5 through §5.2.9 keep the limit properties out of
+	// DAV:allprop, so they are requested by name.
+	request := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <cal:max-resource-size/>
+    <cal:min-date-time/>
+    <cal:max-date-time/>
+    <cal:max-instances/>
+    <cal:max-attendees-per-instance/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(request))
 	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-
-	// Check for required calendar properties
-	expectedProps := []string{
-		"<cal:max-resource-size>",
-		"<cal:min-date-time>",
-		"<cal:max-date-time>",
-		"<cal:max-instances>",
-		"<cal:max-attendees-per-instance>",
-	}
-
-	for _, prop := range expectedProps {
-		if !strings.Contains(body, prop) {
-			t.Errorf("missing required property %s in response: %s", prop, body)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropstatNames(t, http.StatusOK,
+		calQN("max-resource-size"),
+		calQN("min-date-time"),
+		calQN("max-date-time"),
+		calQN("max-instances"),
+		calQN("max-attendees-per-instance"),
+	)
 }
 
 func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
@@ -10217,24 +10363,23 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
+	// RFC 4791 §7 makes calendar-query and calendar-multiget available on a
+	// calendar object resource, so only the collection-scoped reports are
+	// refused there. A refused report answers DAV:supported-report (RFC 3253
+	// §3.6) unless the report has a rule of its own, as free-busy-query does.
 	testCases := []struct {
 		name         string
 		path         string
 		reportType   string
 		body         string
+		condition    xml.Name
 		errorMessage string
 	}{
 		{
-			name:         "calendar-query on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "calendar-query",
-			errorMessage: "calendar reports not allowed on calendar object resources",
-		},
-		{
-			name:         "sync-collection on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "sync-collection",
-			errorMessage: "REPORT not allowed on calendar object resources",
+			name:       "sync-collection on resource path",
+			path:       "/dav/calendars/1/event.ics",
+			reportType: "sync-collection",
+			condition:  davQN("supported-report"),
 		},
 		{
 			name:       "free-busy-query on resource path",
@@ -10261,6 +10406,10 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 
 			h.Report(rr, req)
 
+			if tc.condition.Local != "" {
+				assertErrorConditions(t, rr, http.StatusForbidden, tc.condition)
+				return
+			}
 			if rr.Code != http.StatusForbidden {
 				t.Errorf("expected 403 Forbidden, got %d: %s", rr.Code, rr.Body.String())
 			}

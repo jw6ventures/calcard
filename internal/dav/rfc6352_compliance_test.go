@@ -1610,6 +1610,57 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 		assertCardDAVErrorBody(t, rr.Body.String(), "supported-address-data")
 	})
 
+	// Section 6.3.2.1 with §6.2.2: PUT admits exactly the media type
+	// CARDDAV:supported-address-data advertises. A prefix match on the header
+	// lets through types the collection never claimed to hold.
+	t.Run("Section6_3_2_1_MediaTypeMatchesTheAdvertisedAddressData", func(t *testing.T) {
+		accepted := map[string]string{
+			"the advertised type":      "text/vcard",
+			"with a charset parameter": "text/vcard; charset=utf-8",
+			"an advertised version":    "text/vcard; version=3.0",
+			"the other advertised one": "text/vcard; version=4.0",
+			"case-insensitive type":    "TEXT/VCard",
+		}
+		refused := map[string]string{
+			"an unadvertised version":          "text/vcard; version=2.1",
+			"a longer type sharing the prefix": "text/vcardjunk",
+			"the legacy directory type":        "text/directory",
+			"calendar data":                    "text/calendar",
+			"an unparseable header":            "text/vcard;;",
+		}
+		vcard := buildVCard("3.0", "UID:media-type", "FN:Media Type")
+
+		for name, contentType := range accepted {
+			t.Run("accepted/"+name, func(t *testing.T) {
+				h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
+				req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/media-type.vcf", strings.NewReader(vcard))
+				req.Header.Set("Content-Type", contentType)
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				h.Put(rr, req)
+
+				if rr.Code != http.StatusCreated {
+					t.Errorf("PUT with Content-Type %q = %d, want 201; body: %s", contentType, rr.Code, rr.Body.String())
+				}
+			})
+		}
+
+		for name, contentType := range refused {
+			t.Run("refused/"+name, func(t *testing.T) {
+				h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
+				req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/media-type.vcf", strings.NewReader(vcard))
+				req.Header.Set("Content-Type", contentType)
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				h.Put(rr, req)
+
+				assertCardDAVPreconditionStatus(t, rr, http.StatusUnsupportedMediaType, "supported-address-data")
+			})
+		}
+	})
+
 	t.Run("Section6_3_2_1_RejectsInvalidVCardData", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}

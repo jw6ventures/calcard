@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.9')
+VALUES ('version', 'v1.1.10')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -390,3 +390,12 @@ ALTER TABLE contacts
 
 CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
     ON contacts (object_acl_path);
+
+-- description_lang holds the xml:lang attribute RFC 4918 section 4.3 requires a
+-- server to return with the property value it was set with; NULL means the
+-- calendar description carries no language tag. supported_components holds the
+-- component names a calendar collection accepts, as set by MKCALENDAR; NULL
+-- means the collection imposes no restriction of its own and the server default
+-- applies.
+ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT;
+ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];

@@ -25,7 +25,7 @@ func birthdayCalendarSyncToken() string {
 
 func birthdayCalendarCollection(href, principalHref string) response {
 	description := birthdayCalendarDescription
-	return calendarCollectionResponse(href, birthdayCalendarName, &description, nil, nil, principalHref, birthdayCalendarSyncToken(), "0", true)
+	return calendarCollectionResponse(href, birthdayCalendarName, store.Calendar{Description: &description}, principalHref, birthdayCalendarSyncToken(), "0", true)
 }
 
 func isBirthdayCalendarTarget(target davTarget) bool {
@@ -149,21 +149,36 @@ func escapeICalText(s string) string {
 	return s
 }
 
-func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
+// birthdayCalendarReportResponses runs one REPORT against the virtual birthday
+// collection. targetResource names a single generated resource when the
+// Request-URI is an object resource rather than the collection.
+func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath, targetResource string, report reportRequest) ([]response, string, error) {
 	events, err := h.generateBirthdayEvents(ctx, user.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate birthday events")
 	}
+	// Response hrefs are built from the collection, so an object-resource
+	// Request-URI narrows the candidate set instead of moving the base href.
+	collectionPath := cleanPath
+	if targetResource != "" {
+		events = eventsWithResourceName(events, targetResource)
+		if len(events) == 0 {
+			// RFC 4791 §7: the Request-URI names no resource here, so there is
+			// nothing for the report to run against.
+			return nil, "", store.ErrNotFound
+		}
+		collectionPath = birthdayCalendarHref()
+	}
 
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, cleanPath, report.Prop, reportCalendarData(report))
+		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, cleanPath, collectionPath, targetResource, report.Prop, reportCalendarData(report))
 		return res, "", err
 	case "calendar-query":
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
-		res, err := h.calendarResourceReportResponses(ctx, user, cleanPath, events, report.Prop, reportCalendarData(report))
+		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.Prop, reportCalendarData(report))
 		return res, "", err
 	case "free-busy-query":
 		if report.Filter != nil {
@@ -204,9 +219,9 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	}
 }
 
-func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, cleanPath string, requested *reportProp, calData *calendarDataEl) ([]response, error) {
+func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, resolvePath, collectionPath, targetResource string, requested *reportProp, calData *calendarDataEl) ([]response, error) {
 	if len(hrefs) == 0 {
-		return h.calendarResourceReportResponses(ctx, user, cleanPath, events, requested, calData)
+		return h.calendarResourceReportResponses(ctx, user, collectionPath, events, requested, calData)
 	}
 
 	eventsByUID := make(map[string]store.Event)
@@ -219,12 +234,12 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 		if h.multistatusBuildComplete(responses) {
 			break
 		}
-		cleanHref := resolveDAVHref(cleanPath, href)
+		cleanHref := resolveDAVHref(resolvePath, href)
 		// Birthday calendar uses numeric-only parsing (special virtual calendar with constant ID -1)
 		id, uid, ok := parseResourcePath(cleanHref, calendarPrefix)
 		// RFC 4791 §7.9: an unresolvable or out-of-scope href still owes the client a DAV:response.
-		if cleanHref == "" || !ok || id != birthdayCalendarID {
-			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, cleanPath), Status: httpStatusNotFound})
+		if cleanHref == "" || !ok || id != birthdayCalendarID || !multigetHrefInScope(targetResource, uid) {
+			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, collectionPath), Status: httpStatusNotFound})
 			continue
 		}
 		ev, found := eventsByUID[uid]

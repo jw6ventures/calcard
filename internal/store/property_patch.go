@@ -5,12 +5,12 @@ import (
 	"database/sql"
 )
 
-func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, name string, description, timezone, color *string, resourcePath string, dead []DeadPropertyMutation) error {
+func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, props CalendarProperties, resourcePath string, dead []DeadPropertyMutation) error {
 	if s == nil || s.Calendars == nil {
 		return ErrNotFound
 	}
 	if s.pool == nil {
-		if err := s.Calendars.UpdateProperties(ctx, calendarID, name, description, timezone, color); err != nil {
+		if err := s.Calendars.UpdateProperties(ctx, calendarID, props); err != nil {
 			return err
 		}
 		if s.DeadProperties != nil {
@@ -24,7 +24,7 @@ func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, n
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE calendars SET name=$1, description=$2, timezone=$3, color=$4, updated_at=NOW() WHERE id=$5`, name, description, timezone, color, calendarID)
+	result, err := tx.ExecContext(ctx, `UPDATE calendars SET name=$1, description=$2, description_lang=$3, timezone=$4, color=$5, updated_at=NOW() WHERE id=$6`, props.Name, props.Description, props.DescriptionLang, props.Timezone, props.Color, calendarID)
 	if err != nil {
 		return err
 	}

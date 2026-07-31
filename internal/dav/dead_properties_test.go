@@ -15,6 +15,7 @@ import (
 type fakeDeadPropertyRepo struct {
 	properties map[string]map[string]store.DeadProperty
 	listCalls  int
+	applyErr   error
 }
 
 func TestCopyMoveDeleteDeadPropertyLifecycle(t *testing.T) {
@@ -205,6 +206,9 @@ func (f *fakeDeadPropertyRepo) ListByResources(_ context.Context, paths []string
 }
 
 func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
+	if f.applyErr != nil {
+		return f.applyErr
+	}
 	if f.properties == nil {
 		f.properties = make(map[string]map[string]store.DeadProperty)
 	}
@@ -590,27 +594,235 @@ func TestProppatchRejectsInvalidCalendarTimezoneAtomically(t *testing.T) {
 	}
 }
 
-func TestValidCalendarTimezoneAcceptsBareAndCalendarWrappedValues(t *testing.T) {
+// RFC 4791 §5.2.2 makes a CALDAV:calendar-timezone value an iCalendar object
+// containing exactly one VTIMEZONE, so the VCALENDAR envelope is required and a
+// bare component is not a valid value.
+// standardObservance is the minimal RFC 5545 §3.6.5 STANDARD sub-component: the
+// three properties an observance must declare and nothing else.
+const standardObservance = "BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"
+
+// wrapTimezoneValue builds a calendar-timezone value: a complete VCALENDAR
+// holding one VTIMEZONE whose sub-components are the given body.
+func wrapTimezoneValue(observances string) string {
+	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+		"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + observances +
+		"END:VTIMEZONE\r\nEND:VCALENDAR\r\n"
+}
+
+func TestValidCalendarTimezoneRequiresWrappedSingleVTimezone(t *testing.T) {
 	tests := []struct {
 		name  string
 		value string
+		want  bool
 	}{
 		{
-			name: "bare VTIMEZONE",
-			value: "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" +
-				"BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n" +
-				"END:VTIMEZONE\r\n",
+			name:  "VCALENDAR wrapper",
+			value: wrapTimezoneValue(standardObservance),
+			want:  true,
 		},
 		{
-			name: "VCALENDAR wrapper",
+			name:  "a second observance is allowed",
+			value: wrapTimezoneValue(standardObservance + "BEGIN:DAYLIGHT\r\nDTSTART:19700308T020000\r\nTZOFFSETFROM:-0600\r\nTZOFFSETTO:-0500\r\nEND:DAYLIGHT\r\n"),
+			want:  true,
+		},
+		{
+			name: "valid optional timezone properties",
 			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
-				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nLAST-MODIFIED:20260730T120000Z\r\nTZURL:https://example.test/timezones/chicago.ics\r\n" +
+				"BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\n" +
+				"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nRDATE:19711107T020000\r\nTZNAME:CST\r\nCOMMENT:Standard time\r\n" +
+				"END:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: true,
+		},
+		{
+			name: "bare VTIMEZONE is not an iCalendar object",
+			value: "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance +
+				"END:VTIMEZONE\r\n",
+			want: false,
+		},
+		{
+			name: "two VTIMEZONE components",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:Europe/London\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name: "VCALENDAR property after its component",
+			value: "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" +
+				standardObservance + "END:VTIMEZONE\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name:  "no VTIMEZONE at all",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\nEND:VCALENDAR\r\n",
+			want:  false,
+		},
+		{
+			name: "VTIMEZONE without a TZID",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		// RFC 5545 §3.6: VERSION and PRODID are required of every iCalendar
+		// object and occur once each. A value missing them is not one, however
+		// well-formed the VTIMEZONE inside it is.
+		{
+			name: "VCALENDAR without VERSION",
+			value: "BEGIN:VCALENDAR\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name: "VCALENDAR without PRODID",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name: "VCALENDAR naming another iCalendar version",
+			value: "BEGIN:VCALENDAR\r\nVERSION:1.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name: "VCALENDAR repeating VERSION",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		// RFC 5545 §3.6.5: a VTIMEZONE carries at least one observance, and each
+		// observance says when it starts and which offsets it moves between.
+		{
+			name:  "VTIMEZONE with no observance",
+			value: wrapTimezoneValue(""),
+			want:  false,
+		},
+		{
+			name: "VTIMEZONE repeating TZURL",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nTZURL:https://example.test/one\r\nTZURL:https://example.test/two\r\n" +
+				standardObservance + "END:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name:  "VTIMEZONE carrying a disallowed standard property",
+			value: wrapTimezoneValue("SUMMARY:not allowed here\r\n" + standardObservance),
+			want:  false,
+		},
+		{
+			name:  "observance without DTSTART",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance without TZOFFSETTO",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with an empty TZOFFSETFROM",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with a malformed DTSTART",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:not-a-date\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance DTSTART must be local time",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000Z\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance DTSTART cannot carry TZID",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART;TZID=America/Chicago:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with a malformed TZOFFSETFROM",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:garbage\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with an out of range TZOFFSETTO",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:+2460\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with negative zero UTC offset",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance repeating RRULE",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nRRULE:FREQ=YEARLY\r\nRRULE:FREQ=MONTHLY\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with malformed RRULE",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nRRULE:not-a-rule\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance RRULE UNTIL must be UTC",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nRRULE:FREQ=YEARLY;UNTIL=20061029T020000\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance RRULE finite end must use UNTIL",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nRRULE:FREQ=YEARLY;COUNT=10\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with malformed RDATE",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nRDATE:not-a-date\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with malformed parameter syntax",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART;VALUE:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "observance with an unescaped text delimiter",
+			value: wrapTimezoneValue("BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nCOMMENT:one;two\r\nEND:STANDARD\r\n"),
+			want:  false,
+		},
+		{
+			name:  "an unknown sub-component",
+			value: wrapTimezoneValue(standardObservance + "BEGIN:VALARM\r\nACTION:DISPLAY\r\nEND:VALARM\r\n"),
+			want:  false,
+		},
+		{
+			name: "a VEVENT beside the VTIMEZONE",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\n" +
+				"BEGIN:VEVENT\r\nUID:intruder\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: false,
+		},
+		{
+			name: "an unterminated component",
+			value: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+				"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + standardObservance + "END:VTIMEZONE\r\n",
+			want: false,
+		},
+		{
+			name:  "a line that is not a content line",
+			value: wrapTimezoneValue(standardObservance + "this is not a property\r\n"),
+			want:  false,
+		},
+		{
+			name:  "not iCalendar at all",
+			value: "this is not a calendar",
+			want:  false,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if !validCalendarTimezone(test.value) {
-				t.Fatalf("validCalendarTimezone() = false for %s", test.value)
+			if got := validCalendarTimezone(test.value); got != test.want {
+				t.Fatalf("validCalendarTimezone() = %v, want %v for %s", got, test.want, test.value)
 			}
 		})
 	}
