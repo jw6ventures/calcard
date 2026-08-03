@@ -1547,7 +1547,7 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
-	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	validIcal := buildCalendarObject(buildVEvent("new"))
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(validIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -1577,7 +1577,7 @@ func TestPutRejectsCalendarWriteWithoutEditor(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
-	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(buildCalendarObject(buildVEvent("new"))))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -2183,7 +2183,7 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	newIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	newIcal := buildCalendarObject(buildVEvent("event", "SUMMARY:Updated"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(newIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2217,9 +2217,7 @@ func TestPutTooLarge(t *testing.T) {
 
 	h.Put(rr, req)
 
-	if rr.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected 413, got %d", rr.Code)
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-resource-size"))
 }
 
 func TestMkcolValidatesPathAndName(t *testing.T) {
@@ -7687,7 +7685,10 @@ type fakeEventRepo struct {
 	getByUIDErrKey           string
 	getByResourceNameErr     error
 	getByResourceNameKey     string
+	resourceLookupSequence   []*store.Event
+	uidLookupSequence        []*store.Event
 	resourceLookupCount      int
+	upsertCalls              int
 	batchResourceLookupCount int
 	listForCalendarCalls     int
 	pageLookupCount          int
@@ -7699,6 +7700,7 @@ func (f *fakeEventRepo) key(calendarID int64, uid string) string {
 }
 
 func (f *fakeEventRepo) Upsert(ctx context.Context, event store.Event) (*store.Event, error) {
+	f.upsertCalls++
 	if f.upsertErr != nil {
 		return nil, f.upsertErr
 	}
@@ -7720,6 +7722,15 @@ func (f *fakeEventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid s
 }
 
 func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*store.Event, error) {
+	if len(f.uidLookupSequence) > 0 {
+		event := f.uidLookupSequence[0]
+		f.uidLookupSequence = f.uidLookupSequence[1:]
+		if event == nil {
+			return nil, nil
+		}
+		copy := *event
+		return &copy, nil
+	}
 	if f.getByUIDErr != nil && (f.getByUIDErrKey == "" || f.getByUIDErrKey == f.key(calendarID, uid)) {
 		return nil, f.getByUIDErr
 	}
@@ -7732,6 +7743,15 @@ func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid stri
 
 func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*store.Event, error) {
 	f.resourceLookupCount++
+	if len(f.resourceLookupSequence) > 0 {
+		event := f.resourceLookupSequence[0]
+		f.resourceLookupSequence = f.resourceLookupSequence[1:]
+		if event == nil {
+			return nil, nil
+		}
+		copy := *event
+		return &copy, nil
+	}
 	if f.getByResourceNameErr != nil && (f.getByResourceNameKey == "" || f.getByResourceNameKey == f.key(calendarID, resourceName)) {
 		return nil, f.getByResourceNameErr
 	}
@@ -8829,7 +8849,7 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -9105,7 +9125,7 @@ func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t
 		}},
 	}}
 
-	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	body := buildCalendarObject(buildVEvent("event", "SUMMARY:Updated", "DTSTART:20240601T100000Z"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), delegate))
@@ -9135,7 +9155,7 @@ func TestPutWithIfMatchFailure(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"wrong-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -9157,7 +9177,7 @@ func TestPutWithIfNoneMatchStar(t *testing.T) {
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("new"))
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -9183,7 +9203,7 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -9199,7 +9219,7 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event", "DTSTART:20240601T100000Z"))
 
 	t.Run("read-only grant cannot create event", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
@@ -9573,7 +9593,7 @@ func TestPutRejectsInvalidICalendar(t *testing.T) {
 
 			h.Put(rr, req)
 
-			assertErrorConditions(t, rr, http.StatusBadRequest, calQN("valid-calendar-data"))
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
 		})
 	}
 }
@@ -9586,7 +9606,7 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
-	validData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	validData := buildCalendarObject(buildVEvent("test", "DTSTART:20240601T100000Z"))
 	req := newCalendarPutRequest("/dav/calendars/2/test.ics", strings.NewReader(validData))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -10520,7 +10540,7 @@ func TestPutWithIfMatchStarUpdatesExistingEvent(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("existing"))
 	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -10546,7 +10566,7 @@ func TestPutEventWeakIfMatchPreconditionFails(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `W/"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -10970,7 +10990,7 @@ func TestBirthdayEventsUseStableDTStampAndSummary(t *testing.T) {
 	}
 }
 
-func TestPutEventUpsertConflictReturnsNoUIDConflict(t *testing.T) {
+func TestPutEventUnidentifiedStoreConflictDoesNotReturnMalformedNoUIDConflict(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
@@ -10980,19 +11000,87 @@ func TestPutEventUpsertConflictReturnsNoUIDConflict(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("new-event"))
 	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
 	h.Put(rr, req)
 
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("PUT with store conflict = %d, want 409: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT with unidentified store conflict = %d, want 500: %s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "no-uid-conflict") {
-		t.Fatalf("PUT conflict body missing no-uid-conflict precondition: %s", rr.Body.String())
+	if strings.Contains(rr.Body.String(), "no-uid-conflict") {
+		t.Fatalf("PUT emitted no-uid-conflict without its required DAV:href: %s", rr.Body.String())
 	}
+}
+
+func TestCalendarPutReauthorizesWhenResourceExistenceChanges(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	existing := &store.Event{
+		ID: 10, CalendarID: 2, UID: "event", ResourceName: "event",
+		RawICAL: "OLD", ETag: "old-etag",
+	}
+	newServer := func(eventRepo *fakeEventRepo, privilege string) *DavServer {
+		return &DavServer{store: &store.Store{
+			Calendars: &fakeCalendarRepo{
+				accessibleByUser: map[int64][]store.CalendarAccess{
+					owner.ID: {{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true}},
+				},
+				calendars: map[int64]*store.Calendar{
+					2: {ID: 2, UserID: owner.ID, Name: "Work"},
+				},
+			},
+			Events: eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: privilege},
+			}},
+		}}
+	}
+	body := buildCalendarObject(buildVEvent("event", "DTSTART:20240601T100000Z", "SUMMARY:New"))
+
+	t.Run("create authorization cannot become update authorization", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events:                 map[string]*store.Event{"2:event": existing},
+			resourceLookupSequence: []*store.Event{nil, existing, existing},
+		}
+		h := newServer(eventRepo, "bind")
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("PUT after target appeared = %d, want 403: %s", rr.Code, rr.Body.String())
+		}
+		if eventRepo.upsertCalls != 0 {
+			t.Fatalf("PUT updated the appeared resource %d times without write-content", eventRepo.upsertCalls)
+		}
+	})
+
+	t.Run("update authorization cannot become create authorization", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events:                 map[string]*store.Event{"2:event": existing},
+			resourceLookupSequence: []*store.Event{existing, nil, nil},
+			uidLookupSequence:      []*store.Event{nil},
+		}
+		h := newServer(eventRepo, "write-content")
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("PUT after target disappeared = %d, want 403: %s", rr.Code, rr.Body.String())
+		}
+		if eventRepo.upsertCalls != 0 {
+			t.Fatalf("PUT recreated the disappeared resource %d times without bind", eventRepo.upsertCalls)
+		}
+	})
 }
 
 func TestCopyMoveAmbiguousSourceCalendarReturns409(t *testing.T) {
@@ -11073,7 +11161,12 @@ func TestGetUnknownDavPathReturns404(t *testing.T) {
 	}
 }
 
-func TestPutEventFetchesResourceOnce(t *testing.T) {
+// A PUT reads the target resource twice and no more: once in the handler, to
+// choose between the DAV:bind and DAV:write-content privilege, and once inside
+// the store's write decision. The second read is not a redundant lookup — on
+// PostgreSQL it happens inside the write transaction, under the advisory locks
+// that make the UID and identity checks hold through to the write.
+func TestPutEventFetchesResourceTwice(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
@@ -11083,7 +11176,7 @@ func TestPutEventFetchesResourceOnce(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("new-event"))
 	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
@@ -11093,8 +11186,8 @@ func TestPutEventFetchesResourceOnce(t *testing.T) {
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("PUT = %d, want 201: %s", rr.Code, rr.Body.String())
 	}
-	if eventRepo.resourceLookupCount != 1 {
-		t.Fatalf("PUT performed %d GetByResourceName lookups, want 1", eventRepo.resourceLookupCount)
+	if eventRepo.resourceLookupCount != 2 {
+		t.Fatalf("PUT performed %d GetByResourceName lookups, want 2", eventRepo.resourceLookupCount)
 	}
 }
 

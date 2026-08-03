@@ -107,6 +107,608 @@ func SupportedEventRecurrence(ical string) bool {
 	return supportedRecurrenceFreq(extractRRuleParam(rrule, "FREQ"))
 }
 
+// ValidRecurrenceRule reports whether value uses the recurrence grammar this
+// package can expand. It is intentionally independent of a DTSTART timezone;
+// callers that expand the rule parse it again with the DTSTART location.
+func ValidRecurrenceRule(value string) bool {
+	_, ok := parseRecurrenceRule(value, time.UTC)
+	return ok
+}
+
+// RecurrenceSetExceedsLimit counts the instance identities in the recurring
+// VEVENT, VTODO, or VJOURNAL set carried by raw. The second result is false
+// when a recurrence value cannot be parsed.
+func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
+	components := topLevelComponents(raw, func(name string) bool {
+		switch strings.ToUpper(strings.TrimSpace(name)) {
+		case "VEVENT", "VTODO", "VJOURNAL":
+			return true
+		default:
+			return false
+		}
+	})
+	if len(components) == 0 {
+		return false, true
+	}
+
+	var master *VEventComponent
+	overrides := make(map[string]bool)
+	instances := make(map[string]struct{})
+	for i := range components {
+		component := &components[i]
+		recurrenceID, hasRecurrenceID := ComponentProperty(component, "RECURRENCE-ID")
+		if !hasRecurrenceID {
+			if master == nil {
+				master = component
+			}
+			continue
+		}
+		parsed, ok := parsePropertyDateTime(recurrenceID.KeyPart, recurrenceID.Value)
+		if !ok {
+			return false, false
+		}
+		key := recurrenceInstantKey(parsed)
+		cancelled := strings.EqualFold(componentPropertyValue(component, "STATUS"), "CANCELLED")
+		overrides[key] = cancelled
+		if !cancelled {
+			instances["override:"+key] = struct{}{}
+		}
+	}
+	if master == nil {
+		return len(instances) > limit, true
+	}
+
+	excluded := make(map[string]struct{})
+	for _, property := range componentProperties(master, "EXDATE") {
+		values, ok := recurrencePropertyInstants(property)
+		if !ok {
+			return false, false
+		}
+		for _, value := range values {
+			excluded[recurrenceInstantKey(value)] = struct{}{}
+		}
+	}
+	add := func(value time.Time) bool {
+		key := recurrenceInstantKey(value)
+		if _, skip := excluded[key]; skip {
+			return false
+		}
+		if _, replaced := overrides[key]; replaced {
+			return false
+		}
+		instances["generated:"+key] = struct{}{}
+		return len(instances) > limit
+	}
+
+	dtstartProperty, hasDTStart := ComponentProperty(master, "DTSTART")
+	var dtstart time.Time
+	if hasDTStart {
+		var ok bool
+		dtstart, ok = parsePropertyDateTime(dtstartProperty.KeyPart, dtstartProperty.Value)
+		if !ok {
+			return false, false
+		}
+	}
+
+	hasRecurrence := false
+	for _, property := range componentProperties(master, "RDATE") {
+		hasRecurrence = true
+		values, ok := recurrencePropertyInstants(property)
+		if !ok {
+			return false, false
+		}
+		for _, value := range values {
+			if add(value) {
+				return true, true
+			}
+		}
+	}
+
+	rrule := strings.TrimSpace(componentPropertyValue(master, "RRULE"))
+	if rrule == "" {
+		if hasDTStart {
+			if add(dtstart) {
+				return true, true
+			}
+		} else if !hasRecurrence {
+			instances["master"] = struct{}{}
+		}
+		return len(instances) > limit, true
+	}
+	if !hasDTStart {
+		return false, false
+	}
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+	if !ok {
+		return false, false
+	}
+	if add(dtstart) {
+		return true, true
+	}
+	if !recurrenceBySetPosMaySelect(dtstart, rule) {
+		return len(instances) > limit, true
+	}
+
+	periodStart := recurrencePeriodStart(dtstart, rule)
+	occurrences := 0
+	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
+		for _, current := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+			if current.Before(dtstart) {
+				continue
+			}
+			if rule.Until != nil && current.After(*rule.Until) {
+				return len(instances) > limit, true
+			}
+			occurrences++
+			if rule.Count > 0 && occurrences > rule.Count {
+				return len(instances) > limit, true
+			}
+			if add(current) {
+				return true, true
+			}
+		}
+		next := advanceRecurrencePeriod(periodStart, rule)
+		if !next.After(periodStart) {
+			return len(instances) > limit, true
+		}
+		periodStart = next
+		if rule.Until != nil && periodStart.After(*rule.Until) {
+			return len(instances) > limit, true
+		}
+	}
+	mayProduceCandidate := occurrences > 0 || recurrenceRuleMayProduceCandidate(dtstart, rule)
+	if rule.Count > 0 && mayProduceCandidate {
+		maxSuppressed := len(excluded)
+		for _, cancelled := range overrides {
+			if cancelled {
+				maxSuppressed++
+			}
+		}
+		if rule.Count-maxSuppressed > limit {
+			return true, true
+		}
+	}
+	if !mayProduceCandidate {
+		return len(instances) > limit, true
+	}
+	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, rule, &occurrences, add); handled {
+		return exceeds, true
+	}
+	// An unbounded rule that could not produce limit+1 candidates within the
+	// scan guard is conservatively over the advertised server limit.
+	if rule.Count == 0 && rule.Until == nil {
+		return true, true
+	}
+	return len(instances) > limit, true
+}
+
+// recurrenceRuleMayProduceCandidate distinguishes a merely sparse bounded rule
+// from one whose filters can never select a recurrence period. Gregorian dates
+// repeat every 400 years. Reducing the recurrence interval against that cycle
+// also accounts for sub-daily clock alignment without visiting every second in
+// the cycle.
+func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) bool {
+	if !recurrenceBySetPosMaySelect(dtstart, rule) {
+		return false
+	}
+	const daysInGregorianCycle = int64(146097)
+	base := recurrencePeriodStart(dtstart, rule)
+
+	var subDailyResidues map[int64]struct{}
+	var subDailyDivisor int64
+	if _, subDaily := recurrenceFrequencySeconds(rule.Freq); subDaily {
+		stepSeconds, ok := subDailyRecurrenceSeconds(rule)
+		if !ok {
+			return false
+		}
+		subDailyDivisor = greatestCommonDivisor(stepSeconds, daysInGregorianCycle*24*60*60)
+		subDailyResidues = make(map[int64]struct{})
+		for _, offset := range allowedSubDailyPeriodOffsets(rule) {
+			subDailyResidues[positiveRemainder(offset, subDailyDivisor)] = struct{}{}
+		}
+		if len(subDailyResidues) == 0 {
+			return false
+		}
+	}
+
+	for year := 2000; year < 2400; year++ {
+		for dayNumber := 1; dayNumber <= daysInYear(year); dayNumber++ {
+			day := time.Date(year, 1, dayNumber, 0, 0, 0, 0, dtstart.Location())
+			if !dateMatchesRule(day, rule) {
+				continue
+			}
+			switch rule.Freq {
+			case "SECONDLY", "MINUTELY", "HOURLY":
+				required := positiveRemainder(base.Unix()-day.Unix(), subDailyDivisor)
+				if _, ok := subDailyResidues[required]; ok {
+					return true
+				}
+			case "DAILY":
+				divisor := greatestCommonDivisor(int64(rule.Interval), daysInGregorianCycle)
+				if positiveRemainder(civilDayNumber(day)-civilDayNumber(base), divisor) == 0 {
+					return true
+				}
+			default:
+				// The normal scan covers far more than a complete calendar cycle for
+				// weekly and coarser frequencies. No candidate there means the rule
+				// cannot justify treating COUNT as an attainable lower bound.
+				return false
+			}
+		}
+	}
+	return false
+}
+
+func recurrenceFrequencySeconds(freq string) (int64, bool) {
+	switch freq {
+	case "SECONDLY":
+		return 1, true
+	case "MINUTELY":
+		return 60, true
+	case "HOURLY":
+		return 60 * 60, true
+	default:
+		return 0, false
+	}
+}
+
+func allowedSubDailyPeriodOffsets(rule recurrenceRule) []int64 {
+	var offsets []int64
+	for hour := 0; hour < 24; hour++ {
+		if !intMatchesIfPresent(hour, rule.ByHour) {
+			continue
+		}
+		if rule.Freq == "HOURLY" {
+			offsets = append(offsets, int64(hour*60*60))
+			continue
+		}
+		for minute := 0; minute < 60; minute++ {
+			if !intMatchesIfPresent(minute, rule.ByMinute) {
+				continue
+			}
+			if rule.Freq == "MINUTELY" {
+				offsets = append(offsets, int64((hour*60+minute)*60))
+				continue
+			}
+			for second := 0; second < 60; second++ {
+				if intMatchesIfPresent(second, rule.BySecond) || (second == 59 && intInSlice(60, rule.BySecond)) {
+					offsets = append(offsets, int64((hour*60+minute)*60+second))
+				}
+			}
+		}
+	}
+	return offsets
+}
+
+func greatestCommonDivisor(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func positiveRemainder(value, divisor int64) int64 {
+	result := value % divisor
+	if result < 0 {
+		result += divisor
+	}
+	return result
+}
+
+func recurrenceBySetPosMaySelect(dtstart time.Time, rule recurrenceRule) bool {
+	clockCandidates := len(defaultedInts(rule.ByHour, dtstart.Hour())) *
+		len(defaultedInts(rule.ByMinute, dtstart.Minute())) *
+		validSecondCandidateCount(rule.BySecond)
+	maxCandidates := clockCandidates
+	switch rule.Freq {
+	case "SECONDLY":
+		maxCandidates = 1
+	case "MINUTELY":
+		maxCandidates = validSecondCandidateCount(rule.BySecond)
+	case "HOURLY":
+		maxCandidates = len(defaultedInts(rule.ByMinute, dtstart.Minute())) *
+			validSecondCandidateCount(rule.BySecond)
+	case "WEEKLY":
+		maxCandidates *= 7
+	case "MONTHLY":
+		maxCandidates *= 31
+	case "YEARLY":
+		maxCandidates *= 366
+	}
+	if maxCandidates == 0 {
+		return false
+	}
+	if len(rule.BySetPos) == 0 {
+		return true
+	}
+	for _, position := range rule.BySetPos {
+		if position >= -maxCandidates && position <= maxCandidates {
+			return true
+		}
+	}
+	return false
+}
+
+func validSecondCandidateCount(values []int) int {
+	if len(values) == 0 {
+		return 1
+	}
+	candidates := make(map[int]struct{}, len(values))
+	for _, value := range values {
+		if value >= 0 && value <= 60 {
+			if value == 60 {
+				value = 59
+			}
+			candidates[value] = struct{}{}
+		}
+	}
+	return len(candidates)
+}
+
+// Sparse rules are evaluated exactly while work remains. Exhausting the bound
+// fails closed on max-instances instead of letting one PUT monopolize a worker.
+const sparseRecurrenceWorkLimit = 10_000_000
+
+func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule, occurrences *int, add func(time.Time) bool) (bool, bool) {
+	if rule.Until == nil && (rule.Count == 0 || *occurrences == 0) {
+		return false, false
+	}
+	switch rule.Freq {
+	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
+	default:
+		return false, false
+	}
+
+	var until time.Time
+	if rule.Until != nil {
+		until = *rule.Until
+	}
+	exceeds := false
+	complete := false
+	remainingWork := sparseRecurrenceWorkLimit
+	addCandidate := func(current time.Time) bool {
+		if rule.Until != nil && current.After(until) {
+			return false
+		}
+		if rule.Count > 0 {
+			if *occurrences >= rule.Count {
+				complete = true
+				return true
+			}
+			(*occurrences)++
+		}
+		if add(current) {
+			exceeds = true
+			complete = true
+			return true
+		}
+		if rule.Count > 0 && *occurrences >= rule.Count {
+			complete = true
+			return true
+		}
+		return false
+	}
+
+	for year := periodStart.Year(); rule.Until == nil || year <= until.Year(); year++ {
+		for dayNumber := 1; dayNumber <= daysInYear(year); dayNumber++ {
+			remainingWork--
+			if remainingWork <= 0 {
+				return true, true
+			}
+			day := time.Date(year, 1, dayNumber, 0, 0, 0, 0, dtstart.Location())
+			if !dateMatchesRule(day, rule) {
+				continue
+			}
+			if rule.Freq == "DAILY" {
+				if day.Before(periodStart) || !dailyRecurrencePeriodAligned(day, dtstart, rule.Interval) {
+					continue
+				}
+				for _, current := range recurrenceCandidatesForPeriod(day, dtstart, rule) {
+					if current.Before(dtstart) {
+						continue
+					}
+					if addCandidate(current) {
+						return exceeds, complete
+					}
+				}
+				continue
+			}
+
+			if visitSparseSubDailyPeriods(day, periodStart, dtstart, until, rule, &remainingWork, addCandidate) {
+				if remainingWork <= 0 {
+					return true, true
+				}
+				return exceeds, complete
+			}
+		}
+	}
+	return false, true
+}
+
+func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule recurrenceRule, remainingWork *int, add func(time.Time) bool) bool {
+	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
+	if !ok {
+		return false
+	}
+	base := recurrencePeriodStart(dtstart, rule)
+	dayEnd := day.AddDate(0, 0, 1)
+	firstUnix := day.Unix()
+	if periodStart.After(day) {
+		firstUnix = periodStart.Unix()
+	}
+	remainder := positiveRemainder(firstUnix-base.Unix(), stepSeconds)
+	if remainder != 0 {
+		firstUnix += stepSeconds - remainder
+	}
+	lastUnix := dayEnd.Unix()
+	if !until.IsZero() && until.Before(dayEnd) {
+		lastUnix = until.Unix() + 1
+	}
+
+	for periodUnix := firstUnix; periodUnix < lastUnix; {
+		(*remainingWork)--
+		if *remainingWork <= 0 {
+			return true
+		}
+		period := time.Unix(periodUnix, 0).In(day.Location())
+		for _, current := range recurrenceCandidatesForPeriod(period, dtstart, rule) {
+			if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
+				continue
+			}
+			if add(current) {
+				return true
+			}
+		}
+		if periodUnix > int64(^uint64(0)>>1)-stepSeconds {
+			break
+		}
+		periodUnix += stepSeconds
+	}
+	return false
+}
+
+func dailyRecurrencePeriodAligned(day, dtstart time.Time, interval int) bool {
+	if interval <= 0 {
+		return false
+	}
+	base := recurrencePeriodStart(dtstart, recurrenceRule{Freq: "DAILY"})
+	delta := civilDayNumber(day) - civilDayNumber(base)
+	return delta >= 0 && delta%int64(interval) == 0
+}
+
+func civilDayNumber(value time.Time) int64 {
+	year := int64(value.Year())
+	month := int64(value.Month())
+	if month <= 2 {
+		year--
+	}
+	era := year / 400
+	yearOfEra := year - era*400
+	adjustedMonth := month - 3
+	if adjustedMonth < 0 {
+		adjustedMonth += 12
+	}
+	dayOfYear := (153*adjustedMonth+2)/5 + int64(value.Day()) - 1
+	dayOfEra := yearOfEra*365 + yearOfEra/4 - yearOfEra/100 + dayOfYear
+	return era*146097 + dayOfEra
+}
+
+func recurrencePropertyInstants(property PropertyValue) ([]time.Time, bool) {
+	parts := strings.Split(property.Value, ",")
+	values := make([]time.Time, 0, len(parts))
+	for _, part := range parts {
+		start := strings.TrimSpace(part)
+		if slash := strings.IndexByte(start, '/'); slash >= 0 {
+			start = strings.TrimSpace(start[:slash])
+		}
+		parsed, ok := parsePropertyDateTime(property.KeyPart, start)
+		if !ok {
+			return nil, false
+		}
+		values = append(values, parsed)
+	}
+	return values, true
+}
+
+func recurrenceInstantKey(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+// LatestRecurrenceOnOrBefore returns the latest generated recurrence start at
+// or before the supplied wall-clock value. It is used to apply the observance
+// rules in a submitted VTIMEZONE definition.
+func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool) {
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+	if !ok || before.Before(dtstart) {
+		return time.Time{}, false
+	}
+	threshold := before
+	if rule.Until != nil && rule.Until.Before(threshold) {
+		threshold = *rule.Until
+	}
+	periodStart := recurrencePeriodStart(dtstart, rule)
+	if rule.Count == 0 {
+		periodStart = fastForwardRecurrencePeriod(periodStart, threshold, rule)
+	}
+
+	var latest time.Time
+	occurrences := 0
+	if rule.Count > 0 {
+		periodStart = recurrencePeriodStart(dtstart, rule)
+		for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
+			for _, candidate := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+				if candidate.Before(dtstart) {
+					continue
+				}
+				if rule.Until != nil && candidate.After(*rule.Until) {
+					return latest, !latest.IsZero()
+				}
+				occurrences++
+				if occurrences > rule.Count || candidate.After(before) {
+					return latest, !latest.IsZero()
+				}
+				latest = candidate
+			}
+			periodStart = advanceRecurrencePeriod(periodStart, rule)
+		}
+		return latest, !latest.IsZero()
+	}
+
+	for scanned := 0; scanned < 1000; scanned++ {
+		for _, candidate := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+			if candidate.Before(dtstart) || candidate.After(before) {
+				continue
+			}
+			if rule.Until != nil && candidate.After(*rule.Until) {
+				continue
+			}
+			if latest.IsZero() || candidate.After(latest) {
+				latest = candidate
+			}
+		}
+		if !latest.IsZero() {
+			return latest, true
+		}
+		previous := retreatRecurrencePeriod(periodStart, rule)
+		if !previous.Before(periodStart) || previous.Before(dtstart) {
+			break
+		}
+		periodStart = previous
+	}
+	return time.Time{}, false
+}
+
+func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
+	interval := rule.Interval
+	if interval <= 0 {
+		interval = 1
+	}
+	switch rule.Freq {
+	case "SECONDLY":
+		return periodStart.Add(-time.Duration(interval) * time.Second)
+	case "MINUTELY":
+		return periodStart.Add(-time.Duration(interval) * time.Minute)
+	case "HOURLY":
+		return periodStart.Add(-time.Duration(interval) * time.Hour)
+	case "DAILY":
+		return periodStart.AddDate(0, 0, -interval)
+	case "WEEKLY":
+		return periodStart.AddDate(0, 0, -7*interval)
+	case "MONTHLY":
+		return periodStart.AddDate(0, -interval, 0)
+	case "YEARLY":
+		return periodStart.AddDate(-interval, 0, 0)
+	default:
+		return periodStart
+	}
+}
+
 func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, maxInstances int, transform func(BusyPeriod) (BusyPeriod, bool)) ([]BusyPeriod, bool) {
 	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
 	if !ok {
@@ -559,10 +1161,8 @@ func ParsePropertyDateTimeLocal(keyPart, value string) (time.Time, bool) {
 		if strings.HasPrefix(strings.ToUpper(param), "TZID=") {
 			tzid := strings.TrimSpace(param[len("TZID="):])
 			if loc, err := time.LoadLocation(tzid); err == nil {
-				for _, format := range icalLocalFormats {
-					if parsed, err := time.ParseInLocation(format, value, loc); err == nil {
-						return parsed, true
-					}
+				if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
+					return parsed, true
 				}
 			}
 			break
@@ -647,7 +1247,10 @@ func ParseDuration(value string) (time.Duration, bool) {
 	return sign * total, true
 }
 
-const recurrenceScanLimit = 100000
+const (
+	recurrenceScanLimit = 100000
+	maxICalendarInteger = 1<<31 - 1
+)
 
 type recurrenceRule struct {
 	Freq       string
@@ -676,9 +1279,17 @@ func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool
 	for _, part := range strings.Split(rrule, ";") {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
 		if len(kv) != 2 {
-			continue
+			return recurrenceRule{}, false
 		}
-		params[strings.ToUpper(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
+		key := strings.ToUpper(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+		if !knownRecurrenceRulePart(key) || value == "" {
+			return recurrenceRule{}, false
+		}
+		if _, duplicate := params[key]; duplicate {
+			return recurrenceRule{}, false
+		}
+		params[key] = value
 	}
 	freq := strings.ToUpper(params["FREQ"])
 	if !supportedRecurrenceFreq(freq) {
@@ -691,17 +1302,20 @@ func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool
 	}
 	if intervalStr := params["INTERVAL"]; intervalStr != "" {
 		interval, err := strconv.Atoi(intervalStr)
-		if err != nil || interval <= 0 {
+		if err != nil || interval <= 0 || interval > maxICalendarInteger {
 			return recurrenceRule{}, false
 		}
 		rule.Interval = interval
 	}
 	if countStr := params["COUNT"]; countStr != "" {
 		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
+		if err != nil || count <= 0 || count > maxICalendarInteger {
 			return recurrenceRule{}, false
 		}
 		rule.Count = count
+	}
+	if params["COUNT"] != "" && params["UNTIL"] != "" {
+		return recurrenceRule{}, false
 	}
 	if untilStr := params["UNTIL"]; untilStr != "" {
 		until, ok := parseRecurrenceUntil(untilStr, loc)
@@ -719,7 +1333,7 @@ func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool
 	}
 
 	var ok bool
-	if rule.BySecond, ok = parseIntList(params["BYSECOND"], 0, 59); !ok {
+	if rule.BySecond, ok = parseIntList(params["BYSECOND"], 0, 60); !ok {
 		return recurrenceRule{}, false
 	}
 	if rule.ByMinute, ok = parseIntList(params["BYMINUTE"], 0, 59); !ok {
@@ -746,15 +1360,54 @@ func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool
 	if rule.ByDay, ok = parseWeekdayList(params["BYDAY"]); !ok {
 		return recurrenceRule{}, false
 	}
+	ordinalWeekday := false
+	for _, day := range rule.ByDay {
+		if day.Ordinal != 0 {
+			ordinalWeekday = true
+			break
+		}
+	}
+	if ordinalWeekday && rule.Freq != "MONTHLY" && rule.Freq != "YEARLY" {
+		return recurrenceRule{}, false
+	}
+	if ordinalWeekday && rule.Freq == "YEARLY" && len(rule.ByWeekNo) != 0 {
+		return recurrenceRule{}, false
+	}
+	if rule.Freq == "WEEKLY" && len(rule.ByMonthDay) != 0 {
+		return recurrenceRule{}, false
+	}
+	if (rule.Freq == "DAILY" || rule.Freq == "WEEKLY" || rule.Freq == "MONTHLY") && len(rule.ByYearDay) != 0 {
+		return recurrenceRule{}, false
+	}
+	if len(rule.ByWeekNo) != 0 && rule.Freq != "YEARLY" {
+		return recurrenceRule{}, false
+	}
+	if len(rule.BySetPos) != 0 && !recurrenceRuleHasOtherByPart(rule) {
+		return recurrenceRule{}, false
+	}
 	return rule, true
+}
+
+func recurrenceRuleHasOtherByPart(rule recurrenceRule) bool {
+	return len(rule.BySecond) != 0 || len(rule.ByMinute) != 0 || len(rule.ByHour) != 0 ||
+		len(rule.ByDay) != 0 || len(rule.ByMonthDay) != 0 || len(rule.ByYearDay) != 0 ||
+		len(rule.ByWeekNo) != 0 || len(rule.ByMonth) != 0
+}
+
+func knownRecurrenceRulePart(name string) bool {
+	switch name {
+	case "FREQ", "UNTIL", "COUNT", "INTERVAL", "BYSECOND", "BYMINUTE", "BYHOUR",
+		"BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS", "WKST":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseRecurrenceUntil(value string, loc *time.Location) (time.Time, bool) {
 	if loc != nil && !hasZoneSuffix(value) {
-		for _, format := range icalLocalFormats {
-			if parsed, err := time.ParseInLocation(format, value, loc); err == nil {
-				return parsed, true
-			}
+		if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
+			return parsed, true
 		}
 	}
 	parsed, err := ParseDateTime(value)
@@ -877,20 +1530,23 @@ func fastForwardRecurrencePeriod(periodStart, threshold time.Time, rule recurren
 }
 
 func subDailyRecurrenceStep(rule recurrenceRule) (time.Duration, bool) {
+	seconds, ok := subDailyRecurrenceSeconds(rule)
+	if !ok || seconds > int64(time.Duration(1<<63-1)/time.Second) {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+func subDailyRecurrenceSeconds(rule recurrenceRule) (int64, bool) {
 	interval := rule.Interval
 	if interval <= 0 {
 		interval = 1
 	}
-	switch rule.Freq {
-	case "SECONDLY":
-		return time.Duration(interval) * time.Second, true
-	case "MINUTELY":
-		return time.Duration(interval) * time.Minute, true
-	case "HOURLY":
-		return time.Duration(interval) * time.Hour, true
-	default:
+	unitSeconds, ok := recurrenceFrequencySeconds(rule.Freq)
+	if !ok || int64(interval) > int64(^uint64(0)>>1)/unitSeconds {
 		return 0, false
 	}
+	return int64(interval) * unitSeconds, true
 }
 
 func advanceRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
@@ -899,12 +1555,12 @@ func advanceRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 		interval = 1
 	}
 	switch rule.Freq {
-	case "SECONDLY":
-		return periodStart.Add(time.Duration(interval) * time.Second)
-	case "MINUTELY":
-		return periodStart.Add(time.Duration(interval) * time.Minute)
-	case "HOURLY":
-		return periodStart.Add(time.Duration(interval) * time.Hour)
+	case "SECONDLY", "MINUTELY", "HOURLY":
+		seconds, ok := subDailyRecurrenceSeconds(rule)
+		if !ok || periodStart.Unix() > int64(^uint64(0)>>1)-seconds {
+			return periodStart
+		}
+		return time.Unix(periodStart.Unix()+seconds, int64(periodStart.Nanosecond())).In(periodStart.Location())
 	case "DAILY":
 		return periodStart.AddDate(0, 0, interval)
 	case "WEEKLY":
@@ -1002,6 +1658,9 @@ func defaultedInts(values []int, fallback int) []int {
 }
 
 func appendValidTime(values []time.Time, year int, month time.Month, day, hour, minute, second int, loc *time.Location) []time.Time {
+	if second == 60 {
+		second = 59
+	}
 	if second < 0 || second > 59 {
 		return values
 	}

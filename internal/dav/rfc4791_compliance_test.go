@@ -1400,10 +1400,9 @@ func TestRFC4791_RejectMalformedICalendar(t *testing.T) {
 
 			h.Put(rr, req)
 
-			// RFC 4791: Invalid calendar data should be rejected
-			if rr.Code != http.StatusBadRequest {
-				t.Errorf("RFC 4791: Malformed iCalendar (%s) should return 400, got %d", tt.description, rr.Code)
-			}
+			// §1.3: resubmitting the same malformed body can only fail again,
+			// which is the 403 half of the precondition status rule.
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
 		})
 	}
 }
@@ -1840,7 +1839,7 @@ func TestRFC4791_Precondition_SupportedCalendarData_RejectUnsupportedMediaType(t
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 }
 
 func TestRFC4791_Precondition_MinDateTime_RejectEarlierDates(t *testing.T) {
@@ -2204,48 +2203,109 @@ func TestRFC4791_PutAfterMaxDateTimeRejected(t *testing.T) {
 }
 
 // Sections 5.2.6, 5.2.7 and 5.3.2.1 bound "any DATE or DATE-TIME value" a
-// calendar object resource stores, not merely its DTSTART and DTEND. CalCard
-// collects only those two in analyzeICalendar, so every other date-valued
-// property passes the limits unread. This test pins that gap rather than the
-// requirement: each case below is stored today and must be rejected once the
-// limits cover every date-valued property, at which point the expectations
-// below invert.
-func TestRFC4791_Precondition_DateLimits_UncheckedPropertiesKnownDefect(t *testing.T) {
+// calendar object resource stores, not merely its DTSTART and DTEND. Every
+// date-valued property below is read and bounded, in both the single-value and
+// the comma-separated list forms, and in the PERIOD form VFREEBUSY uses.
+func TestRFC4791_Precondition_DateLimits_CoverEveryDateProperty(t *testing.T) {
 	tests := []struct {
-		name     string
-		property string
-		ical     string
+		name      string
+		condition string
+		ical      string
 	}{
 		{
-			name:     "VTODO DUE beyond max-date-time",
-			property: "DUE",
+			name:      "VTODO DUE beyond max-date-time",
+			condition: "max-date-time",
 			ical: buildCalendarObject(buildVTodo("late-due",
 				"DTSTART:20240601T000000Z", "DUE:99991231T235959Z")),
 		},
 		{
-			name:     "RECURRENCE-ID before min-date-time",
-			property: "RECURRENCE-ID",
+			name:      "RECURRENCE-ID before min-date-time",
+			condition: "min-date-time",
 			ical: buildCalendarObject(buildVEvent("early-recurrence-id",
 				"RECURRENCE-ID:15000101T000000Z", "DTSTART:20240601T100000Z", "DTEND:20240601T110000Z")),
 		},
 		{
-			name:     "RDATE beyond max-date-time",
-			property: "RDATE",
+			name:      "RDATE beyond max-date-time",
+			condition: "max-date-time",
 			ical: buildCalendarObject(buildVEvent("late-rdate",
 				"DTSTART:20240601T100000Z", "DTEND:20240601T110000Z", "RDATE:99991231T235959Z")),
 		},
 		{
-			name:     "EXDATE before min-date-time",
-			property: "EXDATE",
+			name:      "RDATE list with one out-of-range member",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVEvent("late-rdate-list",
+				"DTSTART:20240601T100000Z", "DTEND:20240601T110000Z",
+				"RDATE:20240602T100000Z,99991231T235959Z")),
+		},
+		{
+			name:      "RDATE PERIOD start before min-date-time",
+			condition: "min-date-time",
+			ical: buildCalendarObject(buildVEvent("early-rdate-period",
+				"RDATE;VALUE=PERIOD:18991231T235959Z/PT1H")),
+		},
+		{
+			name:      "RDATE PERIOD end beyond max-date-time",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVEvent("late-rdate-period",
+				"RDATE;VALUE=PERIOD:21001231T230000Z/21010101T010000Z")),
+		},
+		{
+			name:      "RRULE UNTIL before min-date-time",
+			condition: "min-date-time",
+			ical: buildCalendarObject(buildVEvent("early-until",
+				"RRULE:FREQ=YEARLY;UNTIL=18990101T000000Z")),
+		},
+		{
+			name:      "RRULE UNTIL beyond max-date-time",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVEvent("late-until",
+				"RRULE:FREQ=YEARLY;UNTIL=22000101T000000Z")),
+		},
+		{
+			name:      "EXDATE before min-date-time",
+			condition: "min-date-time",
 			ical: buildCalendarObject(buildVEvent("early-exdate",
 				"DTSTART:20240601T100000Z", "DTEND:20240601T110000Z",
 				"RRULE:FREQ=DAILY;COUNT=3", "EXDATE:15000101T000000Z")),
 		},
 		{
-			name:     "VJOURNAL DATE-form DTSTAMP beyond max-date-time",
-			property: "DTSTAMP",
+			name:      "VJOURNAL DTSTAMP beyond max-date-time",
+			condition: "max-date-time",
 			ical: buildCalendarObject(buildVJournal("late-dtstamp",
 				"DTSTAMP:99991231T235959Z", "DTSTART;VALUE=DATE:20240601")),
+		},
+		{
+			name:      "VTODO COMPLETED before min-date-time",
+			condition: "min-date-time",
+			ical: buildCalendarObject(buildVTodo("early-completed",
+				"DTSTART:20240601T000000Z", "COMPLETED:15000101T000000Z")),
+		},
+		{
+			name:      "CREATED before min-date-time",
+			condition: "min-date-time",
+			ical: buildCalendarObject(buildVEvent("early-created",
+				"DTSTART:20240601T100000Z", "CREATED:15000101T000000Z")),
+		},
+		{
+			name:      "LAST-MODIFIED beyond max-date-time",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVEvent("late-last-modified",
+				"DTSTART:20240601T100000Z", "LAST-MODIFIED:99991231T235959Z")),
+		},
+		{
+			name:      "absolute VALARM TRIGGER beyond max-date-time",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVEvent("late-trigger",
+				"DTSTART:20240601T100000Z",
+				buildComponent("VALARM",
+					"ACTION:DISPLAY", "DESCRIPTION:Alarm",
+					"TRIGGER;VALUE=DATE-TIME:99991231T235959Z"))),
+		},
+		{
+			name:      "VFREEBUSY period beyond max-date-time",
+			condition: "max-date-time",
+			ical: buildCalendarObject(buildVFreeBusy("late-freebusy",
+				"FREEBUSY:20240601T100000Z/99991231T235959Z")),
 		},
 	}
 
@@ -2256,7 +2316,8 @@ func TestRFC4791_Precondition_DateLimits_UncheckedPropertiesKnownDefect(t *testi
 					{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 				},
 			}
-			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{events: make(map[string]*store.Event)}}}
+			eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 			user := &store.User{ID: 1}
 
 			req := newCalendarPutRequest("/dav/calendars/1/limits.ics", strings.NewReader(tt.ical))
@@ -2265,12 +2326,63 @@ func TestRFC4791_Precondition_DateLimits_UncheckedPropertiesKnownDefect(t *testi
 
 			h.Put(rr, req)
 
-			if rr.Code != http.StatusCreated {
-				t.Fatalf("PUT of an out-of-range %s = %d, want the 201 CalCard returns today. "+
-					"If the date limits now cover %s, invert this case into an assertErrorConditions check; body: %s",
-					tt.property, rr.Code, tt.property, rr.Body.String())
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN(tt.condition))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
 			}
 		})
+	}
+}
+
+func TestRFC4791_Precondition_RecurrenceUntilDateLimitsAreInclusive(t *testing.T) {
+	tests := map[string]string{
+		"minimum": caldavMinDateTime,
+		"maximum": caldavMaxDateTime,
+	}
+
+	for name, boundary := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+			body := buildCalendarObject(buildVEvent("until-"+name,
+				"DTSTART:"+boundary,
+				"RRULE:FREQ=YEARLY;UNTIL="+boundary))
+
+			rr := putCalendarObject(t, h, "until-"+name+".ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT with RRULE UNTIL on the %s date limit = %d, want 201: %s", name, rr.Code, rr.Body.String())
+			}
+			if len(eventRepo.events) != 1 {
+				t.Fatalf("stored events = %d, want 1", len(eventRepo.events))
+			}
+		})
+	}
+}
+
+// Sections 5.2.6 and 5.2.7 bound the DATE and DATE-TIME values a resource
+// carries, not the instances a recurrence rule generates from them. This rule
+// has only two instances, so it stays within max-instances while its generated
+// second instance falls beyond max-date-time.
+func TestRFC4791_Precondition_DateLimitsIgnoreGeneratedRecurrenceInstances(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event)}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := buildCalendarObject(buildVEvent("past-limit",
+		"DTSTART:21001231T230000Z", "DTEND:21001231T235959Z", "RRULE:FREQ=YEARLY;COUNT=2"))
+	req := newCalendarPutRequest("/dav/calendars/1/past-limit.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT with only a generated instance beyond max-date-time = %d, want 201: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -3321,18 +3433,27 @@ func TestRFC4791_PutExceedsMaxAttendeesPerInstance(t *testing.T) {
 
 	attendees := make([]string, 0, caldavMaxAttendees+2)
 	attendees = append(attendees, "DTSTART:20240101T000000Z")
+	alarmAttendees := []string{"ACTION:EMAIL", "TRIGGER:-PT15M", "DESCRIPTION:Alarm", "SUMMARY:Alarm"}
 	for i := 0; i < caldavMaxAttendees+1; i++ {
 		attendees = append(attendees, fmt.Sprintf("ATTENDEE:mailto:user%d@example.com", i))
+		alarmAttendees = append(alarmAttendees, fmt.Sprintf("ATTENDEE:mailto:alarm%d@example.com", i))
 	}
-	icalData := buildCalendarObject(buildVEvent("attendees", attendees...))
+	tests := map[string]string{
+		"VEVENT":              buildCalendarObject(buildVEvent("attendees", attendees...)),
+		"VEVENT EMAIL VALARM": buildCalendarObject(buildVEvent("alarm-attendees", buildComponent("VALARM", alarmAttendees...))),
+		"VFREEBUSY":           buildCalendarObject(buildVFreeBusy("freebusy-attendees", attendees...)),
+	}
+	for name, icalData := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := newCalendarPutRequest("/dav/calendars/1/attendees.ics", strings.NewReader(icalData))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
 
-	req := newCalendarPutRequest("/dav/calendars/1/attendees.ics", strings.NewReader(icalData))
-	req = req.WithContext(auth.WithUser(req.Context(), user))
-	rr := httptest.NewRecorder()
+			h.Put(rr, req)
 
-	h.Put(rr, req)
-
-	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-attendees-per-instance"))
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-attendees-per-instance"))
+		})
+	}
 }
 
 // Section 5.2.8: max-instances Precondition
@@ -3368,6 +3489,56 @@ func TestRFC4791_PutExceedsMaxInstancesLowercaseParams(t *testing.T) {
 	icalData := buildCalendarObject(buildVEvent("too-many-lower",
 		"DTSTART:20240101T000000Z", "RRULE:freq=daily;count=2001"))
 	req := newCalendarPutRequest("/dav/calendars/1/too-many-lower.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-instances"))
+}
+
+func TestRFC4791_PutExceedsMaxInstancesWithoutCount(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	user := &store.User{ID: 1}
+
+	tests := map[string]string{
+		"unbounded rule": buildCalendarObject(buildVEvent("unbounded",
+			"DTSTART:20240101T000000Z", "RRULE:FREQ=DAILY")),
+		"UNTIL beyond limit": buildCalendarObject(buildVEvent("until",
+			"DTSTART:20240101T000000Z", "RRULE:FREQ=DAILY;UNTIL=20270101T000000Z")),
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+			req := newCalendarPutRequest("/dav/calendars/1/instances.ics", strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			h.Put(rr, req)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-instances"))
+		})
+	}
+}
+
+func TestRFC4791_PutExceedsMaxInstancesWithRDates(t *testing.T) {
+	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{{
+		Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true,
+	}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	rdates := make([]string, 0, caldavMaxInstances)
+	for i := 1; i <= caldavMaxInstances; i++ {
+		rdates = append(rdates, start.AddDate(0, 0, i).Format("20060102T150405Z"))
+	}
+	body := buildCalendarObject(buildVEvent("rdates",
+		"DTSTART:"+start.Format("20060102T150405Z"), "RDATE:"+strings.Join(rdates, ",")))
+	req := newCalendarPutRequest("/dav/calendars/1/rdates.ics", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3433,7 +3604,7 @@ func TestRFC4791_PutWithUnsupportedMediaType(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 }
 
 // Section 5.3.2.1: Content-Type is required for calendar object resources
@@ -3453,10 +3624,7 @@ func TestRFC4791_PutWithoutContentTypeRejected(t *testing.T) {
 
 	h.Put(rr, req)
 
-	if rr.Code != http.StatusUnsupportedMediaType {
-		t.Errorf("PUT without Content-Type = %d, want 415 Unsupported Media Type", rr.Code)
-	}
-	assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 }
 
 // Section 5.3.2.1: text/plain is not supported calendar data
@@ -3477,7 +3645,7 @@ func TestRFC4791_PutWithTextPlainRejected(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 }
 
 // Section 5.3.2.1 (CALDAV:supported-calendar-data) and §5.2.4: PUT admits
@@ -3537,7 +3705,7 @@ func TestRFC4791_PutMediaTypeMatchesTheAdvertisedCalendarData(t *testing.T) {
 
 			newServer().Put(rr, req)
 
-			assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 		})
 	}
 }
@@ -3586,7 +3754,7 @@ func TestRFC4791_PutExceedsMaxResourceSize(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusRequestEntityTooLarge, calQN("max-resource-size"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-resource-size"))
 }
 
 // Sections 4.1 and 5.3.2.1: METHOD is forbidden in calendar object resources.
@@ -3607,7 +3775,7 @@ func TestRFC4791_ValidCalendarObject_RejectMethodProperty(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusConflict, calQN("valid-calendar-object-resource"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
 }
 
 // Section 4.1: a calendar object resource MUST NOT contain more than one type of
@@ -3629,7 +3797,7 @@ func TestRFC4791_ValidCalendarObject_RejectMixedComponentTypes(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusBadRequest, calQN("valid-calendar-object-resource"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
 }
 
 func TestRFC4791_ValidCalendarObject_RejectMissingUID(t *testing.T) {
@@ -3650,21 +3818,17 @@ func TestRFC4791_ValidCalendarObject_RejectMissingUID(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusBadRequest, calQN("valid-calendar-object-resource"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
 }
 
 // Section 4.1: a UID is unique within a calendar collection, so a second
-// resource name carrying one already in use fails CALDAV:no-uid-conflict.
+// resource name carrying one already in use fails CALDAV:no-uid-conflict, whose
+// DAV:href reports the resource that already holds it (§5.3.2.1).
 //
-// This covers the sequential case only. putCalendarObject reads the UID
-// through Events.GetByUID and writes
-// through Events.Upsert as two statements, so two concurrent PUTs naming one
-// UID at different resource names can both find no conflict; the second write
-// then takes the ON CONFLICT (calendar_id, uid) DO UPDATE branch in
-// internal/store/postgres.go, silently rewriting resource_name, and both
-// requests answer 201. Closing the row needs the atomic repository operation
-// and the PostgreSQL concurrency tests Phase 3 owns; no handler-level test can
-// establish it.
+// This is the sequential case. The concurrent one is settled inside
+// Store.PutCalendarObject, whose transaction resolves the UID owner and writes
+// under the same advisory locks; TestPostgres_ConcurrentPutsOneUIDTwoResources
+// exercises it against a live database.
 func TestRFC4791_UIDUniqueness_SameUIDMustBeSameResource(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -3691,9 +3855,12 @@ func TestRFC4791_UIDUniqueness_SameUIDMustBeSameResource(t *testing.T) {
 	rr = httptest.NewRecorder()
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusConflict, calQN("no-uid-conflict"))
+	assertUIDConflict(t, rr, "/dav/calendars/1/first.ics")
 }
 
+// Section 5.3.2.1: an overwrite may not replace a resource with one carrying a
+// different UID. The DAV:href names the resource whose UID the request would
+// have changed, which is the request target itself.
 func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -3720,7 +3887,7 @@ func TestRFC4791_UpdateDoesNotAllowChangingUID(t *testing.T) {
 	rr = httptest.NewRecorder()
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusConflict, calQN("no-uid-conflict"))
+	assertUIDConflict(t, rr, "/dav/calendars/1/same.ics")
 }
 
 // Section 5.3.2.1: Multiple different UIDs in a single resource must be rejected
@@ -3741,7 +3908,7 @@ func TestRFC4791_PutWithDifferentUIDsRejected(t *testing.T) {
 
 	h.Put(rr, req)
 
-	assertErrorConditions(t, rr, http.StatusConflict, calQN("valid-calendar-object-resource"))
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
 }
 
 // Section 4.1: Recurrence set with same UID in a single resource is allowed
@@ -4391,7 +4558,7 @@ func TestRFC4791_SupportedCalendarDataIsTextCalendarVersionTwo(t *testing.T) {
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 			h.Put(rr, req)
-			assertErrorConditions(t, rr, http.StatusUnsupportedMediaType, calQN("supported-calendar-data"))
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("supported-calendar-data"))
 		})
 	}
 }

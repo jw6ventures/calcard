@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"strings"
@@ -47,6 +48,26 @@ func writeCalDAVErrorMulti(w http.ResponseWriter, status int, conditions ...stri
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = fmt.Fprint(w, buildCalDAVErrorXML(conditions))
+}
+
+// writeCalDAVUIDConflict answers the CALDAV:no-uid-conflict precondition of
+// RFC 4791 §5.3.2.1, whose DAV:href child names the resource already using the
+// submitted UID. §1.3 makes the status 409: the user can remove or rename that
+// resource and resubmit. Callers resolve the conflicting resource before using
+// this response because DAV:href is part of the precondition's content model.
+func writeCalDAVUIDConflict(w http.ResponseWriter, conflictHref string) {
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusConflict)
+	var body strings.Builder
+	body.WriteString(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:no-uid-conflict>`)
+	var escaped strings.Builder
+	if err := xml.EscapeText(&escaped, []byte(conflictHref)); err == nil {
+		body.WriteString("<D:href>")
+		body.WriteString(escaped.String())
+		body.WriteString("</D:href>")
+	}
+	body.WriteString(`</C:no-uid-conflict></D:error>`)
+	_, _ = fmt.Fprint(w, body.String())
 }
 
 // writeDAVError writes a DAV:-namespace precondition error body (RFC 4918 §16),

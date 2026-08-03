@@ -191,12 +191,15 @@ func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, us
 	if existingByUID != nil {
 		sameSource := destCalID == srcCalID && existingByUID.UID == src.UID && eventResourceName(*existingByUID) == eventResourceName(*src)
 		if !sameSource && eventResourceName(*existingByUID) != destResourceName {
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			writeCalDAVUIDConflict(w, calendarObjectHref(destCalID, existingByUID))
 			return
 		}
 	}
 	if srcCalID == destCalID {
-		writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+		// A copy inside one collection would give the source's UID to a second
+		// resource, which §4.1 forbids; the source is the resource already
+		// holding it.
+		writeCalDAVUIDConflict(w, calendarObjectHref(srcCalID, src))
 		return
 	}
 	if existing != nil && !overwrite {
@@ -237,8 +240,8 @@ func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, us
 	defer invalidateDAVRequestState(r.Context())
 	_, err = h.store.CopyEventAndState(r.Context(), srcCalID, destCalID, src.UID, destResourceName, etag, fromStatePath, toStatePath, replacedUID)
 	if err != nil {
-		if err == store.ErrConflict {
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+		if errors.Is(err, store.ErrConflict) {
+			h.writeCalendarCopyMoveConflict(w, r, destCalID, destResourceName, src.UID)
 			return
 		}
 		http.Error(w, "failed to copy event", http.StatusInternalServerError)
@@ -483,7 +486,7 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 	if existingByUID != nil {
 		sameSource := destCalID == srcCalID && existingByUID.UID == src.UID && eventResourceName(*existingByUID) == eventResourceName(*src)
 		if !sameSource && eventResourceName(*existingByUID) != destResourceName {
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+			writeCalDAVUIDConflict(w, calendarObjectHref(destCalID, existingByUID))
 			return
 		}
 	}
@@ -524,8 +527,8 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 	}
 	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveEventAndState(r.Context(), srcCalID, destCalID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID); err != nil {
-		if err == store.ErrConflict {
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+		if errors.Is(err, store.ErrConflict) {
+			h.writeCalendarCopyMoveConflict(w, r, destCalID, destResourceName, src.UID)
 			return
 		}
 		http.Error(w, "failed to move event", http.StatusInternalServerError)
@@ -538,6 +541,26 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 		w.Header().Set("Location", destPath)
 		w.WriteHeader(http.StatusCreated)
 	}
+}
+
+func (h *DavServer) writeCalendarCopyMoveConflict(w http.ResponseWriter, r *http.Request, calendarID int64, resourceName, uid string) {
+	existing, resourceErr := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
+	byUID, uidErr := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+	if resourceErr != nil || uidErr != nil {
+		http.Error(w, "failed to load conflicting event", http.StatusInternalServerError)
+		return
+	}
+	var conflict *store.Event
+	if existing != nil && existing.UID != uid {
+		conflict = existing
+	} else if byUID != nil && eventResourceName(*byUID) != resourceName {
+		conflict = byUID
+	}
+	if conflict == nil {
+		http.Error(w, "failed to resolve event conflict", http.StatusInternalServerError)
+		return
+	}
+	writeCalDAVUIDConflict(w, calendarObjectHref(calendarID, conflict))
 }
 
 func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {

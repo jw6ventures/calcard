@@ -12,6 +12,7 @@ func TestParseDateTime(t *testing.T) {
 		wantErr bool
 	}{
 		{"20250115T120000Z", time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC), false},
+		{"19970630T235960Z", time.Date(1997, 6, 30, 23, 59, 59, 0, time.UTC), false},
 		{"20250115", time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC), false},
 		{"2025-01-15T12:00:00Z", time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC), false},
 		{"", time.Time{}, true},
@@ -48,6 +49,144 @@ func TestParseDuration(t *testing.T) {
 		if ok != tt.ok || got != tt.want {
 			t.Fatalf("ParseDuration(%q) = (%v, %v), want (%v, %v)", tt.input, got, ok, tt.want, tt.ok)
 		}
+	}
+}
+
+func TestRecurrenceSetExceedsLimitCountsSparseFiniteRule(t *testing.T) {
+	tests := map[string]struct {
+		rrule   string
+		extra   string
+		exceeds bool
+	}{
+		"COUNT": {
+			rrule:   "FREQ=DAILY;COUNT=1001;BYMONTH=2;BYMONTHDAY=29",
+			exceeds: true,
+		},
+		"COUNT with irrelevant EXDATE": {
+			rrule:   "FREQ=DAILY;COUNT=1001;BYMONTH=2;BYMONTHDAY=29",
+			extra:   "EXDATE:20240301T000000Z\r\n",
+			exceeds: true,
+		},
+		"COUNT reduced to the limit by EXDATE": {
+			rrule:   "FREQ=DAILY;COUNT=1001;BYMONTH=2;BYMONTHDAY=29",
+			extra:   "EXDATE:20240229T000000Z\r\n",
+			exceeds: false,
+		},
+		"UNTIL": {
+			rrule:   "FREQ=HOURLY;UNTIL=99991231T235959Z;BYMONTH=2;BYMONTHDAY=29;BYHOUR=0",
+			exceeds: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := "BEGIN:VCALENDAR\r\n" +
+				"BEGIN:VEVENT\r\n" +
+				"UID:sparse\r\n" +
+				"DTSTART:20240229T000000Z\r\n" +
+				"RRULE:" + tt.rrule + "\r\n" +
+				tt.extra +
+				"END:VEVENT\r\n" +
+				"END:VCALENDAR\r\n"
+
+			exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+			if !valid {
+				t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+			}
+			if exceeds != tt.exceeds {
+				t.Fatalf("RecurrenceSetExceedsLimit() exceeds = %t, want %t", exceeds, tt.exceeds)
+			}
+		})
+	}
+}
+
+func TestRecurrenceSetExceedsLimitDoesNotAssumeFiniteRuleCanProduceItsCount(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:impossible\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=DAILY;COUNT=1001;BYMONTH=2;BYMONTHDAY=30\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+	if !valid {
+		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+	}
+	if exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = true, want false")
+	}
+}
+
+func TestRecurrenceSetExceedsLimitCountsRuleWhoseFirstCandidateIsBeyondScanGuard(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:delayed-sparse\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=SECONDLY;COUNT=1001;BYMONTH=2\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+	if !valid {
+		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+	}
+	if !exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = false, want true")
+	}
+}
+
+func TestRecurrenceSetExceedsLimitDoesNotAssumeIntervalCanReachFilteredTime(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:unaligned\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=SECONDLY;INTERVAL=86400;COUNT=1001;BYHOUR=1\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+	if !valid {
+		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+	}
+	if exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = true, want false")
+	}
+}
+
+func TestRecurrenceSetExceedsLimitFinishesImpossibleSparseUntilRule(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:impossible-sparse-until\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=SECONDLY;UNTIL=99991231T235959Z;BYSECOND=0;BYSETPOS=2\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+	if !valid {
+		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+	}
+	if exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = true, want false")
+	}
+}
+
+func TestRecurrenceSetExceedsLimitHandlesLargeSubDailyInterval(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:large-interval\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=HOURLY;INTERVAL=2562048\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	exceeds, valid := RecurrenceSetExceedsLimit(raw, 1000)
+	if !valid {
+		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+	}
+	if !exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = false, want true")
 	}
 }
 

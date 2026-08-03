@@ -4,6 +4,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 func TestIsValidCalDAVCondition(t *testing.T) {
@@ -55,6 +57,65 @@ func TestWriteCalDAVError_ValidCondition(t *testing.T) {
 	}
 	if !strings.Contains(body, "<?xml version") {
 		t.Error("expected XML declaration in response")
+	}
+}
+
+func TestDAVErrorWritersEmitExactWireXML(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(*httptest.ResponseRecorder)
+		want  string
+	}{
+		{
+			name: "CalDAV condition",
+			write: func(w *httptest.ResponseRecorder) {
+				writeCalDAVError(w, 403, "max-resource-size")
+			},
+			want: `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:max-resource-size/></D:error>`,
+		},
+		{
+			name: "DAV condition",
+			write: func(w *httptest.ResponseRecorder) {
+				writeDAVError(w, 409, "resource-must-be-null")
+			},
+			want: `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:"><D:resource-must-be-null/></D:error>`,
+		},
+		{
+			name: "UID conflict href",
+			write: func(w *httptest.ResponseRecorder) {
+				writeCalDAVUIDConflict(w, "/dav/calendars/1/a&b.ics")
+			},
+			want: `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:no-uid-conflict><D:href>/dav/calendars/1/a&amp;b.ics</D:href></C:no-uid-conflict></D:error>`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			tt.write(w)
+			if got := w.Body.String(); got != tt.want {
+				t.Fatalf("response body = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCalendarObjectHrefEscapesResourceNameAsOnePathSegment(t *testing.T) {
+	tests := map[string]string{
+		"a#b":   "/dav/calendars/7/a%23b.ics",
+		"a?b":   "/dav/calendars/7/a%3Fb.ics",
+		"a%b":   "/dav/calendars/7/a%25b.ics",
+		"a b":   "/dav/calendars/7/a%20b.ics",
+		"a/b":   "/dav/calendars/7/a%2Fb.ics",
+		"plain": "/dav/calendars/7/plain.ics",
+	}
+	for resourceName, want := range tests {
+		t.Run(resourceName, func(t *testing.T) {
+			got := calendarObjectHref(7, &store.Event{ResourceName: resourceName})
+			if got != want {
+				t.Fatalf("calendarObjectHref() = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

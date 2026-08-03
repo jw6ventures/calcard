@@ -19,20 +19,16 @@ func TestPutSuppliesPrecomputedEventWriteMetadata(t *testing.T) {
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	raw := "BEGIN:VCALENDAR\r\n" +
-		"VERSION:2.0\r\n" +
-		"BEGIN:VEVENT\r\n" +
-		"UID:event\r\n" +
-		"SUMMARY:Planning\\, Review\r\n" +
-		"DESCRIPTION:Outer description\r\n" +
-		"DTSTART:20260720T150000Z\r\n" +
-		"DTEND:20260720T160000Z\r\n" +
-		"RRULE:FREQ=DAILY;COUNT=3\r\n" +
-		"BEGIN:VALARM\r\n" +
-		"DESCRIPTION:Nested alarm must not replace event metadata\r\n" +
-		"END:VALARM\r\n" +
-		"END:VEVENT\r\n" +
-		"END:VCALENDAR\r\n"
+	raw := buildCalendarObject(buildVEvent("event",
+		"SUMMARY:Planning\\, Review",
+		"DESCRIPTION:Outer description",
+		"DTSTART:20260720T150000Z",
+		"DTEND:20260720T160000Z",
+		"RRULE:FREQ=DAILY;COUNT=3",
+		buildComponent("VALARM",
+			"ACTION:DISPLAY",
+			"TRIGGER:-PT15M",
+			"DESCRIPTION:Nested alarm must not replace event metadata")))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(raw))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()

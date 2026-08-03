@@ -268,7 +268,7 @@ func applyCalendarLivePatch(state *calendarPatchState, kind string, property pro
 type icalComponent struct {
 	name          string
 	properties    map[string]int
-	propertyLines map[string][]calendarTimezoneProperty
+	propertyLines map[string][]icalProperty
 	values        map[string]string
 	children      map[string]int
 }
@@ -277,7 +277,7 @@ func newICalComponent(name string) *icalComponent {
 	return &icalComponent{
 		name:          name,
 		properties:    map[string]int{},
-		propertyLines: map[string][]calendarTimezoneProperty{},
+		propertyLines: map[string][]icalProperty{},
 		values:        map[string]string{},
 		children:      map[string]int{},
 	}
@@ -326,7 +326,7 @@ func validCalendarTimezone(value string) bool {
 			if len(stack) == 0 {
 				return false
 			}
-			property, ok := parseCalendarTimezoneProperty(line)
+			property, ok := parseICalProperty(line)
 			if !ok {
 				return false
 			}

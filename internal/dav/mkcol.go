@@ -460,7 +460,7 @@ func parseSupportedComponentSet(innerXML string) ([]string, bool) {
 // object resources of the named component type. A collection cannot restrict
 // itself to a type the server does not implement.
 func isSupportableCalendarComponent(name string) bool {
-	return slices.Contains(defaultSupportedCalendarComponents, name)
+	return slices.Contains(defaultSupportedCalendarComponents, name) || nonStandardICalendarName(name)
 }
 
 // writeMkcalendarResponse answers a successful MKCALENDAR. RFC 4791 §5.3.1

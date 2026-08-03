@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -36,23 +38,7 @@ func checkConditional(r *http.Request, etag string, exists bool) bool {
 // weak-compare equal (RFC 7232 §2.3.2); it never matches under the strong
 // comparison If-Match requires.
 func etagListMatches(headerValue, etag string, allowWeak bool) bool {
-	if headerValue == "*" {
-		return true
-	}
-	for _, candidate := range strings.Split(headerValue, ",") {
-		candidate = strings.TrimSpace(candidate)
-		if strings.HasPrefix(candidate, "W/") {
-			if !allowWeak {
-				continue
-			}
-			candidate = strings.TrimPrefix(candidate, "W/")
-		}
-		candidate = strings.Trim(candidate, "\"")
-		if candidate != "" && candidate == etag {
-			return true
-		}
-	}
-	return false
+	return headerValue == "*" || slices.Contains(entityTags(headerValue, allowWeak), etag)
 }
 
 // checkConditionalHeaders validates If-Match and If-None-Match headers for events
@@ -125,7 +111,8 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 	isAddressBook := target.Valid && target.Domain == davPathAddressBook && target.Resource
 	if r.ContentLength > maxDAVBodyBytes {
 		if isCalendar {
-			writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+			// §1.3: a body over the limit fails however often it is resubmitted.
+			writeCalDAVError(w, http.StatusForbidden, "max-resource-size")
 		} else if isAddressBook {
 			writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
 		} else {
@@ -139,7 +126,7 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			if isCalendar {
-				writeCalDAVError(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+				writeCalDAVError(w, http.StatusForbidden, "max-resource-size")
 			} else if isAddressBook {
 				writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
 			} else {
@@ -189,56 +176,33 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string, body []byte, bodyText, etag string) {
-	existingByResource, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceUID)
-	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
-		return
-	}
-	requiredPrivilege := "bind"
-	if existingByResource != nil {
-		requiredPrivilege = "write-content"
-	}
-	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
-	if err != nil {
-		status := http.StatusInternalServerError
-		if err == store.ErrNotFound {
-			status = http.StatusNotFound
-		}
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
-		}
-		http.Error(w, http.StatusText(status), status)
+	cal, existingByResource, ok := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
+	if !ok {
 		return
 	}
 
 	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
 	missingContentType := contentType == ""
 	if !missingContentType && !mediaTypeAdvertised(contentType, "text/calendar", calendarDataVersions) {
-		writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
+		writeCalDAVError(w, http.StatusForbidden, "supported-calendar-data")
 		return
 	}
 
+	root, err := parseICalendarObject(bodyText)
+	if err != nil {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
+		return
+	}
+	if fault := validateCalendarObject(root); fault != nil {
+		writeCalDAVErrorMulti(w, fault.status, fault.conditions...)
+		return
+	}
 	analysis, err := analyzeICalendar(bodyText)
 	if err != nil {
-		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-data")
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
 		return
 	}
 
-	componentTypes := analysis.ComponentTypes
-	for comp := range componentTypes {
-		if _, ok := allowedCalendarComponents[comp]; !ok {
-			writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
-			return
-		}
-	}
-	_, hasEvent := componentTypes["VEVENT"]
-	_, hasTodo := componentTypes["VTODO"]
-	_, hasJournal := componentTypes["VJOURNAL"]
-	_, hasFreeBusy := componentTypes["VFREEBUSY"]
-	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-component")
-		return
-	}
 	// RFC 4791 §5.2.3 and §5.3.2.1: a component type the target collection does
 	// not list in CALDAV:supported-calendar-component-set cannot be stored there.
 	if !calendarAcceptsComponents(cal, analysis.Components) {
@@ -246,74 +210,32 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if analysis.HasMethod {
-		writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
-		return
-	}
-
-	if conditions := analysis.objectValidationConditions(); len(conditions) > 0 {
-		if len(conditions) == 2 {
-			writeCalDAVError(w, http.StatusConflict, "valid-calendar-object-resource")
-			return
-		}
-		writeCalDAVErrorMulti(w, http.StatusBadRequest, conditions...)
-		return
-	}
-
-	minDate, maxDate := caldavDateLimits()
-	for _, t := range analysis.DateTimes {
-		if t.Before(minDate) {
-			writeCalDAVError(w, http.StatusForbidden, "min-date-time")
-			return
-		}
-		if t.After(maxDate) {
-			writeCalDAVError(w, http.StatusForbidden, "max-date-time")
-			return
-		}
-	}
-
 	if analysis.MaxAttendees > caldavMaxAttendees {
 		writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
 		return
 	}
-	if analysis.HasRRULECount && analysis.MaxRRULECount > caldavMaxInstances {
+	exceedsInstances, validRecurrence := ical.RecurrenceSetExceedsLimit(bodyText, caldavMaxInstances)
+	if !validRecurrence {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
+		return
+	}
+	if exceedsInstances {
 		writeCalDAVError(w, http.StatusForbidden, "max-instances")
 		return
 	}
 
 	if missingContentType {
-		writeCalDAVError(w, http.StatusUnsupportedMediaType, "supported-calendar-data")
+		writeCalDAVError(w, http.StatusForbidden, "supported-calendar-data")
 		return
 	}
 
 	uid, err := analysis.uid()
 	if err != nil {
-		writeCalDAVError(w, http.StatusBadRequest, "valid-calendar-object-resource")
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
 		return
 	}
 	resourceName := resourceUID
 	if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
-		return
-	}
-	if existingByResource != nil && existingByResource.UID != uid {
-		// Reject: client trying to change UID of existing resource
-		writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
-		return
-	}
-
-	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
-		return
-	}
-	if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
-		// Reject: client trying to use same UID at different path
-		writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
-		return
-	}
-
-	if !h.checkConditionalHeaders(r, existing) {
-		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	}
 
@@ -332,23 +254,145 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if _, err := h.store.Events.Upsert(r.Context(), store.Event{CalendarID: calendarID, UID: uid, ResourceName: resourceName, RawICAL: bodyText, ETag: etag, WriteMetadata: &analysis.Metadata}); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeCalDAVError(w, http.StatusConflict, "no-uid-conflict")
+	write := store.CalendarObjectWrite{
+		CalendarID:    calendarID,
+		UID:           uid,
+		ResourceName:  resourceName,
+		RawICAL:       bodyText,
+		ETag:          etag,
+		Metadata:      &analysis.Metadata,
+		Precondition:  calendarObjectPrecondition(r),
+		ExpectedState: &store.CalendarObjectResourceState{Exists: existingByResource != nil},
+	}
+	result, err := h.store.PutCalendarObject(r.Context(), write)
+	if errors.Is(err, store.ErrResourceStateChanged) {
+		currentCal, current, authorized := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
+		if !authorized {
 			return
 		}
+		if !calendarAcceptsComponents(currentCal, analysis.Components) {
+			writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
+			return
+		}
+		if current == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
+		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
+		result, err = h.store.PutCalendarObject(r.Context(), write)
+	}
+	switch {
+	case errors.Is(err, store.ErrUIDConflict):
+		var conflict *store.Event
+		if result != nil {
+			conflict = result.Conflict
+		}
+		if conflict == nil {
+			h.logger().Error("Put", "calendar object UID conflict did not identify a resource for %q in calendar %d", uid, calendarID)
+			http.Error(w, "failed to save event", http.StatusInternalServerError)
+			return
+		}
+		writeCalDAVUIDConflict(w, calendarObjectHref(calendarID, conflict))
+		return
+	case errors.Is(err, store.ErrPreconditionFailed):
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	case errors.Is(err, store.ErrConflict):
+		h.logger().Error("Put", "calendar object store conflict did not identify a resource for %q in calendar %d", uid, calendarID)
+		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		return
+	case errors.Is(err, store.ErrResourceStateChanged):
+		http.Error(w, "resource changed while writing; retry the request", http.StatusConflict)
+		return
+	case err != nil:
 		h.logger().Error("Put", "failed to save event %q in calendar %d: %v", uid, calendarID, err)
 		http.Error(w, "failed to save event", http.StatusInternalServerError)
 		return
+	case result == nil:
+		h.logger().Error("Put", "calendar object write returned no result for %q in calendar %d", uid, calendarID)
+		http.Error(w, "failed to save event", http.StatusInternalServerError)
+		return
 	}
-	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
-	if existing == nil {
+
+	// §5.3.4: the strong ETag says the stored octets are the submitted ones, so
+	// it is only returned once the store confirms it kept them unchanged.
+	if result.Event != nil && result.Event.RawICAL == bodyText {
+		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", result.Event.ETag))
+	}
+	if result.Created {
 		h.logger().Info("Put", "created event %q in calendar %d", uid, calendarID)
 		w.WriteHeader(http.StatusCreated)
 	} else {
 		h.logger().Info("Put", "updated event %q in calendar %d", uid, calendarID)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// calendarObjectPrecondition translates the request's conditional headers into
+// the form the store re-evaluates inside its write transaction. RFC 7232 §3.1
+// gives If-Match strong comparison, so a weak candidate never matches; §3.2
+// gives If-None-Match weak comparison, so one may.
+func calendarObjectPrecondition(r *http.Request) store.CalendarObjectPrecondition {
+	precondition := store.CalendarObjectPrecondition{}
+	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
+		precondition.IfMatch = &store.ETagCondition{Any: ifMatch == "*", ETags: entityTags(ifMatch, false)}
+	}
+	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
+		precondition.IfNoneMatch = &store.ETagCondition{Any: ifNoneMatch == "*", ETags: entityTags(ifNoneMatch, true)}
+	}
+	return precondition
+}
+
+// entityTags parses a comma-separated If-Match or If-None-Match value into the
+// bare entity tags it names, dropping weak ones where the comparison is strong.
+func entityTags(headerValue string, allowWeak bool) []string {
+	var tags []string
+	for _, candidate := range strings.Split(headerValue, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if strings.HasPrefix(candidate, "W/") {
+			if !allowWeak {
+				continue
+			}
+			candidate = strings.TrimPrefix(candidate, "W/")
+		}
+		if candidate = strings.Trim(candidate, "\""); candidate != "" {
+			tags = append(tags, candidate)
+		}
+	}
+	return tags
+}
+
+// calendarObjectHref is the URL of one calendar object resource, as the
+// CALDAV:no-uid-conflict error body reports it.
+func calendarObjectHref(calendarID int64, event *store.Event) string {
+	if event == nil {
+		return ""
+	}
+	return fmt.Sprintf("/dav/calendars/%d/%s.ics", calendarID, url.PathEscape(eventResourceName(*event)))
+}
+
+func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceName, cleanPath string) (*store.CalendarAccess, *store.Event, bool) {
+	existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, resourceName)
+	if err != nil {
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		return nil, nil, false
+	}
+	requiredPrivilege := "bind"
+	if existing != nil {
+		requiredPrivilege = "write-content"
+	}
+	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if err == store.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		if errors.Is(err, errForbidden) {
+			status = http.StatusForbidden
+		}
+		http.Error(w, http.StatusText(status), status)
+		return nil, nil, false
+	}
+	return cal, existing, true
 }
 
 func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string) {

@@ -114,9 +114,11 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		sb.WriteString("TRANSP:TRANSPARENT\r\n") // Free/busy: free time
 		sb.WriteString("CLASS:PUBLIC\r\n")
 
-		// Add X-property to mark this as a birthday event
+		// RFC 5545 §3.8.8.2: a non-standard property the server defines for its
+		// own use carries a vendor id, so it cannot collide with another
+		// implementation's property of the same purpose.
 		sb.WriteString("X-CALCARD-TYPE:BIRTHDAY\r\n")
-		sb.WriteString(fmt.Sprintf("X-CONTACT-UID:%s\r\n", c.UID))
+		sb.WriteString(fmt.Sprintf("X-CALCARD-CONTACT-UID:%s\r\n", c.UID))
 
 		sb.WriteString("END:VEVENT\r\n")
 		sb.WriteString("END:VCALENDAR\r\n")

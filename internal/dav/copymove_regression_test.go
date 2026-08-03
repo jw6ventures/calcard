@@ -67,3 +67,36 @@ func TestMoveContactMapsTransactionalUIDConflictToCardDAVPrecondition(t *testing
 		}
 	}
 }
+
+func TestCalendarCopyMoveDoNotEmitNoUIDConflictWithoutHref(t *testing.T) {
+	calendars := &fakeCalendarRepo{accessible: []store.CalendarAccess{
+		{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}, Editor: true},
+		{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Destination"}, Editor: true},
+	}}
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			events := &fakeEventRepo{events: map[string]*store.Event{
+				"1:event": {CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag"},
+			}}
+			if method == "COPY" {
+				events.copyErr = store.ErrConflict
+			} else {
+				events.moveErr = store.ErrConflict
+			}
+			h := NewDavServer(Options{Store: &store.Store{Calendars: calendars, Events: events}})
+			request := httptest.NewRequest(method, "/dav/calendars/1/event.ics", nil)
+			request.Header.Set("Destination", "/dav/calendars/2/destination.ics")
+			request = request.WithContext(auth.WithUser(request.Context(), &store.User{ID: 1}))
+			response := httptest.NewRecorder()
+
+			h.ServeHTTP(response, request)
+
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("%s unidentified conflict = %d, want 500: %s", method, response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "no-uid-conflict") {
+				t.Fatalf("%s emitted no-uid-conflict without its required DAV:href: %s", method, response.Body.String())
+			}
+		})
+	}
+}

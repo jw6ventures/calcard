@@ -4,11 +4,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
-type calendarTimezoneProperty struct {
+// icalProperty is one parsed RFC 5545 content line. keyPart keeps the name and
+// parameters exactly as they were written, because the shared internal/ical
+// helpers resolve a TZID from that spelling rather than from a parameter map.
+type icalProperty struct {
 	name       string
+	keyPart    string
 	value      string
 	parameters map[string]string
 }
@@ -33,22 +36,23 @@ var knownICalendarParameters = map[string]struct{}{
 	"ROLE": {}, "RSVP": {}, "SENT-BY": {}, "TZID": {}, "VALUE": {},
 }
 
-func parseCalendarTimezoneProperty(line string) (calendarTimezoneProperty, bool) {
+func parseICalProperty(line string) (icalProperty, bool) {
 	colon := delimiterOutsideQuotes(line, ':')
 	if colon <= 0 {
-		return calendarTimezoneProperty{}, false
+		return icalProperty{}, false
 	}
 	keyPart := line[:colon]
 	parts, ok := splitOutsideQuotes(keyPart, ';')
 	if !ok || len(parts) == 0 {
-		return calendarTimezoneProperty{}, false
+		return icalProperty{}, false
 	}
 	name := strings.ToUpper(strings.TrimSpace(parts[0]))
 	if !validICalendarToken(name) {
-		return calendarTimezoneProperty{}, false
+		return icalProperty{}, false
 	}
-	property := calendarTimezoneProperty{
+	property := icalProperty{
 		name:       name,
+		keyPart:    keyPart,
 		value:      strings.TrimSpace(line[colon+1:]),
 		parameters: make(map[string]string, len(parts)-1),
 	}
@@ -57,18 +61,18 @@ func parseCalendarTimezoneProperty(line string) (calendarTimezoneProperty, bool)
 		parameterName = strings.ToUpper(strings.TrimSpace(parameterName))
 		parameterValue = strings.TrimSpace(parameterValue)
 		if !found || !validICalendarToken(parameterName) || !validICalendarParameterValue(parameterValue) {
-			return calendarTimezoneProperty{}, false
+			return icalProperty{}, false
 		}
 		if _, duplicate := property.parameters[parameterName]; duplicate {
 			if _, standard := knownICalendarParameters[parameterName]; standard {
-				return calendarTimezoneProperty{}, false
+				return icalProperty{}, false
 			}
 			continue
 		}
 		property.parameters[parameterName] = unquoteICalendarParameter(parameterValue)
 	}
 	if strings.ContainsAny(property.value, "\x00\r\n") {
-		return calendarTimezoneProperty{}, false
+		return icalProperty{}, false
 	}
 	return property, true
 }
@@ -207,7 +211,7 @@ func atMostOne(component *icalComponent, names ...string) bool {
 	return true
 }
 
-func validCalendarTimezoneProperty(componentName string, property calendarTimezoneProperty) bool {
+func validCalendarTimezoneProperty(componentName string, property icalProperty) bool {
 	allowedParameters := map[string]struct{}{}
 	switch property.name {
 	case "DTSTART", "RDATE":
@@ -257,25 +261,19 @@ func validCalendarTimezoneProperty(componentName string, property calendarTimezo
 }
 
 func validUTCDateTime(value string) bool {
-	if !strings.HasSuffix(strings.ToUpper(value), "Z") {
-		return false
-	}
-	_, err := time.Parse("20060102T150405Z", strings.ToUpper(value))
-	return err == nil
+	form, ok := parseICalDateForm(strings.ToUpper(value))
+	return ok && form == icalUTCDateTime
 }
 
-func validTimezoneDateTimeProperty(property calendarTimezoneProperty) bool {
+func validTimezoneDateTimeProperty(property icalProperty) bool {
 	if valueType, ok := property.parameters["VALUE"]; ok && !strings.EqualFold(valueType, "DATE-TIME") {
 		return false
 	}
-	if strings.HasSuffix(strings.ToUpper(property.value), "Z") {
-		return false
-	}
-	_, err := time.Parse("20060102T150405", property.value)
-	return err == nil
+	form, ok := parseICalDateForm(property.value)
+	return ok && form == icalFloatingDateTime
 }
 
-func validTimezoneRDate(property calendarTimezoneProperty) bool {
+func validTimezoneRDate(property icalProperty) bool {
 	if valueType, ok := property.parameters["VALUE"]; ok && !strings.EqualFold(valueType, "DATE-TIME") {
 		return false
 	}
@@ -285,10 +283,8 @@ func validTimezoneRDate(property calendarTimezoneProperty) bool {
 	}
 	for _, value := range values {
 		value = strings.TrimSpace(value)
-		if value == "" || strings.HasSuffix(strings.ToUpper(value), "Z") {
-			return false
-		}
-		if _, err := time.Parse("20060102T150405", value); err != nil {
+		form, ok := parseICalDateForm(value)
+		if value == "" || !ok || form != icalFloatingDateTime {
 			return false
 		}
 	}
@@ -365,7 +361,7 @@ func validTimezoneRecurrenceRule(value string) bool {
 		"BYYEARDAY": {}, "BYWEEKNO": {}, "BYMONTH": {}, "BYSETPOS": {}, "WKST": {},
 	}
 	for name := range values {
-		if _, ok := known[name]; !ok && !validICalendarToken(name) {
+		if _, ok := known[name]; !ok {
 			return false
 		}
 	}

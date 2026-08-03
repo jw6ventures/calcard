@@ -1610,9 +1610,6 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 		assertCardDAVErrorBody(t, rr.Body.String(), "supported-address-data")
 	})
 
-	// Section 6.3.2.1 with §6.2.2: PUT admits exactly the media type
-	// CARDDAV:supported-address-data advertises. A prefix match on the header
-	// lets through types the collection never claimed to hold.
 	t.Run("Section6_3_2_1_MediaTypeMatchesTheAdvertisedAddressData", func(t *testing.T) {
 		accepted := map[string]string{
 			"the advertised type":      "text/vcard",

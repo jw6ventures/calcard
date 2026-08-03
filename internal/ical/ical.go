@@ -29,6 +29,7 @@ func ParseDateTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, fmt.Errorf("empty datetime")
 	}
+	s = normalizeLeapSecond(s)
 
 	for _, format := range icalDateTimeFormats {
 		if t, err := time.Parse(format, s); err == nil {
@@ -45,6 +46,7 @@ func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
 	if loc == nil || hasZoneSuffix(s) {
 		return ParseDateTime(s)
 	}
+	s = normalizeLeapSecond(s)
 
 	for _, format := range icalLocalFormats {
 		if t, err := time.ParseInLocation(format, s, loc); err == nil {
@@ -53,6 +55,23 @@ func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
 	}
 
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
+}
+
+// RFC 5545 permits second 60 for a positive leap second and recommends that
+// implementations without leap-second support interpret it as second 59.
+func normalizeLeapSecond(value string) string {
+	timeSeparator := strings.IndexByte(value, 'T')
+	if timeSeparator < 0 {
+		return value
+	}
+	secondStart := timeSeparator + 5
+	if len(value) > timeSeparator+3 && value[timeSeparator+3] == ':' {
+		secondStart = timeSeparator + 7
+	}
+	if secondStart+2 > len(value) || value[secondStart:secondStart+2] != "60" {
+		return value
+	}
+	return value[:secondStart] + "59" + value[secondStart+2:]
 }
 
 func hasZoneSuffix(s string) bool {

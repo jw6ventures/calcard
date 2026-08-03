@@ -1505,6 +1505,38 @@ func assertErrorConditions(t *testing.T, rr *httptest.ResponseRecorder, wantStat
 	}
 }
 
+// assertUIDConflict asserts the CALDAV:no-uid-conflict precondition of RFC 4791
+// §5.3.2.1 together with the DAV:href its definition gives it: the URL of the
+// resource already using the submitted UID.
+func assertUIDConflict(t *testing.T, rr *httptest.ResponseRecorder, wantHref string) {
+	t.Helper()
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", rr.Code, rr.Body.String())
+	}
+	root, err := parseRootElement(rr.Body.Bytes(), davQN("error"))
+	if err != nil {
+		t.Fatalf("decode DAV:error: %v; body: %s", err, rr.Body.String())
+	}
+	if len(root.Children) != 1 || root.Children[0].Name != calQN("no-uid-conflict") {
+		t.Fatalf("DAV:error children = %s, want one CALDAV:no-uid-conflict", qnList(childNames(root)))
+	}
+	conflict := root.Children[0]
+	if len(conflict.Children) != 1 || conflict.Children[0].Name != davQN("href") {
+		t.Fatalf("CALDAV:no-uid-conflict children = %s, want one DAV:href", qnList(childNames(conflict)))
+	}
+	if got := strings.TrimSpace(conflict.Children[0].Text); got != wantHref {
+		t.Errorf("conflicting resource href = %q, want %q", got, wantHref)
+	}
+}
+
+func childNames(el davElement) []xml.Name {
+	names := make([]xml.Name, 0, len(el.Children))
+	for _, child := range el.Children {
+		names = append(names, child.Name)
+	}
+	return names
+}
+
 // assertMKCalendarCreated asserts the normative half of RFC 4791 §5.3.1 — a
 // success body, when present, is a CALDAV:mkcalendar-response element — and
 // pins the exact success status CalCard returns.

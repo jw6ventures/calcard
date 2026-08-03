@@ -10,11 +10,13 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
+// calendarAnalysis is the reading of a calendar object the handler needs once
+// validateCalendarObject has accepted it: the components to check against the
+// collection's own restrictions, the recurrence and attendee counts the §5.2
+// limits bound, and the metadata the store indexes.
 type calendarAnalysis struct {
 	ComponentTypes map[string]struct{}
 	Components     []calendarTopLevelComponent
-	HasMethod      bool
-	DateTimes      []time.Time
 	MaxAttendees   int
 	MaxRRULECount  int
 	HasRRULECount  bool
@@ -100,13 +102,8 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 		if !ok {
 			continue
 		}
-		switch name {
-		case "METHOD":
-			analysis.HasMethod = true
-		case "DTSTART", "DTEND":
-			if parsed, ok := ical.ParsePropertyDateTimeLocal(keyPart, value); ok {
-				analysis.DateTimes = append(analysis.DateTimes, parsed)
-			}
+		if current != nil && name == "ATTENDEE" && attendeeLimitedComponent(current.Type) {
+			currentAttendees++
 		}
 		if current != nil && len(stack) == 2 {
 			switch name {
@@ -120,10 +117,6 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 				}
 			case "RECURRENCE-ID":
 				current.HasRecurrenceID = true
-			case "ATTENDEE":
-				if attendeeLimitedComponent(current.Type) {
-					currentAttendees++
-				}
 			case "RRULE":
 				if recurrenceLimitedComponent(current.Type) {
 					if count, ok := rruleCount(value); ok {
@@ -154,7 +147,7 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 }
 
 func attendeeLimitedComponent(componentType string) bool {
-	return componentType == "VEVENT" || componentType == "VTODO" || componentType == "VJOURNAL"
+	return componentType == "VEVENT" || componentType == "VTODO" || componentType == "VJOURNAL" || componentType == "VFREEBUSY"
 }
 
 func recurrenceLimitedComponent(componentType string) bool {
@@ -265,37 +258,6 @@ func unescapeCalendarText(value string) string {
 	value = strings.ReplaceAll(value, `\,`, ",")
 	value = strings.ReplaceAll(value, `\;`, ";")
 	return strings.ReplaceAll(value, `\\`, `\`)
-}
-
-func (a calendarAnalysis) objectValidationConditions() []string {
-	for _, component := range a.Components {
-		if component.UIDEmpty || component.UIDCount == 0 {
-			return []string{"valid-calendar-object-resource"}
-		}
-		if component.UIDCount > 1 {
-			return []string{"valid-calendar-data"}
-		}
-	}
-	if len(a.Components) <= 1 {
-		return nil
-	}
-	uid := a.Components[0].UID
-	withoutRecurrence := 0
-	withRecurrence := 0
-	for _, component := range a.Components {
-		if component.UID != uid {
-			return []string{"valid-calendar-object-resource", "valid-calendar-data"}
-		}
-		if component.HasRecurrenceID {
-			withRecurrence++
-		} else {
-			withoutRecurrence++
-		}
-	}
-	if withRecurrence > 0 && withoutRecurrence == 1 {
-		return nil
-	}
-	return []string{"valid-calendar-object-resource"}
 }
 
 func (a calendarAnalysis) uid() (string, error) {

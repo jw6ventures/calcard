@@ -517,5 +517,6 @@ func TestExtensionPutValidatorRejectsCalendarObject(t *testing.T) {
 }
 
 func validCalendarObject(uid string) string {
-	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	return buildCalendarObject(buildVEvent(uid,
+		"DTSTART:20260101T120000Z", "DTEND:20260101T130000Z", "SUMMARY:Test"))
 }

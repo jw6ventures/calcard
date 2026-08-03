@@ -22,6 +22,6 @@ func isTopLevelComponentType(componentType string) bool {
 	case "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY":
 		return true
 	default:
-		return false
+		return nonStandardICalendarName(componentType)
 	}
 }
