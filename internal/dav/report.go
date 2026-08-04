@@ -83,6 +83,10 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if isACLReport(report.XMLName.Local) {
+		h.reportACL(w, r, user, cleanPath, body)
+		return
+	}
 
 	if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "calendar-multiget" {
 		// RFC 4791 §7: both reports are supported on calendar object resources
@@ -150,7 +154,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			http.Error(w, "ambiguous calendar path", http.StatusConflict)
 			return
 		}
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "calendar not found", http.StatusNotFound)
 			return
 		}
@@ -185,12 +189,13 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calID, cleanPath, loadPrivilege)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if err == store.ErrNotFound {
-			status = http.StatusNotFound
+		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
+			writeNeedPrivileges(w, cleanPath, loadPrivilege)
+			return
 		}
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrNotFound) {
+			status = http.StatusNotFound
 		}
 		http.Error(w, "calendar not found", status)
 		return
@@ -401,11 +406,12 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 
 	book, err := h.loadAddressBookWithPrivilege(r.Context(), user, bookID, cleanPath, "read")
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
+		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
+			writeNeedPrivileges(w, cleanPath, "read")
+			return
 		}
-		if err == store.ErrNotFound {
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrNotFound) {
 			status = http.StatusNotFound
 		}
 		http.Error(w, "address book not found", status)

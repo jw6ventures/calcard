@@ -70,12 +70,13 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 
 	responses, err := h.buildPropfindResponses(r.Context(), r, r.URL.Path, depth, user, &propfindReq)
 	if err != nil {
+		if errors.Is(err, errForbidden) {
+			writeNeedPrivileges(w, r.URL.Path, "read")
+			return
+		}
 		status := http.StatusBadRequest
 		if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
 			status = http.StatusConflict
-		}
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
 		}
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, http.ErrNotSupported) {
 			status = http.StatusNotFound

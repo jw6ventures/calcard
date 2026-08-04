@@ -94,46 +94,53 @@ type prop struct {
 	// nil = absent (404), a pointer to "" = present-empty (200 empty element),
 	// and a pointer to a non-empty value = present (200). Presence must not be
 	// inferred from a Go zero value.
-	DisplayName                   *string                        `xml:"d:displayname,omitempty"`
-	ResourceType                  *resourceType                  `xml:"d:resourcetype,omitempty"`
-	GetETag                       string                         `xml:"d:getetag,omitempty"`
-	GetContentType                string                         `xml:"d:getcontenttype,omitempty"`
-	CalendarData                  cdataString                    `xml:"cal:calendar-data,omitempty"`
-	AddressData                   cdataString                    `xml:"card:address-data,omitempty"`
-	CalendarDescription           *langString                    `xml:"cal:calendar-description,omitempty"`
-	CalendarTimezone              *string                        `xml:"cal:calendar-timezone,omitempty"`
-	CalendarColor                 *string                        `xml:"ical:calendar-color,omitempty"`
-	AddressBookDesc               *string                        `xml:"card:addressbook-description,omitempty"`
-	SupportedAddressData          *supportedAddressData          `xml:"card:supported-address-data,omitempty"`
-	AddressBookMaxResourceSize    string                         `xml:"card:max-resource-size,omitempty"`
-	SupportedCollationSet         *supportedCollationSet         `xml:"card:supported-collation-set,omitempty"`
-	CalDAVSupportedCollationSet   *caldavSupportedCollationSet   `xml:"cal:supported-collation-set,omitempty"`
-	SyncToken                     string                         `xml:"d:sync-token,omitempty"`
-	CTag                          string                         `xml:"cs:getctag,omitempty"`
-	CurrentUserPrincipal          *expandableHrefProp            `xml:"d:current-user-principal,omitempty"`
-	CurrentUserPrincipalURL       *hrefProp                      `xml:"d:current-user-principal-URL,omitempty"`
-	PrincipalURL                  *expandableHrefProp            `xml:"d:principal-URL,omitempty"`
-	CalendarHomeSet               *hrefListProp                  `xml:"cal:calendar-home-set,omitempty"`
-	AddressbookHomeSet            *hrefListProp                  `xml:"card:addressbook-home-set,omitempty"`
-	PrincipalAddress              *hrefProp                      `xml:"card:principal-address,omitempty"`
-	SupportedReportSet            *supportedReportSet            `xml:"d:supported-report-set,omitempty"`
-	SupportedCalendarComponentSet *supportedCalendarComponentSet `xml:"cal:supported-calendar-component-set,omitempty"`
-	MaxResourceSize               string                         `xml:"cal:max-resource-size,omitempty"`
-	MinDateTime                   string                         `xml:"cal:min-date-time,omitempty"`
-	MaxDateTime                   string                         `xml:"cal:max-date-time,omitempty"`
-	MaxInstances                  string                         `xml:"cal:max-instances,omitempty"`
-	MaxAttendeesPerInstance       string                         `xml:"cal:max-attendees-per-instance,omitempty"`
-	ScheduleCalendarTransp        *scheduleCalendarTransp        `xml:"cal:schedule-calendar-transp,omitempty"`
-	SupportedCalendarData         *supportedCalendarData         `xml:"cal:supported-calendar-data,omitempty"`
-	CalendarServerReadOnly        *struct{}                      `xml:"cs:read-only,omitempty"`
-	CurrentUserPrivilegeSet       *currentUserPrivilegeSet       `xml:"d:current-user-privilege-set,omitempty"`
-	LockDiscovery                 *lockDiscoveryProp             `xml:"d:lockdiscovery,omitempty"`
-	SupportedLock                 *supportedLockProp             `xml:"d:supportedlock,omitempty"`
-	Owner                         *hrefProp                      `xml:"d:owner,omitempty"`
-	ACL                           *aclProp                       `xml:"d:acl,omitempty"`
-	SupportedPrivilegeSet         *supportedPrivilegeSetProp     `xml:"d:supported-privilege-set,omitempty"`
-	PrincipalCollectionSet        *hrefListProp                  `xml:"d:principal-collection-set,omitempty"`
-	CustomXML                     []XMLProperty                  `xml:",any,omitempty"`
+	DisplayName                    *string                        `xml:"d:displayname,omitempty"`
+	ResourceType                   *resourceType                  `xml:"d:resourcetype,omitempty"`
+	GetETag                        string                         `xml:"d:getetag,omitempty"`
+	GetContentType                 string                         `xml:"d:getcontenttype,omitempty"`
+	CalendarData                   cdataString                    `xml:"cal:calendar-data,omitempty"`
+	AddressData                    cdataString                    `xml:"card:address-data,omitempty"`
+	CalendarDescription            *langString                    `xml:"cal:calendar-description,omitempty"`
+	CalendarTimezone               *string                        `xml:"cal:calendar-timezone,omitempty"`
+	CalendarColor                  *string                        `xml:"ical:calendar-color,omitempty"`
+	AddressBookDesc                *string                        `xml:"card:addressbook-description,omitempty"`
+	SupportedAddressData           *supportedAddressData          `xml:"card:supported-address-data,omitempty"`
+	AddressBookMaxResourceSize     string                         `xml:"card:max-resource-size,omitempty"`
+	SupportedCollationSet          *supportedCollationSet         `xml:"card:supported-collation-set,omitempty"`
+	CalDAVSupportedCollationSet    *caldavSupportedCollationSet   `xml:"cal:supported-collation-set,omitempty"`
+	SyncToken                      string                         `xml:"d:sync-token,omitempty"`
+	CTag                           string                         `xml:"cs:getctag,omitempty"`
+	CurrentUserPrincipal           *expandableHrefProp            `xml:"d:current-user-principal,omitempty"`
+	CurrentUserPrincipalURL        *hrefProp                      `xml:"d:current-user-principal-URL,omitempty"`
+	PrincipalURL                   *expandableHrefProp            `xml:"d:principal-URL,omitempty"`
+	AlternateURISet                *hrefListProp                  `xml:"d:alternate-URI-set,omitempty"`
+	GroupMembership                *hrefListProp                  `xml:"d:group-membership,omitempty"`
+	CalendarHomeSet                *hrefListProp                  `xml:"cal:calendar-home-set,omitempty"`
+	AddressbookHomeSet             *hrefListProp                  `xml:"card:addressbook-home-set,omitempty"`
+	PrincipalAddress               *hrefProp                      `xml:"card:principal-address,omitempty"`
+	SupportedReportSet             *supportedReportSet            `xml:"d:supported-report-set,omitempty"`
+	SupportedCalendarComponentSet  *supportedCalendarComponentSet `xml:"cal:supported-calendar-component-set,omitempty"`
+	MaxResourceSize                string                         `xml:"cal:max-resource-size,omitempty"`
+	MinDateTime                    string                         `xml:"cal:min-date-time,omitempty"`
+	MaxDateTime                    string                         `xml:"cal:max-date-time,omitempty"`
+	MaxInstances                   string                         `xml:"cal:max-instances,omitempty"`
+	MaxAttendeesPerInstance        string                         `xml:"cal:max-attendees-per-instance,omitempty"`
+	ScheduleCalendarTransp         *scheduleCalendarTransp        `xml:"cal:schedule-calendar-transp,omitempty"`
+	SupportedCalendarData          *supportedCalendarData         `xml:"cal:supported-calendar-data,omitempty"`
+	CalendarServerReadOnly         *struct{}                      `xml:"cs:read-only,omitempty"`
+	CurrentUserPrivilegeSet        *currentUserPrivilegeSet       `xml:"d:current-user-privilege-set,omitempty"`
+	LockDiscovery                  *lockDiscoveryProp             `xml:"d:lockdiscovery,omitempty"`
+	SupportedLock                  *supportedLockProp             `xml:"d:supportedlock,omitempty"`
+	Owner                          *hrefProp                      `xml:"d:owner,omitempty"`
+	Group                          *hrefProp                      `xml:"d:group,omitempty"`
+	ACL                            *aclProp                       `xml:"d:acl,omitempty"`
+	ACLRestrictions                *aclRestrictionsProp           `xml:"d:acl-restrictions,omitempty"`
+	InheritedACLSet                *hrefListProp                  `xml:"d:inherited-acl-set,omitempty"`
+	SupportedPrivilegeSet          *supportedPrivilegeSetProp     `xml:"d:supported-privilege-set,omitempty"`
+	PrincipalCollectionSet         *hrefListProp                  `xml:"d:principal-collection-set,omitempty"`
+	CustomXML                      []XMLProperty                  `xml:",any,omitempty"`
+	aclForbidden                   bool
+	currentUserPrivilegesForbidden bool
 }
 
 func (p *prop) setCustomXMLProperty(property XMLProperty) {
@@ -294,6 +301,8 @@ type propertySelection struct {
 	CurrentUserPrincipal          *struct{}  `xml:"DAV: current-user-principal"`
 	CurrentUserPrincipalURL       *struct{}  `xml:"DAV: current-user-principal-URL"`
 	PrincipalURL                  *struct{}  `xml:"DAV: principal-URL"`
+	AlternateURISet               *struct{}  `xml:"DAV: alternate-URI-set"`
+	GroupMembership               *struct{}  `xml:"DAV: group-membership"`
 	CalendarHomeSet               *struct{}  `xml:"urn:ietf:params:xml:ns:caldav calendar-home-set"`
 	AddressbookHomeSet            *struct{}  `xml:"urn:ietf:params:xml:ns:carddav addressbook-home-set"`
 	PrincipalAddress              *struct{}  `xml:"urn:ietf:params:xml:ns:carddav principal-address"`
@@ -311,7 +320,10 @@ type propertySelection struct {
 	LockDiscovery                 *struct{}  `xml:"DAV: lockdiscovery"`
 	SupportedLock                 *struct{}  `xml:"DAV: supportedlock"`
 	Owner                         *struct{}  `xml:"DAV: owner"`
+	Group                         *struct{}  `xml:"DAV: group"`
 	ACLProp                       *struct{}  `xml:"DAV: acl"`
+	ACLRestrictions               *struct{}  `xml:"DAV: acl-restrictions"`
+	InheritedACLSet               *struct{}  `xml:"DAV: inherited-acl-set"`
 	SupportedPrivilegeSet         *struct{}  `xml:"DAV: supported-privilege-set"`
 	PrincipalCollectionSet        *struct{}  `xml:"DAV: principal-collection-set"`
 	CustomXML                     []xml.Name `xml:",any"`
@@ -674,7 +686,7 @@ type proppatchProp struct {
 }
 
 type hrefProp struct {
-	Href string `xml:"d:href"`
+	Href string `xml:"d:href,omitempty"`
 }
 
 type expandableHrefProp struct {
@@ -714,13 +726,17 @@ type supportedReport struct {
 }
 
 type reportType struct {
-	CalendarMultiGet    *struct{} `xml:"cal:calendar-multiget,omitempty"`
-	CalendarQuery       *struct{} `xml:"cal:calendar-query,omitempty"`
-	FreeBusyQuery       *struct{} `xml:"cal:free-busy-query,omitempty"`
-	AddressbookMultiGet *struct{} `xml:"card:addressbook-multiget,omitempty"`
-	AddressbookQuery    *struct{} `xml:"card:addressbook-query,omitempty"`
-	SyncCollection      *struct{} `xml:"d:sync-collection,omitempty"`
-	ExpandProperty      *struct{} `xml:"d:expand-property,omitempty"`
+	CalendarMultiGet           *struct{} `xml:"cal:calendar-multiget,omitempty"`
+	CalendarQuery              *struct{} `xml:"cal:calendar-query,omitempty"`
+	FreeBusyQuery              *struct{} `xml:"cal:free-busy-query,omitempty"`
+	AddressbookMultiGet        *struct{} `xml:"card:addressbook-multiget,omitempty"`
+	AddressbookQuery           *struct{} `xml:"card:addressbook-query,omitempty"`
+	SyncCollection             *struct{} `xml:"d:sync-collection,omitempty"`
+	ExpandProperty             *struct{} `xml:"d:expand-property,omitempty"`
+	ACLPrincipalPropSet        *struct{} `xml:"d:acl-principal-prop-set,omitempty"`
+	PrincipalMatch             *struct{} `xml:"d:principal-match,omitempty"`
+	PrincipalPropertySearch    *struct{} `xml:"d:principal-property-search,omitempty"`
+	PrincipalSearchPropertySet *struct{} `xml:"d:principal-search-property-set,omitempty"`
 }
 
 type supportedCalendarComponentSet struct {
@@ -847,13 +863,18 @@ type currentUserPrivilegeSet struct {
 }
 
 type privilege struct {
-	Read            *readPrivilege `xml:"d:read,omitempty"`
-	ReadFreeBusy    *struct{}      `xml:"cal:read-free-busy,omitempty"`
-	Write           *struct{}      `xml:"d:write,omitempty"`
-	WriteContent    *struct{}      `xml:"d:write-content,omitempty"`
-	WriteProperties *struct{}      `xml:"d:write-properties,omitempty"`
-	Bind            *struct{}      `xml:"d:bind,omitempty"`
-	Unbind          *struct{}      `xml:"d:unbind,omitempty"`
+	All                         *struct{}      `xml:"d:all,omitempty"`
+	Read                        *readPrivilege `xml:"d:read,omitempty"`
+	ReadFreeBusy                *struct{}      `xml:"cal:read-free-busy,omitempty"`
+	Write                       *struct{}      `xml:"d:write,omitempty"`
+	WriteContent                *struct{}      `xml:"d:write-content,omitempty"`
+	WriteProperties             *struct{}      `xml:"d:write-properties,omitempty"`
+	Bind                        *struct{}      `xml:"d:bind,omitempty"`
+	Unbind                      *struct{}      `xml:"d:unbind,omitempty"`
+	ReadACL                     *struct{}      `xml:"d:read-acl,omitempty"`
+	ReadCurrentUserPrivilegeSet *struct{}      `xml:"d:read-current-user-privilege-set,omitempty"`
+	WriteACL                    *struct{}      `xml:"d:write-acl,omitempty"`
+	Unlock                      *struct{}      `xml:"d:unlock,omitempty"`
 }
 
 type readPrivilege struct {
@@ -927,42 +948,373 @@ type lockEntry struct {
 // ACL XML models (RFC 3744)
 
 type aclRequest struct {
-	XMLName xml.Name `xml:"DAV: acl"`
-	ACE     []ace    `xml:"DAV: ace"`
+	XMLName xml.Name               `xml:"DAV: acl"`
+	ACE     []ace                  `xml:"DAV: ace"`
+	Unknown []unsupportedPrivilege `xml:",any"`
+}
+
+func (r *aclRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	if start.Name != (xml.Name{Space: "DAV:", Local: "acl"}) {
+		return fmt.Errorf("unexpected ACL root %q", xmlNameString(start.Name))
+	}
+	*r = aclRequest{XMLName: start.Name}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		switch child.Name {
+		case (xml.Name{Space: "DAV:", Local: "ace"}):
+			var value ace
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			r.ACE = append(r.ACE, value)
+		default:
+			var value unsupportedPrivilege
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			r.Unknown = append(r.Unknown, value)
+		}
+		return nil
+	})
 }
 
 type ace struct {
-	Principal acePrincipal `xml:"DAV: principal"`
-	Grant     *aceGrant    `xml:"DAV: grant"`
-	Deny      *aceDeny     `xml:"DAV: deny"`
+	Principal []acePrincipal         `xml:"DAV: principal"`
+	Invert    []aceInvert            `xml:"DAV: invert"`
+	Grant     []aceGrant             `xml:"DAV: grant"`
+	Deny      []aceDeny              `xml:"DAV: deny"`
+	Protected []emptyElement         `xml:"DAV: protected"`
+	Inherited []aceInherited         `xml:"DAV: inherited"`
+	Unknown   []unsupportedPrivilege `xml:",any"`
+	Sequence  []xml.Name             `xml:"-"`
+}
+
+func (a *ace) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*a = ace{}
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			a.Sequence = append(a.Sequence, token.Name)
+			switch token.Name {
+			case (xml.Name{Space: "DAV:", Local: "principal"}):
+				var value acePrincipal
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Principal = append(a.Principal, value)
+			case (xml.Name{Space: "DAV:", Local: "invert"}):
+				var value aceInvert
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Invert = append(a.Invert, value)
+			case (xml.Name{Space: "DAV:", Local: "grant"}):
+				var value aceGrant
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Grant = append(a.Grant, value)
+			case (xml.Name{Space: "DAV:", Local: "deny"}):
+				var value aceDeny
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Deny = append(a.Deny, value)
+			case (xml.Name{Space: "DAV:", Local: "protected"}):
+				var value emptyElement
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Protected = append(a.Protected, value)
+			case (xml.Name{Space: "DAV:", Local: "inherited"}):
+				var value aceInherited
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Inherited = append(a.Inherited, value)
+			default:
+				var value unsupportedPrivilege
+				if err := dec.DecodeElement(&value, &token); err != nil {
+					return err
+				}
+				a.Unknown = append(a.Unknown, value)
+			}
+		case xml.CharData:
+			if strings.TrimSpace(string(token)) != "" {
+				return fmt.Errorf("unexpected character data in DAV:ace")
+			}
+		case xml.EndElement:
+			if token.Name == start.Name {
+				return nil
+			}
+		}
+	}
 }
 
 type acePrincipal struct {
-	Href          string    `xml:"DAV: href,omitempty"`
-	All           *struct{} `xml:"DAV: all,omitempty"`
-	Authenticated *struct{} `xml:"DAV: authenticated,omitempty"`
-	Self          *struct{} `xml:"DAV: self,omitempty"`
+	Href            []string               `xml:"DAV: href"`
+	All             []emptyElement         `xml:"DAV: all"`
+	Authenticated   []emptyElement         `xml:"DAV: authenticated"`
+	Unauthenticated []emptyElement         `xml:"DAV: unauthenticated"`
+	Property        []acePrincipalProperty `xml:"DAV: property"`
+	Self            []emptyElement         `xml:"DAV: self"`
+	Unknown         []unsupportedPrivilege `xml:",any"`
+}
+
+func (p *acePrincipal) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*p = acePrincipal{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		switch child.Name {
+		case (xml.Name{Space: "DAV:", Local: "href"}):
+			value, err := decodeTextOnly(dec, child)
+			if err != nil {
+				return err
+			}
+			p.Href = append(p.Href, value)
+		case (xml.Name{Space: "DAV:", Local: "all"}):
+			return decodeEmptyElement(dec, child, &p.All)
+		case (xml.Name{Space: "DAV:", Local: "authenticated"}):
+			return decodeEmptyElement(dec, child, &p.Authenticated)
+		case (xml.Name{Space: "DAV:", Local: "unauthenticated"}):
+			return decodeEmptyElement(dec, child, &p.Unauthenticated)
+		case (xml.Name{Space: "DAV:", Local: "property"}):
+			var value acePrincipalProperty
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			p.Property = append(p.Property, value)
+		case (xml.Name{Space: "DAV:", Local: "self"}):
+			return decodeEmptyElement(dec, child, &p.Self)
+		default:
+			return decodeUnsupportedElement(dec, child, &p.Unknown)
+		}
+		return nil
+	})
+}
+
+type aceInvert struct {
+	Principal []acePrincipal         `xml:"DAV: principal"`
+	Unknown   []unsupportedPrivilege `xml:",any"`
+}
+
+func (i *aceInvert) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*i = aceInvert{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		if child.Name == (xml.Name{Space: "DAV:", Local: "principal"}) {
+			var value acePrincipal
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			i.Principal = append(i.Principal, value)
+			return nil
+		}
+		return decodeUnsupportedElement(dec, child, &i.Unknown)
+	})
+}
+
+type acePrincipalProperty struct {
+	Owner   []emptyElement         `xml:"DAV: owner"`
+	Group   []emptyElement         `xml:"DAV: group"`
+	Unknown []unsupportedPrivilege `xml:",any"`
+}
+
+func (p *acePrincipalProperty) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*p = acePrincipalProperty{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		switch child.Name {
+		case (xml.Name{Space: "DAV:", Local: "owner"}):
+			return decodeEmptyElement(dec, child, &p.Owner)
+		case (xml.Name{Space: "DAV:", Local: "group"}):
+			return decodeEmptyElement(dec, child, &p.Group)
+		default:
+			return decodeUnsupportedElement(dec, child, &p.Unknown)
+		}
+	})
+}
+
+type aceInherited struct {
+	Href    []string               `xml:"DAV: href"`
+	Unknown []unsupportedPrivilege `xml:",any"`
+}
+
+func (i *aceInherited) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*i = aceInherited{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		if child.Name == (xml.Name{Space: "DAV:", Local: "href"}) {
+			value, err := decodeTextOnly(dec, child)
+			if err != nil {
+				return err
+			}
+			i.Href = append(i.Href, value)
+			return nil
+		}
+		return decodeUnsupportedElement(dec, child, &i.Unknown)
+	})
 }
 
 type aceGrant struct {
-	Privileges []acePrivilege `xml:"DAV: privilege"`
+	Privileges []acePrivilege         `xml:"DAV: privilege"`
+	Unknown    []unsupportedPrivilege `xml:",any"`
+}
+
+func (g *aceGrant) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*g = aceGrant{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		if child.Name == (xml.Name{Space: "DAV:", Local: "privilege"}) {
+			var value acePrivilege
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			g.Privileges = append(g.Privileges, value)
+			return nil
+		}
+		return decodeUnsupportedElement(dec, child, &g.Unknown)
+	})
 }
 
 type aceDeny struct {
-	Privileges []acePrivilege `xml:"DAV: privilege"`
+	Privileges []acePrivilege         `xml:"DAV: privilege"`
+	Unknown    []unsupportedPrivilege `xml:",any"`
+}
+
+func (d *aceDeny) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*d = aceDeny{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		if child.Name == (xml.Name{Space: "DAV:", Local: "privilege"}) {
+			var value acePrivilege
+			if err := dec.DecodeElement(&value, &child); err != nil {
+				return err
+			}
+			d.Privileges = append(d.Privileges, value)
+			return nil
+		}
+		return decodeUnsupportedElement(dec, child, &d.Unknown)
+	})
 }
 
 type acePrivilege struct {
-	Read            *emptyElement          `xml:"DAV: read,omitempty"`
-	Write           *emptyElement          `xml:"DAV: write,omitempty"`
-	WriteContent    *emptyElement          `xml:"DAV: write-content,omitempty"`
-	WriteProperties *emptyElement          `xml:"DAV: write-properties,omitempty"`
-	ReadACL         *emptyElement          `xml:"DAV: read-acl,omitempty"`
-	WriteACL        *emptyElement          `xml:"DAV: write-acl,omitempty"`
-	Bind            *emptyElement          `xml:"DAV: bind,omitempty"`
-	Unbind          *emptyElement          `xml:"DAV: unbind,omitempty"`
-	All             *emptyElement          `xml:"DAV: all,omitempty"`
-	Unknown         []unsupportedPrivilege `xml:",any"`
+	Read                        *emptyElement          `xml:"DAV: read,omitempty"`
+	Write                       *emptyElement          `xml:"DAV: write,omitempty"`
+	WriteContent                *emptyElement          `xml:"DAV: write-content,omitempty"`
+	WriteProperties             *emptyElement          `xml:"DAV: write-properties,omitempty"`
+	ReadACL                     *emptyElement          `xml:"DAV: read-acl,omitempty"`
+	ReadCurrentUserPrivilegeSet *emptyElement          `xml:"DAV: read-current-user-privilege-set,omitempty"`
+	WriteACL                    *emptyElement          `xml:"DAV: write-acl,omitempty"`
+	Unlock                      *emptyElement          `xml:"DAV: unlock,omitempty"`
+	Bind                        *emptyElement          `xml:"DAV: bind,omitempty"`
+	Unbind                      *emptyElement          `xml:"DAV: unbind,omitempty"`
+	ReadFreeBusy                *emptyElement          `xml:"urn:ietf:params:xml:ns:caldav read-free-busy,omitempty"`
+	All                         *emptyElement          `xml:"DAV: all,omitempty"`
+	Unknown                     []unsupportedPrivilege `xml:",any"`
+	Elements                    int                    `xml:"-"`
+}
+
+func (p *acePrivilege) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
+	*p = acePrivilege{}
+	return decodeElementOnly(dec, start, func(child xml.StartElement) error {
+		p.Elements++
+		switch child.Name {
+		case (xml.Name{Space: "DAV:", Local: "read"}):
+			return decodeEmptyElementPointer(dec, child, &p.Read)
+		case (xml.Name{Space: "DAV:", Local: "write"}):
+			return decodeEmptyElementPointer(dec, child, &p.Write)
+		case (xml.Name{Space: "DAV:", Local: "write-content"}):
+			return decodeEmptyElementPointer(dec, child, &p.WriteContent)
+		case (xml.Name{Space: "DAV:", Local: "write-properties"}):
+			return decodeEmptyElementPointer(dec, child, &p.WriteProperties)
+		case (xml.Name{Space: "DAV:", Local: "read-acl"}):
+			return decodeEmptyElementPointer(dec, child, &p.ReadACL)
+		case (xml.Name{Space: "DAV:", Local: "read-current-user-privilege-set"}):
+			return decodeEmptyElementPointer(dec, child, &p.ReadCurrentUserPrivilegeSet)
+		case (xml.Name{Space: "DAV:", Local: "write-acl"}):
+			return decodeEmptyElementPointer(dec, child, &p.WriteACL)
+		case (xml.Name{Space: "DAV:", Local: "unlock"}):
+			return decodeEmptyElementPointer(dec, child, &p.Unlock)
+		case (xml.Name{Space: "DAV:", Local: "bind"}):
+			return decodeEmptyElementPointer(dec, child, &p.Bind)
+		case (xml.Name{Space: "DAV:", Local: "unbind"}):
+			return decodeEmptyElementPointer(dec, child, &p.Unbind)
+		case (xml.Name{Space: "urn:ietf:params:xml:ns:caldav", Local: "read-free-busy"}):
+			return decodeEmptyElementPointer(dec, child, &p.ReadFreeBusy)
+		case (xml.Name{Space: "DAV:", Local: "all"}):
+			return decodeEmptyElementPointer(dec, child, &p.All)
+		default:
+			return decodeUnsupportedElement(dec, child, &p.Unknown)
+		}
+	})
+}
+
+func decodeElementOnly(dec *xml.Decoder, start xml.StartElement, decodeChild func(xml.StartElement) error) error {
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			if err := decodeChild(token); err != nil {
+				return err
+			}
+		case xml.CharData:
+			if strings.TrimSpace(string(token)) != "" {
+				return fmt.Errorf("unexpected character data in %q", xmlNameString(start.Name))
+			}
+		case xml.EndElement:
+			if token.Name == start.Name {
+				return nil
+			}
+		}
+	}
+}
+
+func decodeTextOnly(dec *xml.Decoder, start xml.StartElement) (string, error) {
+	var value strings.Builder
+	for {
+		token, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			return "", fmt.Errorf("unexpected nested element %q", xmlNameString(token.Name))
+		case xml.CharData:
+			value.Write(token)
+		case xml.EndElement:
+			if token.Name == start.Name {
+				return value.String(), nil
+			}
+		}
+	}
+}
+
+func decodeEmptyElement(dec *xml.Decoder, start xml.StartElement, values *[]emptyElement) error {
+	var value emptyElement
+	if err := dec.DecodeElement(&value, &start); err != nil {
+		return err
+	}
+	*values = append(*values, value)
+	return nil
+}
+
+func decodeEmptyElementPointer(dec *xml.Decoder, start xml.StartElement, value **emptyElement) error {
+	var decoded emptyElement
+	if err := dec.DecodeElement(&decoded, &start); err != nil {
+		return err
+	}
+	*value = &decoded
+	return nil
+}
+
+func decodeUnsupportedElement(dec *xml.Decoder, start xml.StartElement, values *[]unsupportedPrivilege) error {
+	var value unsupportedPrivilege
+	if err := dec.DecodeElement(&value, &start); err != nil {
+		return err
+	}
+	*values = append(*values, value)
+	return nil
 }
 
 type emptyElement struct{}
@@ -1006,16 +1358,29 @@ type aclProp struct {
 }
 
 type aceResp struct {
-	Principal acePrincipalResp `xml:"d:principal"`
-	Grant     *aceGrantResp    `xml:"d:grant,omitempty"`
-	Deny      *aceDenyResp     `xml:"d:deny,omitempty"`
+	Principal acePrincipalResp  `xml:"d:principal"`
+	Grant     *aceGrantResp     `xml:"d:grant,omitempty"`
+	Deny      *aceDenyResp      `xml:"d:deny,omitempty"`
+	Protected *struct{}         `xml:"d:protected,omitempty"`
+	Inherited *aceInheritedResp `xml:"d:inherited,omitempty"`
+}
+
+type aceInheritedResp struct {
+	Href string `xml:"d:href"`
 }
 
 type acePrincipalResp struct {
-	Href          string    `xml:"d:href,omitempty"`
-	All           *struct{} `xml:"d:all,omitempty"`
-	Authenticated *struct{} `xml:"d:authenticated,omitempty"`
-	Self          *struct{} `xml:"d:self,omitempty"`
+	Href            string                    `xml:"d:href,omitempty"`
+	All             *struct{}                 `xml:"d:all,omitempty"`
+	Authenticated   *struct{}                 `xml:"d:authenticated,omitempty"`
+	Unauthenticated *struct{}                 `xml:"d:unauthenticated,omitempty"`
+	Property        *acePrincipalPropertyResp `xml:"d:property,omitempty"`
+	Self            *struct{}                 `xml:"d:self,omitempty"`
+}
+
+type acePrincipalPropertyResp struct {
+	Owner *struct{} `xml:"d:owner,omitempty"`
+	Group *struct{} `xml:"d:group,omitempty"`
 }
 
 type aceGrantResp struct {
@@ -1027,15 +1392,18 @@ type aceDenyResp struct {
 }
 
 type acePrivilegeResp struct {
-	Read            *struct{} `xml:"d:read,omitempty"`
-	Write           *struct{} `xml:"d:write,omitempty"`
-	WriteContent    *struct{} `xml:"d:write-content,omitempty"`
-	WriteProperties *struct{} `xml:"d:write-properties,omitempty"`
-	ReadACL         *struct{} `xml:"d:read-acl,omitempty"`
-	WriteACL        *struct{} `xml:"d:write-acl,omitempty"`
-	Bind            *struct{} `xml:"d:bind,omitempty"`
-	Unbind          *struct{} `xml:"d:unbind,omitempty"`
-	All             *struct{} `xml:"d:all,omitempty"`
+	Read                        *struct{} `xml:"d:read,omitempty"`
+	Write                       *struct{} `xml:"d:write,omitempty"`
+	WriteContent                *struct{} `xml:"d:write-content,omitempty"`
+	WriteProperties             *struct{} `xml:"d:write-properties,omitempty"`
+	ReadACL                     *struct{} `xml:"d:read-acl,omitempty"`
+	ReadCurrentUserPrivilegeSet *struct{} `xml:"d:read-current-user-privilege-set,omitempty"`
+	WriteACL                    *struct{} `xml:"d:write-acl,omitempty"`
+	Unlock                      *struct{} `xml:"d:unlock,omitempty"`
+	Bind                        *struct{} `xml:"d:bind,omitempty"`
+	Unbind                      *struct{} `xml:"d:unbind,omitempty"`
+	ReadFreeBusy                *struct{} `xml:"cal:read-free-busy,omitempty"`
+	All                         *struct{} `xml:"d:all,omitempty"`
 }
 
 type supportedPrivilegeSetProp struct {
@@ -1044,19 +1412,25 @@ type supportedPrivilegeSetProp struct {
 
 type supportedPrivilege struct {
 	Privilege   supportedPrivilegeType `xml:"d:privilege"`
-	Description string                 `xml:"d:description"`
+	Description langString             `xml:"d:description"`
 	SubPrivs    []supportedPrivilege   `xml:"d:supported-privilege,omitempty"`
 }
 
 type supportedPrivilegeType struct {
-	Read            *struct{} `xml:"d:read,omitempty"`
-	Write           *struct{} `xml:"d:write,omitempty"`
-	WriteContent    *struct{} `xml:"d:write-content,omitempty"`
-	WriteProperties *struct{} `xml:"d:write-properties,omitempty"`
-	ReadACL         *struct{} `xml:"d:read-acl,omitempty"`
-	WriteACL        *struct{} `xml:"d:write-acl,omitempty"`
-	Bind            *struct{} `xml:"d:bind,omitempty"`
-	Unbind          *struct{} `xml:"d:unbind,omitempty"`
-	All             *struct{} `xml:"d:all,omitempty"`
-	ReadFreeBusy    *struct{} `xml:"cal:read-free-busy,omitempty"`
+	Read                        *struct{} `xml:"d:read,omitempty"`
+	Write                       *struct{} `xml:"d:write,omitempty"`
+	WriteContent                *struct{} `xml:"d:write-content,omitempty"`
+	WriteProperties             *struct{} `xml:"d:write-properties,omitempty"`
+	ReadACL                     *struct{} `xml:"d:read-acl,omitempty"`
+	ReadCurrentUserPrivilegeSet *struct{} `xml:"d:read-current-user-privilege-set,omitempty"`
+	WriteACL                    *struct{} `xml:"d:write-acl,omitempty"`
+	Unlock                      *struct{} `xml:"d:unlock,omitempty"`
+	Bind                        *struct{} `xml:"d:bind,omitempty"`
+	Unbind                      *struct{} `xml:"d:unbind,omitempty"`
+	All                         *struct{} `xml:"d:all,omitempty"`
+	ReadFreeBusy                *struct{} `xml:"cal:read-free-busy,omitempty"`
+}
+
+type aclRestrictionsProp struct {
+	NoInvert *struct{} `xml:"d:no-invert,omitempty"`
 }

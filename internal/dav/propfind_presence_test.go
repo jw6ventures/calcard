@@ -189,20 +189,16 @@ func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 	}
 }
 
-// TestCurrentUserPrivilegeSetForPathPresentEmptyOnApplicablePaths verifies the
-// producer side of the contract: principal and generic-collection paths, which
-// the property applies to but for which no per-privilege grants are computed,
-// return a present-empty set (non-nil, zero children) rather than nil.
-func TestCurrentUserPrivilegeSetForPathPresentEmptyOnApplicablePaths(t *testing.T) {
+func TestCurrentUserPrivilegeSetForOwnedGenericPathsReportsEffectivePrivileges(t *testing.T) {
 	h := &DavServer{store: &store.Store{}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 	for _, path := range []string{"/dav/principals/1/", "/dav/", "/dav/calendars/", "/dav/addressbooks/"} {
 		privs := h.currentUserPrivilegeSetForPath(context.Background(), user, path)
 		if privs == nil {
-			t.Fatalf("%s: expected a present-empty privilege set (non-nil), got nil", path)
+			t.Fatalf("%s: expected a privilege set, got nil", path)
 		}
-		if len(privs.Privileges) != 0 {
-			t.Fatalf("%s: expected zero privileges, got %#v", path, privs.Privileges)
+		if len(privs.Privileges) != len(calendarCurrentPrivilegeNames) {
+			t.Fatalf("%s: got %d privileges, want %d: %#v", path, len(privs.Privileges), len(calendarCurrentPrivilegeNames), privs.Privileges)
 		}
 	}
 }
@@ -227,10 +223,7 @@ func TestStatusOKPropDisplayNamePresence(t *testing.T) {
 	}
 }
 
-// TestPropfindPrincipalCurrentUserPrivilegeSetPresentEmpty is an end-to-end
-// check that a principal (an applicable kind with no computed privileges)
-// answers current-user-privilege-set with a present-empty 200 element, not a 404.
-func TestPropfindPrincipalCurrentUserPrivilegeSetPresentEmpty(t *testing.T) {
+func TestPropfindOwnedPrincipalCurrentUserPrivilegeSetIncludesAll(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 	h := &DavServer{store: &store.Store{}}
 
@@ -246,8 +239,8 @@ func TestPropfindPrincipalCurrentUserPrivilegeSetPresentEmpty(t *testing.T) {
 		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
 	}
 	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:current-user-privilege-set></d:current-user-privilege-set>") {
-		t.Fatalf("expected present-empty current-user-privilege-set on principal, got %s", respBody)
+	if !strings.Contains(respBody, "<d:all") || !strings.Contains(respBody, "<d:write-acl") || !strings.Contains(respBody, "<d:unlock") {
+		t.Fatalf("expected effective owner privileges on principal, got %s", respBody)
 	}
 	if strings.Contains(respBody, "404") {
 		t.Fatalf("current-user-privilege-set must not be a 404 on a principal, got %s", respBody)
@@ -328,10 +321,7 @@ func TestCurrentUserPrivilegeSetZeroPrivilegesIsPresentEmpty(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
 	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
-	if privs == nil {
-		t.Fatal("expected a present-empty privilege set (non-nil), got nil")
-	}
-	if len(privs.Privileges) != 0 {
-		t.Fatalf("expected zero privileges, got %#v", privs.Privileges)
+	if privs != nil {
+		t.Fatalf("expected an inaccessible resource to have no visible privilege set, got %#v", privs)
 	}
 }

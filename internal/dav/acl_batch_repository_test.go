@@ -137,6 +137,27 @@ func TestBatchedCalendarFilteringFallsBackToResolvedCollectionPrivileges(t *test
 	}
 }
 
+func TestBatchedCalendarFilteringUsesFirstMatchingACE(t *testing.T) {
+	cal := &store.CalendarAccess{
+		Calendar: store.Calendar{ID: 2, UserID: 9, Name: "Shared"},
+		Shared:   true, PrivilegesResolved: true,
+	}
+	entries := []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/2/visible", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read", Position: 0},
+		{ResourcePath: "/dav/calendars/2/visible", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read", Position: 1},
+	}
+	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
+	events := []store.Event{{CalendarID: 2, UID: "visible", ResourceName: "visible"}}
+
+	visible, err := h.filterReadableCalendarEvents(context.Background(), &store.User{ID: 1}, cal, events)
+	if err != nil {
+		t.Fatalf("filterReadableCalendarEvents() error = %v", err)
+	}
+	if len(visible) != 1 || visible[0].UID != "visible" {
+		t.Fatalf("filterReadableCalendarEvents() = %#v, want the first granting ACE to decide", visible)
+	}
+}
+
 func TestCalendarMultigetFallsBackToResolvedCollectionPrivileges(t *testing.T) {
 	cal := &store.CalendarAccess{
 		Calendar:           store.Calendar{ID: 2, UserID: 9, Name: "Shared"},

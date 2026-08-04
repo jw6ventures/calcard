@@ -33,7 +33,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if calendarID, uid, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -73,7 +73,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 
 		cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "read")
 		if err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -113,7 +113,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -125,7 +125,7 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if matched {
 		if _, err := h.loadAddressBookWithPrivilege(r.Context(), user, addressBookID, cleanPath, "read"); err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}

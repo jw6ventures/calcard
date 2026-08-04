@@ -267,14 +267,16 @@ func (f ContactFilter) IsZero() bool {
 
 // AppPassword is a per-client credential for DAV access.
 type AppPassword struct {
-	ID         int64
-	UserID     int64
-	Label      string
-	TokenHash  string
-	CreatedAt  time.Time
-	ExpiresAt  *time.Time
-	RevokedAt  *time.Time
-	LastUsedAt *time.Time
+	ID              int64
+	UserID          int64
+	Label           string
+	TokenHash       string
+	DigestMD5HA1    *string
+	DigestSHA256HA1 *string
+	CreatedAt       time.Time
+	ExpiresAt       *time.Time
+	RevokedAt       *time.Time
+	LastUsedAt      *time.Time
 }
 
 // DeletedResource tracks tombstones for sync reporting.
@@ -311,6 +313,14 @@ type Lock struct {
 	TimeoutSeconds int
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
+
+	// These transient fields bind lock creation to the state authorized by the
+	// DAV layer. They are not persisted in the locks table.
+	ExpectedTargetExists   *bool
+	ExpectedCollection     string
+	ExpectedCollectionID   int64
+	ExpectedCollectionCTag *int64
+	ExpectedResourceState  *DAVResourceState
 }
 
 // LockPrecondition captures one write target whose active locks must be
@@ -328,6 +338,7 @@ type ACLEntry struct {
 	PrincipalHref string
 	IsGrant       bool
 	Privilege     string
+	Position      int
 	CreatedAt     time.Time
 }
 

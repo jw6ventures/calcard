@@ -64,6 +64,16 @@ func (s *Service) authCachePut(key string, user *store.User, tokenID int64) {
 	s.authCache[key] = authCacheEntry{user: user, tokenID: tokenID, expiresAt: now.Add(authCacheTTL)}
 }
 
+func (s *Service) authCacheClearUser(userID int64) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	for key, entry := range s.authCache {
+		if entry.user != nil && entry.user.ID == userID {
+			delete(s.authCache, key)
+		}
+	}
+}
+
 // touchLastUsedThrottled records app-password usage off the request path. It
 // skips the write entirely when last_used_at was updated recently, and runs the
 // UPDATE on a detached context so a finished request can't cancel it mid-write.

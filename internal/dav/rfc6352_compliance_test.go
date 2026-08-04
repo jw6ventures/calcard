@@ -188,9 +188,14 @@ type fakeACLRepo struct {
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
+	statePaths := davStatePaths(resourcePath)
+	aliases := make(map[string]struct{}, len(statePaths))
+	for _, statePath := range statePaths {
+		aliases[statePath] = struct{}{}
+	}
 	filtered := make([]store.ACLEntry, 0, len(f.entries))
 	for _, entry := range f.entries {
-		if entry.ResourcePath != resourcePath {
+		if _, replace := aliases[entry.ResourcePath]; !replace {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -414,7 +419,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 	})
 
-	t.Run("Section3_ACLDenyOverridesBroadGrant", func(t *testing.T) {
+	t.Run("Section3_EarlierACLDenyStopsLaterBroadGrant", func(t *testing.T) {
 		user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
@@ -423,8 +428,8 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
@@ -436,7 +441,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 			t.Fatalf("checkACLPrivilege() error = %v", err)
 		}
 		if granted {
-			t.Fatal("RFC 6352 Section 3: deny ACEs must override broader grants for the same resource")
+			t.Fatal("RFC 3744 Section 6: an earlier matching deny ACE must stop evaluation before a later grant")
 		}
 	})
 
@@ -3985,7 +3990,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
@@ -4925,11 +4930,11 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 		rr := httptest.NewRecorder()
 		h.Proppatch(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "403") {
-			t.Errorf("RFC 4918/RFC 3744: PROPPATCH by non-owner MUST return 403 propstat, got: %s", rr.Body.String())
+		if !strings.Contains(rr.Body.String(), "<D:need-privileges>") || !strings.Contains(rr.Body.String(), "<D:write-properties/>") {
+			t.Errorf("RFC 3744: PROPPATCH privilege failure must identify DAV:write-properties, got: %s", rr.Body.String())
 		}
 	})
 }

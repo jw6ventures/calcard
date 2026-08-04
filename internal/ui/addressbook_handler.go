@@ -488,7 +488,7 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		resourceName = contact.UID
 	}
 	resourcePath := path.Join("/dav/addressbooks", strconv.FormatInt(bookID, 10), resourceName)
-	if err := h.store.DeleteContactAndState(r.Context(), bookID, uid, resourcePath); err != nil {
+	if err := h.store.DeleteContactAndState(r.Context(), bookID, store.ContactDAVResourceState(contact), resourcePath, nil); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to delete contact"})
 		return
 	}

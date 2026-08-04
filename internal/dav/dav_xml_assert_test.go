@@ -1186,7 +1186,12 @@ func (r davResponse) supportedPrivileges(t *testing.T) []string {
 				len(privilege.Children), qnList(privilege.childNames()))
 			return
 		}
-		path := qnString(privilege.Children[0].Name)
+		privilegeName := privilege.Children[0]
+		if strings.TrimSpace(privilegeName.Text) != "" || len(privilegeName.Children) != 0 {
+			t.Errorf("RFC 3744 §3.1: privilege %s is not an empty element", qnString(privilegeName.Name))
+			return
+		}
+		path := qnString(privilegeName.Name)
 		if prefix != "" {
 			path = prefix + "/" + path
 		}

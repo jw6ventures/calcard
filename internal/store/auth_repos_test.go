@@ -22,21 +22,25 @@ func TestAppPasswordRepoCRUDAndQueries(t *testing.T) {
 	now := time.Now().UTC()
 	expires := now.Add(24 * time.Hour)
 	lastUsed := now.Add(time.Hour)
+	md5HA1 := "md5-ha1"
+	sha256HA1 := "sha256-ha1"
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO app_passwords (user_id, label, token_hash, expires_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+INSERT INTO app_passwords (user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 `)).
-		WithArgs(int64(7), "Laptop", "hash", &expires).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "created_at", "expires_at", "revoked_at", "last_used_at"}).
-			AddRow(int64(1), int64(7), "Laptop", "hash", now, expires, nil, nil))
+		WithArgs(int64(7), "Laptop", "hash", &md5HA1, &sha256HA1, &expires).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "digest_md5_ha1", "digest_sha256_ha1", "created_at", "expires_at", "revoked_at", "last_used_at"}).
+			AddRow(int64(1), int64(7), "Laptop", "hash", md5HA1, sha256HA1, now, expires, nil, nil))
 
 	created, err := repo.Create(context.Background(), AppPassword{
-		UserID:    7,
-		Label:     "Laptop",
-		TokenHash: "hash",
-		ExpiresAt: &expires,
+		UserID:          7,
+		Label:           "Laptop",
+		TokenHash:       "hash",
+		DigestMD5HA1:    &md5HA1,
+		DigestSHA256HA1: &sha256HA1,
+		ExpiresAt:       &expires,
 	})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -46,14 +50,14 @@ RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, la
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 FROM app_passwords
 WHERE user_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
 ORDER BY created_at DESC
 `)).
 		WithArgs(int64(7)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "created_at", "expires_at", "revoked_at", "last_used_at"}).
-			AddRow(int64(1), int64(7), "Laptop", "hash", now, expires, nil, lastUsed))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "digest_md5_ha1", "digest_sha256_ha1", "created_at", "expires_at", "revoked_at", "last_used_at"}).
+			AddRow(int64(1), int64(7), "Laptop", "hash", md5HA1, sha256HA1, now, expires, nil, lastUsed))
 
 	found, err := repo.FindValidByUser(context.Background(), 7)
 	if err != nil {
@@ -63,7 +67,7 @@ ORDER BY created_at DESC
 		t.Fatalf("FindValidByUser() = %#v", found)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`)).
 		WithArgs(int64(9)).
 		WillReturnError(sql.ErrNoRows)
 
@@ -248,13 +252,15 @@ func TestScanHelpersHandleNullableFields(t *testing.T) {
 		*(dest[1].(*int64)) = 2
 		*(dest[2].(*string)) = "Laptop"
 		*(dest[3].(*string)) = "hash"
-		*(dest[4].(*time.Time)) = now
-		*(dest[5].(*sql.NullTime)) = sql.NullTime{}
-		*(dest[6].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[4].(*sql.NullString)) = sql.NullString{String: "md5-ha1", Valid: true}
+		*(dest[5].(*sql.NullString)) = sql.NullString{}
+		*(dest[6].(*time.Time)) = now
 		*(dest[7].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[8].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[9].(*sql.NullTime)) = sql.NullTime{}
 		return nil
 	})
-	if err != nil || app.ExpiresAt != nil || app.RevokedAt != nil || app.LastUsedAt != nil {
+	if err != nil || app.DigestMD5HA1 == nil || *app.DigestMD5HA1 != "md5-ha1" || app.DigestSHA256HA1 != nil || app.ExpiresAt != nil || app.RevokedAt != nil || app.LastUsedAt != nil {
 		t.Fatalf("scanAppPassword() = %#v, %v", app, err)
 	}
 

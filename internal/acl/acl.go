@@ -4,9 +4,19 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
+)
+
+const (
+	PrincipalAll             = "DAV:all"
+	PrincipalAuthenticated   = "DAV:authenticated"
+	PrincipalUnauthenticated = "DAV:unauthenticated"
+	PrincipalSelf            = "DAV:self"
+	PrincipalPropertyOwner   = "DAV:property:owner"
+	PrincipalPropertyGroup   = "DAV:property:group"
 )
 
 func PrincipalHref(userID int64) string {
@@ -14,26 +24,88 @@ func PrincipalHref(userID int64) string {
 }
 
 func PrincipalHrefs(user *store.User) []string {
-	principals := []string{"DAV:all"}
+	principals := []string{PrincipalAll}
 	if user != nil {
-		principals = append(principals, "DAV:authenticated", PrincipalHref(user.ID))
+		principals = append(principals, PrincipalAuthenticated, PrincipalHref(user.ID))
+	} else {
+		principals = append(principals, PrincipalUnauthenticated)
 	}
 	return principals
 }
 
 func ApplicablePrincipals(user *store.User) map[string]struct{} {
-	principals := map[string]struct{}{"DAV:all": {}}
+	principals := map[string]struct{}{PrincipalAll: {}}
 	if user != nil {
 		principals[PrincipalHref(user.ID)] = struct{}{}
-		principals["DAV:authenticated"] = struct{}{}
+		principals[PrincipalAuthenticated] = struct{}{}
+	} else {
+		principals[PrincipalUnauthenticated] = struct{}{}
 	}
 	return principals
+}
+
+// ResourcePrincipals carries the facts about the resource under evaluation that
+// RFC 3744 section 5.5.1 resolves the DAV:self and DAV:property principal forms
+// against. Those two name a principal indirectly, through the resource rather
+// than through the ACE, so a decision over them cannot be made from the
+// requesting user alone.
+type ResourcePrincipals struct {
+	// OwnerHref is the resource's DAV:owner value, empty when it has none.
+	OwnerHref string
+	// SelfHref is the principal a principal resource identifies. It is empty
+	// for every resource that is not itself a principal.
+	SelfHref string
+}
+
+// ApplicablePrincipalsFor extends ApplicablePrincipals with the principal forms
+// that depend on the resource being accessed.
+//
+// DAV:property:group never becomes applicable: CalCard defines no DAV:group
+// property, and section 5.5.1 makes an ACE naming a property the resource does
+// not define match nothing. Storing such an ACE is therefore harmless, and
+// leaving it unmatched is the specified behavior rather than an omission.
+func ApplicablePrincipalsFor(user *store.User, resource ResourcePrincipals) map[string]struct{} {
+	principals := ApplicablePrincipals(user)
+	if user == nil {
+		return principals
+	}
+	current := NormalizePrincipalHref(PrincipalHref(user.ID))
+	if resource.OwnerHref != "" && NormalizePrincipalHref(resource.OwnerHref) == current {
+		principals[PrincipalPropertyOwner] = struct{}{}
+	}
+	if resource.SelfHref != "" && NormalizePrincipalHref(resource.SelfHref) == current {
+		principals[PrincipalSelf] = struct{}{}
+	}
+	return principals
+}
+
+// NeedsResourcePrincipals reports whether any entry names a principal form that
+// only ApplicablePrincipalsFor can resolve. Callers use it to skip resolving a
+// resource's owner — which generally costs a query — for the ordinary ACL that
+// names none.
+func NeedsResourcePrincipals(entries []store.ACLEntry) bool {
+	for _, entry := range entries {
+		switch NormalizePrincipalHref(entry.PrincipalHref) {
+		case PrincipalSelf, PrincipalPropertyOwner, PrincipalPropertyGroup:
+			return true
+		}
+	}
+	return false
+}
+
+func SortEntries(entries []store.ACLEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Position != entries[j].Position {
+			return entries[i].Position < entries[j].Position
+		}
+		return entries[i].ID < entries[j].ID
+	})
 }
 
 func NormalizePrincipalHref(raw string) string {
 	raw = strings.TrimSpace(raw)
 	switch raw {
-	case "", "DAV:all", "DAV:authenticated":
+	case "", PrincipalAll, PrincipalAuthenticated, PrincipalUnauthenticated, PrincipalSelf, PrincipalPropertyOwner, PrincipalPropertyGroup:
 		return raw
 	}
 	if isCanonicalPrincipalHref(raw) {
@@ -74,8 +146,6 @@ func PrivilegeMatches(granted, requested string) bool {
 	if granted == requested || granted == "all" {
 		return true
 	}
-	// CalDAV read grants include free-busy visibility; non-calendar callers do
-	// not request read-free-busy.
 	if granted == "read" && requested == "read-free-busy" {
 		return true
 	}
@@ -99,7 +169,6 @@ func HasApplicablePrincipal(entries []store.ACLEntry, applicablePrincipals map[s
 }
 
 func decidePrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	hasGrant := false
 	for _, entry := range entries {
 		if _, ok := applicablePrincipals[NormalizePrincipalHref(entry.PrincipalHref)]; !ok {
 			continue
@@ -107,13 +176,7 @@ func decidePrivilege(entries []store.ACLEntry, applicablePrincipals map[string]s
 		if !PrivilegeMatches(entry.Privilege, privilege) {
 			continue
 		}
-		if !entry.IsGrant {
-			return false, true
-		}
-		hasGrant = true
-	}
-	if hasGrant {
-		return true, true
+		return entry.IsGrant, true
 	}
 	return false, false
 }

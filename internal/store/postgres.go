@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ type userRepo struct {
 
 func (r *userRepo) UpsertOAuthUser(ctx context.Context, subject, email, fullName, firstName string) (*User, error) {
 	const q = `
+WITH previous AS MATERIALIZED (
+    SELECT id, primary_email FROM users WHERE oauth_subject = $1
+), upserted AS (
 INSERT INTO users (oauth_subject, primary_email, full_name, first_name)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (oauth_subject) DO UPDATE SET
@@ -30,6 +34,19 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
         first_name = EXCLUDED.first_name,
         last_login_at = NOW()
 RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+), revoked AS (
+    UPDATE app_passwords
+    SET revoked_at = NOW()
+    WHERE user_id = (SELECT id FROM upserted)
+      AND revoked_at IS NULL
+      AND EXISTS (
+          SELECT 1 FROM previous
+          WHERE previous.primary_email IS DISTINCT FROM $2
+      )
+    RETURNING id
+)
+SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+FROM upserted
 `
 	defer observeDB(ctx, "users.upsert_oauth")()
 	row := r.pool.QueryRowContext(ctx, q, subject, email, fullName, firstName)
@@ -109,24 +126,7 @@ func sqlLiteralList(items ...string) string {
 }
 
 func calendarACLBooleanExpr(userParam string, privileges ...string) string {
-	privilegeList := sqlLiteralList(privileges...)
-	principals := aclPrincipalListExpr(userParam)
-	return `(
-       NOT EXISTS (
-           SELECT 1 FROM acl_entries d
-           WHERE d.resource_path = '/dav/calendars/' || c.id::text
-             AND d.principal_href IN ` + principals + `
-             AND d.is_grant = FALSE
-             AND d.privilege IN (` + privilegeList + `)
-       )
-       AND EXISTS (
-           SELECT 1 FROM acl_entries g
-           WHERE g.resource_path = '/dav/calendars/' || c.id::text
-             AND g.principal_href IN ` + principals + `
-             AND g.is_grant = TRUE
-             AND g.privilege IN (` + privilegeList + `)
-       )
-   )`
+	return aclOrderedBooleanExpr("a.resource_path = '/dav/calendars/' || c.id::text", userParam, privileges...)
 }
 
 func aclPrincipalListExpr(userParam string) string {
@@ -137,30 +137,35 @@ func aclPrincipalListExpr(userParam string) string {
 // acl_entries.resource_path_norm and events.object_acl_path (both strip the
 // trailing .ics/.vcf so a grant stored either way lines up). The equality is
 // index-backed.
-func calendarEventACLDenyExpr(userParam string, privileges ...string) string {
+func aclOrderedDecisionExpr(resourcePredicate, userParam string, privileges ...string) string {
 	privilegeList := sqlLiteralList(privileges...)
-	return `EXISTS (
-           SELECT 1 FROM acl_entries d
-           WHERE d.resource_path_norm = e.object_acl_path
-             AND d.principal_href IN ` + aclPrincipalListExpr(userParam) + `
-             AND d.is_grant = FALSE
-             AND d.privilege IN (` + privilegeList + `)
-       )`
+	return `(SELECT a.is_grant
+           FROM acl_entries a
+           WHERE ` + resourcePredicate + `
+             AND a.principal_href IN ` + aclPrincipalListExpr(userParam) + `
+             AND a.privilege IN (` + privilegeList + `)
+           ORDER BY a.ace_order, a.id
+           LIMIT 1)`
 }
 
-func calendarEventACLGrantExpr(userParam string, privileges ...string) string {
-	privilegeList := sqlLiteralList(privileges...)
-	return `EXISTS (
-           SELECT 1 FROM acl_entries g
-           WHERE g.resource_path_norm = e.object_acl_path
-             AND g.principal_href IN ` + aclPrincipalListExpr(userParam) + `
-             AND g.is_grant = TRUE
-             AND g.privilege IN (` + privilegeList + `)
-       )`
+func aclOrderedBooleanExpr(resourcePredicate, userParam string, privileges ...string) string {
+	return `COALESCE(` + aclOrderedDecisionExpr(resourcePredicate, userParam, privileges...) + `, FALSE)`
 }
 
 func calendarEventACLAllowsExpr(userParam string, privileges ...string) string {
-	return `(NOT ` + calendarEventACLDenyExpr(userParam, privileges...) + ` AND ` + calendarEventACLGrantExpr(userParam, privileges...) + `)`
+	return aclOrderedBooleanExpr("a.resource_path_norm = e.object_acl_path", userParam, privileges...)
+}
+
+func calendarEventACLAllowsWithCollectionFallbackExpr(userParam string, privileges ...string) string {
+	return `COALESCE(` + aclOrderedDecisionExpr("a.resource_path_norm = e.object_acl_path", userParam, privileges...) + `, ` + calendarACLBooleanExpr(userParam, privileges...) + `)`
+}
+
+func addressBookACLBooleanExpr(userParam string, privileges ...string) string {
+	return aclOrderedBooleanExpr("a.resource_path = '/dav/addressbooks/' || b.id::text", userParam, privileges...)
+}
+
+func contactACLBooleanExpr(userParam string, privileges ...string) string {
+	return aclOrderedBooleanExpr("a.resource_path_norm = c.object_acl_path", userParam, privileges...)
 }
 
 func calendarACLAnyAccessExpr(userParam string) string {
@@ -170,8 +175,8 @@ func calendarACLAnyAccessExpr(userParam string) string {
            OR ` + calendarACLBooleanExpr(userParam, "write", "all") + `
            OR ` + calendarACLBooleanExpr(userParam, "write-content", "write", "all") + `
            OR ` + calendarACLBooleanExpr(userParam, "write-properties", "write", "all") + `
-           OR ` + calendarACLBooleanExpr(userParam, "bind", "write", "all") + `
-           OR ` + calendarACLBooleanExpr(userParam, "unbind", "write", "all") + `
+		   OR ` + calendarACLBooleanExpr(userParam, "bind", "write", "all") + `
+		   OR ` + calendarACLBooleanExpr(userParam, "unbind", "write", "all") + `
        )`
 }
 
@@ -260,8 +265,8 @@ SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.tim
        CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write", "all") + ` END as can_write,
        CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write-content", "write", "all") + ` END as can_write_content,
        CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "write-properties", "write", "all") + ` END as can_write_properties,
-       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "bind", "write", "all") + ` END as can_bind,
-       CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "unbind", "write", "all") + ` END as can_unbind
+		CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "bind", "write", "all") + ` END as can_bind,
+		CASE WHEN c.user_id = $1 THEN TRUE ELSE ` + calendarACLBooleanExpr("$1", "unbind", "write", "all") + ` END as can_unbind
 FROM calendars c
 JOIN users u ON u.id = c.user_id
 WHERE c.user_id = $1
@@ -314,8 +319,8 @@ SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.tim
        CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write", "all") + ` END as can_write,
        CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write-content", "write", "all") + ` END as can_write_content,
        CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "write-properties", "write", "all") + ` END as can_write_properties,
-       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "bind", "write", "all") + ` END as can_bind,
-       CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "unbind", "write", "all") + ` END as can_unbind
+		CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "bind", "write", "all") + ` END as can_bind,
+		CASE WHEN c.user_id = $2 THEN TRUE ELSE ` + calendarACLBooleanExpr("$2", "unbind", "write", "all") + ` END as can_unbind
 FROM calendars c
 JOIN users u ON u.id = c.user_id
 WHERE c.id = $1
@@ -805,11 +810,7 @@ JOIN calendars c ON c.id = e.calendar_id
 WHERE c.user_id = $1
    OR (
        c.user_id <> $1
-       AND NOT ` + calendarEventACLDenyExpr("$1", "read", "all") + `
-       AND (
-           ` + calendarEventACLGrantExpr("$1", "read", "all") + `
-           OR ` + calendarACLBooleanExpr("$1", "read", "all") + `
-       )
+       AND ` + calendarEventACLAllowsWithCollectionFallbackExpr("$1", "read", "all") + `
    )
 ORDER BY e.last_modified DESC
 LIMIT $2
@@ -1027,6 +1028,14 @@ func isContactResourceNameConflict(err error) bool {
 	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "idx_contacts_resource_name"
 }
 
+func isContactIdentityConflict(err error) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) || pqErr.Code != "23505" {
+		return false
+	}
+	return pqErr.Constraint == "idx_contacts_resource_name" || pqErr.Constraint == "contacts_address_book_id_uid_key"
+}
+
 func isEventResourceNameConflict(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505" && pqErr.Constraint == "events_calendar_resource_name_unique"
@@ -1064,29 +1073,14 @@ func (r *addressBookRepo) ListByUser(ctx context.Context, userID int64) ([]Addre
 }
 
 func (r *addressBookRepo) ListAccessible(ctx context.Context, userID int64) ([]AddressBook, error) {
-	const q = `
+	q := `
 SELECT b.id, b.user_id, b.name, b.description, b.ctag, b.created_at, b.updated_at
 FROM address_books b
 WHERE b.user_id=$1
    OR (
        b.user_id<>$1
        AND (
-           (
-               NOT EXISTS (
-                   SELECT 1 FROM acl_entries d
-                   WHERE d.resource_path='/dav/addressbooks/' || b.id::text
-                     AND d.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
-                     AND d.is_grant=FALSE
-                     AND d.privilege IN ('read', 'all')
-               )
-               AND EXISTS (
-                   SELECT 1 FROM acl_entries g
-                   WHERE g.resource_path='/dav/addressbooks/' || b.id::text
-                     AND g.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
-                     AND g.is_grant=TRUE
-                     AND g.privilege IN ('read', 'all')
-               )
-           )
+           ` + addressBookACLBooleanExpr("$1", "read", "all") + `
            OR EXISTS (
                SELECT 1
                FROM acl_entries g0
@@ -1094,13 +1088,7 @@ WHERE b.user_id=$1
                WHERE g0.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
                  AND g0.is_grant=TRUE
                  AND g0.privilege IN ('read', 'all')
-                 AND NOT EXISTS (
-                     SELECT 1 FROM acl_entries d
-                     WHERE d.resource_path_norm=c.object_acl_path
-                       AND d.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
-                       AND d.is_grant=FALSE
-                       AND d.privilege IN ('read', 'all')
-                 )
+                 AND ` + contactACLBooleanExpr("$1", "read", "all") + `
            )
        )
    )
@@ -1740,12 +1728,12 @@ type appPasswordRepo struct {
 
 func (r *appPasswordRepo) Create(ctx context.Context, token AppPassword) (*AppPassword, error) {
 	const q = `
-INSERT INTO app_passwords (user_id, label, token_hash, expires_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+INSERT INTO app_passwords (user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 `
 	defer observeDB(ctx, "app_passwords.create")()
-	row := r.pool.QueryRowContext(ctx, q, token.UserID, token.Label, token.TokenHash, token.ExpiresAt)
+	row := r.pool.QueryRowContext(ctx, q, token.UserID, token.Label, token.TokenHash, token.DigestMD5HA1, token.DigestSHA256HA1, token.ExpiresAt)
 	t, err := scanAppPassword(row.Scan)
 	if err != nil {
 		return nil, err
@@ -1755,7 +1743,7 @@ RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, la
 
 func (r *appPasswordRepo) FindValidByUser(ctx context.Context, userID int64) ([]AppPassword, error) {
 	const q = `
-SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 FROM app_passwords
 WHERE user_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
 ORDER BY created_at DESC
@@ -1779,7 +1767,7 @@ ORDER BY created_at DESC
 }
 
 func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPassword, error) {
-	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE user_id=$1 ORDER BY created_at DESC`
+	const q = `SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE user_id=$1 ORDER BY created_at DESC`
 	defer observeDB(ctx, "app_passwords.list_by_user")()
 	rows, err := r.pool.QueryContext(ctx, q, userID)
 	if err != nil {
@@ -1799,7 +1787,7 @@ func (r *appPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]AppPa
 }
 
 func (r *appPasswordRepo) GetByID(ctx context.Context, id int64) (*AppPassword, error) {
-	const q = `SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`
+	const q = `SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.get_by_id")()
 	row := r.pool.QueryRowContext(ctx, q, id)
 	t, err := scanAppPassword(row.Scan)
@@ -1997,13 +1985,47 @@ func (r *lockRepo) Create(ctx context.Context, lock Lock) (*Lock, error) {
 
 	// Serialize concurrent lock creation for the resource and its parent path so
 	// parent/child lock requests observe each other before conflict checks run.
-	for _, resourcePath := range lockSerializationPaths(lock.ResourcePath) {
+	for _, resourcePath := range sortedLockSerializationPaths(lock.ResourcePath) {
 		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
 			return nil, err
 		}
 	}
+	originalResourcePath := lock.ResourcePath
 	if err := canonicalizePendingCalendarLockTx(ctx, tx, &lock); err != nil {
 		return nil, err
+	}
+	if lock.ExpectedTargetExists != nil && !*lock.ExpectedTargetExists && lock.ResourcePath != originalResourcePath {
+		return nil, ErrResourceStateChanged
+	}
+	switch lock.ExpectedCollection {
+	case "calendar":
+		if err := validateCollectionCTagsTx(ctx, tx, "calendars",
+			collectionCTagExpectation{id: lock.ExpectedCollectionID, ctag: lock.ExpectedCollectionCTag}); err != nil {
+			return nil, err
+		}
+		if lock.ExpectedResourceState != nil {
+			current, err := selectEventTx(ctx, tx, `resource_name`, lock.ExpectedCollectionID, lock.ExpectedResourceState.ResourceName)
+			if err != nil {
+				return nil, err
+			}
+			if !eventDAVStateMatches(*lock.ExpectedResourceState, current) {
+				return nil, ErrResourceStateChanged
+			}
+		}
+	case "addressbook":
+		if err := validateCollectionCTagsTx(ctx, tx, "address_books",
+			collectionCTagExpectation{id: lock.ExpectedCollectionID, ctag: lock.ExpectedCollectionCTag}); err != nil {
+			return nil, err
+		}
+		if lock.ExpectedResourceState != nil {
+			current, err := selectContactTx(ctx, tx, `resource_name`, lock.ExpectedCollectionID, lock.ExpectedResourceState.ResourceName)
+			if err != nil {
+				return nil, err
+			}
+			if !contactDAVStateMatches(*lock.ExpectedResourceState, current) {
+				return nil, ErrResourceStateChanged
+			}
+		}
 	}
 
 	// Check for conflicting locks on the resource itself.
@@ -2136,6 +2158,22 @@ func lockSerializationPaths(resourcePath string) []string {
 	paths := []string{cleanPath}
 	paths = append(paths, lockAncestorPaths(cleanPath)...)
 	return paths
+}
+
+func sortedLockSerializationPaths(resourcePaths ...string) []string {
+	seen := make(map[string]struct{})
+	var result []string
+	for _, resourcePath := range resourcePaths {
+		for _, candidate := range lockSerializationPaths(resourcePath) {
+			if _, exists := seen[candidate]; exists {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			result = append(result, candidate)
+		}
+	}
+	slices.Sort(result)
+	return result
 }
 
 // lockAncestorPaths returns all parent paths of p, excluding p itself.
@@ -2313,6 +2351,19 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 	defer tx.Rollback()
+	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []ACLEntry) error {
+	statePaths := davStatePaths(resourcePath)
+	for _, lockPath := range sortedLockSerializationPaths(statePaths...) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockPath); err != nil {
+			return err
+		}
+	}
 
 	type aclIdentity struct {
 		principalHref string
@@ -2320,8 +2371,8 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		privilege     string
 	}
 
-	const existingQ = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`
-	rows, err := tx.QueryContext(ctx, existingQ, resourcePath)
+	const existingQ = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`
+	rows, err := tx.QueryContext(ctx, existingQ, pq.Array(statePaths))
 	if err != nil {
 		return err
 	}
@@ -2335,9 +2386,10 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 			principalHref string
 			isGrant       bool
 			privilege     string
+			position      int
 			createdAt     time.Time
 		)
-		if err := rows.Scan(&id, &existingPath, &principalHref, &isGrant, &privilege, &createdAt); err != nil {
+		if err := rows.Scan(&id, &existingPath, &principalHref, &isGrant, &privilege, &position, &createdAt); err != nil {
 			return err
 		}
 		existingCreatedAt[aclIdentity{
@@ -2350,14 +2402,15 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 
-	// Delete existing entries for this resource
-	const deleteQ = `DELETE FROM acl_entries WHERE resource_path=$1`
-	if _, err := tx.ExecContext(ctx, deleteQ, resourcePath); err != nil {
+	// Replace every historical spelling of the resource identity so a legacy
+	// extension-suffixed ACE cannot survive a revocation on the canonical URL.
+	const deleteQ = `DELETE FROM acl_entries WHERE resource_path = ANY($1)`
+	if _, err := tx.ExecContext(ctx, deleteQ, pq.Array(statePaths)); err != nil {
 		return err
 	}
 
 	// Insert the new entries
-	const insertQ = `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`
+	const insertQ = `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at) VALUES ($1, $2, $3, $4, $5, $6)`
 	for _, entry := range entries {
 		createdAt := entry.CreatedAt
 		if createdAt.IsZero() {
@@ -2371,7 +2424,7 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 				createdAt = time.Now().UTC()
 			}
 		}
-		if _, err := tx.ExecContext(ctx, insertQ, resourcePath, entry.PrincipalHref, entry.IsGrant, entry.Privilege, createdAt); err != nil {
+		if _, err := tx.ExecContext(ctx, insertQ, resourcePath, entry.PrincipalHref, entry.IsGrant, entry.Privilege, entry.Position, createdAt); err != nil {
 			return err
 		}
 	}
@@ -2380,7 +2433,7 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func touchACLDependentState(ctx context.Context, tx *sql.Tx, resourcePath string) error {
@@ -2471,7 +2524,7 @@ func aclResourceNameCandidates(resourceName, ext string) (string, string) {
 }
 
 func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error) {
-	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY ace_order, id`
 	defer observeDB(ctx, "acl.list_by_resource")()
 	rows, err := r.pool.QueryContext(ctx, q, resourcePath)
 	if err != nil {
@@ -2482,7 +2535,7 @@ func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]AC
 	var result []ACLEntry
 	for rows.Next() {
 		var e ACLEntry
-		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.Position, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, e)
@@ -2494,7 +2547,7 @@ func (r *aclRepo) ListByResources(ctx context.Context, resourcePaths []string) (
 	if len(resourcePaths) == 0 {
 		return []ACLEntry{}, nil
 	}
-	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY resource_path, created_at, id`
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY resource_path, ace_order, id`
 	defer observeDB(ctx, "acl.list_by_resources")()
 	rows, err := r.pool.QueryContext(ctx, q, pq.Array(resourcePaths))
 	if err != nil {
@@ -2508,7 +2561,7 @@ func (r *aclRepo) ListByResourcesAndPrincipals(ctx context.Context, resourcePath
 	if len(resourcePaths) == 0 || len(principalHrefs) == 0 {
 		return []ACLEntry{}, nil
 	}
-	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path = ANY($1) AND principal_href = ANY($2) ORDER BY resource_path, created_at, id`
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) AND principal_href = ANY($2) ORDER BY resource_path, ace_order, id`
 	defer observeDB(ctx, "acl.list_by_resources_and_principals")()
 	rows, err := r.pool.QueryContext(ctx, q, pq.Array(resourcePaths), pq.Array(principalHrefs))
 	if err != nil {
@@ -2522,7 +2575,7 @@ func scanACLEntries(rows *sql.Rows) ([]ACLEntry, error) {
 	var result []ACLEntry
 	for rows.Next() {
 		var entry ACLEntry
-		if err := rows.Scan(&entry.ID, &entry.ResourcePath, &entry.PrincipalHref, &entry.IsGrant, &entry.Privilege, &entry.CreatedAt); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.ResourcePath, &entry.PrincipalHref, &entry.IsGrant, &entry.Privilege, &entry.Position, &entry.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, entry)
@@ -2531,7 +2584,7 @@ func scanACLEntries(rows *sql.Rows) ([]ACLEntry, error) {
 }
 
 func (r *aclRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error) {
-	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE principal_href=$1 ORDER BY created_at`
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE principal_href=$1 ORDER BY resource_path, ace_order, id`
 	defer observeDB(ctx, "acl.list_by_principal")()
 	rows, err := r.pool.QueryContext(ctx, q, principalHref)
 	if err != nil {
@@ -2542,7 +2595,7 @@ func (r *aclRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]
 	var result []ACLEntry
 	for rows.Next() {
 		var e ACLEntry
-		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.ResourcePath, &e.PrincipalHref, &e.IsGrant, &e.Privilege, &e.Position, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, e)
@@ -2552,17 +2605,13 @@ func (r *aclRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]
 
 func (r *aclRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
 	const q = `
-SELECT CASE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
-    ) THEN FALSE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
-    ) THEN TRUE
-    ELSE FALSE
-END
+SELECT COALESCE((
+    SELECT is_grant
+    FROM acl_entries
+    WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3
+    ORDER BY ace_order, id
+    LIMIT 1
+), FALSE)
 `
 	defer observeDB(ctx, "acl.has_privilege")()
 	var exists bool
@@ -2789,13 +2838,17 @@ func scanContact(scan rowScanner) (Contact, error) {
 
 func scanAppPassword(scan rowScanner) (AppPassword, error) {
 	var t AppPassword
+	var digestMD5HA1 sql.NullString
+	var digestSHA256HA1 sql.NullString
 	var expiresAt sql.NullTime
 	var revokedAt sql.NullTime
 	var lastUsedAt sql.NullTime
-	if err := scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &t.CreatedAt, &expiresAt, &revokedAt, &lastUsedAt); err != nil {
+	if err := scan(&t.ID, &t.UserID, &t.Label, &t.TokenHash, &digestMD5HA1, &digestSHA256HA1, &t.CreatedAt, &expiresAt, &revokedAt, &lastUsedAt); err != nil {
 		return AppPassword{}, err
 	}
 	t.ExpiresAt = nullableTime(expiresAt)
+	t.DigestMD5HA1 = nullableString(digestMD5HA1)
+	t.DigestSHA256HA1 = nullableString(digestSHA256HA1)
 	t.RevokedAt = nullableTime(revokedAt)
 	t.LastUsedAt = nullableTime(lastUsedAt)
 	return t, nil

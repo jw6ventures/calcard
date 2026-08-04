@@ -68,10 +68,6 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported path for PROPPATCH", http.StatusBadRequest)
 		return
 	}
-	if !h.requireLock(w, r, cleanPath, "resource is locked") {
-		return
-	}
-
 	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
 		if errors.Is(err, errRequestTooLarge) {
@@ -88,13 +84,22 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var responses []response
+	lockPreconditions := h.lockPreconditions(r, cleanPath)
 	switch target.Domain {
 	case davPathCalendar:
-		responses, err = h.proppatchCalendar(r.Context(), user, cleanPath, target, &request)
+		responses, err = h.proppatchCalendar(r.Context(), user, cleanPath, target, &request, lockPreconditions)
 	case davPathAddressBook:
-		responses, err = h.proppatchAddressBook(r.Context(), user, cleanPath, target, &request)
+		responses, err = h.proppatchAddressBook(r.Context(), user, cleanPath, target, &request, lockPreconditions)
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrLockConflict) {
+			http.Error(w, "resource is locked", http.StatusLocked)
+			return
+		}
+		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
+			writeNeedPrivileges(w, cleanPath, "write-properties")
+			return
+		}
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, errInvalidPath):
@@ -149,7 +154,7 @@ func (p *proppatchPreflight) record(property proppatchProperty, status int) {
 	}
 }
 
-func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest) ([]response, error) {
+func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest, lockPreconditions []store.LockPrecondition) ([]response, error) {
 	calendarID, ok, err := h.resolveCalendarID(ctx, user, target.CollectionSegment)
 	if err != nil {
 		return nil, err
@@ -166,13 +171,14 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 	}
 	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, canonicalPath, "write-properties")
 	if err != nil {
-		if errors.Is(err, errForbidden) {
-			return forbiddenProppatchResponse(href, requestedProppatchPropertyNames(request)), nil
+		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
+			return nil, errForbidden
 		}
 		return nil, err
 	}
+	var event *store.Event
 	if target.Resource {
-		event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
+		event, err = h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
 		if err != nil {
 			return nil, err
 		}
@@ -187,9 +193,11 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 		return failedProppatchResponse(href, preflight), nil
 	}
 	if target.Resource {
-		err = h.store.PatchDeadProperties(ctx, canonicalPath, preflight.dead)
+		expected := store.EventDAVResourceState(event)
+		expected.CollectionCTag = &cal.CTag
+		err = h.store.PatchObjectDeadProperties(ctx, "calendar", calendarID, expected, canonicalPath, preflight.dead, lockPreconditions)
 	} else {
-		err = h.store.PatchCalendarProperties(ctx, calendarID, state.properties(), canonicalPath, preflight.dead)
+		err = h.store.PatchCalendarProperties(ctx, calendarID, state.properties(), canonicalPath, preflight.dead, lockPreconditions)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -425,7 +433,7 @@ func validUTCOffset(value string) bool {
 	return value[0] != '-' || hour != 0 || minute != 0 || second != 0
 }
 
-func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest) ([]response, error) {
+func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest, lockPreconditions []store.LockPrecondition) ([]response, error) {
 	bookID, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
 	if err != nil {
 		return nil, err
@@ -443,12 +451,13 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 	}
 	if err := h.requireAddressBookPrivilege(ctx, user, book, canonicalPath, "write-properties"); err != nil {
 		if errors.Is(err, errForbidden) || errors.Is(err, store.ErrNotFound) {
-			return forbiddenProppatchResponse(href, requestedProppatchPropertyNames(request)), nil
+			return nil, errForbidden
 		}
 		return nil, err
 	}
+	var contact *store.Contact
 	if target.Resource {
-		contact, err := h.store.Contacts.GetByResourceName(ctx, bookID, target.ResourceName)
+		contact, err = h.store.Contacts.GetByResourceName(ctx, bookID, target.ResourceName)
 		if err != nil {
 			return nil, err
 		}
@@ -463,9 +472,11 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 		return failedProppatchResponse(href, preflight), nil
 	}
 	if target.Resource {
-		err = h.store.PatchDeadProperties(ctx, canonicalPath, preflight.dead)
+		expected := store.ContactDAVResourceState(contact)
+		expected.CollectionCTag = &book.CTag
+		err = h.store.PatchObjectDeadProperties(ctx, "addressbook", bookID, expected, canonicalPath, preflight.dead, lockPreconditions)
 	} else {
-		err = h.store.PatchAddressBookProperties(ctx, bookID, state.name, state.description, canonicalPath, preflight.dead)
+		err = h.store.PatchAddressBookProperties(ctx, bookID, state.name, state.description, canonicalPath, preflight.dead, lockPreconditions)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {

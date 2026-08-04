@@ -88,6 +88,11 @@ func (h *DavServer) loadAddressBookWithPrivilege(ctx context.Context, user *stor
 // can resolve, in DAV:acl document order.
 var addressBookPrivilegeNames = []string{"read", "write", "write-content", "write-properties", "bind", "unbind"}
 
+var addressBookCurrentPrivilegeNames = []string{
+	"all", "read", "read-free-busy", "read-acl", "read-current-user-privilege-set",
+	"write", "write-content", "write-properties", "bind", "unbind", "write-acl", "unlock",
+}
+
 // addressBookPrivilegeContext mirrors calendarPrivilegeContext: one resolution
 // of canonical path, ownership, and ACL entries that several privilege
 // decisions can share. Unlike calendars there is no applicable-principal
@@ -109,7 +114,11 @@ func (h *DavServer) addressBookPrivilegeContextFor(ctx context.Context, user *st
 	} else if err != nil {
 		return nil, err
 	}
-	pc := &addressBookPrivilegeContext{principals: acl.ApplicablePrincipals(user)}
+	// An address book is never a principal resource, so DAV:self cannot resolve
+	// here; its owner is the row's user, which costs nothing to name.
+	pc := &addressBookPrivilegeContext{principals: acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{
+		OwnerHref: acl.PrincipalHref(book.UserID),
+	})}
 	if user != nil && book.UserID == user.ID {
 		pc.owner = true
 		return pc, nil
@@ -162,6 +171,30 @@ func (h *DavServer) addressBookPrivilegeDecision(ctx context.Context, user *stor
 
 func (h *DavServer) requireAddressBookPrivilege(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) error {
 	return requirePrivilegeDecision(h.addressBookPrivilegeDecision(ctx, user, book, cleanPath, privilege))
+}
+
+func (h *DavServer) requireAnyAddressBookPrivilege(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string) error {
+	pc, err := h.addressBookPrivilegeContextFor(ctx, user, book, cleanPath)
+	if err != nil {
+		return err
+	}
+	if pc == nil {
+		return store.ErrNotFound
+	}
+	sawForbidden := false
+	for _, privilege := range addressBookPrivilegeNames {
+		allowed, denied := pc.decide(privilege)
+		if allowed {
+			return nil
+		}
+		if denied {
+			sawForbidden = true
+		}
+	}
+	if sawForbidden {
+		return errForbidden
+	}
+	return errPrivilegeNotGranted
 }
 
 // addressBookPrivilegeDecisionFromEntries evaluates contact visibility from a

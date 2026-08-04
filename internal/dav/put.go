@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
-	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -141,7 +140,7 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 	bodyText := string(body)
 
 	if calendarID, resourceUID, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "calendar not found", http.StatusNotFound)
 			return
 		}
@@ -157,7 +156,7 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if addressBookID, _, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "address book not found", http.StatusNotFound)
 			return
 		}
@@ -188,39 +187,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	root, err := parseICalendarObject(bodyText)
-	if err != nil {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
-		return
-	}
-	if fault := validateCalendarObject(root); fault != nil {
-		writeCalDAVErrorMulti(w, fault.status, fault.conditions...)
-		return
-	}
-	analysis, err := analyzeICalendar(bodyText)
-	if err != nil {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
-		return
-	}
-
-	// RFC 4791 §5.2.3 and §5.3.2.1: a component type the target collection does
-	// not list in CALDAV:supported-calendar-component-set cannot be stored there.
-	if !calendarAcceptsComponents(cal, analysis.Components) {
-		writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
-		return
-	}
-
-	if analysis.MaxAttendees > caldavMaxAttendees {
-		writeCalDAVError(w, http.StatusForbidden, "max-attendees-per-instance")
-		return
-	}
-	exceedsInstances, validRecurrence := ical.RecurrenceSetExceedsLimit(bodyText, caldavMaxInstances)
-	if !validRecurrence {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-data")
-		return
-	}
-	if exceedsInstances {
-		writeCalDAVError(w, http.StatusForbidden, "max-instances")
+	validated, fault := validateCalendarObjectForStorage(bodyText, cal)
+	if fault != nil {
+		writeCalendarObjectFault(w, fault)
 		return
 	}
 
@@ -229,11 +198,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	uid, err := analysis.uid()
-	if err != nil {
-		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
-		return
-	}
+	uid := validated.UID
 	resourceName := resourceUID
 	if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
 		return
@@ -255,14 +220,16 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	}
 
 	write := store.CalendarObjectWrite{
-		CalendarID:    calendarID,
-		UID:           uid,
-		ResourceName:  resourceName,
-		RawICAL:       bodyText,
-		ETag:          etag,
-		Metadata:      &analysis.Metadata,
-		Precondition:  calendarObjectPrecondition(r),
-		ExpectedState: &store.CalendarObjectResourceState{Exists: existingByResource != nil},
+		CalendarID:           calendarID,
+		UID:                  uid,
+		ResourceName:         resourceName,
+		RawICAL:              bodyText,
+		ETag:                 etag,
+		Metadata:             &validated.Analysis.Metadata,
+		Precondition:         calendarObjectPrecondition(r),
+		ExpectedState:        &store.CalendarObjectResourceState{Exists: existingByResource != nil},
+		ExpectedCalendarCTag: &cal.CTag,
+		LockPreconditions:    h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
 	}
 	result, err := h.store.PutCalendarObject(r.Context(), write)
 	if errors.Is(err, store.ErrResourceStateChanged) {
@@ -270,7 +237,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		if !authorized {
 			return
 		}
-		if !calendarAcceptsComponents(currentCal, analysis.Components) {
+		if !calendarAcceptsComponents(currentCal, validated.Analysis.Components) {
 			writeCalDAVError(w, http.StatusForbidden, "supported-calendar-component")
 			return
 		}
@@ -278,6 +245,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 			return
 		}
 		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
+		write.ExpectedCalendarCTag = &currentCal.CTag
 		result, err = h.store.PutCalendarObject(r.Context(), write)
 	}
 	switch {
@@ -377,19 +345,14 @@ func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http
 		return nil, nil, false
 	}
 	requiredPrivilege := "bind"
+	privilegePath := path.Dir(cleanPath)
 	if existing != nil {
 		requiredPrivilege = "write-content"
+		privilegePath = cleanPath
 	}
-	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, requiredPrivilege)
+	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, privilegePath, requiredPrivilege)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if err == store.ErrNotFound {
-			status = http.StatusNotFound
-		}
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
-		}
-		http.Error(w, http.StatusText(status), status)
+		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, requiredPrivilege))
 		return nil, nil, false
 	}
 	return cal, existing, true
@@ -399,7 +362,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 	book, err := h.getAddressBook(r.Context(), addressBookID)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			status = http.StatusNotFound
 		}
 		http.Error(w, "address book not found", status)
@@ -436,15 +399,13 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 		return
 	}
 	requiredPrivilege := "bind"
+	privilegePath := path.Dir(cleanPath)
 	if existingByName != nil {
 		requiredPrivilege = "write-content"
+		privilegePath = cleanPath
 	}
-	if err := h.requireAddressBookPrivilege(r.Context(), user, book, cleanPath, requiredPrivilege); err != nil {
-		status := http.StatusForbidden
-		if err == store.ErrNotFound {
-			status = http.StatusNotFound
-		}
-		http.Error(w, http.StatusText(status), status)
+	if err := h.requireAddressBookPrivilege(r.Context(), user, book, privilegePath, requiredPrivilege); err != nil {
+		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, requiredPrivilege))
 		return
 	}
 	if existingByName != nil && existingByName.UID != uid {
@@ -487,24 +448,47 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 		return
 	}
 
-	if existingByName == nil {
-		if err := h.deleteDAVACLState(r.Context(), user, cleanPath); err != nil {
-			http.Error(w, "failed to reset resource ACL state", http.StatusInternalServerError)
-			return
-		}
+	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
+		return
 	}
-
-	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{AddressBookID: addressBookID, UID: uid, ResourceName: resourceName, RawVCard: bodyText, ETag: etag}); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			writeCardDAVUIDConflict(w, cleanPath)
+	result, err := h.store.PutContactObject(r.Context(), store.ContactObjectWrite{
+		AddressBookID:           addressBookID,
+		UID:                     uid,
+		ResourceName:            resourceName,
+		RawVCard:                bodyText,
+		ETag:                    etag,
+		Precondition:            calendarObjectPrecondition(r),
+		ExpectedState:           store.ContactDAVResourceState(existingByName),
+		ExpectedAddressBookCTag: &book.CTag,
+		StatePath:               canonicalPath,
+		LockPreconditions:       h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
+	})
+	switch {
+	case errors.Is(err, store.ErrUIDConflict):
+		if result == nil || result.Conflict == nil {
+			http.Error(w, "failed to save contact", http.StatusInternalServerError)
 			return
 		}
+		writeCardDAVUIDConflict(w, fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*result.Conflict)))
+		return
+	case errors.Is(err, store.ErrConflict):
+		writeCardDAVUIDConflict(w, cleanPath)
+		return
+	case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrResourceStateChanged):
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	case errors.Is(err, store.ErrLockConflict):
+		http.Error(w, "resource is locked", http.StatusLocked)
+		return
+	case err != nil:
 		h.logger().Error("Put", "failed to save contact %q in address book %d: %v", uid, addressBookID, err)
 		http.Error(w, "failed to save contact", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
-	if existing == nil {
+	if result != nil && result.Created {
 		h.logger().Info("Put", "created contact %q in address book %d", uid, addressBookID)
 		w.WriteHeader(http.StatusCreated)
 	} else {

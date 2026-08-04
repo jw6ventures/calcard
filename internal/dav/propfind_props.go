@@ -3,11 +3,15 @@ package dav
 import (
 	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
+	aclutil "github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -19,6 +23,7 @@ type propDecorationMask struct {
 	lockDiscovery           bool
 	acl                     bool
 	currentUserPrivilegeSet bool
+	owner                   bool
 }
 
 // decorationMaskFor derives the set of expensive properties worth computing for
@@ -30,12 +35,13 @@ func decorationMaskFor(req *propfindRequest) propDecorationMask {
 		return propDecorationMask{}
 	}
 	if req == nil || req.Prop == nil {
-		return propDecorationMask{lockDiscovery: true, acl: true, currentUserPrivilegeSet: true}
+		return propDecorationMask{lockDiscovery: true, acl: true, currentUserPrivilegeSet: true, owner: true}
 	}
 	return propDecorationMask{
 		lockDiscovery:           req.Prop.LockDiscovery != nil,
 		acl:                     req.Prop.ACLProp != nil,
 		currentUserPrivilegeSet: req.Prop.CurrentUserPrivilegeSet != nil,
+		owner:                   req.Prop.Owner != nil || req.Prop.ACLProp != nil,
 	}
 }
 
@@ -159,6 +165,7 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 		for _, statePath := range davStatePaths(resourcePath) {
 			resourceEntries = append(resourceEntries, byPath[statePath]...)
 		}
+		aclutil.SortEntries(resourceEntries)
 		cache.put(resourcePath, resourceEntries)
 	}
 	return nil
@@ -205,6 +212,36 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 	p.SupportedLock = defaultSupportedLock()
 	p.SupportedPrivilegeSet = defaultSupportedPrivilegeSet()
 	p.PrincipalCollectionSet = &hrefListProp{Href: []string{"/dav/principals/"}}
+	p.Group = &hrefProp{}
+	p.ACLRestrictions = &aclRestrictionsProp{NoInvert: &struct{}{}}
+	p.InheritedACLSet = &hrefListProp{}
+	inheritedACLPath := inheritedACLSourcePath(resourcePath)
+	var inheritedEntries []store.ACLEntry
+	if inheritedACLPath != "" && h != nil && h.store != nil && h.store.ACLEntries != nil {
+		var err error
+		inheritedEntries, err = h.aclEntriesForResource(ctx, inheritedACLPath)
+		if err != nil {
+			return err
+		}
+		if len(inheritedEntries) != 0 {
+			p.InheritedACLSet.Href = []string{ensureCollectionHref(inheritedACLPath)}
+		}
+	}
+	if strings.HasPrefix(normalizeDAVHref(resourcePath), "/dav/principals/") {
+		p.AlternateURISet = &hrefListProp{}
+		p.GroupMembership = &hrefListProp{}
+	}
+	ownerHref := ""
+	if mask.owner && user != nil {
+		var err error
+		ownerHref, err = h.ownerPrincipalForPath(ctx, user, resourcePath)
+		if err != nil {
+			return err
+		}
+		if ownerHref != "" {
+			p.Owner = &hrefProp{Href: ownerHref}
+		}
+	}
 
 	if mask.lockDiscovery {
 		lockDiscovery, err := h.lockDiscoveryForPath(ctx, resourcePath)
@@ -214,12 +251,33 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 		p.LockDiscovery = lockDiscovery
 	}
 
-	if mask.acl && h != nil && h.store != nil && h.store.ACLEntries != nil {
-		entries, err := h.aclEntriesForResource(ctx, resourcePath)
+	if mask.acl {
+		allowed, err := h.checkACLPrivilege(ctx, user, resourcePath, "read-acl")
 		if err != nil {
 			return err
 		}
-		p.ACL = buildACLPropFromEntries(entries)
+		if !allowed {
+			p.aclForbidden = true
+		} else {
+			var entries []store.ACLEntry
+			if h != nil && h.store != nil && h.store.ACLEntries != nil {
+				entries, err = h.aclEntriesForResource(ctx, resourcePath)
+				if err != nil {
+					return err
+				}
+			}
+			p.ACL = buildACLPropFromEntries(entries)
+			if len(inheritedEntries) != 0 {
+				inherited := buildACLPropFromEntries(inheritedEntries)
+				for i := range inherited.ACE {
+					inherited.ACE[i].Inherited = &aceInheritedResp{Href: ensureCollectionHref(inheritedACLPath)}
+				}
+				p.ACL.ACE = append(p.ACL.ACE, inherited.ACE...)
+			}
+			if ownerHref != "" {
+				p.ACL.ACE = append([]aceResp{protectedOwnerACE(ownerHref)}, p.ACL.ACE...)
+			}
+		}
 	}
 
 	if user != nil && p.CurrentUserPrincipal == nil {
@@ -227,11 +285,94 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 		p.CurrentUserPrincipal = &expandableHrefProp{Href: principalHref}
 		p.CurrentUserPrincipalURL = &hrefProp{Href: principalHref}
 	}
-	if mask.currentUserPrivilegeSet && user != nil && p.CurrentUserPrivilegeSet == nil {
-		p.CurrentUserPrivilegeSet = h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+	if mask.currentUserPrivilegeSet && user != nil {
+		allowed, err := h.checkACLPrivilege(ctx, user, resourcePath, "read-current-user-privilege-set")
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			p.CurrentUserPrivilegeSet = nil
+			p.currentUserPrivilegesForbidden = true
+		} else {
+			if h.store == nil || h.store.ACLEntries != nil || h.isResourceOwner(ctx, user, resourcePath) || p.CurrentUserPrivilegeSet == nil {
+				p.CurrentUserPrivilegeSet = h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+			}
+		}
 	}
 
 	return nil
+}
+
+func inheritedACLSourcePath(resourcePath string) string {
+	cleanPath := normalizeDAVHref(resourcePath)
+	if strings.HasPrefix(cleanPath, calendarPrefix+"/") {
+		collectionPath := calendarCollectionPath(cleanPath)
+		if collectionPath != cleanPath {
+			return collectionPath
+		}
+	}
+	if strings.HasPrefix(cleanPath, addressBookPrefix+"/") {
+		collectionPath := addressBookCollectionPath(cleanPath)
+		if collectionPath != cleanPath {
+			return collectionPath
+		}
+	}
+	return ""
+}
+
+func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User, resourcePath string) (string, error) {
+	cleanPath := normalizeDAVHref(resourcePath)
+	if strings.HasPrefix(cleanPath, "/dav/principals/") {
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/"), "/")[0]
+		if id, err := strconv.ParseInt(segment, 10, 64); err == nil {
+			return fmt.Sprintf("/dav/principals/%d/", id), nil
+		}
+	}
+	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		if h == nil || h.store == nil || h.store.Calendars == nil {
+			return h.principalURL(user), nil
+		}
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/calendars/"), "/"), "/")[0]
+		id, ok, err := h.resolveCalendarID(ctx, user, segment)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) && user != nil {
+				return h.principalURL(user), nil
+			}
+			return "", err
+		}
+		if ok {
+			calendar, err := h.store.Calendars.GetByID(ctx, id)
+			if err != nil {
+				return "", err
+			}
+			if calendar != nil {
+				return fmt.Sprintf("/dav/principals/%d/", calendar.UserID), nil
+			}
+		}
+	}
+	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+		if h == nil || h.store == nil || h.store.AddressBooks == nil {
+			return h.principalURL(user), nil
+		}
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks/"), "/"), "/")[0]
+		id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) && user != nil {
+				return h.principalURL(user), nil
+			}
+			return "", err
+		}
+		if ok {
+			book, err := h.store.AddressBooks.GetByID(ctx, id)
+			if err != nil {
+				return "", err
+			}
+			if book != nil {
+				return fmt.Sprintf("/dav/principals/%d/", book.UserID), nil
+			}
+		}
+	}
+	return h.principalURL(user), nil
 }
 
 func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
@@ -240,6 +381,9 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	}
 
 	cleanPath := normalizeDAVHref(resourcePath)
+	if h.isResourceOwner(ctx, user, cleanPath) && isGenericDAVPrivilegePath(cleanPath) {
+		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames)
+	}
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		if isBirthdayCalendarPath(ctx, cleanPath) {
 			// The birthday calendar is virtual: there is no stored calendar to
@@ -264,10 +408,11 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		if err != nil || !ok {
 			return nil
 		}
-		cal, err := h.getCalendar(ctx, calendarID)
-		if err != nil || cal == nil {
+		access, err := h.loadCalendarWithAnyPrivilege(ctx, user, calendarID, cleanPath)
+		if err != nil || access == nil {
 			return nil
 		}
+		cal := &access.Calendar
 
 		// Resolve the ACL state once and decide every privilege from it
 		// instead of one full path/entry resolution per privilege name.
@@ -275,8 +420,8 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		if err != nil || pc == nil {
 			return nil
 		}
-		privileges := make([]privilege, 0, len(calendarPrivilegeNames))
-		for _, name := range calendarPrivilegeNames {
+		privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
+		for _, name := range calendarCurrentPrivilegeNames {
 			if allowed, _ := pc.decide(name); allowed {
 				privileges = append(privileges, privilegeElementForName(name))
 			}
@@ -288,11 +433,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	}
 
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		// Neither a calendar nor an address-book path: this is a principal or a
-		// generic collection, both of which the property applies to. We do not
-		// compute per-privilege grants for them, so report a present-empty set
-		// (privilege* content model) rather than nil, which would be a 404.
-		return &currentUserPrivilegeSet{}
+		return h.genericCurrentUserPrivilegeSet(ctx, user, cleanPath)
 	}
 
 	segment := singleCollectionSegment(cleanPath, "/dav/addressbooks/")
@@ -320,8 +461,8 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	if err != nil || pc == nil {
 		return nil
 	}
-	privileges := make([]privilege, 0, len(addressBookPrivilegeNames))
-	for _, name := range addressBookPrivilegeNames {
+	privileges := make([]privilege, 0, len(addressBookCurrentPrivilegeNames))
+	for _, name := range addressBookCurrentPrivilegeNames {
 		if allowed, _ := pc.decide(name); allowed {
 			privileges = append(privileges, privilegeElementForName(name))
 		}
@@ -331,13 +472,59 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	return &currentUserPrivilegeSet{Privileges: privileges}
 }
 
+func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return &currentUserPrivilegeSet{}
+	}
+	entries, err := h.aclEntriesForResource(ctx, resourcePath)
+	if err != nil {
+		return nil
+	}
+	principals, err := h.applicablePrincipalsForPath(ctx, user, resourcePath, entries)
+	if err != nil {
+		return nil
+	}
+	privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
+	for _, name := range calendarCurrentPrivilegeNames {
+		if allowed, _ := aclutil.DecisionForPrivilege(entries, principals, name); allowed {
+			privileges = append(privileges, privilegeElementForName(name))
+		}
+	}
+	return &currentUserPrivilegeSet{Privileges: privileges}
+}
+
+func isGenericDAVPrivilegePath(resourcePath string) bool {
+	cleanPath := path.Clean(resourcePath)
+	if cleanPath == "/dav" || cleanPath == "/dav/calendars" || cleanPath == "/dav/addressbooks" || cleanPath == "/dav/principals" {
+		return true
+	}
+	if strings.HasPrefix(cleanPath, "/dav/principals/") {
+		return len(strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/"), "/")) == 1
+	}
+	return false
+}
+
+func currentUserPrivilegeSetForNames(names []string) *currentUserPrivilegeSet {
+	privileges := make([]privilege, 0, len(names))
+	for _, name := range names {
+		privileges = append(privileges, privilegeElementForName(name))
+	}
+	return &currentUserPrivilegeSet{Privileges: privileges}
+}
+
 // privilegeElementForName maps a privilege name to its XML response element.
 func privilegeElementForName(name string) privilege {
 	switch name {
+	case "all":
+		return privilege{All: &struct{}{}}
 	case "read":
 		return privilege{Read: &readPrivilege{}}
 	case "read-free-busy":
 		return privilege{ReadFreeBusy: &struct{}{}}
+	case "read-acl":
+		return privilege{ReadACL: &struct{}{}}
+	case "read-current-user-privilege-set":
+		return privilege{ReadCurrentUserPrivilegeSet: &struct{}{}}
 	case "write":
 		return privilege{Write: &struct{}{}}
 	case "write-content":
@@ -348,6 +535,10 @@ func privilegeElementForName(name string) privilege {
 		return privilege{Bind: &struct{}{}}
 	case "unbind":
 		return privilege{Unbind: &struct{}{}}
+	case "write-acl":
+		return privilege{WriteACL: &struct{}{}}
+	case "unlock":
+		return privilege{Unlock: &struct{}{}}
 	}
 	return privilege{}
 }

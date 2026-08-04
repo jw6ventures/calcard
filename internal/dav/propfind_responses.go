@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -45,9 +46,17 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 			if err != nil {
 				return nil, err
 			}
+			calendarRes, err = h.appendLockNullMembers(ctx, user, "/dav/calendars", depth, calendarRes)
+			if err != nil {
+				return nil, err
+			}
 			res = h.appendMultistatusResponses(res, calendarRes)
 			if !h.multistatusBuildComplete(res) {
 				addressBookRes, err := h.addressBookResponses(ctx, "/dav/addressbooks", depth, user)
+				if err != nil {
+					return nil, err
+				}
+				addressBookRes, err = h.appendLockNullMembers(ctx, user, "/dav/addressbooks", depth, addressBookRes)
 				if err != nil {
 					return nil, err
 				}
@@ -99,6 +108,25 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	case strings.HasPrefix(cleanPath, "/dav/calendars"):
 		responses, err := h.calendarResponses(ctx, cleanPath, depth, user)
 		if err != nil {
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			if lockNull == nil {
+				return nil, err
+			}
+			responses = []response{*lockNull}
+		} else if len(responses) == 1 && responses[0].Status == httpStatusNotFound {
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			if lockNull != nil {
+				responses = []response{*lockNull}
+			}
+		}
+		responses, err = h.appendLockNullMembers(ctx, user, cleanPath, depth, responses)
+		if err != nil {
 			return nil, err
 		}
 		responses, err = h.appendCollectionContributors(ctx, r, user, cleanPath, depth, responses)
@@ -119,6 +147,25 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		return responses, nil
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
 		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user)
+		if err != nil {
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			if lockNull == nil {
+				return nil, err
+			}
+			responses = []response{*lockNull}
+		} else if len(responses) == 1 && responses[0].Status == httpStatusNotFound {
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			if lockNull != nil {
+				responses = []response{*lockNull}
+			}
+		}
+		responses, err = h.appendLockNullMembers(ctx, user, cleanPath, depth, responses)
 		if err != nil {
 			return nil, err
 		}
@@ -166,6 +213,94 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		return responses, nil
 	}
+}
+
+func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.User, cleanPath string) (*response, error) {
+	if h == nil || h.store == nil || h.store.Locks == nil || user == nil {
+		return nil, nil
+	}
+	canonicalPath, err := h.canonicalDAVPath(ctx, user, cleanPath)
+	if err != nil {
+		return nil, nil
+	}
+	locks, err := h.store.Locks.ListByResource(ctx, canonicalPath)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	for i := range locks {
+		lock := &locks[i]
+		if lock.ExpiresAt.Before(now) {
+			continue
+		}
+		publicPath := publicDAVLockRoot(lock.ResourcePath)
+		allowed, err := h.checkACLPrivilege(ctx, user, path.Dir(publicPath), "read")
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return nil, nil
+		}
+		result := resourceResponse(publicPath, statusOKProp(path.Base(publicPath), resourceType{}))
+		return &result, nil
+	}
+	return nil, nil
+}
+
+func (h *DavServer) appendLockNullMembers(ctx context.Context, user *store.User, cleanPath, depth string, responses []response) ([]response, error) {
+	if !depthIncludesChildren(depth) || h == nil || h.store == nil || h.store.Locks == nil || user == nil {
+		return responses, nil
+	}
+	parentPath := normalizeDAVHref(cleanPath)
+	locks, err := h.store.Locks.ListByResourcePrefix(ctx, strings.TrimSuffix(parentPath, "/")+"/")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(responses))
+	for i := range responses {
+		seen[normalizeDAVHref(responses[i].Href)] = struct{}{}
+	}
+	now := time.Now()
+	for i := range locks {
+		lock := &locks[i]
+		if lock.ExpiresAt.Before(now) {
+			continue
+		}
+		if _, pending := publicPendingCollectionPath(lock.ResourcePath); pending && lock.UserID != user.ID {
+			continue
+		}
+		publicPath := publicDAVLockRoot(lock.ResourcePath)
+		candidatePath := normalizeDAVHref(publicPath)
+		if depth == "1" {
+			if path.Dir(candidatePath) != parentPath {
+				continue
+			}
+		} else if !strings.HasPrefix(candidatePath, strings.TrimSuffix(parentPath, "/")+"/") {
+			continue
+		}
+		if _, ok := seen[candidatePath]; ok {
+			continue
+		}
+		exists, err := h.lockTargetExists(ctx, user, publicPath)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			continue
+		}
+		allowed, err := h.checkACLPrivilege(ctx, user, path.Dir(publicPath), "read")
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			continue
+		}
+		responses = h.appendMultistatusResponses(responses, []response{
+			resourceResponse(publicPath, statusOKProp(path.Base(publicPath), resourceType{})),
+		})
+		seen[candidatePath] = struct{}{}
+	}
+	return responses, nil
 }
 
 // stripCalendarAllprop removes the CalDAV properties RFC 4791 keeps out of a
@@ -260,6 +395,13 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 					break
 				}
 				c := &cals[i]
+				readable, err := h.canReadCalendarCollection(ctx, user, c)
+				if err != nil {
+					return nil, err
+				}
+				if !readable {
+					continue
+				}
 				href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(c.ID)))
 				ctag := strconv.FormatInt(c.CTag, 10)
 				syncToken := buildSyncToken("cal", c.ID, c.UpdatedAt)
@@ -335,6 +477,13 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 		}
 		return []response{resourceResponse(resourceHref, etagProp(event.ETag, event.RawICAL, true))}, nil
 	}
+	readable, err := h.canReadCalendarCollection(ctx, user, cal)
+	if err != nil {
+		return nil, err
+	}
+	if !readable {
+		return nil, store.ErrNotFound
+	}
 
 	href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
 	ctag := strconv.FormatInt(cal.CTag, 10)
@@ -350,12 +499,23 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	return res, nil
 }
 
+func (h *DavServer) canReadCalendarCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess) (bool, error) {
+	if cal == nil {
+		return false, nil
+	}
+	allowed, denied, err := h.calendarPrivilegeDecision(ctx, user, &cal.Calendar, calendarCollectionResourcePath(cal.ID), "read")
+	if err != nil || allowed || denied {
+		return allowed, err
+	}
+	return cal.EffectivePrivileges().Allows("read"), nil
+}
+
 func (h *DavServer) loadDiscoverableCalendar(ctx context.Context, user *store.User, calendarID int64) (*store.CalendarAccess, error) {
 	cal, err := h.loadCalendar(ctx, user, calendarID)
 	if err == nil {
 		return cal, nil
 	}
-	if err != store.ErrNotFound && !errors.Is(err, errForbidden) {
+	if !errors.Is(err, store.ErrNotFound) && !errors.Is(err, errForbidden) {
 		return nil, err
 	}
 
@@ -388,6 +548,13 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 					break
 				}
 				b := &books[i]
+				readable, err := h.canReadAddressBookCollection(ctx, user, b)
+				if err != nil {
+					return nil, err
+				}
+				if !readable {
+					continue
+				}
 				href := ensureCollectionHref(path.Join("/dav/addressbooks", fmt.Sprint(b.ID)))
 				ctag := strconv.FormatInt(b.CTag, 10)
 				syncToken := buildSyncToken("card", b.ID, b.UpdatedAt)
@@ -454,6 +621,17 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 	return res, nil
 }
 
+func (h *DavServer) canReadAddressBookCollection(ctx context.Context, user *store.User, book *store.AddressBook) (bool, error) {
+	if book == nil {
+		return false, nil
+	}
+	allowed, denied, err := h.addressBookPrivilegeDecision(ctx, user, book, addressBookCollectionResourcePath(book.ID), "read")
+	if err != nil || allowed || denied {
+		return allowed, err
+	}
+	return h == nil || h.store == nil || h.store.ACLEntries == nil, nil
+}
+
 func (h *DavServer) appendCalendarPropfindPages(ctx context.Context, user *store.User, cal *store.CalendarAccess, baseHref string, responses []response) ([]response, error) {
 	afterID := int64(0)
 	for !h.multistatusBuildComplete(responses) {
@@ -512,7 +690,9 @@ func (h *DavServer) principalResponses(cleanPath, depth string, user *store.User
 
 	// Only the authenticated user's principal is exposed.
 	if relPath == "" {
-		res := []response{collectionResponse(ensureCollectionHref("/dav/principals"), "Principals")}
+		collection := collectionResponse(ensureCollectionHref("/dav/principals"), "Principals")
+		collection.Propstat[0].Prop.SupportedReportSet = &supportedReportSet{Reports: aclPrincipalCollectionSupportedReports()}
+		res := []response{collection}
 		if depthIncludesChildren(depth) {
 			res = append(res, principalResponse(principalHref, user))
 		}
@@ -546,7 +726,7 @@ func principalResponse(href string, user *store.User) response {
 		CurrentUserPrincipalURL: &hrefProp{Href: href},
 		CalendarHomeSet:         &hrefListProp{Href: []string{"/dav/calendars/"}},
 		AddressbookHomeSet:      &hrefListProp{Href: []string{"/dav/addressbooks/"}},
-		SupportedReportSet:      combinedSupportedReports(),
+		SupportedReportSet:      &supportedReportSet{Reports: aclResourceSupportedReports()},
 	}
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
 }

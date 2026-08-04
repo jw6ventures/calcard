@@ -79,6 +79,19 @@ func TestMiddlewareCapturesRequestAndRestoresBody(t *testing.T) {
 	}
 }
 
+func TestSanitizedAuthorizationRedactsDigestCredentials(t *testing.T) {
+	value := `Digest username="user@example.com", realm="CalCard DAV", nonce="signed-nonce", uri="/dav/", response="credential-response", cnonce="client-secret"`
+	got := sanitizedAuthorization(value)
+	if got != "[REDACTED]" {
+		t.Fatalf("sanitizedAuthorization() = %q, want complete redaction", got)
+	}
+	for _, secret := range []string{"user@example.com", "signed-nonce", "credential-response", "client-secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("sanitized authorization leaked %q: %q", secret, got)
+		}
+	}
+}
+
 func TestMiddlewareSerializesConcurrentRequestsAsJSONLines(t *testing.T) {
 	var output bytes.Buffer
 	handler := Middleware(Options{Writer: &output})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

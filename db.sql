@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.10')
+VALUES ('version', 'v1.1.11')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -65,7 +65,12 @@ CREATE TABLE app_passwords (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NULL,
     revoked_at TIMESTAMPTZ NULL,
-    last_used_at TIMESTAMPTZ NULL
+    last_used_at TIMESTAMPTZ NULL,
+    -- Encrypted HTTP Digest HA1s (AES-256-GCM under a key derived from
+    -- APP_SESSION_SECRET). An HA1 is password-equivalent for the DAV realm, so
+    -- it is never stored as the bare hash Digest computes.
+    digest_md5_ha1 TEXT NULL,
+    digest_sha256_ha1 TEXT NULL
 );
 
 CREATE INDEX idx_events_calendar_id ON events(calendar_id);
@@ -255,12 +260,13 @@ CREATE TABLE IF NOT EXISTS acl_entries (
     principal_href TEXT NOT NULL,
     is_grant BOOLEAN NOT NULL DEFAULT TRUE,
     privilege TEXT NOT NULL,
+    ace_order INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_acl_resource ON acl_entries(resource_path);
 CREATE INDEX IF NOT EXISTS idx_acl_principal ON acl_entries(principal_href);
 DROP INDEX IF EXISTS idx_acl_unique;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_acl_unique ON acl_entries(resource_path, principal_href, privilege, is_grant);
+CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
 
 -- Add slug column for MKCALENDAR path mapping
 ALTER TABLE calendars ADD COLUMN slug TEXT;

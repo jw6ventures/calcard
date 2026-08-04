@@ -27,14 +27,6 @@ func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
-	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
-		return
-	}
-	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
-	if err != nil {
-		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
-		return
-	}
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
 		http.Error(w, "unsupported path", http.StatusBadRequest)
 		return
@@ -42,6 +34,21 @@ func (h *DavServer) mkcol(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
 	if len(parts) > 2 || (len(parts) == 2 && parts[0] != "" && parts[1] != "") {
 		http.Error(w, "nested address book collections not allowed", http.StatusForbidden)
+		return
+	}
+	// Only once the Request-URI is known to name an address book location does
+	// the address book home become the collection this MKCOL binds into, and so
+	// the resource whose DAV:bind privilege RFC 3744 Appendix B requires.
+	if err := h.requireACLPrivilege(r.Context(), user, addressBookPrefix, "bind"); err != nil {
+		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, addressBookPrefix, "bind"))
+		return
+	}
+	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
+		return
+	}
+	pendingLockPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to resolve collection path", http.StatusInternalServerError)
 		return
 	}
 	name := strings.TrimSpace(parts[len(parts)-1])
@@ -125,9 +132,6 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
-	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
-		return
-	}
 	// The location precondition is checked before the Request-URI is resolved
 	// for lock rebinding, because a URI that can never hold a calendar
 	// collection has no canonical form to resolve.
@@ -139,6 +143,16 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	}
 	if locationStatus != 0 {
 		writeCalDAVError(w, locationStatus, conditionCalendarLocationOK)
+		return
+	}
+	// Only a Request-URI that named a calendar location makes the calendar home
+	// the collection this MKCALENDAR binds into, and so the resource whose
+	// DAV:bind privilege RFC 4791 §5.3.1.1 requires.
+	if err := h.requireACLPrivilege(r.Context(), user, calendarPrefix, "bind"); err != nil {
+		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, calendarPrefix, "bind"))
+		return
+	}
+	if !h.requireLocks(w, r, "resource is locked", cleanPath, path.Dir(cleanPath)) {
 		return
 	}
 

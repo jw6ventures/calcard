@@ -101,7 +101,7 @@ func (h *DavServer) resolveAddressBookID(ctx context.Context, user *store.User, 
 	if err != nil {
 		if errors.Is(err, errAmbiguousAddressBook) {
 			result.err = errAmbiguousAddressBook
-		} else if err == store.ErrNotFound {
+		} else if errors.Is(err, store.ErrNotFound) {
 			result.err = store.ErrNotFound
 		} else {
 			return 0, false, err
@@ -141,7 +141,7 @@ func (h *DavServer) resolveCalendarID(ctx context.Context, user *store.User, seg
 	if err != nil {
 		if errors.Is(err, errAmbiguousCalendar) {
 			result.err = errAmbiguousCalendar
-		} else if err == store.ErrNotFound {
+		} else if errors.Is(err, store.ErrNotFound) {
 			result.err = store.ErrNotFound
 		} else {
 			return 0, false, err
@@ -166,7 +166,7 @@ func (h *DavServer) parseCalendarResourcePath(ctx context.Context, user *store.U
 		if errors.Is(err, errAmbiguousCalendar) {
 			return 0, target.ResourceName, true, errAmbiguousCalendar
 		}
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return 0, target.ResourceName, true, err
 		}
 		return 0, "", false, err
@@ -195,7 +195,7 @@ func (h *DavServer) parseAddressBookResourcePath(ctx context.Context, user *stor
 		if errors.Is(err, errAmbiguousAddressBook) {
 			return 0, target.ResourceName, true, errAmbiguousAddressBook
 		}
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return 0, target.ResourceName, true, err
 		}
 		return 0, "", false, err

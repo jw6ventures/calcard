@@ -50,7 +50,11 @@ type propfindPropertySpec struct {
 	// three states — absent, present-empty, present-nonempty — are decided
 	// explicitly and never by Go's zero values or xml omitempty.
 	emptyValue func(src *prop) bool
-	copyValue  func(dst, src *prop, q *propfindPropQuery)
+	// forbidden distinguishes a defined property whose value the current
+	// principal may not read from an absent property. RFC 3744 assigns those
+	// cases a property-level 403, not a 404.
+	forbidden func(src *prop) bool
+	copyValue func(dst, src *prop, q *propfindPropQuery)
 }
 
 func davName(local string) xml.Name { return xml.Name{Local: local} }
@@ -206,6 +210,20 @@ var propfindPropertyTable = []propfindPropertySpec{
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalURL = src.PrincipalURL },
 	},
 	{
+		emptyName:     davName("d:alternate-URI-set"),
+		requested:     func(q *propfindPropQuery) bool { return q.AlternateURISet != nil },
+		ok:            kindPrincipal,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.AlternateURISet = src.AlternateURISet },
+	},
+	{
+		emptyName:     davName("d:group-membership"),
+		requested:     func(q *propfindPropQuery) bool { return q.GroupMembership != nil },
+		ok:            kindPrincipal,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.GroupMembership = src.GroupMembership },
+	},
+	{
 		emptyName: davName("cal:calendar-home-set"),
 		requested: func(q *propfindPropQuery) bool { return q.CalendarHomeSet != nil },
 		ok:        kindPrincipal,
@@ -300,6 +318,7 @@ var propfindPropertyTable = []propfindPropertySpec{
 		requested:     func(q *propfindPropQuery) bool { return q.CurrentUserPrivilegeSet != nil },
 		ok:            kindAll,
 		alwaysDefined: true,
+		forbidden:     func(src *prop) bool { return src.currentUserPrivilegesForbidden },
 		present:       func(src *prop) bool { return src.CurrentUserPrivilegeSet != nil },
 		emptyValue: func(src *prop) bool {
 			return src.CurrentUserPrivilegeSet != nil && len(src.CurrentUserPrivilegeSet.Privileges) == 0
@@ -323,11 +342,21 @@ var propfindPropertyTable = []propfindPropertySpec{
 	{
 		emptyName: davName("d:owner"),
 		requested: func(q *propfindPropQuery) bool { return q.Owner != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.Owner = src.Owner },
+	},
+	{
+		emptyName:     davName("d:group"),
+		requested:     func(q *propfindPropQuery) bool { return q.Group != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.Group = src.Group },
 	},
 	{
 		emptyName: davName("d:acl"),
 		requested: func(q *propfindPropQuery) bool { return q.ACLProp != nil },
 		ok:        kindAll,
+		forbidden: func(src *prop) bool { return src.aclForbidden },
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.ACL = src.ACL },
 	},
 	{
@@ -335,6 +364,20 @@ var propfindPropertyTable = []propfindPropertySpec{
 		requested: func(q *propfindPropQuery) bool { return q.SupportedPrivilegeSet != nil },
 		ok:        kindAll,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedPrivilegeSet = src.SupportedPrivilegeSet },
+	},
+	{
+		emptyName:     davName("d:acl-restrictions"),
+		requested:     func(q *propfindPropQuery) bool { return q.ACLRestrictions != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.ACLRestrictions = src.ACLRestrictions },
+	},
+	{
+		emptyName:     davName("d:inherited-acl-set"),
+		requested:     func(q *propfindPropQuery) bool { return q.InheritedACLSet != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.InheritedACLSet = src.InheritedACLSet },
 	},
 	{
 		emptyName: davName("d:principal-collection-set"),
@@ -380,9 +423,14 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 	var okProp prop
 	var okSet bool
 	var notFoundNames []xml.Name
+	var forbiddenNames []xml.Name
 	for i := range propfindPropertyTable {
 		spec := &propfindPropertyTable[i]
 		if !spec.requested(req.Prop) {
+			continue
+		}
+		if spec.forbidden != nil && spec.forbidden(&src) {
+			forbiddenNames = append(forbiddenNames, spec.emptyName)
 			continue
 		}
 		dataSuppressed := req.suppressData && (spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data")
@@ -418,6 +466,9 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 	}
 	if len(notFoundNames) > 0 {
 		resp.Propstat = append(resp.Propstat, propstat{PropNames: notFoundNames, Status: httpStatusNotFound})
+	}
+	if len(forbiddenNames) > 0 {
+		resp.Propstat = append(resp.Propstat, propstat{PropNames: forbiddenNames, Status: httpStatusForbidden})
 	}
 	if len(resp.Propstat) == 0 {
 		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}

@@ -1,12 +1,15 @@
 package dav
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+var errPrivilegeNotGranted = fmt.Errorf("privilege not granted: %w", store.ErrNotFound)
 
 // Collection URL prefixes for the default DAV modules. Used by the shared
 // path/ACL helpers below so calendar and address-book code stays in lockstep.
@@ -57,8 +60,9 @@ func appendObjectACLPaths(paths []string, collectionPath, resourceName, ext stri
 // requirePrivilegeDecision turns the (allowed, denied) result of a privilege
 // decision into the standard error contract shared by the require*Privilege
 // helpers: nil when allowed, errForbidden when explicitly denied, and
-// store.ErrNotFound otherwise (so callers fail closed without leaking
-// existence).
+// errPrivilegeNotGranted otherwise. That sentinel still matches
+// store.ErrNotFound so existing privacy-preserving callers fail closed, while
+// method handlers can distinguish an absent resource from a missing privilege.
 func requirePrivilegeDecision(allowed, denied bool, err error) error {
 	if err != nil {
 		return err
@@ -69,5 +73,9 @@ func requirePrivilegeDecision(allowed, denied bool, err error) error {
 	if denied {
 		return errForbidden
 	}
-	return store.ErrNotFound
+	return errPrivilegeNotGranted
+}
+
+func isPrivilegeNotGranted(err error) bool {
+	return errors.Is(err, errPrivilegeNotGranted)
 }

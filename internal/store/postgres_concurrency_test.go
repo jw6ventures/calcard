@@ -347,6 +347,631 @@ func TestPostgres_ConcurrentMkcalendarCreatesOneCollection(t *testing.T) {
 	}
 }
 
+func TestPostgres_CalendarObjectTransfersRollBackEventAndDAVStateTogether(t *testing.T) {
+	for _, operation := range []CalendarObjectTransferOperation{CalendarObjectCopy, CalendarObjectMove} {
+		t.Run(string(operation), func(t *testing.T) {
+			s := newPostgresStore(t)
+			_, sourceCalendarID := newPostgresCalendar(t, s, "object-transfer-source-"+string(operation))
+			_, destinationCalendarID := newPostgresCalendar(t, s, "object-transfer-destination-"+string(operation))
+			ctx := context.Background()
+			raw := postgresCalendarObject("source", "Source")
+			if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: sourceCalendarID, UID: "source", ResourceName: "source", RawICAL: raw, ETag: "source-etag",
+			}); err != nil {
+				t.Fatalf("seed source event: %v", err)
+			}
+			sourcePath := fmt.Sprintf("/dav/calendars/%d/source", sourceCalendarID)
+			destinationPath := fmt.Sprintf("/dav/calendars/%d/destination", destinationCalendarID)
+			if err := s.DeadProperties.Apply(ctx, sourcePath, []DeadPropertyMutation{{
+				NamespaceURI: "urn:calcard:test", LocalName: "marker", InnerXML: "source-state",
+			}}); err != nil {
+				t.Fatalf("seed source dead property: %v", err)
+			}
+
+			triggerOperation := "INSERT"
+			if operation == CalendarObjectMove {
+				triggerOperation = "UPDATE"
+			}
+			triggerSQL := fmt.Sprintf(`
+CREATE FUNCTION reject_object_state_change() RETURNS trigger AS $$
+BEGIN
+    IF NEW.resource_path = %s THEN
+        RAISE EXCEPTION 'forced DAV state failure';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER reject_object_state_change
+BEFORE %s ON dav_dead_properties
+FOR EACH ROW EXECUTE FUNCTION reject_object_state_change()`, pq.QuoteLiteral(destinationPath), triggerOperation)
+			if _, err := s.Calendars.(*calendarRepo).pool.ExecContext(ctx, triggerSQL); err != nil {
+				t.Fatalf("install failure trigger: %v", err)
+			}
+
+			_, err := s.TransferCalendarObject(ctx, CalendarObjectTransfer{
+				Operation:               operation,
+				SourceCalendarID:        sourceCalendarID,
+				SourceUID:               "source",
+				SourceResourceName:      "source",
+				ExpectedSourceETag:      "source-etag",
+				ExpectedSourceRaw:       raw,
+				DestinationCalendarID:   destinationCalendarID,
+				DestinationResourceName: "destination",
+				ExpectedDestination:     CalendarObjectTransferState{},
+				Overwrite:               true,
+				RawICAL:                 raw,
+				ETag:                    "destination-etag",
+				SourceStatePath:         sourcePath,
+				DestinationStatePath:    destinationPath,
+			})
+			if err == nil {
+				t.Fatal("TransferCalendarObject() error = nil, want forced rollback")
+			}
+
+			source, loadErr := s.Events.GetByResourceName(ctx, sourceCalendarID, "source")
+			if loadErr != nil || source == nil || source.ETag != "source-etag" {
+				t.Fatalf("source after rollback = %#v, %v", source, loadErr)
+			}
+			destination, loadErr := s.Events.GetByResourceName(ctx, destinationCalendarID, "destination")
+			if loadErr != nil || destination != nil {
+				t.Fatalf("destination after rollback = %#v, %v", destination, loadErr)
+			}
+			properties, loadErr := s.DeadProperties.ListByResources(ctx, []string{sourcePath, destinationPath})
+			if loadErr != nil {
+				t.Fatalf("list dead properties: %v", loadErr)
+			}
+			if len(properties) != 1 || properties[0].ResourcePath != sourcePath || properties[0].InnerXML != "source-state" {
+				t.Fatalf("DAV state after rollback = %#v", properties)
+			}
+		})
+	}
+}
+
+func TestPostgres_CalendarObjectMovePublishesSourceRemoval(t *testing.T) {
+	for _, crossCalendar := range []bool{false, true} {
+		name := "same-calendar rename"
+		if crossCalendar {
+			name = "cross-calendar move"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newPostgresStore(t)
+			_, sourceCalendarID := newPostgresCalendar(t, s, "move-sync-source")
+			destinationCalendarID := sourceCalendarID
+			if crossCalendar {
+				_, destinationCalendarID = newPostgresCalendar(t, s, "move-sync-destination")
+			}
+			ctx := context.Background()
+			raw := postgresCalendarObject("source", "Source")
+			if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: sourceCalendarID, UID: "source", ResourceName: "source", RawICAL: raw, ETag: "source-etag",
+			}); err != nil {
+				t.Fatalf("seed source event: %v", err)
+			}
+
+			database := s.Calendars.(*calendarRepo).pool
+			var sourceCTagBefore int64
+			if err := database.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE id=$1`, sourceCalendarID).Scan(&sourceCTagBefore); err != nil {
+				t.Fatalf("load source ctag: %v", err)
+			}
+
+			result, err := s.TransferCalendarObject(ctx, CalendarObjectTransfer{
+				Operation:               CalendarObjectMove,
+				SourceCalendarID:        sourceCalendarID,
+				SourceUID:               "source",
+				SourceResourceName:      "source",
+				ExpectedSourceETag:      "source-etag",
+				ExpectedSourceRaw:       raw,
+				DestinationCalendarID:   destinationCalendarID,
+				DestinationResourceName: "renamed",
+				ExpectedDestination:     CalendarObjectTransferState{},
+				Overwrite:               true,
+				RawICAL:                 raw,
+				ETag:                    "source-etag",
+				SourceStatePath:         fmt.Sprintf("/dav/calendars/%d/source", sourceCalendarID),
+				DestinationStatePath:    fmt.Sprintf("/dav/calendars/%d/renamed", destinationCalendarID),
+			})
+			if err != nil {
+				t.Fatalf("TransferCalendarObject() error = %v", err)
+			}
+			if result == nil || result.Event == nil || result.Event.CalendarID != destinationCalendarID || result.Event.ResourceName != "renamed" {
+				t.Fatalf("move result = %#v", result)
+			}
+
+			var tombstones int
+			if err := database.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM deleted_resources
+WHERE resource_type='event' AND collection_id=$1 AND uid='source' AND resource_name='source'`, sourceCalendarID).Scan(&tombstones); err != nil {
+				t.Fatalf("load source tombstone: %v", err)
+			}
+			if tombstones != 1 {
+				t.Fatalf("source tombstones = %d, want 1", tombstones)
+			}
+
+			var sourceCTagAfter int64
+			if err := database.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE id=$1`, sourceCalendarID).Scan(&sourceCTagAfter); err != nil {
+				t.Fatalf("reload source ctag: %v", err)
+			}
+			if sourceCTagAfter <= sourceCTagBefore {
+				t.Fatalf("source ctag = %d after move, want greater than %d", sourceCTagAfter, sourceCTagBefore)
+			}
+		})
+	}
+}
+
+func TestPostgres_CalendarCollectionTransferRebindsPendingDestinationLock(t *testing.T) {
+	for _, operation := range []CalendarCollectionTransferOperation{CalendarCollectionCopy, CalendarCollectionMove} {
+		t.Run(string(operation), func(t *testing.T) {
+			s := newPostgresStore(t)
+			userID, sourceID := newPostgresCalendar(t, s, "collection-lock-"+string(operation))
+			ctx := context.Background()
+			source, err := s.Calendars.GetByID(ctx, sourceID)
+			if err != nil || source == nil {
+				t.Fatalf("load source calendar: %#v, %v", source, err)
+			}
+			pendingPath := fmt.Sprintf("/dav/calendars/.pending/%d/transferred", userID)
+			sourcePath := fmt.Sprintf("/dav/calendars/%d", sourceID)
+			sourceToken := "collection-source-" + string(operation)
+			if _, err := s.Locks.Create(ctx, Lock{
+				Token: sourceToken, ResourcePath: sourcePath, UserID: userID,
+				LockScope: "exclusive", LockType: "write", Depth: "0",
+				TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("seed source lock: %v", err)
+			}
+			token := "collection-transfer-" + string(operation)
+			if _, err := s.Locks.Create(ctx, Lock{
+				Token: token, ResourcePath: pendingPath, UserID: userID,
+				LockScope: "exclusive", LockType: "write", Depth: "0",
+				TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("seed pending destination lock: %v", err)
+			}
+
+			lockPreconditions := []LockPrecondition{
+				{ResourcePath: pendingPath, LookupPaths: []string{pendingPath}, Tokens: []string{token}},
+			}
+			if operation == CalendarCollectionMove {
+				lockPreconditions = append(lockPreconditions, LockPrecondition{ResourcePath: sourcePath, LookupPaths: []string{sourcePath}, Tokens: []string{sourceToken}})
+			}
+			result, err := s.TransferCalendarCollection(ctx, CalendarCollectionTransfer{
+				Operation:           operation,
+				Depth:               "infinity",
+				Overwrite:           true,
+				SourceID:            sourceID,
+				ExpectedSourceCTag:  source.CTag,
+				SourceStatePath:     sourcePath,
+				DestinationOwnerID:  userID,
+				DestinationSlug:     "transferred",
+				DestinationLockPath: pendingPath,
+				ExpectedDestination: CalendarCollectionState{},
+				LockPreconditions:   lockPreconditions,
+			})
+			if err != nil {
+				t.Fatalf("TransferCalendarCollection() error = %v", err)
+			}
+			if result == nil || result.Calendar == nil {
+				t.Fatalf("transfer result = %#v", result)
+			}
+			lock, err := s.Locks.GetByToken(ctx, token)
+			if err != nil || lock == nil {
+				t.Fatalf("load rebound lock: %#v, %v", lock, err)
+			}
+			wantPath := fmt.Sprintf("/dav/calendars/%d", result.Calendar.ID)
+			if lock.ResourcePath != wantPath {
+				t.Fatalf("rebound lock path = %q, want %q", lock.ResourcePath, wantPath)
+			}
+			sourceLock, err := s.Locks.GetByToken(ctx, sourceToken)
+			if err != nil {
+				t.Fatalf("load source lock: %v", err)
+			}
+			if operation == CalendarCollectionCopy {
+				if sourceLock == nil || sourceLock.ResourcePath != sourcePath {
+					t.Fatalf("COPY source lock = %#v, want it unchanged at %q", sourceLock, sourcePath)
+				}
+			} else if sourceLock != nil {
+				t.Fatalf("MOVE source lock = %#v, want RFC 4918 section 7.6 to remove it", sourceLock)
+			}
+			if operation == CalendarCollectionMove {
+				oldSource, err := s.Calendars.GetByID(ctx, sourceID)
+				if err != nil || oldSource != nil {
+					t.Fatalf("MOVE source binding still resolves: %#v, %v", oldSource, err)
+				}
+				if result.Calendar.ID == sourceID {
+					t.Fatalf("MOVE destination reused advertised source identity %d", sourceID)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgres_CalendarObjectTransferUsesRFC4918MoveLockSemantics(t *testing.T) {
+	for _, operation := range []CalendarObjectTransferOperation{CalendarObjectCopy, CalendarObjectMove} {
+		t.Run(string(operation), func(t *testing.T) {
+			s := newPostgresStore(t)
+			userID, sourceCalendarID := newPostgresCalendar(t, s, "object-lock-"+string(operation))
+			ctx := context.Background()
+			destinationCalendar, err := s.Calendars.Create(ctx, Calendar{UserID: userID, Name: "Object Lock Destination " + string(operation)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceRaw := postgresCalendarObject("source", "Source")
+			sourceResult, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: sourceCalendarID, UID: "source", ResourceName: "source", RawICAL: sourceRaw, ETag: "source-etag",
+			})
+			if err != nil || sourceResult == nil || sourceResult.Event == nil {
+				t.Fatalf("seed source: %#v, %v", sourceResult, err)
+			}
+			destinationResult, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: destinationCalendar.ID, UID: "old-destination", ResourceName: "destination",
+				RawICAL: postgresCalendarObject("old-destination", "Destination"), ETag: "destination-etag",
+			})
+			if err != nil || destinationResult == nil || destinationResult.Event == nil {
+				t.Fatalf("seed destination: %#v, %v", destinationResult, err)
+			}
+			sourcePath := fmt.Sprintf("/dav/calendars/%d/source", sourceCalendarID)
+			destinationPath := fmt.Sprintf("/dav/calendars/%d/destination", destinationCalendar.ID)
+			sourceToken := "object-source-" + string(operation)
+			destinationToken := "object-destination-" + string(operation)
+			for token, resourcePath := range map[string]string{sourceToken: sourcePath, destinationToken: destinationPath} {
+				if _, err := s.Locks.Create(ctx, Lock{
+					Token: token, ResourcePath: resourcePath, UserID: userID, LockScope: "exclusive", LockType: "write",
+					Depth: "0", TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+				}); err != nil {
+					t.Fatalf("seed lock %q: %v", token, err)
+				}
+			}
+			preconditions := []LockPrecondition{{
+				ResourcePath: destinationPath, LookupPaths: []string{destinationPath}, Tokens: []string{destinationToken},
+			}}
+			if operation == CalendarObjectMove {
+				preconditions = append(preconditions, LockPrecondition{
+					ResourcePath: sourcePath, LookupPaths: []string{sourcePath}, Tokens: []string{sourceToken},
+				})
+			}
+			_, err = s.TransferCalendarObject(ctx, CalendarObjectTransfer{
+				Operation: operation, SourceCalendarID: sourceCalendarID, SourceUID: "source", SourceResourceName: "source",
+				ExpectedSourceETag: "source-etag", ExpectedSourceRaw: sourceRaw,
+				DestinationCalendarID: destinationCalendar.ID, DestinationResourceName: "destination",
+				ExpectedDestination: CalendarObjectTransferState{Exists: true, UID: "old-destination", ETag: "destination-etag"},
+				Overwrite:           true, RawICAL: sourceRaw, ETag: "copied-etag", SourceStatePath: sourcePath,
+				DestinationStatePath: destinationPath, LockPreconditions: preconditions,
+			})
+			if err != nil {
+				t.Fatalf("TransferCalendarObject() error = %v", err)
+			}
+			destinationLock, err := s.Locks.GetByToken(ctx, destinationToken)
+			if err != nil || destinationLock == nil || destinationLock.ResourcePath != destinationPath {
+				t.Fatalf("destination lock = %#v, %v", destinationLock, err)
+			}
+			sourceLock, err := s.Locks.GetByToken(ctx, sourceToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == CalendarObjectCopy {
+				if sourceLock == nil || sourceLock.ResourcePath != sourcePath {
+					t.Fatalf("COPY source lock = %#v", sourceLock)
+				}
+			} else if sourceLock != nil {
+				t.Fatalf("MOVE source lock = %#v, want nil", sourceLock)
+			}
+		})
+	}
+}
+
+func TestPostgres_CalendarCollectionTransferPreservesDestinationLockTree(t *testing.T) {
+	for _, operation := range []CalendarCollectionTransferOperation{CalendarCollectionCopy, CalendarCollectionMove} {
+		t.Run(string(operation), func(t *testing.T) {
+			s := newPostgresStore(t)
+			userID, sourceID := newPostgresCalendar(t, s, "collection-tree-lock-"+string(operation))
+			ctx := context.Background()
+			destinationSlug := "tree-lock-destination-" + string(operation)
+			destination, err := s.Calendars.Create(ctx, Calendar{UserID: userID, Name: "Tree Lock Destination", Slug: &destinationSlug})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceRaw := postgresCalendarObject("source", "Source")
+			sourceResult, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: sourceID, UID: "source", ResourceName: "member", RawICAL: sourceRaw, ETag: "source-etag",
+			})
+			if err != nil || sourceResult == nil || sourceResult.Event == nil {
+				t.Fatalf("seed source: %#v, %v", sourceResult, err)
+			}
+			if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+				CalendarID: destination.ID, UID: "destination", ResourceName: "member",
+				RawICAL: postgresCalendarObject("destination", "Destination"), ETag: "destination-etag",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			source, _ := s.Calendars.GetByID(ctx, sourceID)
+			destination, _ = s.Calendars.GetByID(ctx, destination.ID)
+			sourceRoot := calendarCollectionStatePath(sourceID)
+			destinationRoot := calendarCollectionStatePath(destination.ID)
+			tokens := map[string]string{
+				"source-root-" + string(operation):        sourceRoot,
+				"source-member-" + string(operation):      sourceRoot + "/member",
+				"destination-root-" + string(operation):   destinationRoot,
+				"destination-member-" + string(operation): destinationRoot + "/member",
+			}
+			for token, resourcePath := range tokens {
+				if _, err := s.Locks.Create(ctx, Lock{
+					Token: token, ResourcePath: resourcePath, UserID: userID, LockScope: "exclusive", LockType: "write",
+					Depth: "0", TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+				}); err != nil {
+					t.Fatalf("seed lock %q: %v", token, err)
+				}
+			}
+			preconditions := []LockPrecondition{
+				{ResourcePath: destinationRoot, LookupPaths: []string{destinationRoot}, Tokens: []string{"destination-root-" + string(operation)}},
+				{ResourcePath: destinationRoot + "/member", LookupPaths: []string{destinationRoot + "/member"}, Tokens: []string{"destination-member-" + string(operation)}},
+			}
+			if operation == CalendarCollectionMove {
+				preconditions = append(preconditions,
+					LockPrecondition{ResourcePath: sourceRoot, LookupPaths: []string{sourceRoot}, Tokens: []string{"source-root-" + string(operation)}},
+					LockPrecondition{ResourcePath: sourceRoot + "/member", LookupPaths: []string{sourceRoot + "/member"}, Tokens: []string{"source-member-" + string(operation)}},
+				)
+			}
+			result, err := s.TransferCalendarCollection(ctx, CalendarCollectionTransfer{
+				Operation: operation, Depth: "infinity", Overwrite: true, SourceID: sourceID,
+				ExpectedSourceCTag: source.CTag, SourceStatePath: sourceRoot, DestinationOwnerID: userID,
+				DestinationSlug: destinationSlug, ExpectedDestination: CalendarCollectionState{Exists: true, ID: destination.ID, CTag: destination.CTag},
+				DestinationStatePath: destinationRoot, DestinationLockPath: destinationRoot,
+				Members: []CalendarCollectionMember{{
+					ID: sourceResult.Event.ID, UID: "source", ResourceName: "member", RawICAL: sourceRaw,
+					ETag: "source-etag", NewETag: "copied-etag",
+				}},
+				LockPreconditions: preconditions,
+			})
+			if err != nil {
+				t.Fatalf("TransferCalendarCollection() error = %v", err)
+			}
+			newRoot := calendarCollectionStatePath(result.Calendar.ID)
+			for token, suffix := range map[string]string{
+				"destination-root-" + string(operation):   "",
+				"destination-member-" + string(operation): "/member",
+			} {
+				lock, err := s.Locks.GetByToken(ctx, token)
+				if err != nil || lock == nil || lock.ResourcePath != newRoot+suffix {
+					t.Fatalf("destination lock %q = %#v, %v; want %q", token, lock, err, newRoot+suffix)
+				}
+			}
+			for _, token := range []string{"source-root-" + string(operation), "source-member-" + string(operation)} {
+				lock, err := s.Locks.GetByToken(ctx, token)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if operation == CalendarCollectionCopy {
+					if lock == nil {
+						t.Fatalf("COPY removed source lock %q", token)
+					}
+				} else if lock != nil {
+					t.Fatalf("MOVE retained source lock %q: %#v", token, lock)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgres_CalendarCollectionCopyRollsBackCreatedCollectionAndMembers(t *testing.T) {
+	s := newPostgresStore(t)
+	userID, sourceID := newPostgresCalendar(t, s, "collection-copy-source")
+	ctx := context.Background()
+	for _, uid := range []string{"first", "second"} {
+		if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+			CalendarID: sourceID, UID: uid, ResourceName: uid, RawICAL: postgresCalendarObject(uid, uid), ETag: "etag-" + uid,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", uid, err)
+		}
+	}
+	source, err := s.Calendars.GetByID(ctx, sourceID)
+	if err != nil || source == nil {
+		t.Fatalf("load source calendar: %#v, %v", source, err)
+	}
+	events, err := s.Events.ListForCalendar(ctx, sourceID)
+	if err != nil {
+		t.Fatalf("list source events: %v", err)
+	}
+	members := make([]CalendarCollectionMember, 0, len(events))
+	for _, event := range events {
+		members = append(members, CalendarCollectionMember{
+			ID: event.ID, UID: event.UID, ResourceName: event.ResourceName, RawICAL: event.RawICAL, ETag: event.ETag, NewETag: "copy-" + event.ETag,
+		})
+	}
+	sourcePath := calendarCollectionStatePath(sourceID)
+	if err := s.DeadProperties.Apply(ctx, sourcePath, []DeadPropertyMutation{{
+		NamespaceURI: "urn:calcard:test", LocalName: "marker", InnerXML: "collection-state",
+	}}); err != nil {
+		t.Fatalf("seed collection state: %v", err)
+	}
+	triggerSQL := fmt.Sprintf(`
+CREATE FUNCTION reject_member_copy() RETURNS trigger AS $$
+BEGIN
+    IF NEW.calendar_id <> %d THEN
+        RAISE EXCEPTION 'forced member copy failure';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER reject_member_copy
+BEFORE INSERT ON events
+FOR EACH ROW EXECUTE FUNCTION reject_member_copy()`, sourceID)
+	if _, err := s.Calendars.(*calendarRepo).pool.ExecContext(ctx, triggerSQL); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+
+	_, err = s.TransferCalendarCollection(ctx, CalendarCollectionTransfer{
+		Operation:            CalendarCollectionCopy,
+		Depth:                "infinity",
+		Overwrite:            true,
+		SourceID:             sourceID,
+		ExpectedSourceCTag:   source.CTag,
+		SourceStatePath:      sourcePath,
+		DestinationOwnerID:   userID,
+		DestinationSlug:      "rolled-back-copy",
+		DestinationStatePath: "/dav/calendars/rolled-back-copy",
+		ExpectedDestination:  CalendarCollectionState{},
+		Members:              members,
+	})
+	if err == nil {
+		t.Fatal("TransferCalendarCollection() error = nil, want forced rollback")
+	}
+
+	calendars, err := s.Calendars.ListByUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("list calendars: %v", err)
+	}
+	if len(calendars) != 1 || calendars[0].ID != sourceID {
+		t.Fatalf("calendars after rollback = %#v", calendars)
+	}
+	stored, err := s.Events.ListForCalendar(ctx, sourceID)
+	if err != nil || len(stored) != len(members) {
+		t.Fatalf("source members after rollback = %#v, %v", stored, err)
+	}
+	properties, err := s.DeadProperties.ListByResources(ctx, []string{sourcePath})
+	if err != nil || len(properties) != 1 || properties[0].InnerXML != "collection-state" {
+		t.Fatalf("source DAV state after rollback = %#v, %v", properties, err)
+	}
+}
+
+func TestPostgres_CalendarCollectionDeleteRollsBackTreeState(t *testing.T) {
+	s := newPostgresStore(t)
+	_, sourceID := newPostgresCalendar(t, s, "collection-delete-source")
+	ctx := context.Background()
+	raw := postgresCalendarObject("member", "Member")
+	seeded, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+		CalendarID: sourceID, UID: "member", ResourceName: "member", RawICAL: raw, ETag: "member-etag",
+	})
+	if err != nil || seeded == nil || seeded.Event == nil {
+		t.Fatalf("seed member: %#v, %v", seeded, err)
+	}
+	source, err := s.Calendars.GetByID(ctx, sourceID)
+	if err != nil || source == nil {
+		t.Fatalf("load source: %#v, %v", source, err)
+	}
+	sourcePath := calendarCollectionStatePath(sourceID)
+	if err := s.DeadProperties.Apply(ctx, sourcePath, []DeadPropertyMutation{{
+		NamespaceURI: "urn:calcard:test", LocalName: "marker", InnerXML: "delete-state",
+	}}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	triggerSQL := fmt.Sprintf(`
+CREATE FUNCTION reject_calendar_delete() RETURNS trigger AS $$
+BEGIN
+    IF OLD.id = %d THEN
+        RAISE EXCEPTION 'forced calendar delete failure';
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER reject_calendar_delete
+BEFORE DELETE ON calendars
+FOR EACH ROW EXECUTE FUNCTION reject_calendar_delete()`, sourceID)
+	if _, err := s.Calendars.(*calendarRepo).pool.ExecContext(ctx, triggerSQL); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+
+	_, err = s.TransferCalendarCollection(ctx, CalendarCollectionTransfer{
+		Operation:          CalendarCollectionDelete,
+		SourceID:           sourceID,
+		ExpectedSourceCTag: source.CTag,
+		SourceStatePath:    sourcePath,
+		Members: []CalendarCollectionMember{{
+			ID: seeded.Event.ID, UID: "member", ResourceName: "member", RawICAL: raw, ETag: "member-etag",
+		}},
+	})
+	if err == nil {
+		t.Fatal("TransferCalendarCollection(delete) error = nil, want forced rollback")
+	}
+	if calendar, loadErr := s.Calendars.GetByID(ctx, sourceID); loadErr != nil || calendar == nil {
+		t.Fatalf("calendar after rollback = %#v, %v", calendar, loadErr)
+	}
+	if member, loadErr := s.Events.GetByResourceName(ctx, sourceID, "member"); loadErr != nil || member == nil {
+		t.Fatalf("member after rollback = %#v, %v", member, loadErr)
+	}
+	properties, loadErr := s.DeadProperties.ListByResources(ctx, []string{sourcePath})
+	if loadErr != nil || len(properties) != 1 || properties[0].InnerXML != "delete-state" {
+		t.Fatalf("tree state after rollback = %#v, %v", properties, loadErr)
+	}
+}
+
+func TestPostgres_ACLDecisionsFollowACEOrder(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "ordered-acl-owner")
+	ctx := context.Background()
+	viewer, err := s.Users.UpsertOAuthUser(ctx, "ordered-acl-viewer", "viewer@example.test", "Viewer", "Viewer")
+	if err != nil {
+		t.Fatalf("create viewer: %v", err)
+	}
+	resourcePath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+	principal := fmt.Sprintf("/dav/principals/%d/", viewer.ID)
+
+	assertVisible := func(want bool) {
+		t.Helper()
+		calendars, err := s.Calendars.ListAccessible(ctx, viewer.ID)
+		if err != nil {
+			t.Fatalf("ListAccessible() error = %v", err)
+		}
+		got := false
+		for _, calendar := range calendars {
+			got = got || calendar.ID == calendarID
+		}
+		if got != want {
+			t.Fatalf("calendar visibility = %v, want %v; calendars = %#v", got, want, calendars)
+		}
+	}
+
+	if err := s.ACLEntries.SetACL(ctx, resourcePath, []ACLEntry{
+		{PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
+		{PrincipalHref: principal, IsGrant: false, Privilege: "read", Position: 1},
+	}); err != nil {
+		t.Fatalf("set grant-first ACL: %v", err)
+	}
+	assertVisible(true)
+	allowed, err := s.ACLEntries.HasPrivilege(ctx, resourcePath, principal, "read")
+	if err != nil || !allowed {
+		t.Fatalf("grant-first HasPrivilege() = %v, %v", allowed, err)
+	}
+
+	if err := s.ACLEntries.SetACL(ctx, resourcePath, []ACLEntry{
+		{PrincipalHref: principal, IsGrant: false, Privilege: "read", Position: 0},
+		{PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 1},
+	}); err != nil {
+		t.Fatalf("set deny-first ACL: %v", err)
+	}
+	assertVisible(false)
+	allowed, err = s.ACLEntries.HasPrivilege(ctx, resourcePath, principal, "read")
+	if err != nil || allowed {
+		t.Fatalf("deny-first HasPrivilege() = %v, %v", allowed, err)
+	}
+}
+
+func TestPostgres_ConcurrentACLReplacementsDoNotMerge(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "concurrent-acl-replacement")
+	resourcePath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+
+	const writers = 12
+	errs := runConcurrently(writers, func(i int) error {
+		return s.ACLEntries.SetACL(context.Background(), resourcePath, []ACLEntry{{
+			PrincipalHref: fmt.Sprintf("/dav/principals/%d/", i+100),
+			IsGrant:       true,
+			Privilege:     "read",
+			Position:      0,
+		}})
+	})
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent SetACL() error = %v", err)
+		}
+	}
+	entries, err := s.ACLEntries.ListByResource(context.Background(), resourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("concurrent ACL replacements left %d entries, want exactly one complete replacement: %#v", len(entries), entries)
+	}
+}
+
 func isPostgresUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && string(pqErr.Code) == "23505"

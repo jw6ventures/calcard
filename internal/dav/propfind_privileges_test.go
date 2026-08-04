@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	aclutil "github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -93,8 +94,8 @@ func TestPropfindCurrentUserPrivilegeSetResourceKinds(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 
-	// A "write" grant aggregates the individual write privileges (see
-	// acl.PrivilegeMatches), so a shared writable resource must report them all.
+	// DAV:write aggregates write-content and write-properties. Bind and unbind
+	// remain independent privileges and are granted explicitly for editors.
 	writePrivileges := []string{"<d:write>", "<d:write-content>", "<d:write-properties>", "<d:bind>", "<d:unbind>"}
 	allPrivileges := append([]string{"<d:read>"}, writePrivileges...)
 
@@ -128,42 +129,42 @@ func TestPropfindCurrentUserPrivilegeSetResourceKinds(t *testing.T) {
 			want: allPrivileges,
 		},
 		{
-			name: "shared read-only calendar collection", user: delegate, grants: []string{"read"},
+			name: "shared read-only calendar collection", user: delegate, grants: []string{"read", "read-current-user-privilege-set"},
 			requestPath: "/dav/calendars/5/", href: "/dav/calendars/5/",
 			want: []string{"<d:read>"}, unwanted: writePrivileges,
 		},
 		{
-			name: "shared read-only calendar object", user: delegate, grants: []string{"read"},
+			name: "shared read-only calendar object", user: delegate, grants: []string{"read", "read-current-user-privilege-set"},
 			requestPath: "/dav/calendars/5/event.ics", href: "/dav/calendars/5/event.ics",
 			want: []string{"<d:read>"}, unwanted: writePrivileges,
 		},
 		{
-			name: "shared read-only address book collection", user: delegate, grants: []string{"read"},
+			name: "shared read-only address book collection", user: delegate, grants: []string{"read", "read-current-user-privilege-set"},
 			requestPath: "/dav/addressbooks/6/", href: "/dav/addressbooks/6/",
 			want: []string{"<d:read>"}, unwanted: writePrivileges,
 		},
 		{
-			name: "shared read-only address object", user: delegate, grants: []string{"read"},
+			name: "shared read-only address object", user: delegate, grants: []string{"read", "read-current-user-privilege-set"},
 			requestPath: "/dav/addressbooks/6/alice.vcf", href: "/dav/addressbooks/6/alice.vcf",
 			want: []string{"<d:read>"}, unwanted: writePrivileges,
 		},
 		{
-			name: "shared writable calendar collection", user: delegate, grants: []string{"read", "write"},
+			name: "shared writable calendar collection", user: delegate, grants: []string{"read", "read-current-user-privilege-set", "write", "bind", "unbind"},
 			requestPath: "/dav/calendars/5/", href: "/dav/calendars/5/",
 			want: allPrivileges,
 		},
 		{
-			name: "shared writable calendar object", user: delegate, grants: []string{"read", "write"},
+			name: "shared writable calendar object", user: delegate, grants: []string{"read", "read-current-user-privilege-set", "write", "bind", "unbind"},
 			requestPath: "/dav/calendars/5/event.ics", href: "/dav/calendars/5/event.ics",
 			want: allPrivileges,
 		},
 		{
-			name: "shared writable address book collection", user: delegate, grants: []string{"read", "write"},
+			name: "shared writable address book collection", user: delegate, grants: []string{"read", "read-current-user-privilege-set", "write", "bind", "unbind"},
 			requestPath: "/dav/addressbooks/6/", href: "/dav/addressbooks/6/",
 			want: allPrivileges,
 		},
 		{
-			name: "shared writable address object", user: delegate, grants: []string{"read", "write"},
+			name: "shared writable address object", user: delegate, grants: []string{"read", "read-current-user-privilege-set", "write", "bind", "unbind"},
 			requestPath: "/dav/addressbooks/6/alice.vcf", href: "/dav/addressbooks/6/alice.vcf",
 			want: allPrivileges,
 		},
@@ -238,13 +239,7 @@ func TestPropfindBirthdayCalendarObjectPrivilegeSet(t *testing.T) {
 	}
 }
 
-// TestPropfindObjectPrivilegeSetPresentEmptyWithoutPrivileges drives decoration
-// and filtering together for object resources held by a user with no grants:
-// zero privileges is a present-empty 200 element (RFC 3744 privilege* content
-// model), never a property-level 404. It stops short of a full HTTP PROPFIND
-// because resource discovery rejects a user without read before any property is
-// built.
-func TestPropfindObjectPrivilegeSetPresentEmptyWithoutPrivileges(t *testing.T) {
+func TestPropfindObjectPrivilegeSetRequiresReadCurrentUserPrivilegeSet(t *testing.T) {
 	stranger := &store.User{ID: 3, PrimaryEmail: "stranger@example.com"}
 	h := privilegeKindsHandler("read")
 	req := &propfindRequest{Prop: &propfindPropQuery{
@@ -267,13 +262,9 @@ func TestPropfindObjectPrivilegeSetPresentEmptyWithoutPrivileges(t *testing.T) {
 				t.Fatalf("decorate responses: %v", err)
 			}
 			filtered := filterNonPrincipalPropfindResponse(responses[0], req)
-			okXML := marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusOK))
-			nfXML := marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusNotFound))
-			if !strings.Contains(okXML, "<d:current-user-privilege-set></d:current-user-privilege-set>") {
-				t.Fatalf("expected present-empty privilege set in the 200 propstat, got 200=%q 404=%q", okXML, nfXML)
-			}
-			if strings.Contains(nfXML, "<d:current-user-privilege-set") {
-				t.Fatalf("present-empty privilege set must not appear in the 404 propstat, got %q", nfXML)
+			forbiddenXML := marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusForbidden))
+			if !strings.Contains(forbiddenXML, "<d:current-user-privilege-set") {
+				t.Fatalf("expected current-user-privilege-set in the 403 propstat, got %q", forbiddenXML)
 			}
 		})
 	}
@@ -298,6 +289,39 @@ func TestCurrentUserPrivilegeSetForObjectPathsIsPresent(t *testing.T) {
 		if len(privs.Privileges) == 0 {
 			t.Fatalf("%s: expected privileges for a reachable object, got none", path)
 		}
+	}
+}
+
+func TestCurrentUserPrivilegeSetForDelegatedPrincipalReportsGrantedPrivileges(t *testing.T) {
+	delegate := &store.User{ID: 1, PrimaryEmail: "delegate@example.com"}
+	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/principals/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/principals/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read-current-user-privilege-set"},
+	}}}}
+
+	privileges := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/principals/2/")
+	if privileges == nil {
+		t.Fatal("expected a present privilege set")
+	}
+	encoded := marshalPropstatXML(t, &propstat{Prop: prop{CurrentUserPrivilegeSet: privileges}})
+	for _, want := range []string{"<d:read>", "<d:current-user-privilege-set>"} {
+		if !strings.Contains(encoded, want) {
+			t.Fatalf("expected %s in delegated principal privilege set, got %s", want, encoded)
+		}
+	}
+}
+
+func TestCurrentUserPrivilegeSetForAddressBookIncludesSupportedReadFreeBusy(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	h := privilegeKindsHandler("read-free-busy", "read-current-user-privilege-set")
+
+	privileges := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/6/")
+	if privileges == nil {
+		t.Fatal("expected a present privilege set")
+	}
+	encoded := marshalPropstatXML(t, &propstat{Prop: prop{CurrentUserPrivilegeSet: privileges}})
+	if !strings.Contains(encoded, "<cal:read-free-busy>") {
+		t.Fatalf("expected supported read-free-busy privilege, got %s", encoded)
 	}
 }
 
@@ -331,4 +355,107 @@ func TestSharedCalendarsAppearInCalendarHomeListing(t *testing.T) {
 		"/dav/calendars/1/",
 		"/dav/calendars/2/",
 	)
+}
+
+// RFC 3744 §5.5.1 resolves DAV:self and DAV:property against the resource, not
+// against the requesting user, so the principal set an ACL decision evaluates
+// has to be built per resource. CalCard's owner policy grants a resource's owner
+// every privilege ahead of the stored ACEs, so today these forms decide nothing
+// the owner short-circuit had not already decided; resolving them here is what
+// keeps that a property of the policy rather than of an unresolved sentinel.
+func TestApplicablePrincipalsForPathResolvesResourceDependentForms(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	calendar := store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}
+	needsResolution := []store.ACLEntry{{PrincipalHref: aclutil.PrincipalSelf}, {PrincipalHref: aclutil.PrincipalPropertyOwner}}
+
+	h := NewDavServer(Options{Store: &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: []store.CalendarAccess{{Calendar: calendar, Editor: true}},
+			calendars:  map[int64]*store.Calendar{calendar.ID: &calendar},
+		},
+		Events:     &fakeEventRepo{events: map[string]*store.Event{}},
+		ACLEntries: &fakeACLRepo{},
+	}})
+
+	tests := []struct {
+		name         string
+		user         *store.User
+		resourcePath string
+		want         []string
+		absent       []string
+	}{
+		{
+			name: "own principal resolves both self and owner", user: delegate,
+			resourcePath: "/dav/principals/2/",
+			want:         []string{aclutil.PrincipalSelf, aclutil.PrincipalPropertyOwner},
+			absent:       []string{aclutil.PrincipalPropertyGroup},
+		},
+		{
+			name: "another principal resolves neither", user: delegate,
+			resourcePath: "/dav/principals/1/",
+			absent:       []string{aclutil.PrincipalSelf, aclutil.PrincipalPropertyOwner, aclutil.PrincipalPropertyGroup},
+		},
+		{
+			name: "owned calendar resolves owner but never self", user: owner,
+			resourcePath: "/dav/calendars/5",
+			want:         []string{aclutil.PrincipalPropertyOwner},
+			absent:       []string{aclutil.PrincipalSelf, aclutil.PrincipalPropertyGroup},
+		},
+		{
+			name: "shared calendar resolves neither for the sharee", user: delegate,
+			resourcePath: "/dav/calendars/5",
+			absent:       []string{aclutil.PrincipalSelf, aclutil.PrincipalPropertyOwner, aclutil.PrincipalPropertyGroup},
+		},
+		{
+			name: "calendar object inherits its collection's owner", user: owner,
+			resourcePath: "/dav/calendars/5/event.ics",
+			want:         []string{aclutil.PrincipalPropertyOwner},
+			absent:       []string{aclutil.PrincipalSelf},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := h.applicablePrincipalsForPath(context.Background(), tc.user, tc.resourcePath, needsResolution)
+			if err != nil {
+				t.Fatalf("applicablePrincipalsForPath() error = %v", err)
+			}
+			for _, principal := range tc.want {
+				if _, ok := got[principal]; !ok {
+					t.Errorf("missing %q: %#v", principal, got)
+				}
+			}
+			for _, principal := range tc.absent {
+				if _, ok := got[principal]; ok {
+					t.Errorf("unexpectedly applied %q: %#v", principal, got)
+				}
+			}
+		})
+	}
+}
+
+// Resolving a resource's owner costs a lookup, so an ACL naming only hrefs and
+// the DAV: sentinels must not pay it. A server with no repositories at all
+// answers only if the ordinary path never reaches one.
+func TestApplicablePrincipalsForPathSkipsOwnerLookupWithoutResourceForms(t *testing.T) {
+	user := &store.User{ID: 2}
+	ordinary := []store.ACLEntry{
+		{PrincipalHref: aclutil.PrincipalAll, Privilege: "read", IsGrant: true},
+		{PrincipalHref: aclutil.PrincipalHref(2), Privilege: "write", IsGrant: true},
+	}
+	h := NewDavServer(Options{Store: &store.Store{}})
+
+	got, err := h.applicablePrincipalsForPath(context.Background(), user, "/dav/calendars/5", ordinary)
+	if err != nil {
+		t.Fatalf("applicablePrincipalsForPath() error = %v", err)
+	}
+	if _, ok := got[aclutil.PrincipalHref(2)]; !ok {
+		t.Fatalf("resolved set dropped the user's own principal: %#v", got)
+	}
+	for _, principal := range []string{aclutil.PrincipalSelf, aclutil.PrincipalPropertyOwner, aclutil.PrincipalPropertyGroup} {
+		if _, ok := got[principal]; ok {
+			t.Errorf("unexpectedly applied %q: %#v", principal, got)
+		}
+	}
 }

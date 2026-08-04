@@ -438,6 +438,72 @@ func TestServiceListEventsBatchesACLLookups(t *testing.T) {
 	}
 }
 
+func TestServiceListEventsHonorsACEOrderAcrossPrincipalQueries(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	tests := []struct {
+		name      string
+		entries   []store.ACLEntry
+		wantCount int
+	}{
+		{
+			name: "specific deny precedes broad grant",
+			entries: []store.ACLEntry{
+				{ID: 2, ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 1},
+				{ID: 1, ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0},
+			},
+			wantCount: 0,
+		},
+		{
+			name: "broad grant precedes specific deny",
+			entries: []store.ACLEntry{
+				{ID: 1, ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 0},
+				{ID: 2, ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 1},
+			},
+			wantCount: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewService(&store.Store{
+				Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+					1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
+				}},
+				Events: &fakeEventRepo{events: map[string]store.Event{
+					"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1"},
+				}},
+				ACLEntries: &fakeACLRepo{entries: tc.entries},
+			})
+
+			events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
+			if err != nil {
+				t.Fatalf("ListEvents() error = %v", err)
+			}
+			if len(events) != tc.wantCount {
+				t.Fatalf("ListEvents() len = %d, want %d", len(events), tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestCalendarPrivilegeDecisionHonorsACEOrderAcrossResourceAliases(t *testing.T) {
+	user := &store.User{ID: 2}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
+	entries := map[string][]store.ACLEntry{
+		"/dav/calendars/1/event": {
+			{ID: 2, ResourcePath: "/dav/calendars/1/event", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 1},
+		},
+		"/dav/calendars/1/event.ics": {
+			{ID: 1, ResourcePath: "/dav/calendars/1/event.ics", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0},
+		},
+	}
+
+	granted, denied := calendarPrivilegeDecisionFromEntries(user, cal, "event", "read", entries)
+	if granted || !denied {
+		t.Fatalf("calendarPrivilegeDecisionFromEntries() = (%v, %v), want denied", granted, denied)
+	}
+}
+
 func TestServiceListEventsPaginationOnlyPreservesLastModifiedOrder(t *testing.T) {
 	owner := &store.User{ID: 1}
 

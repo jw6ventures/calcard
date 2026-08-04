@@ -33,6 +33,11 @@ type Service struct {
 
 	authMu    sync.Mutex
 	authCache map[string]authCacheEntry
+
+	digestMu     sync.Mutex
+	digestKey    []byte
+	digestReplay map[string]digestReplayEntry
+	digestNow    func() time.Time
 }
 
 func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (*Service, error) {
@@ -121,6 +126,7 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
 		return
 	}
+	s.authCacheClearUser(user.ID)
 
 	if err := s.store.EnsureDefaultCollections(ctx, user.ID); err != nil {
 		http.Error(w, "failed to bootstrap user", http.StatusInternalServerError)
@@ -146,17 +152,34 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 		return "", nil, err
 	}
 	plaintext := base64.RawURLEncoding.EncodeToString(buf)
+	user, err := s.store.Users.GetByID(ctx, userID)
+	if err != nil {
+		return "", nil, err
+	}
+	if user == nil || user.PrimaryEmail == "" {
+		return "", nil, errors.New("user email required")
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
 	if err != nil {
 		return "", nil, err
 	}
 
+	// An HA1 authenticates its holder without the password, so it is sealed
+	// under a key derived from the session secret rather than stored as the
+	// bare hash Digest computes. Without a configured secret there is no key,
+	// and the app password is created usable over Basic alone.
+	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, plaintext)
+	if err != nil {
+		return "", nil, err
+	}
 	created, err := s.store.AppPasswords.Create(ctx, store.AppPassword{
-		UserID:    userID,
-		Label:     label,
-		TokenHash: string(hash),
-		ExpiresAt: expiresAt,
+		UserID:          userID,
+		Label:           label,
+		TokenHash:       string(hash),
+		DigestMD5HA1:    md5HA1,
+		DigestSHA256HA1: sha256HA1,
+		ExpiresAt:       expiresAt,
 	})
 	if err != nil {
 		return "", nil, err
@@ -226,25 +249,40 @@ func (s *Service) RequireSession(next http.Handler) http.Handler {
 
 func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		username, password, ok := r.BasicAuth()
-		if !ok {
-			w.Header().Set("WWW-Authenticate", "Basic realm=\"CalCard DAV\"")
-			http.Error(w, "authentication required", http.StatusUnauthorized)
-			return
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		scheme, _, _ := strings.Cut(authorization, " ")
+		var (
+			user  *store.User
+			err   error
+			stale bool
+		)
+		switch {
+		case strings.EqualFold(scheme, "Basic"):
+			if !s.secureRequest(r) {
+				err = errors.New("basic authentication requires a secure transport")
+				break
+			}
+			username, password, ok := r.BasicAuth()
+			if !ok || username == "" || password == "" {
+				err = errors.New("invalid credentials")
+				break
+			}
+			user, err = s.ValidateAppPassword(r.Context(), username, password)
+		case strings.EqualFold(scheme, "Digest"):
+			user, stale, err = s.validateDAVDigest(r)
+		default:
+			err = errors.New("authentication required")
 		}
-		if username == "" || password == "" {
+		if err != nil || user == nil {
+			if challengeErr := s.writeDAVAuthChallenge(w, r, stale); challengeErr != nil {
+				http.Error(w, "failed to issue authentication challenge", http.StatusInternalServerError)
+				return
+			}
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
 
-		ctx := r.Context()
-		user, err := s.ValidateAppPassword(ctx, username, password)
-		if err != nil {
-			http.Error(w, "invalid credentials", http.StatusUnauthorized)
-			return
-		}
-
-		ctx = WithUser(ctx, user)
+		ctx := WithUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -253,14 +291,48 @@ func (s *Service) ClearSession(w http.ResponseWriter, r *http.Request) {
 	s.sessions.Clear(r.Context(), w, r)
 }
 
+// cookieSecure reports whether to mark cookies Secure. It is deliberately more
+// willing than secureRequest: a site addressed over https should set the flag
+// even on a request whose transport cannot be confirmed, because the cost of
+// setting it needlessly is a cookie the browser withholds over cleartext, while
+// the cost of omitting it is a cookie the browser sends there.
 func (s *Service) cookieSecure(r *http.Request) bool {
+	if s.secureRequest(r) {
+		return true
+	}
+	if s == nil || s.cfg == nil {
+		return false
+	}
+	base, err := url.Parse(s.cfg.BaseURL)
+	return err == nil && base.Scheme == "https"
+}
+
+// secureRequest reports whether this request reached the server over TLS.
+//
+// A request forwarded by a proxy listed in APP_TRUSTED_PROXIES is trusted
+// to describe its own leg through X-Forwarded-Proto; a request from anywhere
+// else is not, so the header cannot be spoofed into unlocking Basic over
+// cleartext. Configuring no proxies at all trusts every peer's X-Forwarded-Proto
+// matching how the forwarded client IP is resolved and the warning the
+// configuration loader prints at startup.
+func (s *Service) secureRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
 	if r.TLS != nil {
 		return true
 	}
-	if base, err := url.Parse(s.cfg.BaseURL); err == nil && base.Scheme == "https" {
-		return true
+	if s == nil || s.cfg == nil {
+		return false
 	}
-	return false
+	if trusted := parseTrustedProxies(s.cfg.TrustedProxies); len(trusted) > 0 {
+		remoteIP, _ := parseRemoteAddr(r.RemoteAddr)
+		if remoteIP == nil || !isTrustedProxy(remoteIP, trusted) {
+			return false
+		}
+	}
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }
 
 func randomState() (string, error) {

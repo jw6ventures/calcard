@@ -52,8 +52,8 @@ func TestCopyMoveDeleteDeadPropertyLifecycle(t *testing.T) {
 	if len(dead.properties["/dav/calendars/1/event"]) != 1 {
 		t.Fatalf("COPY changed source dead properties: %#v", dead.properties)
 	}
-	if len(locks.locks) != 0 {
-		t.Fatalf("COPY retained destination locks: %#v", locks.locks)
+	if len(locks.locks) != 2 || locks.locks["destination"].ResourcePath != "/dav/calendars/2/copied" || locks.locks["legacy"].ResourcePath != "/dav/calendars/2/copied.ics" {
+		t.Fatalf("COPY changed destination locks: %#v", locks.locks)
 	}
 	for _, entry := range acls.entries {
 		if entry.ResourcePath == "/dav/calendars/2/copied" || entry.ResourcePath == "/dav/calendars/2/copied.ics" {
@@ -84,7 +84,7 @@ func TestCopyMoveDeleteDeadPropertyLifecycle(t *testing.T) {
 	if len(dead.properties["/dav/calendars/2/copied.ics"]) != 0 || dead.properties["/dav/calendars/3/moved.ics"]["urn:test\x00legacy"].InnerXML != "legacy-source" {
 		t.Fatalf("MOVE legacy dead properties = %#v", dead.properties)
 	}
-	if _, ok := locks.locks["old-destination"]; ok || locks.locks["source-canonical"].ResourcePath != "/dav/calendars/3/moved" || locks.locks["source-legacy"].ResourcePath != "/dav/calendars/3/moved.ics" {
+	if len(locks.locks) != 1 || locks.locks["old-destination"] == nil || locks.locks["old-destination"].ResourcePath != "/dav/calendars/3/moved.ics" {
 		t.Fatalf("MOVE lock state = %#v", locks.locks)
 	}
 	for _, entry := range acls.entries {
@@ -93,7 +93,11 @@ func TestCopyMoveDeleteDeadPropertyLifecycle(t *testing.T) {
 		}
 	}
 
-	if err := st.DeleteEventAndState(context.Background(), 3, "event", "/dav/calendars/3/moved"); err != nil {
+	moved, err := events.GetByUID(context.Background(), 3, "event")
+	if err != nil || moved == nil {
+		t.Fatalf("GetByUID() = %#v, %v", moved, err)
+	}
+	if err := st.DeleteEventAndState(context.Background(), 3, store.EventDAVResourceState(moved), "/dav/calendars/3/moved", nil); err != nil {
 		t.Fatalf("DeleteEventAndState() error = %v", err)
 	}
 	if len(dead.properties["/dav/calendars/3/moved"]) != 0 {

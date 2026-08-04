@@ -57,6 +57,11 @@ func (h *DavServer) accessibleCalendars(ctx context.Context, user *store.User) (
 // resolve, in DAV:acl document order.
 var calendarPrivilegeNames = []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"}
 
+var calendarCurrentPrivilegeNames = []string{
+	"all", "read", "read-free-busy", "read-acl", "read-current-user-privilege-set",
+	"write", "write-content", "write-properties", "bind", "unbind", "write-acl", "unlock",
+}
+
 // calendarPrivilegeContext carries one resolution of everything a calendar
 // privilege decision depends on — canonical path, ownership, and the ACL
 // entries for the resource and its collection — so callers evaluating several
@@ -81,7 +86,11 @@ func (h *DavServer) calendarPrivilegeContextFor(ctx context.Context, user *store
 	} else if err != nil {
 		return nil, err
 	}
-	pc := &calendarPrivilegeContext{principals: acl.ApplicablePrincipals(user)}
+	// A calendar is never a principal resource, so DAV:self cannot resolve here;
+	// its owner is the row's user, which costs nothing to name.
+	pc := &calendarPrivilegeContext{principals: acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{
+		OwnerHref: acl.PrincipalHref(cal.UserID),
+	})}
 	if user != nil && cal.UserID == user.ID {
 		pc.owner = true
 		return pc, nil
@@ -197,7 +206,7 @@ func (h *DavServer) loadCalendarWithPrivilege(ctx context.Context, user *store.U
 	}
 	cal, err := h.getCalendar(ctx, id)
 	if err != nil {
-		if err != store.ErrNotFound || legacy == nil {
+		if !errors.Is(err, store.ErrNotFound) || legacy == nil {
 			return nil, err
 		}
 		cal = &legacy.Calendar
@@ -221,7 +230,7 @@ func (h *DavServer) canAccessCalendarObject(ctx context.Context, user *store.Use
 	}
 	resourcePath := objectResourcePath(calendarPrefix, cal.ID, resourceName)
 	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, resourcePath, privilege); err != nil {
-		if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 			return false, nil
 		}
 		return false, err
@@ -278,7 +287,7 @@ func (h *DavServer) loadCalendarWithAnyPrivilege(ctx context.Context, user *stor
 
 	cal, err := h.getCalendar(ctx, id)
 	if err != nil {
-		if err != store.ErrNotFound || legacy == nil {
+		if !errors.Is(err, store.ErrNotFound) || legacy == nil {
 			return nil, err
 		}
 		cal = &legacy.Calendar
@@ -395,8 +404,10 @@ type batchedACLDecision struct {
 
 func newBatchedObjectACLDecider(user *store.User, ownerID int64, collectionPath string, entriesByPath map[string][]store.ACLEntry) *batchedObjectACLDecider {
 	decider := &batchedObjectACLDecider{
-		owner:          user != nil && ownerID == user.ID,
-		principals:     acl.ApplicablePrincipals(user),
+		owner: user != nil && ownerID == user.ID,
+		principals: acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{
+			OwnerHref: acl.PrincipalHref(ownerID),
+		}),
 		entriesByPath:  entriesByPath,
 		collectionPath: normalizeDAVHref(collectionPath),
 	}
@@ -488,34 +499,11 @@ func (d *batchedObjectACLDecider) objectEntries(resourceName, extension string) 
 }
 
 func decisionForEntrySets(first, second []store.ACLEntry, principals map[string]struct{}, privilege string) (bool, bool) {
-	if privilege == "write" {
-		applicable := false
-		for _, child := range []string{"write-content", "write-properties", "bind", "unbind"} {
-			granted, decided := decideEntrySets(first, second, principals, child)
-			applicable = applicable || decided
-			if !granted {
-				return false, applicable
-			}
-		}
-		return applicable, applicable
-	}
-	return decideEntrySets(first, second, principals, privilege)
-}
-
-func decideEntrySets(first, second []store.ACLEntry, principals map[string]struct{}, privilege string) (bool, bool) {
-	hasGrant := false
-	for _, entries := range [][]store.ACLEntry{first, second} {
-		for _, entry := range entries {
-			if _, ok := principals[acl.NormalizePrincipalHref(entry.PrincipalHref)]; !ok || !acl.PrivilegeMatches(entry.Privilege, privilege) {
-				continue
-			}
-			if !entry.IsGrant {
-				return false, true
-			}
-			hasGrant = true
-		}
-	}
-	return hasGrant, hasGrant
+	entries := make([]store.ACLEntry, 0, len(first)+len(second))
+	entries = append(entries, first...)
+	entries = append(entries, second...)
+	acl.SortEntries(entries)
+	return acl.DecisionForPrivilege(entries, principals, privilege)
 }
 
 func (h *DavServer) loadCalendar(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {

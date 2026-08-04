@@ -21,6 +21,9 @@ func TestUserRepoUpsertOAuthUserSynchronizesProfileNames(t *testing.T) {
 	repo := &userRepo{pool: db}
 	now := time.Now().UTC()
 	mock.ExpectQuery(regexp.QuoteMeta(`
+WITH previous AS MATERIALIZED (
+    SELECT id, primary_email FROM users WHERE oauth_subject = $1
+), upserted AS (
 INSERT INTO users (oauth_subject, primary_email, full_name, first_name)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (oauth_subject) DO UPDATE SET
@@ -29,6 +32,19 @@ ON CONFLICT (oauth_subject) DO UPDATE SET
         first_name = EXCLUDED.first_name,
         last_login_at = NOW()
 RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+), revoked AS (
+    UPDATE app_passwords
+    SET revoked_at = NOW()
+    WHERE user_id = (SELECT id FROM upserted)
+      AND revoked_at IS NULL
+      AND EXISTS (
+          SELECT 1 FROM previous
+          WHERE previous.primary_email IS DISTINCT FROM $2
+      )
+    RETURNING id
+)
+SELECT id, oauth_subject, primary_email, full_name, first_name, created_at, last_login_at, onboarding_completed_at
+FROM upserted
 `)).
 		WithArgs("oauth-subject", "dana@example.com", "Dana Lee", "Dana").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at"}).
@@ -40,6 +56,28 @@ RETURNING id, oauth_subject, primary_email, full_name, first_name, created_at, l
 	}
 	if user.FullName != "Dana Lee" || user.FirstName != "Dana" {
 		t.Fatalf("UpsertOAuthUser() = %#v", user)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestUserRepoUpsertOAuthUserRevokesAppPasswordsWhenEmailChanges(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &userRepo{pool: db}
+	now := time.Now().UTC()
+	mock.ExpectQuery(`(?s)WITH previous AS MATERIALIZED .*UPDATE app_passwords.*previous\.primary_email IS DISTINCT FROM \$2`).
+		WithArgs("oauth-subject", "new@example.com", "Dana Lee", "Dana").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "oauth_subject", "primary_email", "full_name", "first_name", "created_at", "last_login_at", "onboarding_completed_at"}).
+			AddRow(int64(7), "oauth-subject", "new@example.com", "Dana Lee", "Dana", now, now, nil))
+
+	if _, err := repo.UpsertOAuthUser(context.Background(), "oauth-subject", "new@example.com", "Dana Lee", "Dana"); err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)

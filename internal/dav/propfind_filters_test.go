@@ -239,6 +239,7 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 			ACL:                     &aclProp{},
 			SupportedPrivilegeSet:   defaultSupportedPrivilegeSet(),
 			PrincipalCollectionSet:  &hrefListProp{Href: []string{"/dav/principals/"}},
+			Owner:                   &hrefProp{Href: "/dav/principals/1/"},
 		},
 		Status: httpStatusOK,
 	}}}
@@ -265,7 +266,7 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 		t.Fatalf("expected supported principal props in 200 propstat, got %#v", okStat)
 	}
 	notFound := propstatNotFoundNameSet(filtered.Propstat)
-	for _, name := range []string{"d:getetag", "cal:calendar-timezone", "cal:schedule-calendar-transp", "d:owner"} {
+	for _, name := range []string{"d:getetag", "cal:calendar-timezone", "cal:schedule-calendar-transp"} {
 		if !notFound[xml.Name{Local: name}] {
 			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
 		}
@@ -328,6 +329,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 			ScheduleCalendarTransp:  &scheduleCalendarTransp{Opaque: &struct{}{}},
 			CurrentUserPrivilegeSet: calendarCurrentUserPrivilegeSet(true),
 			ACL:                     &aclProp{},
+			Owner:                   &hrefProp{Href: "/dav/principals/1/"},
 		},
 		Status: httpStatusOK,
 	}}}
@@ -357,7 +359,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 	}
 	notFound := propstatNotFoundNameSet(filtered.Propstat)
 	// calendar-color was requested but is unset on this calendar: 404, not junk.
-	for _, name := range []string{"d:getetag", "card:addressbook-description", "d:principal-URL", "d:owner", "ical:calendar-color"} {
+	for _, name := range []string{"d:getetag", "card:addressbook-description", "d:principal-URL", "ical:calendar-color"} {
 		if !notFound[xml.Name{Local: name}] {
 			t.Fatalf("expected %s in 404 propstat names, got %#v", name, notFound)
 		}

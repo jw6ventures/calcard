@@ -125,24 +125,55 @@ func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string
 		}
 		result = append(result, entries...)
 	}
+	acl.SortEntries(result)
 	return result, nil
 }
 
-func (s *Service) aclDecision(ctx context.Context, user *store.User, resourcePaths []string, privilege string) (bool, bool, error) {
+func (s *Service) aclDecision(ctx context.Context, user *store.User, bookID int64, resourcePaths []string, privilege string) (bool, bool, error) {
 	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
 	if err != nil {
 		return false, false, err
 	}
-	granted, applicable := acl.DecisionForPrivilege(entries, acl.ApplicablePrincipals(user), privilege)
+	principals, err := s.addressBookApplicablePrincipals(ctx, user, bookID, entries)
+	if err != nil {
+		return false, false, err
+	}
+	granted, applicable := acl.DecisionForPrivilege(entries, principals, privilege)
 	return granted, applicable, nil
 }
 
-func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePaths []string) (bool, error) {
+func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, bookID int64, resourcePaths []string) (bool, error) {
 	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
 	if err != nil {
 		return false, err
 	}
-	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
+	principals, err := s.addressBookApplicablePrincipals(ctx, user, bookID, entries)
+	if err != nil {
+		return false, err
+	}
+	return acl.HasApplicablePrincipal(entries, principals), nil
+}
+
+// addressBookApplicablePrincipals names the principals an ACE on an address
+// book or one of its contacts can apply to. An address book is never a
+// principal resource, so DAV:self cannot resolve against it. The owner is only
+// looked up when some entry names a form that needs it, so the ordinary ACL
+// costs no extra query.
+func (s *Service) addressBookApplicablePrincipals(ctx context.Context, user *store.User, bookID int64, entries []store.ACLEntry) (map[string]struct{}, error) {
+	if !acl.NeedsResourcePrincipals(entries) {
+		return acl.ApplicablePrincipals(user), nil
+	}
+	if s == nil || s.store == nil || s.store.AddressBooks == nil {
+		return acl.ApplicablePrincipals(user), nil
+	}
+	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return acl.ApplicablePrincipals(user), nil
+	}
+	return acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{OwnerHref: acl.PrincipalHref(book.UserID)}), nil
 }
 
 // privilegeDecision evaluates whether user holds privilege on a contact (when
@@ -157,7 +188,7 @@ func (s *Service) privilegeDecision(ctx context.Context, user *store.User, bookI
 
 	resourcePaths := addressBookACLResourcePaths(bookID, resourceName)
 	if len(resourcePaths) > 0 {
-		if granted, applicable, err := s.aclDecision(ctx, user, resourcePaths, privilege); err != nil {
+		if granted, applicable, err := s.aclDecision(ctx, user, bookID, resourcePaths, privilege); err != nil {
 			return false, false, err
 		} else if applicable {
 			return granted, true, nil
@@ -165,13 +196,13 @@ func (s *Service) privilegeDecision(ctx context.Context, user *store.User, bookI
 	}
 
 	collectionPaths := []string{addressBookACLCollectionPath(bookID)}
-	if granted, applicable, err := s.aclDecision(ctx, user, collectionPaths, privilege); err != nil {
+	if granted, applicable, err := s.aclDecision(ctx, user, bookID, collectionPaths, privilege); err != nil {
 		return false, false, err
 	} else if applicable {
 		return granted, true, nil
 	}
 
-	applicable, err := s.aclHasApplicablePrincipal(ctx, user, append(append([]string{}, resourcePaths...), collectionPaths...))
+	applicable, err := s.aclHasApplicablePrincipal(ctx, user, bookID, append(append([]string{}, resourcePaths...), collectionPaths...))
 	if err != nil {
 		return false, false, err
 	}
@@ -207,15 +238,21 @@ func (s *Service) prefetchACLEntries(ctx context.Context, user *store.User, book
 			result[path] = append(result[path], entry)
 		}
 	}
+	for resourcePath := range result {
+		acl.SortEntries(result[resourcePath])
+	}
 	return result, nil
 }
 
-func canReadContactFromEntries(user *store.User, bookID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
-	applicable := acl.ApplicablePrincipals(user)
+func canReadContactFromEntries(user *store.User, bookID, ownerID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
+	applicable := acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{OwnerHref: acl.PrincipalHref(ownerID)})
+	var resourceEntries []store.ACLEntry
 	for _, p := range addressBookACLResourcePaths(bookID, resourceName) {
-		if granted, decided := acl.DecisionForPrivilege(entriesByPath[p], applicable, "read"); decided {
-			return granted
-		}
+		resourceEntries = append(resourceEntries, entriesByPath[p]...)
+	}
+	acl.SortEntries(resourceEntries)
+	if granted, decided := acl.DecisionForPrivilege(resourceEntries, applicable, "read"); decided {
+		return granted
 	}
 	if granted, decided := acl.DecisionForPrivilege(entriesByPath[addressBookACLCollectionPath(bookID)], applicable, "read"); decided {
 		return granted
@@ -247,11 +284,22 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 	}
 	principalHref := sharePrincipalHref(targetUserID)
 	filtered := make([]store.ACLEntry, 0, len(entries))
+	sharePosition := -1
+	maxPosition := -1
 	for _, entry := range entries {
+		if entry.Position > maxPosition {
+			maxPosition = entry.Position
+		}
 		if entry.PrincipalHref == principalHref && entry.IsGrant && shareManagedPrivilege(entry.Privilege) {
+			if sharePosition == -1 || entry.Position < sharePosition {
+				sharePosition = entry.Position
+			}
 			continue
 		}
 		filtered = append(filtered, entry)
+	}
+	if sharePosition == -1 {
+		sharePosition = maxPosition + 1
 	}
 	for _, privilege := range sharePresetPrivileges(editor) {
 		filtered = append(filtered, store.ACLEntry{
@@ -259,6 +307,7 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 			PrincipalHref: principalHref,
 			IsGrant:       true,
 			Privilege:     privilege,
+			Position:      sharePosition,
 		})
 	}
 	return s.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
@@ -275,21 +324,43 @@ func (s *Service) UnshareAddressBook(ctx context.Context, user *store.User, book
 		return ErrNotFound
 	}
 	isOwner := user != nil && book.UserID == user.ID
+	resourcePath := addressBookACLCollectionPath(bookID)
+	entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	acl.SortEntries(entries)
 	if !isOwner {
 		// A non-owner may only remove their own share, and only if they actually
 		// have one (otherwise the book stays hidden).
 		if user == nil || targetUserID != user.ID {
 			return ErrNotFound
 		}
-		applicable, err := s.aclHasApplicablePrincipal(ctx, user, []string{addressBookACLCollectionPath(bookID)})
-		if err != nil {
-			return err
-		}
-		if !applicable {
+		if !hasEffectiveManagedShare(entries, user.ID) {
 			return ErrNotFound
 		}
 	}
-	return s.store.ACLEntries.DeletePrincipalEntriesByResourcePrefix(ctx, sharePrincipalHref(targetUserID), addressBookACLCollectionPath(bookID))
+	principalHref := sharePrincipalHref(targetUserID)
+	filtered := make([]store.ACLEntry, 0, len(entries))
+	for _, entry := range entries {
+		if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && shareManagedPrivilege(entry.Privilege) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return s.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
+}
+
+func hasEffectiveManagedShare(entries []store.ACLEntry, userID int64) bool {
+	principalHref := sharePrincipalHref(userID)
+	applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
+	for _, entry := range entries {
+		if _, ok := applicable[acl.NormalizePrincipalHref(entry.PrincipalHref)]; !ok || !acl.PrivilegeMatches(entry.Privilege, "read") {
+			continue
+		}
+		return entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && shareManagedPrivilege(entry.Privilege)
+	}
+	return false
 }
 
 // ListAddressBookShares returns the principals an owned address book is shared
@@ -303,7 +374,7 @@ func (s *Service) ListAddressBookShares(ctx context.Context, owner *store.User, 
 		return nil, err
 	}
 
-	grouped := map[int64][]store.ACLEntry{}
+	acl.SortEntries(entries)
 	createdAt := map[int64]time.Time{}
 	for _, entry := range entries {
 		if !entry.IsGrant || !shareVisiblePrivilege(entry.Privilege) {
@@ -317,17 +388,24 @@ func (s *Service) ListAddressBookShares(ctx context.Context, owner *store.User, 
 		if err != nil {
 			continue
 		}
-		grouped[userID] = append(grouped[userID], entry)
 		if createdAt[userID].IsZero() || entry.CreatedAt.Before(createdAt[userID]) {
 			createdAt[userID] = entry.CreatedAt
 		}
 	}
 
-	shares := make([]AddressBookShare, 0, len(grouped))
-	for userID, group := range grouped {
+	shares := make([]AddressBookShare, 0, len(createdAt))
+	for userID := range createdAt {
+		applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
+		read, decided := acl.DecisionForPrivilege(entries, applicable, "read")
+		if !decided || !read {
+			continue
+		}
+		editor, _ := acl.DecisionForPrivilege(entries, applicable, "write")
+		bind, _ := acl.DecisionForPrivilege(entries, applicable, "bind")
+		unbind, _ := acl.DecisionForPrivilege(entries, applicable, "unbind")
 		shares = append(shares, AddressBookShare{
 			UserID:    userID,
-			Editor:    shareEditorFromEntries(group),
+			Editor:    editor && bind && unbind,
 			CreatedAt: createdAt[userID],
 		})
 	}

@@ -69,14 +69,16 @@ func (p CalendarObjectPrecondition) satisfiedBy(existing *Event) bool {
 // uniqueness and the conditional-header requirements travel with it so they are
 // re-evaluated where the write happens rather than in a separate earlier read.
 type CalendarObjectWrite struct {
-	CalendarID    int64
-	UID           string
-	ResourceName  string
-	RawICAL       string
-	ETag          string
-	Metadata      *EventWriteMetadata
-	Precondition  CalendarObjectPrecondition
-	ExpectedState *CalendarObjectResourceState
+	CalendarID           int64
+	UID                  string
+	ResourceName         string
+	RawICAL              string
+	ETag                 string
+	Metadata             *EventWriteMetadata
+	Precondition         CalendarObjectPrecondition
+	ExpectedState        *CalendarObjectResourceState
+	ExpectedCalendarCTag *int64
+	LockPreconditions    []LockPrecondition
 }
 
 // CalendarObjectWriteResult reports what a write did. Conflict names the
@@ -116,6 +118,9 @@ func (s *Store) PutCalendarObject(ctx context.Context, write CalendarObjectWrite
 		write.ResourceName = write.UID
 	}
 	if s.pool == nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, write.LockPreconditions); err != nil {
+			return nil, err
+		}
 		if s.CalendarObjects != nil {
 			return s.CalendarObjects.PutCalendarObject(ctx, write)
 		}
@@ -127,6 +132,13 @@ func (s *Store) PutCalendarObject(ctx context.Context, write CalendarObjectWrite
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := validateLockPreconditionsTx(ctx, tx, write.LockPreconditions); err != nil {
+		return nil, err
+	}
+	if err := validateCollectionCTagsTx(ctx, tx, "calendars",
+		collectionCTagExpectation{id: write.CalendarID, ctag: write.ExpectedCalendarCTag}); err != nil {
+		return nil, err
+	}
 
 	result, err := putCalendarObjectTx(ctx, tx, write)
 	if err != nil {

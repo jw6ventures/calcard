@@ -202,7 +202,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean(r.URL.Path)
 	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -216,6 +216,26 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	depth, err := parseLockDepth(r.Header.Get("Depth"))
 	if err != nil {
 		http.Error(w, "invalid Depth header", http.StatusBadRequest)
+		return
+	}
+	targetExists, err := h.lockTargetExists(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to resolve lock target", http.StatusInternalServerError)
+		return
+	}
+	requiredPrivilege := "bind"
+	requiredPrivilegePath := path.Dir(cleanPath)
+	if targetExists {
+		requiredPrivilege = "write-content"
+		requiredPrivilegePath = canonicalPath
+	}
+	allowed, err := h.canLockPath(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		writeNeedPrivileges(w, requiredPrivilegePath, requiredPrivilege)
 		return
 	}
 	timeout := parseLockTimeout(r.Header.Get("Timeout"))
@@ -244,16 +264,6 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeLockResponse(w, refreshed, http.StatusOK)
-		return
-	}
-
-	allowed, err := h.canLockPath(r.Context(), user, cleanPath)
-	if err != nil {
-		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
-		return
-	}
-	if !allowed {
-		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -313,12 +323,15 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds: timeout,
 		ExpiresAt:      expiresAt,
 	}
+	expectedExists := targetExists
+	newLock.ExpectedTargetExists = &expectedExists
+	if err := h.populateLockExpectation(r.Context(), user, cleanPath, &newLock); err != nil {
+		http.Error(w, "failed to resolve lock target state", http.StatusInternalServerError)
+		return
+	}
 
 	status := http.StatusOK
-	if exists, err := h.lockTargetExists(r.Context(), user, cleanPath); err != nil {
-		http.Error(w, "failed to resolve lock target", http.StatusInternalServerError)
-		return
-	} else if !exists {
+	if !targetExists {
 		status = http.StatusCreated
 	}
 
@@ -327,6 +340,10 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is already locked", http.StatusLocked)
+			return
+		}
+		if errors.Is(err, store.ErrResourceStateChanged) {
+			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
 		http.Error(w, "failed to create lock", http.StatusInternalServerError)
@@ -338,6 +355,71 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Lock-Token", "<"+token+">")
 	writeLockResponse(w, created, status)
+}
+
+func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.User, cleanPath string, lock *store.Lock) error {
+	if h == nil || h.store == nil || lock == nil {
+		return nil
+	}
+	target := parsedDAVTarget(ctx, cleanPath)
+	if !target.Valid || target.CollectionSegment == "" {
+		return nil
+	}
+	switch target.Domain {
+	case davPathCalendar:
+		calendarID, ok, err := h.resolveCalendarID(ctx, user, target.CollectionSegment)
+		if errors.Is(err, store.ErrNotFound) || !ok {
+			return nil
+		}
+		if err != nil || calendarID == birthdayCalendarID {
+			return err
+		}
+		cal, err := h.getCalendar(ctx, calendarID)
+		if err != nil {
+			return err
+		}
+		lock.ExpectedCollection = "calendar"
+		lock.ExpectedCollectionID = calendarID
+		lock.ExpectedCollectionCTag = &cal.CTag
+		if target.Resource && h.store.Events != nil {
+			event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
+			if err != nil {
+				return err
+			}
+			state := store.EventDAVResourceState(event)
+			if event == nil {
+				state.ResourceName = target.ResourceName
+			}
+			lock.ExpectedResourceState = &state
+		}
+	case davPathAddressBook:
+		addressBookID, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
+		if errors.Is(err, store.ErrNotFound) || !ok {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		book, err := h.getAddressBook(ctx, addressBookID)
+		if err != nil {
+			return err
+		}
+		lock.ExpectedCollection = "addressbook"
+		lock.ExpectedCollectionID = addressBookID
+		lock.ExpectedCollectionCTag = &book.CTag
+		if target.Resource && h.store.Contacts != nil {
+			contact, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, target.ResourceName)
+			if err != nil {
+				return err
+			}
+			state := store.ContactDAVResourceState(contact)
+			if contact == nil {
+				state.ResourceName = target.ResourceName
+			}
+			lock.ExpectedResourceState = &state
+		}
+	}
+	return nil
 }
 
 func (h *DavServer) canLockPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
@@ -355,7 +437,7 @@ func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, clea
 	switch {
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
 		if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				return false, nil
 			}
 			return false, err
@@ -375,13 +457,13 @@ func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, clea
 			return false, nil
 		}
 		_, ok, err := h.resolveAddressBookID(ctx, user, segment)
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return false, nil
 		}
 		return ok, err
 	case strings.HasPrefix(cleanPath, "/dav/calendars/"):
 		if calendarID, resourceName, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				return false, nil
 			}
 			return false, err
@@ -401,7 +483,7 @@ func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, clea
 			return false, nil
 		}
 		_, ok, err := h.resolveCalendarID(ctx, user, segment)
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return false, nil
 		}
 		return ok, err
@@ -412,19 +494,20 @@ func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, clea
 
 func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
-		if err == store.ErrNotFound || errors.Is(err, errAmbiguousAddressBook) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousAddressBook) {
 			return false, nil
 		}
 		return false, err
 	} else if matched {
 		book, err := h.getAddressBook(ctx, addressBookID)
 		if err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				return false, nil
 			}
 			return false, err
 		}
 		privilege := "bind"
+		privilegePath := path.Dir(cleanPath)
 		if h != nil && h.store != nil && h.store.Contacts != nil {
 			existing, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, resourceName)
 			if err != nil {
@@ -432,10 +515,14 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 			}
 			if existing != nil {
 				privilege = "write-content"
+				privilegePath = cleanPath
 			}
+		} else {
+			privilege = "write-content"
+			privilegePath = cleanPath
 		}
-		if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, privilege); err != nil {
-			if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+		if err := h.requireAddressBookPrivilege(ctx, user, book, privilegePath, privilege); err != nil {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				return false, nil
 			}
 			return false, err
@@ -449,7 +536,7 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 	}
 	addressBookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return true, nil
 		}
 		if errors.Is(err, errAmbiguousAddressBook) {
@@ -462,13 +549,13 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 	}
 	book, err := h.getAddressBook(ctx, addressBookID)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
 	}
-	if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, "write"); err != nil {
-		if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+	if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, "write-content"); err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 			return false, nil
 		}
 		return false, err
@@ -478,7 +565,7 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 
 func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
 	if calendarID, _, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
-		if err == store.ErrNotFound || errors.Is(err, errAmbiguousCalendar) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousCalendar) {
 			return false, nil
 		}
 		return false, err
@@ -488,12 +575,13 @@ func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, c
 		}
 		cal, err := h.getCalendar(ctx, calendarID)
 		if err != nil {
-			if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				return false, nil
 			}
 			return false, err
 		}
 		privilege := "bind"
+		privilegePath := path.Dir(cleanPath)
 		if h.store != nil && h.store.Events != nil {
 			existing, err := h.store.Events.GetByResourceName(ctx, calendarID, path.Base(normalizeDAVResourceIdentity(cleanPath)))
 			if err != nil {
@@ -501,12 +589,13 @@ func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, c
 			}
 			if existing != nil {
 				privilege = "write-content"
+				privilegePath = cleanPath
 			}
 		} else {
 			privilege = "write-content"
 		}
-		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, privilege); err != nil {
-			if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+		if err := h.requireCalendarPrivilege(ctx, user, cal, privilegePath, privilege); err != nil {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				return false, nil
 			}
 			return false, err
@@ -520,7 +609,7 @@ func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, c
 	}
 	calendarID, ok, err := h.resolveCalendarID(ctx, user, segment)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return true, nil
 		}
 		if errors.Is(err, errAmbiguousCalendar) {
@@ -536,30 +625,18 @@ func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, c
 	}
 	cal, err := h.loadCalendar(ctx, user, calendarID)
 	if err != nil {
-		if err == store.ErrNotFound || errors.Is(err, errForbidden) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 			return false, nil
 		}
 		return false, err
 	}
-	allowed, err := h.hasAnyCalendarWritePrivilege(ctx, user, cal, cleanPath)
-	if err != nil {
+	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, "write-content"); err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+			return false, nil
+		}
 		return false, err
 	}
-	if !allowed {
-		return false, nil
-	}
 	return true, nil
-}
-
-func (h *DavServer) hasAnyCalendarWritePrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath string) (bool, error) {
-	for _, privilege := range []string{"write", "bind", "write-content", "write-properties", "unbind"} {
-		if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, cleanPath, privilege); err == nil {
-			return true, nil
-		} else if err != store.ErrNotFound && !errors.Is(err, errForbidden) {
-			return false, err
-		}
-	}
-	return false, nil
 }
 
 func singleCollectionSegment(cleanPath, prefix string) string {
@@ -605,7 +682,7 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean(r.URL.Path)
 	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 	if err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -616,7 +693,6 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to resolve path", http.StatusInternalServerError)
 		return
 	}
-
 	lock, err := h.store.Locks.GetByToken(r.Context(), token)
 	if err != nil || lock == nil {
 		http.Error(w, "lock not found", http.StatusConflict)
@@ -628,8 +704,14 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lock.UserID != user.ID {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+		if h.store == nil || h.store.ACLEntries == nil {
+			writeNeedPrivileges(w, canonicalPath, "unlock")
+			return
+		}
+		if err := h.requireACLPrivilege(r.Context(), user, canonicalPath, "unlock"); err != nil {
+			_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, canonicalPath, "unlock"))
+			return
+		}
 	}
 
 	defer invalidateDAVRequestState(r.Context())

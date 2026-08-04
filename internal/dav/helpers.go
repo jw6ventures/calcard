@@ -163,17 +163,17 @@ func etagProp(etag, data string, calendar bool) propstat {
 // on an object resource by §7.10, and sync-collection is a collection report.
 func calendarObjectSupportedReports() *supportedReportSet {
 	return &supportedReportSet{
-		Reports: []supportedReport{
+		Reports: append([]supportedReport{
 			{Report: reportType{CalendarMultiGet: &struct{}{}}},
 			{Report: reportType{CalendarQuery: &struct{}{}}},
 			{Report: reportType{ExpandProperty: &struct{}{}}},
-		},
+		}, aclResourceSupportedReports()...),
 	}
 }
 
 func addressBookResourcePropstat(etag, data string) propstat {
 	ps := etagProp(etag, data, false)
-	ps.Prop.SupportedReportSet = addressbookSupportedReports()
+	ps.Prop.SupportedReportSet = addressbookObjectSupportedReports()
 	return ps
 }
 
@@ -187,38 +187,73 @@ func deletedResponse(href string) response {
 
 func calendarSupportedReports() *supportedReportSet {
 	return &supportedReportSet{
-		Reports: []supportedReport{
+		Reports: append([]supportedReport{
 			{Report: reportType{CalendarMultiGet: &struct{}{}}},
 			{Report: reportType{CalendarQuery: &struct{}{}}},
 			{Report: reportType{FreeBusyQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
 			{Report: reportType{ExpandProperty: &struct{}{}}},
-		},
+		}, aclCollectionSupportedReports()...),
 	}
 }
 
 func addressbookSupportedReports() *supportedReportSet {
 	return &supportedReportSet{
-		Reports: []supportedReport{
+		Reports: append([]supportedReport{
 			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
 			{Report: reportType{AddressbookQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
 			{Report: reportType{ExpandProperty: &struct{}{}}},
-		},
+		}, aclCollectionSupportedReports()...),
+	}
+}
+
+func addressbookObjectSupportedReports() *supportedReportSet {
+	return &supportedReportSet{
+		Reports: append([]supportedReport{
+			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
+			{Report: reportType{AddressbookQuery: &struct{}{}}},
+			{Report: reportType{ExpandProperty: &struct{}{}}},
+		}, aclResourceSupportedReports()...),
 	}
 }
 
 func combinedSupportedReports() *supportedReportSet {
 	return &supportedReportSet{
-		Reports: []supportedReport{
+		Reports: append([]supportedReport{
 			{Report: reportType{CalendarMultiGet: &struct{}{}}},
 			{Report: reportType{CalendarQuery: &struct{}{}}},
 			{Report: reportType{AddressbookMultiGet: &struct{}{}}},
 			{Report: reportType{AddressbookQuery: &struct{}{}}},
 			{Report: reportType{SyncCollection: &struct{}{}}},
 			{Report: reportType{ExpandProperty: &struct{}{}}},
-		},
+		}, aclRootCollectionSupportedReports()...),
 	}
+}
+
+func aclResourceSupportedReports() []supportedReport {
+	return []supportedReport{
+		{Report: reportType{ACLPrincipalPropSet: &struct{}{}}},
+		{Report: reportType{PrincipalPropertySearch: &struct{}{}}},
+	}
+}
+
+func aclCollectionSupportedReports() []supportedReport {
+	return []supportedReport{
+		{Report: reportType{ACLPrincipalPropSet: &struct{}{}}},
+		{Report: reportType{PrincipalMatch: &struct{}{}}},
+		{Report: reportType{PrincipalPropertySearch: &struct{}{}}},
+	}
+}
+
+func aclPrincipalCollectionSupportedReports() []supportedReport {
+	return append(aclCollectionSupportedReports(),
+		supportedReport{Report: reportType{PrincipalSearchPropertySet: &struct{}{}}},
+	)
+}
+
+func aclRootCollectionSupportedReports() []supportedReport {
+	return aclCollectionSupportedReports()
 }
 
 // defaultSupportedCalendarComponents is the component set a calendar collection
@@ -347,8 +382,10 @@ func isASCIILower(r rune) bool {
 
 func calendarCurrentUserPrivilegeSet(readOnly bool) *currentUserPrivilegeSet {
 	privs := []privilege{
-		{Read: &readPrivilege{ReadFreeBusy: &struct{}{}}},
+		{Read: &readPrivilege{}},
 		{ReadFreeBusy: &struct{}{}},
+		{ReadACL: &struct{}{}},
+		{ReadCurrentUserPrivilegeSet: &struct{}{}},
 	}
 	if !readOnly {
 		privs = append(privs,
@@ -357,6 +394,8 @@ func calendarCurrentUserPrivilegeSet(readOnly bool) *currentUserPrivilegeSet {
 			privilege{WriteProperties: &struct{}{}},
 			privilege{Bind: &struct{}{}},
 			privilege{Unbind: &struct{}{}},
+			privilege{WriteACL: &struct{}{}},
+			privilege{Unlock: &struct{}{}},
 		)
 	}
 	return &currentUserPrivilegeSet{Privileges: privs}

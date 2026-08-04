@@ -126,7 +126,7 @@ func (s *Service) ListContacts(ctx context.Context, user *store.User, bookID int
 	}
 	visible := make([]store.Contact, 0, len(contacts))
 	for _, c := range contacts {
-		if canReadContactFromEntries(user, bookID, contactResourceName(c), entriesByPath) {
+		if canReadContactFromEntries(user, bookID, book.UserID, contactResourceName(c), entriesByPath) {
 			visible = append(visible, c)
 		}
 	}
@@ -239,7 +239,7 @@ func (s *Service) DeleteContact(ctx context.Context, user *store.User, bookID in
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
-	return s.store.DeleteContactAndState(ctx, bookID, uid, resourcePaths[0])
+	return s.store.DeleteContactAndState(ctx, bookID, store.ContactDAVResourceState(existing), resourcePaths[0], nil)
 }
 
 func (s *Service) requireOwnedBook(ctx context.Context, user *store.User, bookID int64) (*store.AddressBook, error) {

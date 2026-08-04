@@ -288,6 +288,9 @@ func (s *Service) collectCalendarACLEntries(ctx context.Context, user *store.Use
 			}
 		}
 	}
+	for resourcePath := range entriesByPath {
+		acl.SortEntries(entriesByPath[resourcePath])
+	}
 	return entriesByPath, hasResourceEntries, nil
 }
 
@@ -402,7 +405,7 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
-	return s.store.DeleteEventAndState(ctx, calendarID, uid, resourcePaths[0])
+	return s.store.DeleteEventAndState(ctx, calendarID, store.EventDAVResourceState(existing), resourcePaths[0], nil)
 }
 
 func (s *Service) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) error {
@@ -459,22 +462,22 @@ func (s *Service) calendarPrivilegeDecision(ctx context.Context, user *store.Use
 	}
 
 	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
-	resourceApplicable, err := s.aclHasApplicablePrincipal(ctx, user, resourcePaths)
+	resourceApplicable, err := s.aclHasApplicablePrincipal(ctx, user, cal.UserID, resourcePaths)
 	if err != nil {
 		return false, false, err
 	}
-	if granted, applicable, err := s.aclDecision(ctx, user, resourcePaths, privilege); err != nil {
+	if granted, applicable, err := s.aclDecision(ctx, user, cal.UserID, resourcePaths, privilege); err != nil {
 		return false, false, err
 	} else if applicable {
 		return granted, !granted, nil
 	}
 
 	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
-	collectionApplicable, err := s.aclHasApplicablePrincipal(ctx, user, collectionPaths)
+	collectionApplicable, err := s.aclHasApplicablePrincipal(ctx, user, cal.UserID, collectionPaths)
 	if err != nil {
 		return false, false, err
 	}
-	if granted, applicable, err := s.aclDecision(ctx, user, collectionPaths, privilege); err != nil {
+	if granted, applicable, err := s.aclDecision(ctx, user, cal.UserID, collectionPaths, privilege); err != nil {
 		return false, false, err
 	} else if applicable {
 		return granted, !granted, nil
@@ -483,18 +486,17 @@ func (s *Service) calendarPrivilegeDecision(ctx context.Context, user *store.Use
 	return false, resourceApplicable || collectionApplicable, nil
 }
 
-func (s *Service) aclDecision(ctx context.Context, user *store.User, resourcePaths []string, privilege string) (bool, bool, error) {
+func (s *Service) aclDecision(ctx context.Context, user *store.User, ownerID int64, resourcePaths []string, privilege string) (bool, bool, error) {
 	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
 	if err != nil {
 		return false, false, err
 	}
 
-	applicablePrincipals := acl.ApplicablePrincipals(user)
-	granted, applicable := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
+	granted, applicable := acl.DecisionForPrivilege(entries, calendarApplicablePrincipals(user, ownerID), privilege)
 	return granted, applicable, nil
 }
 
-func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, resourcePaths []string) (bool, error) {
+func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, ownerID int64, resourcePaths []string) (bool, error) {
 	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
 	if err != nil {
 		return false, err
@@ -503,7 +505,15 @@ func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.Use
 		return false, nil
 	}
 
-	return acl.HasApplicablePrincipal(entries, acl.ApplicablePrincipals(user)), nil
+	return acl.HasApplicablePrincipal(entries, calendarApplicablePrincipals(user, ownerID)), nil
+}
+
+// calendarApplicablePrincipals names the principals an ACE on a calendar or one
+// of its objects can apply to. A calendar is never a principal resource, so
+// DAV:self cannot resolve against it; DAV:property:owner resolves to the row's
+// owning user.
+func calendarApplicablePrincipals(user *store.User, ownerID int64) map[string]struct{} {
+	return acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{OwnerHref: acl.PrincipalHref(ownerID)})
 }
 
 func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string) ([]store.ACLEntry, error) {
@@ -526,6 +536,7 @@ func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string
 		}
 		result = append(result, entries...)
 	}
+	acl.SortEntries(result)
 	return result, nil
 }
 
@@ -556,6 +567,9 @@ func (s *Service) prefetchCalendarACLEntries(ctx context.Context, user *store.Us
 			}
 			result[resourcePath] = append(result[resourcePath], entry)
 		}
+	}
+	for resourcePath := range result {
+		acl.SortEntries(result[resourcePath])
 	}
 	return result, nil
 }
@@ -595,19 +609,20 @@ func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarA
 	}
 
 	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, resourcePaths, privilege); applicable {
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, cal.UserID, resourcePaths, privilege); applicable {
 		return granted, !granted
 	}
 
 	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, collectionPaths, privilege); applicable {
+	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, cal.UserID, collectionPaths, privilege); applicable {
 		return granted, !granted
 	}
 
-	return false, aclHasApplicablePrincipalForPaths(entriesByPath, user, resourcePaths) || aclHasApplicablePrincipalForPaths(entriesByPath, user, collectionPaths)
+	return false, aclHasApplicablePrincipalForPaths(entriesByPath, user, cal.UserID, resourcePaths) ||
+		aclHasApplicablePrincipalForPaths(entriesByPath, user, cal.UserID, collectionPaths)
 }
 
-func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string, privilege string) (bool, bool) {
+func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user *store.User, ownerID int64, resourcePaths []string, privilege string) (bool, bool) {
 	if len(entriesByPath) == 0 {
 		return false, false
 	}
@@ -615,14 +630,15 @@ func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user
 	for _, resourcePath := range resourcePaths {
 		entries = append(entries, entriesByPath[resourcePath]...)
 	}
-	return acl.DecisionForPrivilege(entries, acl.ApplicablePrincipals(user), privilege)
+	acl.SortEntries(entries)
+	return acl.DecisionForPrivilege(entries, calendarApplicablePrincipals(user, ownerID), privilege)
 }
 
-func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, resourcePaths []string) bool {
+func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, ownerID int64, resourcePaths []string) bool {
 	if len(entriesByPath) == 0 {
 		return false
 	}
-	applicablePrincipals := acl.ApplicablePrincipals(user)
+	applicablePrincipals := calendarApplicablePrincipals(user, ownerID)
 	for _, resourcePath := range resourcePaths {
 		if acl.HasApplicablePrincipal(entriesByPath[resourcePath], applicablePrincipals) {
 			return true

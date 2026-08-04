@@ -24,9 +24,9 @@ import (
 //
 // RFC 4791 §5.3.2.1 requires data submitted by PUT to be valid for its media
 // type, so a PUT this suite expects to succeed cannot send an object RFC 5545
-// rejects: once Phase 3 lands the strict validation the matrix schedules, such
-// a fixture is answered by the validator before it reaches the behavior the
-// test names, and the test stops measuring what it says it measures. A
+// rejects: the strict validator answers such a fixture before it reaches the
+// behavior the test names, and the test stops measuring what it says it
+// measures. A
 // precondition test stays valid in every respect but the one condition it
 // exercises, which is what makes that condition the reason for the failure.
 const (
@@ -121,7 +121,8 @@ func TestRFC4791_OptionsAdvertisesCalendarAccess(t *testing.T) {
 	// §5.1 scopes the requirement to "any resource" that supports a calendar
 	// property, report, method or privilege, so the calendar home, a calendar
 	// collection and a calendar object resource all qualify -- the object
-	// resource because RPT-05 advertises the calendaring reports on it.
+	// resource because DAV:supported-report-set advertises the calendaring
+	// reports on it.
 	paths := []string{"/dav/calendars/", "/dav/calendars/1/", "/dav/calendars/1/event.ics"}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
@@ -1441,6 +1442,9 @@ func TestRFC4791_SupportedReportSetProperty(t *testing.T) {
 		calQN("free-busy-query"),
 		davQN("sync-collection"),
 		davQN("expand-property"),
+		davQN("acl-principal-prop-set"),
+		davQN("principal-match"),
+		davQN("principal-property-search"),
 	)
 }
 
@@ -1455,28 +1459,32 @@ func TestRFC4791_SupportedReportSetProperty(t *testing.T) {
 // rejected MKCALENDAR creates nothing — since a status alone does not say the
 // collection was left uncreated.
 func TestRFC4791_NoNestedCalendarCollections(t *testing.T) {
-	parent := &store.Calendar{ID: 1, UserID: 1, Name: "Test"}
-	calRepo := &fakeCalendarRepo{
-		calendars:  map[int64]*store.Calendar{1: parent},
-		accessible: []store.CalendarAccess{{Calendar: *parent, Editor: true}},
-	}
-	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	user := &store.User{ID: 1}
+	for _, requestPath := range []string{"/dav/calendars/1/nested/", "/dav/calendars/1/ordinary/nested/"} {
+		t.Run(requestPath, func(t *testing.T) {
+			parent := &store.Calendar{ID: 1, UserID: 1, Name: "Test"}
+			calRepo := &fakeCalendarRepo{
+				calendars:  map[int64]*store.Calendar{1: parent},
+				accessible: []store.CalendarAccess{{Calendar: *parent, Editor: true}},
+			}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+			user := &store.User{ID: 1}
 
-	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/1/nested/", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), user))
-	rr := httptest.NewRecorder()
+			req := httptest.NewRequest("MKCALENDAR", requestPath, nil)
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
 
-	h.Mkcalendar(rr, req)
+			h.Mkcalendar(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("MKCALENDAR inside a calendar collection = %d, want 403 Forbidden; body: %s", rr.Code, rr.Body.String())
-	}
-	if len(calRepo.calendars) != 1 || calRepo.calendars[1] != parent {
-		t.Errorf("a rejected MKCALENDAR changed the collection set: %v", calRepo.calendars)
-	}
-	if len(calRepo.accessible) != 1 {
-		t.Errorf("a rejected MKCALENDAR granted access to %d collections, want the parent alone", len(calRepo.accessible))
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("MKCALENDAR inside a calendar collection = %d, want 403 Forbidden; body: %s", rr.Code, rr.Body.String())
+			}
+			if len(calRepo.calendars) != 1 || calRepo.calendars[1] != parent {
+				t.Errorf("a rejected MKCALENDAR changed the collection set: %v", calRepo.calendars)
+			}
+			if len(calRepo.accessible) != 1 {
+				t.Errorf("a rejected MKCALENDAR granted access to %d collections, want the parent alone", len(calRepo.accessible))
+			}
+		})
 	}
 }
 
@@ -2741,7 +2749,8 @@ func TestRFC4791_LimitRecurrenceSetInCalendarData(t *testing.T) {
 
 	h.Report(rr, req)
 
-	// Phase 7 owns asserting that the recurrence set is actually limited.
+	// Asserting that the recurrence set is actually limited belongs with the
+	// calendar-data projection, not here.
 	decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/recurring.ics").
 		assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
@@ -2790,7 +2799,8 @@ func TestRFC4791_ExpandRecurringEventsInCalendarData(t *testing.T) {
 
 	h.Report(rr, req)
 
-	// Phase 7 owns asserting that the instances are actually expanded.
+	// Asserting that the instances are actually expanded belongs with the
+	// calendar-data projection, not here.
 	decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/recurring.ics").
 		assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
@@ -2901,14 +2911,7 @@ func TestRFC4791_CurrentUserPrivilegeSetIncludesReadFreeBusy(t *testing.T) {
 
 // Section 6.1.1: "The CALDAV:read-free-busy privilege MUST be aggregated in the
 // DAV:read privilege".
-//
-// CalCard does not meet it. defaultSupportedPrivilegeSet in acl.go omits
-// CALDAV:read-free-busy from DAV:supported-privilege-set entirely, so nothing
-// places it below DAV:read, and the containment assertions above pass on two
-// unrelated privileges. This test pins the hierarchy actually served, so the
-// gap stays visible and any change to it is deliberate; the failure message
-// says what to do with the test when the aggregation lands.
-func TestRFC4791_SupportedPrivilegeSet_ReadFreeBusyNotAggregatedUnderRead_KnownDefect(t *testing.T) {
+func TestRFC4791_SupportedPrivilegeSet_ReadFreeBusyAggregatedUnderRead(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -2937,21 +2940,45 @@ func TestRFC4791_SupportedPrivilegeSet_ReadFreeBusyNotAggregatedUnderRead_KnownD
 		"{DAV:}all",
 		"{DAV:}all/{DAV:}read",
 		"{DAV:}all/{DAV:}read-acl",
+		"{DAV:}all/{DAV:}read-current-user-privilege-set",
+		"{DAV:}all/{DAV:}read/{urn:ietf:params:xml:ns:caldav}read-free-busy",
 		"{DAV:}all/{DAV:}write",
 		"{DAV:}all/{DAV:}write-acl",
+		"{DAV:}all/{DAV:}unlock",
 		"{DAV:}all/{DAV:}write/{DAV:}bind",
 		"{DAV:}all/{DAV:}write/{DAV:}unbind",
 		"{DAV:}all/{DAV:}write/{DAV:}write-content",
 		"{DAV:}all/{DAV:}write/{DAV:}write-properties",
 	)
+}
 
-	aggregated := qnString(davQN("read")) + "/" + qnString(calQN("read-free-busy"))
-	for _, path := range resp.supportedPrivileges(t) {
-		if strings.HasSuffix(path, aggregated) {
-			t.Errorf("%s now aggregates %s. Replace this test with a positive "+
-				"assertion of the aggregation and update CALDAV_FIXES.md.",
-				qnString(davQN("read")), qnString(calQN("read-free-busy")))
-		}
+func TestRFC4791_ReadFreeBusyPrivilegeIsSupportedOnOrdinaryAndObjectResources(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true}},
+	}
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{
+		"1:event": {CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag"},
+	}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
+	body := `<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:supported-privilege-set/></D:prop></D:propfind>`
+
+	for _, href := range []string{"/dav/", "/dav/calendars/1/event.ics"} {
+		t.Run(href, func(t *testing.T) {
+			req := httptest.NewRequest("PROPFIND", href, strings.NewReader(body))
+			req.Header.Set("Depth", "0")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			h.Propfind(rr, req)
+
+			privileges := decodeMultistatus(t, rr).responseForHref(t, href).supportedPrivileges(t)
+			want := "{DAV:}all/{DAV:}read/{urn:ietf:params:xml:ns:caldav}read-free-busy"
+			if !slices.Contains(privileges, want) {
+				t.Fatalf("supported privileges on %s missing %s: %#v", href, want, privileges)
+			}
+		})
 	}
 }
 
@@ -3011,11 +3038,8 @@ func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 	h.Report(rr, req)
-	// §7.10 requires free-busy access not to reveal resource URLs, so a caller
-	// holding only read-free-busy sees the collection as absent rather than
-	// forbidden.
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("calendar-query with only read-free-busy = %d, want 404 Not Found", rr.Code)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("calendar-query with only read-free-busy = %d, want 403 Forbidden", rr.Code)
 	}
 
 	multigetBody := `<?xml version="1.0" encoding="utf-8" ?>
@@ -3027,8 +3051,8 @@ func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 	h.Report(rr, req)
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("calendar-multiget with only read-free-busy = %d, want 404 Not Found", rr.Code)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("calendar-multiget with only read-free-busy = %d, want 403 Forbidden", rr.Code)
 	}
 }
 
@@ -4107,7 +4131,7 @@ func TestRFC4791_MkcalendarInvalidPath(t *testing.T) {
 	}
 }
 
-// --- Phase 2: discovery, properties, and MKCALENDAR ------------------------
+// --- Discovery, calendar collection properties, and MKCALENDAR ------------
 
 // newCalendarPropfind builds a PROPFIND request naming exactly the properties
 // given as prefixed wire names, so the CalDAV properties RFC 4791 keeps out of
@@ -4126,9 +4150,9 @@ func newCalendarPropfind(t *testing.T, user *store.User, href string, properties
 	return req.WithContext(auth.WithUser(req.Context(), user))
 }
 
-// phase2CalendarServer returns a server holding one writable calendar at
+// calendarPropertyServer returns a server holding one writable calendar at
 // /dav/calendars/1/ built from cal, with cal's identity fields filled in.
-func phase2CalendarServer(cal store.Calendar) (*DavServer, *fakeCalendarRepo, *store.User) {
+func calendarPropertyServer(cal store.Calendar) (*DavServer, *fakeCalendarRepo, *store.User) {
 	if cal.ID == 0 {
 		cal.ID = 1
 	}
@@ -4162,11 +4186,9 @@ func allpropCalendarResponse(t *testing.T, h *DavServer, user *store.User) davRe
 // carries a SHOULD NOT against being returned by DAV:allprop. The rule is
 // absence, not a 404 -- allprop reports the properties the server chooses to
 // expose that way, so an excluded one is simply not in the response at all.
-//
-// Rows DISC-10, PROP-02, PROP-07, PROP-09, PROP-12, PROP-17 and PROP-34.
 func TestRFC4791_CalendarCollection_AllpropExcludesCalDAVProperties(t *testing.T) {
 	description := "Personal events"
-	h, _, user := phase2CalendarServer(store.Calendar{Description: &description})
+	h, _, user := calendarPropertyServer(store.Calendar{Description: &description})
 	resp := allpropCalendarResponse(t, h, user)
 
 	excluded := []xml.Name{
@@ -4194,9 +4216,9 @@ func TestRFC4791_CalendarCollection_AllpropExcludesCalDAVProperties(t *testing.T
 
 // Section 5.2.1: a defined CALDAV:calendar-description carries the xml:lang it
 // was set with. RFC 4918 §4.3 ties the language to the value, so a PROPPATCH
-// that declares one is answered by a PROPFIND that returns it. Row PROP-06.
+// that declares one is answered by a PROPFIND that returns it.
 func TestRFC4791_CalendarDescriptionRoundTripsXMLLang(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{})
+	h, _, user := calendarPropertyServer(store.Calendar{})
 
 	patch := `<?xml version="1.0" encoding="utf-8"?>
 <d:propertyupdate xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
@@ -4239,10 +4261,10 @@ func TestRFC4791_CalendarDescriptionRoundTripsXMLLang(t *testing.T) {
 }
 
 // Section 5.2.1: a description set with no xml:lang comes back with none, so the
-// attribute is not invented. Row PROP-06.
+// attribute is not invented.
 func TestRFC4791_CalendarDescriptionWithoutXMLLangCarriesNoAttribute(t *testing.T) {
 	description := "Personal events"
-	h, _, user := phase2CalendarServer(store.Calendar{Description: &description})
+	h, _, user := calendarPropertyServer(store.Calendar{Description: &description})
 
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, newCalendarPropfind(t, user, "/dav/calendars/1/", "cal:calendar-description"))
@@ -4260,8 +4282,7 @@ func TestRFC4791_CalendarDescriptionWithoutXMLLangCarriesNoAttribute(t *testing.
 // Sections 5.2.3, 5.2.4, 5.2.5 through 5.2.9 and 7.5.1: every one of these
 // properties is protected, so a PROPPATCH naming it fails. RFC 4918 §9.2 also
 // makes every other instruction in the request fail with 424, which the
-// settable displayname riding along proves. Rows PROP-01, PROP-11, PROP-16,
-// PROP-20, PROP-22, PROP-25, PROP-28, PROP-30, PROP-33 and DATA-18.
+// settable displayname riding along proves.
 func TestRFC4791_ProtectedCalendarPropertiesRejectProppatch(t *testing.T) {
 	protected := []struct {
 		name    xml.Name
@@ -4283,7 +4304,7 @@ END:VCALENDAR</cal:calendar-data>`},
 
 	for _, tc := range protected {
 		t.Run(tc.name.Local, func(t *testing.T) {
-			h, calRepo, user := phase2CalendarServer(store.Calendar{})
+			h, calRepo, user := calendarPropertyServer(store.Calendar{})
 
 			body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propertyupdate xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
@@ -4310,9 +4331,9 @@ END:VCALENDAR</cal:calendar-data>`},
 // Section 7.5.1 and §9.4: CALDAV:supported-collation-set is defined wherever a
 // text-matching report is supported -- for CalCard the calendar collection,
 // which serves calendar-query -- and carries CALDAV:supported-collation text
-// children each naming one collation identifier. Rows PROP-03, PROP-45, QRY-06.
+// children each naming one collation identifier.
 func TestRFC4791_SupportedCollationSetAdvertisedOnCalendarCollection(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{})
+	h, _, user := calendarPropertyServer(store.Calendar{})
 
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, newCalendarPropfind(t, user, "/dav/calendars/1/", "cal:supported-collation-set"))
@@ -4371,7 +4392,7 @@ func TestRFC4791_SupportedCollationSetAdvertisedOnCalendarObjectResources(t *tes
 	}
 
 	t.Run("ordinary calendar object", func(t *testing.T) {
-		h, _, user := phase2CalendarServer(store.Calendar{})
+		h, _, user := calendarPropertyServer(store.Calendar{})
 		h.store.Events = &fakeEventRepo{events: map[string]*store.Event{
 			"1:standup": {CalendarID: 1, UID: "standup", ResourceName: "standup", ETag: "etag",
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
@@ -4411,7 +4432,7 @@ func TestRFC4791_SupportedCollationSetAdvertisedOnCalendarObjectResources(t *tes
 // applies wherever it is defined -- including the calendar object resources it
 // is now served on.
 func TestRFC4791_AllpropOmitsSupportedCollationSetOnCalendarObjects(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{})
+	h, _, user := calendarPropertyServer(store.Calendar{})
 	h.store.Events = &fakeEventRepo{events: map[string]*store.Event{
 		"1:standup": {CalendarID: 1, UID: "standup", ResourceName: "standup", ETag: "etag",
 			RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
@@ -4430,9 +4451,9 @@ func TestRFC4791_AllpropOmitsSupportedCollationSetOnCalendarObjects(t *testing.T
 
 // Section 5.2.3: CALDAV:comp name="VTIMEZONE" is advertised only by a server
 // that stores VTIMEZONE-only calendar object resources. CalCard does not, so it
-// must not appear in the advertised set. Row PROP-14.
+// must not appear in the advertised set.
 func TestRFC4791_SupportedCalendarComponentSetOmitsVTimezone(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{})
+	h, _, user := calendarPropertyServer(store.Calendar{})
 
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, newCalendarPropfind(t, user, "/dav/calendars/1/", "cal:supported-calendar-component-set"))
@@ -4469,7 +4490,7 @@ func TestRFC4791_SupportedCalendarComponentSetOmitsVTimezone(t *testing.T) {
 }
 
 // Section 5.2.3: with no CALDAV:supported-calendar-component-set of its own, a
-// collection accepts every component type the server implements. Row PROP-15.
+// collection accepts every component type the server implements.
 func TestRFC4791_CollectionWithoutComponentSetAcceptsEveryComponentType(t *testing.T) {
 	if got := calendarSupportedComponents(nil); !slices.Equal(got, defaultSupportedCalendarComponents) {
 		t.Fatalf("calendarSupportedComponents(nil) = %v, want the server default %v", got, defaultSupportedCalendarComponents)
@@ -4484,7 +4505,7 @@ func TestRFC4791_CollectionWithoutComponentSetAcceptsEveryComponentType(t *testi
 	for component, data := range objects {
 		t.Run(component, func(t *testing.T) {
 			// SupportedComponents is nil, so the collection defines no set.
-			h, _, user := phase2CalendarServer(store.Calendar{})
+			h, _, user := calendarPropertyServer(store.Calendar{})
 			req := newCalendarPutRequest("/dav/calendars/1/"+strings.ToLower(component)+".ics", strings.NewReader(data))
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
@@ -4500,10 +4521,10 @@ func TestRFC4791_CollectionWithoutComponentSetAcceptsEveryComponentType(t *testi
 
 // Sections 5.2.3 and 5.3.2.1: a collection that restricts itself to one
 // component type advertises that set and refuses every other type with
-// CALDAV:supported-calendar-component. Rows PROP-13 and PROP-37 for the
-// per-collection set MKCALENDAR establishes.
+// CALDAV:supported-calendar-component, for the per-collection set MKCALENDAR
+// establishes.
 func TestRFC4791_CollectionComponentSetIsEnforcedOnPut(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{SupportedComponents: []string{"VTODO"}})
+	h, _, user := calendarPropertyServer(store.Calendar{SupportedComponents: []string{"VTODO"}})
 
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, newCalendarPropfind(t, user, "/dav/calendars/1/", "cal:supported-calendar-component-set"))
@@ -4528,9 +4549,9 @@ func TestRFC4791_CollectionComponentSetIsEnforcedOnPut(t *testing.T) {
 
 // Section 5.2.4: with no CALDAV:supported-calendar-data of its own a collection
 // accepts only text/calendar version 2.0, which is exactly the single pair
-// CalCard advertises everywhere. Row PROP-19.
+// CalCard advertises everywhere.
 func TestRFC4791_SupportedCalendarDataIsTextCalendarVersionTwo(t *testing.T) {
-	h, _, user := phase2CalendarServer(store.Calendar{})
+	h, _, user := calendarPropertyServer(store.Calendar{})
 
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, newCalendarPropfind(t, user, "/dav/calendars/1/", "cal:supported-calendar-data"))
@@ -4564,7 +4585,7 @@ func TestRFC4791_SupportedCalendarDataIsTextCalendarVersionTwo(t *testing.T) {
 }
 
 // Section 5.2.10: a PROPPATCH of CALDAV:calendar-timezone requires a valid
-// iCalendar object containing exactly one VTIMEZONE. Row PROP-32.
+// iCalendar object containing exactly one VTIMEZONE.
 func TestRFC4791_ProppatchCalendarTimezoneRequiresOneVTimezone(t *testing.T) {
 	valid := "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:" + testProdID +
 		"\nBEGIN:VTIMEZONE\nTZID:America/Chicago\nBEGIN:STANDARD\nDTSTART:19701101T020000\nTZOFFSETFROM:-0500\nTZOFFSETTO:-0600\nEND:STANDARD\nEND:VTIMEZONE\nEND:VCALENDAR"
@@ -4628,7 +4649,7 @@ func TestRFC4791_ProppatchCalendarTimezoneRequiresOneVTimezone(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h, _, user := phase2CalendarServer(store.Calendar{})
+			h, _, user := calendarPropertyServer(store.Calendar{})
 			body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propertyupdate xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
   <d:set><d:prop><cal:calendar-timezone>` + tc.value + `</cal:calendar-timezone></d:prop></d:set>
@@ -4648,7 +4669,7 @@ func TestRFC4791_ProppatchCalendarTimezoneRequiresOneVTimezone(t *testing.T) {
 
 // Section 9.6: CALDAV:calendar-data is a REPORT selector, not a WebDAV
 // property, so PROPFIND never returns its value. The PROPPATCH half is covered
-// by TestRFC4791_ProtectedCalendarPropertiesRejectProppatch. Row DATA-18.
+// by TestRFC4791_ProtectedCalendarPropertiesRejectProppatch.
 func TestRFC4791_CalendarDataIsNotReturnedByPropfind(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -4682,8 +4703,8 @@ func TestRFC4791_CalendarDataIsNotReturnedByPropfind(t *testing.T) {
 // Section 7: the calendaring reports are advertised in DAV:supported-report-set
 // on calendar object resources, not only on calendar collections, and every
 // report advertised there works. free-busy-query is absent because §7.10 makes
-// it a 403 on an object resource, and sync-collection is a collection report.
-// Rows RPT-05, RPT-03 and RPT-04.
+// it a 403 on an object resource, and sync-collection is a collection
+// report.
 func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
@@ -4704,7 +4725,12 @@ func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 				DTEnd:        &end,
 			},
 		}}
-		return &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}, &store.User{ID: 1}
+		user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+		return &DavServer{store: &store.Store{
+			Calendars: calRepo,
+			Events:    eventRepo,
+			Users:     &aclReportUserRepo{users: map[int64]store.User{user.ID: *user}},
+		}}, user
 	}
 
 	// Each advertised report is paired with a body targeting the object resource
@@ -4720,6 +4746,11 @@ func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 			`<D:property name="current-user-principal" namespace="DAV:">` +
 			`<D:property name="displayname" namespace="DAV:"/>` +
 			`</D:property></D:expand-property>`,
+		davQN("acl-principal-prop-set"): `<D:acl-principal-prop-set xmlns:D="DAV:">` +
+			`<D:prop><D:displayname/></D:prop></D:acl-principal-prop-set>`,
+		davQN("principal-property-search"): `<D:principal-property-search xmlns:D="DAV:"><D:property-search>` +
+			`<D:prop><D:displayname/></D:prop><D:match>owner</D:match></D:property-search>` +
+			`<D:apply-to-principal-collection-set/></D:principal-property-search>`,
 	}
 
 	h, user := newServer()
@@ -4749,6 +4780,16 @@ func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 				t.Fatalf("%s on a calendar object resource = %d, want 207; body: %s", qnString(name), rr.Code, rr.Body.String())
 			}
 			ms := decodeMultistatus(t, rr)
+			if name == davQN("acl-principal-prop-set") {
+				ms.assertHrefs(t, "/dav/principals/1/")
+				ms.responseForHref(t, "/dav/principals/1/").
+					assertPropStatus(t, davQN("displayname"), http.StatusOK)
+				return
+			}
+			if name == davQN("principal-property-search") {
+				ms.assertHrefs(t, "/dav/principals/1/")
+				return
+			}
 			ms.assertHrefs(t, "/dav/calendars/1/event.ics")
 			ms.responseForHref(t, "/dav/calendars/1/event.ics").
 				assertPropStatus(t, davQN("getetag"), http.StatusOK)
@@ -4757,7 +4798,7 @@ func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 }
 
 // Section 7.9: a calendar-multiget run against a calendar object resource has
-// exactly one DAV:href, and that href identifies the Request-URI. Row RPT-04.
+// exactly one DAV:href, and that href identifies the Request-URI.
 func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -4860,7 +4901,6 @@ func newMkcalendarRequest(t *testing.T, user *store.User, path, body string) *ht
 
 // Section 5.3.1: a MKCALENDAR response body is a CALDAV:mkcalendar-response
 // element, and a successful response carries Cache-Control: no-cache.
-// Rows MKCAL-01 and MKCAL-03.
 func TestRFC4791_MkcalendarResponseElementAndCacheControl(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
 	h := &DavServer{store: &store.Store{Calendars: calRepo}}
@@ -4896,7 +4936,7 @@ func TestRFC4791_MkcalendarResponseElementAndCacheControl(t *testing.T) {
 }
 
 // Section 5.3.1: a MKCALENDAR request body, when present, is a
-// CALDAV:mkcalendar element and nothing else. Row MKCAL-06.
+// CALDAV:mkcalendar element and nothing else.
 func TestRFC4791_MkcalendarRejectsForeignRequestBody(t *testing.T) {
 	bodies := map[string]string{
 		"DAV:mkcalendar":     `<d:mkcalendar xmlns:d="DAV:"><d:set><d:prop><d:displayname>Work</d:displayname></d:prop></d:set></d:mkcalendar>`,
@@ -4926,7 +4966,7 @@ func TestRFC4791_MkcalendarRejectsForeignRequestBody(t *testing.T) {
 }
 
 // Section 5.3.1: property instructions are processed in document order, so the
-// last of two naming one property wins. Row MKCAL-07. Both live in the one
+// last of two naming one property wins. Both live in the one
 // DAV:set the §9.2 content model admits.
 func TestRFC4791_MkcalendarProcessesInstructionsInDocumentOrder(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
@@ -5005,7 +5045,6 @@ func TestRFC4791_MkcalendarEnforcesRequestGrammar(t *testing.T) {
 // Section 5.3.1: when a property instruction fails, all of them fail. The
 // response is the RFC 2518 §12.13.2 result -- a 207 carrying the failing
 // property's own status and 424 for the rest -- and no collection is created.
-// Rows MKCAL-02, MKCAL-04 and MKCAL-08.
 func TestRFC4791_MkcalendarFailedInstructionCreatesNothing(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
 	h := &DavServer{store: &store.Store{Calendars: calRepo}}
@@ -5157,7 +5196,7 @@ func (f *failingCalendarListRepo) ListByUser(context.Context, int64) ([]store.Ca
 // Section 5.3.1.1 (DAV:resource-must-be-null) and §1.3: no resource may exist at
 // the Request-URI, and the failure names the condition under a top-level
 // DAV:error. The user can remove the existing collection and resubmit, so §1.3
-// makes it a 409. Row MKCAL-09.
+// makes it a 409.
 func TestRFC4791_MkcalendarOnExistingResourceReportsResourceMustBeNull(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
 	h := &DavServer{store: &store.Store{Calendars: calRepo}}
@@ -5178,7 +5217,7 @@ func TestRFC4791_MkcalendarOnExistingResourceReportsResourceMustBeNull(t *testin
 
 // Section 5.3.1.1 (CALDAV:valid-calendar-data): a CALDAV:calendar-timezone in a
 // MKCALENDAR body is a valid iCalendar object containing exactly one VTIMEZONE.
-// Rows MKCAL-11 and MKCAL-04. The valid case also proves the value round-trips.
+// The valid case also proves the value round-trips.
 func TestRFC4791_MkcalendarValidatesCalendarTimezone(t *testing.T) {
 	invalid := map[string]string{
 		"bare component": "BEGIN:VTIMEZONE\nTZID:America/Chicago\nEND:VTIMEZONE",
@@ -5225,7 +5264,6 @@ func TestRFC4791_MkcalendarValidatesCalendarTimezone(t *testing.T) {
 // CALDAV:supported-calendar-component-set, which the created collection then
 // advertises and enforces. §5.2.3's content model is one or more empty
 // CALDAV:comp elements carrying a name attribute, so a body breaking it fails.
-// Rows PROP-36, PROP-15 and MKCAL-02.
 func TestRFC4791_MkcalendarSetsSupportedCalendarComponentSet(t *testing.T) {
 	t.Run("restricts the created collection", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}

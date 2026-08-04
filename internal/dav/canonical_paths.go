@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -47,7 +48,7 @@ func (h *DavServer) canonicalCollectionPath(ctx context.Context, user *store.Use
 
 	id, ok, err := resolve(ctx, user, segment)
 	if err != nil {
-		if err == store.ErrNotFound && len(parts) == 1 {
+		if errors.Is(err, store.ErrNotFound) && len(parts) == 1 {
 			if user != nil {
 				return pendingCollectionPath(prefix, user.ID, segment), nil
 			}

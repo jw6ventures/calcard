@@ -2342,13 +2342,15 @@ func TestAllCalendarEventsJSONPerResourceCapabilities(t *testing.T) {
 	}
 	const principal = "/dav/principals/100/"
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
-		// The collection grants read and write, so an event is editable and
+		// The collection grants read, write, bind, and unbind, so an event is editable and
 		// deletable unless a resource-level deny overrides that grant. This is
 		// what makes the deny assertions below meaningful: a regression that
 		// ignored resource denies would fall back to these grants and pass a
 		// missing-grant test, but not this one.
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "bind"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "unbind"},
 		{ResourcePath: "/dav/calendars/1/read-denied", PrincipalHref: principal, IsGrant: false, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/1/edit-denied", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
 		{ResourcePath: "/dav/calendars/1/del-denied", PrincipalHref: principal, IsGrant: false, Privilege: "unbind"},
@@ -2560,7 +2562,7 @@ func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
 	}
 }
 
-func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
+func TestUnshareCalendarAllowsSharedUserToLeaveWithoutRemovingCustomACLs(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: map[string]*store.CalendarAccess{
 			"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true, Editor: true},
@@ -2608,8 +2610,8 @@ func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
-	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
-		t.Fatalf("expected descendant ACLs for leaving user to be deleted, got %#v", descendantEntries)
+	if len(descendantEntries) != 3 {
+		t.Fatalf("expected descendant custom ACLs to remain unchanged, got %#v", descendantEntries)
 	}
 }
 
@@ -2674,7 +2676,7 @@ func TestShareCalendarPreservesCustomPrincipalACLs(t *testing.T) {
 	}
 }
 
-func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
+func TestUnshareCalendarRemovesOnlyManagedCollectionGrants(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		calendars: map[int64]*store.Calendar{
 			1: {ID: 1, UserID: 100, Name: "Work"},
@@ -2717,9 +2719,20 @@ func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
 
+	got := map[string]struct{}{}
 	for _, entry := range entries {
 		if entry.PrincipalHref == "/dav/principals/200/" {
-			t.Fatalf("expected all ACLs for removed principal to be deleted, got %#v", entries)
+			got[fmt.Sprintf("%t:%s", entry.IsGrant, entry.Privilege)] = struct{}{}
+		}
+	}
+	for _, want := range []string{"true:read-acl", "false:write-content"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("expected custom ACL %q to remain, got %#v", want, entries)
+		}
+	}
+	for _, removed := range []string{"true:read", "true:read-free-busy", "true:write"} {
+		if _, ok := got[removed]; ok {
+			t.Fatalf("expected managed ACL %q to be removed, got %#v", removed, entries)
 		}
 	}
 
@@ -2727,8 +2740,8 @@ func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
-	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
-		t.Fatalf("expected descendant ACLs for removed principal to be deleted, got %#v", descendantEntries)
+	if len(descendantEntries) != 3 {
+		t.Fatalf("expected descendant custom ACLs to remain unchanged, got %#v", descendantEntries)
 	}
 }
 
@@ -2744,7 +2757,7 @@ func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
 		},
-		deletePrincipalEntriesByResourcePrefixErr: errors.New("boom"),
+		setACLErr: errors.New("boom"),
 	}
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars:  calRepo,
@@ -2801,6 +2814,84 @@ func TestCalendarShareViewsIncludePrincipalsWithCustomAccess(t *testing.T) {
 	}
 	if !shares[0].Editor {
 		t.Fatalf("expected bind grant to be treated as editable access, got %#v", shares)
+	}
+}
+
+func TestCalendarShareViewsHonorsOrderedDeny(t *testing.T) {
+	userMap := map[int64]store.User{
+		200: {ID: 200, PrimaryEmail: "delegate@example.com"},
+	}
+	h := NewHandler(&config.Config{}, &store.Store{
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ID: 2, ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind", Position: 2},
+			{ID: 1, ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "all", Position: 1},
+		}},
+	}, nil)
+
+	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
+	if err != nil {
+		t.Fatalf("calendarShareViews() error = %v", err)
+	}
+	if len(shares) != 0 {
+		t.Fatalf("expected effective deny to hide principal from share list, got %#v", shares)
+	}
+}
+
+func TestDecideCalendarPrivilegeHonorsACEOrderAcrossResourceAliases(t *testing.T) {
+	user := &store.User{ID: 200}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 100}}
+
+	tests := []struct {
+		name    string
+		entries map[string][]store.ACLEntry
+		want    bool
+	}{
+		{
+			name: "earlier alias deny wins",
+			entries: map[string][]store.ACLEntry{
+				"/dav/calendars/1/event.ics": {{ID: 2, PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read", Position: 2}},
+				"/dav/calendars/1/event":     {{ID: 1, PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "read", Position: 1}},
+			},
+			want: false,
+		},
+		{
+			name: "earlier alias grant wins",
+			entries: map[string][]store.ACLEntry{
+				"/dav/calendars/1/event.ics": {{ID: 2, PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 2}},
+				"/dav/calendars/1/event":     {{ID: 1, PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1}},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decideCalendarPrivilege(user, cal, "/dav/calendars/1/event.ics", "read", func(candidate string) ([]store.ACLEntry, error) {
+				return tt.entries[candidate], nil
+			})
+			if err != nil {
+				t.Fatalf("decideCalendarPrivilege() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("decideCalendarPrivilege() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRemoveCalendarShareRejectsIneffectiveManagedGrant(t *testing.T) {
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ID: 1, ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 1},
+		{ID: 2, ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 2},
+	}}
+	h := NewHandler(&config.Config{}, &store.Store{ACLEntries: aclRepo}, nil)
+
+	err := h.removeCalendarShare(context.Background(), 1, 200, true)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("removeCalendarShare() error = %v, want %v", err, store.ErrNotFound)
+	}
+	if len(aclRepo.entries) != 2 {
+		t.Fatalf("expected denied share ACLs to remain unchanged, got %#v", aclRepo.entries)
 	}
 }
 
@@ -3346,6 +3437,7 @@ func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64)
 type fakeACLRepo struct {
 	entries                                   []store.ACLEntry
 	deletePrincipalEntriesByResourcePrefixErr error
+	setACLErr                                 error
 	listByResourceCalls                       int
 	listByPrincipalCalls                      int
 	listByResourcesAndPrincipalsCalls         int
@@ -3353,6 +3445,9 @@ type fakeACLRepo struct {
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
+	if f.setACLErr != nil {
+		return f.setACLErr
+	}
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {
 		if entry.ResourcePath == resourcePath {

@@ -55,6 +55,11 @@ func (r *deadPropertyRepo) Apply(ctx context.Context, resourcePath string, mutat
 		return err
 	}
 	defer tx.Rollback()
+	for _, lockPath := range sortedLockSerializationPaths(resourcePath) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockPath); err != nil {
+			return err
+		}
+	}
 	if err := applyDeadPropertyMutationsTx(ctx, tx, resourcePath, mutations); err != nil {
 		return err
 	}

@@ -311,6 +311,70 @@ func TestReadOnlyShareGrantsReadNotWrite(t *testing.T) {
 	}
 }
 
+func TestListContactsHonorsACEOrderAcrossPrincipalQueries(t *testing.T) {
+	tests := []struct {
+		name      string
+		entries   []store.ACLEntry
+		wantCount int
+	}{
+		{
+			name: "specific deny precedes broad grant",
+			entries: []store.ACLEntry{
+				{ID: 10, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read", Position: 0},
+				{ID: 12, ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 1},
+				{ID: 11, ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0},
+			},
+			wantCount: 0,
+		},
+		{
+			name: "broad grant precedes specific deny",
+			entries: []store.ACLEntry{
+				{ID: 10, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read", Position: 0},
+				{ID: 11, ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 0},
+				{ID: 12, ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 1},
+			},
+			wantCount: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewService(&store.Store{
+				AddressBooks: &fakeAB{books: map[int64]*store.AddressBook{
+					1: {ID: 1, UserID: 1, Name: "Shared"},
+				}},
+				Contacts: &fakeContacts{items: map[string]store.Contact{
+					"1:c1": {AddressBookID: 1, UID: "c1", ResourceName: "c1"},
+				}},
+				ACLEntries: &fakeACL{entries: tc.entries},
+			})
+
+			contacts, err := svc.ListContacts(context.Background(), sharee, 1, store.ContactFilter{})
+			if err != nil {
+				t.Fatalf("ListContacts() error = %v", err)
+			}
+			if len(contacts) != tc.wantCount {
+				t.Fatalf("ListContacts() len = %d, want %d", len(contacts), tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestCanReadContactHonorsACEOrderAcrossResourceAliases(t *testing.T) {
+	entries := map[string][]store.ACLEntry{
+		"/dav/addressbooks/1/contact": {
+			{ID: 2, ResourcePath: "/dav/addressbooks/1/contact", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 1},
+		},
+		"/dav/addressbooks/1/contact.vcf": {
+			{ID: 1, ResourcePath: "/dav/addressbooks/1/contact.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0},
+		},
+	}
+
+	if canReadContactFromEntries(sharee, 1, owner.ID, "contact", entries) {
+		t.Fatal("canReadContactFromEntries() ignored earlier deny on a resource alias")
+	}
+}
+
 func TestEditorShareGrantsWrite(t *testing.T) {
 	svc, _ := newTestService()
 	if err := svc.ShareAddressBook(context.Background(), owner, 1, 2, true); err != nil {
@@ -414,6 +478,45 @@ func TestShareeCanLeaveButNotRemoveOthers(t *testing.T) {
 	}
 	if _, err := svc.GetAddressBook(context.Background(), sharee, 1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("after leave GetAddressBook err=%v, want ErrNotFound", err)
+	}
+}
+
+func TestShareeCannotRemoveDenyToGainBroadGrant(t *testing.T) {
+	aclRepo := &fakeACL{entries: []store.ACLEntry{
+		{ID: 1, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0},
+		{ID: 2, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read", Position: 1},
+	}}
+	svc := NewService(&store.Store{
+		AddressBooks: &fakeAB{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: owner.ID, Name: "Owner book"}}},
+		ACLEntries:   aclRepo,
+	})
+
+	err := svc.UnshareAddressBook(context.Background(), sharee, 1, sharee.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UnshareAddressBook() error = %v, want ErrNotFound", err)
+	}
+	if len(aclRepo.entries) != 2 || aclRepo.entries[0].IsGrant {
+		t.Fatalf("UnshareAddressBook() changed protective ACL entries: %#v", aclRepo.entries)
+	}
+}
+
+func TestListAddressBookSharesHonorsOrderedDenies(t *testing.T) {
+	createdAt := time.Now().UTC()
+	svc := NewService(&store.Store{
+		AddressBooks: &fakeAB{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: owner.ID, Name: "Owner book"}}},
+		ACLEntries: &fakeACL{entries: []store.ACLEntry{
+			{ID: 1, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read", Position: 0, CreatedAt: createdAt},
+			{ID: 2, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read", Position: 1, CreatedAt: createdAt},
+			{ID: 3, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write", Position: 1, CreatedAt: createdAt},
+		}},
+	})
+
+	shares, err := svc.ListAddressBookShares(context.Background(), owner, 1)
+	if err != nil {
+		t.Fatalf("ListAddressBookShares() error = %v", err)
+	}
+	if len(shares) != 0 {
+		t.Fatalf("ListAddressBookShares() = %#v, want denied principal omitted", shares)
 	}
 }
 

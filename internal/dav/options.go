@@ -66,8 +66,8 @@ func supportsCopyMove(cleanPath string) bool {
 	case cleanPath == "" || cleanPath == "/" || cleanPath == ".":
 		return false
 	case strings.HasPrefix(cleanPath, "/dav/calendars/"):
-		_, _, ok := parseCalendarResourceSegments(cleanPath)
-		return ok
+		target := parseDAVTarget(cleanPath)
+		return target.Valid && target.Domain == davPathCalendar && target.CollectionSegment != ""
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
 		_, _, ok := parseAddressBookResourceSegments(cleanPath)
 		return ok

@@ -14,19 +14,22 @@ type txPool interface {
 type Store struct {
 	pool txPool
 
-	Users            UserRepository
-	Calendars        CalendarRepository
-	CalendarState    CalendarStateCreator
-	CalendarObjects  CalendarObjectWriter
-	Events           EventRepository
-	AddressBooks     AddressBookRepository
-	Contacts         ContactRepository
-	AppPasswords     AppPasswordRepository
-	DeletedResources DeletedResourceRepository
-	Sessions         SessionRepository
-	Locks            LockRepository
-	ACLEntries       ACLRepository
-	DeadProperties   DeadPropertyRepository
+	Users               UserRepository
+	Calendars           CalendarRepository
+	CalendarState       CalendarStateCreator
+	CalendarObjects     CalendarObjectWriter
+	ContactObjects      ContactObjectWriter
+	CalendarTransfers   CalendarObjectTransferBackend
+	CalendarCollections CalendarCollectionTransferBackend
+	Events              EventRepository
+	AddressBooks        AddressBookRepository
+	Contacts            ContactRepository
+	AppPasswords        AppPasswordRepository
+	DeletedResources    DeletedResourceRepository
+	Sessions            SessionRepository
+	Locks               LockRepository
+	ACLEntries          ACLRepository
+	DeadProperties      DeadPropertyRepository
 }
 
 // New wires concrete repository implementations with shared connection pool.

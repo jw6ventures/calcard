@@ -3,12 +3,92 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/lib/pq"
 )
+
+// DAVResourceState identifies the exact object state on which the HTTP layer
+// based its conditional and privilege checks.
+type DAVResourceState struct {
+	Exists         bool
+	ID             int64
+	UID            string
+	ResourceName   string
+	ETag           string
+	RawData        string
+	CollectionCTag *int64
+}
+
+type ContactTransferExpectation struct {
+	Source                     DAVResourceState
+	Destination                DAVResourceState
+	SourceAddressBookCTag      *int64
+	DestinationAddressBookCTag *int64
+	Overwrite                  bool
+}
+
+type collectionCTagExpectation struct {
+	id   int64
+	ctag *int64
+}
+
+func validateCollectionCTagsTx(ctx context.Context, tx *sql.Tx, table string, expectations ...collectionCTagExpectation) error {
+	expectedByID := make(map[int64]int64, len(expectations))
+	for _, expectation := range expectations {
+		if expectation.id <= 0 || expectation.ctag == nil {
+			continue
+		}
+		if expected, ok := expectedByID[expectation.id]; ok && expected != *expectation.ctag {
+			return ErrResourceStateChanged
+		}
+		expectedByID[expectation.id] = *expectation.ctag
+	}
+	ids := make([]int64, 0, len(expectedByID))
+	for id := range expectedByID {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	query := `SELECT ctag FROM ` + table + ` WHERE id=$1 FOR UPDATE`
+	for _, id := range ids {
+		var current int64
+		if err := tx.QueryRowContext(ctx, query, id).Scan(&current); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrResourceStateChanged
+			}
+			return err
+		}
+		if current != expectedByID[id] {
+			return ErrResourceStateChanged
+		}
+	}
+	return nil
+}
+
+func EventDAVResourceState(event *Event) DAVResourceState {
+	if event == nil {
+		return DAVResourceState{}
+	}
+	return DAVResourceState{
+		Exists: true, ID: event.ID, UID: event.UID, ResourceName: storedResourceName(*event),
+		ETag: event.ETag, RawData: event.RawICAL,
+	}
+}
+
+func ContactDAVResourceState(contact *Contact) DAVResourceState {
+	if contact == nil {
+		return DAVResourceState{}
+	}
+	return DAVResourceState{
+		Exists: true, ID: contact.ID, UID: contact.UID, ResourceName: storedContactResourceName(*contact),
+		ETag: contact.ETag, RawData: contact.RawVCard,
+	}
+}
 
 // CreateCalendarAndState creates a calendar collection together with the DAV
 // state bound to it at creation time: the dead properties the request set, and
@@ -67,16 +147,13 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	if len(preconditions) == 0 {
 		return nil
 	}
-	serialized := make(map[string]struct{})
+	var serializationTargets []string
 	for _, precondition := range preconditions {
-		for _, resourcePath := range lockSerializationPaths(precondition.ResourcePath) {
-			if _, seen := serialized[resourcePath]; seen {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
-				return err
-			}
-			serialized[resourcePath] = struct{}{}
+		serializationTargets = append(serializationTargets, precondition.ResourcePath)
+	}
+	for _, resourcePath := range sortedLockSerializationPaths(serializationTargets...) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
+			return err
 		}
 	}
 
@@ -121,6 +198,122 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 		return ErrLockConflict
 	}
 	return nil
+}
+
+func validateLockPreconditionsFallback(ctx context.Context, locks LockRepository, preconditions []LockPrecondition) error {
+	if len(preconditions) == 0 || locks == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for _, precondition := range preconditions {
+		for _, resourcePath := range precondition.LookupPaths {
+			resourcePath = path.Clean(resourcePath)
+			if resourcePath == "." {
+				continue
+			}
+			if _, ok := seen[resourcePath]; ok {
+				continue
+			}
+			seen[resourcePath] = struct{}{}
+			paths = append(paths, resourcePath)
+		}
+	}
+	active, err := locks.ListByResources(ctx, paths)
+	if err != nil {
+		return err
+	}
+	if !LockPreconditionsSatisfied(preconditions, active) {
+		return ErrLockConflict
+	}
+	return nil
+}
+
+type ACLResourceExpectation struct {
+	CollectionKind string
+	CollectionID   int64
+	CollectionCTag *int64
+	ResourceState  *DAVResourceState
+}
+
+func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries []ACLEntry, expected ACLResourceExpectation, lockPreconditions []LockPrecondition) error {
+	if s == nil || s.ACLEntries == nil {
+		return ErrNotFound
+	}
+	if s.pool == nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if expected.ResourceState != nil {
+			switch expected.CollectionKind {
+			case "calendar":
+				if s.Events == nil {
+					return ErrNotFound
+				}
+				current, err := s.Events.GetByResourceName(ctx, expected.CollectionID, expected.ResourceState.ResourceName)
+				if err != nil {
+					return err
+				}
+				if !eventDAVStateMatches(*expected.ResourceState, current) {
+					return ErrResourceStateChanged
+				}
+			case "addressbook":
+				if s.Contacts == nil {
+					return ErrNotFound
+				}
+				current, err := s.Contacts.GetByResourceName(ctx, expected.CollectionID, expected.ResourceState.ResourceName)
+				if err != nil {
+					return err
+				}
+				if !contactDAVStateMatches(*expected.ResourceState, current) {
+					return ErrResourceStateChanged
+				}
+			}
+		}
+		return s.ACLEntries.SetACL(ctx, resourcePath, entries)
+	}
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return err
+	}
+	switch expected.CollectionKind {
+	case "calendar":
+		if err := validateCollectionCTagsTx(ctx, tx, "calendars",
+			collectionCTagExpectation{id: expected.CollectionID, ctag: expected.CollectionCTag}); err != nil {
+			return err
+		}
+		if expected.ResourceState != nil {
+			current, err := selectEventTx(ctx, tx, `resource_name`, expected.CollectionID, expected.ResourceState.ResourceName)
+			if err != nil {
+				return err
+			}
+			if !eventDAVStateMatches(*expected.ResourceState, current) {
+				return ErrResourceStateChanged
+			}
+		}
+	case "addressbook":
+		if err := validateCollectionCTagsTx(ctx, tx, "address_books",
+			collectionCTagExpectation{id: expected.CollectionID, ctag: expected.CollectionCTag}); err != nil {
+			return err
+		}
+		if expected.ResourceState != nil {
+			current, err := selectContactTx(ctx, tx, `resource_name`, expected.CollectionID, expected.ResourceState.ResourceName)
+			if err != nil {
+				return err
+			}
+			if !contactDAVStateMatches(*expected.ResourceState, current) {
+				return ErrResourceStateChanged
+			}
+		}
+	}
+	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LockPreconditionsSatisfied applies the write-lock conditions captured by the
@@ -176,12 +369,22 @@ func moveLocksTx(ctx context.Context, tx execContext, fromPath, toPath string) e
 	return err
 }
 
-func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, uid, resourcePath string) error {
+func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, expected DAVResourceState, resourcePath string, lockPreconditions []LockPrecondition) error {
 	if s == nil || s.pool == nil {
 		if s == nil || s.Events == nil {
 			return ErrNotFound
 		}
-		if err := s.Events.DeleteByUID(ctx, calendarID, uid); err != nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		current, err := s.Events.GetByResourceName(ctx, calendarID, expected.ResourceName)
+		if err != nil {
+			return err
+		}
+		if !eventDAVStateMatches(expected, current) {
+			return ErrResourceStateChanged
+		}
+		if err := s.Events.DeleteByUID(ctx, calendarID, expected.UID); err != nil {
 			return err
 		}
 		return s.deleteDAVStateFallback(ctx, resourcePath, true)
@@ -192,17 +395,25 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, uid, 
 		return err
 	}
 	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE calendar_id=$1 AND uid=$2`, calendarID, uid)
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return err
+	}
+	if err := validateCollectionCTagsTx(ctx, tx, "calendars",
+		collectionCTagExpectation{id: calendarID, ctag: expected.CollectionCTag}); err != nil {
+		return err
+	}
+	if err := acquireDAVObjectIdentityLocks(ctx, tx, "calendar-object", calendarID, expected); err != nil {
+		return err
+	}
+	current, err := selectEventTx(ctx, tx, `resource_name`, calendarID, expected.ResourceName)
 	if err != nil {
 		return err
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
+	if !eventDAVStateMatches(expected, current) {
+		return ErrResourceStateChanged
 	}
-	if rows == 0 {
-		return ErrNotFound
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id=$1`, current.ID); err != nil {
+		return err
 	}
 	if err := deleteDAVStateTx(ctx, tx, resourcePath, true); err != nil {
 		return err
@@ -210,12 +421,22 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, uid, 
 	return tx.Commit()
 }
 
-func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, uid, resourcePath string) error {
+func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, expected DAVResourceState, resourcePath string, lockPreconditions []LockPrecondition) error {
 	if s == nil || s.pool == nil {
 		if s == nil || s.Contacts == nil {
 			return ErrNotFound
 		}
-		if err := s.Contacts.DeleteByUID(ctx, addressBookID, uid); err != nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		current, err := s.Contacts.GetByResourceName(ctx, addressBookID, expected.ResourceName)
+		if err != nil {
+			return err
+		}
+		if !contactDAVStateMatches(expected, current) {
+			return ErrResourceStateChanged
+		}
+		if err := s.Contacts.DeleteByUID(ctx, addressBookID, expected.UID); err != nil {
 			return err
 		}
 		return s.deleteDAVStateFallback(ctx, resourcePath, true)
@@ -226,22 +447,98 @@ func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, 
 		return err
 	}
 	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`, addressBookID, uid)
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return err
+	}
+	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
+		collectionCTagExpectation{id: addressBookID, ctag: expected.CollectionCTag}); err != nil {
+		return err
+	}
+	if err := acquireDAVObjectIdentityLocks(ctx, tx, "contact-object", addressBookID, expected); err != nil {
+		return err
+	}
+	current, err := selectContactTx(ctx, tx, `resource_name`, addressBookID, expected.ResourceName)
 	if err != nil {
 		return err
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
+	if !contactDAVStateMatches(expected, current) {
+		return ErrResourceStateChanged
 	}
-	if rows == 0 {
-		return ErrNotFound
+	if _, err := tx.ExecContext(ctx, `DELETE FROM contacts WHERE id=$1`, current.ID); err != nil {
+		return err
 	}
 	if err := deleteDAVStateTx(ctx, tx, resourcePath, true); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func eventDAVStateMatches(expected DAVResourceState, event *Event) bool {
+	if expected.Exists != (event != nil) {
+		return false
+	}
+	if event == nil {
+		return true
+	}
+	if expected.ID != 0 && expected.ID != event.ID {
+		return false
+	}
+	return expected.UID == event.UID && expected.ResourceName == storedResourceName(*event) &&
+		expected.ETag == event.ETag && expected.RawData == event.RawICAL
+}
+
+func contactDAVStateMatches(expected DAVResourceState, contact *Contact) bool {
+	if expected.Exists != (contact != nil) {
+		return false
+	}
+	if contact == nil {
+		return true
+	}
+	if expected.ID != 0 && expected.ID != contact.ID {
+		return false
+	}
+	return expected.UID == contact.UID && expected.ResourceName == storedContactResourceName(*contact) &&
+		expected.ETag == contact.ETag && expected.RawData == contact.RawVCard
+}
+
+func storedContactResourceName(contact Contact) string {
+	if contact.ResourceName != "" {
+		return contact.ResourceName
+	}
+	return contact.UID
+}
+
+func acquireDAVObjectIdentityLocks(ctx context.Context, tx execContext, kind string, collectionID int64, states ...DAVResourceState) error {
+	var keys []string
+	for _, state := range states {
+		if state.ResourceName != "" {
+			keys = append(keys, fmt.Sprintf("%s:%d:name:%s", kind, collectionID, state.ResourceName))
+		}
+		if state.UID != "" {
+			keys = append(keys, fmt.Sprintf("%s:%d:uid:%s", kind, collectionID, state.UID))
+		}
+	}
+	slices.Sort(keys)
+	for _, key := range slices.Compact(keys) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const contactDAVColumns = `id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified`
+
+func selectContactTx(ctx context.Context, tx *sql.Tx, column string, addressBookID int64, value string) (*Contact, error) {
+	query := `SELECT ` + contactDAVColumns + ` FROM contacts WHERE address_book_id=$1 AND ` + column + `=$2 FOR UPDATE`
+	contact, err := scanContact(tx.QueryRowContext(ctx, query, addressBookID, value).Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &contact, nil
 }
 
 func deleteDAVStateTx(ctx context.Context, tx execContext, resourcePath string, deleteACL bool) error {
@@ -305,6 +602,9 @@ func davStatePaths(resourcePath string) []string {
 	addPath(resourcePath)
 	switch {
 	case strings.HasPrefix(resourcePath, "/dav/addressbooks/"):
+		if !strings.Contains(strings.Trim(strings.TrimPrefix(resourcePath, "/dav/addressbooks/"), "/"), "/") {
+			return paths
+		}
 		base := resourcePath
 		if strings.EqualFold(path.Ext(base), ".vcf") {
 			base = strings.TrimSuffix(base, path.Ext(base))
@@ -314,6 +614,9 @@ func davStatePaths(resourcePath string) []string {
 		}
 		addPath(base + ".vcf")
 	case strings.HasPrefix(resourcePath, "/dav/calendars/"):
+		if !strings.Contains(strings.Trim(strings.TrimPrefix(resourcePath, "/dav/calendars/"), "/"), "/") {
+			return paths
+		}
 		base := resourcePath
 		if strings.EqualFold(path.Ext(base), ".ics") {
 			base = strings.TrimSuffix(base, path.Ext(base))
@@ -471,11 +774,17 @@ WHERE calendar_id=$13 AND uid=$14`
 }
 
 // MoveContactAndState is the contact counterpart of MoveEventAndState.
-func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string) error {
+func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string, expected ContactTransferExpectation, lockPreconditions []LockPrecondition) error {
 	if s == nil || s.Contacts == nil {
 		return ErrNotFound
 	}
 	if s.pool == nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateContactTransferViaRepository(ctx, s.Contacts, fromAddressBookID, toAddressBookID, destResourceName, expected); err != nil {
+			return err
+		}
 		if err := s.Contacts.MoveToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
 			return err
 		}
@@ -487,8 +796,18 @@ func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAd
 		return err
 	}
 	defer tx.Rollback()
-
-	if err := moveContactTx(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return err
+	}
+	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
+		collectionCTagExpectation{id: fromAddressBookID, ctag: expected.SourceAddressBookCTag},
+		collectionCTagExpectation{id: toAddressBookID, ctag: expected.DestinationAddressBookCTag}); err != nil {
+		return err
+	}
+	if err := acquireContactTransferIdentityLocks(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName, expected); err != nil {
+		return err
+	}
+	if _, _, err := transferContactTx(ctx, tx, contactTransferMove, fromAddressBookID, toAddressBookID, uid, destResourceName, "", expected); err != nil {
 		return err
 	}
 	if err := moveDAVStateTx(ctx, tx, fromStatePath, toStatePath); err != nil {
@@ -517,10 +836,7 @@ func moveDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string
 		if _, err := tx.ExecContext(ctx, `UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`, destinationPath, sourcePath); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, destinationPath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`, destinationPath, sourcePath); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, sourcePath); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, destinationPath); err != nil {
@@ -548,11 +864,6 @@ func (s *Store) moveDAVStateFallback(ctx context.Context, fromPath, toPath, reso
 					return err
 				}
 			}
-			if s.Locks != nil {
-				if err := s.Locks.DeleteByResourcePath(ctx, destinationPath); err != nil {
-					return err
-				}
-			}
 			if err := s.clearDeadPropertiesFallback(ctx, destinationPath); err != nil {
 				return err
 			}
@@ -568,7 +879,7 @@ func (s *Store) moveDAVStateFallback(ctx context.Context, fromPath, toPath, reso
 				}
 			}
 			if s.Locks != nil {
-				if err := s.Locks.MoveResourcePath(ctx, sourcePath, destinationPath); err != nil {
+				if err := s.Locks.DeleteByResourcePath(ctx, sourcePath); err != nil {
 					return err
 				}
 			}
@@ -673,11 +984,17 @@ func (s *Store) CopyEventAndState(ctx context.Context, fromCalendarID, toCalenda
 	return event, nil
 }
 
-func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag, fromStatePath, toStatePath, replacedUID string) (*Contact, error) {
+func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag, fromStatePath, toStatePath, replacedUID string, expected ContactTransferExpectation, lockPreconditions []LockPrecondition) (*Contact, error) {
 	if s == nil || s.Contacts == nil {
 		return nil, ErrNotFound
 	}
 	if s.pool == nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return nil, err
+		}
+		if err := validateContactTransferViaRepository(ctx, s.Contacts, fromAddressBookID, toAddressBookID, destResourceName, expected); err != nil {
+			return nil, err
+		}
 		contact, err := s.Contacts.CopyToAddressBook(ctx, fromAddressBookID, toAddressBookID, uid, destResourceName, newETag)
 		if err != nil {
 			return nil, err
@@ -693,7 +1010,18 @@ func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAd
 		return nil, err
 	}
 	defer tx.Rollback()
-	contact, err := copyContactTx(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName, newETag)
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+		return nil, err
+	}
+	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
+		collectionCTagExpectation{id: fromAddressBookID, ctag: expected.SourceAddressBookCTag},
+		collectionCTagExpectation{id: toAddressBookID, ctag: expected.DestinationAddressBookCTag}); err != nil {
+		return nil, err
+	}
+	if err := acquireContactTransferIdentityLocks(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName, expected); err != nil {
+		return nil, err
+	}
+	contact, _, err := transferContactTx(ctx, tx, contactTransferCopy, fromAddressBookID, toAddressBookID, uid, destResourceName, newETag, expected)
 	if err != nil {
 		return nil, err
 	}
@@ -709,14 +1037,158 @@ func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAd
 	return contact, nil
 }
 
+type contactTransferOperation string
+
+const (
+	contactTransferCopy contactTransferOperation = "copy"
+	contactTransferMove contactTransferOperation = "move"
+)
+
+func validateContactTransferViaRepository(ctx context.Context, contacts ContactRepository, fromAddressBookID, toAddressBookID int64, destResourceName string, expected ContactTransferExpectation) error {
+	source, err := contacts.GetByResourceName(ctx, fromAddressBookID, expected.Source.ResourceName)
+	if err != nil {
+		return err
+	}
+	if !contactDAVStateMatches(expected.Source, source) {
+		return ErrResourceStateChanged
+	}
+	destination, err := contacts.GetByResourceName(ctx, toAddressBookID, destResourceName)
+	if err != nil {
+		return err
+	}
+	if source != nil && destination != nil && source.ID != 0 && source.ID == destination.ID {
+		if !expected.Overwrite {
+			return ErrPreconditionFailed
+		}
+		return nil
+	}
+	if !contactDAVStateMatches(expected.Destination, destination) {
+		return ErrResourceStateChanged
+	}
+	if destination != nil && !expected.Overwrite {
+		return ErrPreconditionFailed
+	}
+	return nil
+}
+
+func acquireContactTransferIdentityLocks(ctx context.Context, tx execContext, fromAddressBookID, toAddressBookID int64, uid, destResourceName string, expected ContactTransferExpectation) error {
+	keys := []string{
+		fmt.Sprintf("contact-object:%d:name:%s", fromAddressBookID, expected.Source.ResourceName),
+		fmt.Sprintf("contact-object:%d:uid:%s", fromAddressBookID, uid),
+		fmt.Sprintf("contact-object:%d:name:%s", toAddressBookID, destResourceName),
+		fmt.Sprintf("contact-object:%d:uid:%s", toAddressBookID, uid),
+	}
+	if expected.Destination.UID != "" {
+		keys = append(keys, fmt.Sprintf("contact-object:%d:uid:%s", toAddressBookID, expected.Destination.UID))
+	}
+	slices.Sort(keys)
+	for _, key := range slices.Compact(keys) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func transferContactTx(ctx context.Context, tx *sql.Tx, operation contactTransferOperation, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string, expected ContactTransferExpectation) (*Contact, bool, error) {
+	source, err := selectContactTx(ctx, tx, `resource_name`, fromAddressBookID, expected.Source.ResourceName)
+	if err != nil {
+		return nil, false, err
+	}
+	if !contactDAVStateMatches(expected.Source, source) || source.UID != uid {
+		return nil, false, ErrResourceStateChanged
+	}
+
+	destination, err := selectContactTx(ctx, tx, `resource_name`, toAddressBookID, destResourceName)
+	if err != nil {
+		return nil, false, err
+	}
+	sameResource := destination != nil && destination.ID == source.ID
+	if sameResource {
+		if !expected.Overwrite {
+			return nil, false, ErrPreconditionFailed
+		}
+		return source, false, nil
+	}
+	if !contactDAVStateMatches(expected.Destination, destination) {
+		return nil, false, ErrResourceStateChanged
+	}
+	if destination != nil && !expected.Overwrite {
+		return nil, false, ErrPreconditionFailed
+	}
+
+	byUID, err := selectContactTx(ctx, tx, `uid`, toAddressBookID, source.UID)
+	if err != nil {
+		return nil, false, err
+	}
+	if byUID != nil && byUID.ID != source.ID && byUID.ID != contactID(destination) && storedContactResourceName(*byUID) != destResourceName {
+		return nil, false, ErrConflict
+	}
+	if operation == contactTransferCopy && fromAddressBookID == toAddressBookID {
+		return nil, false, ErrConflict
+	}
+
+	created := destination == nil
+	if destination != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM contacts WHERE id=$1`, destination.ID); err != nil {
+			return nil, false, err
+		}
+	}
+
+	switch operation {
+	case contactTransferCopy:
+		const insert = `
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+RETURNING ` + contactDAVColumns
+		copied, err := scanContact(tx.QueryRowContext(ctx, insert,
+			toAddressBookID, source.UID, destResourceName, source.RawVCard, newETag,
+			source.DisplayName, source.PrimaryEmail, source.Birthday,
+		).Scan)
+		if err != nil {
+			if isContactIdentityConflict(err) {
+				return nil, false, ErrResourceStateChanged
+			}
+			return nil, false, err
+		}
+		return &copied, created, nil
+	case contactTransferMove:
+		const update = `UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE id=$3 RETURNING ` + contactDAVColumns
+		moved, err := scanContact(tx.QueryRowContext(ctx, update, toAddressBookID, destResourceName, source.ID).Scan)
+		if err != nil {
+			if isContactIdentityConflict(err) {
+				return nil, false, ErrResourceStateChanged
+			}
+			return nil, false, err
+		}
+		if storedContactResourceName(*source) != destResourceName || fromAddressBookID != toAddressBookID {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`, fromAddressBookID, source.UID, storedContactResourceName(*source)); err != nil {
+				return nil, false, err
+			}
+		}
+		if fromAddressBookID != toAddressBookID {
+			if _, err := tx.ExecContext(ctx, `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`, fromAddressBookID); err != nil {
+				return nil, false, err
+			}
+		}
+		return &moved, created, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported contact transfer operation %q", operation)
+	}
+}
+
+func contactID(contact *Contact) int64 {
+	if contact == nil {
+		return 0
+	}
+	return contact.ID
+}
+
 func copyDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
 	if toPath == "" {
 		return nil
 	}
 	for _, statePath := range davStatePaths(toPath) {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, statePath); err != nil {
-			return err
-		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, statePath); err != nil {
 			return err
 		}
@@ -727,22 +1199,19 @@ func copyDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string
 	if fromPath == "" || fromPath == toPath {
 		return nil
 	}
+	fromPaths := davStatePaths(fromPath)
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at)
-SELECT $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
+SELECT DISTINCT ON (namespace_uri, local_name) $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
 FROM dav_dead_properties
-WHERE resource_path=$2`, toPath, fromPath)
+WHERE resource_path = ANY($2)
+ORDER BY namespace_uri, local_name, CASE WHEN resource_path=$3 THEN 0 ELSE 1 END, updated_at DESC`, toPath, pq.Array(fromPaths), fromPath)
 	return err
 }
 
 func (s *Store) copyDAVStateFallback(ctx context.Context, fromPath, toPath, resourceType string, collectionID int64, replacedUID, resourceName string) error {
 	if toPath != "" {
 		for _, statePath := range davStatePaths(toPath) {
-			if s.Locks != nil {
-				if err := s.Locks.DeleteByResourcePath(ctx, statePath); err != nil {
-					return err
-				}
-			}
 			if s.ACLEntries != nil {
 				if err := s.ACLEntries.Delete(ctx, statePath); err != nil {
 					return err
@@ -766,21 +1235,37 @@ func (s *Store) copyDeadPropertiesFallback(ctx context.Context, fromPath, toPath
 	if s == nil || s.DeadProperties == nil || toPath == "" || fromPath == toPath {
 		return nil
 	}
-	properties, err := s.DeadProperties.ListByResources(ctx, []string{fromPath, toPath})
+	fromPaths := davStatePaths(fromPath)
+	toPaths := davStatePaths(toPath)
+	lookupPaths := append(append([]string(nil), fromPaths...), toPaths...)
+	properties, err := s.DeadProperties.ListByResources(ctx, lookupPaths)
 	if err != nil {
 		return err
 	}
-	var clearDestination, setDestination []DeadPropertyMutation
+	propertiesByPath := make(map[string][]DeadProperty)
 	for _, property := range properties {
-		if property.ResourcePath == toPath {
+		propertiesByPath[property.ResourcePath] = append(propertiesByPath[property.ResourcePath], property)
+	}
+	for _, destinationPath := range toPaths {
+		var clearDestination []DeadPropertyMutation
+		for _, property := range propertiesByPath[destinationPath] {
 			clearDestination = append(clearDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, Remove: true})
 		}
-		if property.ResourcePath == fromPath {
-			setDestination = append(setDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, InnerXML: property.InnerXML})
+		if err := s.DeadProperties.Apply(ctx, destinationPath, clearDestination); err != nil {
+			return err
 		}
 	}
-	if err := s.DeadProperties.Apply(ctx, toPath, clearDestination); err != nil {
-		return err
+	seen := make(map[string]struct{})
+	var setDestination []DeadPropertyMutation
+	for _, sourcePath := range fromPaths {
+		for _, property := range propertiesByPath[sourcePath] {
+			key := property.NamespaceURI + "\x00" + property.LocalName
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			setDestination = append(setDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, InnerXML: property.InnerXML})
+		}
 	}
 	return s.DeadProperties.Apply(ctx, toPath, setDestination)
 }
