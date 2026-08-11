@@ -239,7 +239,7 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 	for i := range events {
 		event := &events[i]
 		if operation == store.CalendarCollectionCopy {
-			allowed, denied, err := h.calendarPrivilegeDecision(r.Context(), user, &source.Calendar, calendarObjectHref(source.ID, event), "read")
+			allowed, denied, err := h.calendarPrivilegeDecision(r.Context(), user, &source.Calendar, calendarObjectConflictHref(source.ID, event), "read")
 			if err != nil {
 				return nil, nil, err
 			}
@@ -248,14 +248,14 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 			}
 			if !allowed {
 				failures = append(failures, calendarCollectionMemberFailure{
-					href: calendarObjectHref(source.ID, event), fault: &calendarObjectFault{status: http.StatusNotFound},
+					href: calendarObjectConflictHref(source.ID, event), fault: &calendarObjectFault{status: http.StatusNotFound},
 				})
 				continue
 			}
 		}
 		validated, fault := validateCalendarObjectForStorage(event.RawICAL, source)
 		if fault != nil {
-			failures = append(failures, calendarCollectionMemberFailure{href: calendarObjectHref(source.ID, event), fault: fault})
+			failures = append(failures, calendarCollectionMemberFailure{href: calendarObjectConflictHref(source.ID, event), fault: fault})
 			continue
 		}
 		members = append(members, store.CalendarCollectionMember{

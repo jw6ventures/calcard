@@ -53,7 +53,7 @@ func parseICalProperty(line string) (icalProperty, bool) {
 	property := icalProperty{
 		name:       name,
 		keyPart:    keyPart,
-		value:      strings.TrimSpace(line[colon+1:]),
+		value:      line[colon+1:],
 		parameters: make(map[string]string, len(parts)-1),
 	}
 	for _, rawParameter := range parts[1:] {

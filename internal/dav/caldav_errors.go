@@ -70,6 +70,29 @@ func writeCalDAVUIDConflict(w http.ResponseWriter, conflictHref string) {
 	_, _ = fmt.Fprint(w, body.String())
 }
 
+// writeCalDAVSupportedFilter answers the CALDAV:supported-filter precondition
+// of RFC 4791 §7.8.8, whose content model is (comp-filter*, prop-filter*,
+// param-filter*): §7.8 asks the server to name the filter elements it could not
+// honour, so the offending ones are echoed back with their name attributes.
+func writeCalDAVSupportedFilter(w http.ResponseWriter, offending []filterElementRef) {
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	var body strings.Builder
+	body.WriteString(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:supported-filter>`)
+	for _, ref := range offending {
+		if !isValidCalDAVCondition(ref.Element) {
+			continue
+		}
+		var escaped strings.Builder
+		if err := xml.EscapeText(&escaped, []byte(ref.Name)); err != nil {
+			continue
+		}
+		fmt.Fprintf(&body, `<C:%s name="%s"/>`, ref.Element, escaped.String())
+	}
+	body.WriteString(`</C:supported-filter></D:error>`)
+	_, _ = fmt.Fprint(w, body.String())
+}
+
 // writeDAVError writes a DAV:-namespace precondition error body (RFC 4918 §16),
 // e.g. DAV:supported-report or DAV:propfind-finite-depth.
 func writeDAVError(w http.ResponseWriter, status int, condition string) {

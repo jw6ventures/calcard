@@ -115,7 +115,7 @@ func statusOKProp(name string, rtype resourceType) propstat {
 func statusOKPropWithExtras(name string, rtype resourceType, principalHref string, includeCalendarHome, includeAddressHome bool) propstat {
 	p := prop{
 		ResourceType:            &rtype,
-		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
+		CurrentUserPrincipal:    &hrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
 	}
 	if name != "" {
@@ -332,11 +332,10 @@ func supportedCollationSetProp() *supportedCollationSet {
 	}
 }
 
-// supportedCalendarCollations are the collations CalDAV text matching applies
-// today. The matcher folds case the RFC 4790 i;ascii-casemap way and nothing
-// else, so that is the only identifier advertised; i;octet, which RFC 4791 §7.5
-// also requires, is advertised once the matcher honours it.
-var supportedCalendarCollations = []string{"i;ascii-casemap"}
+// supportedCalendarCollations are the collations CalDAV text matching applies,
+// which RFC 4791 §7.5 requires to be exactly what
+// CALDAV:supported-collation-set advertises. Both do substring matching.
+var supportedCalendarCollations = []string{"i;ascii-casemap", "i;octet"}
 
 func caldavSupportedCollationSetProp() *caldavSupportedCollationSet {
 	return &caldavSupportedCollationSet{SupportedCollation: supportedCalendarCollations}
@@ -347,16 +346,28 @@ func caldavSupportedCollationSetProp() *caldavSupportedCollationSet {
 // attribute optional and defaults it to i;ascii-casemap, so an absent value is
 // supported; "default" is the RFC 4790 alias for the server's default.
 func calendarCollationSupported(collation string) bool {
-	normalized := asciiCasemapFold(strings.TrimSpace(collation))
-	if normalized == "" || normalized == asciiCasemapFold("default") {
-		return true
+	_, ok := calendarCollationFolder(collation)
+	return ok
+}
+
+// calendarCollationFolder returns the folding one collation identifier applies
+// to both the search string and the value it is matched against. RFC 4791 §7.5
+// forbids a wildcard in the identifier, so one is refused before lookup rather
+// than expanded.
+func calendarCollationFolder(collation string) (func(string) string, bool) {
+	normalized := asciiCasemapFold(collation)
+	if strings.Contains(normalized, "*") {
+		return nil, false
 	}
-	for _, supported := range supportedCalendarCollations {
-		if normalized == asciiCasemapFold(supported) {
-			return true
-		}
+	switch normalized {
+	case "", asciiCasemapFold("default"), asciiCasemapFold("i;ascii-casemap"):
+		return asciiCasemapFold, true
+	case asciiCasemapFold("i;octet"):
+		// RFC 4790 §9.3 compares octet by octet, so the value passes through.
+		return func(s string) string { return s }, true
+	default:
+		return nil, false
 	}
-	return false
 }
 
 // asciiCasemapFold folds a string the RFC 4790 i;ascii-casemap way: US-ASCII

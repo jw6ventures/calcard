@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 func safeUnmarshalXML(data []byte, v interface{}) error {
@@ -46,6 +47,34 @@ func expectXMLDocumentEnd(decoder *xml.Decoder) error {
 			}
 		}
 	}
+}
+
+// validXMLNameToken reports whether value is an XML 1.0 §2.3 Name. A request
+// that carries a property name as an attribute value rather than as an element
+// -- DAV:expand-property does -- has to check that itself, because the decoder
+// only enforces the production on names it parsed as markup.
+func validXMLNameToken(value string) bool {
+	if value == "" || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if xmlNameStartCharacter(r) || r == '-' || r == '.' || r >= '0' && r <= '9' ||
+			r == '·' || r >= '̀' && r <= 'ͯ' || r >= '‿' && r <= '⁀' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func xmlNameStartCharacter(r rune) bool {
+	return r == ':' || r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' ||
+		r >= 'À' && r <= 'Ö' || r >= 'Ø' && r <= 'ö' ||
+		r >= 'ø' && r <= '˿' || r >= 'Ͱ' && r <= 'ͽ' ||
+		r >= 'Ϳ' && r <= '῿' || r >= '‌' && r <= '‍' ||
+		r >= '⁰' && r <= '↏' || r >= 'Ⰰ' && r <= '⿯' ||
+		r >= '、' && r <= '퟿' || r >= '豈' && r <= '﷏' ||
+		r >= 'ﷰ' && r <= '�' || r >= '\U00010000' && r <= '\U000effff'
 }
 
 var errRequestTooLarge = errors.New("request too large")

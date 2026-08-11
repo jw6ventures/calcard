@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -10,46 +11,15 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, expandReq *expandPropertyRequest) ([]response, string, error) {
-	targetResourceName := ""
+func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, request *http.Request) ([]response, string, error) {
 	addressDataReq := reportAddressData(report)
-	if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathAddressBook && target.Resource {
-		targetResourceName = target.ResourceName
-	}
 	switch report.XMLName.Local {
 	case "addressbook-multiget":
-		res, err := h.addressBookMultiGetReport(ctx, user, book, report.Hrefs, cleanPath, report.Prop, addressDataReq)
+		res, err := h.addressBookMultiGetReport(ctx, user, book, report.Hrefs, cleanPath, report.Prop, addressDataReq, request)
 		return res, "", err
 	case "addressbook-query":
 		res, err := h.addressBookQuery(ctx, user, book, cleanPath, report.CardFilter, report.Prop, addressDataReq, report.Limit)
 		return res, "", err
-	case "expand-property":
-		collectionHref := strings.TrimSuffix(cleanPath, "/")
-		if targetResourceName == "" {
-			collectionHref += "/"
-		}
-		if targetResourceName != "" {
-			contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, targetResourceName)
-			if err != nil {
-				return nil, "", fmt.Errorf("failed to fetch contact")
-			}
-			if contact == nil {
-				return []response{{Href: collectionHref, Status: httpStatusNotFound}}, "", nil
-			}
-			return []response{buildAddressObjectExpandPropertyResponse(collectionHref, *contact, expandReq)}, "", nil
-		}
-		resp := addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, buildSyncToken("card", book.ID, book.UpdatedAt), strconv.FormatInt(book.CTag, 10))
-		selections := expandPropertySelections(expandReq)
-		if len(resp.Propstat) > 0 {
-			expanded := h.expandedPrincipalProp(user, selections)
-			if expanded.CurrentUserPrincipal != nil {
-				resp.Propstat[0].Prop.CurrentUserPrincipal = expanded.CurrentUserPrincipal
-			}
-			if expanded.PrincipalURL != nil {
-				resp.Propstat[0].Prop.PrincipalURL = expanded.PrincipalURL
-			}
-		}
-		return []response{resp}, "", nil
 	case "sync-collection":
 		return h.addressBookSyncCollection(ctx, user, book, principalHref, cleanPath, report)
 	default:
@@ -103,7 +73,7 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 			if !canReadAddressBookContactWithDecider(resourceName, decider) || !contactMatchesCardFilter(contact, filter) {
 				continue
 			}
-			href := baseHref + resourceName + ".vcf"
+			href := addressObjectHref(baseHref, resourceName)
 			resp, err := h.buildAddressObjectReportResponse(href, contact, reqProp, addressDataReq)
 			if err != nil {
 				return nil, err
@@ -127,10 +97,10 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 			Error:  &responseError{NumberOfMatchesWithinLimits: &struct{}{}},
 		})
 	}
-	return h.finishReportResponses(ctx, user, responses, reqProp, false, addressDataReq)
+	return h.finishReportResponses(ctx, user, responses, propertySelector{Prop: reqProp}, false, addressDataReq)
 }
 
-func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.User, book *store.AddressBook, hrefs []string, cleanPath string, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
+func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.User, book *store.AddressBook, hrefs []string, cleanPath string, reqProp *reportProp, addressDataReq *addressDataQuery, request *http.Request) ([]response, error) {
 	if len(hrefs) == 0 {
 		return nil, fmt.Errorf("href required")
 	}
@@ -145,17 +115,15 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	resourceNames := make([]string, 0, len(hrefs))
 	seenNames := make(map[string]struct{}, len(hrefs))
 	for _, href := range hrefs {
-		cleanHref := resolveDAVHref(cleanPath, href)
-		if cleanHref == "" {
+		resolved, ok := h.resolveAddressBookHrefForRequest(href, request)
+		if !ok {
 			continue
 		}
-		if _, resourceName, ok := parseAddressBookResourceSegments(cleanHref); ok {
-			if _, ok := seenNames[resourceName]; ok {
-				continue
-			}
-			seenNames[resourceName] = struct{}{}
-			resourceNames = append(resourceNames, resourceName)
+		if _, seen := seenNames[resolved.ResourceName]; seen {
+			continue
 		}
+		seenNames[resolved.ResourceName] = struct{}{}
+		resourceNames = append(resourceNames, resolved.ResourceName)
 	}
 	entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, bookID, resourceNames)
 	if err != nil {
@@ -189,18 +157,17 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	}
 	var responses []response
 	for _, href := range hrefs {
-		cleanHref := resolveDAVHref(cleanPath, href)
-		responseHref := multiGetFallbackHref(href, cleanHref, cleanPath)
-		if cleanHref == "" {
-			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
-			continue
-		}
-		segment, resourceName, ok := parseAddressBookResourceSegments(cleanHref)
+		resolved, ok := h.resolveAddressBookHrefForRequest(href, request)
+		resourceName := resolved.ResourceName
+		responseHref := multiGetFallbackHref(href, resolved.Path, cleanPath)
+		// RFC 6352 §8.7: every requested href needs a DAV:response, so an
+		// unresolvable or out-of-scope one reports 404 under the best href the
+		// request gives us instead of being dropped.
 		if !ok {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		id, ok := resolveSegment(segment)
+		id, ok := resolveSegment(resolved.Segment)
 		if !ok || id != bookID {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
@@ -224,7 +191,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 		}
 		responses = append(responses, resp)
 	}
-	return h.finishReportResponses(ctx, user, responses, reqProp, false, addressDataReq)
+	return h.finishReportResponses(ctx, user, responses, propertySelector{Prop: reqProp}, false, addressDataReq)
 }
 
 func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
@@ -263,7 +230,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		if h.multistatusBuildComplete(responses) {
 			break
 		}
-		href := collectionHref + contactResourceName(contact) + ".vcf"
+		href := addressObjectHref(collectionHref, contactResourceName(contact))
 		resp, err := h.buildAddressObjectReportResponse(href, contact, report.Prop, addressDataReq)
 		if err != nil {
 			return nil, "", err
@@ -297,12 +264,12 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 			if !canReadAddressBookContactWithDecider(resourceName, decider) {
 				continue
 			}
-			href := collectionHref + resourceName + ".vcf"
+			href := addressObjectHref(collectionHref, resourceName)
 			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 		}
 	}
 
-	responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, false, addressDataReq)
+	responses, err = h.finishReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, false, addressDataReq)
 	if err != nil {
 		return nil, "", err
 	}

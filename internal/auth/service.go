@@ -307,25 +307,33 @@ func (s *Service) cookieSecure(r *http.Request) bool {
 	return err == nil && base.Scheme == "https"
 }
 
-// secureRequest reports whether this request reached the server over TLS.
-//
-// A request forwarded by a proxy listed in APP_TRUSTED_PROXIES is trusted
-// to describe its own leg through X-Forwarded-Proto; a request from anywhere
-// else is not, so the header cannot be spoofed into unlocking Basic over
-// cleartext. Configuring no proxies at all trusts every peer's X-Forwarded-Proto
-// matching how the forwarded client IP is resolved and the warning the
-// configuration loader prints at startup.
 func (s *Service) secureRequest(r *http.Request) bool {
+	if s == nil || s.cfg == nil {
+		return r != nil && r.TLS != nil
+	}
+	return RequestIsSecure(r, s.cfg.TrustedProxies)
+}
+
+// RequestIsSecure reports whether this request reached the server over TLS.
+//
+// A request forwarded by a proxy listed in trustedProxies (APP_TRUSTED_PROXIES)
+// is trusted to describe its own leg through X-Forwarded-Proto; a request from
+// anywhere else is not, so the header cannot be spoofed into unlocking Basic
+// over cleartext. Configuring no proxies at all trusts every peer's
+// X-Forwarded-Proto, matching how the forwarded client IP is resolved and the
+// warning the configuration loader prints at startup.
+//
+// It is exported because the DAV href resolver needs the same answer: a
+// DAV:href naming an absolute URI is compared against the Request-URI scheme,
+// and behind a TLS-terminating proxy only this rule can supply it.
+func RequestIsSecure(r *http.Request, trustedProxies []string) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	if s == nil || s.cfg == nil {
-		return false
-	}
-	if trusted := parseTrustedProxies(s.cfg.TrustedProxies); len(trusted) > 0 {
+	if trusted := parseTrustedProxies(trustedProxies); len(trusted) > 0 {
 		remoteIP, _ := parseRemoteAddr(r.RemoteAddr)
 		if remoteIP == nil || !isTrustedProxy(remoteIP, trusted) {
 			return false

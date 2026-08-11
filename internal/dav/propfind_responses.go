@@ -460,7 +460,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 			return nil, http.ErrNotSupported
 		}
 		href := ensureCollectionHref(path.Join("/dav/calendars", fmt.Sprint(cal.ID)))
-		resourceHref := strings.TrimSuffix(href, "/") + "/" + resourceName + ".ics"
+		resourceHref := calendarObjectHref(href, resourceName)
 		allowed, err := h.canReadCalendarObject(ctx, user, cal, resourceName)
 		if err != nil {
 			return nil, err
@@ -601,7 +601,7 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 		if err != nil {
 			return nil, err
 		}
-		href := strings.TrimSuffix(collectionHref, "/") + "/" + resourceName + ".vcf"
+		href := addressObjectHref(collectionHref, resourceName)
 		if contact == nil {
 			return []response{{Href: href, Status: httpStatusNotFound}}, nil
 		}
@@ -721,8 +721,8 @@ func principalResponse(href string, user *store.User) response {
 	p := prop{
 		DisplayName:             stringPtr(principalDisplayName(user)),
 		ResourceType:            &resourceType{Principal: &struct{}{}},
-		PrincipalURL:            &expandableHrefProp{Href: href},
-		CurrentUserPrincipal:    &expandableHrefProp{Href: href},
+		PrincipalURL:            &hrefProp{Href: href},
+		CurrentUserPrincipal:    &hrefProp{Href: href},
 		CurrentUserPrincipalURL: &hrefProp{Href: href},
 		CalendarHomeSet:         &hrefListProp{Href: []string{"/dav/calendars/"}},
 		AddressbookHomeSet:      &hrefListProp{Href: []string{"/dav/addressbooks/"}},
@@ -735,30 +735,9 @@ func rootCollectionResponse(href string, principalHref string) response {
 	p := prop{
 		DisplayName:             stringPtr("CalCard DAV"),
 		ResourceType:            &resourceType{Collection: &struct{}{}},
-		CurrentUserPrincipal:    &expandableHrefProp{Href: principalHref},
+		CurrentUserPrincipal:    &hrefProp{Href: principalHref},
 		CurrentUserPrincipalURL: &hrefProp{Href: principalHref},
 		SupportedReportSet:      combinedSupportedReports(),
 	}
 	return response{Href: href, Propstat: []propstat{{Prop: p, Status: httpStatusOK}}}
-}
-
-func (h *DavServer) expandedPrincipalProp(user *store.User, selections expandPropertySelection) prop {
-	principalHref := h.principalURL(user)
-	principalResp := principalResponse(principalHref, user)
-	result := prop{}
-	if selections.CurrentUserPrincipal != nil {
-		filtered := principalResp
-		if selections.CurrentUserPrincipal.Prop != nil {
-			filtered = filterPropfindResponseForKind(principalResp, selections.CurrentUserPrincipal, kindPrincipal)
-		}
-		result.CurrentUserPrincipal = &expandableHrefProp{Response: []response{filtered}}
-	}
-	if selections.PrincipalURL != nil {
-		filtered := principalResp
-		if selections.PrincipalURL.Prop != nil {
-			filtered = filterPropfindResponseForKind(principalResp, selections.PrincipalURL, kindPrincipal)
-		}
-		result.PrincipalURL = &expandableHrefProp{Response: []response{filtered}}
-	}
-	return result
 }

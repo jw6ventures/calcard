@@ -1,10 +1,14 @@
 package dav
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -203,8 +207,13 @@ func TestValidCalendarFilterCollations(t *testing.T) {
 		"identifiers are case-insensitive":             {collation: "I;ASCII-CASEMAP", want: true},
 		"the default alias":                            {collation: "default", want: true},
 		"an unadvertised collation":                    {collation: "i;unicode-casemap", want: false},
-		"i;octet is not implemented yet":               {collation: "i;octet", want: false},
+		"the required octet collation":                 {collation: "i;octet", want: true},
 		"an unknown identifier":                        {collation: "i;made-up", want: false},
+		// RFC 4791 §7.5 forbids a wildcard in a collation identifier, so one is
+		// refused rather than expanded against the supported set.
+		"a wildcard identifier":       {collation: "i;ascii-*", want: false},
+		"a bare wildcard":             {collation: "*", want: false},
+		"a wildcard on a real prefix": {collation: "i;*", want: false},
 	}
 
 	for name, tt := range tests {
@@ -216,12 +225,29 @@ func TestValidCalendarFilterCollations(t *testing.T) {
 				t.Errorf("prop-filter collation %q = %v, want %v", tt.collation, got, tt.want)
 			}
 
-			compScoped := &calFilter{CompFilter: compFilter{
-				Name:       "VCALENDAR",
-				CompFilter: []compFilter{{Name: "VEVENT", TextMatch: match}},
+			// The walk descends through nested comp-filters and into the
+			// param-filters a prop-filter carries, so a collation named at any
+			// depth is checked.
+			nested := &calFilter{CompFilter: compFilter{
+				Name: "VCALENDAR",
+				CompFilter: []compFilter{{
+					Name: "VEVENT",
+					CompFilter: []compFilter{{
+						Name:       "VALARM",
+						PropFilter: []propFilter{{Name: "DESCRIPTION", TextMatch: match}},
+					}},
+				}},
 			}}
-			if got := validCalendarFilterCollations(compScoped); got != tt.want {
-				t.Errorf("comp-filter collation %q = %v, want %v", tt.collation, got, tt.want)
+			if got := validCalendarFilterCollations(nested); got != tt.want {
+				t.Errorf("nested comp-filter collation %q = %v, want %v", tt.collation, got, tt.want)
+			}
+
+			paramScoped := calQueryWithPropFilter(propFilter{
+				Name:        "ATTENDEE",
+				ParamFilter: []paramFilter{{Name: "PARTSTAT", TextMatch: match}},
+			})
+			if got := validCalendarFilterCollations(paramScoped); got != tt.want {
+				t.Errorf("param-filter collation %q = %v, want %v", tt.collation, got, tt.want)
 			}
 		})
 	}
@@ -1020,4 +1046,390 @@ func TestRecurrenceParsingIsScopedToVEvent(t *testing.T) {
 	if strings.Contains(body, "FREEBUSY:20250601T090000Z/20250601T100000Z") {
 		t.Fatalf("expected no invented busy period from VTIMEZONE RRULE, got %s", body)
 	}
+}
+
+// calFilterOverVEvent wraps VEVENT-scoped children in the VCALENDAR comp-filter
+// RFC 4791 §9.7.1 scopes to the calendar object resource itself.
+func calFilterOverVEvent(vevent compFilter) *calFilter {
+	vevent.Name = "VEVENT"
+	return &calFilter{CompFilter: compFilter{Name: "VCALENDAR", CompFilter: []compFilter{vevent}}}
+}
+
+const filterEventICAL = "BEGIN:VCALENDAR\r\n" +
+	"VERSION:2.0\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:scoped\r\n" +
+	"DTSTART:20240601T090000Z\r\n" +
+	"SUMMARY:Standup\r\n" +
+	"DESCRIPTION:agenda mentions Retro\r\n" +
+	"ATTENDEE;PARTSTAT=ACCEPTED;CN=Dana:mailto:dana@example.com\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:Reminder\r\n" +
+	"TRIGGER:-PT15M\r\n" +
+	"END:VALARM\r\n" +
+	"END:VEVENT\r\n" +
+	"END:VCALENDAR\r\n"
+
+// RFC 4791 §9.7.2 scopes a prop-filter's text-match to the named property's
+// value. Matching the whole object instead lets an unrelated property satisfy
+// the filter, which is the defect this pins closed.
+func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
+	tests := []struct {
+		name     string
+		property string
+		text     string
+		want     bool
+	}{
+		{name: "the named property's own value matches", property: "SUMMARY", text: "Standup", want: true},
+		{name: "another property's value does not", property: "SUMMARY", text: "Retro", want: false},
+		{name: "that other property matches under its own filter", property: "DESCRIPTION", text: "Retro", want: true},
+		{name: "a component name is not a property value", property: "SUMMARY", text: "VEVENT", want: false},
+		{name: "a parameter is not part of the property value", property: "ATTENDEE", text: "ACCEPTED", want: false},
+		{name: "the property value itself still matches", property: "ATTENDEE", text: "dana@example.com", want: true},
+	}
+
+	h := &DavServer{}
+	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name:      tt.property,
+				TextMatch: &textMatch{Text: tt.text},
+			}}})
+			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+				t.Fatalf("text-match %q on %s = %v, want %v", tt.text, tt.property, got, tt.want)
+			}
+		})
+	}
+}
+
+// RFC 4791 §9.7.3: a param-filter is scoped to the named parameter of the
+// enclosing property. An empty filter matches its existence, is-not-defined
+// matches its absence, and a text-match matches that parameter's value.
+func TestParamFilterIsScopedToTheNamedParameter(t *testing.T) {
+	tests := []struct {
+		name  string
+		param paramFilter
+		want  bool
+	}{
+		{name: "a defined parameter matches an empty filter", param: paramFilter{Name: "PARTSTAT"}, want: true},
+		{name: "an absent parameter does not", param: paramFilter{Name: "ROLE"}, want: false},
+		{name: "is-not-defined matches an absent parameter", param: paramFilter{Name: "ROLE", IsNotDefined: &struct{}{}}, want: true},
+		{name: "is-not-defined rejects a defined parameter", param: paramFilter{Name: "PARTSTAT", IsNotDefined: &struct{}{}}, want: false},
+		{name: "the parameter value matches", param: paramFilter{Name: "PARTSTAT", TextMatch: &textMatch{Text: "accepted"}}, want: true},
+		{name: "another parameter's value does not", param: paramFilter{Name: "PARTSTAT", TextMatch: &textMatch{Text: "Dana"}}, want: false},
+		{name: "the property value is not the parameter value", param: paramFilter{Name: "PARTSTAT", TextMatch: &textMatch{Text: "mailto:"}}, want: false},
+		{name: "parameter names are case-insensitive", param: paramFilter{Name: "partstat"}, want: true},
+		{name: "a negated parameter text-match inverts", param: paramFilter{Name: "PARTSTAT", TextMatch: &textMatch{Text: "DECLINED", NegateCondition: "yes"}}, want: true},
+	}
+
+	h := &DavServer{}
+	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name:        "ATTENDEE",
+				ParamFilter: []paramFilter{tt.param},
+			}}})
+			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+				t.Fatalf("param-filter %+v = %v, want %v", tt.param, got, tt.want)
+			}
+		})
+	}
+}
+
+// RFC 4791 §9.7.1 and §9.7.4: a comp-filter is scoped to the calendar object at
+// the filter root and to the enclosing component when nested, an empty filter
+// matches existence, and is-not-defined matches an absent component.
+func TestCompFilterScopingAndIsNotDefined(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter *calFilter
+		want   bool
+	}{
+		{
+			name:   "the root comp-filter names the calendar object",
+			filter: &calFilter{CompFilter: compFilter{Name: "VCALENDAR"}},
+			want:   true,
+		},
+		{
+			name:   "a root comp-filter naming a contained component matches nothing",
+			filter: &calFilter{CompFilter: compFilter{Name: "VEVENT"}},
+			want:   false,
+		},
+		{
+			name:   "a nested component is found under its parent",
+			filter: calFilterOverVEvent(compFilter{}),
+			want:   true,
+		},
+		{
+			name:   "a component nested two deep is found",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{Name: "VALARM"}}}),
+			want:   true,
+		},
+		{
+			name:   "a component absent from the parent does not match",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{Name: "VTODO"}}}),
+			want:   false,
+		},
+		{
+			name:   "a VALARM outside its VEVENT parent does not match",
+			filter: &calFilter{CompFilter: compFilter{Name: "VCALENDAR", CompFilter: []compFilter{{Name: "VALARM"}}}},
+			want:   false,
+		},
+		{
+			name:   "is-not-defined matches an absent component",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{Name: "VTODO", IsNotDefined: &struct{}{}}}}),
+			want:   true,
+		},
+		{
+			name:   "is-not-defined rejects a present component",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{Name: "VALARM", IsNotDefined: &struct{}{}}}}),
+			want:   false,
+		},
+		{
+			name: "every child filter is conjunctive",
+			filter: calFilterOverVEvent(compFilter{
+				PropFilter: []propFilter{{Name: "SUMMARY"}, {Name: "LOCATION"}},
+			}),
+			want: false,
+		},
+		{
+			name: "a prop-filter is scoped to its own component",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{
+				Name:       "VALARM",
+				PropFilter: []propFilter{{Name: "SUMMARY"}},
+			}}}),
+			want: false,
+		},
+		{
+			name: "the alarm's own property is in scope there",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{
+				Name:       "VALARM",
+				PropFilter: []propFilter{{Name: "TRIGGER"}},
+			}}}),
+			want: true,
+		},
+	}
+
+	h := &DavServer{}
+	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := h.eventMatchesFilter(event, tt.filter); got != tt.want {
+				t.Fatalf("eventMatchesFilter = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// RFC 4791 §7.5 requires both i;ascii-casemap and i;octet, and §9.7.5 defaults
+// the attribute to i;ascii-casemap. i;octet compares octet by octet (RFC 4790
+// §9.3), so it is the case-sensitive one.
+func TestTextMatchHonoursTheNamedCollation(t *testing.T) {
+	tests := []struct {
+		name      string
+		collation string
+		text      string
+		want      bool
+	}{
+		{name: "absent collation folds ASCII case", collation: "", text: "standup", want: true},
+		{name: "the default alias folds ASCII case", collation: "default", text: "standup", want: true},
+		{name: "i;ascii-casemap folds ASCII case", collation: "i;ascii-casemap", text: "sTaNdUp", want: true},
+		{name: "i;octet is case-sensitive", collation: "i;octet", text: "standup", want: false},
+		{name: "i;octet matches the exact octets", collation: "i;octet", text: "Standup", want: true},
+		{name: "identifiers are case-insensitive", collation: "I;OCTET", text: "Standup", want: true},
+	}
+
+	h := &DavServer{}
+	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name:      "SUMMARY",
+				TextMatch: &textMatch{Text: tt.text, Collation: tt.collation},
+			}}})
+			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+				t.Fatalf("collation %q matching %q = %v, want %v", tt.collation, tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawICAL string
+		text    string
+		want    bool
+	}{
+		{
+			name: "an escaped comma is matched as the TEXT value it represents",
+			rawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:escaped\r\n" +
+				`SUMMARY:Planning\, review` + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			text: "Planning, review",
+			want: true,
+		},
+		{
+			name: "octet matching preserves whitespace in the search text",
+			rawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:spaces\r\n" +
+				"SUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			text: " Standup ",
+			want: false,
+		},
+		{
+			name: "octet matching preserves trailing whitespace in the property value",
+			rawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:value-spaces\r\n" +
+				"SUMMARY:Standup \r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			text: "Standup ",
+			want: true,
+		},
+	}
+
+	h := &DavServer{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name: "SUMMARY",
+				TextMatch: &textMatch{
+					Text:      tt.text,
+					Collation: "i;octet",
+				},
+			}}})
+			if got := h.eventMatchesFilter(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter); got != tt.want {
+				t.Fatalf("eventMatchesFilter() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A calendar object whose stored octets do not parse matches nothing rather
+// than failing the report for every other resource in the collection.
+func TestFilterTreatsUnparseableStoredDataAsNoMatch(t *testing.T) {
+	h := &DavServer{}
+	filter := &calFilter{CompFilter: compFilter{Name: "VCALENDAR"}}
+	for _, raw := range []string{"", "ICAL", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"} {
+		if h.eventMatchesFilter(store.Event{UID: "broken", RawICAL: raw}, filter) {
+			t.Errorf("unparseable data %q matched", raw)
+		}
+	}
+}
+
+// The virtual birthday collection is the only calendar data CalCard authors, so
+// it never passes through PUT validation. Filtering it goes through the same
+// parsed-tree matcher as stored data, which this pins: a generated event has to
+// stay parseable and its properties addressable by name.
+func TestBirthdayCalendarEventsMatchScopedFilters(t *testing.T) {
+	birthday := time.Date(1990, 6, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "Dana Lee"
+	h := &DavServer{store: &store.Store{
+		Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:dana": {ID: 1, AddressBookID: 1, UID: "dana", DisplayName: &displayName, Birthday: &birthday},
+		}},
+	}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("generateBirthdayEvents() = %d events, want 1", len(events))
+	}
+
+	tests := []struct {
+		name   string
+		filter *calFilter
+		want   bool
+	}{
+		{name: "the generated VEVENT is found", filter: calFilterOverVEvent(compFilter{}), want: true},
+		{
+			name: "its SUMMARY is addressable by name",
+			filter: calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name: "SUMMARY", TextMatch: &textMatch{Text: "Dana Lee"},
+			}}}),
+			want: true,
+		},
+		{
+			name: "the server-authored extension property is addressable too",
+			filter: calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name: "X-CALCARD-TYPE", TextMatch: &textMatch{Text: "BIRTHDAY"},
+			}}}),
+			want: true,
+		},
+		{
+			name: "a DTSTART parameter is addressable",
+			filter: calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
+				Name:        "DTSTART",
+				ParamFilter: []paramFilter{{Name: "VALUE", TextMatch: &textMatch{Text: "DATE"}}},
+			}}}),
+			want: true,
+		},
+		{
+			name:   "a component it does not carry does not match",
+			filter: calFilterOverVEvent(compFilter{CompFilter: []compFilter{{Name: "VALARM"}}}),
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := h.eventMatchesFilter(events[0], tt.filter); got != tt.want {
+				t.Fatalf("eventMatchesFilter = %v, want %v for %s", got, tt.want, events[0].RawICAL)
+			}
+		})
+	}
+}
+
+// A client matches the hrefs one report returns against another's, so the
+// generated collection has to answer a multiget with the spelling its
+// calendar-query returns rather than echoing back the href the request used.
+func TestBirthdayCalendarReportsAgreeOnTheResourceHref(t *testing.T) {
+	birthday := time.Date(1990, 6, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "Dana Lee"
+	h := &DavServer{store: &store.Store{
+		Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:dana": {ID: 1, AddressBookID: 1, UID: "dana", DisplayName: &displayName, Birthday: &birthday},
+		}},
+	}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents() error = %v", err)
+	}
+	resourceName := eventResourceName(events[0])
+	collectionHref := birthdayCalendarHref()
+
+	runReport := func(t *testing.T, body string) davMultistatus {
+		t.Helper()
+		req := httptest.NewRequest("REPORT", collectionHref, strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+		h.Report(rr, req)
+		return decodeMultistatus(t, rr)
+	}
+
+	queried := runReport(t, calendarQueryBody(
+		`<D:prop><D:getetag/></D:prop><C:filter>`+grammarVEventFilter+`</C:filter>`))
+	if len(queried.Responses) != 1 {
+		t.Fatalf("calendar-query responses = %d, want 1", len(queried.Responses))
+	}
+	if len(queried.Responses[0].Hrefs) != 1 {
+		t.Fatalf("calendar-query response carries %d hrefs, want 1", len(queried.Responses[0].Hrefs))
+	}
+	want := queried.Responses[0].Hrefs[0]
+
+	// The extension is spelled the other way round from the canonical href, so
+	// an echoed response href would not match what calendar-query returned.
+	fetched := runReport(t, `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <D:href>`+collectionHref+resourceName+`.ICS</D:href>
+</C:calendar-multiget>`)
+	if len(fetched.Responses) != 1 {
+		t.Fatalf("calendar-multiget responses = %d, want 1", len(fetched.Responses))
+	}
+	fetched.Responses[0].assertHref(t, want)
+	fetched.Responses[0].assertPropStatus(t, davQN("getetag"), http.StatusOK)
 }

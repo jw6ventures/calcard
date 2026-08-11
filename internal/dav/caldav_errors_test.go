@@ -111,9 +111,9 @@ func TestCalendarObjectHrefEscapesResourceNameAsOnePathSegment(t *testing.T) {
 	}
 	for resourceName, want := range tests {
 		t.Run(resourceName, func(t *testing.T) {
-			got := calendarObjectHref(7, &store.Event{ResourceName: resourceName})
+			got := calendarObjectConflictHref(7, &store.Event{ResourceName: resourceName})
 			if got != want {
-				t.Fatalf("calendarObjectHref() = %q, want %q", got, want)
+				t.Fatalf("calendarObjectConflictHref() = %q, want %q", got, want)
 			}
 		})
 	}

@@ -677,6 +677,7 @@ func TestRFC4791_CalendarQueryReportBasic(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -770,6 +771,7 @@ func TestRFC4791_TimeRangeFilteringAccuracy(t *testing.T) {
 </C:calendar-query>`, tt.rangeStart, tt.rangeEnd)
 
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+			req.Header.Set("Depth", "1")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -841,8 +843,9 @@ func TestRFC4791_CalendarMultigetReport(t *testing.T) {
 
 // Section 7.2: support for the calendaring reports on ordinary collections is a
 // MAY. CalCard declines it, which is compliant, so this pins the decline rather
-// than asserting a requirement. The calendar-object-resource target is a
-// different matter — §7 makes it mandatory — and CalCard does not meet it.
+// than asserting a requirement. RFC 3253 §3.6 fixes the shape of that decline:
+// 403 naming DAV:supported-report under a top-level DAV:error. Calendar object
+// resources are covered by the separate mandatory-target tests below.
 func TestRFC4791_CalendarReports_OnOrdinaryCollection_AreDeclined(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -887,18 +890,21 @@ func TestRFC4791_CalendarReports_OnOrdinaryCollection_AreDeclined(t *testing.T) 
 		},
 	}
 
+	// The DAV root and the two home collections are all ordinary collections.
+	collections := []string{"/dav/", "/dav/calendars/", "/dav/addressbooks/"}
+
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("REPORT", "/dav/", strings.NewReader(tt.body))
-			req = req.WithContext(auth.WithUser(req.Context(), user))
-			rr := httptest.NewRecorder()
+		for _, collection := range collections {
+			t.Run(tt.name+" on "+collection, func(t *testing.T) {
+				req := httptest.NewRequest("REPORT", collection, strings.NewReader(tt.body))
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
 
-			h.Report(rr, req)
+				h.Report(rr, req)
 
-			if rr.Code != http.StatusForbidden {
-				t.Errorf("%s on an ordinary collection = %d, want 403 Forbidden; body: %s", tt.name, rr.Code, rr.Body.String())
-			}
-		})
+				assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+			})
+		}
 	}
 }
 
@@ -1035,9 +1041,12 @@ func TestRFC4791_CalendarQueryRejectsUnsupportedCollation(t *testing.T) {
 	}
 	user := &store.User{ID: 1}
 
-	for _, collation := range []string{"i;unicode-casemap", "i;octet", "i;made-up"} {
+	// A wildcard is refused rather than expanded, which §7.5 states as its own
+	// MUST NOT alongside the unsupported-identifier rule.
+	for _, collation := range []string{"i;unicode-casemap", "i;made-up", "i;ascii-*", "*", " i;octet "} {
 		t.Run(collation, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body(collation)))
+			req.Header.Set("Depth", "1")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -1052,6 +1061,7 @@ func TestRFC4791_CalendarQueryRejectsUnsupportedCollation(t *testing.T) {
 	for _, collation := range []string{"i;ascii-casemap", "default"} {
 		t.Run("supported/"+collation, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body(collation)))
+			req.Header.Set("Depth", "1")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -1333,6 +1343,7 @@ func TestRFC4791_CalendarQuery_CalendarDataComponentFiltering_Works(t *testing.T
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2461,6 +2472,7 @@ func TestRFC4791_TextMatchFilterInQuery(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2511,6 +2523,7 @@ func TestRFC4791_PropFilterIsNotDefined(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2603,6 +2616,7 @@ func TestRFC4791_PartialCalendarDataRetrieval(t *testing.T) {
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+			req.Header.Set("Depth", "1")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -2744,6 +2758,7 @@ func TestRFC4791_LimitRecurrenceSetInCalendarData(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2794,6 +2809,7 @@ func TestRFC4791_ExpandRecurringEventsInCalendarData(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -2839,6 +2855,7 @@ func TestRFC4791_TimeRangeFilteringWithRecurringEvents(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3035,6 +3052,7 @@ func TestRFC4791_ReadFreeBusyPrivilegeEnforcedForReports(t *testing.T) {
   </C:filter>
 </C:calendar-query>`
 	req = httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(queryBody))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
 	h.Report(rr, req)
@@ -3106,6 +3124,7 @@ func TestRFC4791_CalendarQueryWithMultipleFilters(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3120,8 +3139,8 @@ func TestRFC4791_CalendarQueryWithMultipleFilters(t *testing.T) {
 //
 // The half this asserts is that a request carrying a timezone is accepted and
 // answered normally. The half it does not is §7.3 resolution: CalCard's
-// reportRequest has no timezone field, so the element is parsed away and
-// floating values are not resolved against it.
+// reportRequest carries the value, but the time-range evaluator does not yet
+// validate it or resolve floating values against it.
 func TestRFC4791_TimezoneXMLElement(t *testing.T) {
 	start := time.Date(2024, 6, 15, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 15, 11, 0, 0, 0, time.UTC)
@@ -3174,6 +3193,7 @@ END:VCALENDAR</C:timezone>
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3312,6 +3332,7 @@ func TestRFC4791_PropFilterWithNoChildMatchesDefinedProperty(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -3364,6 +3385,7 @@ func TestRFC4791_NegateConditionInFilter(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -4019,6 +4041,7 @@ func TestRFC4791_TextMatchWithCollation(t *testing.T) {
 </C:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -4790,6 +4813,12 @@ func TestRFC4791_CalendarObjectResourceSupportedReportSet(t *testing.T) {
 				ms.assertHrefs(t, "/dav/principals/1/")
 				return
 			}
+			if name == davQN("expand-property") {
+				ms.assertHrefs(t, "/dav/calendars/1/event.ics")
+				ms.responseForHref(t, "/dav/calendars/1/event.ics").
+					assertPropstatNames(t, http.StatusNotFound, davQN("current-user-principal"))
+				return
+			}
 			ms.assertHrefs(t, "/dav/calendars/1/event.ics")
 			ms.responseForHref(t, "/dav/calendars/1/event.ics").
 				assertPropStatus(t, davQN("getetag"), http.StatusOK)
@@ -4823,9 +4852,13 @@ func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 	}
 
 	for name, body := range map[string]string{
-		"no href":          bodyForHrefs(),
-		"multiple hrefs":   bodyForHrefs("/dav/calendars/1/one.ics", "/dav/calendars/1/two.ics"),
-		"different object": bodyForHrefs("/dav/calendars/1/two.ics"),
+		"no href":             bodyForHrefs(),
+		"multiple hrefs":      bodyForHrefs("/dav/calendars/1/one.ics", "/dav/calendars/1/two.ics"),
+		"different object":    bodyForHrefs("/dav/calendars/1/two.ics"),
+		"foreign authority":   bodyForHrefs("http://other.example/dav/calendars/1/one.ics"),
+		"different scheme":    bodyForHrefs("https://example.com/dav/calendars/1/one.ics"),
+		"query component":     bodyForHrefs("http://example.com/dav/calendars/1/one.ics?view=full"),
+		"surrounding padding": bodyForHrefs(" /dav/calendars/1/one.ics "),
 	} {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/one.ics", strings.NewReader(body))
@@ -4840,18 +4873,25 @@ func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 		})
 	}
 
-	req := httptest.NewRequest("REPORT", "/dav/calendars/1/one.ics",
-		strings.NewReader(bodyForHrefs("https://example.test/dav/calendars/1/one.ics")))
-	req = req.WithContext(auth.WithUser(req.Context(), user))
-	rr := httptest.NewRecorder()
-	h.Report(rr, req)
+	for name, target := range map[string]string{
+		"absolute HTTP URI":        "http://example.com/dav/calendars/1/one.ics",
+		"absolute HTTPS URI":       "https://example.com/dav/calendars/1/one.ics",
+		"matching query component": "http://example.com/dav/calendars/1/one.ics?view=full",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", target, strings.NewReader(bodyForHrefs(target)))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("valid calendar-multiget = %d, want 207; body: %s", rr.Code, rr.Body.String())
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("valid calendar-multiget = %d, want 207; body: %s", rr.Code, rr.Body.String())
+			}
+			decodeMultistatus(t, rr).
+				responseForHref(t, "/dav/calendars/1/one.ics").
+				assertPropStatus(t, davQN("getetag"), http.StatusOK)
+		})
 	}
-	decodeMultistatus(t, rr).
-		responseForHref(t, "/dav/calendars/1/one.ics").
-		assertPropStatus(t, davQN("getetag"), http.StatusOK)
 
 	t.Run("equivalent collection alias", func(t *testing.T) {
 		slug := "work"

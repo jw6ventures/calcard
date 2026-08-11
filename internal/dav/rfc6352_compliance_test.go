@@ -2328,7 +2328,7 @@ func TestRFC6352_AddressBookCreation(t *testing.T) {
 }
 
 func TestRFC6352_ReportMethodSupport(t *testing.T) {
-	user := &store.User{ID: 1}
+	user := &store.User{ID: 1, FullName: "Test User", PrimaryEmail: "test@example.com"}
 	now := store.Now()
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -2344,15 +2344,11 @@ func TestRFC6352_ReportMethodSupport(t *testing.T) {
 
 	t.Run("Section8_1_ExpandPropertySupportedOnCollection", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
-<D:expand-property xmlns:D="DAV:">
-  <D:prop>
-    <D:current-user-principal>
-      <D:prop>
-        <D:displayname/>
-      </D:prop>
-    </D:current-user-principal>
-  </D:prop>
-</D:expand-property>`
+	<D:expand-property xmlns:D="DAV:">
+	  <D:property name="current-user-principal" namespace="DAV:">
+	    <D:property name="displayname" namespace="DAV:"/>
+	  </D:property>
+	</D:expand-property>`
 
 		req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(body))
 		req.Header.Set("Depth", "0")
@@ -2364,26 +2360,21 @@ func TestRFC6352_ReportMethodSupport(t *testing.T) {
 		if rr.Code != http.StatusMultiStatus {
 			t.Errorf("RFC 6352 Section 8.1: servers MUST support the expand-property REPORT on address book collections, got %d", rr.Code)
 		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "/dav/principals/1/") {
-			t.Errorf("expand-property on a collection should include the expanded principal href, got %s", respBody)
-		}
-		if !strings.Contains(respBody, user.PrimaryEmail) {
-			t.Errorf("expand-property on a collection should include the expanded principal properties, got %s", respBody)
-		}
+		principal := decodeMultistatus(t, rr).
+			responseForHref(t, "/dav/addressbooks/5/").
+			assertPropStatus(t, davQN("current-user-principal"), http.StatusOK)
+		expanded := responseFromElement(t, assertSoleChild(t, principal, davQN("response")))
+		expanded.assertHref(t, "/dav/principals/1/")
+		expanded.assertPropValue(t, davQN("displayname"), http.StatusOK, user.FullName)
 	})
 
 	t.Run("Section8_1_ExpandPropertySupportedOnAddressObjectResource", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
-<D:expand-property xmlns:D="DAV:">
-  <D:prop>
-    <D:current-user-principal>
-      <D:prop>
-        <D:displayname/>
-      </D:prop>
-    </D:current-user-principal>
-  </D:prop>
-</D:expand-property>`
+	<D:expand-property xmlns:D="DAV:">
+	  <D:property name="current-user-principal" namespace="DAV:">
+	    <D:property name="displayname" namespace="DAV:"/>
+	  </D:property>
+	</D:expand-property>`
 
 		req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
 		req.Header.Set("Depth", "0")

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"path"
 	"slices"
 	"strings"
@@ -259,7 +258,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
 		}
-		writeCalDAVUIDConflict(w, calendarObjectHref(calendarID, conflict))
+		writeCalDAVUIDConflict(w, calendarObjectConflictHref(calendarID, conflict))
 		return
 	case errors.Is(err, store.ErrPreconditionFailed):
 		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
@@ -329,13 +328,18 @@ func entityTags(headerValue string, allowWeak bool) []string {
 	return tags
 }
 
-// calendarObjectHref is the URL of one calendar object resource, as the
-// CALDAV:no-uid-conflict error body reports it.
-func calendarObjectHref(calendarID int64, event *store.Event) string {
+// calendarObjectConflictHref is the URL of the calendar object resource already
+// holding a UID, as the CALDAV:no-uid-conflict error body reports it.
+func calendarObjectConflictHref(calendarID int64, event *store.Event) string {
 	if event == nil {
 		return ""
 	}
-	return fmt.Sprintf("/dav/calendars/%d/%s.ics", calendarID, url.PathEscape(eventResourceName(*event)))
+	return calendarObjectHref(fmt.Sprintf("/dav/calendars/%d", calendarID), eventResourceName(*event))
+}
+
+// addressObjectConflictHref is its CardDAV:no-uid-conflict counterpart.
+func addressObjectConflictHref(addressBookID int64, resourceName string) string {
+	return addressObjectHref(fmt.Sprintf("/dav/addressbooks/%d", addressBookID), resourceName)
 }
 
 func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceName, cleanPath string) (*store.CalendarAccess, *store.Event, bool) {
@@ -409,7 +413,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 		return
 	}
 	if existingByName != nil && existingByName.UID != uid {
-		conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByName))
+		conflictHref := addressObjectConflictHref(addressBookID, contactResourceName(*existingByName))
 		writeCardDAVUIDConflict(w, conflictHref)
 		return
 	}
@@ -421,7 +425,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 		return
 	}
 	if existingByUID != nil && contactResourceName(*existingByUID) != resourceName {
-		conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*existingByUID))
+		conflictHref := addressObjectConflictHref(addressBookID, contactResourceName(*existingByUID))
 		writeCardDAVUIDConflict(w, conflictHref)
 		return
 	}
@@ -471,7 +475,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 			http.Error(w, "failed to save contact", http.StatusInternalServerError)
 			return
 		}
-		writeCardDAVUIDConflict(w, fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*result.Conflict)))
+		writeCardDAVUIDConflict(w, addressObjectConflictHref(addressBookID, contactResourceName(*result.Conflict)))
 		return
 	case errors.Is(err, store.ErrConflict):
 		writeCardDAVUIDConflict(w, cleanPath)

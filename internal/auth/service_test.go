@@ -915,6 +915,11 @@ func TestSecureRequestTrustsTLSAndForwardedProto(t *testing.T) {
 			if got := (&Service{cfg: tc.cfg}).secureRequest(req); got != tc.want {
 				t.Fatalf("secureRequest() = %t, want %t", got, tc.want)
 			}
+			// The DAV href resolver reaches the same rule through the exported
+			// entry point, so the two cannot be allowed to drift apart.
+			if got := RequestIsSecure(req, tc.cfg.TrustedProxies); got != tc.want {
+				t.Fatalf("RequestIsSecure() = %t, want %t", got, tc.want)
+			}
 		})
 	}
 }

@@ -827,6 +827,19 @@ func (r davResponse) assertHref(t *testing.T, want string) {
 	}
 }
 
+// assertResponseStatus asserts the DAV:status a response carries in place of
+// propstats, which RFC 4918 §14.24 uses when one status covers the whole
+// resource — a calendar-multiget href that resolves to nothing, for instance.
+func (r davResponse) assertResponseStatus(t *testing.T, wantStatus int) {
+	t.Helper()
+	if r.Status == "" {
+		t.Fatalf("DAV:response for %v carries no DAV:status", r.Hrefs)
+	}
+	if got := statusCodeFromLine(t, r.Status); got != wantStatus {
+		t.Errorf("DAV:response for %v status = %d, want %d", r.Hrefs, got, wantStatus)
+	}
+}
+
 // responseFromElement retypes a DAV:response that appears somewhere other than
 // as a direct child of DAV:multistatus — RFC 3253 §3.8 inlines one inside an
 // expanded property — so the nested document is asserted with the same typed

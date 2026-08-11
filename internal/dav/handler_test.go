@@ -233,7 +233,8 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", "", nil, nil)
+	request := httptest.NewRequest("REPORT", "https://cal.example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -260,7 +261,8 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", "", nil, nil)
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -269,6 +271,38 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 	}
 	if responses[0].Href != "/dav/calendars/2/test-event.ics" {
 		t.Fatalf("unexpected href %q", responses[0].Href)
+	}
+}
+
+func TestCalendarMultiGetPreservesEncodedPathSeparators(t *testing.T) {
+	repo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:team/standup": {
+				CalendarID:   2,
+				UID:          "team-standup",
+				ResourceName: "team/standup",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:team-standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "abc123",
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+
+	hrefs := []string{"/dav/calendars/2/team%2Fstandup.ics"}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
+	if err != nil {
+		t.Fatalf("calendarMultiGet returned error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(responses))
+	}
+	if responses[0].Status != httpStatusOK {
+		t.Fatalf("encoded resource href returned %q, want 200 OK", responses[0].Status)
+	}
+	if responses[0].Href != "/dav/calendars/2/team%2Fstandup.ics" {
+		t.Fatalf("response href = %q, want encoded path separator", responses[0].Href)
 	}
 }
 
@@ -342,7 +376,7 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
-	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
+	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -374,7 +408,7 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, now.Add(-time.Hour)),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -406,24 +440,9 @@ func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
+	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if !errors.Is(err, errInvalidSyncToken) {
 		t.Fatalf("expected errInvalidSyncToken, got %v", err)
-	}
-}
-
-func TestResolveDAVHrefHandlesRelativeAbsoluteAndURL(t *testing.T) {
-	base := "/dav/calendars/2/"
-	cases := map[string]string{
-		"event.ics":                                    "/dav/calendars/2/event.ics",
-		"/dav/calendars/2/absolute.ics":                "/dav/calendars/2/absolute.ics",
-		"https://example.com/dav/calendars/2/full.ics": "/dav/calendars/2/full.ics",
-		"http://example.com/dav/calendars/2/full.ics":  "/dav/calendars/2/full.ics",
-	}
-	for raw, want := range cases {
-		if got := resolveDAVHref(base, raw); got != want {
-			t.Fatalf("resolveDAVHref(%q) = %q, want %q", raw, got, want)
-		}
 	}
 }
 
@@ -442,7 +461,7 @@ func TestAddressBookMultiGetReportHandlesRelativeHrefAgainstResourceBase(t *test
 	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
 
-	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil)
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/5/alice.vcf", nil))
 	if err != nil {
 		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
@@ -909,7 +928,7 @@ func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", "", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "", report, nil)
 	if !errors.Is(err, errUnsupportedReport) {
 		t.Fatalf("calendarReportResponses error = %v, want errUnsupportedReport", err)
 	}
@@ -929,7 +948,7 @@ func TestAddressBookReportUnknownTypeIsRefused(t *testing.T) {
 	book := &store.AddressBook{ID: 4, UserID: 1, Name: "Contacts"}
 	user := &store.User{ID: 1}
 
-	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, nil)
+	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/4/", nil))
 	if !errors.Is(err, errUnsupportedReport) {
 		t.Fatalf("addressBookReportResponses error = %v, want errUnsupportedReport", err)
 	}
@@ -1200,7 +1219,8 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 
 func TestReportRequiresAuthentication(t *testing.T) {
 	h := &DavServer{}
-	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`))
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`))
+	req.Header.Set("Depth", "1")
 	rr := httptest.NewRecorder()
 
 	h.Report(rr, req)
@@ -1218,6 +1238,7 @@ func TestReportRejectsTooLargeBody(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", nil)
+	req.Header.Set("Depth", "1")
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1237,12 +1258,13 @@ func TestReportCalendarQueryReturnsEvents(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "etag"},
+			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag"},
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -1299,6 +1321,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 			name: "calendar query getetag only",
 			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
   <D:prop><D:getetag/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
 </cal:calendar-query>`,
 			want:       "<d:getetag>",
 			unwanted:   []string{"<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
@@ -1328,6 +1351,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 			name: "calendar query supported report set",
 			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
   <D:prop><D:supported-report-set/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
 </cal:calendar-query>`,
 			want:       "<d:supported-report-set>",
 			unwanted:   []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
@@ -1337,6 +1361,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 			name: "calendar query resource type",
 			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
   <D:prop><D:resourcetype/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
 </cal:calendar-query>`,
 			want:       "<d:resourcetype",
 			unwanted:   []string{"<d:getetag>", "<d:getcontenttype>", "<cal:calendar-data>"},
@@ -1346,6 +1371,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 			name: "calendar query lock discovery",
 			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
   <D:prop><D:lockdiscovery/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
 </cal:calendar-query>`,
 			want:       "opaquelocktoken:report-lock",
 			unwanted:   []string{"404 Not Found", "<d:getetag>", "<cal:calendar-data>"},
@@ -1355,6 +1381,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 			name: "calendar query unknown property",
 			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:" xmlns:x="urn:example:unknown">
   <D:prop><x:mystery/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
 </cal:calendar-query>`,
 			want:       "urn:example:unknown",
 			unwanted:   []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
@@ -1365,6 +1392,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(tc.body))
+			req.Header.Set("Depth", "1")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
 			rr := httptest.NewRecorder()
 
@@ -1821,7 +1849,7 @@ func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/keep.vcf", "/dav/addressbooks/3/skip.vcf"}
 	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
-	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil)
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/2/", nil))
 	if err != nil {
 		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
@@ -1851,7 +1879,7 @@ func TestAddressBookMultiGetMissingReturns404(t *testing.T) {
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/present.vcf", "/dav/addressbooks/2/missing.vcf"}
 	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
-	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil)
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/2/", nil))
 	if err != nil {
 		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
@@ -1882,7 +1910,7 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 	}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Book", CTag: 1, UpdatedAt: now}
 	user := &store.User{ID: 1}
-	responses, token, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, nil)
+	responses, token, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/5/", nil))
 	if err != nil {
 		t.Fatalf("addressBookReportResponses returned error: %v", err)
 	}
@@ -1921,7 +1949,7 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, then),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", "", report)
+	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -2563,7 +2591,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, nil)
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, propertySelector{})
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -2796,8 +2824,9 @@ func TestDeleteAddressBookNotFound(t *testing.T) {
 func TestReportCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/9/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
@@ -2970,7 +2999,8 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	brokenRepo := &errorEventRepo{}
 	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
-	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", "", nil, nil)
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/1/", nil)
+	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "", nil, propertySelector{}, request)
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -9014,14 +9044,19 @@ func TestCalendarQueryWithCompFilter(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	// Filter for VEVENT only
+	// Filter for VEVENT only. RFC 4791 §9.7.1 scopes the outermost comp-filter
+	// to the calendar object resource, so the component being selected is
+	// always one level in from VCALENDAR.
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
-			<cal:comp-filter name="VEVENT"/>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT"/>
+			</cal:comp-filter>
 		</cal:filter>
 	</cal:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -9059,13 +9094,16 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	// Query for events in June 2024 - filter should apply to VEVENT component
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT">
+					<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+				</cal:comp-filter>
 			</cal:comp-filter>
 		</cal:filter>
 	</cal:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -9102,21 +9140,22 @@ func TestCalendarQueryRejectsSQLLookingTimeRangeStart(t *testing.T) {
 
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z' OR '1'='1" end="20240630T235959Z"/>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT">
+					<cal:time-range start="20240601T000000Z' OR '1'='1" end="20240630T235959Z"/>
+				</cal:comp-filter>
 			</cal:comp-filter>
 		</cal:filter>
 	</cal:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected invalid time-range to return 400, got %d: %s", rr.Code, rr.Body.String())
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-filter"))
 	if strings.Contains(rr.Body.String(), "in-range.ics") || strings.Contains(rr.Body.String(), "out-range.ics") {
 		t.Fatalf("invalid time-range must not broaden query results, got %s", rr.Body.String())
 	}
@@ -9389,8 +9428,9 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 		}},
 	}}
 
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), delegate))
 	rr := httptest.NewRecorder()
 

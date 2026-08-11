@@ -55,10 +55,10 @@ func parseICalendarObject(raw string) (*icalNode, error) {
 	var stack []*icalNode
 	var root *icalNode
 	for _, rawLine := range ical.UnfoldLines(raw) {
-		line := strings.TrimSpace(rawLine)
-		if line == "" {
+		if strings.TrimSpace(rawLine) == "" {
 			continue
 		}
+		line := rawLine
 		upper := strings.ToUpper(line)
 		switch {
 		case strings.HasPrefix(upper, "BEGIN:"):

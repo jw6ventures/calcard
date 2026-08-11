@@ -217,87 +217,6 @@ var supportedCardDAVFilterParams = map[string]struct{}{
 	"TZ":        {},
 }
 
-func parseExpandPropertyRequest(body []byte) (*expandPropertyRequest, error) {
-	if len(body) == 0 {
-		return nil, nil
-	}
-	var req expandPropertyRequest
-	if err := safeUnmarshalXML(body, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
-}
-
-type expandPropertySelection struct {
-	CurrentUserPrincipal *propfindRequest
-	PrincipalURL         *propfindRequest
-}
-
-func expandPropertySelections(req *expandPropertyRequest) expandPropertySelection {
-	var selection expandPropertySelection
-	if req == nil {
-		return selection
-	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		selection.CurrentUserPrincipal = &propfindRequest{Prop: req.Prop.CurrentUserPrincipal.Prop}
-	}
-	if req.Prop.PrincipalURL != nil {
-		selection.PrincipalURL = &propfindRequest{Prop: req.Prop.PrincipalURL.Prop}
-	}
-	for _, property := range req.Property {
-		propReq := &propfindRequest{Prop: propfindQueryFromExpandProperties(property.Property)}
-		switch {
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal":
-			selection.CurrentUserPrincipal = propReq
-		case property.Namespace == "DAV:" && property.Name == "principal-URL":
-			selection.PrincipalURL = propReq
-		}
-	}
-	return selection
-}
-
-func propfindQueryFromExpandProperties(properties []expandPropertyElement) *propfindPropQuery {
-	if len(properties) == 0 {
-		return nil
-	}
-	query := &propfindPropQuery{}
-	for _, property := range properties {
-		switch {
-		case property.Namespace == "DAV:" && property.Name == "displayname":
-			query.DisplayName = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "resourcetype":
-			query.ResourceType = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal":
-			query.CurrentUserPrincipal = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal-URL":
-			query.CurrentUserPrincipalURL = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "principal-URL":
-			query.PrincipalURL = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supported-report-set":
-			query.SupportedReportSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "lockdiscovery":
-			query.LockDiscovery = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supportedlock":
-			query.SupportedLock = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "acl":
-			query.ACLProp = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supported-privilege-set":
-			query.SupportedPrivilegeSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "principal-collection-set":
-			query.PrincipalCollectionSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-privilege-set":
-			query.CurrentUserPrivilegeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:caldav" && property.Name == "calendar-home-set":
-			query.CalendarHomeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:carddav" && property.Name == "addressbook-home-set":
-			query.AddressbookHomeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:carddav" && property.Name == "principal-address":
-			query.PrincipalAddress = &struct{}{}
-		}
-	}
-	return query
-}
-
 func parseVCardProperties(raw string) []vcardProperty {
 	lines := ical.UnfoldLines(raw)
 	props := make([]vcardProperty, 0, len(lines))
@@ -603,28 +522,6 @@ func (h *DavServer) buildAddressObjectReportResponse(href string, contact store.
 	}
 	resp := resourceResponse(href, propertyStatus)
 	return resp, nil
-}
-
-func buildAddressObjectExpandPropertyResponse(href string, contact store.Contact, req *expandPropertyRequest) response {
-	resp := resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard))
-	if req == nil {
-		return resp
-	}
-
-	var notFoundProp prop
-	var notFoundSet bool
-	if req.Prop.CurrentUserPrincipal != nil {
-		notFoundProp.CurrentUserPrincipal = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		notFoundProp.PrincipalURL = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	return resp
 }
 
 func stripAddressBookAllprop(responses []response) {

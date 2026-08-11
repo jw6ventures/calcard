@@ -72,7 +72,7 @@ func TestExtensionHandlesAdditiveReportOnDefaultPath(t *testing.T) {
 }
 
 func TestExtensionReportDoesNotOverrideCoreReportByDefault(t *testing.T) {
-	reportBody := `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav"/>`
+	reportBody := `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav"><C:filter><C:comp-filter name="VCALENDAR"/></C:filter></C:calendar-query>`
 	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
@@ -85,6 +85,7 @@ func TestExtensionReportDoesNotOverrideCoreReportByDefault(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(reportBody))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 1}))
 	rec := httptest.NewRecorder()
 
@@ -215,7 +216,7 @@ func TestReportPropertyDecorationDoesNotInvokePropfindDecorator(t *testing.T) {
 	})
 	responses := []response{resourceResponse("/dav/calendars/1/event.ics", etagProp("etag", "", true))}
 
-	if _, err := s.finishReportResponses(context.Background(), &store.User{ID: 1}, responses, &reportProp{propertySelection: propertySelection{GetETag: &struct{}{}}}, false, nil); err != nil {
+	if _, err := s.finishReportResponses(context.Background(), &store.User{ID: 1}, responses, propertySelector{Prop: &reportProp{propertySelection: propertySelection{GetETag: &struct{}{}}}}, false, nil); err != nil {
 		t.Fatalf("finishReportResponses() error = %v", err)
 	}
 	if decoratorCalls != 0 {

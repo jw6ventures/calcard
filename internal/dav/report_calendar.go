@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +16,7 @@ import (
 // targetResource is the resource name when the Request-URI is a calendar object
 // resource rather than the collection, which RFC 4791 §7 supports for
 // calendar-query and calendar-multiget; it is empty for a collection target.
-func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, resolvePath, responsePath, targetResource string, report reportRequest) ([]response, string, error) {
+func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, responsePath, targetResource string, report reportRequest, request *http.Request) ([]response, string, error) {
 	// RFC 4791 §7: a report whose Request-URI names a calendar object resource
 	// runs against that resource, so a URI naming none has nothing to report on.
 	// That is a request-level 404, not a 207 saying the resource matched nothing.
@@ -31,10 +32,10 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	calData := reportCalendarData(report)
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, resolvePath, responsePath, targetResource, calData, report.Prop)
+		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, calData, report.selector, request)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.Prop)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.selector)
 		return res, "", err
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
@@ -59,127 +60,173 @@ func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter)
 	return filtered
 }
 
-// filterSubject holds the per-event text the filter nodes reuse: the
-// case-folded body for substring matching, plus its unfolded content lines for
-// exact property-name matching. Both are derived at most once per event because
-// the matchers below run once per filter node. Line unfolding is deferred
-// because most calendar-query filters carry no prop-filter at all.
-type filterSubject struct {
-	foldedICAL  string
-	foldedLines []string
-	unfolded    bool
-}
-
-func newFilterSubject(rawICAL string) filterSubject {
-	return filterSubject{foldedICAL: asciiCasemapFold(rawICAL)}
-}
-
-func (s *filterSubject) lines() []string {
-	if !s.unfolded {
-		s.foldedLines = ical.UnfoldLines(s.foldedICAL)
-		s.unfolded = true
-	}
-	return s.foldedLines
-}
-
-// definesProperty reports whether an unfolded content line declares exactly the
-// named property. Matching the whole line name rather than a "NAME:" substring
-// keeps parameterized lines (DTSTART;TZID=...) matching, stops prefixed
-// extensions (X-SUMMARY) from satisfying a SUMMARY filter, and stops a value
-// that merely contains "NAME:" from being read as a declaration.
-func (s *filterSubject) definesProperty(name string) bool {
-	want := asciiCasemapFold(strings.TrimSpace(name))
-	if want == "" {
+// eventMatchesFilter applies one CALDAV:filter to a calendar object resource.
+// RFC 4791 §9.7 scopes each filter element to a component, a property of that
+// component, or a parameter of that property, so matching runs over the parsed
+// tree rather than over the object's text: a substring search cannot tell a
+// SUMMARY value from a DESCRIPTION that quotes one. An object whose stored
+// octets do not parse matches nothing rather than failing the whole report.
+func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
+	root, err := parseICalendarObject(event.RawICAL)
+	if err != nil {
 		return false
 	}
-	for _, line := range s.lines() {
-		// Without a parameter or value delimiter the line is not a property.
-		if !strings.ContainsAny(line, ";:") {
+	// RFC 4791 §9.7.1: the outermost comp-filter is scoped to the calendar
+	// object resource itself.
+	return h.matchesCompFilter(event, []*icalNode{root}, &filter.CompFilter)
+}
+
+// matchesCompFilter applies one CALDAV:comp-filter to the components it is
+// scoped to: the calendar object at the filter root, and the children of the
+// enclosing component when nested. An empty filter matches the component's
+// existence and every child filter is conjunctive (RFC 4791 §9.7.1).
+func (h *DavServer) matchesCompFilter(event store.Event, candidates []*icalNode, filter *compFilter) bool {
+	want := asciiCasemapFold(filter.Name)
+	defined := false
+	for _, node := range candidates {
+		if want != "" && node.name != want {
 			continue
 		}
-		if ical.PropertyName(line) == want {
+		defined = true
+		if filter.IsNotDefined != nil {
+			return false
+		}
+		if h.compFilterBodyMatches(event, node, filter) {
 			return true
 		}
+	}
+	if filter.IsNotDefined != nil {
+		return !defined
 	}
 	return false
 }
 
-func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
-	subject := newFilterSubject(event.RawICAL)
-	return h.matchesCompFilter(event, &subject, &filter.CompFilter)
-}
-
-func (h *DavServer) matchesCompFilter(event store.Event, subject *filterSubject, compFilter *compFilter) bool {
-	compType := compFilter.Name
-	if compType != "" && !h.hasComponent(subject.foldedICAL, compType) {
+func (h *DavServer) compFilterBodyMatches(event store.Event, node *icalNode, filter *compFilter) bool {
+	if filter.TimeRange != nil && !h.eventInTimeRange(event, filter.TimeRange) {
 		return false
 	}
-
-	if compFilter.TimeRange != nil {
-		if !h.eventInTimeRange(event, compFilter.TimeRange) {
+	for i := range filter.PropFilter {
+		if !matchesPropFilter(node, &filter.PropFilter[i]) {
 			return false
 		}
 	}
-
-	for _, nestedFilter := range compFilter.CompFilter {
-		if !h.matchesCompFilter(event, subject, &nestedFilter) {
+	for i := range filter.CompFilter {
+		if !h.matchesCompFilter(event, node.children, &filter.CompFilter[i]) {
 			return false
 		}
 	}
-
-	for _, propFilter := range compFilter.PropFilter {
-		if !h.matchesPropFilter(subject, &propFilter) {
-			return false
-		}
-	}
-
-	if compFilter.TextMatch != nil {
-		if !h.matchesTextMatch(subject.foldedICAL, compFilter.TextMatch) {
-			return false
-		}
-	}
-
 	return true
 }
 
-func (h *DavServer) matchesPropFilter(subject *filterSubject, propFilter *propFilter) bool {
-	hasProp := subject.definesProperty(propFilter.Name)
-
-	if propFilter.IsNotDefined != nil {
-		return !hasProp
+// matchesPropFilter applies one CALDAV:prop-filter to the named property of the
+// enclosing component. An empty filter matches the property's existence, and
+// its time-range or text-match result is conjoined with every param-filter
+// (RFC 4791 §9.7.2).
+func matchesPropFilter(node *icalNode, filter *propFilter) bool {
+	want := asciiCasemapFold(filter.Name)
+	defined := false
+	for i := range node.properties {
+		property := &node.properties[i]
+		if property.name != want {
+			continue
+		}
+		defined = true
+		if filter.IsNotDefined != nil {
+			return false
+		}
+		if propFilterBodyMatches(property, filter) {
+			return true
+		}
 	}
+	if filter.IsNotDefined != nil {
+		return !defined
+	}
+	return false
+}
 
-	if !hasProp {
+func propFilterBodyMatches(property *icalProperty, filter *propFilter) bool {
+	if filter.TextMatch != nil && !matchesCalendarText(calendarTextMatchValue(property), filter.TextMatch) {
 		return false
 	}
-
-	if propFilter.TextMatch != nil {
-		return h.matchesTextMatch(subject.foldedICAL, propFilter.TextMatch)
+	if filter.TimeRange != nil && !propertyInTimeRange(property, filter.TimeRange) {
+		return false
 	}
-
+	for i := range filter.ParamFilter {
+		if !matchesParamFilter(property, &filter.ParamFilter[i]) {
+			return false
+		}
+	}
 	return true
 }
 
-// matchesTextMatch expects icalData already folded by the caller, with the same
-// collation it folds the search string with.
-func (h *DavServer) matchesTextMatch(foldedICAL string, textMatch *textMatch) bool {
-	text := strings.TrimSpace(textMatch.Text)
-	if text == "" {
-		return true
+var calendarTextProperties = nameSet(
+	"ACTION", "CALSCALE", "CATEGORIES", "CLASS", "COMMENT", "CONTACT", "DESCRIPTION",
+	"LOCATION", "METHOD", "PRODID", "RELATED-TO", "REQUEST-STATUS", "RESOURCES",
+	"STATUS", "SUMMARY", "TRANSP", "TZID", "TZNAME", "UID", "VERSION",
+)
+
+func calendarTextMatchValue(property *icalProperty) string {
+	if valueType, explicit := property.parameters["VALUE"]; explicit {
+		if strings.EqualFold(valueType, "TEXT") {
+			return unescapeCalendarText(property.value)
+		}
+		return property.value
 	}
-
-	matches := strings.Contains(foldedICAL, asciiCasemapFold(text))
-
-	if textMatch.NegateCondition == "yes" {
-		return !matches
+	if calendarTextProperties.contains(property.name) {
+		return unescapeCalendarText(property.value)
 	}
-
-	return matches
+	if _, standard := knownICalendarProperties[property.name]; !standard {
+		return unescapeCalendarText(property.value)
+	}
+	return property.value
 }
 
-// hasComponent expects icalData already folded by the caller.
-func (h *DavServer) hasComponent(foldedICAL, componentType string) bool {
-	return strings.Contains(foldedICAL, "BEGIN:"+asciiCasemapFold(componentType))
+// matchesParamFilter applies one CALDAV:param-filter to the named parameter of
+// the enclosing property. An empty filter matches the parameter's existence and
+// an optional text-match matches its value (RFC 4791 §9.7.3).
+func matchesParamFilter(property *icalProperty, filter *paramFilter) bool {
+	value, defined := property.parameters[asciiCasemapFold(filter.Name)]
+	if filter.IsNotDefined != nil {
+		return !defined
+	}
+	if !defined {
+		return false
+	}
+	if filter.TextMatch != nil {
+		return matchesCalendarText(value, filter.TextMatch)
+	}
+	return true
+}
+
+// matchesCalendarText applies one CALDAV:text-match to the single value it is
+// scoped to: a substring test under the named collation, inverted when
+// negate-condition is "yes" (RFC 4791 §9.7.5).
+func matchesCalendarText(value string, match *textMatch) bool {
+	fold, ok := calendarCollationFolder(match.Collation)
+	if !ok {
+		return false
+	}
+	matched := strings.Contains(fold(value), fold(match.Text))
+	if match.NegateCondition == "yes" {
+		return !matched
+	}
+	return matched
+}
+
+// propertyInTimeRange applies the RFC 4791 §9.9 overlap test every date-valued
+// property shares: start <= value AND end > value. This helper uses the shared
+// parser's current timezone resolution; request and collection timezone
+// selection belong to the higher-level time-range evaluator.
+func propertyInTimeRange(property *icalProperty, tr *timeRange) bool {
+	start, end, ok := calendarTimeRangeBounds(tr)
+	if !ok {
+		return false
+	}
+	value, ok := ical.ParsePropertyDateTimeLocal(property.keyPart, property.value)
+	if !ok {
+		return false
+	}
+	return !value.Before(start) && value.Before(end)
 }
 
 func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
@@ -314,17 +361,26 @@ func validCalendarFilterCollations(filter *calFilter) bool {
 }
 
 func validCompFilterCollations(filter *compFilter) bool {
-	if filter.TextMatch != nil && !calendarCollationSupported(filter.TextMatch.Collation) {
-		return false
-	}
 	for i := range filter.PropFilter {
-		propFilter := &filter.PropFilter[i]
-		if propFilter.TextMatch != nil && !calendarCollationSupported(propFilter.TextMatch.Collation) {
+		if !validPropFilterCollations(&filter.PropFilter[i]) {
 			return false
 		}
 	}
 	for i := range filter.CompFilter {
 		if !validCompFilterCollations(&filter.CompFilter[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func validPropFilterCollations(filter *propFilter) bool {
+	if filter.TextMatch != nil && !calendarCollationSupported(filter.TextMatch.Collation) {
+		return false
+	}
+	for i := range filter.ParamFilter {
+		param := &filter.ParamFilter[i]
+		if param.TextMatch != nil && !calendarCollationSupported(param.TextMatch.Collation) {
 			return false
 		}
 	}
@@ -343,6 +399,13 @@ func validCompFilterTimeRanges(filter *compFilter) bool {
 	if filter.TimeRange != nil {
 		if _, _, ok := calendarTimeRangeBounds(filter.TimeRange); !ok {
 			return false
+		}
+	}
+	for i := range filter.PropFilter {
+		if tr := filter.PropFilter[i].TimeRange; tr != nil {
+			if _, _, ok := calendarTimeRangeBounds(tr); !ok {
+				return false
+			}
 		}
 	}
 	for i := range filter.CompFilter {
@@ -550,9 +613,9 @@ func recurringEventDuration(event store.Event, component *ical.VEventComponent, 
 	return time.Hour
 }
 
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, selector propertySelector) ([]response, error) {
 	if targetResource != "" {
-		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, requested)
+		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, selector)
 	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
@@ -575,7 +638,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		if err != nil {
 			return nil, err
 		}
-		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, requested, calData, buildLimit-len(responses))...)
+		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, calData, buildLimit-len(responses))...)
 
 		lastID := events[len(events)-1].ID
 		if lastID <= afterID || len(events) < multistatusPageSize {
@@ -584,43 +647,42 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		afterID = lastID
 	}
 
-	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
 }
 
-func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, resolvePath, responsePath, targetResource string, calData *calendarDataEl, requested *reportProp) ([]response, error) {
-	if len(hrefs) == 0 {
-		return h.calendarQuery(ctx, user, cal, responsePath, targetResource, nil, calData, requested)
-	}
+func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, responsePath, targetResource string, calData *calendarDataEl, selector propertySelector, request *http.Request) ([]response, error) {
+	// RFC 4791 §9.10 requires at least one DAV:href, so the grammar pass has
+	// already refused a body carrying none: there is no hrefless multiget to
+	// answer with a dump of the collection.
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 
-	// Apple clients multiget hundreds of hrefs after a sync; fetch the events
-	// and the relevant ACL entries in one batch each instead of one event
-	// query plus one full privilege evaluation per href.
+	// Every href owes a DAV:response, so the build limit is reached after
+	// exactly that many hrefs and nothing past it is ever looked at.
 	buildLimit := h.multistatusBuildLimit()
-	uids := make([]string, 0, min(len(hrefs), buildLimit))
-	seen := make(map[string]struct{}, min(len(hrefs), buildLimit))
-	validHrefs := 0
-	for _, href := range hrefs {
-		cleanHref := resolveDAVHref(resolvePath, href)
-		if cleanHref == "" {
+	if len(hrefs) > buildLimit {
+		hrefs = hrefs[:buildLimit]
+	}
+	// Apple clients multiget hundreds of hrefs after a sync, so each href is
+	// resolved once and the events and their ACL entries are read in one batch
+	// each, instead of one event query plus one full privilege evaluation per
+	// href.
+	resolved := make([]resolvedObjectHref, len(hrefs))
+	inScope := make([]bool, len(hrefs))
+	uids := make([]string, 0, len(hrefs))
+	seen := make(map[string]struct{}, len(hrefs))
+	for i, href := range hrefs {
+		target, ok := h.resolveCalendarHrefForRequest(href, request)
+		resolved[i] = target
+		inScope[i] = ok && calendarSegmentMatches(cal, target.Segment) &&
+			multigetHrefInScope(targetResource, target.ResourceName)
+		if !inScope[i] {
 			continue
 		}
-		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
-		if !ok || !calendarSegmentMatches(cal, segment) || !multigetHrefInScope(targetResource, uid) {
+		if _, duplicate := seen[target.ResourceName]; duplicate {
 			continue
 		}
-		validHrefs++
-		if _, ok := seen[uid]; ok {
-			if validHrefs >= buildLimit {
-				break
-			}
-			continue
-		}
-		seen[uid] = struct{}{}
-		uids = append(uids, uid)
-		if validHrefs >= buildLimit {
-			break
-		}
+		seen[target.ResourceName] = struct{}{}
+		uids = append(uids, target.ResourceName)
 	}
 	// A multiget whose hrefs all fail to resolve still owes the client a
 	// response per href, so only the repository reads are skipped here.
@@ -643,21 +705,17 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	}
 	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), prefetchedACLEntries)
 
-	var responses []response
-	for _, href := range hrefs {
-		if len(responses) >= buildLimit {
-			break
-		}
-		cleanHref := resolveDAVHref(resolvePath, href)
+	responses := make([]response, 0, len(hrefs))
+	for i, href := range hrefs {
+		uid := resolved[i].ResourceName
 		// RFC 4791 §7.9: every requested href needs a DAV:response, so an
 		// unresolvable or out-of-scope one reports 404 under the best href the
 		// request gives us instead of being dropped.
-		segment, uid, ok := parseCalendarResourceSegments(cleanHref)
-		if cleanHref == "" || !ok || !calendarSegmentMatches(cal, segment) || !multigetHrefInScope(targetResource, uid) {
-			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, responsePath), Status: httpStatusNotFound})
+		if !inScope[i] {
+			responses = append(responses, response{Href: multiGetFallbackHref(href, resolved[i].Path, responsePath), Status: httpStatusNotFound})
 			continue
 		}
-		responseHref := responseBase + uid + ".ics"
+		responseHref := calendarObjectHref(responseBase, uid)
 		ev := eventsByName[uid]
 		if ev == nil {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
@@ -671,9 +729,9 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, requested, calData))
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, calData))
 	}
-	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
 }
 
 // eventsWithResourceName narrows a generated event set to the one resource an
@@ -698,7 +756,7 @@ func multigetHrefInScope(targetResource, uid string) bool {
 // calendarObjectQuery answers a calendar-query whose Request-URI is a single
 // calendar object resource (RFC 4791 §7). The filter still decides whether the
 // resource is reported, so a non-matching resource yields an empty multistatus.
-func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, requested *reportProp) ([]response, error) {
+func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, selector propertySelector) ([]response, error) {
 	event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch event")
@@ -714,8 +772,8 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, c
 			return nil, err
 		}
 	}
-	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, requested, calData, h.multistatusBuildLimit())
-	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
+	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, calData, h.multistatusBuildLimit())
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
 }
 
 func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
@@ -764,7 +822,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	responses := []response{
 		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Calendar, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
-	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, report.Prop, calData, h.multistatusBuildLimit()-len(responses))
+	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, calData, h.multistatusBuildLimit()-len(responses))
 	responses = h.appendMultistatusResponses(responses, resourceResponses)
 
 	// Include deleted resources if this is an incremental sync
@@ -785,12 +843,12 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 			if _, ok := visible[resourceName]; ok {
 				continue
 			}
-			href := collectionHref + resourceName + ".ics"
+			href := calendarObjectHref(collectionHref, resourceName)
 			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 			deletedHrefs[href] = struct{}{}
 		}
 		if h.multistatusBuildComplete(responses) {
-			responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
+			responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
 			return responses, syncToken, err
 		}
 		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "event", cal.ID, since)
@@ -805,7 +863,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 			if resourceName == "" {
 				resourceName = d.UID
 			}
-			href := collectionHref + resourceName + ".ics"
+			href := calendarObjectHref(collectionHref, resourceName)
 			if _, ok := deletedHrefs[href]; ok {
 				continue
 			}
@@ -814,7 +872,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 		}
 	}
 
-	responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
+	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
 	if err != nil {
 		return nil, "", err
 	}

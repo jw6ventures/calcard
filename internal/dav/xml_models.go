@@ -9,6 +9,12 @@ import (
 
 // XML response models and helpers for DAV PROPFIND/REPORT responses.
 
+const (
+	namespaceDAV     = "DAV:"
+	namespaceCalDAV  = "urn:ietf:params:xml:ns:caldav"
+	namespaceCardDAV = "urn:ietf:params:xml:ns:carddav"
+)
+
 type multistatus struct {
 	XMLName   xml.Name   `xml:"d:multistatus"`
 	XmlnsD    string     `xml:"xmlns:d,attr"`
@@ -110,9 +116,9 @@ type prop struct {
 	CalDAVSupportedCollationSet    *caldavSupportedCollationSet   `xml:"cal:supported-collation-set,omitempty"`
 	SyncToken                      string                         `xml:"d:sync-token,omitempty"`
 	CTag                           string                         `xml:"cs:getctag,omitempty"`
-	CurrentUserPrincipal           *expandableHrefProp            `xml:"d:current-user-principal,omitempty"`
+	CurrentUserPrincipal           *hrefProp                      `xml:"d:current-user-principal,omitempty"`
 	CurrentUserPrincipalURL        *hrefProp                      `xml:"d:current-user-principal-URL,omitempty"`
-	PrincipalURL                   *expandableHrefProp            `xml:"d:principal-URL,omitempty"`
+	PrincipalURL                   *hrefProp                      `xml:"d:principal-URL,omitempty"`
 	AlternateURISet                *hrefListProp                  `xml:"d:alternate-URI-set,omitempty"`
 	GroupMembership                *hrefListProp                  `xml:"d:group-membership,omitempty"`
 	CalendarHomeSet                *hrefListProp                  `xml:"cal:calendar-home-set,omitempty"`
@@ -279,6 +285,14 @@ type reportRequest struct {
 	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 	Prop         *reportProp       `xml:"DAV: prop"`
 	Limit        *addressbookLimit `xml:"urn:ietf:params:xml:ns:carddav limit"`
+
+	// selector and Timezone are filled by the RFC 4791 §9 grammar pass rather
+	// than by struct tags: the three property selectors are alternatives the
+	// tag decoder cannot distinguish, and CALDAV:timezone has a position in the
+	// content model as well as a value. The element is carried here rather than
+	// parsed away so the time-range evaluator can validate and use it.
+	selector propertySelector
+	Timezone string `xml:"-"`
 }
 
 // propertySelection is the shared live/dead property model used by PROPFIND
@@ -336,11 +350,15 @@ type reportProp struct {
 	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 }
 
-// calendarDataEl specifies what calendar data to return (RFC 4791 Section 9.6)
+// calendarDataEl specifies what calendar data to return (RFC 4791 §9.6). Its
+// ATTLIST defaults content-type to text/calendar and version to 2.0, so an
+// absent attribute names the same pair an explicit one would.
 type calendarDataEl struct {
-	Expand *expandEl      `xml:"urn:ietf:params:xml:ns:caldav expand"`
-	Comp   []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
-	Prop   []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
+	ContentType *string        `xml:"content-type,attr"`
+	Version     *string        `xml:"version,attr"`
+	Expand      *expandEl      `xml:"urn:ietf:params:xml:ns:caldav expand"`
+	Comp        []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
+	Prop        []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
 }
 
 // calendarComp describes component selection within calendar-data.
@@ -361,13 +379,20 @@ type expandEl struct {
 	End   string `xml:"end,attr"`
 }
 
-// propfindRequest represents a PROPFIND request body (RFC 4918 Section 9.1)
+// propfindRequest represents a PROPFIND request body (RFC 4918 Section 9.1). It
+// also carries the property selection of a DAV:expand-property REPORT, so both
+// run through one property filter.
 type propfindRequest struct {
 	XMLName      xml.Name
 	AllProp      *struct{}          `xml:"DAV: allprop"`
 	PropName     *struct{}          `xml:"DAV: propname"`
 	Prop         *propfindPropQuery `xml:"DAV: prop"`
 	suppressData bool
+	// expand and expandXML are set only by DAV:expand-property; expandErr carries
+	// the first failure back out, because the filter itself returns no error.
+	expand    expandPropertyExpander
+	expandXML expandXMLPropertyExpander
+	expandErr error
 }
 
 // propfindPropQuery lists specific properties requested
@@ -382,17 +407,30 @@ type calFilter struct {
 	CompFilter compFilter `xml:"urn:ietf:params:xml:ns:caldav comp-filter"`
 }
 
-// compFilter filters by component type and optionally by time-range
+// compFilter filters by component type and optionally by time-range. RFC 4791
+// §9.7.1 admits no text-match here: text matching is scoped to a property or a
+// parameter, never to a whole component.
 type compFilter struct {
-	Name       string       `xml:"name,attr"`
-	TimeRange  *timeRange   `xml:"urn:ietf:params:xml:ns:caldav time-range"`
-	CompFilter []compFilter `xml:"urn:ietf:params:xml:ns:caldav comp-filter"`
-	PropFilter []propFilter `xml:"urn:ietf:params:xml:ns:caldav prop-filter"`
-	TextMatch  *textMatch   `xml:"urn:ietf:params:xml:ns:caldav text-match"`
+	Name         string       `xml:"name,attr"`
+	IsNotDefined *struct{}    `xml:"urn:ietf:params:xml:ns:caldav is-not-defined"`
+	TimeRange    *timeRange   `xml:"urn:ietf:params:xml:ns:caldav time-range"`
+	CompFilter   []compFilter `xml:"urn:ietf:params:xml:ns:caldav comp-filter"`
+	PropFilter   []propFilter `xml:"urn:ietf:params:xml:ns:caldav prop-filter"`
 }
 
-// propFilter filters by property presence and optionally by text-match
+// propFilter filters by property presence and optionally by time-range or
+// text-match, each conjoined with every param-filter (RFC 4791 §9.7.2).
 type propFilter struct {
+	Name         string        `xml:"name,attr"`
+	IsNotDefined *struct{}     `xml:"urn:ietf:params:xml:ns:caldav is-not-defined"`
+	TimeRange    *timeRange    `xml:"urn:ietf:params:xml:ns:caldav time-range"`
+	TextMatch    *textMatch    `xml:"urn:ietf:params:xml:ns:caldav text-match"`
+	ParamFilter  []paramFilter `xml:"urn:ietf:params:xml:ns:caldav param-filter"`
+}
+
+// paramFilter filters by parameter presence and optionally by text-match
+// against that parameter's value (RFC 4791 §9.7.3).
+type paramFilter struct {
 	Name         string     `xml:"name,attr"`
 	IsNotDefined *struct{}  `xml:"urn:ietf:params:xml:ns:caldav is-not-defined"`
 	TextMatch    *textMatch `xml:"urn:ietf:params:xml:ns:caldav text-match"`
@@ -685,32 +723,12 @@ type proppatchProp struct {
 	CustomXML                  []xml.Name             `xml:",any"`
 }
 
+// hrefProp is a property whose value is a single DAV:href. Where the property
+// table marks one expandable, DAV:expand-property substitutes a DAV:response
+// per referenced resource (RFC 3253 §3.8); that rendering belongs to the
+// property filter, so this type carries only the plain value.
 type hrefProp struct {
 	Href string `xml:"d:href,omitempty"`
-}
-
-type expandableHrefProp struct {
-	Href     string
-	Response []response
-}
-
-func (p *expandableHrefProp) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
-	if err := enc.EncodeToken(start); err != nil {
-		return err
-	}
-	if p != nil {
-		if p.Href != "" {
-			if err := enc.EncodeElement(p.Href, xml.StartElement{Name: xml.Name{Local: "d:href"}}); err != nil {
-				return err
-			}
-		}
-		for _, resp := range p.Response {
-			if err := enc.EncodeElement(resp, xml.StartElement{Name: xml.Name{Local: "d:response"}}); err != nil {
-				return err
-			}
-		}
-	}
-	return enc.EncodeToken(start.End())
 }
 
 type hrefListProp struct {
@@ -798,64 +816,14 @@ type addressbookLimit struct {
 }
 
 type expandPropertyRequest struct {
-	XMLName  xml.Name                `xml:"DAV: expand-property"`
-	Prop     expandPropertyTarget    `xml:"DAV: prop"`
+	XMLName  xml.Name
 	Property []expandPropertyElement `xml:"DAV: property"`
-}
-
-type expandPropertyTarget struct {
-	CurrentUserPrincipal *expandPropertySpec `xml:"DAV: current-user-principal"`
-	PrincipalURL         *expandPropertySpec `xml:"DAV: principal-URL"`
-}
-
-type expandPropertySpec struct {
-	Prop *propfindPropQuery `xml:"DAV: prop"`
 }
 
 type expandPropertyElement struct {
 	Name      string                  `xml:"name,attr"`
 	Namespace string                  `xml:"namespace,attr"`
 	Property  []expandPropertyElement `xml:"DAV: property"`
-}
-
-func (e *expandPropertyElement) UnmarshalXML(dec *xml.Decoder, start xml.StartElement) error {
-	*e = expandPropertyElement{}
-	for _, attr := range start.Attr {
-		switch attr.Name.Local {
-		case "name":
-			e.Name = attr.Value
-		case "namespace":
-			e.Namespace = attr.Value
-		}
-	}
-
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		switch tok := tok.(type) {
-		case xml.StartElement:
-			if tok.Name.Space == "DAV:" && tok.Name.Local == "property" {
-				var child expandPropertyElement
-				if err := dec.DecodeElement(&child, &tok); err != nil {
-					return err
-				}
-				e.Property = append(e.Property, child)
-				continue
-			}
-			if err := dec.Skip(); err != nil {
-				return err
-			}
-		case xml.EndElement:
-			if tok.Name == start.Name {
-				return nil
-			}
-		}
-	}
 }
 
 type currentUserPrivilegeSet struct {

@@ -154,7 +154,7 @@ func escapeICalText(s string) string {
 // birthdayCalendarReportResponses runs one REPORT against the virtual birthday
 // collection. targetResource names a single generated resource when the
 // Request-URI is an object resource rather than the collection.
-func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath, targetResource string, report reportRequest) ([]response, string, error) {
+func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath, targetResource string, report reportRequest, request *http.Request) ([]response, string, error) {
 	events, err := h.generateBirthdayEvents(ctx, user.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate birthday events")
@@ -174,13 +174,13 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, cleanPath, collectionPath, targetResource, report.Prop, reportCalendarData(report))
+		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, reportCalendarData(report), request)
 		return res, "", err
 	case "calendar-query":
 		if report.Filter != nil {
 			events = h.applyCalendarFilter(events, report.Filter)
 		}
-		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.Prop, reportCalendarData(report))
+		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, reportCalendarData(report))
 		return res, "", err
 	case "free-busy-query":
 		if report.Filter != nil {
@@ -207,9 +207,9 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		responses := []response{
 			birthdayCalendarCollection(collectionHref, principalHref),
 		}
-		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, report.Prop, calData, h.multistatusBuildLimit()-len(responses))
+		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, calData, h.multistatusBuildLimit()-len(responses))
 		responses = h.appendMultistatusResponses(responses, resourceResponses)
-		responses, err = h.finishReportResponses(ctx, user, responses, report.Prop, calData != nil, nil)
+		responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
 		if err != nil {
 			return nil, "", err
 		}
@@ -221,11 +221,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	}
 }
 
-func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, resolvePath, collectionPath, targetResource string, requested *reportProp, calData *calendarDataEl) ([]response, error) {
-	if len(hrefs) == 0 {
-		return h.calendarResourceReportResponses(ctx, user, collectionPath, events, requested, calData)
-	}
-
+func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, collectionPath, targetResource string, selector propertySelector, calData *calendarDataEl, request *http.Request) ([]response, error) {
 	eventsByUID := make(map[string]store.Event)
 	for _, ev := range events {
 		eventsByUID[ev.UID] = ev
@@ -236,20 +232,25 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 		if h.multistatusBuildComplete(responses) {
 			break
 		}
-		cleanHref := resolveDAVHref(resolvePath, href)
-		// Birthday calendar uses numeric-only parsing (special virtual calendar with constant ID -1)
-		id, uid, ok := parseResourcePath(cleanHref, calendarPrefix)
+		resolved, ok := h.resolveCalendarHrefForRequest(href, request)
+		uid := resolved.ResourceName
+		// The birthday collection is addressed only by its constant ID, never by
+		// a slug, so no repository lookup can resolve its segment.
+		id, idErr := strconv.ParseInt(resolved.Segment, 10, 64)
 		// RFC 4791 §7.9: an unresolvable or out-of-scope href still owes the client a DAV:response.
-		if cleanHref == "" || !ok || id != birthdayCalendarID || !multigetHrefInScope(targetResource, uid) {
-			responses = append(responses, response{Href: multiGetFallbackHref(href, cleanHref, collectionPath), Status: httpStatusNotFound})
+		if !ok || idErr != nil || id != birthdayCalendarID || !multigetHrefInScope(targetResource, uid) {
+			responses = append(responses, response{Href: multiGetFallbackHref(href, resolved.Path, collectionPath), Status: httpStatusNotFound})
 			continue
 		}
+		// An in-scope href names a resource this collection spells one way, so
+		// the response carries that spelling rather than the client's.
+		responseHref := calendarObjectHref(collectionPath, uid)
 		ev, found := eventsByUID[uid]
 		if !found {
-			responses = append(responses, response{Href: cleanHref, Status: httpStatusNotFound})
+			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, rawCalendarResourceReportResponse(cleanHref, ev, requested, calData))
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, ev, calData))
 	}
-	return h.finishReportResponses(ctx, user, responses, requested, calData != nil, nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
 }

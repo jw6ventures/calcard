@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"net/http/httptest"
 	"sort"
 	"testing"
 
@@ -170,7 +171,8 @@ func TestCalendarMultigetFallsBackToResolvedCollectionPrivileges(t *testing.T) {
 	}}
 	h := &DavServer{store: &store.Store{Events: events}}
 
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/2/visible.ics"}, "/dav/calendars/2/", "/dav/calendars/2/", "", nil, nil)
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/2/visible.ics"}, "/dav/calendars/2/", "", nil, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet() error = %v", err)
 	}

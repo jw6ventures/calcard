@@ -249,7 +249,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	if existingByUID != nil {
 		sameSource := destCalID == srcCalID && existingByUID.UID == src.UID && eventResourceName(*existingByUID) == eventResourceName(*src)
 		if !sameSource && eventResourceName(*existingByUID) != destResourceName {
-			writeCalDAVUIDConflict(w, calendarObjectHref(destCalID, existingByUID))
+			writeCalDAVUIDConflict(w, calendarObjectConflictHref(destCalID, existingByUID))
 			return
 		}
 	}
@@ -257,7 +257,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		// A copy inside one collection would give the source's UID to a second
 		// resource, which §4.1 forbids; the source is the resource already
 		// holding it.
-		writeCalDAVUIDConflict(w, calendarObjectHref(srcCalID, src))
+		writeCalDAVUIDConflict(w, calendarObjectConflictHref(srcCalID, src))
 		return
 	}
 	if existing != nil && !overwrite {
@@ -376,7 +376,7 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 		return
 	}
 	if srcBookID == destBookID {
-		conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", srcBookID, contactResourceName(*src))
+		conflictHref := addressObjectConflictHref(srcBookID, contactResourceName(*src))
 		writeCardDAVUIDConflict(w, conflictHref)
 		return
 	}
@@ -392,7 +392,7 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 	if existingByUID != nil {
 		sameSource := destBookID == srcBookID && existingByUID.UID == src.UID && contactResourceName(*existingByUID) == contactResourceName(*src)
 		if !sameSource && contactResourceName(*existingByUID) != destResourceName {
-			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", destBookID, contactResourceName(*existingByUID))
+			conflictHref := addressObjectConflictHref(destBookID, contactResourceName(*existingByUID))
 			writeCardDAVUIDConflict(w, conflictHref)
 			return
 		}
@@ -592,7 +592,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	if existingByUID != nil {
 		sameSource := destCalID == srcCalID && existingByUID.UID == src.UID && eventResourceName(*existingByUID) == eventResourceName(*src)
 		if !sameSource && eventResourceName(*existingByUID) != destResourceName {
-			writeCalDAVUIDConflict(w, calendarObjectHref(destCalID, existingByUID))
+			writeCalDAVUIDConflict(w, calendarObjectConflictHref(destCalID, existingByUID))
 			return
 		}
 	}
@@ -664,7 +664,7 @@ func (h *DavServer) writeCalendarTransferError(w http.ResponseWriter, r *http.Re
 	switch {
 	case errors.Is(err, store.ErrUIDConflict):
 		if result != nil && result.Conflict != nil {
-			writeCalDAVUIDConflict(w, calendarObjectHref(calendarID, result.Conflict))
+			writeCalDAVUIDConflict(w, calendarObjectConflictHref(calendarID, result.Conflict))
 			return true
 		}
 		h.writeCalendarCopyMoveConflict(w, r, calendarID, resourceName, uid)
@@ -703,7 +703,7 @@ func (h *DavServer) writeCalendarCopyMoveConflict(w http.ResponseWriter, r *http
 		http.Error(w, "failed to resolve event conflict", http.StatusInternalServerError)
 		return
 	}
-	writeCalDAVUIDConflict(w, calendarObjectHref(calendarID, conflict))
+	writeCalDAVUIDConflict(w, calendarObjectConflictHref(calendarID, conflict))
 }
 
 func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
@@ -784,7 +784,7 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 	if existingByUID != nil {
 		sameSource := destBookID == srcBookID && existingByUID.UID == src.UID && contactResourceName(*existingByUID) == contactResourceName(*src)
 		if !sameSource && contactResourceName(*existingByUID) != destResourceName {
-			conflictHref := fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", destBookID, contactResourceName(*existingByUID))
+			conflictHref := addressObjectConflictHref(destBookID, contactResourceName(*existingByUID))
 			writeCardDAVUIDConflict(w, conflictHref)
 			return
 		}
@@ -847,10 +847,10 @@ func (h *DavServer) writeContactCopyMoveConflict(w http.ResponseWriter, r *http.
 		conflict = byUID
 	}
 	if conflict == nil {
-		writeCardDAVUIDConflict(w, fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, resourceName))
+		writeCardDAVUIDConflict(w, addressObjectConflictHref(addressBookID, resourceName))
 		return
 	}
-	writeCardDAVUIDConflict(w, fmt.Sprintf("/dav/addressbooks/%d/%s.vcf", addressBookID, contactResourceName(*conflict)))
+	writeCardDAVUIDConflict(w, addressObjectConflictHref(addressBookID, contactResourceName(*conflict)))
 }
 
 func (h *DavServer) requireAddressBookDestinationWritePrivileges(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, existing *store.Contact) error {

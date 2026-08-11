@@ -123,7 +123,7 @@ func TestReportDecorationBatchesLockACLAndDeadPropertyQueries(t *testing.T) {
 	requested := &reportProp{propertySelection: propertySelection{LockDiscovery: &struct{}{}, ACLProp: &struct{}{}}}
 	ctx := withDAVRequestState(auth.WithUser(context.Background(), user))
 
-	responses, err := h.calendarResourceReportResponses(ctx, user, "/dav/calendars/1/", events, requested, nil)
+	responses, err := h.calendarResourceReportResponses(ctx, user, "/dav/calendars/1/", events, propertySelector{Prop: requested}, nil)
 	if err != nil {
 		t.Fatalf("calendarResourceReportResponses() error = %v", err)
 	}
@@ -308,7 +308,7 @@ func TestCalendarReportsResolveDeadPropertiesLikePropfind(t *testing.T) {
 	}{
 		{
 			name: "calendar query",
-			body: `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:" xmlns:X="urn:test"><D:prop><X:note/></D:prop></C:calendar-query>`,
+			body: `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:" xmlns:X="urn:test"><D:prop><X:note/></D:prop><C:filter><C:comp-filter name="VCALENDAR"/></C:filter></C:calendar-query>`,
 		},
 		{
 			name: "calendar multiget",
@@ -322,6 +322,10 @@ func TestCalendarReportsResolveDeadPropertiesLikePropfind(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			request := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(tt.body))
+			// RFC 4791 §7.8 processes a calendar-query with no Depth header as
+			// Depth: 0, which reaches the collection alone; the members these
+			// cases assert on need Depth: 1.
+			request.Header.Set("Depth", "1")
 			request = request.WithContext(auth.WithUser(request.Context(), user))
 			response := httptest.NewRecorder()
 

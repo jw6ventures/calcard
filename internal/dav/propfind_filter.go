@@ -54,10 +54,47 @@ type propfindPropertySpec struct {
 	// principal may not read from an absent property. RFC 3744 assigns those
 	// cases a property-level 403, not a 404.
 	forbidden func(src *prop) bool
-	copyValue func(dst, src *prop, q *propfindPropQuery)
+	// hrefs lists direct DAV:href values. expandValue supplies a compound value
+	// whose nested hrefs need the recursive XML expander instead.
+	hrefs       func(src *prop) []string
+	expandValue func(src *prop) any
+	copyValue   func(dst, src *prop, q *propfindPropQuery)
 }
 
 func davName(local string) xml.Name { return xml.Name{Local: local} }
+
+// propfindPrefixNamespaces resolves the wire prefixes emptyName carries back to
+// the namespaces a request names them by. The table stores the prefixed form
+// because that is what the multistatus declares.
+var propfindPrefixNamespaces = map[string]string{
+	"d":    namespaceDAV,
+	"cal":  namespaceCalDAV,
+	"card": namespaceCardDAV,
+	"cs":   "http://calendarserver.org/ns/",
+	"ical": "http://apple.com/ns/ical/",
+}
+
+func (s *propfindPropertySpec) qname() xml.Name {
+	prefix, local, found := strings.Cut(s.emptyName.Local, ":")
+	if !found {
+		return xml.Name{Local: s.emptyName.Local}
+	}
+	return xml.Name{Space: propfindPrefixNamespaces[prefix], Local: local}
+}
+
+func singleHref(p *hrefProp) []string {
+	if p == nil || p.Href == "" {
+		return nil
+	}
+	return []string{p.Href}
+}
+
+func listHrefs(p *hrefListProp) []string {
+	if p == nil {
+		return nil
+	}
+	return p.Href
+}
 
 var propfindPropertyTable = []propfindPropertySpec{
 	{
@@ -191,12 +228,14 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName: davName("d:current-user-principal"),
+		hrefs:     func(src *prop) []string { return singleHref(src.CurrentUserPrincipal) },
 		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrincipal != nil },
 		ok:        kindCollections,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CurrentUserPrincipal = src.CurrentUserPrincipal },
 	},
 	{
 		emptyName: davName("d:current-user-principal-URL"),
+		hrefs:     func(src *prop) []string { return singleHref(src.CurrentUserPrincipalURL) },
 		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrincipalURL != nil },
 		ok:        kindCollections,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
@@ -205,12 +244,14 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName: davName("d:principal-URL"),
+		hrefs:     func(src *prop) []string { return singleHref(src.PrincipalURL) },
 		requested: func(q *propfindPropQuery) bool { return q.PrincipalURL != nil },
 		ok:        kindPrincipal,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalURL = src.PrincipalURL },
 	},
 	{
 		emptyName:     davName("d:alternate-URI-set"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.AlternateURISet) },
 		requested:     func(q *propfindPropQuery) bool { return q.AlternateURISet != nil },
 		ok:            kindPrincipal,
 		alwaysDefined: true,
@@ -218,6 +259,7 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName:     davName("d:group-membership"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.GroupMembership) },
 		requested:     func(q *propfindPropQuery) bool { return q.GroupMembership != nil },
 		ok:            kindPrincipal,
 		alwaysDefined: true,
@@ -225,18 +267,21 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName: davName("cal:calendar-home-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.CalendarHomeSet) },
 		requested: func(q *propfindPropQuery) bool { return q.CalendarHomeSet != nil },
 		ok:        kindPrincipal,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarHomeSet = src.CalendarHomeSet },
 	},
 	{
 		emptyName: davName("card:addressbook-home-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.AddressbookHomeSet) },
 		requested: func(q *propfindPropQuery) bool { return q.AddressbookHomeSet != nil },
 		ok:        kindPrincipal | kindAddressBookCollection,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.AddressbookHomeSet = src.AddressbookHomeSet },
 	},
 	{
 		emptyName: davName("card:principal-address"),
+		hrefs:     func(src *prop) []string { return singleHref(src.PrincipalAddress) },
 		requested: func(q *propfindPropQuery) bool { return q.PrincipalAddress != nil },
 	},
 	{
@@ -328,10 +373,11 @@ var propfindPropertyTable = []propfindPropertySpec{
 		},
 	},
 	{
-		emptyName: davName("d:lockdiscovery"),
-		requested: func(q *propfindPropQuery) bool { return q.LockDiscovery != nil },
-		ok:        kindAll,
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.LockDiscovery = src.LockDiscovery },
+		emptyName:   davName("d:lockdiscovery"),
+		requested:   func(q *propfindPropQuery) bool { return q.LockDiscovery != nil },
+		ok:          kindAll,
+		expandValue: func(src *prop) any { return src.LockDiscovery },
+		copyValue:   func(dst, src *prop, _ *propfindPropQuery) { dst.LockDiscovery = src.LockDiscovery },
 	},
 	{
 		emptyName: davName("d:supportedlock"),
@@ -341,23 +387,26 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName: davName("d:owner"),
+		hrefs:     func(src *prop) []string { return singleHref(src.Owner) },
 		requested: func(q *propfindPropQuery) bool { return q.Owner != nil },
 		ok:        kindAll,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.Owner = src.Owner },
 	},
 	{
 		emptyName:     davName("d:group"),
+		hrefs:         func(src *prop) []string { return singleHref(src.Group) },
 		requested:     func(q *propfindPropQuery) bool { return q.Group != nil },
 		ok:            kindAll,
 		alwaysDefined: true,
 		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.Group = src.Group },
 	},
 	{
-		emptyName: davName("d:acl"),
-		requested: func(q *propfindPropQuery) bool { return q.ACLProp != nil },
-		ok:        kindAll,
-		forbidden: func(src *prop) bool { return src.aclForbidden },
-		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.ACL = src.ACL },
+		emptyName:   davName("d:acl"),
+		requested:   func(q *propfindPropQuery) bool { return q.ACLProp != nil },
+		ok:          kindAll,
+		forbidden:   func(src *prop) bool { return src.aclForbidden },
+		expandValue: func(src *prop) any { return src.ACL },
+		copyValue:   func(dst, src *prop, _ *propfindPropQuery) { dst.ACL = src.ACL },
 	},
 	{
 		emptyName: davName("d:supported-privilege-set"),
@@ -374,6 +423,7 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName:     davName("d:inherited-acl-set"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.InheritedACLSet) },
 		requested:     func(q *propfindPropQuery) bool { return q.InheritedACLSet != nil },
 		ok:            kindAll,
 		alwaysDefined: true,
@@ -381,6 +431,7 @@ var propfindPropertyTable = []propfindPropertySpec{
 	},
 	{
 		emptyName: davName("d:principal-collection-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.PrincipalCollectionSet) },
 		requested: func(q *propfindPropQuery) bool { return q.PrincipalCollectionSet != nil },
 		ok:        kindAll,
 		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalCollectionSet = src.PrincipalCollectionSet },
@@ -441,6 +492,12 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 			continue
 		}
 		okSet = true
+		if expanded, ok := req.expandProperty(spec, &src); ok {
+			// RFC 3253 §3.8: the hrefs are replaced by a DAV:response for each
+			// resource they reference, under the property's own name.
+			okProp.setCustomXMLProperty(expanded)
+			continue
+		}
 		if spec.emptyValue != nil && spec.emptyValue(&src) {
 			// Present-empty: render an explicit empty element in the 200
 			// propstat instead of copying a value that omitempty would drop.
@@ -454,6 +511,9 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 			continue
 		}
 		if property, ok := src.customXMLProperty(name); ok {
+			if expanded, ok := req.expandCustomXMLProperty(property); ok {
+				property = expanded
+			}
 			okProp.setCustomXMLProperty(property)
 			okSet = true
 		} else {

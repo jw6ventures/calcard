@@ -2,6 +2,30 @@ package dav
 
 import "strings"
 
+// supportedCalendarDataRequest reports whether a CALDAV:calendar-data in a
+// calendaring REPORT names a media type the server can return. RFC 4791 §7.8
+// and §7.9 make an unsupported content-type or version a
+// CALDAV:supported-calendar-data failure, and §9.6 defaults both attributes to
+// the single pair CALDAV:supported-calendar-data advertises. Distinct from the
+// §5.3.2.1 precondition of the same name, which governs stored data.
+func supportedCalendarDataRequest(calData *calendarDataEl) bool {
+	if calData == nil {
+		return true
+	}
+	if calData.ContentType != nil && !strings.EqualFold(*calData.ContentType, "text/calendar") {
+		return false
+	}
+	if calData.Version == nil {
+		return true
+	}
+	for _, supported := range calendarDataVersions {
+		if *calData.Version == supported {
+			return true
+		}
+	}
+	return false
+}
+
 func reportCalendarData(report reportRequest) *calendarDataEl {
 	if report.Prop != nil && report.Prop.CalendarData != nil {
 		return report.Prop.CalendarData

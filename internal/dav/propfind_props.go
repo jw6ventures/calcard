@@ -282,7 +282,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 
 	if user != nil && p.CurrentUserPrincipal == nil {
 		principalHref := h.principalURL(user)
-		p.CurrentUserPrincipal = &expandableHrefProp{Href: principalHref}
+		p.CurrentUserPrincipal = &hrefProp{Href: principalHref}
 		p.CurrentUserPrincipalURL = &hrefProp{Href: principalHref}
 	}
 	if mask.currentUserPrivilegeSet && user != nil {

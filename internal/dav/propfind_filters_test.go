@@ -228,9 +228,9 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 		Prop: prop{
 			DisplayName:             stringPtr("User One"),
 			ResourceType:            &resourceType{Principal: &struct{}{}},
-			CurrentUserPrincipal:    &expandableHrefProp{Href: "/dav/principals/1/"},
+			CurrentUserPrincipal:    &hrefProp{Href: "/dav/principals/1/"},
 			CurrentUserPrincipalURL: &hrefProp{Href: "/dav/principals/1/"},
-			PrincipalURL:            &expandableHrefProp{Href: "/dav/principals/1/"},
+			PrincipalURL:            &hrefProp{Href: "/dav/principals/1/"},
 			CalendarHomeSet:         &hrefListProp{Href: []string{"/dav/calendars/"}},
 			AddressbookHomeSet:      &hrefListProp{Href: []string{"/dav/addressbooks/"}},
 			SupportedReportSet:      &supportedReportSet{},

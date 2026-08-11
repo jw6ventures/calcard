@@ -3,11 +3,13 @@ package dav
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -247,40 +249,140 @@ func normalizeDAVHref(raw string) string {
 	return cleaned
 }
 
-func resolveDAVHref(basePath, rawHref string) string {
-	trimmed := strings.TrimSpace(rawHref)
-	if trimmed == "" {
-		return ""
+// requestScheme is the scheme the client used to reach this server, which an
+// absolute DAV:href has to match to name the same resource (RFC 3986 §6.2.1).
+// http.Server leaves URL.Scheme empty and a TLS-terminating proxy leaves r.TLS
+// nil, so behind one the only truthful answer comes from X-Forwarded-Proto,
+// trusted on the terms internal/auth already sets for it. The configured base
+// URL is the last resort, for a proxy that forwards no such header.
+func (h *DavServer) requestScheme(r *http.Request) string {
+	if r.URL.Scheme != "" {
+		return strings.ToLower(r.URL.Scheme)
 	}
-	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
-		if u, err := url.Parse(trimmed); err == nil {
-			return normalizeDAVHref(u.Path)
-		}
-		return ""
+	var trustedProxies []string
+	if h != nil && h.cfg != nil {
+		trustedProxies = h.cfg.TrustedProxies
 	}
-	if strings.HasPrefix(trimmed, "/") {
-		return normalizeDAVHref(trimmed)
+	if auth.RequestIsSecure(r, trustedProxies) {
+		return "https"
 	}
-	if u, err := url.Parse(trimmed); err == nil && u.Path != "" {
-		if strings.HasPrefix(u.Path, "/") {
-			return normalizeDAVHref(u.Path)
-		}
-		trimmed = u.Path
-	}
-	base := normalizeDAVHref(basePath)
-	if base == "" {
-		base = "/"
-	}
-	if !strings.HasSuffix(base, "/") {
-		if _, _, ok := parseCalendarResourceSegments(base); ok {
-			base = path.Dir(base) + "/"
-		} else if _, _, ok := parseAddressBookResourceSegments(base); ok {
-			base = path.Dir(base) + "/"
-		} else {
-			base += "/"
+	if h != nil && h.cfg != nil {
+		if baseURL, err := url.Parse(h.cfg.BaseURL); err == nil &&
+			(strings.EqualFold(baseURL.Scheme, "http") || strings.EqualFold(baseURL.Scheme, "https")) {
+			return strings.ToLower(baseURL.Scheme)
 		}
 	}
-	return normalizeDAVHref(path.Join(base, trimmed))
+	return "http"
+}
+
+func (h *DavServer) resolveDAVHrefReference(rawHref, basePath string, r *http.Request) (*url.URL, bool) {
+	if r == nil || r.URL == nil || rawHref == "" || strings.TrimSpace(rawHref) != rawHref {
+		return nil, false
+	}
+	reference, err := url.Parse(rawHref)
+	if err != nil || reference.User != nil || reference.Fragment != "" {
+		return nil, false
+	}
+
+	requestURI := &url.URL{
+		Scheme:     h.requestScheme(r),
+		Host:       r.Host,
+		Path:       r.URL.Path,
+		RawPath:    r.URL.RawPath,
+		RawQuery:   r.URL.RawQuery,
+		ForceQuery: r.URL.ForceQuery,
+	}
+	baseURI := *requestURI
+	if basePath != "" {
+		base, parseErr := url.Parse(basePath)
+		if parseErr != nil || base.Scheme != "" || base.Host != "" || base.User != nil || base.Fragment != "" {
+			return nil, false
+		}
+		baseURI.Path = base.Path
+		baseURI.RawPath = base.RawPath
+	}
+	resolved := baseURI.ResolveReference(reference)
+	if resolved.User != nil || !strings.EqualFold(resolved.Scheme, requestURI.Scheme) ||
+		!strings.EqualFold(resolved.Host, requestURI.Host) || resolved.RawQuery != requestURI.RawQuery ||
+		resolved.ForceQuery != requestURI.ForceQuery || resolved.Fragment != "" {
+		return nil, false
+	}
+	return resolved, true
+}
+
+// davHrefReferenceBase is the base a DAV:href in a request body resolves
+// against. RFC 3986 §5.2.2 discards the last segment of a base that does not end
+// in "/", so a collection Request-URI written without its trailing slash needs
+// the slash restored or a relative href would resolve above the collection
+// holding the resource it names. A Request-URI naming an object resource wants
+// that same discard and is left alone.
+func davHrefReferenceBase(requestPath string) string {
+	cleanPath := normalizeDAVHref(requestPath)
+	if target := parseDAVTarget(cleanPath); target.Valid && target.Resource {
+		return cleanPath
+	}
+	return ensureCollectionHref(cleanPath)
+}
+
+// resolvedObjectHref is one DAV:href from a request body resolved against the
+// Request-URI. Path is the percent-encoded path it names and is set whenever
+// the href resolved at all, including when it names no object resource, so a
+// response can still carry the best href the request gave for it.
+type resolvedObjectHref struct {
+	Path         string
+	Segment      string
+	ResourceName string
+}
+
+// resolveCalendarHrefForRequest and resolveAddressBookHrefForRequest resolve one
+// DAV:href from a multiget body against the Request-URI and split the result
+// into its collection segment and resource name. The bool reports whether the
+// href names an object resource in that domain, not whether it resolved.
+func (h *DavServer) resolveCalendarHrefForRequest(rawHref string, r *http.Request) (resolvedObjectHref, bool) {
+	return h.resolveObjectHrefForRequest(rawHref, calendarPrefix, r)
+}
+
+func (h *DavServer) resolveAddressBookHrefForRequest(rawHref string, r *http.Request) (resolvedObjectHref, bool) {
+	return h.resolveObjectHrefForRequest(rawHref, addressBookPrefix, r)
+}
+
+func (h *DavServer) resolveObjectHrefForRequest(rawHref, prefix string, r *http.Request) (resolvedObjectHref, bool) {
+	if r == nil || r.URL == nil {
+		return resolvedObjectHref{}, false
+	}
+	resolved, ok := h.resolveDAVHrefReference(rawHref, davHrefReferenceBase(r.URL.Path), r)
+	if !ok {
+		return resolvedObjectHref{}, false
+	}
+	cleanPath := path.Clean(resolved.EscapedPath())
+	segment, resourceName, ok := parseEscapedResourcePath(cleanPath, prefix)
+	return resolvedObjectHref{Path: cleanPath, Segment: segment, ResourceName: resourceName}, ok
+}
+
+// parseEscapedResourcePath splits an already-cleaned object-resource path that
+// is still percent-encoded, which is the form a resolved DAV:href arrives in.
+func parseEscapedResourcePath(cleanPath, prefix string) (string, string, bool) {
+	collectionPrefix := prefix + "/"
+	if !strings.HasPrefix(cleanPath, collectionPrefix) {
+		return "", "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(cleanPath, collectionPrefix), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	segment, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", false
+	}
+	resourceSegment, err := url.PathUnescape(parts[1])
+	if err != nil {
+		return "", "", false
+	}
+	resourceName := strings.TrimSuffix(resourceSegment, path.Ext(resourceSegment))
+	if segment == "" || resourceName == "" {
+		return "", "", false
+	}
+	return segment, resourceName, true
 }
 
 // isValidCalendarSlug validates calendar slugs for path safety.
