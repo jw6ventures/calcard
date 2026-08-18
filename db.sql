@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.11')
+VALUES ('version', 'v1.1.12')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -367,11 +367,14 @@ CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
 ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
 
+-- These expressions have to match the ListForCalendarFiltered predicates
+-- verbatim or the indexes stop applying; internal/store/postgres.go carries why
+-- each COALESCE reads the columns it does.
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
-    ON events (calendar_id, COALESCE(recurrence_start, dtstart));
+    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
-    ON events (calendar_id, COALESCE(recurrence_until, dtend, dtstart));
+    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
 
 -- Persistent WebDAV dead properties and batched ACL lookup support.
 CREATE TABLE IF NOT EXISTS dav_dead_properties (

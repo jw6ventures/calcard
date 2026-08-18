@@ -321,3 +321,77 @@ type davExtensionFunc func(*dav.Registry)
 func (f davExtensionFunc) RegisterDAV(r *dav.Registry) {
 	f(r)
 }
+
+// chi's middleware.RealIP rewrites r.RemoteAddr from client-supplied headers
+// with no trust check, and it runs ahead of everything that later reads that
+// field to decide whether the request is trustworthy. Once a deployment names
+// its trusted proxies, the rewrite must happen only for those peers.
+func TestTrustedRealIPOnlyRewritesForConfiguredProxies(t *testing.T) {
+	tests := []struct {
+		name           string
+		trustedProxies []string
+		remoteAddr     string
+		want           string
+	}{
+		{
+			name:           "a trusted proxy's forwarded address is adopted",
+			trustedProxies: []string{"10.0.0.0/8"},
+			remoteAddr:     "10.1.2.3:4567",
+			want:           "198.51.100.7",
+		},
+		{
+			name:           "an untrusted peer cannot name its own address",
+			trustedProxies: []string{"10.0.0.0/8"},
+			remoteAddr:     "203.0.113.9:4567",
+			want:           "203.0.113.9:4567",
+		},
+		{
+			// Unconfigured deployments trust every peer's forwarded headers;
+			// the config loader warns about it at startup.
+			name:       "no configured proxies keeps the forwarded address",
+			remoteAddr: "203.0.113.9:4567",
+			want:       "198.51.100.7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var seen string
+			handler := trustedRealIP(tt.trustedProxies)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				seen = r.RemoteAddr
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			req.Header.Set("X-Real-IP", "198.51.100.7")
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			if seen != tt.want {
+				t.Fatalf("RemoteAddr = %q, want %q", seen, tt.want)
+			}
+		})
+	}
+}
+
+// The end-to-end shape of the same defect: a client on an untrusted address
+// claiming to be a trusted proxy, over a cleartext connection it also claims is
+// TLS, must not be offered or granted HTTP Basic.
+func TestSpoofedForwardedHeadersDoNotUnlockBasicOverCleartext(t *testing.T) {
+	trustedProxies := []string{"10.0.0.0/8"}
+	var secure bool
+	handler := trustedRealIP(trustedProxies)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		secure = auth.RequestIsSecure(r, trustedProxies)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+	req.RemoteAddr = "203.0.113.9:4567"
+	req.Header.Set("X-Real-IP", "10.1.2.3")
+	req.Header.Set("X-Forwarded-For", "10.1.2.3")
+	req.Header.Set("True-Client-IP", "10.1.2.3")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if secure {
+		t.Fatal("a spoofed X-Real-IP made a cleartext request look secure, which would unlock HTTP Basic")
+	}
+}

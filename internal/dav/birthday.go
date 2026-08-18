@@ -178,21 +178,15 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		return res, "", err
 	case "calendar-query":
 		if report.Filter != nil {
-			events = h.applyCalendarFilter(events, report.Filter)
+			// The collection is generated rather than stored, so it defines no
+			// CALDAV:calendar-timezone of its own and §7.3 resolves floating
+			// values against the request's CALDAV:timezone, else UTC. Its
+			// entries are DTSTART;VALUE=DATE, so the zone decides which instants
+			// the implied day covers.
+			events = applyCalendarFilter(events, report.Filter, reportFloatingZone(report.Timezone, nil))
 		}
 		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, reportCalendarData(report))
 		return res, "", err
-	case "free-busy-query":
-		if report.Filter != nil {
-			events = h.applyCalendarFilter(events, report.Filter)
-		}
-		if report.TimeRange != nil {
-			events = h.filterCalendarEventsByTimeRange(events, report.TimeRange)
-		}
-		freeBusyData := h.generateFreeBusy(events, report.Filter, report.TimeRange)
-		href := strings.TrimSuffix(cleanPath, "/") + "/freebusy.ics"
-		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(freeBusyData)))
-		return []response{resourceResponse(href, etagProp(etag, freeBusyData, true))}, "", nil
 	case "sync-collection":
 		if report.SyncToken != "" {
 			info, err := parseSyncToken(report.SyncToken)

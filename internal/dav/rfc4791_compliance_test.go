@@ -745,12 +745,17 @@ func TestRFC4791_TimeRangeFilteringAccuracy(t *testing.T) {
 					{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 				},
 			}
+			// The time-range test reads the component the filter names, so the
+			// stored octets carry the schedule rather than the denormalized
+			// dtstart/dtend columns the query plan narrows on.
+			raw := fmt.Sprintf("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:%s\r\nDTEND:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				tt.eventStart.Format("20060102T150405Z"), tt.eventEnd.Format("20060102T150405Z"))
 			eventRepo := &fakeEventRepo{
 				events: map[string]*store.Event{
 					"1:test": {
 						CalendarID: 1,
 						UID:        "test",
-						RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						RawICAL:    raw,
 						ETag:       "e",
 						DTStart:    &tt.eventStart,
 						DTEnd:      &tt.eventEnd,
@@ -923,7 +928,7 @@ func TestRFC4791_FreeBusyQueryReport(t *testing.T) {
 			"1:event": {
 				CalendarID: 1,
 				UID:        "event",
-				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 				ETag:       "e",
 				DTStart:    &start,
 				DTEnd:      &end,
@@ -950,23 +955,61 @@ func TestRFC4791_FreeBusyQueryReport(t *testing.T) {
 	}
 	assertMediaType(t, rr, "text/calendar")
 
-	respBody := rr.Body.String()
-	// RFC 4791 Section 7.10: Response must contain VFREEBUSY component
-	if !strings.Contains(respBody, "BEGIN:VFREEBUSY") {
-		t.Error("RFC 4791 Section 7.10: Response must contain VFREEBUSY component")
+	// §7.10 makes the body an iCalendar object with exactly one VFREEBUSY, so
+	// it is parsed and its component asserted rather than searched for text.
+	root, err := parseICalendarObject(rr.Body.String())
+	if err != nil {
+		t.Fatalf("RFC 4791 Section 7.10: response is not a valid iCalendar object: %v (%s)", err, rr.Body.String())
 	}
-	if !strings.Contains(respBody, "END:VFREEBUSY") {
-		t.Error("RFC 4791 Section 7.10: Response must have complete VFREEBUSY component")
+	if got := root.childCount("VFREEBUSY"); got != 1 {
+		t.Fatalf("RFC 4791 Section 7.10: response carries %d VFREEBUSY components, want exactly 1", got)
 	}
-	if strings.Count(respBody, "BEGIN:VFREEBUSY") != 1 || strings.Count(respBody, "END:VFREEBUSY") != 1 {
-		t.Error("RFC 4791 Section 7.10: Response must contain exactly one VFREEBUSY component")
+	freeBusy, _ := namedComponent(root, "VFREEBUSY")
+
+	// RFC 5545 §3.6.4 makes UID and DTSTAMP both REQUIRED in a VFREEBUSY.
+	for _, required := range []string{"UID", "DTSTAMP"} {
+		if freeBusy.count(required) != 1 {
+			t.Errorf("RFC 5545 Section 3.6.4: VFREEBUSY must carry exactly one %s, got %d", required, freeBusy.count(required))
+		}
 	}
-	// Must include FREEBUSY periods
-	if !strings.Contains(respBody, "FREEBUSY:") {
+	if freeBusy.count("FREEBUSY") == 0 {
 		t.Error("RFC 4791 Section 7.10: Response must include FREEBUSY properties")
 	}
-	if !strings.Contains(respBody, "DTSTART:20240601T000000Z") || !strings.Contains(respBody, "DTEND:20240630T235959Z") {
-		t.Error("RFC 4791 Section 7.10: Response must include requested time range in VFREEBUSY")
+	if got := freeBusy.value("DTSTART"); got != "20240601T000000Z" {
+		t.Errorf("VFREEBUSY DTSTART = %q, want the requested range start", got)
+	}
+	if got := freeBusy.value("DTEND"); got != "20240630T235959Z" {
+		t.Errorf("VFREEBUSY DTEND = %q, want the requested range end", got)
+	}
+}
+
+// Two free-busy reports answered inside the same second still name two
+// different VFREEBUSY components, so a client caching by UID cannot collapse
+// them.
+func TestRFC4791_FreeBusyResponseUIDIsUnique(t *testing.T) {
+	h := &DavServer{}
+	tr := &timeRange{Start: "20240601T000000Z", End: "20240630T235959Z"}
+
+	uidOf := func(body string) string {
+		t.Helper()
+		root, err := parseICalendarObject(body)
+		if err != nil {
+			t.Fatalf("free-busy response is not a valid iCalendar object: %v", err)
+		}
+		freeBusy, _ := namedComponent(root, "VFREEBUSY")
+		if freeBusy == nil {
+			t.Fatal("free-busy response carries no VFREEBUSY")
+		}
+		return freeBusy.value("UID")
+	}
+
+	first := uidOf(h.generateFreeBusy(nil, nil, tr))
+	second := uidOf(h.generateFreeBusy(nil, nil, tr))
+	if first == "" {
+		t.Fatal("VFREEBUSY carries no UID")
+	}
+	if first == second {
+		t.Fatalf("two free-busy responses share the UID %q", first)
 	}
 }
 
@@ -2355,8 +2398,8 @@ func TestRFC4791_Precondition_DateLimits_CoverEveryDateProperty(t *testing.T) {
 
 func TestRFC4791_Precondition_RecurrenceUntilDateLimitsAreInclusive(t *testing.T) {
 	tests := map[string]string{
-		"minimum": caldavMinDateTime,
-		"maximum": caldavMaxDateTime,
+		"minimum": ical.MinDateTime,
+		"maximum": ical.MaxDateTime,
 	}
 
 	for name, boundary := range tests {
@@ -3427,8 +3470,8 @@ func TestRFC4791_MaxAttendeesPerInstanceProperty(t *testing.T) {
 	got := decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/").
 		assertPropInt(t, calQN("max-attendees-per-instance"))
-	if got != caldavMaxAttendees {
-		t.Errorf("max-attendees-per-instance = %d, want %d", got, caldavMaxAttendees)
+	if got != ical.MaxAttendeesPerInstance {
+		t.Errorf("max-attendees-per-instance = %d, want %d", got, ical.MaxAttendeesPerInstance)
 	}
 }
 
@@ -3462,8 +3505,8 @@ func TestRFC4791_MaxInstancesProperty(t *testing.T) {
 	got := decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/").
 		assertPropInt(t, calQN("max-instances"))
-	if got != caldavMaxInstances {
-		t.Errorf("max-instances = %d, want %d", got, caldavMaxInstances)
+	if got != ical.MaxRecurrenceInstances {
+		t.Errorf("max-instances = %d, want %d", got, ical.MaxRecurrenceInstances)
 	}
 }
 
@@ -3477,10 +3520,10 @@ func TestRFC4791_PutExceedsMaxAttendeesPerInstance(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 
-	attendees := make([]string, 0, caldavMaxAttendees+2)
+	attendees := make([]string, 0, ical.MaxAttendeesPerInstance+2)
 	attendees = append(attendees, "DTSTART:20240101T000000Z")
 	alarmAttendees := []string{"ACTION:EMAIL", "TRIGGER:-PT15M", "DESCRIPTION:Alarm", "SUMMARY:Alarm"}
-	for i := 0; i < caldavMaxAttendees+1; i++ {
+	for i := 0; i < ical.MaxAttendeesPerInstance+1; i++ {
 		attendees = append(attendees, fmt.Sprintf("ATTENDEE:mailto:user%d@example.com", i))
 		alarmAttendees = append(alarmAttendees, fmt.Sprintf("ATTENDEE:mailto:alarm%d@example.com", i))
 	}
@@ -3578,8 +3621,8 @@ func TestRFC4791_PutExceedsMaxInstancesWithRDates(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	user := &store.User{ID: 1}
 	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	rdates := make([]string, 0, caldavMaxInstances)
-	for i := 1; i <= caldavMaxInstances; i++ {
+	rdates := make([]string, 0, ical.MaxRecurrenceInstances)
+	for i := 1; i <= ical.MaxRecurrenceInstances; i++ {
 		rdates = append(rdates, start.AddDate(0, 0, i).Format("20060102T150405Z"))
 	}
 	body := buildCalendarObject(buildVEvent("rdates",
@@ -4852,13 +4895,12 @@ func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 	}
 
 	for name, body := range map[string]string{
-		"no href":             bodyForHrefs(),
-		"multiple hrefs":      bodyForHrefs("/dav/calendars/1/one.ics", "/dav/calendars/1/two.ics"),
-		"different object":    bodyForHrefs("/dav/calendars/1/two.ics"),
-		"foreign authority":   bodyForHrefs("http://other.example/dav/calendars/1/one.ics"),
-		"different scheme":    bodyForHrefs("https://example.com/dav/calendars/1/one.ics"),
-		"query component":     bodyForHrefs("http://example.com/dav/calendars/1/one.ics?view=full"),
-		"surrounding padding": bodyForHrefs(" /dav/calendars/1/one.ics "),
+		"no href":           bodyForHrefs(),
+		"multiple hrefs":    bodyForHrefs("/dav/calendars/1/one.ics", "/dav/calendars/1/two.ics"),
+		"different object":  bodyForHrefs("/dav/calendars/1/two.ics"),
+		"foreign authority": bodyForHrefs("http://other.example/dav/calendars/1/one.ics"),
+		"different scheme":  bodyForHrefs("https://example.com/dav/calendars/1/one.ics"),
+		"query component":   bodyForHrefs("http://example.com/dav/calendars/1/one.ics?view=full"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest("REPORT", "/dav/calendars/1/one.ics", strings.NewReader(body))
@@ -4892,6 +4934,25 @@ func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 				assertPropStatus(t, davQN("getetag"), http.StatusOK)
 		})
 	}
+
+	// XML keeps whitespace in element content, but a DAV:href is a URI and a URI
+	// carries none, so a client that indents the href it wrote still names the
+	// Request-URI.
+	t.Run("surrounding padding", func(t *testing.T) {
+		req := httptest.NewRequest("REPORT", "/dav/calendars/1/one.ics",
+			strings.NewReader(bodyForHrefs("\n    /dav/calendars/1/one.ics\n  ")))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.Report(rr, req)
+
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("padded calendar-multiget = %d, want 207; body: %s", rr.Code, rr.Body.String())
+		}
+		decodeMultistatus(t, rr).
+			responseForHref(t, "/dav/calendars/1/one.ics").
+			assertPropStatus(t, davQN("getetag"), http.StatusOK)
+	})
 
 	t.Run("equivalent collection alias", func(t *testing.T) {
 		slug := "work"

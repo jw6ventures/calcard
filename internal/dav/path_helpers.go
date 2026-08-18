@@ -1,7 +1,5 @@
 package dav
 
-import "strings"
-
 // multiGetFallbackHref picks the DAV:href to report for a multiget entry that
 // could not be resolved: the normalized path when there is one, otherwise the
 // raw requested href, and the collection path as a last resort. A DAV:response
@@ -10,7 +8,7 @@ func multiGetFallbackHref(rawHref, cleanHref, collectionPath string) string {
 	if cleanHref != "" {
 		return cleanHref
 	}
-	if trimmed := strings.TrimSpace(rawHref); trimmed != "" {
+	if trimmed := trimHrefFraming(rawHref); trimmed != "" {
 		return trimmed
 	}
 	return collectionPath

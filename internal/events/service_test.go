@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -627,7 +629,7 @@ func TestHelpersAndValidators(t *testing.T) {
 		}
 		var b strings.Builder
 		b.WriteString("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n")
-		for i := 0; i < caldavMaxAttendees+1; i++ {
+		for i := 0; i < ical.MaxAttendeesPerInstance+1; i++ {
 			b.WriteString("ATTENDEE:mailto:user@example.com\r\n")
 		}
 		b.WriteString("END:VEVENT\r\nEND:VCALENDAR\r\n")
@@ -685,7 +687,7 @@ func TestHelpersAndValidators(t *testing.T) {
 		if got := ensureCRLF("A\nB"); got != "A\r\nB\r\n" {
 			t.Fatalf("unexpected CRLF result %q", got)
 		}
-		minDate, maxDate := caldavDateLimits()
+		minDate, maxDate := ical.DateLimits()
 		if !minDate.Before(maxDate) {
 			t.Fatal("expected valid date limits")
 		}
@@ -1006,4 +1008,27 @@ func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 
 func key(calendarID int64, uid string) string {
 	return strconv.FormatInt(calendarID, 10) + ":" + uid
+}
+
+// The API path and the DAV path validate the same calendar data, and the CalDAV
+// collection properties advertise one pair of limits for both, so this path
+// enforces the values internal/ical defines rather than a set of its own. A
+// second, more permissive set here would let a payload the DAV handlers refuse
+// be stored through the API and then served over CalDAV as a resource exceeding
+// the advertised limit.
+func TestCalendarLimitsEnforceTheAdvertisedCalDAVValues(t *testing.T) {
+	overAttendees := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:a\r\n" +
+		"DTSTAMP:20240601T100000Z\r\nDTSTART:20240601T100000Z\r\n" +
+		strings.Repeat("ATTENDEE:mailto:a@example.com\r\n", ical.MaxAttendeesPerInstance+1) +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+	if err := validateStrictICalendar(overAttendees); err == nil {
+		t.Errorf("an object carrying %d attendees was accepted", ical.MaxAttendeesPerInstance+1)
+	}
+
+	overInstances := fmt.Sprintf("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:b\r\n"+
+		"DTSTAMP:20240601T100000Z\r\nDTSTART:20240601T100000Z\r\nRRULE:FREQ=DAILY;COUNT=%d\r\n"+
+		"END:VEVENT\r\nEND:VCALENDAR\r\n", ical.MaxRecurrenceInstances+1)
+	if err := validateStrictICalendar(overInstances); err == nil {
+		t.Errorf("an object generating %d instances was accepted", ical.MaxRecurrenceInstances+1)
+	}
 }

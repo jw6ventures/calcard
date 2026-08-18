@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	icalpkg "github.com/jw6ventures/calcard/internal/ical"
 )
 
 // TestListForCalendarFilteredStartBound asserts the Start lower bound uses the
@@ -23,7 +25,7 @@ func TestListForCalendarFilteredStartBound(t *testing.T) {
 	defer db.Close()
 
 	repo := &eventRepo{pool: db}
-	mock.ExpectQuery(`AND COALESCE\(recurrence_until, dtend, dtstart\) >= \$2`).
+	mock.ExpectQuery(`AND COALESCE\(recurrence_until, dtend, 'infinity'::timestamptz\) >= \$2`).
 		WithArgs(int64(1), start).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag",
@@ -51,7 +53,7 @@ func TestListForCalendarFilteredEndBound(t *testing.T) {
 	defer db.Close()
 
 	repo := &eventRepo{pool: db}
-	mock.ExpectQuery(`AND COALESCE\(recurrence_start, dtstart\) <= \$2`).
+	mock.ExpectQuery(`AND COALESCE\(recurrence_start, dtstart, '-infinity'::timestamptz\) <= \$2`).
 		WithArgs(int64(1), end).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag",
@@ -74,7 +76,7 @@ func TestListForCalendarPageAfterUsesKeysetAndFilter(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`(?s)FROM events WHERE calendar_id=\$1 AND id>\$2.*COALESCE\(recurrence_until, dtend, dtstart\) >= \$3.*summary ILIKE \$4.*ORDER BY id ASC LIMIT \$5`).
+	mock.ExpectQuery(`(?s)FROM events WHERE calendar_id=\$1 AND id>\$2.*COALESCE\(recurrence_until, dtend, 'infinity'::timestamptz\) >= \$3.*summary ILIKE \$4.*ORDER BY id ASC LIMIT \$5`).
 		WithArgs(int64(7), int64(100), start, `%planning%`, 256).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag",
@@ -145,7 +147,7 @@ func TestRecurrenceUntilFromICal(t *testing.T) {
 	// resolve to the sentinel (never an underestimate).
 	isSentinel := func(t *testing.T, got *time.Time) {
 		t.Helper()
-		if got == nil || !got.Equal(recurrenceUntilSentinel) {
+		if got == nil || !got.Equal(icalpkg.RecurrenceUntilSentinel) {
 			t.Fatalf("expected sentinel, got %v", got)
 		}
 	}
@@ -157,7 +159,7 @@ func TestRecurrenceUntilFromICal(t *testing.T) {
 		if got.Before(trueEnd) {
 			t.Fatalf("bound %v underestimates true last-instance end %v", got, trueEnd)
 		}
-		if got.Equal(recurrenceUntilSentinel) {
+		if got.Equal(icalpkg.RecurrenceUntilSentinel) {
 			t.Fatalf("expected a precise bound, got sentinel")
 		}
 	}

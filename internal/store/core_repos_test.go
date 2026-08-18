@@ -2359,7 +2359,7 @@ func TestCalendarPropertyColumnsMigration(t *testing.T) {
 		"../../db.sql": {
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[]",
-			"VALUES ('version', 'v1.1.11')",
+			"VALUES ('version', 'v1.1.12')",
 		},
 	}
 	for path, expected := range sources {
@@ -2392,7 +2392,46 @@ func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T)
 			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
 			"digest_md5_ha1 TEXT NULL",
 			"digest_sha256_ha1 TEXT NULL",
-			"VALUES ('version', 'v1.1.11')",
+			"VALUES ('version', 'v1.1.12')",
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+// A PostgreSQL expression index only serves a predicate that spells the
+// expression verbatim, so the two COALESCE tails have to read the same in the
+// migration, the baseline schema, and ListForCalendarFiltered. Drift costs the
+// index silently: the range falls out of the index scan and back into a filter.
+func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
+	startIndex := "CREATE INDEX IF NOT EXISTS idx_events_recurrence_start\n    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz))"
+	untilIndex := "CREATE INDEX IF NOT EXISTS idx_events_recurrence_until\n    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz))"
+
+	sources := map[string][]string{
+		"../../migrations/v1.1.12.sql": {
+			"DROP INDEX IF EXISTS idx_events_recurrence_start",
+			"DROP INDEX IF EXISTS idx_events_recurrence_until",
+			startIndex,
+			untilIndex,
+			"UPDATE application SET value = 'v1.1.12'",
+		},
+		"../../db.sql": {
+			startIndex,
+			untilIndex,
+			"VALUES ('version', 'v1.1.12')",
+		},
+		"postgres.go": {
+			"COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= ",
+			"COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= ",
 		},
 	}
 	for path, expected := range sources {

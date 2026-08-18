@@ -6,6 +6,47 @@ import (
 	"time"
 )
 
+// The CalDAV collection limits RFC 4791 §5.2.5 through §5.2.9 let a server
+// advertise. They live here rather than in internal/dav because the same
+// calendar data is reachable through the DAV handlers and the events service,
+// and validating it against two different sets of limits would let a client
+// store through one path what the other refuses -- while the CalDAV properties
+// advertise only one of them.
+const (
+	// MinDateTime and MaxDateTime are CALDAV:min-date-time and
+	// CALDAV:max-date-time, inclusive at both ends.
+	MinDateTime = "19000101T000000Z"
+	MaxDateTime = "21001231T235959Z"
+	// MaxRecurrenceInstances is CALDAV:max-instances, the instance count one
+	// recurrence set may generate.
+	MaxRecurrenceInstances = 1000
+	// MaxAttendeesPerInstance is CALDAV:max-attendees-per-instance, counted per
+	// instance rather than per resource.
+	MaxAttendeesPerInstance = 100
+)
+
+var (
+	minDateTimeValue time.Time
+	maxDateTimeValue time.Time
+)
+
+func init() {
+	var err error
+	if minDateTimeValue, err = ParseDateTime(MinDateTime); err != nil {
+		panic(fmt.Sprintf("invalid MinDateTime constant: %v", err))
+	}
+	if maxDateTimeValue, err = ParseDateTime(MaxDateTime); err != nil {
+		panic(fmt.Sprintf("invalid MaxDateTime constant: %v", err))
+	}
+}
+
+// DateLimits returns the parsed CALDAV:min-date-time and CALDAV:max-date-time
+// bounds. Both are inclusive: RFC 4791 §5.2.6 and §5.2.7 define them as the
+// earliest and latest date a resource may carry.
+func DateLimits() (time.Time, time.Time) {
+	return minDateTimeValue, maxDateTimeValue
+}
+
 var icalDateTimeFormats = []string{
 	"20060102",             // Date only
 	"20060102T150405",      // Basic format

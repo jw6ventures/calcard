@@ -2591,7 +2591,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, propertySelector{})
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, propertySelector{}, floatingZone{})
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -7963,6 +7963,9 @@ func TestPropfindObjectGrantDoesNotExposeParentAddressBook(t *testing.T) {
 }
 
 type fakeEventRepo struct {
+	// ignoreFilter drops the time-range narrowing the PostgreSQL predicates
+	// apply, so a test can compare the pushdown path against a full scan.
+	ignoreFilter             bool
 	events                   map[string]*store.Event
 	deleted                  []string
 	copyErr                  error
@@ -8093,11 +8096,11 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 	return result, nil
 }
 
-func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, _ store.EventFilter) ([]store.Event, error) {
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
 	f.pageLookupCount++
 	var result []store.Event
 	for _, event := range f.events {
-		if event.CalendarID == calendarID && (event.ID > afterID || afterID == 0 && event.ID == 0) {
+		if event.CalendarID == calendarID && (event.ID > afterID || afterID == 0 && event.ID == 0) && f.keeps(*event, filter) {
 			result = append(result, *event)
 		}
 	}
@@ -8108,8 +8111,95 @@ func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID
 	return result, nil
 }
 
-func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
-	return f.ListForCalendar(ctx, calendarID)
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	f.listForCalendarCalls++
+	var result []store.Event
+	for _, event := range f.events {
+		if event.CalendarID == calendarID && f.keeps(*event, filter) {
+			result = append(result, *event)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeEventRepo) keeps(event store.Event, filter store.EventFilter) bool {
+	return f.ignoreFilter || eventFilterKeeps(event, filter)
+}
+
+// eventFilterKeeps mirrors the time-range narrowing the PostgreSQL predicates
+// apply, so a report exercised against this fake sees the same candidate set a
+// real query plan would hand it. The infinity fallbacks are the COALESCE tails:
+// a row with no derived bound at all stays a candidate for every range and the
+// in-memory RFC 4791 §9.9 test decides it.
+//
+// Every column the predicates read is derived from the payload here rather than
+// taken off store.Event, because that is where they come from in production: a
+// fixture whose fields disagree with its own iCalendar would otherwise be
+// narrowed on bounds no stored row could ever have.
+func eventFilterKeeps(event store.Event, filter store.EventFilter) bool {
+	dtstart, dtend := fakeEventColumns(event.RawICAL)
+	recurrenceStart, recurrenceUntil := fakeRecurrenceBounds(event.RawICAL)
+	if filter.Start != nil {
+		latest := firstNonNilTime(recurrenceUntil, dtend)
+		if latest != nil && latest.Before(*filter.Start) {
+			return false
+		}
+	}
+	if filter.End != nil {
+		earliest := firstNonNilTime(recurrenceStart, dtstart)
+		if earliest != nil && earliest.After(*filter.End) {
+			return false
+		}
+	}
+	return true
+}
+
+// fakeEventColumns derives the dtstart and dtend columns the way
+// store.parseICalFields does: from the primary VEVENT alone, and dtend only from
+// a literal DTEND property. No other component type populates either.
+func fakeEventColumns(raw string) (*time.Time, *time.Time) {
+	component := ical.PrimaryVEventComponent(raw)
+	if component == nil {
+		return nil, nil
+	}
+	read := func(name string) *time.Time {
+		property, ok := ical.ComponentProperty(component, name)
+		if !ok {
+			return nil
+		}
+		parsed, ok := ical.ParsePropertyDateTimeLocal(property.KeyPart, property.Value)
+		if !ok {
+			return nil
+		}
+		return &parsed
+	}
+	return read("DTSTART"), read("DTEND")
+}
+
+func fakeRecurrenceBounds(raw string) (*time.Time, *time.Time) {
+	bounds := ical.ConservativeRecurrenceBounds(raw)
+	if !bounds.Recurring {
+		return nil, nil
+	}
+	start, until := bounds.Start, bounds.Until
+	if bounds.StartUnknown {
+		sentinel := ical.RecurrenceStartSentinel
+		start = &sentinel
+	}
+	if bounds.UntilUnknown {
+		sentinel := ical.RecurrenceUntilSentinel
+		until = &sentinel
+	}
+	return start, until
+}
+
+func firstNonNilTime(candidates ...*time.Time) *time.Time {
+	for _, candidate := range candidates {
+		if candidate != nil {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
@@ -9085,8 +9175,8 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
-			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
@@ -9132,8 +9222,8 @@ func TestCalendarQueryRejectsSQLLookingTimeRangeStart(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
-			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
@@ -10072,7 +10162,7 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}

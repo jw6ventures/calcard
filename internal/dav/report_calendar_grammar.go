@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // The calendar-query and calendar-multiget bodies are read against their
@@ -38,6 +41,13 @@ type calendarMultigetRequest struct {
 
 func invalidFilter(format string, args ...any) *reportGrammarFault {
 	return &reportGrammarFault{condition: "valid-filter", reason: fmt.Sprintf(format, args...)}
+}
+
+// invalidReportCalendarData names the CALDAV:valid-calendar-data precondition,
+// which RFC 4791 §7.8 raises when the timezone a REPORT carries is not a valid
+// iCalendar object holding a single valid VTIMEZONE.
+func invalidReportCalendarData(format string, args ...any) *reportGrammarFault {
+	return &reportGrammarFault{condition: "valid-calendar-data", reason: fmt.Sprintf(format, args...)}
 }
 
 func unsupportedFilterElement(element, name string) *reportGrammarFault {
@@ -176,6 +186,9 @@ func parseCalendarQueryRequest(body []byte) (*calendarQueryRequest, *reportGramm
 			text, fault := decodeTextElement(dec, child, "CALDAV:timezone")
 			if fault != nil {
 				return fault
+			}
+			if !validCalendarTimezone(text) {
+				return invalidReportCalendarData("CALDAV:timezone is not an iCalendar object carrying one valid VTIMEZONE")
 			}
 			request.Timezone = text
 			stage = queryStageEnd
@@ -603,4 +616,150 @@ func validateCompFilterSemantics(filter *compFilter) *reportGrammarFault {
 		}
 	}
 	return nil
+}
+
+// Request-side CALDAV:time-range checks. These judge what the request
+// spelled -- the value form RFC 4791 §9.9 requires and the §7.8/§7.9 bounds --
+// rather than whether stored data intersects it, which is time_range.go's job.
+
+func validCalendarFilterTimeRanges(filter *calFilter) bool {
+	if filter == nil {
+		return true
+	}
+	return validCompFilterTimeRanges(&filter.CompFilter)
+}
+
+func validTimeRange(tr *timeRange) bool {
+	if tr == nil {
+		return true
+	}
+	_, _, ok := calendarTimeRangeBounds(tr)
+	return ok
+}
+
+func validCompFilterTimeRanges(filter *compFilter) bool {
+	if filter.TimeRange != nil {
+		if _, _, ok := calendarTimeRangeBounds(filter.TimeRange); !ok {
+			return false
+		}
+	}
+	for i := range filter.PropFilter {
+		if tr := filter.PropFilter[i].TimeRange; tr != nil {
+			if _, _, ok := calendarTimeRangeBounds(tr); !ok {
+				return false
+			}
+		}
+	}
+	for i := range filter.CompFilter {
+		if !validCompFilterTimeRanges(&filter.CompFilter[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// reportTimeRangeDateLimitFault checks every CALDAV:time-range the request
+// carries against the collection's CALDAV:min-date-time and
+// CALDAV:max-date-time. RFC 4791 §7.8 and §7.9 bound the *request's* range,
+// inclusively at both ends, which is a different rule from the §5.3.2.1
+// preconditions bounding stored data. It returns the precondition to answer
+// with, or an empty string when every range is within the limits.
+//
+// Only an attribute the request actually spells is tested: an omitted one means
+// an infinity that no finite limit could contain.
+func reportTimeRangeDateLimitFault(filter *calFilter, tr *timeRange) string {
+	minTime, maxTime := ical.DateLimits()
+	for _, value := range reportTimeRangeValues(filter, tr) {
+		instant, ok := parseUTCDateTime(value)
+		if !ok {
+			// The form is the grammar's to refuse; an unparseable value carries
+			// no instant to compare against a limit.
+			continue
+		}
+		if instant.Before(minTime) {
+			return "min-date-time"
+		}
+		if instant.After(maxTime) {
+			return "max-date-time"
+		}
+	}
+	return ""
+}
+
+func reportTimeRangeValues(filter *calFilter, tr *timeRange) []string {
+	var values []string
+	appendRange := func(r *timeRange) {
+		if r == nil {
+			return
+		}
+		if strings.TrimSpace(r.Start) != "" {
+			values = append(values, r.Start)
+		}
+		if strings.TrimSpace(r.End) != "" {
+			values = append(values, r.End)
+		}
+	}
+	appendRange(tr)
+	if filter != nil {
+		var walk func(*compFilter)
+		walk = func(component *compFilter) {
+			appendRange(component.TimeRange)
+			for i := range component.PropFilter {
+				appendRange(component.PropFilter[i].TimeRange)
+			}
+			for i := range component.CompFilter {
+				walk(&component.CompFilter[i])
+			}
+		}
+		walk(&filter.CompFilter)
+	}
+	return values
+}
+
+// calendarTimeRangeBounds resolves a CALDAV:time-range to the instants it
+// spans. RFC 4791 §9.9 requires both attributes to be a "date with UTC time",
+// so a DATE, a floating DATE-TIME, or a numeric offset is refused rather than
+// interpreted; an omitted attribute means -infinity or +infinity, and at least
+// one has to be present.
+func calendarTimeRangeBounds(tr *timeRange) (time.Time, time.Time, bool) {
+	if tr == nil {
+		return time.Time{}, time.Time{}, false
+	}
+
+	hasStart := strings.TrimSpace(tr.Start) != ""
+	hasEnd := strings.TrimSpace(tr.End) != ""
+	if !hasStart && !hasEnd {
+		return time.Time{}, time.Time{}, false
+	}
+
+	var start time.Time
+	var ok bool
+	if hasStart {
+		start, ok = parseUTCDateTime(tr.Start)
+		if !ok {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+
+	end := ical.RecurrenceUntilSentinel
+	if hasEnd {
+		end, ok = parseUTCDateTime(tr.End)
+		if !ok {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+	if hasStart && !end.After(start) {
+		return time.Time{}, time.Time{}, false
+	}
+	return start, end, true
+}
+
+// parseUTCDateTime accepts only the iCalendar "date with UTC time" spelling.
+func parseUTCDateTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if form, ok := parseICalDateForm(value); !ok || form != icalUTCDateTime {
+		return time.Time{}, false
+	}
+	parsed, err := ical.ParseDateTime(value)
+	return parsed, err == nil
 }

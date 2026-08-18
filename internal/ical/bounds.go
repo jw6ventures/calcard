@@ -16,6 +16,15 @@ type RecurrenceBounds struct {
 	UntilUnknown bool
 }
 
+// RecurrenceStartSentinel and RecurrenceUntilSentinel are the open-ended values
+// a caller substitutes for a bound RecurrenceBounds could not compute, so a row
+// the columns cannot bound stays a candidate for every range and exact
+// expansion makes the decision.
+var (
+	RecurrenceStartSentinel = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+	RecurrenceUntilSentinel = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+)
+
 // ConservativeRecurrenceBounds computes bounds for top-level VEVENT, VTODO and
 // VJOURNAL components without under-approximating their recurrence windows.
 func ConservativeRecurrenceBounds(raw string) RecurrenceBounds {
@@ -174,7 +183,7 @@ func recurringComponentsFromLines(lines []string) []recurringComponent {
 					continue
 				}
 				current.dtstartSeen = true
-				if parsed, ok := parsePropertyDateTime(keyPart, value); ok {
+				if parsed, ok := ParsePropertyDateTimeLocal(keyPart, value); ok {
 					current.dtstart = timePointer(parsed)
 					current.allDay = len(value) == len("20060102") || PropertyParamEquals(keyPart, "VALUE", "DATE")
 				}
@@ -184,7 +193,7 @@ func recurringComponentsFromLines(lines []string) []recurringComponent {
 					continue
 				}
 				current.dtendSeen = true
-				if parsed, ok := parsePropertyDateTime(keyPart, value); ok {
+				if parsed, ok := ParsePropertyDateTimeLocal(keyPart, value); ok {
 					current.dtend = timePointer(parsed)
 				}
 			case "DURATION":
@@ -203,7 +212,7 @@ func recurringComponentsFromLines(lines []string) []recurringComponent {
 					continue
 				}
 				current.recurrenceIDSeen = true
-				if parsed, ok := parsePropertyDateTime(keyPart, value); ok {
+				if parsed, ok := ParsePropertyDateTimeLocal(keyPart, value); ok {
 					current.recurrenceID = timePointer(parsed)
 					current.rangeThisAndFuture = PropertyParamEquals(keyPart, "RANGE", "THISANDFUTURE")
 				} else {
@@ -242,7 +251,7 @@ func rdateStarts(keyPart, value string) ([]time.Time, bool) {
 		if strings.Contains(part, "/") {
 			part = strings.TrimSpace(strings.SplitN(part, "/", 2)[0])
 		}
-		if parsed, parsedOK := parsePropertyDateTime(keyPart, part); parsedOK {
+		if parsed, parsedOK := ParsePropertyDateTimeLocal(keyPart, part); parsedOK {
 			starts = append(starts, parsed)
 		} else {
 			ok = false
@@ -285,7 +294,7 @@ func boundedRecurrenceUntil(dtstart time.Time, dtend *time.Time, durationPropert
 		}
 	}
 
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
 	if !ok {
 		return nil, false
 	}

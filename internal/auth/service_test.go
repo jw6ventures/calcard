@@ -518,6 +518,62 @@ func TestRequireDAVAuthDoesNotOfferOrAcceptBasicOnCleartextTransport(t *testing.
 	}
 }
 
+// A deployment naming its trusted proxies believes X-Forwarded-Proto only from
+// those peers. The check reads r.RemoteAddr, so it holds only while the
+// forwarded-address middleware leaves that field alone for an untrusted peer --
+// a client that could rewrite it would be answering the trust question itself
+// and could unlock Basic over cleartext.
+func TestRequestIsSecureRejectsSpoofedForwardedHeadersFromUntrustedPeers(t *testing.T) {
+	trusted := []string{"10.0.0.0/8"}
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       bool
+	}{
+		{name: "a trusted proxy is believed", remoteAddr: "10.1.2.3:4567", want: true},
+		{name: "an untrusted peer is not", remoteAddr: "203.0.113.9:4567", want: false},
+		{name: "an unparseable peer is not", remoteAddr: "not-an-address", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			req.Header.Set("X-Forwarded-Proto", "https")
+			if got := RequestIsSecure(req, trusted); got != tt.want {
+				t.Fatalf("RequestIsSecure(%q) = %v, want %v", tt.remoteAddr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTrustedProxiesAllowsPeer(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		trusted    []string
+		want       bool
+	}{
+		// An unconfigured deployment keeps the documented posture: every peer's
+		// forwarded headers are honoured, and the config loader warns about it.
+		{name: "no configured proxies trusts every peer", remoteAddr: "203.0.113.9:4567", want: true},
+		{name: "a peer inside the CIDR", remoteAddr: "10.1.2.3:4567", trusted: []string{"10.0.0.0/8"}, want: true},
+		{name: "a peer outside the CIDR", remoteAddr: "203.0.113.9:4567", trusted: []string{"10.0.0.0/8"}},
+		{name: "a bare IP entry", remoteAddr: "192.0.2.7:1234", trusted: []string{"192.0.2.7"}, want: true},
+		{name: "an address with no port", remoteAddr: "10.1.2.3", trusted: []string{"10.0.0.0/8"}, want: true},
+		{name: "an unparseable address", remoteAddr: "not-an-address", trusted: []string{"10.0.0.0/8"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NewTrustedProxies(tt.trusted).AllowsPeer(tt.remoteAddr); got != tt.want {
+				t.Fatalf("NewTrustedProxies(%v).AllowsPeer(%q) = %v, want %v", tt.trusted, tt.remoteAddr, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDigestNonceCountAcceptsUniqueOutOfOrderValues(t *testing.T) {
 	service := &Service{digestNow: func() time.Time { return time.Unix(1_700_000_000, 0) }}
 

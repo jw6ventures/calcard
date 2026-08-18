@@ -31,10 +31,10 @@ func validateCalendarObjectForStorage(raw string, cal *store.CalendarAccess) (*v
 	if !calendarAcceptsComponents(cal, analysis.Components) {
 		return nil, &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"supported-calendar-component"}}
 	}
-	if analysis.MaxAttendees > caldavMaxAttendees {
+	if analysis.MaxAttendees > ical.MaxAttendeesPerInstance {
 		return nil, &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-attendees-per-instance"}}
 	}
-	exceedsInstances, validRecurrence := ical.RecurrenceSetExceedsLimit(raw, caldavMaxInstances)
+	exceedsInstances, validRecurrence := ical.RecurrenceSetExceedsLimit(raw, ical.MaxRecurrenceInstances)
 	if !validRecurrence {
 		return nil, invalidCalendarData()
 	}

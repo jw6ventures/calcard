@@ -199,6 +199,36 @@ func forwardedClientIP(xff string, trusted []*net.IPNet) net.IP {
 	return nil
 }
 
+// TrustedProxies is a parsed APP_TRUSTED_PROXIES set. It is built once and read
+// per request, since the forwarded-address middleware asks about every request
+// the server handles.
+type TrustedProxies struct {
+	nets []*net.IPNet
+}
+
+// NewTrustedProxies parses the configured proxy addresses and CIDR blocks,
+// discarding entries that are neither.
+func NewTrustedProxies(values []string) TrustedProxies {
+	return TrustedProxies{nets: parseTrustedProxies(values)}
+}
+
+// AllowsPeer reports whether remoteAddr -- the address of the immediate peer,
+// before any forwarded-header rewriting -- belongs to a configured proxy.
+// Configuring none allows every peer, matching how RequestIsSecure and the rate
+// limiter already treat an unconfigured deployment.
+//
+// The forwarded-address middleware asks this before it rewrites RemoteAddr:
+// every later trust decision, RequestIsSecure included, reads that field, so
+// rewriting it on an untrusted peer's say-so lets a client answer the question
+// for itself.
+func (t TrustedProxies) AllowsPeer(remoteAddr string) bool {
+	if len(t.nets) == 0 {
+		return true
+	}
+	ip, _ := parseRemoteAddr(remoteAddr)
+	return isTrustedProxy(ip, t.nets)
+}
+
 func parseTrustedProxies(values []string) []*net.IPNet {
 	var trusted []*net.IPNet
 	for _, raw := range values {

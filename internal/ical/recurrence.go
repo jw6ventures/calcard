@@ -16,19 +16,87 @@ type BusyPeriod struct {
 	End   time.Time
 }
 
+// PropertyTimeResolver resolves one date-valued content line to the absolute
+// instant it names. It exists so a caller holding a timezone this package cannot
+// see -- RFC 4791 §7.3 gives a report the request's CALDAV:timezone, else the
+// collection's CALDAV:calendar-timezone -- resolves every date in a recurrence
+// set the same way it resolved the DTSTART it passes in. A nil resolver means
+// ParsePropertyDateTimeLocal, which reads a floating value as UTC.
+type PropertyTimeResolver func(keyPart, value string) (time.Time, bool)
+
+func (resolve PropertyTimeResolver) or(keyPart, value string) (time.Time, bool) {
+	if resolve == nil {
+		return ParsePropertyDateTimeLocal(keyPart, value)
+	}
+	return resolve(keyPart, value)
+}
+
+// recurrenceExpansion selects which component the recurrence set belongs to,
+// how its dates resolve, and how an occurrence is judged to reach the requested
+// window. The two callers need different answers to the last: free-busy wants
+// the half-open overlap a busy period has, while a time-range test wants every
+// occurrence a stricter RFC 4791 §9.9 condition could still accept, so it must
+// not lose a candidate to a bound that is tighter than the condition finally
+// applied.
+type recurrenceExpansion struct {
+	componentName    string
+	includeOverrides bool
+	maxInstances     int
+	resolve          PropertyTimeResolver
+	reaches          func(start, end, rangeStart, rangeEnd time.Time) bool
+}
+
 // RecurringBusyPeriods expands a recurring event (RRULE, RDATE, EXDATE and
 // RECURRENCE-ID overrides, including RANGE=THISANDFUTURE) into the concrete
 // busy periods that overlap [rangeStart, rangeEnd). dtstart and duration are
 // the event's resolved start and occurrence length; maxInstances caps the
-// expansion.
-func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int) []BusyPeriod {
-	component := PrimaryVEventComponent(raw)
-	exdates := eventExDates(component)
-	overrides := eventRecurrenceOverrides(raw, duration)
+// expansion and resolve reads the recurrence dates, per PropertyTimeResolver.
+func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []BusyPeriod {
+	return expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+		componentName:    "VEVENT",
+		includeOverrides: true,
+		maxInstances:     maxInstances,
+		resolve:          resolve,
+		reaches:          periodOverlaps,
+	})
+}
+
+// RecurrenceInstanceStarts expands the recurrence set of the named component
+// and returns the start of every *generated* instance whose occurrence window
+// touches [rangeStart, rangeEnd]. Overridden instances are left out: RFC 4791
+// §9.7.1 scopes a comp-filter to each component of the resource, so an
+// override is matched as the component it is rather than through its master's
+// pattern. Both bounds are inclusive, because the caller re-applies the exact
+// §9.9 condition and an exclusive bound here would drop an occurrence that
+// starts precisely at the end of the range.
+func RecurrenceInstanceStarts(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []time.Time {
+	periods := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+		componentName:    componentName,
+		includeOverrides: false,
+		maxInstances:     maxInstances,
+		resolve:          resolve,
+		reaches:          periodTouches,
+	})
+	starts := make([]time.Time, 0, len(periods))
+	for _, period := range periods {
+		starts = append(starts, period.Start)
+	}
+	return starts
+}
+
+func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) []BusyPeriod {
+	// One unfold serves the master, the overrides and the RDATEs. This runs once
+	// per candidate component of every resource a report considers, so a
+	// per-reader scan of the payload would be paid that many times over.
+	components := componentsNamedFromLines(UnfoldLines(raw), expansion.componentName)
+	component := primaryOf(components)
+	exdates := eventExDates(component, expansion.resolve)
+	overrides := componentRecurrenceOverrides(components, duration, expansion.resolve)
+	rdates := componentRDatePeriods(component, expansion.resolve)
 	seen := make(map[string]struct{})
 	periods := make([]BusyPeriod, 0)
 	addPeriod := func(period BusyPeriod, suppressGeneratedOverride bool, applyExDates bool) {
-		if len(periods) >= maxInstances {
+		if len(periods) >= expansion.maxInstances {
 			return
 		}
 		if suppressGeneratedOverride && isOverrideRecurrenceID(period.Start, overrides) {
@@ -37,7 +105,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 		if applyExDates && isExcludedDate(period.Start, exdates) {
 			return
 		}
-		if !periodOverlaps(period.Start, period.End, rangeStart, rangeEnd) {
+		if !expansion.reaches(period.Start, period.End, rangeStart, rangeEnd) {
 			return
 		}
 		key := period.Start.UTC().Format(time.RFC3339Nano) + "/" + period.End.UTC().Format(time.RFC3339Nano)
@@ -60,18 +128,18 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 				return applyThisAndFutureOverrides(period, overrides)
 			}
 		}
-		periods, ok := rruleBusyPeriods(dtstart, duration, rrule, exdates, scanStart, scanEnd, maxInstances, transform)
+		periods, ok := rruleBusyPeriods(dtstart, duration, rrule, exdates, scanStart, scanEnd, transform, expansion)
 		if !ok {
 			addPeriod(BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
 		}
 		for _, period := range periods {
 			addPeriod(period, true, true)
 		}
-	} else if len(eventRDatePeriods(raw)) > 0 {
+	} else if len(rdates) > 0 {
 		addPeriod(BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
 	}
 
-	for _, rdate := range eventRDatePeriods(raw) {
+	for _, rdate := range rdates {
 		end := rdate.End
 		if end.IsZero() {
 			end = rdate.Start.Add(duration)
@@ -79,11 +147,13 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 		addPeriod(BusyPeriod{Start: rdate.Start, End: end}, true, true)
 	}
 
-	for _, override := range overrides {
-		if override.cancelled {
-			continue
+	if expansion.includeOverrides {
+		for _, override := range overrides {
+			if override.cancelled {
+				continue
+			}
+			addPeriod(override.period, false, false)
 		}
-		addPeriod(override.period, false, false)
 	}
 
 	return periods
@@ -95,13 +165,23 @@ type rdatePeriod struct {
 }
 
 func EventHasRecurrence(ical string) bool {
-	component := PrimaryVEventComponent(ical)
-	return componentPropertyValue(component, "RRULE") != "" || len(eventRDatePeriods(ical)) > 0
+	return componentHasRecurrence(ical, "VEVENT")
 }
 
-func SupportedEventRecurrence(ical string) bool {
-	rrule := componentPropertyValue(PrimaryVEventComponent(ical), "RRULE")
-	if rrule == "" {
+// componentHasRecurrence reports whether the named component's master carries a
+// recurrence pattern this package can expand into instances.
+func componentHasRecurrence(ical, componentName string) bool {
+	component := PrimaryComponent(ical, componentName)
+	return componentPropertyValue(component, "RRULE") != "" ||
+		len(componentRDatePeriods(component, nil)) > 0
+}
+
+// SupportedRecurrenceRule reports whether an RRULE value uses a frequency this
+// package expands. An unsupported one is not an error: the caller keeps the
+// resource rather than silently filtering it out. An empty value is a component
+// with no rule to expand, which is trivially supported.
+func SupportedRecurrenceRule(rrule string) bool {
+	if strings.TrimSpace(rrule) == "" {
 		return true
 	}
 	return supportedRecurrenceFreq(extractRRuleParam(rrule, "FREQ"))
@@ -111,7 +191,7 @@ func SupportedEventRecurrence(ical string) bool {
 // package can expand. It is intentionally independent of a DTSTART timezone;
 // callers that expand the rule parse it again with the DTSTART location.
 func ValidRecurrenceRule(value string) bool {
-	_, ok := parseRecurrenceRule(value, time.UTC)
+	_, ok := parseRecurrenceRule(value, time.UTC, nil)
 	return ok
 }
 
@@ -131,7 +211,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 		return false, true
 	}
 
-	var master *VEventComponent
+	var master *Component
 	overrides := make(map[string]bool)
 	instances := make(map[string]struct{})
 	for i := range components {
@@ -143,7 +223,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 			}
 			continue
 		}
-		parsed, ok := parsePropertyDateTime(recurrenceID.KeyPart, recurrenceID.Value)
+		parsed, ok := ParsePropertyDateTimeLocal(recurrenceID.KeyPart, recurrenceID.Value)
 		if !ok {
 			return false, false
 		}
@@ -184,7 +264,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	var dtstart time.Time
 	if hasDTStart {
 		var ok bool
-		dtstart, ok = parsePropertyDateTime(dtstartProperty.KeyPart, dtstartProperty.Value)
+		dtstart, ok = ParsePropertyDateTimeLocal(dtstartProperty.KeyPart, dtstartProperty.Value)
 		if !ok {
 			return false, false
 		}
@@ -218,7 +298,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	if !hasDTStart {
 		return false, false
 	}
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
 	if !ok {
 		return false, false
 	}
@@ -607,7 +687,7 @@ func recurrencePropertyInstants(property PropertyValue) ([]time.Time, bool) {
 		if slash := strings.IndexByte(start, '/'); slash >= 0 {
 			start = strings.TrimSpace(start[:slash])
 		}
-		parsed, ok := parsePropertyDateTime(property.KeyPart, start)
+		parsed, ok := ParsePropertyDateTimeLocal(property.KeyPart, start)
 		if !ok {
 			return nil, false
 		}
@@ -624,7 +704,7 @@ func recurrenceInstantKey(value time.Time) string {
 // or before the supplied wall-clock value. It is used to apply the observance
 // rules in a submitted VTIMEZONE definition.
 func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool) {
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
 	if !ok || before.Before(dtstart) {
 		return time.Time{}, false
 	}
@@ -709,8 +789,8 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 	}
 }
 
-func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, maxInstances int, transform func(BusyPeriod) (BusyPeriod, bool)) ([]BusyPeriod, bool) {
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location())
+func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, transform func(BusyPeriod) (BusyPeriod, bool), expansion recurrenceExpansion) ([]BusyPeriod, bool) {
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), expansion.resolve)
 	if !ok {
 		return nil, false
 	}
@@ -748,10 +828,10 @@ func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, e
 					continue
 				}
 			}
-			if periodOverlaps(period.Start, period.End, rangeStart, rangeEnd) && !isExcludedDate(current, exdates) {
+			if expansion.reaches(period.Start, period.End, rangeStart, rangeEnd) && !isExcludedDate(current, exdates) {
 				periods = append(periods, period)
 			}
-			if len(periods) >= maxInstances {
+			if len(periods) >= expansion.maxInstances {
 				return periods, true
 			}
 		}
@@ -811,6 +891,12 @@ func periodOverlaps(start, end, rangeStart, rangeEnd time.Time) bool {
 	return start.Before(rangeEnd) && end.After(rangeStart)
 }
 
+// periodTouches is periodOverlaps with both bounds inclusive, so an occurrence
+// that only meets the range at an endpoint still reaches it.
+func periodTouches(start, end, rangeStart, rangeEnd time.Time) bool {
+	return !start.After(rangeEnd) && !end.Before(rangeStart)
+}
+
 func isExcludedDate(start time.Time, exdates []time.Time) bool {
 	for _, exdate := range exdates {
 		if start.Equal(exdate) {
@@ -820,9 +906,9 @@ func isExcludedDate(start time.Time, exdates []time.Time) bool {
 	return false
 }
 
-func eventRDatePeriods(ical string) []rdatePeriod {
+func componentRDatePeriods(component *Component, resolve PropertyTimeResolver) []rdatePeriod {
 	var periods []rdatePeriod
-	for _, prop := range eventPropertyValues(ical, "RDATE") {
+	for _, prop := range componentProperties(component, "RDATE") {
 		for _, value := range strings.Split(prop.Value, ",") {
 			value = strings.TrimSpace(value)
 			if value == "" {
@@ -830,7 +916,7 @@ func eventRDatePeriods(ical string) []rdatePeriod {
 			}
 			if strings.Contains(value, "/") {
 				parts := strings.SplitN(value, "/", 2)
-				start, ok := parsePropertyDateTime(prop.KeyPart, strings.TrimSpace(parts[0]))
+				start, ok := resolve.or(prop.KeyPart, strings.TrimSpace(parts[0]))
 				if !ok {
 					continue
 				}
@@ -841,14 +927,14 @@ func eventRDatePeriods(ical string) []rdatePeriod {
 						end = start.Add(duration)
 					}
 				} else {
-					if parsedEnd, ok := parsePropertyDateTime(prop.KeyPart, periodEnd); ok {
+					if parsedEnd, ok := resolve.or(prop.KeyPart, periodEnd); ok {
 						end = parsedEnd
 					}
 				}
 				periods = append(periods, rdatePeriod{Start: start, End: end})
 				continue
 			}
-			if start, ok := parsePropertyDateTime(prop.KeyPart, value); ok {
+			if start, ok := resolve.or(prop.KeyPart, value); ok {
 				periods = append(periods, rdatePeriod{Start: start})
 			}
 		}
@@ -856,11 +942,11 @@ func eventRDatePeriods(ical string) []rdatePeriod {
 	return periods
 }
 
-func eventExDates(component *VEventComponent) []time.Time {
+func eventExDates(component *Component, resolve PropertyTimeResolver) []time.Time {
 	var dates []time.Time
 	for _, prop := range componentProperties(component, "EXDATE") {
 		for _, value := range strings.Split(prop.Value, ",") {
-			if parsed, ok := parsePropertyDateTime(prop.KeyPart, strings.TrimSpace(value)); ok {
+			if parsed, ok := resolve.or(prop.KeyPart, strings.TrimSpace(value)); ok {
 				dates = append(dates, parsed)
 			}
 		}
@@ -875,21 +961,21 @@ type recurrenceOverride struct {
 	rangeThisAndFuture bool
 }
 
-func eventRecurrenceOverrides(ical string, fallbackDuration time.Duration) []recurrenceOverride {
+func componentRecurrenceOverrides(components []Component, fallbackDuration time.Duration, resolve PropertyTimeResolver) []recurrenceOverride {
 	var overrides []recurrenceOverride
-	for _, component := range vEventComponents(ical) {
+	for _, component := range components {
 		recurrenceIDProp, ok := ComponentProperty(&component, "RECURRENCE-ID")
 		if !ok {
 			continue
 		}
-		recurrenceID, ok := parsePropertyDateTime(recurrenceIDProp.KeyPart, recurrenceIDProp.Value)
+		recurrenceID, ok := resolve.or(recurrenceIDProp.KeyPart, recurrenceIDProp.Value)
 		if !ok {
 			continue
 		}
 
 		start := recurrenceID
 		if prop, ok := ComponentProperty(&component, "DTSTART"); ok {
-			if parsed, ok := ParsePropertyDateTimeLocal(prop.KeyPart, prop.Value); ok {
+			if parsed, ok := resolve.or(prop.KeyPart, prop.Value); ok {
 				start = parsed
 			}
 		}
@@ -901,7 +987,7 @@ func eventRecurrenceOverrides(ical string, fallbackDuration time.Duration) []rec
 
 		end := start.Add(fallbackDuration)
 		if prop, ok := ComponentProperty(&component, "DTEND"); ok {
-			if parsed, ok := ParsePropertyDateTimeLocal(prop.KeyPart, prop.Value); ok && parsed.After(start) {
+			if parsed, ok := resolve.or(prop.KeyPart, prop.Value); ok && parsed.After(start) {
 				end = parsed
 			}
 		} else if prop, ok := ComponentProperty(&component, "DURATION"); ok {
@@ -982,8 +1068,9 @@ func isOverrideRecurrenceID(start time.Time, overrides []recurrenceOverride) boo
 	return false
 }
 
-// VEventComponent is one VEVENT block's parsed content lines.
-type VEventComponent struct {
+// Component is one component block's parsed content lines, of whatever type the
+// BEGIN named.
+type Component struct {
 	properties          []PropertyValue
 	malformedProperties []string
 }
@@ -995,12 +1082,20 @@ type PropertyValue struct {
 	Value   string
 }
 
-func eventPropertyValues(ical, name string) []PropertyValue {
-	return componentProperties(PrimaryVEventComponent(ical), name)
+// PrimaryVEventComponent returns the master VEVENT of the resource, the
+// component the denormalized event columns are derived from.
+func PrimaryVEventComponent(ical string) *Component {
+	return PrimaryComponent(ical, "VEVENT")
 }
 
-func PrimaryVEventComponent(ical string) *VEventComponent {
-	components := vEventComponents(ical)
+// PrimaryComponent returns the master component of the named type: the first
+// one carrying no RECURRENCE-ID, since RFC 4791 §4.1 permits a resource made
+// only of overridden instances and every one of those carries the property.
+func PrimaryComponent(ical, componentName string) *Component {
+	return primaryOf(componentsNamed(ical, componentName))
+}
+
+func primaryOf(components []Component) *Component {
 	for i := range components {
 		if !componentHasProperty(&components[i], "RECURRENCE-ID") {
 			return &components[i]
@@ -1012,22 +1107,26 @@ func PrimaryVEventComponent(ical string) *VEventComponent {
 	return &components[0]
 }
 
-func vEventComponents(ical string) []VEventComponent {
-	return topLevelComponents(ical, func(name string) bool {
-		return strings.EqualFold(name, "VEVENT")
+func componentsNamed(ical, componentName string) []Component {
+	return componentsNamedFromLines(UnfoldLines(ical), componentName)
+}
+
+func componentsNamedFromLines(lines []string, componentName string) []Component {
+	return topLevelComponentsFromLines(lines, func(name string) bool {
+		return strings.EqualFold(name, componentName)
 	})
 }
 
-func topLevelComponents(ical string, accept func(string) bool) []VEventComponent {
+func topLevelComponents(ical string, accept func(string) bool) []Component {
 	return topLevelComponentsFromLines(UnfoldLines(ical), accept)
 }
 
-func topLevelComponentsFromLines(lines []string, accept func(string) bool) []VEventComponent {
-	var components []VEventComponent
+func topLevelComponentsFromLines(lines []string, accept func(string) bool) []Component {
+	var components []Component
 	depth := 0
 	componentDepth := 0
 	componentName := ""
-	var current *VEventComponent
+	var current *Component
 	for _, rawLine := range lines {
 		controlLine := strings.TrimSpace(rawLine)
 		upper := strings.ToUpper(controlLine)
@@ -1038,7 +1137,7 @@ func topLevelComponentsFromLines(lines []string, accept func(string) bool) []VEv
 			if current == nil && depth == 2 && accept(name) {
 				componentDepth = depth
 				componentName = name
-				current = &VEventComponent{}
+				current = &Component{}
 			}
 			continue
 		case strings.HasPrefix(upper, "END:"):
@@ -1070,7 +1169,7 @@ func topLevelComponentsFromLines(lines []string, accept func(string) bool) []VEv
 	return components
 }
 
-func componentProperties(component *VEventComponent, name string) []PropertyValue {
+func componentProperties(component *Component, name string) []PropertyValue {
 	var values []PropertyValue
 	if component == nil {
 		return values
@@ -1084,7 +1183,7 @@ func componentProperties(component *VEventComponent, name string) []PropertyValu
 	return values
 }
 
-func ComponentProperty(component *VEventComponent, name string) (PropertyValue, bool) {
+func ComponentProperty(component *Component, name string) (PropertyValue, bool) {
 	values := componentProperties(component, name)
 	if len(values) == 0 {
 		return PropertyValue{}, false
@@ -1092,7 +1191,7 @@ func ComponentProperty(component *VEventComponent, name string) (PropertyValue, 
 	return values[0], true
 }
 
-func componentPropertyValue(component *VEventComponent, name string) string {
+func componentPropertyValue(component *Component, name string) string {
 	prop, ok := ComponentProperty(component, name)
 	if !ok {
 		return ""
@@ -1100,26 +1199,33 @@ func componentPropertyValue(component *VEventComponent, name string) string {
 	return strings.TrimSpace(prop.Value)
 }
 
-func componentHasProperty(component *VEventComponent, name string) bool {
+func componentHasProperty(component *Component, name string) bool {
 	_, ok := ComponentProperty(component, name)
 	return ok
 }
 
-func PropertyParamEquals(keyPart, param, value string) bool {
+// PropertyParam returns the value of the named parameter on a content line's
+// key part, and whether the line carries it at all.
+func PropertyParam(keyPart, param string) (string, bool) {
 	parts := strings.Split(keyPart, ";")
 	if len(parts) < 2 {
-		return false
+		return "", false
 	}
 	for _, part := range parts[1:] {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(kv[0]), param) && strings.EqualFold(strings.TrimSpace(kv[1]), value) {
-			return true
+		if strings.EqualFold(strings.TrimSpace(kv[0]), param) {
+			return strings.TrimSpace(kv[1]), true
 		}
 	}
-	return false
+	return "", false
+}
+
+func PropertyParamEquals(keyPart, param, value string) bool {
+	got, ok := PropertyParam(keyPart, param)
+	return ok && strings.EqualFold(got, value)
 }
 
 // PropertyName returns the property name from a content line or its key part,
@@ -1132,26 +1238,13 @@ func PropertyName(keyPart string) string {
 	return keyPart
 }
 
-func parsePropertyDateTime(keyPart, value string) (time.Time, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}, false
-	}
-	for _, param := range strings.Split(keyPart, ";")[1:] {
-		if strings.HasPrefix(strings.ToUpper(param), "TZID=") {
-			tzid := strings.TrimSpace(param[len("TZID="):])
-			if loc, err := time.LoadLocation(tzid); err == nil {
-				if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
-					return parsed, true
-				}
-			}
-			break
-		}
-	}
-	parsed, err := ParseDateTime(value)
-	return parsed, err == nil
-}
-
+// ParsePropertyDateTimeLocal resolves one date-valued content line to an
+// absolute instant, reading a TZID from the property's parameters when it names
+// a zone the host knows. A value carrying neither a resolvable TZID nor its own
+// zone suffix is floating, and this reads it as UTC -- the fallback RFC 4791
+// §7.3 reaches when a request carries no CALDAV:timezone and the collection
+// defines no CALDAV:calendar-timezone. A caller holding either of those resolves
+// the value against it instead.
 func ParsePropertyDateTimeLocal(keyPart, value string) (time.Time, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -1274,7 +1367,7 @@ type weekdaySpecifier struct {
 	Day     time.Weekday
 }
 
-func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool) {
+func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeResolver) (recurrenceRule, bool) {
 	params := make(map[string]string)
 	for _, part := range strings.Split(rrule, ";") {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
@@ -1318,7 +1411,7 @@ func parseRecurrenceRule(rrule string, loc *time.Location) (recurrenceRule, bool
 		return recurrenceRule{}, false
 	}
 	if untilStr := params["UNTIL"]; untilStr != "" {
-		until, ok := parseRecurrenceUntil(untilStr, loc)
+		until, ok := parseRecurrenceUntil(untilStr, loc, resolve)
 		if !ok {
 			return recurrenceRule{}, false
 		}
@@ -1404,10 +1497,22 @@ func knownRecurrenceRulePart(name string) bool {
 	}
 }
 
-func parseRecurrenceUntil(value string, loc *time.Location) (time.Time, bool) {
-	if loc != nil && !hasZoneSuffix(value) {
-		if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
-			return parsed, true
+// parseRecurrenceUntil reads the UNTIL rule part. RFC 5545 §3.3.10 requires a
+// floating UNTIL exactly where DTSTART is floating, so a value carrying no zone
+// of its own belongs to whatever zone resolved DTSTART: the caller's resolver
+// first, since that is the only thing holding a zone the observances of the
+// resource itself define, then the DTSTART location.
+func parseRecurrenceUntil(value string, loc *time.Location, resolve PropertyTimeResolver) (time.Time, bool) {
+	if !hasZoneSuffix(value) {
+		if resolve != nil {
+			if parsed, ok := resolve("UNTIL", value); ok {
+				return parsed, true
+			}
+		}
+		if loc != nil {
+			if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
+				return parsed, true
+			}
 		}
 	}
 	parsed, err := ParseDateTime(value)

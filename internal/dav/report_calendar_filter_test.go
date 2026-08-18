@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,14 @@ import (
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+// resourceInTimeRange drives matcherInTimeRange from stored octets, so a case
+// can state the resource it is about rather than the parse the report path
+// carries between its passes.
+func resourceInTimeRange(event store.Event, tr *timeRange, zone floatingZone) bool {
+	matcher, _ := newEventTimeRangeMatcher(event, zone)
+	return matcherInTimeRange(matcher, tr)
+}
 
 func calQueryWithTimeRange(start, end string) *calFilter {
 	return &calFilter{
@@ -131,14 +140,13 @@ func TestPropFilterMatchesExactPropertyName(t *testing.T) {
 		},
 	}
 
-	h := &DavServer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			event := store.Event{
 				UID:     "prop-filter",
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:prop-filter\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
-			if got := h.eventMatchesFilter(event, calQueryWithPropFilter(tt.propFilter)); got != tt.want {
+			if got := eventMatchesFilter(event, calQueryWithPropFilter(tt.propFilter), floatingZone{}); got != tt.want {
 				t.Fatalf("eventMatchesFilter = %v, want %v for body %q", got, tt.want, tt.body)
 			}
 		})
@@ -182,7 +190,6 @@ func TestTextMatchFoldsOnlyASCIICase(t *testing.T) {
 		},
 	}
 
-	h := &DavServer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			event := store.Event{
@@ -190,7 +197,7 @@ func TestTextMatchFoldsOnlyASCIICase(t *testing.T) {
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:collation\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
 			filter := calQueryWithPropFilter(propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: tt.match}})
-			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("eventMatchesFilter = %v, want %v matching %q against %q", got, tt.want, tt.match, tt.body)
 			}
 		})
@@ -276,7 +283,11 @@ func TestEffectiveTimeRangeWalksNestedCompFilter(t *testing.T) {
 }
 
 func TestEventFilterFromCalFilter(t *testing.T) {
-	t.Run("valid range sets both bounds", func(t *testing.T) {
+	// Both bounds carry the skew unconditionally: the columns the predicates
+	// read and the instant the §9.9 test judges resolve the same property
+	// against different zones, and the report cannot tell per row which of them
+	// a candidate needs.
+	t.Run("valid range sets both bounds, each carrying the skew", func(t *testing.T) {
 		ef, ok := eventFilterFromCalFilter(calQueryWithTimeRange("20260601T000000Z", "20260701T000000Z"))
 		if !ok {
 			t.Fatal("expected ok for valid time-range")
@@ -287,6 +298,14 @@ func TestEventFilterFromCalFilter(t *testing.T) {
 		if !ef.End.After(*ef.Start) {
 			t.Errorf("end %v should be after start %v", ef.End, ef.Start)
 		}
+		wantStart := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Add(-maxStoredInstantSkew)
+		wantEnd := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).Add(maxStoredInstantSkew)
+		if !ef.Start.Equal(wantStart) {
+			t.Errorf("start = %v, want %v", ef.Start, wantStart)
+		}
+		if !ef.End.Equal(wantEnd) {
+			t.Errorf("end = %v, want %v", ef.End, wantEnd)
+		}
 	})
 
 	t.Run("open-ended start-only range is usable", func(t *testing.T) {
@@ -296,6 +315,9 @@ func TestEventFilterFromCalFilter(t *testing.T) {
 		}
 		if ef.Start == nil {
 			t.Error("expected Start to be set")
+		}
+		if ef.End != nil {
+			t.Errorf("an omitted end bounded the read at %v", ef.End)
 		}
 	})
 
@@ -336,42 +358,50 @@ func TestEventFilterFromCalFilter(t *testing.T) {
 // DTSTART); the ordinary overlap expression wrongly excludes one sitting
 // exactly on range_start.
 func TestEventInTimeRangeBoundaryOverlap(t *testing.T) {
-	at := func(hour, minute int) time.Time {
-		return time.Date(2024, 6, 1, hour, minute, 0, 0, time.UTC)
-	}
 	rangeTR := &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"}
 
 	tests := []struct {
-		name    string
-		dtstart time.Time
-		dtend   *time.Time
-		allDay  bool
-		want    bool
+		name     string
+		dtstart  string
+		dtend    string
+		duration string
+		want     bool
 	}{
-		{name: "zero-duration at range start", dtstart: at(10, 0), want: true},
-		{name: "explicit zero-duration DTEND at range start", dtstart: at(10, 0), dtend: ptrTime(at(10, 0)), want: true},
-		{name: "zero-duration inside range", dtstart: at(10, 30), want: true},
-		{name: "zero-duration just before range start", dtstart: at(9, 59), want: false},
-		{name: "zero-duration at range end", dtstart: at(11, 0), want: false},
-		{name: "duration ending at range start", dtstart: at(9, 0), dtend: ptrTime(at(10, 0)), want: false},
-		{name: "duration starting at range end", dtstart: at(11, 0), dtend: ptrTime(at(12, 0)), want: false},
-		{name: "duration overlapping range start", dtstart: at(9, 30), dtend: ptrTime(at(10, 30)), want: true},
-		{name: "duration spanning the range", dtstart: at(9, 0), dtend: ptrTime(at(12, 0)), want: true},
-		{name: "all-day covering the range", dtstart: at(0, 0), dtend: ptrTime(time.Date(2024, 6, 2, 0, 0, 0, 0, time.UTC)), allDay: true, want: true},
+		{name: "zero-duration at range start", dtstart: "20240601T100000Z", want: true},
+		// A DTEND equal to DTSTART is not a legal VEVENT -- RFC 5545 §3.6.1
+		// requires DTEND to be later than DTSTART -- and the §9.9 row for a
+		// VEVENT carrying DTEND is (start < DTEND AND end > DTSTART), which the
+		// degenerate spelling cannot satisfy at the range start. A zero-duration
+		// occurrence is written with DURATION:PT0S or with DTSTART alone.
+		{name: "explicit zero-duration DTEND at range start", dtstart: "20240601T100000Z", dtend: "20240601T100000Z", want: false},
+		{name: "zero DURATION at range start", dtstart: "20240601T100000Z", duration: "PT0S", want: true},
+		{name: "zero-duration inside range", dtstart: "20240601T103000Z", want: true},
+		{name: "zero-duration just before range start", dtstart: "20240601T095900Z", want: false},
+		{name: "zero-duration at range end", dtstart: "20240601T110000Z", want: false},
+		{name: "duration ending at range start", dtstart: "20240601T090000Z", dtend: "20240601T100000Z", want: false},
+		{name: "duration starting at range end", dtstart: "20240601T110000Z", dtend: "20240601T120000Z", want: false},
+		{name: "duration overlapping range start", dtstart: "20240601T093000Z", dtend: "20240601T103000Z", want: true},
+		{name: "duration spanning the range", dtstart: "20240601T090000Z", dtend: "20240601T120000Z", want: true},
+		{name: "all-day covering the range", dtstart: ";VALUE=DATE:20240601", want: true},
 	}
 
-	h := &DavServer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := store.Event{
-				UID:     "boundary",
-				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:boundary\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-				DTStart: &tt.dtstart,
-				DTEnd:   tt.dtend,
-				AllDay:  tt.allDay,
+			dtstart := tt.dtstart
+			if !strings.HasPrefix(dtstart, ";") {
+				dtstart = ":" + dtstart
 			}
-			if got := h.eventInTimeRange(event, rangeTR); got != tt.want {
-				t.Fatalf("eventInTimeRange = %v, want %v", got, tt.want)
+			raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:boundary\r\nDTSTART" + dtstart + "\r\n"
+			if tt.dtend != "" {
+				raw += "DTEND:" + tt.dtend + "\r\n"
+			}
+			if tt.duration != "" {
+				raw += "DURATION:" + tt.duration + "\r\n"
+			}
+			raw += "END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+			if got := resourceInTimeRange(store.Event{UID: "boundary", RawICAL: raw}, rangeTR, floatingZone{}); got != tt.want {
+				t.Fatalf("eventInTimeRange = %v, want %v for %q", got, tt.want, raw)
 			}
 		})
 	}
@@ -386,12 +416,12 @@ func TestFreeBusyIncludesZeroDurationEventAtRangeStart(t *testing.T) {
 	}
 
 	h := &DavServer{}
-	body := h.generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"})
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"})
 	if !strings.Contains(body, "FREEBUSY:20240601T100000Z/20240601T100000Z") {
 		t.Fatalf("expected zero-duration event at range start in free-busy output, got %s", body)
 	}
 
-	before := h.generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240601T110000Z", End: "20240601T120000Z"})
+	before := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240601T110000Z", End: "20240601T120000Z"})
 	if strings.Contains(before, "FREEBUSY:") {
 		t.Fatalf("expected zero-duration event before the range to be omitted, got %s", before)
 	}
@@ -408,7 +438,7 @@ func TestGenerateFreeBusyExpandsRecurringEventsInRequestedRange(t *testing.T) {
 	}
 	tr := &timeRange{Start: "20240617T000000Z", End: "20240618T000000Z"}
 
-	body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, tr)
+	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 
 	if !strings.Contains(body, "FREEBUSY:20240617T100000Z/20240617T110000Z") {
 		t.Fatalf("expected recurring busy period inside requested range, got %s", body)
@@ -502,10 +532,10 @@ func TestGenerateFreeBusyExpandsRRuleByParts(t *testing.T) {
 			}
 
 			h := &DavServer{}
-			if !h.eventInTimeRange(event, tt.rangeTR) {
+			if !resourceInTimeRange(event, tt.rangeTR, floatingZone{}) {
 				t.Fatalf("expected event to match range %+v", tt.rangeTR)
 			}
-			body := h.generateFreeBusy([]store.Event{event}, nil, tt.rangeTR)
+			body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tt.rangeTR)
 			if !strings.Contains(body, tt.wantBusy) {
 				t.Fatalf("expected busy period %q, got %s", tt.wantBusy, body)
 			}
@@ -564,7 +594,7 @@ func TestGenerateFreeBusyExpandsSubDailyRecurringEvents(t *testing.T) {
 				DTEnd:   &tt.end,
 			}
 
-			body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, tt.rangeTR)
+			body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tt.rangeTR)
 
 			if !strings.Contains(body, tt.wantBusy) {
 				t.Fatalf("expected busy period %q, got %s", tt.wantBusy, body)
@@ -592,10 +622,10 @@ func TestGenerateFreeBusyExpandsCountedSubDailyBeyondScanLimit(t *testing.T) {
 	}
 
 	h := &DavServer{}
-	if !h.eventInTimeRange(event, tr) {
+	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected counted secondly recurrence beyond scan limit to match requested range")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	want := "FREEBUSY:" + target.Format("20060102T150405Z") + "/" + target.Add(10*time.Second).Format("20060102T150405Z")
 	if !strings.Contains(body, want) {
 		t.Fatalf("expected busy period %q, got %s", want, body)
@@ -639,10 +669,10 @@ func TestGenerateFreeBusyExpandsSubDailyByParts(t *testing.T) {
 			}
 
 			h := &DavServer{}
-			if !h.eventInTimeRange(event, tt.rangeTR) {
+			if !resourceInTimeRange(event, tt.rangeTR, floatingZone{}) {
 				t.Fatalf("expected event to match range %+v", tt.rangeTR)
 			}
-			body := h.generateFreeBusy([]store.Event{event}, nil, tt.rangeTR)
+			body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tt.rangeTR)
 			if !strings.Contains(body, tt.wantBusy) {
 				t.Fatalf("expected busy period %q, got %s", tt.wantBusy, body)
 			}
@@ -663,19 +693,19 @@ func TestRecurringOverrideMovesInstanceIntoRange(t *testing.T) {
 
 	h := &DavServer{}
 	movedRange := &timeRange{Start: "20240602T150000Z", End: "20240602T160000Z"}
-	if !h.eventInTimeRange(event, movedRange) {
+	if !resourceInTimeRange(event, movedRange, floatingZone{}) {
 		t.Fatal("expected override instance to match its moved range")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, movedRange)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, movedRange)
 	if !strings.Contains(body, "FREEBUSY:20240602T150000Z/20240602T160000Z") {
 		t.Fatalf("expected moved override busy period, got %s", body)
 	}
 
 	originalRange := &timeRange{Start: "20240602T100000Z", End: "20240602T110000Z"}
-	if h.eventInTimeRange(event, originalRange) {
+	if resourceInTimeRange(event, originalRange, floatingZone{}) {
 		t.Fatal("expected overridden original instance to be suppressed")
 	}
-	originalBody := h.generateFreeBusy([]store.Event{event}, nil, originalRange)
+	originalBody := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, originalRange)
 	if strings.Contains(originalBody, "FREEBUSY:20240602T100000Z/20240602T110000Z") {
 		t.Fatalf("expected generated original instance to be suppressed, got %s", originalBody)
 	}
@@ -694,10 +724,10 @@ func TestCancelledRecurrenceOverrideSuppressesBusyPeriod(t *testing.T) {
 
 	tr := &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}
 	h := &DavServer{}
-	if h.eventInTimeRange(event, tr) {
+	if resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected cancelled recurrence override not to match range")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if strings.Contains(body, "FREEBUSY:20240602T100000Z/20240602T110000Z") {
 		t.Fatalf("expected cancelled recurrence override to be omitted, got %s", body)
 	}
@@ -715,10 +745,10 @@ func TestRecurringTimeRangeHonorsRDateAndExDate(t *testing.T) {
 	tr := &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"}
 
 	h := &DavServer{}
-	if !h.eventInTimeRange(rdateEvent, tr) {
+	if !resourceInTimeRange(rdateEvent, tr, floatingZone{}) {
 		t.Fatal("expected RDATE instance to match requested range")
 	}
-	body := h.generateFreeBusy([]store.Event{rdateEvent}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}), nil, tr)
 	if !strings.Contains(body, "FREEBUSY:20240605T090000Z/20240605T100000Z") {
 		t.Fatalf("expected RDATE busy period, got %s", body)
 	}
@@ -729,7 +759,7 @@ func TestRecurringTimeRangeHonorsRDateAndExDate(t *testing.T) {
 		DTStart: &start,
 		DTEnd:   &end,
 	}
-	exdateBody := h.generateFreeBusy([]store.Event{exdateEvent}, nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
+	exdateBody := h.generateFreeBusy(freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}), nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
 	if strings.Contains(exdateBody, "FREEBUSY:20240602T090000Z/20240602T100000Z") {
 		t.Fatalf("expected EXDATE instance to be omitted, got %s", exdateBody)
 	}
@@ -747,10 +777,10 @@ func TestGenerateFreeBusyExpandsYearlyByWeekNo(t *testing.T) {
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20240513T000000Z", End: "20240514T000000Z"}
-	if !h.eventInTimeRange(event, tr) {
+	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected BYWEEKNO recurrence to match requested week")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if !strings.Contains(body, "FREEBUSY:20240513T090000Z/20240513T100000Z") {
 		t.Fatalf("expected BYWEEKNO busy period, got %s", body)
 	}
@@ -795,7 +825,7 @@ func TestGenerateFreeBusyExpandsMonthlyAndYearlyRecurringEvents(t *testing.T) {
 				DTEnd:   &tt.end,
 			}
 
-			body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, tt.rangeTR)
+			body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tt.rangeTR)
 			if !strings.Contains(body, tt.wantBusy) {
 				t.Fatalf("expected busy period %q, got %s", tt.wantBusy, body)
 			}
@@ -813,12 +843,12 @@ func TestGenerateFreeBusyHonorsRecurrenceUntil(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	inRangeBody := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240603T000000Z", End: "20240604T000000Z"})
+	inRangeBody := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240603T000000Z", End: "20240604T000000Z"})
 	if !strings.Contains(inRangeBody, "FREEBUSY:20240603T090000Z/20240603T100000Z") {
 		t.Fatalf("expected last UNTIL instance, got %s", inRangeBody)
 	}
 
-	afterUntilBody := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240604T000000Z", End: "20240605T000000Z"})
+	afterUntilBody := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240604T000000Z", End: "20240605T000000Z"})
 	if strings.Contains(afterUntilBody, "FREEBUSY:") {
 		t.Fatalf("expected no instances after UNTIL, got %s", afterUntilBody)
 	}
@@ -834,10 +864,10 @@ func TestUnsupportedRecurrenceFrequencyIsPermissiveForFiltering(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	if !(&DavServer{}).eventInTimeRange(event, &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}) {
+	if !resourceInTimeRange(event, &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}, floatingZone{}) {
 		t.Fatal("expected unsupported recurrence frequency to be permissively included by filtering")
 	}
-	if got := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}); strings.Contains(got, "FREEBUSY:") {
+	if got := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}); strings.Contains(got, "FREEBUSY:") {
 		t.Fatalf("expected unsupported recurrence expansion to produce no invented periods, got %s", got)
 	}
 }
@@ -854,16 +884,16 @@ func TestMalformedRRuleFallsBackToMasterInstance(t *testing.T) {
 
 	h := &DavServer{}
 	masterRange := &timeRange{Start: "20240601T093000Z", End: "20240601T094500Z"}
-	if !h.eventInTimeRange(event, masterRange) {
+	if !resourceInTimeRange(event, masterRange, floatingZone{}) {
 		t.Fatal("expected malformed recurrence to fall back to the master instance")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, masterRange)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, masterRange)
 	if !strings.Contains(body, "FREEBUSY:20240601T090000Z/20240601T100000Z") {
 		t.Fatalf("expected master busy period for malformed RRULE, got %s", body)
 	}
 
 	laterRange := &timeRange{Start: "20240602T093000Z", End: "20240602T094500Z"}
-	if h.eventInTimeRange(event, laterRange) {
+	if resourceInTimeRange(event, laterRange, floatingZone{}) {
 		t.Fatal("expected malformed recurrence not to invent future instances")
 	}
 }
@@ -878,10 +908,10 @@ func TestRecurringDurationDefinesBusyPeriodEnd(t *testing.T) {
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20240602T103000Z", End: "20240602T104500Z"}
-	if !h.eventInTimeRange(event, tr) {
+	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected DURATION-backed recurrence to overlap the requested range")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if !strings.Contains(body, "FREEBUSY:20240602T090000Z/20240602T110000Z") {
 		t.Fatalf("expected DURATION to set recurring busy period end, got %s", body)
 	}
@@ -895,7 +925,7 @@ func TestRDatePeriodWithExplicitEnd(t *testing.T) {
 		DTStart: &start,
 	}
 
-	body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"})
+	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"})
 	if !strings.Contains(body, "FREEBUSY:20240605T090000Z/20240605T113000Z") {
 		t.Fatalf("expected RDATE period explicit end, got %s", body)
 	}
@@ -909,7 +939,7 @@ func TestRDatePeriodWithDuration(t *testing.T) {
 		DTStart: &start,
 	}
 
-	body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240605T110000Z", End: "20240605T120000Z"})
+	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240605T110000Z", End: "20240605T120000Z"})
 	if !strings.Contains(body, "FREEBUSY:20240605T090000Z/20240605T113000Z") {
 		t.Fatalf("expected RDATE duration period to be expanded to an absolute end, got %s", body)
 	}
@@ -925,7 +955,7 @@ func TestRDateAndExDateHonorTZID(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	body := (&DavServer{}).generateFreeBusy([]store.Event{rdateEvent}, nil, &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"})
+	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}), nil, &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"})
 	if !strings.Contains(body, "FREEBUSY:20240605T130000Z/20240605T140000Z") {
 		t.Fatalf("expected TZID RDATE converted to UTC, got %s", body)
 	}
@@ -936,9 +966,126 @@ func TestRDateAndExDateHonorTZID(t *testing.T) {
 		DTStart: &start,
 		DTEnd:   &end,
 	}
-	exdateBody := (&DavServer{}).generateFreeBusy([]store.Event{exdateEvent}, nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
+	exdateBody := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}), nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
 	if strings.Contains(exdateBody, "FREEBUSY:20240602T130000Z/20240602T140000Z") {
 		t.Fatalf("expected TZID EXDATE instance to be omitted, got %s", exdateBody)
+	}
+}
+
+// RFC 4791 §7.3 gives free-busy the collection's CALDAV:calendar-timezone as
+// the zone a floating value resolves against, and §7.10 makes the response body
+// the report's answer. Resolving the zone only when choosing which events to
+// consider, and then deriving the busy periods as though the same values were
+// UTC, answers with a period the request did not ask about -- or, as here, with
+// none at all, reporting the user free while they are busy.
+func TestFreeBusyPeriodsResolveFloatingValuesThroughTheCollectionTimezone(t *testing.T) {
+	if _, err := time.LoadLocation("America/Chicago"); err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// 10:00 floating. Read as UTC that is 10:00Z; in America/Chicago (CDT in
+	// June) it is 15:00Z, and only the latter is the instant §7.3 names.
+	columnStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	columnEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+	chicago := "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
+		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", Timezone: &chicago}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:floating": {
+				CalendarID: 1,
+				UID:        "floating",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:floating\r\n" +
+					"DTSTART:20240601T100000\r\nDTEND:20240601T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:    "e",
+				DTStart: &columnStart,
+				DTEnd:   &columnEnd,
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:time-range start="20240601T150000Z" end="20240601T160000Z"/>
+</C:free-busy-query>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("free-busy-query = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Body.String(); !strings.Contains(got, "FREEBUSY:20240601T150000Z/20240601T160000Z") {
+		t.Fatalf("busy period was not resolved through the collection timezone, got %s", got)
+	}
+}
+
+// The published periods come from a recurrence set the collection's timezone
+// resolved, so the EXDATE that removes an occurrence has to be read in that same
+// zone. Left at its UTC reading it matches no generated instance, and the
+// response reports the user busy through an occurrence they cancelled.
+func TestFreeBusyPeriodsHonourExDateUnderTheCollectionTimezone(t *testing.T) {
+	if _, err := time.LoadLocation("America/Chicago"); err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	columnStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	columnEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+	chicago := "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
+		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", Timezone: &chicago}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:daily": {
+				CalendarID: 1,
+				UID:        "daily",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:daily\r\n" +
+					"DTSTART:20240601T100000\r\nDTEND:20240601T110000\r\n" +
+					"RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20240602T100000\r\n" +
+					"END:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:    "e",
+				DTStart: &columnStart,
+				DTEnd:   &columnEnd,
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:time-range start="20240601T000000Z" end="20240605T000000Z"/>
+</C:free-busy-query>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("free-busy-query = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	got := rr.Body.String()
+	for _, want := range []string{
+		"FREEBUSY:20240601T150000Z/20240601T160000Z",
+		"FREEBUSY:20240603T150000Z/20240603T160000Z",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %s in %s", want, got)
+		}
+	}
+	if strings.Contains(got, "FREEBUSY:20240602T150000Z") {
+		t.Errorf("the EXDATE'd occurrence was still published: %s", got)
 	}
 }
 
@@ -953,10 +1100,10 @@ func TestRecurringAllDayWithoutDTEndUsesOneDayDuration(t *testing.T) {
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20240602T120000Z", End: "20240602T130000Z"}
-	if !h.eventInTimeRange(event, tr) {
+	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected recurring all-day event to overlap the afternoon of the generated day")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if !strings.Contains(body, "FREEBUSY:20240602T000000Z/20240603T000000Z") {
 		t.Fatalf("expected all-day recurrence to use a one-day busy period, got %s", body)
 	}
@@ -975,10 +1122,10 @@ func TestThisAndFutureOverrideShiftsFollowingInstances(t *testing.T) {
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20240604T150000Z", End: "20240604T160000Z"}
-	if !h.eventInTimeRange(event, tr) {
+	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected RANGE=THISANDFUTURE override to shift later generated instances")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if !strings.Contains(body, "FREEBUSY:20240604T150000Z/20240604T160000Z") {
 		t.Fatalf("expected shifted future busy period, got %s", body)
 	}
@@ -1000,10 +1147,10 @@ func TestCancelledThisAndFutureOverrideSuppressesFollowingInstances(t *testing.T
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20240603T090000Z", End: "20240603T100000Z"}
-	if h.eventInTimeRange(event, tr) {
+	if resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected RANGE=THISANDFUTURE cancellation to suppress following generated instances")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if strings.Contains(body, "FREEBUSY:20240603T090000Z/20240603T100000Z") {
 		t.Fatalf("expected cancelled future busy period to be omitted, got %s", body)
 	}
@@ -1019,7 +1166,7 @@ func TestLowercaseRRuleIsExpanded(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	body := (&DavServer{}).generateFreeBusy([]store.Event{event}, nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
+	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"})
 	if !strings.Contains(body, "FREEBUSY:20240602T090000Z/20240602T100000Z") {
 		t.Fatalf("expected lowercase rrule to be expanded, got %s", body)
 	}
@@ -1039,10 +1186,10 @@ func TestRecurrenceParsingIsScopedToVEvent(t *testing.T) {
 
 	h := &DavServer{}
 	tr := &timeRange{Start: "20250601T000000Z", End: "20250602T000000Z"}
-	if h.eventInTimeRange(event, tr) {
+	if resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected VTIMEZONE RRULE not to make a non-recurring VEVENT match")
 	}
-	body := h.generateFreeBusy([]store.Event{event}, nil, tr)
+	body := h.generateFreeBusy(freeBusyCandidates([]store.Event{event}, floatingZone{}), nil, tr)
 	if strings.Contains(body, "FREEBUSY:20250601T090000Z/20250601T100000Z") {
 		t.Fatalf("expected no invented busy period from VTIMEZONE RRULE, got %s", body)
 	}
@@ -1089,7 +1236,6 @@ func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
 		{name: "the property value itself still matches", property: "ATTENDEE", text: "dana@example.com", want: true},
 	}
 
-	h := &DavServer{}
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1097,7 +1243,7 @@ func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
 				Name:      tt.property,
 				TextMatch: &textMatch{Text: tt.text},
 			}}})
-			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("text-match %q on %s = %v, want %v", tt.text, tt.property, got, tt.want)
 			}
 		})
@@ -1124,7 +1270,6 @@ func TestParamFilterIsScopedToTheNamedParameter(t *testing.T) {
 		{name: "a negated parameter text-match inverts", param: paramFilter{Name: "PARTSTAT", TextMatch: &textMatch{Text: "DECLINED", NegateCondition: "yes"}}, want: true},
 	}
 
-	h := &DavServer{}
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1132,7 +1277,7 @@ func TestParamFilterIsScopedToTheNamedParameter(t *testing.T) {
 				Name:        "ATTENDEE",
 				ParamFilter: []paramFilter{tt.param},
 			}}})
-			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("param-filter %+v = %v, want %v", tt.param, got, tt.want)
 			}
 		})
@@ -1213,11 +1358,10 @@ func TestCompFilterScopingAndIsNotDefined(t *testing.T) {
 		},
 	}
 
-	h := &DavServer{}
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := h.eventMatchesFilter(event, tt.filter); got != tt.want {
+			if got := eventMatchesFilter(event, tt.filter, floatingZone{}); got != tt.want {
 				t.Fatalf("eventMatchesFilter = %v, want %v", got, tt.want)
 			}
 		})
@@ -1242,7 +1386,6 @@ func TestTextMatchHonoursTheNamedCollation(t *testing.T) {
 		{name: "identifiers are case-insensitive", collation: "I;OCTET", text: "Standup", want: true},
 	}
 
-	h := &DavServer{}
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1250,7 +1393,7 @@ func TestTextMatchHonoursTheNamedCollation(t *testing.T) {
 				Name:      "SUMMARY",
 				TextMatch: &textMatch{Text: tt.text, Collation: tt.collation},
 			}}})
-			if got := h.eventMatchesFilter(event, filter); got != tt.want {
+			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("collation %q matching %q = %v, want %v", tt.collation, tt.text, got, tt.want)
 			}
 		})
@@ -1287,7 +1430,6 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 		},
 	}
 
-	h := &DavServer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			filter := calFilterOverVEvent(compFilter{PropFilter: []propFilter{{
@@ -1297,7 +1439,7 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 					Collation: "i;octet",
 				},
 			}}})
-			if got := h.eventMatchesFilter(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter); got != tt.want {
+			if got := eventMatchesFilter(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("eventMatchesFilter() = %v, want %v", got, tt.want)
 			}
 		})
@@ -1307,10 +1449,9 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 // A calendar object whose stored octets do not parse matches nothing rather
 // than failing the report for every other resource in the collection.
 func TestFilterTreatsUnparseableStoredDataAsNoMatch(t *testing.T) {
-	h := &DavServer{}
 	filter := &calFilter{CompFilter: compFilter{Name: "VCALENDAR"}}
 	for _, raw := range []string{"", "ICAL", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"} {
-		if h.eventMatchesFilter(store.Event{UID: "broken", RawICAL: raw}, filter) {
+		if eventMatchesFilter(store.Event{UID: "broken", RawICAL: raw}, filter, floatingZone{}) {
 			t.Errorf("unparseable data %q matched", raw)
 		}
 	}
@@ -1374,10 +1515,77 @@ func TestBirthdayCalendarEventsMatchScopedFilters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := h.eventMatchesFilter(events[0], tt.filter); got != tt.want {
+			if got := eventMatchesFilter(events[0], tt.filter, floatingZone{}); got != tt.want {
 				t.Fatalf("eventMatchesFilter = %v, want %v for %s", got, tt.want, events[0].RawICAL)
 			}
 		})
+	}
+}
+
+// RFC 4791 §7.3 resolves a floating value against the CALDAV:timezone the
+// request carries before anything else, and that source is available to every
+// collection. The birthday collection defines no CALDAV:calendar-timezone of its
+// own, but its entries are DTSTART;VALUE=DATE -- floating values whose implied
+// day sits at a different instant in every zone -- so ignoring the request
+// element answers with a different day than the client asked about.
+func TestBirthdayCalendarQueryResolvesDatesThroughTheRequestTimezone(t *testing.T) {
+	if _, err := time.LoadLocation("America/Chicago"); err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	birthday := time.Date(1990, 6, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "Dana Lee"
+	h := &DavServer{store: &store.Store{
+		Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:dana": {ID: 1, AddressBookID: 1, UID: "dana", DisplayName: &displayName, Birthday: &birthday},
+		}},
+	}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents() error = %v", err)
+	}
+	// The generated DTSTART rolls to next year once this year's birthday has
+	// passed, so the range is built from the value the collection actually
+	// carries rather than from a fixed date.
+	root, err := parseICalendarObject(events[0].RawICAL)
+	if err != nil {
+		t.Fatalf("parseICalendarObject() = %v", err)
+	}
+	event, _ := namedComponent(root, "VEVENT")
+	day, err := time.Parse("20060102", strings.TrimSpace(event.value("DTSTART")))
+	if err != nil {
+		t.Fatalf("generated DTSTART is not a DATE: %v", err)
+	}
+
+	// Read as UTC the birthday occupies [day, day+1); in America/Chicago (CDT,
+	// -0500 in June) the same DATE is [day+05:00Z, day+1+05:00Z). This range
+	// falls in the second and not the first.
+	rangeStart := day.AddDate(0, 0, 1).UTC()
+	timeRangeXML := fmt.Sprintf(`<C:time-range start="%s" end="%s"/>`,
+		rangeStart.Format("20060102T150405Z"),
+		rangeStart.Add(3*time.Hour).Format("20060102T150405Z"))
+
+	query := func(timezone string) davMultistatus {
+		t.Helper()
+		body := calendarQueryBody(`<D:prop><D:getetag/></D:prop><C:filter>` +
+			`<C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+			timeRangeXML +
+			`</C:comp-filter></C:comp-filter></C:filter>` + timezone)
+		req := httptest.NewRequest("REPORT", birthdayCalendarHref(), strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+		h.Report(rr, req)
+		return decodeMultistatus(t, rr)
+	}
+
+	if got := query(""); len(got.Responses) != 0 {
+		t.Fatalf("without a request timezone the range is outside the UTC day, got %d responses", len(got.Responses))
+	}
+
+	chicago := `<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`
+	if got := query(chicago); len(got.Responses) != 1 {
+		t.Fatalf("calendar-query responses = %d, want 1; the request timezone was not applied", len(got.Responses))
 	}
 }
 

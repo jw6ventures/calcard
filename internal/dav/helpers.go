@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -72,10 +73,10 @@ func calendarCollectionPropstatResponse(href, name string, cal store.Calendar, p
 	p.ScheduleCalendarTransp = &scheduleCalendarTransp{Opaque: &struct{}{}}
 
 	p.MaxResourceSize = strconv.FormatInt(maxDAVBodyBytes, 10)
-	p.MinDateTime = caldavMinDateTime
-	p.MaxDateTime = caldavMaxDateTime
-	p.MaxInstances = strconv.Itoa(caldavMaxInstances)
-	p.MaxAttendeesPerInstance = strconv.Itoa(caldavMaxAttendees)
+	p.MinDateTime = ical.MinDateTime
+	p.MaxDateTime = ical.MaxDateTime
+	p.MaxInstances = strconv.Itoa(ical.MaxRecurrenceInstances)
+	p.MaxAttendeesPerInstance = strconv.Itoa(ical.MaxAttendeesPerInstance)
 
 	return resp
 }

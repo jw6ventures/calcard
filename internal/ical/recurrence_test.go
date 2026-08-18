@@ -229,7 +229,7 @@ func TestRecurringBusyPeriodsExpandsWeeklyRuleWithExdate(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000)
+	periods := RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
 
 	// Mondays Jan 6, 13, 27 (Jan 20 excluded by EXDATE).
 	want := []time.Time{
@@ -269,7 +269,7 @@ func TestRecurringBusyPeriodsAppliesOverride(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000)
+	periods := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
 
 	overridden := time.Date(2025, 1, 13, 15, 0, 0, 0, time.UTC)
 	foundOverride := false
@@ -283,6 +283,196 @@ func TestRecurringBusyPeriodsAppliesOverride(t *testing.T) {
 	}
 	if !foundOverride {
 		t.Fatalf("override occurrence missing: %#v", periods)
+	}
+}
+
+func TestRecurrenceInstanceStartsExpandsNonEventComponents(t *testing.T) {
+	for _, component := range []string{"VTODO", "VJOURNAL"} {
+		t.Run(component, func(t *testing.T) {
+			raw := "BEGIN:VCALENDAR\r\n" +
+				"BEGIN:" + component + "\r\n" +
+				"UID:repeating\r\n" +
+				"DTSTART:20250106T100000Z\r\n" +
+				"RRULE:FREQ=WEEKLY;COUNT=3\r\n" +
+				"END:" + component + "\r\n" +
+				"END:VCALENDAR\r\n"
+			dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
+
+			if !componentHasRecurrence(raw, component) {
+				t.Fatalf("componentHasRecurrence(%s) = false", component)
+			}
+			got := RecurrenceInstanceStarts(raw, component, dtstart, 0,
+				time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)
+
+			want := []time.Time{
+				time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
+				time.Date(2025, 1, 13, 10, 0, 0, 0, time.UTC),
+				time.Date(2025, 1, 20, 10, 0, 0, 0, time.UTC),
+			}
+			if len(got) != len(want) {
+				t.Fatalf("RecurrenceInstanceStarts() = %v, want %v", got, want)
+			}
+			for i := range want {
+				if !got[i].Equal(want[i]) {
+					t.Fatalf("instance %d = %v, want %v", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// A zero-duration occurrence sitting exactly on the end of the scan window is
+// still a candidate: RFC 4791 §9.9 conditions such as "start <= DTSTART" accept
+// an endpoint that a half-open overlap would discard before the caller ever
+// evaluates them.
+func TestRecurrenceInstanceStartsIncludesOccurrencesOnTheBounds(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:daily\r\n" +
+		"DTSTART:20250106T100000Z\r\n" +
+		"RRULE:FREQ=DAILY;COUNT=3\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
+	boundary := time.Date(2025, 1, 7, 10, 0, 0, 0, time.UTC)
+
+	got := RecurrenceInstanceStarts(raw, "VEVENT", dtstart, 0, boundary, boundary, 1000, nil)
+	if len(got) != 1 || !got[0].Equal(boundary) {
+		t.Fatalf("RecurrenceInstanceStarts() = %v, want exactly %v", got, boundary)
+	}
+}
+
+// An overridden instance is reported by the override component itself, so the
+// generated set must not also carry the recurrence-ID it replaced.
+func TestRecurrenceInstanceStartsOmitsOverriddenInstances(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:weekly\r\n" +
+		"DTSTART:20250106T100000Z\r\n" +
+		"RRULE:FREQ=WEEKLY;COUNT=2\r\n" +
+		"END:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:weekly\r\n" +
+		"RECURRENCE-ID:20250113T100000Z\r\n" +
+		"DTSTART:20250113T150000Z\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
+
+	got := RecurrenceInstanceStarts(raw, "VEVENT", dtstart, time.Hour,
+		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)
+
+	for _, start := range got {
+		if start.Equal(time.Date(2025, 1, 13, 10, 0, 0, 0, time.UTC)) {
+			t.Fatalf("overridden recurrence-id still generated: %v", got)
+		}
+		if start.Equal(time.Date(2025, 1, 13, 15, 0, 0, 0, time.UTC)) {
+			t.Fatalf("override occurrence returned as a generated instance: %v", got)
+		}
+	}
+	if len(got) != 1 || !got[0].Equal(dtstart) {
+		t.Fatalf("RecurrenceInstanceStarts() = %v, want exactly %v", got, dtstart)
+	}
+}
+
+// A caller holding a timezone this package cannot see resolves the whole
+// recurrence set through it, not only the DTSTART it passes in. Reading EXDATE
+// here instead would compare an instant in one zone against instants in another
+// and quietly stop excluding anything.
+func TestRecurrenceInstanceStartsUsesTheSuppliedResolver(t *testing.T) {
+	// Floating throughout, so every value depends on the resolver.
+	raw := "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:floating\r\n" +
+		"DTSTART:20250106T100000\r\n" +
+		"RRULE:FREQ=WEEKLY;COUNT=3\r\n" +
+		"EXDATE:20250113T100000\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	scanStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	scanEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	// A resolver three hours behind the plain UTC reading, standing in for any
+	// zone the caller resolved a floating value against.
+	behind := PropertyTimeResolver(func(keyPart, value string) (time.Time, bool) {
+		parsed, ok := ParsePropertyDateTimeLocal(keyPart, value)
+		if !ok {
+			return time.Time{}, false
+		}
+		return parsed.Add(3 * time.Hour), true
+	})
+	dtstart, ok := behind("DTSTART", "20250106T100000")
+	if !ok {
+		t.Fatal("resolver rejected the DTSTART")
+	}
+
+	got := RecurrenceInstanceStarts(raw, "VEVENT", dtstart, 0, scanStart, scanEnd, 1000, behind)
+	want := []time.Time{
+		time.Date(2025, 1, 6, 13, 0, 0, 0, time.UTC),
+		time.Date(2025, 1, 20, 13, 0, 0, 0, time.UTC),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("RecurrenceInstanceStarts() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("instance %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+
+	// A nil resolver keeps the ParsePropertyDateTimeLocal reading, which is what
+	// every caller holding no zone of its own relies on.
+	plain, _ := ParsePropertyDateTimeLocal("DTSTART", "20250106T100000")
+	bare := RecurrenceInstanceStarts(raw, "VEVENT", plain, 0, scanStart, scanEnd, 1000, nil)
+	if len(bare) != 2 || !bare[0].Equal(plain) {
+		t.Fatalf("a nil resolver did not read as ParsePropertyDateTimeLocal: %v", bare)
+	}
+}
+
+// The zone a value resolves in, in the order the parameters and the value
+// itself decide it. A caller holding a request or collection timezone does not
+// come through here at all.
+func TestParsePropertyDateTimeLocalZoneSelection(t *testing.T) {
+	tests := []struct {
+		name    string
+		keyPart string
+		value   string
+		want    time.Time
+	}{
+		{
+			name:    "a floating value reads as UTC",
+			keyPart: "DTSTART", value: "20250106T100000",
+			want: time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "a value carrying its own zone keeps it",
+			keyPart: "DTSTART", value: "20250106T100000Z",
+			want: time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "a TZID the host knows wins",
+			keyPart: "DTSTART;TZID=UTC", value: "20250106T100000",
+			want: time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "a TZID the host cannot resolve falls back to UTC",
+			keyPart: "DTSTART;TZID=Custom/Unknown", value: "20250106T100000",
+			want: time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParsePropertyDateTimeLocal(tt.keyPart, tt.value)
+			if !ok {
+				t.Fatalf("ParsePropertyDateTimeLocal(%q, %q) ok = false", tt.keyPart, tt.value)
+			}
+			if !got.Equal(tt.want) {
+				t.Fatalf("ParsePropertyDateTimeLocal(%q, %q) = %v, want %v", tt.keyPart, tt.value, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -275,8 +275,28 @@ func (h *DavServer) requestScheme(r *http.Request) string {
 	return "http"
 }
 
+// xmlWhitespace is what XML 1.0 §2.3 defines whitespace to be. It is the exact
+// set a serializer can introduce around element content, and therefore the
+// exact set that can be stripped back off a DAV:href.
+const xmlWhitespace = " \t\r\n"
+
+// trimHrefFraming removes the indentation an XML serializer can put around
+// element content, so a client that pretty-prints its request body still names
+// the URI it wrote.
+//
+// Deliberately narrower than strings.TrimSpace, which strips every Unicode
+// space -- U+00A0, U+2028, U+3000 and the rest. A URI is US-ASCII (RFC 3986
+// §2), so none of those can be framing this server added; they are part of what
+// the client sent, and discarding them would silently resolve an href to a
+// resource the client did not name. Left in place, they simply fail to name any
+// resource, which is the honest answer to a malformed href.
+func trimHrefFraming(raw string) string {
+	return strings.Trim(raw, xmlWhitespace)
+}
+
 func (h *DavServer) resolveDAVHrefReference(rawHref, basePath string, r *http.Request) (*url.URL, bool) {
-	if r == nil || r.URL == nil || rawHref == "" || strings.TrimSpace(rawHref) != rawHref {
+	rawHref = trimHrefFraming(rawHref)
+	if r == nil || r.URL == nil || rawHref == "" {
 		return nil, false
 	}
 	reference, err := url.Parse(rawHref)

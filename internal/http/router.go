@@ -25,6 +25,35 @@ import (
 	"github.com/jw6ventures/calcard/internal/ui"
 )
 
+// trustedRealIP resolves the forwarded client address into r.RemoteAddr, the
+// job chi's middleware.RealIP does, but only when the immediate peer is a proxy
+// APP_TRUSTED_PROXIES names.
+//
+// chi's version rewrites unconditionally from True-Client-IP, X-Real-IP or the
+// first X-Forwarded-For hop. Because it runs ahead of every other middleware,
+// that turns each downstream trusted-proxy test into one the client answers for
+// itself: auth.RequestIsSecure reads r.RemoteAddr to decide whether to believe
+// X-Forwarded-Proto, so a spoofed X-Real-IP naming a trusted proxy alongside
+// X-Forwarded-Proto: https unlocks HTTP Basic over cleartext -- the transport
+// requirement RFC 4791 §11 makes of it. The rate limiter reads the same field
+// to choose a bucket.
+//
+// A deployment configuring no trusted proxies trusts every peer's forwarded
+// headers, which the configuration loader already warns about at startup.
+func trustedRealIP(trustedProxies []string) func(http.Handler) http.Handler {
+	trusted := auth.NewTrustedProxies(trustedProxies)
+	return func(next http.Handler) http.Handler {
+		forwarded := middleware.RealIP(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if trusted.AllowsPeer(r.RemoteAddr) {
+				forwarded.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 var registeredDAVMethods = struct {
 	sync.Mutex
 	methods map[string]struct{}
@@ -91,7 +120,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 100, 5*time.Minute, cfg.TrustedProxies)
 
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(trustedRealIP(cfg.TrustedProxies))
 	if opts.TrafficCaptureWriter != nil {
 		captureLogger := logging.New(opts.Logger, "HTTP")
 		r.Use(trafficcapture.Middleware(trafficcapture.Options{

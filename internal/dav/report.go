@@ -82,6 +82,14 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 		writeCalDAVError(w, http.StatusForbidden, "supported-collation")
 		return
 	}
+	// RFC 4791 §7.8 and §7.9 bound the range a report may ask about by the
+	// CALDAV:min-date-time and CALDAV:max-date-time of the collections it
+	// targets. §1.3 puts a precondition failure at 403: no resubmission of the
+	// same range can bring it inside a limit the server does not move.
+	if condition := reportTimeRangeDateLimitFault(report.Filter, report.TimeRange); condition != "" {
+		writeCalDAVError(w, http.StatusForbidden, condition)
+		return
+	}
 	if report.XMLName.Local == "free-busy-query" {
 		if !validTimeRange(report.TimeRange) {
 			http.Error(w, "invalid time-range", http.StatusBadRequest)
@@ -288,13 +296,17 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "failed to generate birthday events", http.StatusInternalServerError)
 			return
 		}
+		// Free-busy carries no CALDAV:timezone element of its own, and the
+		// generated birthday collection defines no CALDAV:calendar-timezone, so
+		// §7.3 leaves UTC as the only source for a floating value.
+		candidates := freeBusyCandidates(events, floatingZone{})
 		if report.Filter != nil {
-			events = h.applyCalendarFilter(events, report.Filter)
+			candidates = filterFreeBusyCandidates(candidates, report.Filter)
 		}
 		if report.TimeRange != nil {
-			events = h.filterCalendarEventsByTimeRange(events, report.TimeRange)
+			candidates = filterFreeBusyCandidatesByTimeRange(candidates, report.TimeRange)
 		}
-		freeBusyData := h.generateFreeBusy(events, report.Filter, report.TimeRange)
+		freeBusyData := h.generateFreeBusy(candidates, report.Filter, report.TimeRange)
 		w.Header().Set("Content-Type", "text/calendar")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(freeBusyData))

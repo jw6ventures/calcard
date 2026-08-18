@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -35,7 +34,8 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, calData, report.selector, request)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.selector)
+		zone := reportFloatingZone(report.Timezone, cal.Timezone)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.selector, zone)
 		return res, "", err
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
@@ -46,14 +46,16 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	}
 }
 
-func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter) []store.Event {
+// applyCalendarFilter keeps the events a CALDAV:filter matches, resolving
+// floating values through zone, which RFC 4791 §7.3 orders ahead of UTC.
+func applyCalendarFilter(events []store.Event, filter *calFilter, zone floatingZone) []store.Event {
 	if filter == nil {
 		return events
 	}
 
 	var filtered []store.Event
 	for _, event := range events {
-		if h.eventMatchesFilter(event, filter) {
+		if eventMatchesFilter(event, filter, zone) {
 			filtered = append(filtered, event)
 		}
 	}
@@ -66,21 +68,40 @@ func (h *DavServer) applyCalendarFilter(events []store.Event, filter *calFilter)
 // tree rather than over the object's text: a substring search cannot tell a
 // SUMMARY value from a DESCRIPTION that quotes one. An object whose stored
 // octets do not parse matches nothing rather than failing the whole report.
-func (h *DavServer) eventMatchesFilter(event store.Event, filter *calFilter) bool {
-	root, err := parseICalendarObject(event.RawICAL)
-	if err != nil {
+func eventMatchesFilter(event store.Event, filter *calFilter, zone floatingZone) bool {
+	matcher, ok := newEventTimeRangeMatcher(event, zone)
+	if !ok {
 		return false
 	}
+	return matcherMatchesFilter(matcher, filter)
+}
+
+// newEventTimeRangeMatcher parses one stored object so the filter walk, the
+// §9.9 time-range test and the free-busy period derivation can share a single
+// parse. ok is false for octets that do not parse; the matcher is still
+// returned, since a caller may fall back to the denormalized store columns.
+func newEventTimeRangeMatcher(event store.Event, zone floatingZone) (calendarTimeRangeMatcher, bool) {
+	root, err := parseICalendarObject(event.RawICAL)
+	if err != nil {
+		return newCalendarTimeRangeMatcher(event.RawICAL, nil, zone), false
+	}
+	return newCalendarTimeRangeMatcher(event.RawICAL, root, zone), true
+}
+
+// matcherMatchesFilter is eventMatchesFilter over an object already parsed.
+func matcherMatchesFilter(matcher calendarTimeRangeMatcher, filter *calFilter) bool {
 	// RFC 4791 §9.7.1: the outermost comp-filter is scoped to the calendar
 	// object resource itself.
-	return h.matchesCompFilter(event, []*icalNode{root}, &filter.CompFilter)
+	return matchesCompFilter(matcher, nil, []*icalNode{matcher.root}, &filter.CompFilter)
 }
 
 // matchesCompFilter applies one CALDAV:comp-filter to the components it is
 // scoped to: the calendar object at the filter root, and the children of the
 // enclosing component when nested. An empty filter matches the component's
-// existence and every child filter is conjunctive (RFC 4791 §9.7.1).
-func (h *DavServer) matchesCompFilter(event store.Event, candidates []*icalNode, filter *compFilter) bool {
+// existence and every child filter is conjunctive (RFC 4791 §9.7.1). parent is
+// the component holding candidates, which a VALARM time-range needs to resolve
+// a relative TRIGGER against.
+func matchesCompFilter(matcher calendarTimeRangeMatcher, parent *icalNode, candidates []*icalNode, filter *compFilter) bool {
 	want := asciiCasemapFold(filter.Name)
 	defined := false
 	for _, node := range candidates {
@@ -91,7 +112,7 @@ func (h *DavServer) matchesCompFilter(event store.Event, candidates []*icalNode,
 		if filter.IsNotDefined != nil {
 			return false
 		}
-		if h.compFilterBodyMatches(event, node, filter) {
+		if compFilterBodyMatches(matcher, parent, node, filter) {
 			return true
 		}
 	}
@@ -101,17 +122,23 @@ func (h *DavServer) matchesCompFilter(event store.Event, candidates []*icalNode,
 	return false
 }
 
-func (h *DavServer) compFilterBodyMatches(event store.Event, node *icalNode, filter *compFilter) bool {
-	if filter.TimeRange != nil && !h.eventInTimeRange(event, filter.TimeRange) {
-		return false
+func compFilterBodyMatches(matcher calendarTimeRangeMatcher, parent, node *icalNode, filter *compFilter) bool {
+	if filter.TimeRange != nil {
+		start, end, ok := calendarTimeRangeBounds(filter.TimeRange)
+		if !ok {
+			return false
+		}
+		if !matcher.componentSetInTimeRange(node, parent, start, end) {
+			return false
+		}
 	}
 	for i := range filter.PropFilter {
-		if !matchesPropFilter(node, &filter.PropFilter[i]) {
+		if !matchesPropFilter(matcher, parent, node, &filter.PropFilter[i]) {
 			return false
 		}
 	}
 	for i := range filter.CompFilter {
-		if !h.matchesCompFilter(event, node.children, &filter.CompFilter[i]) {
+		if !matchesCompFilter(matcher, node, node.children, &filter.CompFilter[i]) {
 			return false
 		}
 	}
@@ -121,8 +148,9 @@ func (h *DavServer) compFilterBodyMatches(event store.Event, node *icalNode, fil
 // matchesPropFilter applies one CALDAV:prop-filter to the named property of the
 // enclosing component. An empty filter matches the property's existence, and
 // its time-range or text-match result is conjoined with every param-filter
-// (RFC 4791 §9.7.2).
-func matchesPropFilter(node *icalNode, filter *propFilter) bool {
+// (RFC 4791 §9.7.2). parent is the component holding node, which a time-range
+// needs to find the recurrence set an effective property value moves with.
+func matchesPropFilter(matcher calendarTimeRangeMatcher, parent, node *icalNode, filter *propFilter) bool {
 	want := asciiCasemapFold(filter.Name)
 	defined := false
 	for i := range node.properties {
@@ -134,22 +162,38 @@ func matchesPropFilter(node *icalNode, filter *propFilter) bool {
 		if filter.IsNotDefined != nil {
 			return false
 		}
-		if propFilterBodyMatches(property, filter) {
+		if propFilterBodyMatches(matcher, parent, node, property, filter) {
 			return true
 		}
 	}
 	if filter.IsNotDefined != nil {
 		return !defined
 	}
+	if !defined && filter.TimeRange != nil && len(filter.ParamFilter) == 0 {
+		// RFC 4791 §9.9 closes by directing the test at the effective DTEND of a
+		// VEVENT carrying DURATION instead of one, and at the effective DUE of a
+		// VTODO in the same shape. Only a time-range reads such a value: an
+		// inferred property has no parameters for a param-filter to match, and
+		// §9.7.4's is-not-defined asks whether the component spells the property,
+		// which it still does not.
+		start, end, ok := calendarTimeRangeBounds(filter.TimeRange)
+		return ok && matcher.inferredPropertyInTimeRange(filter.Name, node, parent, start, end)
+	}
 	return false
 }
 
-func propFilterBodyMatches(property *icalProperty, filter *propFilter) bool {
+func propFilterBodyMatches(matcher calendarTimeRangeMatcher, parent, node *icalNode, property *icalProperty, filter *propFilter) bool {
 	if filter.TextMatch != nil && !matchesCalendarText(calendarTextMatchValue(property), filter.TextMatch) {
 		return false
 	}
-	if filter.TimeRange != nil && !propertyInTimeRange(property, filter.TimeRange) {
-		return false
+	if filter.TimeRange != nil {
+		start, end, ok := calendarTimeRangeBounds(filter.TimeRange)
+		if !ok {
+			return false
+		}
+		if !matcher.propertyInTimeRange(*property, node, parent, start, end) {
+			return false
+		}
 	}
 	for i := range filter.ParamFilter {
 		if !matchesParamFilter(property, &filter.ParamFilter[i]) {
@@ -213,86 +257,23 @@ func matchesCalendarText(value string, match *textMatch) bool {
 	return matched
 }
 
-// propertyInTimeRange applies the RFC 4791 §9.9 overlap test every date-valued
-// property shares: start <= value AND end > value. This helper uses the shared
-// parser's current timezone resolution; request and collection timezone
-// selection belong to the higher-level time-range evaluator.
-func propertyInTimeRange(property *icalProperty, tr *timeRange) bool {
-	start, end, ok := calendarTimeRangeBounds(tr)
-	if !ok {
-		return false
-	}
-	value, ok := ical.ParsePropertyDateTimeLocal(property.keyPart, property.value)
-	if !ok {
-		return false
-	}
-	return !value.Before(start) && value.Before(end)
-}
-
-func (h *DavServer) eventInTimeRange(event store.Event, tr *timeRange) bool {
-	start, end, ok := calendarTimeRangeBounds(tr)
-	if !ok {
-		return false
-	}
-
-	if ical.EventHasRecurrence(event.RawICAL) {
-		return h.recurringEventInTimeRange(event, start, end)
-	}
-
-	if event.DTStart != nil {
-		eventEnd := event.DTEnd
-		if eventEnd == nil {
-			// If no end time, use start time
-			eventEnd = event.DTStart
-		}
-
-		return eventOverlapsTimeRange(*event.DTStart, *eventEnd, start, end)
-	}
-
-	return true
-}
-
-// eventOverlapsTimeRange applies the RFC 4791 §9.9 overlap tests. A
-// zero-duration event matches (start <= DTSTART && end > DTSTART); anything
-// with a duration uses the ordinary half-open overlap.
-func eventOverlapsTimeRange(eventStart, eventEnd, rangeStart, rangeEnd time.Time) bool {
-	if eventEnd.Equal(eventStart) {
-		return !eventStart.Before(rangeStart) && eventStart.Before(rangeEnd)
-	}
-	return eventStart.Before(rangeEnd) && eventEnd.After(rangeStart)
-}
-
-// effectiveTimeRange walks the comp-filter tree (VCALENDAR -> VEVENT -> ...) and
-// returns the innermost time-range, which is the one that bounds matching
-// components. It returns nil when no level carries a time-range.
-func effectiveTimeRange(filter *calFilter) *timeRange {
-	if filter == nil {
-		return nil
-	}
-	return compFilterTimeRange(&filter.CompFilter)
-}
-
-func compFilterTimeRange(filter *compFilter) *timeRange {
-	if filter == nil {
-		return nil
-	}
-	for i := range filter.CompFilter {
-		if tr := compFilterTimeRange(&filter.CompFilter[i]); tr != nil {
-			return tr
-		}
-	}
-	return filter.TimeRange
-}
-
+// calendarQueryVEventTimeRange picks the time-range a calendar-query may narrow
+// its database read with: the one spelled directly on the VEVENT comp-filter,
+// since the store derives its dtstart/dtend metadata from VEVENT rows alone.
+//
+// A range nested deeper is not usable. It bounds the sub-component it is scoped
+// to -- a VALARM whose TRIGGER fires days from the event it belongs to, say --
+// and narrowing on the enclosing VEVENT's own columns would drop a resource that
+// RFC 4791 §9.9 matches. Absent a range on the VEVENT itself the report reads
+// the collection unnarrowed and the in-memory pass decides.
 func calendarQueryVEventTimeRange(filter *calFilter) *timeRange {
 	if filter == nil || !strings.EqualFold(filter.CompFilter.Name, "VCALENDAR") {
 		return nil
 	}
-	// The store only derives dtstart/dtend metadata from VEVENT rows today.
 	for i := range filter.CompFilter.CompFilter {
 		child := &filter.CompFilter.CompFilter[i]
 		if strings.EqualFold(child.Name, "VEVENT") {
-			return compFilterTimeRange(child)
+			return child.TimeRange
 		}
 	}
 	return nil
@@ -308,6 +289,27 @@ func eventFilterFromCalFilter(filter *calFilter) (store.EventFilter, bool) {
 	return eventFilterFromTimeRange(calendarQueryVEventTimeRange(filter))
 }
 
+// maxStoredInstantSkew bounds how far the instant the RFC 4791 §9.9 test judges
+// can sit from the denormalized dtstart/dtend the narrowing predicates read.
+//
+// The two resolve the same property against different zones. A column is
+// ical.ParsePropertyDateTimeLocal: a TZID resolves against the host's zone
+// database, and a TZID the host does not know reads as UTC, as a floating value
+// does. The §9.9 evaluator resolves a TZID against the VTIMEZONE the resource
+// ships, which RFC 4791 §4.1 makes authoritative for the TZIDs it uses, and a
+// floating value against the §7.3 zone. A shipped observance offset reaches
+// ±23:59:59 and a host zone reaches ±16:00 once the pre-1900 local-mean-time
+// entries CALDAV:min-date-time admits are in play, so 48 hours covers every
+// pairing of the two.
+const maxStoredInstantSkew = 48 * time.Hour
+
+// eventFilterFromTimeRange turns a request time-range into the narrowing the
+// database read applies. The rows it keeps are a superset; the exact RFC 4791
+// §9.9 test runs in memory afterwards.
+//
+// Both bounds carry maxStoredInstantSkew. Narrowing to the range as spelled
+// drops rows whose column and resolved instant disagree, and no later pass can
+// recover a row the query did not return.
 func eventFilterFromTimeRange(tr *timeRange) (store.EventFilter, bool) {
 	if tr == nil {
 		return store.EventFilter{}, false
@@ -317,35 +319,18 @@ func eventFilterFromTimeRange(tr *timeRange) (store.EventFilter, bool) {
 		return store.EventFilter{}, false
 	}
 	ef := store.EventFilter{}
-	if !start.IsZero() {
-		s := start
+	if strings.TrimSpace(tr.Start) != "" {
+		s := start.Add(-maxStoredInstantSkew)
 		ef.Start = &s
 	}
-	if !end.IsZero() {
-		e := end
+	if strings.TrimSpace(tr.End) != "" {
+		e := end.Add(maxStoredInstantSkew)
 		ef.End = &e
 	}
 	if ef.Start == nil && ef.End == nil {
 		return store.EventFilter{}, false
 	}
 	return ef, true
-}
-
-// listCalendarEventsForTimeRange narrows the database read using the given
-// time-range when one is present, otherwise falls back to listing every event.
-// The returned rows are a superset; callers must still apply exact filtering.
-func (h *DavServer) listCalendarEventsForTimeRange(ctx context.Context, calendarID int64, tr *timeRange) ([]store.Event, error) {
-	if ef, ok := eventFilterFromTimeRange(tr); ok {
-		return h.store.Events.ListForCalendarFiltered(ctx, calendarID, ef)
-	}
-	return h.store.Events.ListForCalendar(ctx, calendarID)
-}
-
-func validCalendarFilterTimeRanges(filter *calFilter) bool {
-	if filter == nil {
-		return true
-	}
-	return validCompFilterTimeRanges(&filter.CompFilter)
 }
 
 // validCalendarFilterCollations reports whether every CALDAV:text-match in the
@@ -387,235 +372,9 @@ func validPropFilterCollations(filter *propFilter) bool {
 	return true
 }
 
-func validTimeRange(tr *timeRange) bool {
-	if tr == nil {
-		return true
-	}
-	_, _, ok := calendarTimeRangeBounds(tr)
-	return ok
-}
-
-func validCompFilterTimeRanges(filter *compFilter) bool {
-	if filter.TimeRange != nil {
-		if _, _, ok := calendarTimeRangeBounds(filter.TimeRange); !ok {
-			return false
-		}
-	}
-	for i := range filter.PropFilter {
-		if tr := filter.PropFilter[i].TimeRange; tr != nil {
-			if _, _, ok := calendarTimeRangeBounds(tr); !ok {
-				return false
-			}
-		}
-	}
-	for i := range filter.CompFilter {
-		if !validCompFilterTimeRanges(&filter.CompFilter[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func calendarTimeRangeBounds(tr *timeRange) (time.Time, time.Time, bool) {
-	if tr == nil {
-		return time.Time{}, time.Time{}, false
-	}
-
-	var start time.Time
-	var err error
-	if strings.TrimSpace(tr.Start) != "" {
-		start, err = ical.ParseDateTime(tr.Start)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-	}
-
-	end := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
-	if strings.TrimSpace(tr.End) != "" {
-		end, err = ical.ParseDateTime(tr.End)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-	}
-	if start.IsZero() && strings.TrimSpace(tr.End) == "" {
-		return time.Time{}, time.Time{}, false
-	}
-	if !start.IsZero() && !end.After(start) {
-		return time.Time{}, time.Time{}, false
-	}
-	return start, end, true
-}
-
-func (h *DavServer) recurringEventInTimeRange(event store.Event, rangeStart, rangeEnd time.Time) bool {
-	if event.DTStart == nil {
-		return true
-	}
-
-	if !ical.SupportedEventRecurrence(event.RawICAL) {
-		return true
-	}
-	return len(h.recurringFreeBusyPeriods(event, rangeStart, rangeEnd)) > 0
-}
-
-// freeBusyQuery returns the free-busy iCalendar text for the calendar's
-// events visible to user within the requested filter/time range.
-func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, filter *calFilter, tr *timeRange) (string, error) {
-	events, err := h.listCalendarEventsForTimeRange(ctx, cal.ID, freeBusyTimeRange(filter, tr))
-	if err != nil {
-		return "", fmt.Errorf("failed to list events")
-	}
-
-	if filter != nil {
-		events = h.applyCalendarFilter(events, filter)
-	}
-	if tr != nil {
-		events = h.filterCalendarEventsByTimeRange(events, tr)
-	}
-	events, err = h.filterCalendarEventsByPrivilege(ctx, user, cal, events, "read-free-busy")
-	if err != nil {
-		return "", err
-	}
-
-	return h.generateFreeBusy(events, filter, tr), nil
-}
-
-func freeBusyTimeRange(filter *calFilter, tr *timeRange) *timeRange {
-	if tr != nil {
-		return tr
-	}
-	return effectiveTimeRange(filter)
-}
-
-// freeBusyHasEffectiveTimeRange reports whether a free-busy-query carries a
-// usable time-range from either source. RFC 4791 §7.10 requires exactly one
-// CALDAV:time-range; without it the report degenerates into a full-collection
-// read and an unbounded text/calendar response.
-func freeBusyHasEffectiveTimeRange(filter *calFilter, tr *timeRange) bool {
-	_, _, ok := calendarTimeRangeBounds(freeBusyTimeRange(filter, tr))
-	return ok
-}
-
-func (h *DavServer) filterCalendarEventsByTimeRange(events []store.Event, tr *timeRange) []store.Event {
-	if tr == nil {
-		return events
-	}
-	filtered := make([]store.Event, 0, len(events))
-	for _, event := range events {
-		if h.eventInTimeRange(event, tr) {
-			filtered = append(filtered, event)
-		}
-	}
-	return filtered
-}
-
-func (h *DavServer) generateFreeBusy(events []store.Event, filter *calFilter, tr *timeRange) string {
-	var sb strings.Builder
-	sb.WriteString("BEGIN:VCALENDAR\r\n")
-	sb.WriteString("VERSION:2.0\r\n")
-	sb.WriteString("PRODID:-//CalCard//CalDAV Server//EN\r\n")
-	sb.WriteString("BEGIN:VFREEBUSY\r\n")
-	sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", time.Now().UTC().Format("20060102T150405Z")))
-
-	freeBusyTR := freeBusyTimeRange(filter, tr)
-	rangeStart, rangeEnd, hasRange := calendarTimeRangeBounds(freeBusyTR)
-	if freeBusyTR != nil {
-		if freeBusyTR.Start != "" {
-			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", freeBusyTR.Start))
-		}
-		if freeBusyTR.End != "" {
-			sb.WriteString(fmt.Sprintf("DTEND:%s\r\n", freeBusyTR.End))
-		}
-	}
-
-	for _, event := range events {
-		for _, period := range h.freeBusyPeriods(event, rangeStart, rangeEnd, hasRange) {
-			startStr := period.Start.UTC().Format("20060102T150405Z")
-			endStr := period.End.UTC().Format("20060102T150405Z")
-			sb.WriteString(fmt.Sprintf("FREEBUSY:%s/%s\r\n", startStr, endStr))
-		}
-	}
-
-	sb.WriteString("END:VFREEBUSY\r\n")
-	sb.WriteString("END:VCALENDAR\r\n")
-
-	return sb.String()
-}
-
-func (h *DavServer) freeBusyPeriods(event store.Event, rangeStart, rangeEnd time.Time, hasRange bool) []ical.BusyPeriod {
-	if event.DTStart == nil {
-		return nil
-	}
-
-	endTime := event.DTEnd
-	if endTime == nil {
-		endTime = event.DTStart
-	}
-	if !hasRange {
-		return []ical.BusyPeriod{{Start: *event.DTStart, End: *endTime}}
-	}
-
-	if !ical.EventHasRecurrence(event.RawICAL) {
-		if eventOverlapsTimeRange(*event.DTStart, *endTime, rangeStart, rangeEnd) {
-			return []ical.BusyPeriod{{Start: *event.DTStart, End: *endTime}}
-		}
-		return nil
-	}
-
-	return h.recurringFreeBusyPeriods(event, rangeStart, rangeEnd)
-}
-
-func (h *DavServer) recurringFreeBusyPeriods(event store.Event, rangeStart, rangeEnd time.Time) []ical.BusyPeriod {
-	component := ical.PrimaryVEventComponent(event.RawICAL)
-	dtstart, ok := recurringEventStart(event, component)
-	if !ok {
-		return nil
-	}
-	duration := recurringEventDuration(event, component, dtstart)
-	return ical.RecurringBusyPeriods(event.RawICAL, dtstart, duration, rangeStart, rangeEnd, caldavMaxInstances)
-}
-
-func recurringEventStart(event store.Event, component *ical.VEventComponent) (time.Time, bool) {
-	if prop, ok := ical.ComponentProperty(component, "DTSTART"); ok {
-		if dtstart, ok := ical.ParsePropertyDateTimeLocal(prop.KeyPart, prop.Value); ok {
-			return dtstart, true
-		}
-	}
-	if event.DTStart != nil {
-		return *event.DTStart, true
-	}
-	return time.Time{}, false
-}
-
-func recurringEventDuration(event store.Event, component *ical.VEventComponent, dtstart time.Time) time.Duration {
-	if prop, ok := ical.ComponentProperty(component, "DTEND"); ok {
-		if dtend, ok := ical.ParsePropertyDateTimeLocal(prop.KeyPart, prop.Value); ok {
-			if d := dtend.Sub(dtstart); d > 0 {
-				return d
-			}
-		}
-	}
-	if prop, ok := ical.ComponentProperty(component, "DURATION"); ok {
-		if d, ok := ical.ParseDuration(prop.Value); ok && d > 0 {
-			return d
-		}
-	}
-	if event.DTEnd != nil {
-		if d := event.DTEnd.Sub(dtstart); d > 0 {
-			return d
-		}
-	}
-	if event.AllDay {
-		return 24 * time.Hour
-	}
-	if prop, ok := ical.ComponentProperty(component, "DTSTART"); ok && ical.PropertyParamEquals(prop.KeyPart, "VALUE", "DATE") {
-		return 24 * time.Hour
-	}
-	return time.Hour
-}
-
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, selector propertySelector) ([]response, error) {
+func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, selector propertySelector, zone floatingZone) ([]response, error) {
 	if targetResource != "" {
-		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, selector)
+		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, selector, zone)
 	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
@@ -632,7 +391,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 
 		matching := events
 		if filter != nil {
-			matching = h.applyCalendarFilter(matching, filter)
+			matching = applyCalendarFilter(matching, filter, zone)
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
 		if err != nil {
@@ -756,7 +515,7 @@ func multigetHrefInScope(targetResource, uid string) bool {
 // calendarObjectQuery answers a calendar-query whose Request-URI is a single
 // calendar object resource (RFC 4791 §7). The filter still decides whether the
 // resource is reported, so a non-matching resource yields an empty multistatus.
-func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, selector propertySelector) ([]response, error) {
+func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, selector propertySelector, zone floatingZone) ([]response, error) {
 	event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch event")
@@ -765,7 +524,7 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, c
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching = h.applyCalendarFilter(matching, filter)
+			matching = applyCalendarFilter(matching, filter, zone)
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
 		if err != nil {

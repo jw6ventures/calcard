@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -891,16 +892,16 @@ func validateStrictICalendar(data string) error {
 		}
 		return fmt.Errorf("%w: invalid calendar object resource", ErrBadRequest)
 	}
-	minDate, maxDate := caldavDateLimits()
+	minDate, maxDate := ical.DateLimits()
 	for _, t := range extractICalDateTimesLines(lines) {
 		if t.Before(minDate) || t.After(maxDate) {
 			return fmt.Errorf("%w: date outside supported range", ErrBadRequest)
 		}
 	}
-	if attendeeCount := countICalAttendeesLines(lines); attendeeCount > caldavMaxAttendees {
+	if attendeeCount := countICalAttendeesLines(lines); attendeeCount > ical.MaxAttendeesPerInstance {
 		return fmt.Errorf("%w: too many attendees", ErrBadRequest)
 	}
-	if count, ok := extractICalRRULECount(data); ok && count > caldavMaxInstances {
+	if count, ok := extractICalRRULECount(data); ok && count > ical.MaxRecurrenceInstances {
 		return fmt.Errorf("%w: too many recurrence instances", ErrBadRequest)
 	}
 	return nil
@@ -1152,17 +1153,6 @@ func parseICalDateTime(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
-}
-
-const (
-	caldavMaxInstances = 2000
-	caldavMaxAttendees = 1000
-)
-
-func caldavDateLimits() (time.Time, time.Time) {
-	minDate := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
-	maxDate := time.Date(2100, 12, 31, 23, 59, 59, 0, time.UTC)
-	return minDate, maxDate
 }
 
 func ensureCRLF(body string) string {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -179,7 +180,7 @@ func TestRFC4791_MkcalendarAcceptsNonStandardSupportedComponent(t *testing.T) {
 }
 
 func TestRFC4791_DateLimitsUseSubmittedVTimezoneDefinition(t *testing.T) {
-	minDate, _ := caldavDateLimits()
+	minDate, _ := ical.DateLimits()
 	for _, tzid := range []string{"Custom/Plus14", "America/New_York"} {
 		t.Run(tzid, func(t *testing.T) {
 			h, eventRepo := writableCalendarServer()

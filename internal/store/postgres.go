@@ -621,17 +621,27 @@ func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int6
 	}
 
 	if f.Start != nil {
-		// Keep events whose last instance ends at or after Start. recurrence_until
-		// holds that end for recurring events (a far-future sentinel when
-		// unbounded) and is NULL for non-recurring events, so COALESCE falls back
-		// to dtend, then dtstart.
-		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= `)
+		// Keep events whose last instance ends at or after Start, which needs an
+		// upper bound on the interval the object occupies. recurrence_until holds
+		// that end for every recurring object (a far-future sentinel when it
+		// cannot be computed), and dtend holds it for a non-recurring VEVENT that
+		// carries a literal DTEND.
+		//
+		// Nothing else does, so everything else falls to 'infinity' and stays a
+		// candidate for the in-memory RFC 4791 §9.9 pass to judge. dtstart is
+		// deliberately not in this list: an object's start is no bound on where
+		// it ends, so reading it here drops a VEVENT written with DURATION or
+		// with a DATE-valued DTSTART -- both occupy time past dtstart that no
+		// column records -- along with every VTODO, VJOURNAL and VFREEBUSY,
+		// which populate neither column at all.
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= `)
 		sb.WriteString(placeholder(f.Start.UTC()))
 	}
 	if f.End != nil {
 		// Keep events whose earliest instance starts at or before End. recurrence_start
 		// captures RDATEs and moved overrides that can occur before the master dtstart.
-		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= `)
+		// '-infinity' keeps an unbounded row for the same reason as above.
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= `)
 		sb.WriteString(placeholder(f.End.UTC()))
 	}
 	if f.Title != "" {
@@ -696,11 +706,11 @@ func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, af
 		return "$" + strconv.Itoa(len(args))
 	}
 	if f.Start != nil {
-		sb.WriteString(` AND COALESCE(recurrence_until, dtend, dtstart) >= `)
+		sb.WriteString(` AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= `)
 		sb.WriteString(placeholder(f.Start.UTC()))
 	}
 	if f.End != nil {
-		sb.WriteString(` AND COALESCE(recurrence_start, dtstart) <= `)
+		sb.WriteString(` AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= `)
 		sb.WriteString(placeholder(f.End.UTC()))
 	}
 	if f.Title != "" {
@@ -2896,12 +2906,6 @@ func parseICalFields(raw string) (summary, description, location *string, dtstar
 	return summary, description, location, dtstart, dtend, allDay
 }
 
-// recurrenceStartSentinel and recurrenceUntilSentinel mark recurrence bounds that
-// cannot be computed precisely. They keep SQL time-range pushdown as a safe
-// superset so the in-memory recurrence expansion can make the exact decision.
-var recurrenceStartSentinel = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
-var recurrenceUntilSentinel = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
-
 // recurrenceBoundsFromICal computes the recurrence_start and recurrence_until
 // values persisted for an event. The start is the earliest known recurring
 // instance start, or a low sentinel when it cannot be computed safely. The until
@@ -2916,11 +2920,11 @@ func recurrenceBoundsFromICal(ical string) (*time.Time, *time.Time) {
 	start := bounds.Start
 	until := bounds.Until
 	if bounds.StartUnknown {
-		sentinel := recurrenceStartSentinel
+		sentinel := icalpkg.RecurrenceStartSentinel
 		start = &sentinel
 	}
 	if bounds.UntilUnknown {
-		sentinel := recurrenceUntilSentinel
+		sentinel := icalpkg.RecurrenceUntilSentinel
 		until = &sentinel
 	}
 	return start, until

@@ -729,7 +729,7 @@ var localDateProperties = nameSet("DTSTART", "DTEND", "DUE", "RECURRENCE-ID")
 // an observance start is reference data a client ships with it, and the values in
 // circulation reach back to 1601, which no useful minimum would admit.
 func validateCalendarObjectDateValues(root *icalNode) *calendarObjectFault {
-	minDate, maxDate := caldavDateLimits()
+	minDate, maxDate := ical.DateLimits()
 	var fault *calendarObjectFault
 	for _, child := range root.children {
 		if child.name == "VTIMEZONE" {

@@ -145,7 +145,7 @@ func TestCalendarQueryUsesKeysetPageAndStopsAtOverflowSentinel(t *testing.T) {
 	h := NewDavServer(Options{Config: cfg, Store: &store.Store{Events: eventRepo}})
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/1/", "", nil, nil, propertySelector{})
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/1/", "", nil, nil, propertySelector{}, floatingZone{})
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -189,7 +189,7 @@ func TestCalendarQueryContinuesPagingPastNonmatchingRows(t *testing.T) {
 		}},
 	}}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/1/", "", filter, nil, propertySelector{})
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/1/", "", filter, nil, propertySelector{}, floatingZone{})
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}

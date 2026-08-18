@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -48,6 +50,21 @@ func calendarFilterBody(inner string) string {
 
 const grammarVEventFilter = `<C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"/></C:comp-filter>`
 
+// grammarVTimezone is a valid CALDAV:timezone value, XML-escaped for a request
+// body. RFC 4791 §7.8 requires the element to hold one valid VTIMEZONE, so a
+// test about placement or cardinality has to carry a real definition.
+var grammarVTimezone = grammarVTimezoneFor("Etc/UTC")
+
+// grammarVTimezoneFor builds that definition for any TZID. The observance is a
+// zero-offset placeholder, which is all a test about the element itself needs;
+// a test about how values resolve names an IANA zone and lets the host's tzdata
+// supply the real offsets.
+func grammarVTimezoneFor(tzid string) string {
+	return `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
+		`BEGIN:VTIMEZONE&#13;&#10;TZID:` + tzid + `&#13;&#10;BEGIN:STANDARD&#13;&#10;DTSTART:19700101T000000&#13;&#10;` +
+		`TZOFFSETFROM:+0000&#13;&#10;TZOFFSETTO:+0000&#13;&#10;END:STANDARD&#13;&#10;END:VTIMEZONE&#13;&#10;END:VCALENDAR&#13;&#10;`
+}
+
 // RFC 4791 §9.5 gives CALDAV:calendar-query the content model
 // ((DAV:allprop | DAV:propname | DAV:prop)?, CALDAV:filter, CALDAV:timezone?).
 // A body outside it is malformed, which names no precondition, so RFC 4791 §1.3
@@ -64,7 +81,7 @@ func TestRFC4791_CalendarQueryContentModel(t *testing.T) {
 		"an empty body":  calendarQueryBody(``),
 		"two filters":    calendarQueryBody(`<C:filter>` + grammarVEventFilter + `</C:filter><C:filter>` + grammarVEventFilter + `</C:filter>`),
 		"timezone first": calendarQueryBody(`<C:timezone>BEGIN:VCALENDAR</C:timezone><C:filter>` + grammarVEventFilter + `</C:filter>`),
-		"two timezones":  calendarQueryBody(`<C:filter>` + grammarVEventFilter + `</C:filter><C:timezone>A</C:timezone><C:timezone>B</C:timezone>`),
+		"two timezones":  calendarQueryBody(`<C:filter>` + grammarVEventFilter + `</C:filter><C:timezone>` + grammarVTimezone + `</C:timezone><C:timezone>` + grammarVTimezone + `</C:timezone>`),
 		"character data": calendarQueryBody(`nonsense<C:filter>` + grammarVEventFilter + `</C:filter>`),
 		"unexpected child": calendarQueryBody(
 			`<D:prop><D:getetag/></D:prop><C:filter>` + grammarVEventFilter + `</C:filter><D:href>/dav/calendars/1/standup.ics</D:href>`),
@@ -428,9 +445,153 @@ func TestRFC4791_CalendarReportsWithoutPropertySelectorReturnOnlyResourceStatus(
 // placement; time-range evaluation tests cover how the value is used.
 func TestRFC4791_CalendarQueryAcceptsTrailingTimezone(t *testing.T) {
 	body := calendarQueryBody(`<D:prop><D:getetag/></D:prop><C:filter>` + grammarVEventFilter + `</C:filter>` +
-		`<C:timezone>BEGIN:VCALENDAR&#13;&#10;END:VCALENDAR&#13;&#10;</C:timezone>`)
+		`<C:timezone>` + grammarVTimezone + `</C:timezone>`)
 	ms := decodeMultistatus(t, runCalendarReport(t, body))
 	ms.assertHrefs(t, "/dav/calendars/1/standup.ics")
+}
+
+// RFC 4791 §9.9 requires both time-range attributes to be an iCalendar "date
+// with UTC time". A DATE, a floating DATE-TIME, or a numeric UTC offset names
+// no unambiguous instant, so the filter is invalid rather than interpreted.
+func TestRFC4791_TimeRangeRequiresDateWithUTCTime(t *testing.T) {
+	refused := map[string][2]string{
+		"DATE start":              {"20240601", "20240630T000000Z"},
+		"DATE end":                {"20240601T000000Z", "20240630"},
+		"floating start":          {"20240601T000000", "20240630T000000Z"},
+		"floating end":            {"20240601T000000Z", "20240630T000000"},
+		"numeric offset start":    {"20240601T000000-0500", "20240630T000000Z"},
+		"extended-format start":   {"2024-06-01T00:00:00Z", "20240630T000000Z"},
+		"lowercase zulu on start": {"20240601T000000z", "20240630T000000Z"},
+	}
+	for name, bounds := range refused {
+		t.Run(name, func(t *testing.T) {
+			body := calendarQueryBody(`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+				`<C:time-range start="` + bounds[0] + `" end="` + bounds[1] + `"/>` +
+				`</C:comp-filter></C:comp-filter></C:filter>`)
+			assertErrorConditions(t, runCalendarReport(t, body), http.StatusForbidden, calQN("valid-filter"))
+		})
+	}
+
+	t.Run("a UTC pair is accepted", func(t *testing.T) {
+		body := calendarQueryBody(`<D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR">` +
+			`<C:comp-filter name="VEVENT"><C:time-range start="20240601T000000Z" end="20240630T000000Z"/>` +
+			`</C:comp-filter></C:comp-filter></C:filter>`)
+		if rr := runCalendarReport(t, body); rr.Code != http.StatusMultiStatus {
+			t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("an open range stays legal", func(t *testing.T) {
+		body := calendarQueryBody(`<D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR">` +
+			`<C:comp-filter name="VEVENT"><C:time-range start="20240601T000000Z"/>` +
+			`</C:comp-filter></C:comp-filter></C:filter>`)
+		if rr := runCalendarReport(t, body); rr.Code != http.StatusMultiStatus {
+			t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+// The zero time.Time is a legal instant a request can spell -- year 1 in UTC --
+// so it cannot double as the marker for an omitted start. Reading it as omitted
+// would skip the ordering rule and silently answer about an open range.
+func TestTimeRangeBoundsDistinguishTheZeroInstantFromAnOmittedStart(t *testing.T) {
+	if _, _, ok := calendarTimeRangeBounds(&timeRange{Start: "00010101T000000Z", End: "00010101T000000Z"}); ok {
+		t.Error("an equal start and end at the zero instant was accepted")
+	}
+	if _, _, ok := calendarTimeRangeBounds(&timeRange{Start: "00010102T000000Z", End: "00010101T000000Z"}); ok {
+		t.Error("an inverted pair at the zero instant was accepted")
+	}
+	start, end, ok := calendarTimeRangeBounds(&timeRange{Start: "00010101T000000Z", End: "00010102T000000Z"})
+	if !ok {
+		t.Fatal("a well-ordered pair at the zero instant was refused")
+	}
+	if !start.Equal(time.Time{}) || !end.After(start) {
+		t.Errorf("bounds = %v..%v, want the zero instant and the day after it", start, end)
+	}
+}
+
+// §9.9 requires at least one attribute, and requires end to be greater than
+// start when both are present.
+func TestRFC4791_TimeRangeBoundsMustBeOrdered(t *testing.T) {
+	refused := map[string]string{
+		"neither attribute":     ``,
+		"end equal to start":    ` start="20240601T000000Z" end="20240601T000000Z"`,
+		"end earlier than star": ` start="20240630T000000Z" end="20240601T000000Z"`,
+	}
+	for name, attrs := range refused {
+		t.Run(name, func(t *testing.T) {
+			body := calendarQueryBody(`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+				`<C:time-range` + attrs + `/></C:comp-filter></C:comp-filter></C:filter>`)
+			assertErrorConditions(t, runCalendarReport(t, body), http.StatusForbidden, calQN("valid-filter"))
+		})
+	}
+}
+
+// RFC 4791 §7.8 and §7.9 bound the range a report asks about by the
+// CALDAV:min-date-time and CALDAV:max-date-time of the targeted collection.
+// The bound is inclusive at both ends, unlike the §5.3.2.1 preconditions that
+// bound stored data.
+func TestRFC4791_ReportTimeRangeHonoursCollectionDateLimits(t *testing.T) {
+	tests := []struct {
+		name      string
+		start     string
+		end       string
+		condition string
+	}{
+		{name: "start before min-date-time", start: "18991231T235959Z", end: "20240630T000000Z", condition: "min-date-time"},
+		{name: "end after max-date-time", start: "20240601T000000Z", end: "21010101T000000Z", condition: "max-date-time"},
+		{name: "start exactly on min-date-time", start: ical.MinDateTime, end: "20240630T000000Z"},
+		{name: "end exactly on max-date-time", start: "20240601T000000Z", end: ical.MaxDateTime},
+		// An omitted attribute is an infinity the limits cannot contain, so it
+		// must not be measured against them.
+		{name: "an open-ended range is not measured", start: "20240601T000000Z"},
+		{name: "an open-started range is not measured", end: "20240630T000000Z"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attrs := ""
+			if tt.start != "" {
+				attrs += ` start="` + tt.start + `"`
+			}
+			if tt.end != "" {
+				attrs += ` end="` + tt.end + `"`
+			}
+			body := calendarQueryBody(`<D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR">` +
+				`<C:comp-filter name="VEVENT"><C:time-range` + attrs + `/>` +
+				`</C:comp-filter></C:comp-filter></C:filter>`)
+			rr := runCalendarReport(t, body)
+			if tt.condition == "" {
+				if rr.Code != http.StatusMultiStatus {
+					t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+				}
+				return
+			}
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN(tt.condition))
+		})
+	}
+}
+
+// RFC 4791 §7.8 makes CALDAV:valid-calendar-data a precondition on the timezone
+// a REPORT carries: it has to be an iCalendar object holding a single valid
+// VTIMEZONE, because §7.3 resolves every floating value in the request against
+// it. §1.3 puts the failure at 403, since no resubmission of the same body can
+// make an invalid definition work.
+func TestRFC4791_CalendarQueryRejectsInvalidTimezone(t *testing.T) {
+	tests := map[string]string{
+		"not an iCalendar object": `nonsense`,
+		"no VTIMEZONE":            `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;END:VCALENDAR&#13;&#10;`,
+		"two VTIMEZONEs":          grammarVTimezone + grammarVTimezone,
+		"a VTIMEZONE with no observance": `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
+			`BEGIN:VTIMEZONE&#13;&#10;TZID:Etc/UTC&#13;&#10;END:VTIMEZONE&#13;&#10;END:VCALENDAR&#13;&#10;`,
+	}
+
+	for name, timezone := range tests {
+		t.Run(name, func(t *testing.T) {
+			body := calendarQueryBody(`<C:filter>` + grammarVEventFilter + `</C:filter><C:timezone>` + timezone + `</C:timezone>`)
+			assertErrorConditions(t, runCalendarReport(t, body), http.StatusForbidden, calQN("valid-calendar-data"))
+		})
+	}
 }
 
 // RFC 4791 §7.8: a calendar-query MAY carry a Depth header and a request
@@ -642,7 +803,23 @@ func TestRFC4791_CalendarMultigetUsesRequestURIEquivalenceForCollectionHrefs(t *
 		"different scheme":  {href: "https://example.com/dav/calendars/1/standup.ics", status: http.StatusNotFound},
 		"query component":   {href: "http://example.com/dav/calendars/1/standup.ics?view=full", status: http.StatusNotFound},
 		"fragment":          {href: "/dav/calendars/1/standup.ics#vevent", status: http.StatusNotFound},
-		"padding":           {href: " /dav/calendars/1/standup.ics ", status: http.StatusNotFound},
+		// A URI carries no surrounding whitespace, so padding is not part of the
+		// reference and the href still names the resource.
+		"padding":              {href: " /dav/calendars/1/standup.ics ", status: http.StatusOK},
+		"tab and CRLF padding": {href: "\t\r\n/dav/calendars/1/standup.ics\r\n\t", status: http.StatusOK},
+		"whitespace only":      {href: "   ", status: http.StatusNotFound},
+		// Only the whitespace XML 1.0 §2.3 defines is framing. A URI is
+		// US-ASCII, so a Unicode space is part of what the client sent, and
+		// trimming it would answer with a resource the href does not name.
+		//
+		// Each of these pads the front, because a resource name is the last path
+		// segment minus its extension and path.Ext takes everything after the
+		// last dot -- so trailing padding is swallowed along with the ".ics",
+		// exactly as "standup.icsZZZ" is, and cannot tell the two trim rules
+		// apart.
+		"leading no-break space":    {href: " /dav/calendars/1/standup.ics", status: http.StatusNotFound},
+		"leading ideographic space": {href: "　/dav/calendars/1/standup.ics", status: http.StatusNotFound},
+		"leading line separator":    {href: " /dav/calendars/1/standup.ics", status: http.StatusNotFound},
 	}
 
 	for name, tt := range tests {

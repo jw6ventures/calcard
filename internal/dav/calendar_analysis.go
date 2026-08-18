@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -243,11 +242,11 @@ func applyRecurrenceMetadata(metadata *store.EventWriteMetadata, lines []string)
 	metadata.RecurrenceStart = bounds.Start
 	metadata.RecurrenceUntil = bounds.Until
 	if bounds.StartUnknown {
-		value := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+		value := ical.RecurrenceStartSentinel
 		metadata.RecurrenceStart = &value
 	}
 	if bounds.UntilUnknown {
-		value := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+		value := ical.RecurrenceUntilSentinel
 		metadata.RecurrenceUntil = &value
 	}
 }
