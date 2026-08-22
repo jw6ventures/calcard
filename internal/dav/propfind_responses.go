@@ -386,7 +386,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 				if err != nil {
 					return nil, err
 				}
-				res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(birthdayHref, events, nil, h.multistatusBuildLimit()-len(res)))
+				res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(birthdayHref, events, calendarDataProjection{}, h.multistatusBuildLimit()-len(res)))
 			}
 
 			// Add regular calendars
@@ -433,7 +433,7 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 				return nil, err
 			}
 			base := ensureCollectionHref(href)
-			res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(base, events, nil, h.multistatusBuildLimit()-len(res)))
+			res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(base, events, calendarDataProjection{}, h.multistatusBuildLimit()-len(res)))
 		}
 		return res, nil
 	}
@@ -646,7 +646,7 @@ func (h *DavServer) appendCalendarPropfindPages(ctx context.Context, user *store
 		if err != nil {
 			return nil, err
 		}
-		responses = h.appendMultistatusResponses(responses, calendarResourceResponsesFilteredLimit(baseHref, visible, nil, h.multistatusBuildLimit()-len(responses)))
+		responses = h.appendMultistatusResponses(responses, calendarResourceResponsesFilteredLimit(baseHref, visible, calendarDataProjection{}, h.multistatusBuildLimit()-len(responses)))
 		lastID := events[len(events)-1].ID
 		if lastID <= afterID || len(events) < multistatusPageSize {
 			break

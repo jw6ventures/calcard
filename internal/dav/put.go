@@ -14,6 +14,20 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
+// maxResourceStateRetries bounds how often a write re-reads the state it was
+// authorized against and tries again after store.ErrResourceStateChanged.
+//
+// Nothing about such a request was wrong: it lost a race for the resource's
+// create-or-update shape, and RFC 4918 §9.7 owes it the 201 or 204 the write
+// itself earns, or the 412 its own conditional header earns. A bare 409 tells
+// the client nothing it can act on, so the loser retries instead.
+//
+// Every loss means some other writer committed, so the bound is on how many
+// writers contend for one resource rather than on elapsed time. Past it the
+// write still answers 409, which keeps an adversarial client from holding a
+// request open indefinitely.
+const maxResourceStateRetries = 16
+
 // checkConditional validates If-Match and If-None-Match headers per RFC 7232:
 // If-Match requires strong comparison, If-None-Match uses weak comparison.
 func checkConditional(r *http.Request, etag string, exists bool) bool {
@@ -231,7 +245,11 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		LockPreconditions:    h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
 	}
 	result, err := h.store.PutCalendarObject(r.Context(), write)
-	if errors.Is(err, store.ErrResourceStateChanged) {
+	for attempt := 0; attempt < maxResourceStateRetries && errors.Is(err, store.ErrResourceStateChanged); attempt++ {
+		// The per-request caches still hold the calendar row the lost attempt was
+		// authorized against, so they have to be dropped first: re-reading through
+		// them would resend the same stale CTag and lose again for the same reason.
+		invalidateDAVRequestState(r.Context())
 		currentCal, current, authorized := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
 		if !authorized {
 			return
@@ -243,6 +261,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		if current == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
 			return
 		}
+		// The conditional headers are re-evaluated inside the write transaction
+		// against the state read here, so a writer whose own precondition is what
+		// failed still answers 412 rather than being retried into a wrong result.
 		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
 		write.ExpectedCalendarCTag = &currentCal.CTag
 		result, err = h.store.PutCalendarObject(r.Context(), write)

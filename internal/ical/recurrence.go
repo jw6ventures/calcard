@@ -11,9 +11,47 @@ import (
 )
 
 // BusyPeriod is one concrete busy interval of an event occurrence.
+// RecurrenceID identifies its slot when the period came from a recurrence set.
 type BusyPeriod struct {
-	Start time.Time
-	End   time.Time
+	RecurrenceID time.Time
+	Start        time.Time
+	End          time.Time
+}
+
+// RecurrenceInstance is one generated occurrence of a recurrence set: the slot
+// it occupies in the master's pattern, and where that occurrence actually
+// falls. The two differ only when a RANGE=THISANDFUTURE override has moved it.
+//
+// The distinction is what RFC 5545 §3.8.4.4 needs: a RECURRENCE-ID names the
+// slot rather than the moved time, so a caller writing one out cannot derive it
+// from the occurrence's own DTSTART.
+type RecurrenceInstance struct {
+	RecurrenceID time.Time
+	Start        time.Time
+}
+
+// RecurrenceSlot is one identity in a master's recurrence pattern together
+// with its original and effective placement. GoverningRangeRecurrenceID names
+// the RANGE=THISANDFUTURE override that supplied the effective placement.
+// ExactOverride is true when a separate ordinary override replaces this slot.
+type RecurrenceSlot struct {
+	RecurrenceID               time.Time
+	Original                   BusyPeriod
+	Effective                  BusyPeriod
+	Suppressed                 bool
+	ExactOverride              bool
+	GoverningRangeRecurrenceID time.Time
+}
+
+// recurrenceOccurrence is the internal form: the slot paired with the period
+// the expansion actually produced for it.
+type recurrenceOccurrence struct {
+	recurrenceID  time.Time
+	original      BusyPeriod
+	period        BusyPeriod
+	suppressed    bool
+	exactOverride bool
+	governing     time.Time
 }
 
 // PropertyTimeResolver resolves one date-valued content line to the absolute
@@ -33,17 +71,17 @@ func (resolve PropertyTimeResolver) or(keyPart, value string) (time.Time, bool) 
 
 // recurrenceExpansion selects which component the recurrence set belongs to,
 // how its dates resolve, and how an occurrence is judged to reach the requested
-// window. The two callers need different answers to the last: free-busy wants
-// the half-open overlap a busy period has, while a time-range test wants every
-// occurrence a stricter RFC 4791 §9.9 condition could still accept, so it must
-// not lose a candidate to a bound that is tighter than the condition finally
-// applied.
+// window. Consumers need different answers to the last: free-busy wants the
+// half-open overlap a busy period has, time-range matching needs an inclusive
+// candidate set for the stricter §9.9 condition, and recurrence limiting needs
+// both the original and effective placements, including suppressed slots.
 type recurrenceExpansion struct {
-	componentName    string
-	includeOverrides bool
-	maxInstances     int
-	resolve          PropertyTimeResolver
-	reaches          func(start, end, rangeStart, rangeEnd time.Time) bool
+	componentName     string
+	includeOverrides  bool
+	includeSuppressed bool
+	maxInstances      int
+	resolve           PropertyTimeResolver
+	reaches           func(original, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool
 }
 
 // RecurringBusyPeriods expands a recurring event (RRULE, RDATE, EXDATE and
@@ -52,39 +90,83 @@ type recurrenceExpansion struct {
 // the event's resolved start and occurrence length; maxInstances caps the
 // expansion and resolve reads the recurrence dates, per PropertyTimeResolver.
 func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []BusyPeriod {
-	return expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+	occurrences := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    "VEVENT",
 		includeOverrides: true,
 		maxInstances:     maxInstances,
 		resolve:          resolve,
-		reaches:          periodOverlaps,
+		reaches: func(_ BusyPeriod, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
+			return !suppressed && periodOverlaps(effective.Start, effective.End, rangeStart, rangeEnd)
+		},
 	})
+	periods := make([]BusyPeriod, 0, len(occurrences))
+	for _, occurrence := range occurrences {
+		period := occurrence.period
+		period.RecurrenceID = occurrence.recurrenceID
+		periods = append(periods, period)
+	}
+	return periods
 }
 
-// RecurrenceInstanceStarts expands the recurrence set of the named component
-// and returns the start of every *generated* instance whose occurrence window
-// touches [rangeStart, rangeEnd]. Overridden instances are left out: RFC 4791
-// §9.7.1 scopes a comp-filter to each component of the resource, so an
-// override is matched as the component it is rather than through its master's
-// pattern. Both bounds are inclusive, because the caller re-applies the exact
-// §9.9 condition and an exclusive bound here would drop an occurrence that
-// starts precisely at the end of the range.
-func RecurrenceInstanceStarts(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []time.Time {
-	periods := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+// RecurrenceInstances expands the recurrence set of the named component and
+// returns every *generated* instance whose occurrence window touches
+// [rangeStart, rangeEnd], each paired with the slot of the master's pattern it
+// belongs to. Overridden instances are left out: RFC 4791 §9.7.1 scopes a
+// comp-filter to each component of the resource, so an override is matched as
+// the component it is rather than through its master's pattern. Both bounds are
+// inclusive, because the caller re-applies the exact §9.9 condition and an
+// exclusive bound here would drop an occurrence that starts precisely at the end
+// of the range.
+func RecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []RecurrenceInstance {
+	occurrences := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    componentName,
 		includeOverrides: false,
 		maxInstances:     maxInstances,
 		resolve:          resolve,
-		reaches:          periodTouches,
+		reaches: func(_ BusyPeriod, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
+			return !suppressed && periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
+		},
 	})
-	starts := make([]time.Time, 0, len(periods))
-	for _, period := range periods {
-		starts = append(starts, period.Start)
+	instances := make([]RecurrenceInstance, 0, len(occurrences))
+	for _, occurrence := range occurrences {
+		instances = append(instances, RecurrenceInstance{
+			RecurrenceID: occurrence.recurrenceID,
+			Start:        occurrence.period.Start,
+		})
 	}
-	return starts
+	return instances
 }
 
-func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) []BusyPeriod {
+// RecurrenceSlots expands only the identities generated by the master. It
+// retains suppressed slots and both placements so callers can decide which
+// RANGE=THISANDFUTURE component impacts a requested window without reimplementing
+// recurrence rules or override precedence.
+func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) []RecurrenceSlot {
+	occurrences := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+		componentName:     componentName,
+		includeSuppressed: true,
+		maxInstances:      maxInstances,
+		resolve:           resolve,
+		reaches: func(original, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
+			return periodTouches(original.Start, original.End, rangeStart, rangeEnd) ||
+				periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
+		},
+	})
+	slots := make([]RecurrenceSlot, 0, len(occurrences))
+	for _, occurrence := range occurrences {
+		slots = append(slots, RecurrenceSlot{
+			RecurrenceID:               occurrence.recurrenceID,
+			Original:                   occurrence.original,
+			Effective:                  occurrence.period,
+			Suppressed:                 occurrence.suppressed,
+			ExactOverride:              occurrence.exactOverride,
+			GoverningRangeRecurrenceID: occurrence.governing,
+		})
+	}
+	return slots
+}
+
+func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) []recurrenceOccurrence {
 	// One unfold serves the master, the overrides and the RDATEs. This runs once
 	// per candidate component of every resource a report considers, so a
 	// per-reader scan of the payload would be paid that many times over.
@@ -94,49 +176,68 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 	overrides := componentRecurrenceOverrides(components, duration, expansion.resolve)
 	rdates := componentRDatePeriods(component, expansion.resolve)
 	seen := make(map[string]struct{})
-	periods := make([]BusyPeriod, 0)
-	addPeriod := func(period BusyPeriod, suppressGeneratedOverride bool, applyExDates bool) {
+	periods := make([]recurrenceOccurrence, 0)
+	// recurrenceID is the slot the occurrence belongs to, which a
+	// RANGE=THISANDFUTURE shift moves the period away from. EXDATE and an
+	// ordinary RECURRENCE-ID override both name that slot, not the shifted start.
+	addPeriod := func(recurrenceID time.Time, original BusyPeriod, generated, applyExDates bool) {
 		if len(periods) >= expansion.maxInstances {
 			return
 		}
-		if suppressGeneratedOverride && isOverrideRecurrenceID(period.Start, overrides) {
+		if applyExDates && isExcludedDate(recurrenceID, exdates) {
 			return
 		}
-		if applyExDates && isExcludedDate(period.Start, exdates) {
+		effective := original
+		suppressed := false
+		exactOverride := false
+		var governing time.Time
+		if generated {
+			effective, suppressed, governing = applyThisAndFutureOverrides(original, overrides)
+			exactOverride = isOverrideRecurrenceID(recurrenceID, overrides)
+			suppressed = suppressed || exactOverride
+		}
+		if suppressed && !expansion.includeSuppressed {
 			return
 		}
-		if !expansion.reaches(period.Start, period.End, rangeStart, rangeEnd) {
+		if !expansion.reaches(original, effective, suppressed, rangeStart, rangeEnd) {
 			return
 		}
-		key := period.Start.UTC().Format(time.RFC3339Nano) + "/" + period.End.UTC().Format(time.RFC3339Nano)
+		key := recurrenceID.UTC().Format(time.RFC3339Nano)
 		if _, ok := seen[key]; ok {
 			return
 		}
 		seen[key] = struct{}{}
-		periods = append(periods, period)
+		periods = append(periods, recurrenceOccurrence{
+			recurrenceID:  recurrenceID,
+			original:      original,
+			period:        effective,
+			suppressed:    suppressed,
+			exactOverride: exactOverride,
+			governing:     governing,
+		})
 	}
 
 	if rrule := componentPropertyValue(component, "RRULE"); rrule != "" {
 		scanStart, scanEnd := rangeStart, rangeEnd
-		var transform func(BusyPeriod) (BusyPeriod, bool)
 		if hasThisAndFutureOverrides(overrides) {
 			if shift := maxThisAndFutureShift(overrides); shift > 0 {
 				scanStart = scanStart.Add(-shift)
 				scanEnd = scanEnd.Add(shift)
 			}
-			transform = func(period BusyPeriod) (BusyPeriod, bool) {
-				return applyThisAndFutureOverrides(period, overrides)
-			}
 		}
-		periods, ok := rruleBusyPeriods(dtstart, duration, rrule, exdates, scanStart, scanEnd, transform, expansion)
+		scanExpansion := expansion
+		scanExpansion.reaches = func(_ BusyPeriod, effective BusyPeriod, _ bool, rangeStart, rangeEnd time.Time) bool {
+			return periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
+		}
+		generated, ok := rruleBusyPeriods(component, dtstart, duration, rrule, exdates, scanStart, scanEnd, scanExpansion)
 		if !ok {
-			addPeriod(BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
+			addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
 		}
-		for _, period := range periods {
-			addPeriod(period, true, true)
+		for _, occurrence := range generated {
+			addPeriod(occurrence.recurrenceID, occurrence.period, true, true)
 		}
 	} else if len(rdates) > 0 {
-		addPeriod(BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
+		addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
 	}
 
 	for _, rdate := range rdates {
@@ -144,7 +245,7 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		if end.IsZero() {
 			end = rdate.Start.Add(duration)
 		}
-		addPeriod(BusyPeriod{Start: rdate.Start, End: end}, true, true)
+		addPeriod(rdate.Start, BusyPeriod{Start: rdate.Start, End: end}, true, true)
 	}
 
 	if expansion.includeOverrides {
@@ -152,7 +253,7 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			if override.cancelled {
 				continue
 			}
-			addPeriod(override.period, false, false)
+			addPeriod(override.recurrenceID, override.period, false, false)
 		}
 	}
 
@@ -789,18 +890,32 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 	}
 }
 
-func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, transform func(BusyPeriod) (BusyPeriod, bool), expansion recurrenceExpansion) ([]BusyPeriod, bool) {
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), expansion.resolve)
+// recurrenceCivilScanPad bounds how far a civil-time scan window is widened
+// past the absolute request bounds, since a valid UTC offset is strictly less
+// than 24 hours.
+const recurrenceCivilScanPad = 24 * time.Hour
+
+func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) ([]recurrenceOccurrence, bool) {
+	recurrenceStart, resolveCandidate, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
+	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), expansion.resolve)
 	if !ok {
 		return nil, false
 	}
-	var periods []BusyPeriod
+	var periods []recurrenceOccurrence
 
-	periodStart := recurrencePeriodStart(dtstart, rule)
+	scanStart, scanEnd := rangeStart, rangeEnd
+	if civil {
+		// A valid UTC offset is strictly less than 24 hours. Padding the absolute
+		// request bounds by that amount produces a safe civil-time scan window;
+		// every candidate is still resolved and checked against the exact bounds.
+		scanStart = scanStart.Add(-recurrenceCivilScanPad)
+		scanEnd = scanEnd.Add(recurrenceCivilScanPad)
+	}
+	periodStart := recurrencePeriodStart(recurrenceStart, rule)
 	occurrences := 0
 	if rule.Count == 0 {
-		periodStart = fastForwardRecurrencePeriod(periodStart, rangeStart.Add(-duration), rule)
-	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, rangeStart.Add(-duration), rule); ok {
+		periodStart = fastForwardRecurrencePeriod(periodStart, scanStart.Add(-duration), rule)
+	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
 		if skipped >= rule.Count {
 			return periods, true
 		}
@@ -808,28 +923,27 @@ func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, e
 		occurrences = skipped
 	}
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-		candidates := recurrenceCandidatesForPeriod(periodStart, dtstart, rule)
+		candidates := recurrenceCandidatesForPeriod(periodStart, recurrenceStart, rule)
 		for _, current := range candidates {
-			if current.Before(dtstart) {
+			if current.Before(recurrenceStart) {
 				continue
 			}
-			if rule.Until != nil && current.After(*rule.Until) {
+			resolvedCurrent, resolved := resolveCandidate(current)
+			if !resolved {
+				continue
+			}
+			if rule.Until != nil && resolvedCurrent.After(*rule.Until) {
 				return periods, true
 			}
 			occurrences++
 			if rule.Count > 0 && occurrences > rule.Count {
 				return periods, true
 			}
-			period := BusyPeriod{Start: current, End: current.Add(duration)}
-			if transform != nil {
-				var skip bool
-				period, skip = transform(period)
-				if skip {
-					continue
-				}
-			}
-			if expansion.reaches(period.Start, period.End, rangeStart, rangeEnd) && !isExcludedDate(current, exdates) {
-				periods = append(periods, period)
+			period := BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
+			// resolvedCurrent is the slot the rule generated; the shared
+			// expansion applies any RANGE=THISANDFUTURE transform afterwards.
+			if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !isExcludedDate(resolvedCurrent, exdates) {
+				periods = append(periods, recurrenceOccurrence{recurrenceID: resolvedCurrent, original: period, period: period})
 			}
 			if len(periods) >= expansion.maxInstances {
 				return periods, true
@@ -841,11 +955,30 @@ func rruleBusyPeriods(dtstart time.Time, duration time.Duration, rrule string, e
 			return periods, true
 		}
 		periodStart = next
-		if rule.Count == 0 && periodStart.After(rangeEnd) {
+		if rule.Count == 0 && periodStart.After(scanEnd) {
 			return periods, true
 		}
 	}
 	return periods, true
+}
+
+func recurrenceGenerationStart(component *Component, fallback time.Time, resolve PropertyTimeResolver) (time.Time, func(time.Time) (time.Time, bool), bool) {
+	property, ok := ComponentProperty(component, "DTSTART")
+	if !ok || hasZoneSuffix(strings.TrimSpace(property.Value)) {
+		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, false
+	}
+	wall, err := ParseDateTime(strings.TrimSpace(property.Value))
+	if err != nil {
+		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, false
+	}
+	dateOnly := !strings.Contains(property.Value, "T")
+	return wall, func(candidate time.Time) (time.Time, bool) {
+		layout := "20060102T150405"
+		if dateOnly {
+			layout = "20060102"
+		}
+		return resolve.or(property.KeyPart, candidate.Format(layout))
+	}, true
 }
 
 func fastForwardCountedSubDailyRecurrence(periodStart, threshold time.Time, rule recurrenceRule) (time.Time, int, bool) {
@@ -1006,7 +1139,7 @@ func componentRecurrenceOverrides(components []Component, fallbackDuration time.
 	return overrides
 }
 
-func applyThisAndFutureOverrides(period BusyPeriod, overrides []recurrenceOverride) (BusyPeriod, bool) {
+func applyThisAndFutureOverrides(period BusyPeriod, overrides []recurrenceOverride) (BusyPeriod, bool, time.Time) {
 	var selected *recurrenceOverride
 	for i := range overrides {
 		override := &overrides[i]
@@ -1018,10 +1151,10 @@ func applyThisAndFutureOverrides(period BusyPeriod, overrides []recurrenceOverri
 		}
 	}
 	if selected == nil {
-		return period, false
+		return period, false, time.Time{}
 	}
 	if selected.cancelled {
-		return period, true
+		return period, true, selected.recurrenceID
 	}
 
 	delta := selected.period.Start.Sub(selected.recurrenceID)
@@ -1030,7 +1163,7 @@ func applyThisAndFutureOverrides(period BusyPeriod, overrides []recurrenceOverri
 	if duration <= 0 {
 		duration = period.End.Sub(period.Start)
 	}
-	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, false
+	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, false, selected.recurrenceID
 }
 
 func maxThisAndFutureShift(overrides []recurrenceOverride) time.Duration {

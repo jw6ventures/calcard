@@ -10,10 +10,9 @@ import (
 	"github.com/jw6ventures/calcard/internal/ical"
 )
 
-// The calendar-query and calendar-multiget bodies are read against their
-// RFC 4791 §9 content models by the token walk in report_grammar.go rather than
-// through the struct tags that frame them. Other REPORT bodies continue through
-// reportRequest and their report-specific validators.
+// The three CalDAV REPORT bodies are read against their RFC 4791 content models
+// by token walks rather than through the permissive struct tags that frame them.
+// Other REPORT bodies continue through reportRequest and their own validators.
 
 // propertySelector is the `(DAV:allprop | DAV:propname | DAV:prop)?` head of
 // both calendaring REPORT bodies. The three are alternatives, so at most one
@@ -65,10 +64,11 @@ func unsupportedCollation(collation string) *reportGrammarFault {
 	}
 }
 
-// applyCalendarReportGrammar re-reads a calendar-query or calendar-multiget
-// body against its RFC 4791 §9 content model and replaces the permissively
-// decoded fields with what the model actually admits. Other report types are
-// left alone.
+// applyCalendarReportGrammar re-reads each CalDAV REPORT body against its RFC
+// 4791 content model and replaces the permissively decoded fields with what the
+// model actually admits. Other report types keep the permissive decode, save for
+// the CALDAV:calendar-data inside them, which carries a content model of its own
+// wherever it appears.
 func applyCalendarReportGrammar(report *reportRequest, body []byte) *reportGrammarFault {
 	switch report.XMLName.Local {
 	case "calendar-query":
@@ -90,16 +90,35 @@ func applyCalendarReportGrammar(report *reportRequest, body []byte) *reportGramm
 		report.Prop = parsed.Selector.Prop
 		report.Hrefs = parsed.Hrefs
 		report.Filter = nil
+	case "free-busy-query":
+		parsed, fault := parseFreeBusyQueryRequest(body)
+		if fault != nil {
+			return fault
+		}
+		report.TimeRange = parsed.TimeRange
+		// §9.11 admits the time-range and nothing else, so anything the
+		// permissive decode picked up names no part of this request.
+		report.Filter = nil
+		report.Prop = nil
+		report.Hrefs = nil
+		report.selector = propertySelector{}
+	}
+	// §9.6 binds a CALDAV:calendar-data selector wherever one appears, including
+	// in a report whose own body this pass does not walk -- sync-collection is the
+	// one CalCard answers. The three walks above raise the fault through
+	// decodePropertySelector and leave none behind, so this reaches the rest.
+	if calData := reportCalendarData(*report); calData != nil && calData.fault != nil {
+		return calData.fault
 	}
 	return nil
 }
 
-// calendarQueryDepth reads the Depth a calendar-query is scoped by. RFC 4791
-// §7.8 processes a request carrying no Depth header as Depth: 0, which is the
-// opposite of the RFC 4918 §9.1 PROPFIND default and reaches the Request-URI
-// alone. RFC 4918 §10.2 fixes the three legal values, so anything else is a
-// malformed request rather than a value to guess at.
-func calendarQueryDepth(r *http.Request) (string, bool) {
+// reportDepth reads the Depth a calendaring REPORT is scoped by. RFC 4791 §7.8
+// and §7.10 both process a request carrying no Depth header as Depth: 0, which
+// is the opposite of the RFC 4918 §9.1 PROPFIND default and reaches the
+// Request-URI alone. RFC 4918 §10.2 fixes the three legal values, so anything
+// else is a malformed request rather than a value to guess at.
+func reportDepth(r *http.Request) (string, bool) {
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	switch depth {
 	case "":
@@ -120,7 +139,7 @@ func calendarQueryExcludedByDepth(r *http.Request, report reportRequest, targetR
 	if report.XMLName.Local != "calendar-query" || targetResource != "" {
 		return false
 	}
-	depth, ok := calendarQueryDepth(r)
+	depth, ok := reportDepth(r)
 	return ok && depth == "0"
 }
 
@@ -282,6 +301,13 @@ func decodePropertySelector(dec *xml.Decoder, start xml.StartElement) (propertyS
 		var requested reportProp
 		if err := dec.DecodeElement(&requested, &start); err != nil {
 			return propertySelector{}, malformedReport("DAV:prop: %v", err)
+		}
+		// CALDAV:calendar-data is the one child of DAV:prop that has a content
+		// model. It reads itself against §9.6 and records what it found there,
+		// because a decoder hook cannot fail the permissive decode every other
+		// report body still goes through.
+		if requested.CalendarData != nil && requested.CalendarData.fault != nil {
+			return propertySelector{}, requested.CalendarData.fault
 		}
 		return propertySelector{Prop: &requested}, nil
 	}
@@ -622,40 +648,12 @@ func validateCompFilterSemantics(filter *compFilter) *reportGrammarFault {
 // spelled -- the value form RFC 4791 §9.9 requires and the §7.8/§7.9 bounds --
 // rather than whether stored data intersects it, which is time_range.go's job.
 
-func validCalendarFilterTimeRanges(filter *calFilter) bool {
-	if filter == nil {
-		return true
-	}
-	return validCompFilterTimeRanges(&filter.CompFilter)
-}
-
 func validTimeRange(tr *timeRange) bool {
 	if tr == nil {
 		return true
 	}
 	_, _, ok := calendarTimeRangeBounds(tr)
 	return ok
-}
-
-func validCompFilterTimeRanges(filter *compFilter) bool {
-	if filter.TimeRange != nil {
-		if _, _, ok := calendarTimeRangeBounds(filter.TimeRange); !ok {
-			return false
-		}
-	}
-	for i := range filter.PropFilter {
-		if tr := filter.PropFilter[i].TimeRange; tr != nil {
-			if _, _, ok := calendarTimeRangeBounds(tr); !ok {
-				return false
-			}
-		}
-	}
-	for i := range filter.CompFilter {
-		if !validCompFilterTimeRanges(&filter.CompFilter[i]) {
-			return false
-		}
-	}
-	return true
 }
 
 // reportTimeRangeDateLimitFault checks every CALDAV:time-range the request
@@ -667,8 +665,18 @@ func validCompFilterTimeRanges(filter *compFilter) bool {
 //
 // Only an attribute the request actually spells is tested: an omitted one means
 // an infinity that no finite limit could contain.
-func reportTimeRangeDateLimitFault(filter *calFilter, tr *timeRange) string {
+func reportTimeRangeDateLimitFault(filter *calFilter, tr *timeRange, calData *calendarDataEl) string {
 	minTime, maxTime := ical.DateLimits()
+	exceeds := func(instant time.Time) string {
+		switch {
+		case instant.Before(minTime):
+			return "min-date-time"
+		case instant.After(maxTime):
+			return "max-date-time"
+		default:
+			return ""
+		}
+	}
 	for _, value := range reportTimeRangeValues(filter, tr) {
 		instant, ok := parseUTCDateTime(value)
 		if !ok {
@@ -676,11 +684,25 @@ func reportTimeRangeDateLimitFault(filter *calFilter, tr *timeRange) string {
 			// no instant to compare against a limit.
 			continue
 		}
-		if instant.Before(minTime) {
-			return "min-date-time"
+		if condition := exceeds(instant); condition != "" {
+			return condition
 		}
-		if instant.After(maxTime) {
-			return "max-date-time"
+	}
+	if calData == nil {
+		return ""
+	}
+	// The §9.6.5–§9.6.7 ranges bound the request the same way a CALDAV:time-range
+	// does, so the same limits reach them. Both endpoints are required there, so
+	// there is no infinity to exempt.
+	for _, r := range []*calendarRange{calData.Expand, calData.LimitRecurrenceSet, calData.LimitFreeBusySet} {
+		if r == nil {
+			continue
+		}
+		if condition := exceeds(r.Start); condition != "" {
+			return condition
+		}
+		if condition := exceeds(r.End); condition != "" {
+			return condition
 		}
 	}
 	return ""

@@ -913,72 +913,73 @@ func icalInstants(root *icalNode, property icalProperty, value string) ([]time.T
 	return []time.Time{parsed}, true
 }
 
+// submittedTimezoneOffset resolves the offset in force at a wall-clock reading
+// in the submitted zone. A VTIMEZONE observance names its transitions in local
+// time, so the reading and the transitions are already on one scale.
 func submittedTimezoneOffset(root *icalNode, tzid string, wall time.Time) (time.Duration, bool) {
-	var timezone *icalNode
-	for _, child := range root.children {
-		if child.name == "VTIMEZONE" && strings.TrimSpace(child.value("TZID")) == tzid {
-			timezone = child
-			break
-		}
-	}
-	if timezone == nil {
+	return submittedTimezoneOffsetBefore(root, tzid, wall, localTransition)
+}
+
+// submittedTimezoneOffsetAtInstant resolves the offset in force at an absolute
+// instant. VTIMEZONE transition values are local wall clocks, so each one is
+// converted with TZOFFSETFROM before it is compared with the instant.
+func submittedTimezoneOffsetAtInstant(root *icalNode, tzid string, instant time.Time) (time.Duration, bool) {
+	return submittedTimezoneOffsetBefore(root, tzid, instant, absoluteTransition)
+}
+
+// localTransition and absoluteTransition are how far an observance's local
+// transition values sit from the scale a bound is measured on: nothing at all
+// for a wall-clock reading in the same zone, and TZOFFSETFROM for an absolute
+// instant, since the transition happens at the moment the *outgoing* offset
+// makes that local value.
+func localTransition(submittedTimezoneObservance) time.Duration { return 0 }
+
+func absoluteTransition(observance submittedTimezoneObservance) time.Duration {
+	return -observance.offsetFrom
+}
+
+// submittedTimezoneOffsetBefore is the TZOFFSETTO of the last transition at or
+// before bound, or the TZOFFSETFROM of the first one when bound precedes them
+// all -- a moment before a zone's earliest observance is still in the offset
+// that observance says it is moving away from.
+//
+// shift is the only thing the two readings differ by, and it applies to every
+// RDATE and RRULE occurrence as well, so an observance is judged the same way
+// however its transitions are spelled.
+func submittedTimezoneOffsetBefore(root *icalNode, tzid string, bound time.Time,
+	shift func(submittedTimezoneObservance) time.Duration) (time.Duration, bool) {
+	observances, ok := submittedTimezoneObservances(root, tzid)
+	if !ok {
 		return 0, false
 	}
 
-	var latest time.Time
-	var latestOffset time.Duration
-	var earliest time.Time
-	var earliestOffsetFrom time.Duration
-	for _, observance := range timezone.children {
-		if observance.name != "STANDARD" && observance.name != "DAYLIGHT" {
-			continue
+	var latest, earliest time.Time
+	var latestOffset, earliestOffsetFrom time.Duration
+	for _, observance := range observances {
+		toBoundScale := shift(observance)
+		first := observance.dtstart.Add(toBoundScale)
+		if earliest.IsZero() || first.Before(earliest) {
+			earliest, earliestOffsetFrom = first, observance.offsetFrom
 		}
-		dtstartProperty, ok := firstICalProperty(observance, "DTSTART")
-		if !ok {
-			return 0, false
-		}
-		dtstart, err := ical.ParseDateTime(dtstartProperty.value)
-		if err != nil {
-			return 0, false
-		}
-		offsetFrom, ok := parseUTCOffsetDuration(observance.value("TZOFFSETFROM"))
-		if !ok {
-			return 0, false
-		}
-		offsetTo, ok := parseUTCOffsetDuration(observance.value("TZOFFSETTO"))
-		if !ok {
-			return 0, false
-		}
-		if earliest.IsZero() || dtstart.Before(earliest) {
-			earliest = dtstart
-			earliestOffsetFrom = offsetFrom
-		}
-
 		consider := func(candidate time.Time) {
-			if candidate.After(wall) {
+			transition := candidate.Add(toBoundScale)
+			if transition.After(bound) {
 				return
 			}
-			if latest.IsZero() || candidate.After(latest) {
-				latest = candidate
-				latestOffset = offsetTo
+			if latest.IsZero() || transition.After(latest) {
+				latest, latestOffset = transition, observance.offsetTo
 			}
 		}
-		consider(dtstart)
-		for _, property := range observance.properties {
-			switch property.name {
-			case "RDATE":
-				for _, value := range strings.Split(property.value, ",") {
-					candidate, err := ical.ParseDateTime(strings.TrimSpace(value))
-					if err != nil {
-						return 0, false
-					}
-					consider(candidate)
-				}
-			case "RRULE":
-				candidate, found := ical.LatestRecurrenceOnOrBefore(dtstart, wall, property.value)
-				if found {
-					consider(candidate)
-				}
+		consider(observance.dtstart)
+		for _, candidate := range observance.rdates {
+			consider(candidate)
+		}
+		for _, rule := range observance.rrules {
+			// The rule generates local values, so it is walked up to the bound
+			// moved onto that same scale.
+			candidate, found := ical.LatestRecurrenceOnOrBefore(observance.dtstart, bound.Add(-toBoundScale), rule)
+			if found {
+				consider(candidate)
 			}
 		}
 	}
@@ -989,6 +990,78 @@ func submittedTimezoneOffset(root *icalNode, tzid string, wall time.Time) (time.
 		return earliestOffsetFrom, true
 	}
 	return 0, false
+}
+
+type submittedTimezoneObservance struct {
+	dtstart    time.Time
+	offsetFrom time.Duration
+	offsetTo   time.Duration
+	rdates     []time.Time
+	rrules     []string
+}
+
+func submittedTimezoneObservances(root *icalNode, tzid string) ([]submittedTimezoneObservance, bool) {
+	timezone := submittedTimezone(root, tzid)
+	if timezone == nil {
+		return nil, false
+	}
+
+	observances := make([]submittedTimezoneObservance, 0, len(timezone.children))
+	for _, node := range timezone.children {
+		if node.name != "STANDARD" && node.name != "DAYLIGHT" {
+			continue
+		}
+		dtstartProperty, ok := firstICalProperty(node, "DTSTART")
+		if !ok {
+			return nil, false
+		}
+		dtstart, err := ical.ParseDateTime(dtstartProperty.value)
+		if err != nil {
+			return nil, false
+		}
+		offsetFrom, ok := parseUTCOffsetDuration(node.value("TZOFFSETFROM"))
+		if !ok {
+			return nil, false
+		}
+		offsetTo, ok := parseUTCOffsetDuration(node.value("TZOFFSETTO"))
+		if !ok {
+			return nil, false
+		}
+
+		observance := submittedTimezoneObservance{
+			dtstart:    dtstart,
+			offsetFrom: offsetFrom,
+			offsetTo:   offsetTo,
+		}
+		for _, property := range node.properties {
+			switch property.name {
+			case "RDATE":
+				for _, value := range strings.Split(property.value, ",") {
+					candidate, err := ical.ParseDateTime(strings.TrimSpace(value))
+					if err != nil {
+						return nil, false
+					}
+					observance.rdates = append(observance.rdates, candidate)
+				}
+			case "RRULE":
+				observance.rrules = append(observance.rrules, property.value)
+			}
+		}
+		observances = append(observances, observance)
+	}
+	return observances, len(observances) > 0
+}
+
+func submittedTimezone(root *icalNode, tzid string) *icalNode {
+	if root == nil {
+		return nil
+	}
+	for _, child := range root.children {
+		if child.name == "VTIMEZONE" && strings.TrimSpace(child.value("TZID")) == tzid {
+			return child
+		}
+	}
+	return nil
 }
 
 func firstICalProperty(node *icalNode, name string) (icalProperty, bool) {

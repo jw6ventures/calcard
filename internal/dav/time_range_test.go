@@ -1244,3 +1244,43 @@ func TestFloatingZoneFallsBackToShippedObservances(t *testing.T) {
 		t.Fatalf("floatingZone.resolve() = %v, want %v", got, want)
 	}
 }
+
+func TestSubmittedTimezoneWallClockUsesAbsoluteTransitions(t *testing.T) {
+	zoneDefinition := wrapCalendar(componentLines("VTIMEZONE",
+		"TZID:Review/Chicago",
+		"BEGIN:STANDARD",
+		"DTSTART:19701101T020000",
+		"TZOFFSETFROM:-0500",
+		"TZOFFSETTO:-0600",
+		"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+		"END:STANDARD",
+		"BEGIN:DAYLIGHT",
+		"DTSTART:19700308T020000",
+		"TZOFFSETFROM:-0600",
+		"TZOFFSETTO:-0500",
+		"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+		"END:DAYLIGHT",
+	)...)
+	zone := newFloatingZone(zoneDefinition)
+	if zone.loc != nil || zone.root == nil {
+		t.Fatalf("expected a submitted-only timezone, got %#v", zone)
+	}
+
+	tests := []struct {
+		name    string
+		instant time.Time
+		want    string
+	}{
+		{name: "before spring transition", instant: time.Date(2024, 3, 10, 7, 30, 0, 0, time.UTC), want: "20240310T013000"},
+		{name: "after spring transition", instant: time.Date(2024, 3, 10, 8, 30, 0, 0, time.UTC), want: "20240310T033000"},
+		{name: "before fall transition", instant: time.Date(2024, 11, 3, 6, 30, 0, 0, time.UTC), want: "20241103T013000"},
+		{name: "after fall transition", instant: time.Date(2024, 11, 3, 7, 30, 0, 0, time.UTC), want: "20241103T013000"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := zone.wallClock(test.instant).Format("20060102T150405"); got != test.want {
+				t.Fatalf("wallClock(%v) = %s, want %s", test.instant, got, test.want)
+			}
+		})
+	}
+}

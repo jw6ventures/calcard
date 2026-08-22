@@ -945,6 +945,7 @@ func TestRFC4791_FreeBusyQueryReport(t *testing.T) {
 </C:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -981,6 +982,9 @@ func TestRFC4791_FreeBusyQueryReport(t *testing.T) {
 	if got := freeBusy.value("DTEND"); got != "20240630T235959Z" {
 		t.Errorf("VFREEBUSY DTEND = %q, want the requested range end", got)
 	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, rr.Body.String()), []string{
+		"FREEBUSY:20240601T100000Z/20240601T120000Z",
+	})
 }
 
 // Two free-busy reports answered inside the same second still name two
@@ -1003,13 +1007,22 @@ func TestRFC4791_FreeBusyResponseUIDIsUnique(t *testing.T) {
 		return freeBusy.value("UID")
 	}
 
-	first := uidOf(h.generateFreeBusy(nil, nil, tr))
-	second := uidOf(h.generateFreeBusy(nil, nil, tr))
+	first := uidOf(h.generateFreeBusy(nil, tr))
+	second := uidOf(h.generateFreeBusy(nil, tr))
 	if first == "" {
 		t.Fatal("VFREEBUSY carries no UID")
 	}
 	if first == second {
 		t.Fatalf("two free-busy responses share the UID %q", first)
+	}
+}
+
+func TestFreeBusyResponseUIDFallbackIsUnique(t *testing.T) {
+	fixed := time.Date(2024, 6, 1, 10, 0, 0, 123, time.UTC)
+	first := freeBusyUIDSuffixFrom(strings.NewReader(""), fixed)
+	second := freeBusyUIDSuffixFrom(strings.NewReader(""), fixed)
+	if first == second {
+		t.Fatalf("two entropy failures at the same instant produced %q", first)
 	}
 }
 
@@ -1030,6 +1043,7 @@ func TestRFC4791_FreeBusyQueryNoMatches(t *testing.T) {
 </C:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -1038,15 +1052,8 @@ func TestRFC4791_FreeBusyQueryNoMatches(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("RFC 4791 Section 7.10: free-busy-query must return 200 OK, got %d", rr.Code)
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "BEGIN:VFREEBUSY") || !strings.Contains(respBody, "END:VFREEBUSY") {
-		t.Fatal("RFC 4791 Section 7.10: Response must include VFREEBUSY component")
-	}
-	if strings.Count(respBody, "BEGIN:VFREEBUSY") != 1 || strings.Count(respBody, "END:VFREEBUSY") != 1 {
-		t.Error("RFC 4791 Section 7.10: Empty result must contain exactly one VFREEBUSY component")
-	}
-	if strings.Contains(respBody, "FREEBUSY:") {
-		t.Error("RFC 4791 Section 7.10: Empty result must not include FREEBUSY properties")
+	if periods := parsedFreeBusyLines(t, rr.Body.String()); len(periods) != 0 {
+		t.Errorf("RFC 4791 Section 7.10: empty result published periods %v", periods)
 	}
 }
 
@@ -2578,13 +2585,6 @@ func TestRFC4791_PropFilterIsNotDefined(t *testing.T) {
 // Sections 7.6 and 9.6: a calendar-data projection returns only the components
 // and properties the request named, inside the VCALENDAR wrapper.
 //
-// The object frame is asserted by parsing the returned value rather than by
-// looking for the BEGIN:VCALENDAR/END:VCALENDAR pair, which an empty wrapper
-// carries too. Serving that frame — one VERSION and one PRODID on the VCALENDAR
-// per RFC 5545 §3.6, wrapping the projected component — is CalCard policy
-// rather than an RFC 4791 requirement, and pinning it is what separates a
-// projection that honours the request from one that returns an empty shell.
-//
 // What the projected VEVENT carries is asserted as an exact set. The stored
 // resource is a valid calendar object resource — RFC 5545 §3.6.1 makes DTSTAMP
 // and DTSTART required of a VEVENT — and the projection drops both, because the
@@ -2670,7 +2670,16 @@ func TestRFC4791_PartialCalendarDataRetrieval(t *testing.T) {
 				assertPropStatus(t, calQN("calendar-data"), http.StatusOK).
 				Value()
 
-			assertICalendarObject(t, data, "VEVENT")
+			root, err := parseICalendarObject(data)
+			if err != nil {
+				t.Fatalf("projected calendar-data does not parse: %v; value:\n%s", err, data)
+			}
+			if got := componentNames(t, data); !slices.Equal(got, []string{"VEVENT"}) {
+				t.Fatalf("top-level components = %v, want [VEVENT]; value:\n%s", got, data)
+			}
+			if len(root.properties) != 0 {
+				t.Errorf("VCALENDAR carries unrequested properties %v; value:\n%s", root.properties, data)
+			}
 			assertICalendarComponentProperties(t, data, "VEVENT", map[string]string{
 				"UID":     "event",
 				"SUMMARY": "Test Event",
@@ -2695,7 +2704,7 @@ func assertICalendarObject(t *testing.T, value string, wantComponents ...string)
 	if strings.Join(got, ",") != strings.Join(wantComponents, ",") {
 		t.Errorf("calendar-data top-level components = %v, want %v; value:\n%s", got, wantComponents, value)
 	}
-	calendarProperties := icalendarPropertiesIn(value, "VCALENDAR")
+	calendarProperties := icalendarPropertiesIn(t, value, "VCALENDAR")
 	for _, required := range []string{"VERSION", "PRODID"} {
 		if n := len(calendarProperties[required]); n != 1 {
 			t.Errorf("VCALENDAR carries %d %s properties of its own, want exactly 1 (RFC 5545 §3.6); value:\n%s",
@@ -2711,7 +2720,7 @@ func assertICalendarObject(t *testing.T, value string, wantComponents ...string)
 func assertICalendarComponentProperties(t *testing.T, value, component string, want map[string]string) {
 	t.Helper()
 	got := make([]string, 0, len(want))
-	for name, values := range icalendarPropertiesIn(value, "VCALENDAR", component) {
+	for name, values := range icalendarPropertiesIn(t, value, "VCALENDAR", component) {
 		for _, propertyValue := range values {
 			got = append(got, name+":"+propertyValue)
 		}
@@ -2728,35 +2737,35 @@ func assertICalendarComponentProperties(t *testing.T, value, component string, w
 	}
 }
 
-// icalendarPropertiesIn indexes the property values declared directly inside the
-// component named by path — {"VCALENDAR"} for the calendar-level properties,
-// {"VCALENDAR", "VEVENT"} for one component's own — unfolding continuation
-// lines per RFC 5545 §3.1 first.
-//
-// The scope is the point. RFC 5545 §3.6 puts VERSION and PRODID on the
-// VCALENDAR itself, so a count taken over the whole object is satisfied by a
-// VERSION nested inside a VEVENT, which is not a valid iCalendar object at all.
-func icalendarPropertiesIn(value string, path ...string) map[string][]string {
+// icalendarPropertiesIn indexes the parsed property values declared directly
+// inside every component matching path. A malformed value fails the test rather
+// than being walked line by line: this helper reads server output, and a
+// partial walk would let an invalid projection satisfy semantic assertions.
+func icalendarPropertiesIn(t *testing.T, value string, path ...string) map[string][]string {
+	t.Helper()
 	properties := make(map[string][]string)
-	var stack []string
-	for _, raw := range ical.UnfoldLines(value) {
-		line := strings.TrimSpace(raw)
-		upper := strings.ToUpper(line)
-		switch {
-		case strings.HasPrefix(upper, "BEGIN:"):
-			stack = append(stack, strings.TrimSpace(strings.TrimPrefix(upper, "BEGIN:")))
-			continue
-		case strings.HasPrefix(upper, "END:"):
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
+	root, err := parseICalendarObject(value)
+	if err != nil {
+		t.Fatalf("server returned malformed iCalendar data: %v; value:\n%s", err, value)
+	}
+	if len(path) == 0 || !strings.EqualFold(path[0], root.name) {
+		return properties
+	}
+	nodes := []*icalNode{root}
+	for _, name := range path[1:] {
+		var children []*icalNode
+		for _, node := range nodes {
+			for _, child := range node.children {
+				if strings.EqualFold(child.name, name) {
+					children = append(children, child)
+				}
 			}
-			continue
 		}
-		if !slices.Equal(stack, path) {
-			continue
-		}
-		if name, _, propertyValue, ok := splitICalendarProperty(line); ok {
-			properties[name] = append(properties[name], propertyValue)
+		nodes = children
+	}
+	for _, node := range nodes {
+		for _, property := range node.properties {
+			properties[property.name] = append(properties[property.name], property.value)
 		}
 	}
 	return properties
@@ -2807,11 +2816,28 @@ func TestRFC4791_LimitRecurrenceSetInCalendarData(t *testing.T) {
 
 	h.Report(rr, req)
 
-	// Asserting that the recurrence set is actually limited belongs with the
-	// calendar-data projection, not here.
-	decodeMultistatus(t, rr).
+	el := decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/recurring.ics").
 		assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
+	value, err := scalarText(el)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// §9.6.6 returns the master component and the overrides impacting the range.
+	// This resource carries no override, so the master comes back as it stands:
+	// the element narrows a recurrence set, it does not expand one, and the
+	// RRULE is what still describes it.
+	properties := icalendarPropertiesIn(t, value, "VCALENDAR", "VEVENT")
+	if got := properties["RRULE"]; len(got) != 1 || got[0] != "FREQ=DAILY;COUNT=30" {
+		t.Errorf("master RRULE = %v, want the stored rule; value:\n%s", got, value)
+	}
+	if got := properties["DTSTART"]; len(got) != 1 || got[0] != "20240101T100000Z" {
+		t.Errorf("master DTSTART = %v, want the unexpanded one; value:\n%s", got, value)
+	}
+	if got := properties["RECURRENCE-ID"]; len(got) != 0 {
+		t.Errorf("limit-recurrence-set synthesized RECURRENCE-ID %v, which is expand's job; value:\n%s", got, value)
+	}
 }
 
 // Section 9.6.5: expand
@@ -2858,11 +2884,187 @@ func TestRFC4791_ExpandRecurringEventsInCalendarData(t *testing.T) {
 
 	h.Report(rr, req)
 
-	// Asserting that the instances are actually expanded belongs with the
-	// calendar-data projection, not here.
-	decodeMultistatus(t, rr).
+	el := decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/recurring.ics").
 		assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
+	value, err := scalarText(el)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// §9.6.5: one component per instance, each carrying the RECURRENCE-ID that
+	// names it, and no recurrence property left to describe a set.
+	properties := icalendarPropertiesIn(t, value, "VCALENDAR", "VEVENT")
+	wantStarts := []string{
+		"20240101T100000Z", "20240102T100000Z", "20240103T100000Z",
+		"20240104T100000Z", "20240105T100000Z",
+	}
+	if !slices.Equal(properties["DTSTART"], wantStarts) {
+		t.Errorf("expanded DTSTARTs = %v, want %v; value:\n%s", properties["DTSTART"], wantStarts, value)
+	}
+	if !slices.Equal(properties["RECURRENCE-ID"], wantStarts) {
+		t.Errorf("expanded RECURRENCE-IDs = %v, want one per instance; value:\n%s",
+			properties["RECURRENCE-ID"], value)
+	}
+	if got := properties["RRULE"]; len(got) != 0 {
+		t.Errorf("expanded output still carries RRULE %v, which §9.6.5 forbids; value:\n%s", got, value)
+	}
+}
+
+// Section 9.6.7: limit-freebusy-set
+//
+// The element trims the FREEBUSY period values of a returned VFREEBUSY to those
+// intersecting the range, and drops a property left holding none. Driven through
+// the handler because the transform reads a stored resource, and a REPORT is the
+// only way a client reaches it.
+func TestRFC4791_LimitFreeBusySetInCalendarData(t *testing.T) {
+	start := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	h := &DavServer{store: &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{
+			Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"},
+			Editor:   true,
+		}}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:busy": {
+				CalendarID: 1,
+				UID:        "busy",
+				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VFREEBUSY\r\nUID:busy\r\n" +
+					"DTSTART:20240601T000000Z\r\nDTEND:20240605T000000Z\r\n" +
+					"FREEBUSY:20240601T090000Z/20240601T100000Z\r\n" +
+					"FREEBUSY:20240604T090000Z/20240604T100000Z\r\n" +
+					"END:VFREEBUSY\r\nEND:VCALENDAR\r\n",
+				ETag:    "e",
+				DTStart: &start,
+			},
+		}},
+	}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop>
+    <C:calendar-data>
+      <C:limit-freebusy-set start="20240601T000000Z" end="20240602T000000Z"/>
+    </C:calendar-data>
+  </D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VFREEBUSY"/>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	el := decodeMultistatus(t, rr).
+		responseForHref(t, "/dav/calendars/1/busy.ics").
+		assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
+	value, err := scalarText(el)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	properties := icalendarPropertiesIn(t, value, "VCALENDAR", "VFREEBUSY")
+	want := []string{"20240601T090000Z/20240601T100000Z"}
+	if !slices.Equal(properties["FREEBUSY"], want) {
+		t.Errorf("FREEBUSY periods = %v, want %v; value:\n%s", properties["FREEBUSY"], want, value)
+	}
+	// §9.6.7 narrows the periods; it does not touch the rest of the component.
+	if got := properties["DTEND"]; len(got) != 1 || got[0] != "20240605T000000Z" {
+		t.Errorf("DTEND = %v, want the stored bound; value:\n%s", got, value)
+	}
+}
+
+// RFC 4791 §7.3 orders the zone a report resolves a floating value against: the
+// CALDAV:timezone the request carries, else the CALDAV:calendar-timezone of the
+// targeted collection, else UTC. §9.6.5 expansion is recurrence arithmetic over
+// exactly those values, so the ordering has to reach the projection and not
+// only the filter.
+func TestRFC4791_ExpandResolvesFloatingValuesThroughTheReportTimezone(t *testing.T) {
+	if _, err := time.LoadLocation("America/Chicago"); err != nil {
+		t.Skip("tzdata unavailable")
+	}
+
+	// A floating DTSTART, so the zone decides which instant each instance names.
+	const floatingRecurrence = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:floating\r\n" +
+		"DTSTART:20240101T090000\r\nDTEND:20240101T100000\r\n" +
+		"RRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	newServer := func(collectionTimezone *string) *DavServer {
+		start := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
+		return &DavServer{store: &store.Store{
+			Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{
+				Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", Timezone: collectionTimezone},
+				Editor:   true,
+			}}},
+			Events: &fakeEventRepo{events: map[string]*store.Event{
+				"1:floating": {CalendarID: 1, UID: "floating", RawICAL: floatingRecurrence, ETag: "e", DTStart: &start},
+			}},
+		}}
+	}
+
+	expandedStarts := func(t *testing.T, h *DavServer, body string) []string {
+		t.Helper()
+		req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+		h.Report(rr, req)
+
+		el := decodeMultistatus(t, rr).
+			responseForHref(t, "/dav/calendars/1/floating.ics").
+			assertPropStatus(t, calQN("calendar-data"), http.StatusOK)
+		value, err := scalarText(el)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return icalendarPropertiesIn(t, value, "VCALENDAR", "VEVENT")["DTSTART"]
+	}
+
+	queryBody := func(timezone string) string {
+		return `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><C:calendar-data><C:expand start="20240101T000000Z" end="20240101T120000Z"/></C:calendar-data></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"/></C:comp-filter></C:filter>` +
+			timezone + `
+</C:calendar-query>`
+	}
+
+	// The range ends at noon UTC. The first instance's 09:00 wall clock is
+	// 09:00Z read as UTC, which is inside it, and 15:00Z read in Chicago, which
+	// is not. So the zone in force decides whether anything comes back at all.
+	t.Run("UTC when neither source names a zone", func(t *testing.T) {
+		got := expandedStarts(t, newServer(nil), queryBody(""))
+		if want := []string{"20240101T090000"}; !slices.Equal(got, want) {
+			t.Errorf("expanded DTSTARTs = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the request timezone is honoured", func(t *testing.T) {
+		body := queryBody(`<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`)
+		if got := expandedStarts(t, newServer(nil), body); len(got) != 0 {
+			t.Errorf("expanded DTSTARTs = %v, want none: 09:00 Chicago is outside the requested day", got)
+		}
+	})
+
+	t.Run("the collection timezone answers when the request names none", func(t *testing.T) {
+		chicago := vTimezoneObject("America/Chicago")
+		if got := expandedStarts(t, newServer(&chicago), queryBody("")); len(got) != 0 {
+			t.Errorf("expanded DTSTARTs = %v, want none: the collection zone was not consulted", got)
+		}
+	})
+
+	t.Run("the request timezone outranks the collection one", func(t *testing.T) {
+		utc := vTimezoneObject("UTC")
+		body := queryBody(`<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`)
+		if got := expandedStarts(t, newServer(&utc), body); len(got) != 0 {
+			t.Errorf("expanded DTSTARTs = %v, want none: the collection zone outranked the request", got)
+		}
+	})
 }
 
 // Sections 7.4 and 9.9: time-range filtering with recurring events.

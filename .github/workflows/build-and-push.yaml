@@ -16,15 +16,93 @@ on:
       - .github/workflows/build-and-push.yaml
     tags:
       - '*'
+  # The test job below is what docker-build-push depends on, so it has to run
+  # on the pull request rather than only after the merge that it gates.
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - Dockerfile
+      - deploy/**
+      - cmd/**
+      - internal/**
+      - migrations/**
+      - go.mod
+      - go.sum
+      - db.sql
+      - .github/workflows/build-and-push.yaml
   workflow_dispatch:
+# Least privilege by default. Only docker-build-push publishes anything, and it
+# raises its own scopes below; a pull request reaches the test job alone, which
+# has no reason to hold a token that can write to the repository or to GHCR.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: calcard_test
+          POSTGRES_PASSWORD: calcard_test
+          POSTGRES_DB: calcard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U calcard_test -d calcard_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # Every TestPostgres_* case runs against this service. Each builds a schema
+    # of its own from db.sql and drops it afterwards, so they neither collide
+    # with one another nor leave the database changed.
+    env:
+      CALCARD_TEST_POSTGRES_DSN: postgres://calcard_test:calcard_test@127.0.0.1:5432/calcard_test?sslmode=disable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt -w required for:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      # The DAV and store guarantees that are properties of one PostgreSQL
+      # transaction only fail under real interleaving, which a single pass can
+      # miss. -race is what makes that failure a report rather than a flake.
+      - name: Test concurrency under the race detector
+        run: go test -race -count=2 ./internal/dav ./internal/store ./internal/auth
+
   docker-build-push:
     if: github.event_name != 'pull_request'
+    needs: test
     runs-on: ubuntu-latest
+    # contents for the tag-only GitHub Release, packages for the GHCR image and
+    # Helm chart pushes.
+    permissions:
+      contents: write
+      packages: write
     env:
       DEFAULT_BRANCH: main
       BETA_BRANCH: develop

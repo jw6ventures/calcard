@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // XML response models and helpers for DAV PROPFIND/REPORT responses.
@@ -255,18 +256,6 @@ func langStringPtr(value string, lang *string) *langString {
 	return &result
 }
 
-// cdataString wraps string content in CDATA for raw XML output.
-type cdataString string
-
-func (c cdataString) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	if c == "" {
-		return nil
-	}
-	return e.EncodeElement(struct {
-		S string `xml:",cdata"`
-	}{S: string(c)}, start)
-}
-
 type resourceType struct {
 	Collection  *struct{} `xml:"d:collection,omitempty"`
 	Calendar    *struct{} `xml:"cal:calendar,omitempty"`
@@ -350,33 +339,49 @@ type reportProp struct {
 	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 }
 
+// calendarRange is the resolved start/end pair CALDAV:expand,
+// CALDAV:limit-recurrence-set and CALDAV:limit-freebusy-set share (RFC 4791
+// §9.6.5–§9.6.7): an inclusive start, a non-inclusive end, both required.
+type calendarRange struct {
+	Start time.Time
+	End   time.Time
+}
+
 // calendarDataEl specifies what calendar data to return (RFC 4791 §9.6). Its
 // ATTLIST defaults content-type to text/calendar and version to 2.0, so an
-// absent attribute names the same pair an explicit one would.
+// absent attribute names the same pair an explicit one would. The children are
+// read by UnmarshalXML against the §9.6 content model rather than by struct
+// tags, which cannot express the sequence or the expand/limit-recurrence-set
+// alternation.
 type calendarDataEl struct {
-	ContentType *string        `xml:"content-type,attr"`
-	Version     *string        `xml:"version,attr"`
-	Expand      *expandEl      `xml:"urn:ietf:params:xml:ns:caldav expand"`
-	Comp        []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
-	Prop        []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
+	ContentType        *string
+	Version            *string
+	Comp               *calendarComp
+	Expand             *calendarRange
+	LimitRecurrenceSet *calendarRange
+	LimitFreeBusySet   *calendarRange
+	// fault carries a content-model violation out of UnmarshalXML. The decode in
+	// report() runs permissively over every REPORT body, so only the §9 grammar
+	// pass is entitled to turn one into a rejection.
+	fault *reportGrammarFault
 }
 
-// calendarComp describes component selection within calendar-data.
+// calendarComp is the CALDAV:comp selection of RFC 4791 §9.6.1,
+// ((allprop | prop*), (allcomp | comp*)).
 type calendarComp struct {
-	Name string         `xml:"name,attr"`
-	Comp []calendarComp `xml:"urn:ietf:params:xml:ns:caldav comp"`
-	Prop []calendarProp `xml:"urn:ietf:params:xml:ns:caldav prop"`
+	Name    string
+	AllProp bool
+	Prop    []calendarProp
+	AllComp bool
+	Comp    []calendarComp
 }
 
-// calendarProp describes property selection within calendar-data.
+// calendarProp is the CALDAV:prop selection of RFC 4791 §9.6.4. NoValue asks
+// for the property name, its parameters and a trailing colon with the value
+// suppressed.
 type calendarProp struct {
-	Name string `xml:"name,attr"`
-}
-
-// expandEl specifies recurrence expansion parameters
-type expandEl struct {
-	Start string `xml:"start,attr"`
-	End   string `xml:"end,attr"`
+	Name    string
+	NoValue bool
 }
 
 // propfindRequest represents a PROPFIND request body (RFC 4918 Section 9.1). It

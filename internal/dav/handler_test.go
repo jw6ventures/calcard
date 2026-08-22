@@ -234,7 +234,7 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "https://cal.example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestCalendarMultiGetPreservesEncodedPathSeparators(t *testing.T) {
 	hrefs := []string{"/dav/calendars/2/team%2Fstandup.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", nil, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -2591,7 +2591,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, nil, propertySelector{}, floatingZone{})
+	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, calendarDataProjection{}, propertySelector{})
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -3000,7 +3000,7 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/1/", nil)
-	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "", nil, propertySelector{}, request)
+	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "", calendarDataProjection{}, propertySelector{}, request)
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -10172,6 +10172,7 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -10183,13 +10184,9 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	if rr.Header().Get("Content-Type") != "text/calendar" {
 		t.Fatalf("expected text/calendar, got %s", rr.Header().Get("Content-Type"))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "VFREEBUSY") {
-		t.Errorf("expected VFREEBUSY in response, got %s", respBody)
-	}
-	if !strings.Contains(respBody, "FREEBUSY:") {
-		t.Errorf("expected FREEBUSY property in response, got %s", respBody)
-	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, rr.Body.String()), []string{
+		"FREEBUSY:20240601T100000Z/20240601T120000Z",
+	})
 }
 
 func TestPropfindParsesRequestBody(t *testing.T) {
@@ -10642,6 +10639,7 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -10696,6 +10694,7 @@ func TestFreeBusyQueryUsesTopLevelTimeRange(t *testing.T) {
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -10711,12 +10710,9 @@ func TestFreeBusyQueryUsesTopLevelTimeRange(t *testing.T) {
 	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
 		t.Fatalf("expected top-level DTEND in freebusy, got %s", respBody)
 	}
-	if !strings.Contains(respBody, "FREEBUSY:20240601T100000Z/20240601T120000Z") {
-		t.Fatalf("expected in-range busy slot, got %s", respBody)
-	}
-	if strings.Contains(respBody, "FREEBUSY:20240701T100000Z/20240701T110000Z") {
-		t.Fatalf("expected out-of-range busy slot to be omitted, got %s", respBody)
-	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, respBody), []string{
+		"FREEBUSY:20240601T100000Z/20240601T120000Z",
+	})
 }
 
 func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
@@ -10747,6 +10743,7 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2}))
 	rr := httptest.NewRecorder()
 
@@ -10756,15 +10753,19 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "FREEBUSY:20240601T100000Z/20240601T110000Z") {
-		t.Fatalf("expected visible busy slot, got %s", respBody)
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, respBody), []string{
+		"FREEBUSY:20240601T100000Z/20240601T110000Z",
+	})
+	root, err := parseICalendarObject(respBody)
+	if err != nil {
+		t.Fatalf("free-busy response is not parseable iCalendar: %v", err)
 	}
-	if strings.Contains(respBody, "FREEBUSY:20240602T120000Z/20240602T130000Z") {
-		t.Fatalf("expected denied busy slot to be omitted, got %s", respBody)
+	if len(root.children) != 1 || root.children[0].name != "VFREEBUSY" {
+		t.Fatalf("free-busy response exposes resource components: %v", componentNames(t, respBody))
 	}
 }
 
-func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(t *testing.T) {
+func TestFreeBusyQueryConcealsCalendarWhenReadFreeBusyIsExplicitlyDenied(t *testing.T) {
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
@@ -10813,8 +10814,11 @@ func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected explicit read-free-busy deny to block REPORT, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected explicit read-free-busy deny to conceal the calendar, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "need-privileges") || strings.Contains(rr.Body.String(), "read-free-busy") {
+		t.Fatalf("concealed free-busy denial exposed privilege details: %s", rr.Body.String())
 	}
 }
 

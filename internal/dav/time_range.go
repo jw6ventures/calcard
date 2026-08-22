@@ -97,6 +97,20 @@ func (z floatingZone) addDays(instant time.Time, days int) time.Time {
 	return instant.In(z.loc).AddDate(0, 0, days).UTC()
 }
 
+// wallClock renders an instant as the wall-clock reading in the zone, which is
+// the spelling a DATE or floating value is written back out with.
+func (z floatingZone) wallClock(instant time.Time) time.Time {
+	if z.loc != nil {
+		return instant.In(z.loc)
+	}
+	if z.root != nil {
+		if offset, ok := submittedTimezoneOffsetAtInstant(z.root, z.tzid, instant); ok {
+			return instant.Add(offset).UTC()
+		}
+	}
+	return instant.UTC()
+}
+
 // icalTimeValue is one resolved date-valued property: the instant it names and
 // whether it was written as a DATE, which several §9.9 rows switch on.
 type icalTimeValue struct {
@@ -244,29 +258,56 @@ func (m calendarTimeRangeMatcher) recurrenceMaster(node, parent *icalNode) *ical
 // expandable is false for a frequency this server cannot expand, which the
 // caller keeps rather than filters out.
 func (m calendarTimeRangeMatcher) instanceShifts(node, master *icalNode, start, end time.Time) ([]time.Duration, bool) {
+	instances, ok := m.recurrenceInstances(node, master, start, end)
+	if !ok {
+		return nil, false
+	}
+	shifts := make([]time.Duration, 0, len(instances))
+	for _, instance := range instances {
+		shifts = append(shifts, instance.shift)
+	}
+	return shifts, true
+}
+
+// recurrenceInstance is one generated occurrence expressed as offsets from the
+// master's DTSTART: where the occurrence falls, and which slot of the pattern it
+// belongs to. The two differ only when a RANGE=THISANDFUTURE override moved it,
+// and a caller writing a RECURRENCE-ID out needs the slot rather than the
+// occurrence (RFC 5545 §3.8.4.4).
+type recurrenceInstance struct {
+	shift     time.Duration
+	slotShift time.Duration
+}
+
+// recurrenceInstances is instanceShifts with the slot kept alongside each
+// occurrence. instanceShifts is the §9.9 evaluator's view, which only ever needs
+// to judge where an occurrence falls.
+func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) ([]recurrenceInstance, bool) {
 	if master == nil {
-		return []time.Duration{0}, true
+		return []recurrenceInstance{{}}, true
 	}
 	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
 		return nil, false
 	}
 	dtstart, ok := m.dateValue(master, "DTSTART", 0)
 	if !ok {
-		// Nothing to expand around, so the component stands on its own dates.
-		return []time.Duration{0}, true
+		return []recurrenceInstance{{}}, true
 	}
 	window := m.occurrenceWindow(master, dtstart)
 	scanStart, scanEnd := start, end
 	if lead := m.alarmScanLead(node, window); lead > 0 {
 		scanStart, scanEnd = start.Add(-lead), end.Add(lead)
 	}
-	instances := ical.RecurrenceInstanceStarts(m.raw, master.name, dtstart.instant, window,
+	generated := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
 		scanStart, scanEnd, ical.MaxRecurrenceInstances, m.resolveContentLine)
-	shifts := make([]time.Duration, 0, len(instances))
-	for _, instance := range instances {
-		shifts = append(shifts, instance.Sub(dtstart.instant))
+	instances := make([]recurrenceInstance, 0, len(generated))
+	for _, instance := range generated {
+		instances = append(instances, recurrenceInstance{
+			shift:     instance.Start.Sub(dtstart.instant),
+			slotShift: instance.RecurrenceID.Sub(dtstart.instant),
+		})
 	}
-	return shifts, true
+	return instances, true
 }
 
 // alarmScanLead is how far outside the requested range an instance can start

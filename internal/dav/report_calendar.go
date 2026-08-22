@@ -28,17 +28,24 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 			return nil, "", store.ErrNotFound
 		}
 	}
-	calData := reportCalendarData(report)
+	// The §7.3 zone every floating value in this report resolves against, the
+	// filter's and the projection's alike -- carried on the projection so the
+	// two cannot be given different readings of the same request. Only
+	// calendar-query carries a CALDAV:timezone of its own; the other reports
+	// fall back to the collection property, as §7.3 orders.
+	projection := calendarDataProjection{
+		selection: reportCalendarData(report),
+		zone:      reportFloatingZone(report.Timezone, cal.Timezone),
+	}
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, calData, report.selector, request)
+		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, projection, report.selector, request)
 		return res, "", err
 	case "calendar-query":
-		zone := reportFloatingZone(report.Timezone, cal.Timezone)
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, calData, report.selector, zone)
+		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, projection, report.selector)
 		return res, "", err
 	case "sync-collection":
-		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, calData)
+		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, projection)
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
 		// with a full dump of the collection.
@@ -333,48 +340,9 @@ func eventFilterFromTimeRange(tr *timeRange) (store.EventFilter, bool) {
 	return ef, true
 }
 
-// validCalendarFilterCollations reports whether every CALDAV:text-match in the
-// filter names a collation the matcher implements. RFC 4791 §7.8.7
-// (CALDAV:supported-collation) forbids answering a request that asks for one
-// the server does not: silently matching under a different collation returns
-// results the client did not ask for.
-func validCalendarFilterCollations(filter *calFilter) bool {
-	if filter == nil {
-		return true
-	}
-	return validCompFilterCollations(&filter.CompFilter)
-}
-
-func validCompFilterCollations(filter *compFilter) bool {
-	for i := range filter.PropFilter {
-		if !validPropFilterCollations(&filter.PropFilter[i]) {
-			return false
-		}
-	}
-	for i := range filter.CompFilter {
-		if !validCompFilterCollations(&filter.CompFilter[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func validPropFilterCollations(filter *propFilter) bool {
-	if filter.TextMatch != nil && !calendarCollationSupported(filter.TextMatch.Collation) {
-		return false
-	}
-	for i := range filter.ParamFilter {
-		param := &filter.ParamFilter[i]
-		if param.TextMatch != nil && !calendarCollationSupported(param.TextMatch.Collation) {
-			return false
-		}
-	}
-	return true
-}
-
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, calData *calendarDataEl, selector propertySelector, zone floatingZone) ([]response, error) {
+func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, projection calendarDataProjection, selector propertySelector) ([]response, error) {
 	if targetResource != "" {
-		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, calData, selector, zone)
+		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, projection, selector)
 	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
@@ -391,13 +359,13 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 
 		matching := events
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, zone)
+			matching = applyCalendarFilter(matching, filter, projection.zone)
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
 		if err != nil {
 			return nil, err
 		}
-		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, calData, buildLimit-len(responses))...)
+		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, projection, buildLimit-len(responses))...)
 
 		lastID := events[len(events)-1].ID
 		if lastID <= afterID || len(events) < multistatusPageSize {
@@ -406,10 +374,10 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		afterID = lastID
 	}
 
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 
-func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, responsePath, targetResource string, calData *calendarDataEl, selector propertySelector, request *http.Request) ([]response, error) {
+func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, responsePath, targetResource string, projection calendarDataProjection, selector propertySelector, request *http.Request) ([]response, error) {
 	// RFC 4791 §9.10 requires at least one DAV:href, so the grammar pass has
 	// already refused a body carrying none: there is no hrefless multiget to
 	// answer with a dump of the collection.
@@ -488,9 +456,9 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, calData))
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, projection))
 	}
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 
 // eventsWithResourceName narrows a generated event set to the one resource an
@@ -515,7 +483,7 @@ func multigetHrefInScope(targetResource, uid string) bool {
 // calendarObjectQuery answers a calendar-query whose Request-URI is a single
 // calendar object resource (RFC 4791 §7). The filter still decides whether the
 // resource is reported, so a non-matching resource yields an empty multistatus.
-func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, calData *calendarDataEl, selector propertySelector, zone floatingZone) ([]response, error) {
+func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, projection calendarDataProjection, selector propertySelector) ([]response, error) {
 	event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch event")
@@ -524,15 +492,15 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, c
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, zone)
+			matching = applyCalendarFilter(matching, filter, projection.zone)
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
 		if err != nil {
 			return nil, err
 		}
 	}
-	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, calData, h.multistatusBuildLimit())
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
+	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, projection, h.multistatusBuildLimit())
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 
 func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
@@ -549,7 +517,7 @@ func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
 	return cal.Name == segment
 }
 
-func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, calData *calendarDataEl) ([]response, string, error) {
+func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, projection calendarDataProjection) ([]response, string, error) {
 	syncToken, _ := h.calendarSyncTokenValue(cal)
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 
@@ -581,7 +549,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	responses := []response{
 		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Calendar, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
 	}
-	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, calData, h.multistatusBuildLimit()-len(responses))
+	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
 	responses = h.appendMultistatusResponses(responses, resourceResponses)
 
 	// Include deleted resources if this is an incremental sync
@@ -607,7 +575,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 			deletedHrefs[href] = struct{}{}
 		}
 		if h.multistatusBuildComplete(responses) {
-			responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
+			responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
 			return responses, syncToken, err
 		}
 		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "event", cal.ID, since)
@@ -631,7 +599,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 		}
 	}
 
-	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
+	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
 	if err != nil {
 		return nil, "", err
 	}

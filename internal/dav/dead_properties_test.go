@@ -123,7 +123,7 @@ func TestReportDecorationBatchesLockACLAndDeadPropertyQueries(t *testing.T) {
 	requested := &reportProp{propertySelection: propertySelection{LockDiscovery: &struct{}{}, ACLProp: &struct{}{}}}
 	ctx := withDAVRequestState(auth.WithUser(context.Background(), user))
 
-	responses, err := h.calendarResourceReportResponses(ctx, user, "/dav/calendars/1/", events, propertySelector{Prop: requested}, nil)
+	responses, err := h.calendarResourceReportResponses(ctx, user, "/dav/calendars/1/", events, propertySelector{Prop: requested}, calendarDataProjection{})
 	if err != nil {
 		t.Fatalf("calendarResourceReportResponses() error = %v", err)
 	}

@@ -174,7 +174,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, reportCalendarData(report), request)
+		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, birthdayCalendarDataProjection(report), request)
 		return res, "", err
 	case "calendar-query":
 		if report.Filter != nil {
@@ -185,7 +185,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 			// the implied day covers.
 			events = applyCalendarFilter(events, report.Filter, reportFloatingZone(report.Timezone, nil))
 		}
-		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, reportCalendarData(report))
+		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, birthdayCalendarDataProjection(report))
 		return res, "", err
 	case "sync-collection":
 		if report.SyncToken != "" {
@@ -197,13 +197,13 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 		// Use a stable sync-token (epoch time) since we always return all events
 		syncToken := birthdayCalendarSyncToken()
-		calData := reportCalendarData(report)
+		projection := birthdayCalendarDataProjection(report)
 		responses := []response{
 			birthdayCalendarCollection(collectionHref, principalHref),
 		}
-		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, calData, h.multistatusBuildLimit()-len(responses))
+		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
 		responses = h.appendMultistatusResponses(responses, resourceResponses)
-		responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, calData != nil)
+		responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
 		if err != nil {
 			return nil, "", err
 		}
@@ -215,7 +215,17 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	}
 }
 
-func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, collectionPath, targetResource string, selector propertySelector, calData *calendarDataEl, request *http.Request) ([]response, error) {
+// birthdayCalendarDataProjection is the §9.6 selection for the generated
+// collection. It defines no CALDAV:calendar-timezone of its own, so §7.3 leaves
+// the request's CALDAV:timezone as the only source ahead of UTC.
+func birthdayCalendarDataProjection(report reportRequest) calendarDataProjection {
+	return calendarDataProjection{
+		selection: reportCalendarData(report),
+		zone:      reportFloatingZone(report.Timezone, nil),
+	}
+}
+
+func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, collectionPath, targetResource string, selector propertySelector, projection calendarDataProjection, request *http.Request) ([]response, error) {
 	eventsByUID := make(map[string]store.Event)
 	for _, ev := range events {
 		eventsByUID[ev.UID] = ev
@@ -244,7 +254,7 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, rawCalendarResourceReportResponse(responseHref, ev, calData))
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, ev, projection))
 	}
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }

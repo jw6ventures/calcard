@@ -47,8 +47,8 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// calendar-query and calendar-multiget are re-read against their RFC 4791
-	// content models because the permissive decode above drops unknown fields.
+	// CalDAV REPORT bodies are re-read against their RFC 4791 content models
+	// because the permissive decode above drops unknown fields.
 	if fault := applyCalendarReportGrammar(&report, body); fault != nil {
 		h.logger().Trace("Report", "rejected %s body for %s: %v", report.XMLName.Local, cleanPath, fault)
 		writeReportGrammarFault(w, fault)
@@ -63,44 +63,29 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if report.XMLName.Local == "calendar-query" {
-		if _, ok := calendarQueryDepth(r); !ok {
+	// RFC 4791 §7.8 and §7.10 both process a request carrying no Depth header as
+	// Depth: 0, and RFC 4918 §10.2 fixes the three legal values.
+	if report.XMLName.Local == "calendar-query" || report.XMLName.Local == "free-busy-query" {
+		if _, ok := reportDepth(r); !ok {
 			http.Error(w, "invalid Depth header", http.StatusBadRequest)
 			return
 		}
-	}
-	// Both checks are free-busy-query's alone: it still uses the permissive
-	// decoder, while the grammar pass above already refuses a calendar-query
-	// carrying either fault, with the precondition RFC 4791 names for it.
-	if report.XMLName.Local == "free-busy-query" && !validCalendarFilterTimeRanges(report.Filter) {
-		http.Error(w, "invalid time-range", http.StatusBadRequest)
-		return
-	}
-	if report.XMLName.Local == "free-busy-query" && !validCalendarFilterCollations(report.Filter) {
-		// RFC 4791 §7.8.7 and §1.3: no resubmission of the same request can make
-		// an unimplemented collation work, so it is a 403.
-		writeCalDAVError(w, http.StatusForbidden, "supported-collation")
-		return
 	}
 	// RFC 4791 §7.8 and §7.9 bound the range a report may ask about by the
 	// CALDAV:min-date-time and CALDAV:max-date-time of the collections it
 	// targets. §1.3 puts a precondition failure at 403: no resubmission of the
 	// same range can bring it inside a limit the server does not move.
-	if condition := reportTimeRangeDateLimitFault(report.Filter, report.TimeRange); condition != "" {
+	if condition := reportTimeRangeDateLimitFault(report.Filter, report.TimeRange, reportCalendarData(report)); condition != "" {
 		writeCalDAVError(w, http.StatusForbidden, condition)
 		return
 	}
-	if report.XMLName.Local == "free-busy-query" {
-		if !validTimeRange(report.TimeRange) {
-			http.Error(w, "invalid time-range", http.StatusBadRequest)
-			return
-		}
-		// Checked here, before dispatch, so every calendar type -- including the
-		// virtual birthday collection -- is covered by the single guard.
-		if !freeBusyHasEffectiveTimeRange(report.Filter, report.TimeRange) {
-			http.Error(w, "time-range required", http.StatusBadRequest)
-			return
-		}
+	// The §9.11 grammar already required exactly one CALDAV:time-range, but its
+	// bounds still have to be usable. Checked here, before dispatch, so every
+	// calendar type -- including the virtual birthday collection -- is covered
+	// by the single guard rather than reading a whole collection first.
+	if report.XMLName.Local == "free-busy-query" && !freeBusyHasTimeRange(report.TimeRange) {
+		http.Error(w, "time-range required", http.StatusBadRequest)
+		return
 	}
 	if handler, ok := h.davRegistry().reportHandler(cleanPath, report.XMLName.Local); ok {
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -227,6 +212,10 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calID, cleanPath, loadPrivilege)
 	if err != nil {
+		if report.XMLName.Local == "free-busy-query" {
+			_ = writePrivilegeRequirementError(w, requirePrivatePrivilegeAt(err, cleanPath, loadPrivilege))
+			return
+		}
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
 			writeNeedPrivileges(w, cleanPath, loadPrivilege)
 			return
@@ -244,10 +233,18 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		return
 	}
 	if report.XMLName.Local == "free-busy-query" {
-		freeBusyData, err := h.freeBusyQuery(r.Context(), user, cal, report.Filter, report.TimeRange)
-		if err != nil {
-			http.Error(w, "failed to list events", http.StatusInternalServerError)
-			return
+		// Out of Depth reach is the empty VFREEBUSY §7.10 requires when nothing
+		// matches, answered without reading the collection at all.
+		var freeBusyData string
+		if freeBusyExcludedByDepth(r, report) {
+			freeBusyData = h.generateFreeBusy(nil, report.TimeRange)
+		} else {
+			var err error
+			freeBusyData, err = h.freeBusyQuery(r.Context(), user, cal, report.TimeRange)
+			if err != nil {
+				http.Error(w, "failed to list events", http.StatusInternalServerError)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "text/calendar")
 		w.WriteHeader(http.StatusOK)
@@ -299,14 +296,11 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 		// Free-busy carries no CALDAV:timezone element of its own, and the
 		// generated birthday collection defines no CALDAV:calendar-timezone, so
 		// §7.3 leaves UTC as the only source for a floating value.
-		candidates := freeBusyCandidates(events, floatingZone{})
-		if report.Filter != nil {
-			candidates = filterFreeBusyCandidates(candidates, report.Filter)
+		var candidates []freeBusyCandidate
+		if !freeBusyExcludedByDepth(r, report) {
+			candidates = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
 		}
-		if report.TimeRange != nil {
-			candidates = filterFreeBusyCandidatesByTimeRange(candidates, report.TimeRange)
-		}
-		freeBusyData := h.generateFreeBusy(candidates, report.Filter, report.TimeRange)
+		freeBusyData := h.generateFreeBusy(candidates, report.TimeRange)
 		w.Header().Set("Content-Type", "text/calendar")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(freeBusyData))

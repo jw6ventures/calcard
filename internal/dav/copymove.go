@@ -187,7 +187,7 @@ func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
-	h.copyCalendarEventWithRetry(w, r, user, srcCalID, srcUID, destPath, overwrite, 1)
+	h.copyCalendarEventWithRetry(w, r, user, srcCalID, srcUID, destPath, overwrite, maxResourceStateRetries)
 }
 
 func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {
@@ -519,7 +519,7 @@ func calendarCollectionMoveDepth(r *http.Request) error {
 }
 
 func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool) {
-	h.moveCalendarEventWithRetry(w, r, user, srcCalID, srcUID, destPath, overwrite, 1)
+	h.moveCalendarEventWithRetry(w, r, user, srcCalID, srcUID, destPath, overwrite, maxResourceStateRetries)
 }
 
 func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {

@@ -41,7 +41,7 @@ func objectHref(collectionHref, resourceName, extension string) string {
 	return strings.TrimSuffix(collectionHref, "/") + "/" + url.PathEscape(resourceName) + extension
 }
 
-func calendarResourceResponsesFilteredLimit(base string, events []store.Event, calData *calendarDataEl, limit int) []response {
+func calendarResourceResponsesFilteredLimit(base string, events []store.Event, projection calendarDataProjection, limit int) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	if limit <= 0 {
 		return nil
@@ -55,18 +55,18 @@ func calendarResourceResponsesFilteredLimit(base string, events []store.Event, c
 			break
 		}
 		href := calendarObjectHref(baseHref, eventResourceName(ev))
-		rawData := filterICalendarData(ev.RawICAL, calData)
+		rawData := filterICalendarData(ev.RawICAL, projection)
 		responses = append(responses, resourceResponse(href, etagProp(ev.ETag, rawData, true)))
 	}
 	return responses
 }
 
-func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, selector propertySelector, calData *calendarDataEl) ([]response, error) {
-	responses := rawCalendarResourceReportResponsesLimit(base, events, calData, h.multistatusBuildLimit())
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, calData != nil)
+func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, selector propertySelector, projection calendarDataProjection) ([]response, error) {
+	responses := rawCalendarResourceReportResponsesLimit(base, events, projection, h.multistatusBuildLimit())
+	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 
-func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, calData *calendarDataEl, limit int) []response {
+func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, projection calendarDataProjection, limit int) []response {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	if limit <= 0 {
 		return nil
@@ -80,13 +80,13 @@ func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, 
 			break
 		}
 		href := calendarObjectHref(baseHref, eventResourceName(ev))
-		responses = append(responses, rawCalendarResourceReportResponse(href, ev, calData))
+		responses = append(responses, rawCalendarResourceReportResponse(href, ev, projection))
 	}
 	return responses
 }
 
-func rawCalendarResourceReportResponse(href string, event store.Event, calData *calendarDataEl) response {
-	rawData := filterICalendarData(event.RawICAL, calData)
+func rawCalendarResourceReportResponse(href string, event store.Event, projection calendarDataProjection) response {
+	rawData := filterICalendarData(event.RawICAL, projection)
 	return resourceResponse(href, etagProp(event.ETag, rawData, true))
 }
 
