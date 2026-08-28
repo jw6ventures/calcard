@@ -554,9 +554,7 @@ func stripPrincipalAllprop(responses []response) {
 }
 
 func writeCardDAVPrecondition(w http.ResponseWriter, status int, condition string) {
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><C:%s/></D:error>`, condition)
+	writeConditionError(w, status, namespaceCardDAV, condition)
 }
 
 // writeCardDAVUIDConflict writes a no-uid-conflict error response including the

@@ -78,7 +78,7 @@ func decodeCalendarDataElement(dec *xml.Decoder, start xml.StartElement) (*calen
 	fault := walkElementChildren(dec, start, "CALDAV:calendar-data", malformedReport, func(dec *xml.Decoder, child xml.StartElement) *reportGrammarFault {
 		switch {
 		case stage == dataStageComp && child.Name == calDAVQName("comp"):
-			comp, fault := decodeCalendarDataComp(dec, child)
+			comp, fault := decodeCalendarDataComp(dec, child, 1)
 			if fault != nil {
 				return fault
 			}
@@ -122,7 +122,10 @@ func decodeCalendarDataElement(dec *xml.Decoder, start xml.StartElement) (*calen
 // ((allprop | prop*), (allcomp | comp*)) with a required name. The alternations
 // are exclusive, so allprop beside prop, or allcomp beside comp, is malformed
 // rather than a union.
-func decodeCalendarDataComp(dec *xml.Decoder, start xml.StartElement) (*calendarComp, *reportGrammarFault) {
+func decodeCalendarDataComp(dec *xml.Decoder, start xml.StartElement, depth int) (*calendarComp, *reportGrammarFault) {
+	if depth > maxRecursiveGrammarDepth {
+		return nil, malformedReport("CALDAV:comp nests deeper than this server decodes")
+	}
 	if fault := checkAttributes(start, "CALDAV:comp", "name"); fault != nil {
 		return nil, fault
 	}
@@ -174,7 +177,7 @@ func decodeCalendarDataComp(dec *xml.Decoder, start xml.StartElement) (*calendar
 			if comp.AllComp {
 				return malformedReport("CALDAV:comp carries CALDAV:comp out of the order §9.6.1 defines")
 			}
-			child, fault := decodeCalendarDataComp(dec, child)
+			child, fault := decodeCalendarDataComp(dec, child, depth+1)
 			if fault != nil {
 				return fault
 			}

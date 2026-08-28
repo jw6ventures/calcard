@@ -1569,9 +1569,10 @@ func TestReportAddressBookRejectsInvalidSyncToken(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for invalid sync token kind, got %d", rr.Code)
-	}
+	// RFC 6578 §3.2 names this failure DAV:valid-sync-token, and RFC 4918 §16
+	// returns a named condition as the child of a top-level DAV:error rather
+	// than as a bare status.
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("valid-sync-token"))
 }
 
 func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
@@ -4489,9 +4490,11 @@ func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
 	unlockRR := httptest.NewRecorder()
 	h.Unlock(unlockRR, unlockReq)
 
-	if unlockRR.Code != http.StatusPreconditionFailed {
-		t.Fatalf("expected mismatched UNLOCK to return 412, got %d: %s", unlockRR.Code, unlockRR.Body.String())
-	}
+	// RFC 4918 §9.11.1 and §16 both give UNLOCK 409 with the named
+	// DAV:lock-token-matches-request-uri precondition when the Request-URI is
+	// outside the scope of the token's lock. The 412 of §9.10.6 is the LOCK
+	// refresh case, not this one.
+	assertErrorConditions(t, unlockRR, http.StatusConflict, davQN("lock-token-matches-request-uri"))
 	if lock, _ := lockRepo.GetByToken(context.Background(), strings.Trim(token, "<>")); lock == nil {
 		t.Fatal("expected mismatched UNLOCK to preserve the original lock")
 	}
@@ -4543,9 +4546,9 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		descendantRR := httptest.NewRecorder()
 		h.Lock(descendantRR, descendantReq)
 
-		if descendantRR.Code != http.StatusPreconditionFailed {
-			t.Fatalf("expected descendant refresh to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
-		}
+		// RFC 4918 §9.10.6 gives the refresh case 412 with the precondition
+		// named, where §9.11.1 gives UNLOCK 409 for the same condition.
+		assertErrorConditions(t, descendantRR, http.StatusPreconditionFailed, davQN("lock-token-matches-request-uri"))
 	})
 
 	t.Run("unlock uses lock root", func(t *testing.T) {
@@ -4555,9 +4558,7 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		descendantRR := httptest.NewRecorder()
 		h.Unlock(descendantRR, descendantReq)
 
-		if descendantRR.Code != http.StatusPreconditionFailed {
-			t.Fatalf("expected descendant UNLOCK to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
-		}
+		assertErrorConditions(t, descendantRR, http.StatusConflict, davQN("lock-token-matches-request-uri"))
 		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock == nil {
 			t.Fatal("expected descendant UNLOCK to preserve the collection lock")
 		}
@@ -10899,6 +10900,12 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 		name       string
 		path       string
 		reportType string
+		// supportedReport marks the reports an address book object resource
+		// does not support at all, which RFC 3253 §3.6 declines with the named
+		// DAV:supported-report condition rather than a bare status. The others
+		// are supported reports refused for a missing Depth header, which names
+		// no condition of its own.
+		supportedReport bool
 	}{
 		{
 			name:       "addressbook-query on resource path",
@@ -10906,9 +10913,10 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 			reportType: "addressbook-query",
 		},
 		{
-			name:       "sync-collection on resource path",
-			path:       "/dav/addressbooks/3/contact.vcf",
-			reportType: "sync-collection",
+			name:            "sync-collection on resource path",
+			path:            "/dav/addressbooks/3/contact.vcf",
+			reportType:      "sync-collection",
+			supportedReport: true,
 		},
 	}
 
@@ -10924,6 +10932,10 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 
 			h.Report(rr, req)
 
+			if tc.supportedReport {
+				assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+				return
+			}
 			if rr.Code != http.StatusForbidden {
 				t.Errorf("expected 403 Forbidden, got %d: %s", rr.Code, rr.Body.String())
 			}

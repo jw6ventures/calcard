@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -10,6 +11,33 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
+
+// listBoundedAddressBookContacts reads an address book in keyset pages rather
+// than whole, on the same terms listBoundedCalendarEvents reads a calendar.
+func (h *DavServer) listBoundedAddressBookContacts(ctx context.Context, bookID int64) ([]store.Contact, error) {
+	rowLimit := h.reportCandidateRowLimit()
+	var contacts []store.Contact
+	afterID := int64(0)
+	for {
+		page, err := h.store.Contacts.ListForBookPageAfter(ctx, bookID, afterID, multistatusPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			return contacts, nil
+		}
+		if len(contacts)+len(page) > rowLimit {
+			return nil, errTooManyCandidateRows
+		}
+		contacts = append(contacts, page...)
+
+		lastID := page[len(page)-1].ID
+		if lastID <= afterID || len(page) < multistatusPageSize {
+			return contacts, nil
+		}
+		afterID = lastID
+	}
+}
 
 func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, request *http.Request) ([]response, string, error) {
 	addressDataReq := reportAddressData(report)
@@ -210,12 +238,15 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	var contacts []store.Contact
 	var err error
 	if since.IsZero() {
-		contacts, err = h.store.Contacts.ListForBook(ctx, book.ID)
+		contacts, err = h.listBoundedAddressBookContacts(ctx, book.ID)
 	} else {
 		contacts, err = h.store.Contacts.ListModifiedSince(ctx, book.ID, since)
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to list contacts")
+		if errors.Is(err, errTooManyCandidateRows) {
+			return nil, "", err
+		}
+		return nil, "", errors.New("failed to list contacts")
 	}
 	contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
 	if err != nil {

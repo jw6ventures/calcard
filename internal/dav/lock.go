@@ -21,6 +21,13 @@ const (
 	maxLockTimeout     = 86400 * 7 // 1 week
 )
 
+// conditionLockTokenMatchesRequestURI is the RFC 4918 precondition for a lock
+// token that names no lock covering the Request-URI. The status depends on the
+// method, and the two statements in the specification differ: §16 and §9.11.1
+// give UNLOCK 409, while §9.10.6 gives a LOCK refresh 412 for the same
+// condition. Each call site carries the status its own section names.
+const conditionLockTokenMatchesRequestURI = "lock-token-matches-request-uri"
+
 func generateLockToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -246,7 +253,9 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	if ifToken := firstIfLockToken(ifHeader, cleanPath, canonicalPath); ifToken != "" {
 		existing, err := h.store.Locks.GetByToken(r.Context(), ifToken)
 		if err != nil || existing == nil {
-			http.Error(w, "lock token not found", http.StatusPreconditionFailed)
+			// RFC 4918 §9.10.6 gives a lock refresh whose token has disappeared
+			// or is invalid the same precondition as one out of scope, at 412.
+			writeDAVError(w, http.StatusPreconditionFailed, conditionLockTokenMatchesRequestURI)
 			return
 		}
 		if existing.UserID != user.ID {
@@ -254,7 +263,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !sameLockRoot(existing.ResourcePath, canonicalPath) {
-			http.Error(w, "lock token does not match request URI", http.StatusPreconditionFailed)
+			writeDAVError(w, http.StatusPreconditionFailed, conditionLockTokenMatchesRequestURI)
 			return
 		}
 		defer invalidateDAVRequestState(r.Context())
@@ -695,11 +704,11 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 	}
 	lock, err := h.store.Locks.GetByToken(r.Context(), token)
 	if err != nil || lock == nil {
-		http.Error(w, "lock not found", http.StatusConflict)
+		writeDAVError(w, http.StatusConflict, conditionLockTokenMatchesRequestURI)
 		return
 	}
 	if !sameLockRoot(lock.ResourcePath, canonicalPath) {
-		http.Error(w, "lock token does not match request URI", http.StatusPreconditionFailed)
+		writeDAVError(w, http.StatusConflict, conditionLockTokenMatchesRequestURI)
 		return
 	}
 

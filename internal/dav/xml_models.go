@@ -42,13 +42,25 @@ type responseError struct {
 	SupportedAddressDataConversion *struct{} `xml:"card:supported-address-data-conversion,omitempty"`
 }
 
+// propstatError is the RFC 4918 §16 DAV:error where a condition applies to
+// particular properties rather than to the resource: in a 207 the element goes
+// inside the propstat carrying those properties, since a multistatus has no
+// top-level error to put it in.
+type propstatError struct {
+	CannotModifyProtectedProperty *struct{} `xml:"d:cannot-modify-protected-property,omitempty"`
+}
+
+// propstat follows the RFC 4918 §14.22 content model
+// (prop, status, error?, responsedescription?), so the field order is the
+// element order on the wire.
 type propstat struct {
 	Prop prop `xml:"d:prop"`
 	// PropNames renders the prop element as a list of empty property
 	// elements instead of Prop — used for 404 propstats and propname
 	// responses, where RFC 4918 requires names without values.
-	PropNames []xml.Name `xml:"-"`
-	Status    string     `xml:"d:status"`
+	PropNames []xml.Name     `xml:"-"`
+	Status    string         `xml:"d:status"`
+	Error     *propstatError `xml:"d:error,omitempty"`
 }
 
 func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
@@ -77,6 +89,11 @@ func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	}
 	if err := e.EncodeElement(p.Status, xml.StartElement{Name: xml.Name{Local: "d:status"}}); err != nil {
 		return err
+	}
+	if p.Error != nil {
+		if err := e.EncodeElement(p.Error, xml.StartElement{Name: xml.Name{Local: "d:error"}}); err != nil {
+			return err
+		}
 	}
 	return e.EncodeToken(start.End())
 }

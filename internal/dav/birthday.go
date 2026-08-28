@@ -219,13 +219,16 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 // collection. It defines no CALDAV:calendar-timezone of its own, so §7.3 leaves
 // the request's CALDAV:timezone as the only source ahead of UTC.
 func birthdayCalendarDataProjection(report reportRequest) calendarDataProjection {
-	return calendarDataProjection{
-		selection: reportCalendarData(report),
-		zone:      reportFloatingZone(report.Timezone, nil),
-	}
+	return newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, nil))
 }
 
 func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, collectionPath, targetResource string, selector propertySelector, projection calendarDataProjection, request *http.Request) ([]response, error) {
+	// §7.9 owes one DAV:response per href here as it does over a stored
+	// collection, so an href list past the limit is refused rather than trimmed.
+	if len(hrefs) > h.multigetHrefLimit() {
+		return nil, errTooManyHrefs
+	}
+
 	eventsByUID := make(map[string]store.Event)
 	for _, ev := range events {
 		eventsByUID[ev.UID] = ev
@@ -233,9 +236,6 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 
 	var responses []response
 	for _, href := range hrefs {
-		if h.multistatusBuildComplete(responses) {
-			break
-		}
 		resolved, ok := h.resolveCalendarHrefForRequest(href, request)
 		uid := resolved.ResourceName
 		// The birthday collection is addressed only by its constant ID, never by

@@ -66,6 +66,20 @@ app:
     writeTimeout: "15s" # Maximum duration before timing out HTTP response writes.
     idleTimeout: "60s" # Maximum time to wait for the next request on keep-alive connections.
 
+  # CalDAV/CardDAV resource limits (RFC 4791 Section 11). Each bounds the work
+  # one request can provoke; a report past a limit is refused rather than
+  # answered with a partial result. Leave a key unset to use the server default,
+  # shown in the comment. Every value must be a non-negative integer, where 0
+  # turns that limit off entirely.
+  dav: {}
+    # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
+    # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
+    # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
+    # maxFilterElements: 100 # Elements one CALDAV:filter may carry; each is evaluated against every candidate resource.
+    # maxReportElementDepth: 20 # Element nesting one REPORT body may reach.
+    # maxMultigetHrefs: 5000 # DAV:href elements one calendar-multiget may carry.
+    # maxReportCandidateRows: 50000 # Stored resources one report will read and parse while looking for matches.
+
 # Kubernetes Service that fronts the app pods.
 service:
   type: ClusterIP # Service type: ClusterIP, NodePort, or LoadBalancer.

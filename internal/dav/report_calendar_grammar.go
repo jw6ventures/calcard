@@ -329,7 +329,7 @@ func decodeCalendarFilter(dec *xml.Decoder, start xml.StartElement) (*calFilter,
 		if count > 1 {
 			return invalidFilter("CALDAV:filter carries more than one CALDAV:comp-filter")
 		}
-		decoded, fault := decodeCompFilter(dec, child)
+		decoded, fault := decodeCompFilter(dec, child, 1)
 		if fault != nil {
 			return fault
 		}
@@ -359,7 +359,10 @@ const (
 // is-not-defined alone or (time-range?, prop-filter*, comp-filter*). §9.7.1
 // gives it one attribute, name; RFC 4791 defines no test attribute, so the
 // CardDAV spelling of an any-of filter is malformed here.
-func decodeCompFilter(dec *xml.Decoder, start xml.StartElement) (*compFilter, *reportGrammarFault) {
+func decodeCompFilter(dec *xml.Decoder, start xml.StartElement, depth int) (*compFilter, *reportGrammarFault) {
+	if depth > maxRecursiveGrammarDepth {
+		return nil, invalidFilter("CALDAV:comp-filter nests deeper than this server evaluates")
+	}
 	name, fault := filterElementName(start, "comp-filter", "CALDAV:comp-filter")
 	if fault != nil {
 		return nil, fault
@@ -400,7 +403,7 @@ func decodeCompFilter(dec *xml.Decoder, start xml.StartElement) (*compFilter, *r
 			stage = compStagePropFilter
 			return nil
 		case calDAVQName("comp-filter"):
-			decoded, fault := decodeCompFilter(dec, child)
+			decoded, fault := decodeCompFilter(dec, child, depth+1)
 			if fault != nil {
 				return fault
 			}

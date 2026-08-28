@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -23,7 +24,12 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 	zone := reportFloatingZone("", cal.Timezone)
 	events, err := h.listCalendarEventsForTimeRange(ctx, cal.ID, tr)
 	if err != nil {
-		return "", fmt.Errorf("failed to list events")
+		// §7.10 gives this report the §7.8 postcondition, so a row budget the
+		// generic reports answer with a capacity status is named here.
+		if errors.Is(err, errTooManyCandidateRows) {
+			return "", errNumberOfMatchesExceeded
+		}
+		return "", errors.New("failed to list events")
 	}
 
 	candidates := filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, zone), tr)
@@ -100,13 +106,11 @@ func (h *DavServer) filterFreeBusyCandidatesByPrivilege(ctx context.Context, use
 }
 
 // listCalendarEventsForTimeRange narrows the database read using the given
-// time-range when one is present, otherwise falls back to listing every event.
-// The returned rows are a superset; callers must still apply exact filtering.
+// time-range when one is present. The returned rows are a superset; callers
+// must still apply exact filtering.
 func (h *DavServer) listCalendarEventsForTimeRange(ctx context.Context, calendarID int64, tr *timeRange) ([]store.Event, error) {
-	if ef, ok := eventFilterFromTimeRange(tr); ok {
-		return h.store.Events.ListForCalendarFiltered(ctx, calendarID, ef)
-	}
-	return h.store.Events.ListForCalendar(ctx, calendarID)
+	databaseFilter, _ := eventFilterFromTimeRange(tr)
+	return h.listBoundedCalendarEvents(ctx, calendarID, databaseFilter)
 }
 
 // matcherInTimeRange reports whether any component of the parsed resource

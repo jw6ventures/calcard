@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -16,13 +17,13 @@ import (
 // projectFor runs the §9.6 projection over raw with no zone, which is the UTC
 // reading every fixture here is written in.
 func projectFor(raw string, selection *calendarDataEl) string {
-	return filterICalendarData(raw, calendarDataProjection{selection: selection})
+	return filterICalendarData(raw, newCalendarDataProjection(selection, floatingZone{}))
 }
 
 // projectForZone is projectFor against the zone RFC 4791 §7.3 gives the report,
 // which is what a floating value in the stored octets resolves through.
 func projectForZone(raw string, selection *calendarDataEl, zone floatingZone) string {
-	return filterICalendarData(raw, calendarDataProjection{selection: selection, zone: zone})
+	return filterICalendarData(raw, newCalendarDataProjection(selection, zone))
 }
 
 // vTimezoneObject is an iCalendar object carrying one VTIMEZONE. The observance
@@ -1702,5 +1703,95 @@ func TestRFC4791_CalendarDataContentModelHoldsInEveryReport(t *testing.T) {
 				t.Fatalf("%s = %d, want 400: %s", report, rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+// RFC 4791 §11 asks a server to take adequate precautions against a report
+// crafted to consume excessive CPU. The §9.6.1 selection is matched against
+// every property of every component of every resource the report returns, so a
+// selection resolved by scanning would cost the request body multiplied by the
+// collection: 350,000 selectors against 2,000 resources measured 10.6 s, under
+// a body-size cap that admits 10 MB. Resolving by name makes the per-resource
+// cost independent of how many selectors the body carries.
+func TestCalendarDataSelectionCostIsIndependentOfSelectorCount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cost guard runs a large projection")
+	}
+	selectors := make([]calendarProp, 0, 200000)
+	for i := 0; i < 200000; i++ {
+		selectors = append(selectors, calendarProp{Name: fmt.Sprintf("X-ABSENT-%d", i)})
+	}
+	selectors = append(selectors, calendarProp{Name: "UID"}, calendarProp{Name: "SUMMARY"})
+	selection := &calendarDataEl{Comp: &calendarComp{
+		Name: "VCALENDAR",
+		Comp: []calendarComp{{Name: "VEVENT", Prop: selectors}},
+	}}
+
+	projection := newCalendarDataProjection(selection, floatingZone{})
+	start := time.Now()
+	for i := 0; i < 2000; i++ {
+		if got := filterICalendarData(projectionFixture, projection); got == "" {
+			t.Fatal("projection returned nothing")
+		}
+	}
+	// The scan cost this replaces was seconds; the indexed cost is tens of
+	// milliseconds. The bound is wide enough that only a return to scanning
+	// trips it.
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("2,000 resources against %d selectors took %s, want the per-resource cost to be independent of the selector count",
+			len(selectors), elapsed)
+	}
+
+	assertICalendarComponentProperties(t, filterICalendarData(projectionFixture, projection), "VEVENT", map[string]string{
+		"UID":     "event-1",
+		"SUMMARY": "Test Event",
+	})
+}
+
+// A name repeated among siblings resolves to its first occurrence, which is
+// where a scan in document order stopped.
+func TestCalendarDataDuplicateSelectorNamesKeepTheFirst(t *testing.T) {
+	t.Run("prop", func(t *testing.T) {
+		got := projectFor(projectionFixture, &calendarDataEl{Comp: &calendarComp{
+			Name: "VCALENDAR",
+			Comp: []calendarComp{{Name: "VEVENT", Prop: []calendarProp{
+				{Name: "SUMMARY"},
+				{Name: "SUMMARY", NoValue: true},
+			}}},
+		}})
+		assertICalendarComponentProperties(t, got, "VEVENT", map[string]string{"SUMMARY": "Test Event"})
+	})
+
+	t.Run("comp", func(t *testing.T) {
+		got := projectFor(projectionFixture, &calendarDataEl{Comp: &calendarComp{
+			Name: "VCALENDAR",
+			Comp: []calendarComp{
+				{Name: "VEVENT", Prop: []calendarProp{{Name: "UID"}}},
+				{Name: "VEVENT", Prop: []calendarProp{{Name: "SUMMARY"}}},
+			},
+		}})
+		assertICalendarComponentProperties(t, got, "VEVENT", map[string]string{"UID": "event-1"})
+		if strings.Contains(strings.ToUpper(got), "SUMMARY") {
+			t.Fatalf("the second CALDAV:comp of the same name was applied; value:\n%s", got)
+		}
+	})
+}
+
+// The shared index is an optimisation, never a condition of correctness: a
+// projection assembled without it projects the same bytes.
+func TestCalendarDataProjectionWithoutTheSharedIndexProjectsTheSame(t *testing.T) {
+	selection := &calendarDataEl{Comp: &calendarComp{
+		Name: "VCALENDAR",
+		Comp: []calendarComp{{
+			Name: "VEVENT",
+			Prop: []calendarProp{{Name: "UID"}, {Name: "SUMMARY"}},
+			Comp: []calendarComp{{Name: "VALARM", Prop: []calendarProp{{Name: "ACTION"}}}},
+		}},
+	}}
+
+	indexed := filterICalendarData(projectionFixture, newCalendarDataProjection(selection, floatingZone{}))
+	bare := filterICalendarData(projectionFixture, calendarDataProjection{selection: selection})
+	if indexed != bare {
+		t.Fatalf("projection without the shared index differs:\nindexed:\n%s\nbare:\n%s", indexed, bare)
 	}
 }

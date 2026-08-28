@@ -32,6 +32,11 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if fault := h.checkReportBodyLimits(body); fault != nil {
+		h.logger().Trace("Report", "rejected oversized body for %s: %v", cleanPath, fault)
+		writeReportGrammarFault(w, fault)
+		return
+	}
 	var report reportRequest
 	if err := safeUnmarshalXML(body, &report); err != nil {
 		h.logger().Error("Report", "invalid REPORT body for %s: %v", cleanPath, err)
@@ -242,7 +247,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			var err error
 			freeBusyData, err = h.freeBusyQuery(r.Context(), user, cal, report.TimeRange)
 			if err != nil {
-				http.Error(w, "failed to list events", http.StatusInternalServerError)
+				writeReportError(w, err)
 				return
 			}
 		}
@@ -253,18 +258,35 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	responses, syncToken, err := h.calendarReportResponses(r.Context(), user, cal, h.principalURL(user), canonicalPath, resourceName, report, r)
 	if err != nil {
-		if errors.Is(err, errUnsupportedReport) {
-			writeDAVError(w, http.StatusForbidden, "supported-report")
-		} else if errors.Is(err, errInvalidSyncToken) {
-			http.Error(w, "invalid sync token", http.StatusForbidden)
-		} else if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "calendar object not found", http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+		writeReportError(w, err)
 		return
 	}
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
+}
+
+// writeReportError answers a failed REPORT. The sentinels are shared by the
+// calendar, birthday and address book paths, so the mapping from one to its
+// status and condition lives in one place; a caller with an answer of its own
+// for a given failure handles that failure before delegating here.
+func writeReportError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errNumberOfMatchesExceeded):
+		writeNumberOfMatchesWithinLimits(w)
+	case errors.Is(err, errTooManyHrefs), errors.Is(err, errTooManyCandidateRows):
+		http.Error(w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+	case errors.Is(err, errUnsupportedReport):
+		writeDAVError(w, http.StatusForbidden, "supported-report")
+	case errors.Is(err, errInvalidSyncToken):
+		writeDAVError(w, http.StatusForbidden, "valid-sync-token")
+	default:
+		// The message is fixed rather than taken from err, which carries
+		// storage and query detail a client has no business reading.
+		http.Error(w, "failed to build report response", http.StatusInternalServerError)
+	}
 }
 
 func (h *DavServer) calendarMultigetHrefIdentifiesResource(ctx context.Context, user *store.User, calendarID int64, resourceName, href string, r *http.Request) (bool, error) {
@@ -309,15 +331,11 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 
 	responses, syncToken, err := h.birthdayCalendarReportResponses(r.Context(), user, h.principalURL(user), cleanPath, targetResource, report, r)
 	if err != nil {
-		if errors.Is(err, errUnsupportedReport) {
-			writeDAVError(w, http.StatusForbidden, "supported-report")
-			return
-		}
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "calendar object not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeReportError(w, err)
 		return
 	}
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
@@ -390,7 +408,10 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 				return
 			}
 		default:
-			http.Error(w, "REPORT not allowed on address book object resources", http.StatusForbidden)
+			// RFC 3253 §3.6 spells the decline of a report a resource does not
+			// support: DAV:supported-report under a top-level DAV:error, the
+			// same answer the calendar path above gives.
+			writeDAVError(w, http.StatusForbidden, "supported-report")
 			return
 		}
 	}
@@ -421,13 +442,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 	}
 	responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, r)
 	if err != nil {
-		if errors.Is(err, errUnsupportedReport) {
-			writeDAVError(w, http.StatusForbidden, "supported-report")
-		} else if errors.Is(err, errInvalidSyncToken) {
-			http.Error(w, "invalid sync token", http.StatusForbidden)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		writeReportError(w, err)
 		return
 	}
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))

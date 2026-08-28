@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -58,6 +59,18 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.MaxMultistatusBytes != 67108864 {
 		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 67108864", cfg.DAV.MaxMultistatusBytes)
 	}
+	if cfg.DAV.MaxFilterElements != 100 {
+		t.Fatalf("DAV.MaxFilterElements = %d, want 100", cfg.DAV.MaxFilterElements)
+	}
+	if cfg.DAV.MaxReportElementDepth != 20 {
+		t.Fatalf("DAV.MaxReportElementDepth = %d, want 20", cfg.DAV.MaxReportElementDepth)
+	}
+	if cfg.DAV.MaxMultigetHrefs != 5000 {
+		t.Fatalf("DAV.MaxMultigetHrefs = %d, want 5000", cfg.DAV.MaxMultigetHrefs)
+	}
+	if cfg.DAV.MaxReportCandidateRows != 50000 {
+		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 50000", cfg.DAV.MaxReportCandidateRows)
+	}
 	if cfg.TrafficCaptureFile != "" {
 		t.Fatalf("TrafficCaptureFile = %q, want disabled by default", cfg.TrafficCaptureFile)
 	}
@@ -88,6 +101,10 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
 	t.Setenv("APP_DAV_MAX_MULTISTATUS_RESPONSES", "321")
 	t.Setenv("APP_DAV_MAX_MULTISTATUS_BYTES", "654321")
+	t.Setenv("APP_DAV_MAX_FILTER_ELEMENTS", "17")
+	t.Setenv("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", "7")
+	t.Setenv("APP_DAV_MAX_MULTIGET_HREFS", "42")
+	t.Setenv("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", "9876")
 
 	cfg, err := Load()
 	if err != nil {
@@ -99,25 +116,81 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	if cfg.DAV.MaxMultistatusBytes != 654321 {
 		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 654321", cfg.DAV.MaxMultistatusBytes)
 	}
+	if cfg.DAV.MaxFilterElements != 17 {
+		t.Fatalf("DAV.MaxFilterElements = %d, want 17", cfg.DAV.MaxFilterElements)
+	}
+	if cfg.DAV.MaxReportElementDepth != 7 {
+		t.Fatalf("DAV.MaxReportElementDepth = %d, want 7", cfg.DAV.MaxReportElementDepth)
+	}
+	if cfg.DAV.MaxMultigetHrefs != 42 {
+		t.Fatalf("DAV.MaxMultigetHrefs = %d, want 42", cfg.DAV.MaxMultigetHrefs)
+	}
+	if cfg.DAV.MaxReportCandidateRows != 9876 {
+		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 9876", cfg.DAV.MaxReportCandidateRows)
+	}
 }
 
-func TestLoadRejectsNonPositiveDAVMultistatusLimits(t *testing.T) {
-	for _, key := range []string{"APP_DAV_MAX_MULTISTATUS_RESPONSES", "APP_DAV_MAX_MULTISTATUS_BYTES"} {
-		for _, value := range []string{"0", "-1", "invalid"} {
+// davLimitKeys is every DAV resource limit, which share one loader and one
+// meaning for 0.
+var davLimitKeys = []string{
+	"APP_DAV_MAX_MULTISTATUS_RESPONSES",
+	"APP_DAV_MAX_MULTISTATUS_BYTES",
+	"APP_DAV_MAX_FILTER_ELEMENTS",
+	"APP_DAV_MAX_REPORT_ELEMENT_DEPTH",
+	"APP_DAV_MAX_MULTIGET_HREFS",
+	"APP_DAV_MAX_REPORT_CANDIDATE_ROWS",
+}
+
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+}
+
+func TestLoadRejectsNegativeAndNonNumericDAVLimits(t *testing.T) {
+	for _, key := range davLimitKeys {
+		for _, value := range []string{"-1", "invalid"} {
 			t.Run(key+"/"+value, func(t *testing.T) {
-				t.Setenv("APP_DB_DSN", "postgres://dsn")
-				t.Setenv("APP_OAUTH_CLIENT_ID", "client")
-				t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
-				t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
-				t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+				setRequiredEnv(t)
 				t.Setenv(key, value)
 
 				_, err := Load()
-				if err == nil || !strings.Contains(err.Error(), key+" must be a positive integer") {
-					t.Fatalf("Load() error = %v, want positive-integer validation for %s=%q", err, key, value)
+				if err == nil || !strings.Contains(err.Error(), key+" must be a non-negative integer") {
+					t.Fatalf("Load() error = %v, want non-negative validation for %s=%q", err, key, value)
 				}
 			})
 		}
+	}
+}
+
+// A limit set to 0 turns that limit off. It is loaded as math.MaxInt so the
+// comparisons downstream need no separate "is it set" test, and so an operator
+// who disables one knob does not silently get the default back.
+func TestLoadTreatsZeroDAVLimitAsUnlimited(t *testing.T) {
+	read := map[string]func(*Config) int{
+		"APP_DAV_MAX_MULTISTATUS_RESPONSES": func(c *Config) int { return c.DAV.MaxMultistatusResponses },
+		"APP_DAV_MAX_MULTISTATUS_BYTES":     func(c *Config) int { return c.DAV.MaxMultistatusBytes },
+		"APP_DAV_MAX_FILTER_ELEMENTS":       func(c *Config) int { return c.DAV.MaxFilterElements },
+		"APP_DAV_MAX_REPORT_ELEMENT_DEPTH":  func(c *Config) int { return c.DAV.MaxReportElementDepth },
+		"APP_DAV_MAX_MULTIGET_HREFS":        func(c *Config) int { return c.DAV.MaxMultigetHrefs },
+		"APP_DAV_MAX_REPORT_CANDIDATE_ROWS": func(c *Config) int { return c.DAV.MaxReportCandidateRows },
+	}
+	for _, key := range davLimitKeys {
+		t.Run(key, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(key, "0")
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want 0 accepted as unlimited", err)
+			}
+			if got := read[key](cfg); got != math.MaxInt {
+				t.Fatalf("%s = %d, want math.MaxInt", key, got)
+			}
+		})
 	}
 }
 

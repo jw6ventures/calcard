@@ -2,6 +2,8 @@ package dav
 
 import (
 	"encoding/xml"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1024,5 +1026,155 @@ func TestRFC4791_ReportPropertySelectorsSelectDifferentBodies(t *testing.T) {
 		// nor the calendar-data selector.
 		resp.assertPropAbsent(t, calQN("calendar-data"))
 		resp.assertPropAbsent(t, calQN("supported-collation-set"))
+	})
+}
+
+// RFC 4791 §11 asks a server to take adequate precautions against a report that
+// would consume excessive CPU or memory. Both recursive REPORT grammars --
+// CALDAV:comp-filter and the CALDAV:comp of CALDAV:calendar-data -- descend
+// once per nested element, so a body nested hundreds of thousands deep buys
+// seconds of CPU and a stack to match for the price of one request under the
+// body-size cap.
+func TestReportBodyNestedPastTheDepthLimitIsRefused(t *testing.T) {
+	nest := func(open, close string, depth int) string {
+		var b strings.Builder
+		for i := 0; i < depth; i++ {
+			b.WriteString(open)
+		}
+		for i := 0; i < depth; i++ {
+			b.WriteString(close)
+		}
+		return b.String()
+	}
+
+	t.Run("CALDAV:calendar-data comp", func(t *testing.T) {
+		body := calendarQueryBody(`<D:prop><C:calendar-data>` +
+			nest(`<C:comp name="VEVENT">`, `</C:comp>`, 5000) +
+			`</C:calendar-data></D:prop><C:filter>` + grammarVEventFilter + `</C:filter>`)
+
+		rr := runCalendarReport(t, body)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("CALDAV:comp-filter", func(t *testing.T) {
+		body := calendarFilterBody(`<C:comp-filter name="VCALENDAR">` +
+			nest(`<C:comp-filter name="VEVENT">`, `</C:comp-filter>`, 5000) +
+			`</C:comp-filter>`)
+
+		rr := runCalendarReport(t, body)
+
+		// Inside CALDAV:filter the refusal is the filter's own precondition
+		// rather than a bare malformed-body status, on the same terms as any
+		// other filter that is not valid.
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-filter"))
+	})
+}
+
+// The nesting RFC 4791 actually defines is shallow -- VCALENDAR, VEVENT, VALARM
+// is the deepest component path a filter can name -- so the limit refuses only
+// bodies far past any filter with a meaning.
+func TestFilterWithinTheDepthLimitIsEvaluated(t *testing.T) {
+	body := calendarFilterBody(`<C:comp-filter name="VCALENDAR">` +
+		`<C:comp-filter name="VEVENT"><C:comp-filter name="VALARM"/></C:comp-filter>` +
+		`</C:comp-filter>`)
+
+	rr := runCalendarReport(t, body)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Every filter element is evaluated against every candidate resource, so the
+// element count is a multiplier on the whole collection scan and is bounded in
+// its own right rather than only through the body-size cap.
+func TestFilterOverTheElementLimitFailsValidFilter(t *testing.T) {
+	var props strings.Builder
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&props, `<C:prop-filter name="SUMMARY-%d"/>`, i)
+	}
+	body := calendarFilterBody(`<C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+		props.String() + `</C:comp-filter></C:comp-filter>`)
+
+	rr := runCalendarReport(t, body)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-filter"))
+}
+
+func TestFilterAtTheElementLimitIsEvaluated(t *testing.T) {
+	// The filter, its two comp-filters and the prop-filters below it are all
+	// counted, so the body stops just short of the default limit.
+	var props strings.Builder
+	for i := 0; i < defaultMaxFilterElements-3; i++ {
+		fmt.Fprintf(&props, `<C:prop-filter name="SUMMARY-%d"/>`, i)
+	}
+	body := calendarFilterBody(`<C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+		props.String() + `</C:comp-filter></C:comp-filter>`)
+
+	rr := runCalendarReport(t, body)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// A limit set to 0 turns that limit off, which is an operator's decision to
+// make. It must not become a way to kill the process: unbounded recursion grows
+// the goroutine stack until the runtime gives up, so the decoders hold
+// themselves to a ceiling of their own whatever the configuration says.
+func TestReportBodyNestedPastTheDecoderCeilingIsRefusedWithLimitsDisabled(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.DAV.MaxReportElementDepth = math.MaxInt
+	cfg.DAV.MaxFilterElements = math.MaxInt
+	h := NewDavServer(Options{Config: cfg, Store: grammarTestServer().store})
+
+	nest := func(open, close string, depth int) string {
+		var b strings.Builder
+		for i := 0; i < depth; i++ {
+			b.WriteString(open)
+		}
+		for i := 0; i < depth; i++ {
+			b.WriteString(close)
+		}
+		return b.String()
+	}
+	run := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+		req.Header.Set("Depth", "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+		h.Report(rr, req)
+		return rr
+	}
+
+	t.Run("CALDAV:comp-filter", func(t *testing.T) {
+		rr := run(t, calendarFilterBody(`<C:comp-filter name="VCALENDAR">`+
+			nest(`<C:comp-filter name="VEVENT">`, `</C:comp-filter>`, maxRecursiveGrammarDepth+50)+
+			`</C:comp-filter>`))
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-filter"))
+	})
+
+	t.Run("CALDAV:calendar-data comp", func(t *testing.T) {
+		rr := run(t, calendarQueryBody(`<D:prop><C:calendar-data>`+
+			nest(`<C:comp name="VEVENT">`, `</C:comp>`, maxRecursiveGrammarDepth+50)+
+			`</C:calendar-data></D:prop><C:filter>`+grammarVEventFilter+`</C:filter>`))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	// The ceiling is far above anything RFC 4791 defines, so a real filter is
+	// still evaluated with the configured budget switched off.
+	t.Run("a filter within the ceiling", func(t *testing.T) {
+		rr := run(t, calendarFilterBody(`<C:comp-filter name="VCALENDAR">`+
+			`<C:comp-filter name="VEVENT"><C:comp-filter name="VALARM"/></C:comp-filter>`+
+			`</C:comp-filter>`))
+		if rr.Code != http.StatusMultiStatus {
+			t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+		}
 	})
 }

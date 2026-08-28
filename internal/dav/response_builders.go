@@ -63,6 +63,12 @@ func calendarResourceResponsesFilteredLimit(base string, events []store.Event, p
 
 func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, selector propertySelector, projection calendarDataProjection) ([]response, error) {
 	responses := rawCalendarResourceReportResponsesLimit(base, events, projection, h.multistatusBuildLimit())
+	// One response past the limit is built so the overflow can be told from a
+	// match set that ends exactly on it, and the report answers the §7.8
+	// postcondition rather than a set trimmed to fit.
+	if len(responses) > h.maxReportResponses() {
+		return nil, errNumberOfMatchesExceeded
+	}
 	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 

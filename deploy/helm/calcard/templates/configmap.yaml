@@ -24,3 +24,28 @@ data:
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
   APP_TRUSTED_PROXIES: {{ .Values.app.trustedProxies | quote }}
   LOG_LEVEL: {{ .Values.app.logLevel | quote }}
+  {{- with .Values.app.dav }}
+  {{- /* hasKey rather than with, so an explicit 0 -- which turns a limit off --
+         reaches the server instead of being dropped as an empty value. */}}
+  {{- if hasKey . "propfindInfinityEnabled" }}
+  APP_DAV_PROPFIND_INFINITY_ENABLED: {{ .propfindInfinityEnabled | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultistatusResponses" }}
+  APP_DAV_MAX_MULTISTATUS_RESPONSES: {{ .maxMultistatusResponses | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultistatusBytes" }}
+  APP_DAV_MAX_MULTISTATUS_BYTES: {{ .maxMultistatusBytes | quote }}
+  {{- end }}
+  {{- if hasKey . "maxFilterElements" }}
+  APP_DAV_MAX_FILTER_ELEMENTS: {{ .maxFilterElements | quote }}
+  {{- end }}
+  {{- if hasKey . "maxReportElementDepth" }}
+  APP_DAV_MAX_REPORT_ELEMENT_DEPTH: {{ .maxReportElementDepth | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultigetHrefs" }}
+  APP_DAV_MAX_MULTIGET_HREFS: {{ .maxMultigetHrefs | quote }}
+  {{- end }}
+  {{- if hasKey . "maxReportCandidateRows" }}
+  APP_DAV_MAX_REPORT_CANDIDATE_ROWS: {{ .maxReportCandidateRows | quote }}
+  {{- end }}
+  {{- end }}

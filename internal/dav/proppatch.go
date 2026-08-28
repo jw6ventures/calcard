@@ -142,6 +142,11 @@ type proppatchPreflight struct {
 	dead     []store.DeadPropertyMutation
 	failures map[int][]xml.Name
 	all      []xml.Name
+	// protected is the subset of the 403 failures that failed because the
+	// property is protected, which is the only one RFC 4918 §9.2.1 gives a
+	// precondition to. The other 403s share the status and name no condition,
+	// so they cannot share a propstat with these.
+	protected map[xml.Name]struct{}
 }
 
 func (p *proppatchPreflight) record(property proppatchProperty, status int) {
@@ -152,6 +157,14 @@ func (p *proppatchPreflight) record(property proppatchProperty, status int) {
 		}
 		p.failures[status] = append(p.failures[status], property.Name)
 	}
+}
+
+func (p *proppatchPreflight) recordProtected(property proppatchProperty) {
+	p.record(property, http.StatusForbidden)
+	if p.protected == nil {
+		p.protected = make(map[xml.Name]struct{})
+	}
+	p.protected[property.Name] = struct{}{}
 }
 
 func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest, lockPreconditions []store.LockPrecondition) ([]response, error) {
@@ -221,7 +234,8 @@ func preflightCalendarPatch(request *proppatchRequest, object bool, state *calen
 			} else if settable {
 				status = applyCalendarLivePatch(state, kind, property, instruction.Remove)
 			} else if _, protected := protectedLiveProperties[property.Name]; protected {
-				status = http.StatusForbidden
+				result.recordProtected(property)
+				continue
 			} else {
 				result.dead = append(result.dead, deadPropertyMutation(property, instruction.Remove))
 			}
@@ -514,10 +528,10 @@ func preflightAddressBookPatch(request *proppatchRequest, object bool, state *ad
 				status = http.StatusForbidden
 			default:
 				if _, protected := protectedLiveProperties[property.Name]; protected {
-					status = http.StatusForbidden
-				} else {
-					result.dead = append(result.dead, deadPropertyMutation(property, instruction.Remove))
+					result.recordProtected(property)
+					continue
 				}
+				result.dead = append(result.dead, deadPropertyMutation(property, instruction.Remove))
 			}
 			result.record(property, status)
 		}
@@ -569,7 +583,22 @@ func failedProppatchResponse(href string, preflight proppatchPreflight) []respon
 		for _, name := range names {
 			failed[name] = struct{}{}
 		}
-		propstats = append(propstats, propstat{PropNames: uniqueXMLNames(names), Status: fmt.Sprintf("HTTP/1.1 %d %s", status, http.StatusText(status))})
+		statusText := fmt.Sprintf("HTTP/1.1 %d %s", status, http.StatusText(status))
+		// RFC 4918 §9.2.1 names only the protected-property refusal, so the two
+		// kinds of 403 answer in separate propstats: one carrying the condition
+		// and one carrying none. §16 puts the element inside the propstat whose
+		// properties it applies to.
+		protected, unconditioned := partitionProtectedNames(uniqueXMLNames(names), preflight.protected)
+		if len(protected) != 0 {
+			propstats = append(propstats, propstat{
+				PropNames: protected,
+				Status:    statusText,
+				Error:     &propstatError{CannotModifyProtectedProperty: &struct{}{}},
+			})
+		}
+		if len(unconditioned) != 0 {
+			propstats = append(propstats, propstat{PropNames: unconditioned, Status: statusText})
+		}
 	}
 	var dependencies []xml.Name
 	for _, name := range preflight.all {
@@ -585,6 +614,19 @@ func failedProppatchResponse(href string, preflight proppatchPreflight) []respon
 
 func successfulProppatchResponse(href string, names []xml.Name) []response {
 	return []response{{Href: href, Propstat: []propstat{{PropNames: uniqueXMLNames(names), Status: httpStatusOK}}}}
+}
+
+// partitionProtectedNames splits names into those that failed for being
+// protected and the rest, preserving the order of both.
+func partitionProtectedNames(names []xml.Name, protected map[xml.Name]struct{}) (matched, rest []xml.Name) {
+	for _, name := range names {
+		if _, ok := protected[name]; ok {
+			matched = append(matched, name)
+			continue
+		}
+		rest = append(rest, name)
+	}
+	return matched, rest
 }
 
 func uniqueXMLNames(names []xml.Name) []xml.Name {

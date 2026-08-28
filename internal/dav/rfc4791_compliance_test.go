@@ -3768,6 +3768,43 @@ func TestRFC4791_PutExceedsMaxInstances(t *testing.T) {
 	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-instances"))
 }
 
+// A recurrence rule that terminates at neither COUNT nor UNTIL generates
+// instances without end, and a sub-second frequency generates them faster than
+// any range can absorb. RFC 4791 §5.2.8 bounds the stored resource by
+// CALDAV:max-instances however the pattern spells itself, so the validator has
+// to answer these rather than run them out.
+func TestRFC4791_PutRejectsUnboundedAndSubSecondRecurrence(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		rrule string
+	}{
+		{name: "unbounded secondly", rrule: "RRULE:FREQ=SECONDLY"},
+		{name: "unbounded secondly with interval", rrule: "RRULE:FREQ=SECONDLY;INTERVAL=1"},
+		{name: "unbounded minutely", rrule: "RRULE:FREQ=MINUTELY"},
+		{name: "unbounded daily", rrule: "RRULE:FREQ=DAILY"},
+		{name: "secondly past the limit", rrule: "RRULE:FREQ=SECONDLY;COUNT=100000"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				accessible: []store.CalendarAccess{
+					{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+				},
+			}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+
+			icalData := buildCalendarObject(buildVEvent("unbounded",
+				"DTSTART:20240101T000000Z", tt.rrule))
+			req := newCalendarPutRequest("/dav/calendars/1/unbounded.ics", strings.NewReader(icalData))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Put(rr, req)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-instances"))
+		})
+	}
+}
+
 func TestRFC4791_PutExceedsMaxInstancesLowercaseParams(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{

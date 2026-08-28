@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -33,10 +34,7 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	// two cannot be given different readings of the same request. Only
 	// calendar-query carries a CALDAV:timezone of its own; the other reports
 	// fall back to the collection property, as §7.3 orders.
-	projection := calendarDataProjection{
-		selection: reportCalendarData(report),
-		zone:      reportFloatingZone(report.Timezone, cal.Timezone),
-	}
+	projection := newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, cal.Timezone))
 	switch report.XMLName.Local {
 	case "calendar-multiget":
 		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, projection, report.selector, request)
@@ -340,14 +338,49 @@ func eventFilterFromTimeRange(tr *timeRange) (store.EventFilter, bool) {
 	return ef, true
 }
 
+// listBoundedCalendarEvents reads a calendar in keyset pages rather than whole,
+// so a collection larger than the report will examine costs one page instead of
+// its full size in memory. Past that budget the report cannot answer over the
+// complete set, which is errTooManyCandidateRows.
+func (h *DavServer) listBoundedCalendarEvents(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	rowLimit := h.reportCandidateRowLimit()
+	var events []store.Event
+	afterID := int64(0)
+	for {
+		page, err := h.store.Events.ListForCalendarPageAfter(ctx, calendarID, afterID, multistatusPageSize, filter)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			return events, nil
+		}
+		if len(events)+len(page) > rowLimit {
+			return nil, errTooManyCandidateRows
+		}
+		events = append(events, page...)
+
+		lastID := page[len(page)-1].ID
+		if lastID <= afterID || len(page) < multistatusPageSize {
+			return events, nil
+		}
+		afterID = lastID
+	}
+}
+
 func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, projection calendarDataProjection, selector propertySelector) ([]response, error) {
 	if targetResource != "" {
 		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, projection, selector)
 	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
-	responses := make([]response, 0, buildLimit)
+	rowLimit := h.reportCandidateRowLimit()
+	// The build limit is a ceiling, not a size: an operator may set the response
+	// limit to unlimited, and a collection is read one page at a time whatever
+	// the limit says. Preallocating a page keeps the growth cheap without
+	// letting a configured value decide an allocation.
+	responses := make([]response, 0, min(buildLimit, multistatusPageSize))
 	afterID := int64(0)
+	scanned := 0
 	for len(responses) < buildLimit {
 		events, err := h.store.Events.ListForCalendarPageAfter(ctx, cal.ID, afterID, multistatusPageSize, databaseFilter)
 		if err != nil {
@@ -355,6 +388,10 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		}
 		if len(events) == 0 {
 			break
+		}
+		scanned += len(events)
+		if scanned > rowLimit {
+			return nil, errNumberOfMatchesExceeded
 		}
 
 		matching := events
@@ -373,6 +410,12 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		}
 		afterID = lastID
 	}
+	// The build runs one response past the limit precisely so the overflow is a
+	// fact rather than an inference: a set that stopped exactly at the limit is
+	// a complete answer, and one response more is not.
+	if len(responses) > h.maxReportResponses() {
+		return nil, errNumberOfMatchesExceeded
+	}
 
 	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
@@ -383,11 +426,11 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	// answer with a dump of the collection.
 	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
 
-	// Every href owes a DAV:response, so the build limit is reached after
-	// exactly that many hrefs and nothing past it is ever looked at.
-	buildLimit := h.multistatusBuildLimit()
-	if len(hrefs) > buildLimit {
-		hrefs = hrefs[:buildLimit]
+	// §7.9 owes one DAV:response per href, so an href list past what the server
+	// will answer is refused rather than trimmed: a trimmed list would present
+	// the leading hrefs as the whole answer.
+	if len(hrefs) > h.multigetHrefLimit() {
+		return nil, errTooManyHrefs
 	}
 	// Apple clients multiget hundreds of hrefs after a sync, so each href is
 	// resolved once and the events and their ACL entries are read in one batch
@@ -533,12 +576,15 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	var events []store.Event
 	var err error
 	if since.IsZero() {
-		events, err = h.store.Events.ListForCalendar(ctx, cal.ID)
+		events, err = h.listBoundedCalendarEvents(ctx, cal.ID, store.EventFilter{})
 	} else {
 		events, err = h.store.Events.ListModifiedSince(ctx, cal.ID, since)
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to list events")
+		if errors.Is(err, errTooManyCandidateRows) {
+			return nil, "", err
+		}
+		return nil, "", errors.New("failed to list events")
 	}
 	allEvents := events
 	events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)

@@ -33,6 +33,20 @@ func supportedCalendarDataRequest(calData *calendarDataEl) bool {
 type calendarDataProjection struct {
 	selection *calendarDataEl
 	zone      floatingZone
+	// index is the selection resolved by name. One report applies one selection
+	// to every resource it matches, so building it per resource would multiply
+	// the request body against the collection.
+	index *calendarCompIndex
+}
+
+// newCalendarDataProjection resolves the §9.6 selection by name once, for the
+// whole report.
+func newCalendarDataProjection(selection *calendarDataEl, zone floatingZone) calendarDataProjection {
+	projection := calendarDataProjection{selection: selection, zone: zone}
+	if selection != nil && selection.Comp != nil {
+		projection.index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
+	}
+	return projection
 }
 
 // requested reports whether the response carries CALDAV:calendar-data at all,
@@ -68,7 +82,13 @@ func filterICalendarData(raw string, projection calendarDataProjection) string {
 	if err != nil {
 		return raw
 	}
-	return writeICalendarObject(projectCalendarData(root, raw, selection, projection.zone))
+	index := projection.index
+	if index == nil && selection.Comp != nil {
+		// A projection built without newCalendarDataProjection still projects
+		// correctly, at the per-resource cost the index exists to avoid.
+		index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
+	}
+	return writeICalendarObject(projectCalendarData(root, raw, selection, index, projection.zone))
 }
 
 // projectCalendarData applies the recurrence transform, then the free-busy
@@ -81,7 +101,7 @@ func filterICalendarData(raw string, projection calendarDataProjection) string {
 // it was stored. A transform hands the next one the tree it produced, which is
 // not the document any more -- expansion removes the VTIMEZONE a later value
 // may still name -- so the zone lookups have to keep answering from the parse.
-func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, zone floatingZone) *icalNode {
+func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone) *icalNode {
 	m := newCalendarTimeRangeMatcher(raw, root, zone)
 	source := root
 	switch {
@@ -105,7 +125,7 @@ func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, 
 	if selection.Expand != nil {
 		mandatory = recurrenceIDName
 	}
-	projected := selectComponent(source, calendarDataRootSelection(selection.Comp), mandatory)
+	projected := selectComponent(source, index, mandatory)
 	if projected == nil {
 		return nil
 	}
@@ -124,18 +144,64 @@ func calendarDataRootSelection(comp *calendarComp) *calendarComp {
 	return &calendarComp{Name: "VCALENDAR", Comp: []calendarComp{*comp}}
 }
 
+// calendarCompIndex is one CALDAV:comp of the §9.6.1 selection with its
+// children resolved by name. The selection is matched against every property of
+// every component of every resource a report returns, so scanning it costs the
+// request body multiplied by the collection -- the CPU exhaustion RFC 4791 §11
+// asks a server to guard against. iCalendar names are case-insensitive, so the
+// keys are upper-cased.
+type calendarCompIndex struct {
+	name    string
+	allProp bool
+	allComp bool
+	// props and comps are nil under allProp and allComp respectively, where the
+	// selection names no child to resolve.
+	props map[string]calendarProp
+	comps map[string]*calendarCompIndex
+}
+
+// newCalendarCompIndex resolves sel and everything below it. A name repeated
+// among siblings keeps its first occurrence, which is the element a scan in
+// document order would have stopped at.
+func newCalendarCompIndex(sel *calendarComp) *calendarCompIndex {
+	index := &calendarCompIndex{
+		name:    sel.Name,
+		allProp: sel.AllProp,
+		allComp: sel.AllComp,
+	}
+	if !sel.AllProp && len(sel.Prop) > 0 {
+		index.props = make(map[string]calendarProp, len(sel.Prop))
+		for _, prop := range sel.Prop {
+			key := strings.ToUpper(prop.Name)
+			if _, seen := index.props[key]; !seen {
+				index.props[key] = prop
+			}
+		}
+	}
+	if !sel.AllComp && len(sel.Comp) > 0 {
+		index.comps = make(map[string]*calendarCompIndex, len(sel.Comp))
+		for i := range sel.Comp {
+			key := strings.ToUpper(sel.Comp[i].Name)
+			if _, seen := index.comps[key]; !seen {
+				index.comps[key] = newCalendarCompIndex(&sel.Comp[i])
+			}
+		}
+	}
+	return index
+}
+
 // selectComponent returns the copy of node that sel admits: the properties
 // under (allprop | prop*) and the sub-components under (allcomp | comp*), per
 // RFC 4791 §9.6.1. A bare CALDAV:comp names neither, and matching zero of each
 // is what its content model says, so it returns the component alone. Properties
 // named in mandatory survive whatever the selection said. nil means sel names
 // no component matching node.
-func selectComponent(node *icalNode, sel *calendarComp, mandatory icalNameSet) *icalNode {
-	if !strings.EqualFold(sel.Name, node.name) {
+func selectComponent(node *icalNode, sel *calendarCompIndex, mandatory icalNameSet) *icalNode {
+	if !strings.EqualFold(sel.name, node.name) {
 		return nil
 	}
 	projected := &icalNode{name: node.name}
-	if sel.AllProp {
+	if sel.allProp {
 		projected.properties = append(projected.properties, node.properties...)
 	} else {
 		for _, property := range node.properties {
@@ -143,38 +209,37 @@ func selectComponent(node *icalNode, sel *calendarComp, mandatory icalNameSet) *
 				projected.properties = append(projected.properties, property)
 				continue
 			}
-			if selected, ok := selectProperty(property, sel.Prop); ok {
+			if selected, ok := selectProperty(property, sel.props); ok {
 				projected.properties = append(projected.properties, selected)
 			}
 		}
 	}
-	if sel.AllComp {
+	if sel.allComp {
 		projected.children = append(projected.children, node.children...)
 		return projected
 	}
 	for _, child := range node.children {
-		for i := range sel.Comp {
-			if selectedChild := selectComponent(child, &sel.Comp[i], mandatory); selectedChild != nil {
-				projected.children = append(projected.children, selectedChild)
-				break
-			}
+		selectedChild, ok := sel.comps[strings.ToUpper(child.name)]
+		if !ok {
+			continue
+		}
+		if projectedChild := selectComponent(child, selectedChild, mandatory); projectedChild != nil {
+			projected.children = append(projected.children, projectedChild)
 		}
 	}
 	return projected
 }
 
-// selectProperty matches one content line against the CALDAV:prop list, keeping
-// every occurrence of a named property rather than the first: two ATTENDEEs are
-// two content lines and §9.6.4 names neither of them individually.
-func selectProperty(property icalProperty, selected []calendarProp) (icalProperty, bool) {
-	for _, want := range selected {
-		if !strings.EqualFold(want.Name, property.name) {
-			continue
-		}
-		if want.NoValue {
-			property.value = ""
-		}
-		return property, true
+// selectProperty matches one content line against the CALDAV:prop selection,
+// keeping every occurrence of a named property rather than the first: two
+// ATTENDEEs are two content lines and §9.6.4 names neither of them individually.
+func selectProperty(property icalProperty, selected map[string]calendarProp) (icalProperty, bool) {
+	want, ok := selected[strings.ToUpper(property.name)]
+	if !ok {
+		return icalProperty{}, false
 	}
-	return icalProperty{}, false
+	if want.NoValue {
+		property.value = ""
+	}
+	return property, true
 }

@@ -12,6 +12,8 @@ import (
 const (
 	defaultMaxMultistatusResponses = 10000
 	defaultMaxMultistatusBytes     = 67108864
+	defaultMaxReportCandidateRows  = 50000
+	defaultMaxMultigetHrefs        = 5000
 	multistatusPageSize            = 256
 )
 
@@ -56,6 +58,41 @@ func (h *DavServer) multistatusLimits() (int, int) {
 		return h.cfg.DAV.MaxMultistatusResponses, h.cfg.DAV.MaxMultistatusBytes
 	}
 	return defaultMaxMultistatusResponses, defaultMaxMultistatusBytes
+}
+
+// maxReportResponses is the number of DAV:response elements one report may
+// return, the count DAV:number-of-matches-within-limits measures against.
+func (h *DavServer) maxReportResponses() int {
+	maxResponses, _ := h.multistatusLimits()
+	if maxResponses <= 0 {
+		return defaultMaxMultistatusResponses
+	}
+	return maxResponses
+}
+
+// reportCandidateRowLimit is how many stored resources one report will read and
+// parse while looking for matches. A filter matching nothing costs the same
+// work per row as one matching everything, so the row budget is what bounds a
+// report whose response count never grows.
+func (h *DavServer) reportCandidateRowLimit() int {
+	if h != nil && h.cfg != nil && h.cfg.DAV.MaxReportCandidateRows > 0 {
+		return h.cfg.DAV.MaxReportCandidateRows
+	}
+	return defaultMaxReportCandidateRows
+}
+
+// multigetHrefLimit is how many DAV:href elements one multiget may carry. It is
+// capped by the response limit as well, since every href owes a DAV:response
+// and a report cannot answer more responses than it may return.
+func (h *DavServer) multigetHrefLimit() int {
+	limit := defaultMaxMultigetHrefs
+	if h != nil && h.cfg != nil && h.cfg.DAV.MaxMultigetHrefs > 0 {
+		limit = h.cfg.DAV.MaxMultigetHrefs
+	}
+	if maxResponses := h.maxReportResponses(); limit > maxResponses {
+		return maxResponses
+	}
+	return limit
 }
 
 func (h *DavServer) multistatusBuildLimit() int {

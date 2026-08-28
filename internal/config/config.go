@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -52,6 +53,24 @@ type Config struct {
 		PropfindInfinityEnabled bool
 		MaxMultistatusResponses int
 		MaxMultistatusBytes     int
+		// MaxFilterElements bounds how many filter elements one CALDAV:filter
+		// may carry. Every one of them is evaluated against every candidate
+		// resource, so an unbounded count is the CPU exhaustion RFC 4791 §11
+		// asks a server to guard against.
+		MaxFilterElements int
+		// MaxReportElementDepth bounds the nesting of the recursive REPORT
+		// grammar elements, CALDAV:comp-filter and the CALDAV:comp of
+		// CALDAV:calendar-data. RFC 4791's own component tree reaches
+		// VCALENDAR -> VEVENT -> VALARM, so the default leaves ample room.
+		MaxReportElementDepth int
+		// MaxMultigetHrefs bounds the DAV:href count of one calendar-multiget.
+		// RFC 4791 §7.9 owes one DAV:response per href, so the report is
+		// refused rather than answered over a truncated href list.
+		MaxMultigetHrefs int
+		// MaxReportCandidateRows bounds how many stored resources one report
+		// reads and parses before its matches are declared outside the
+		// server's predefined limits.
+		MaxReportCandidateRows int
 	}
 
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
@@ -130,11 +149,27 @@ func Load() (*Config, error) {
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
 	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
-	cfg.DAV.MaxMultistatusResponses, err = getenvPositiveIntDefault("APP_DAV_MAX_MULTISTATUS_RESPONSES", 10000)
+	cfg.DAV.MaxMultistatusResponses, err = getenvLimitDefault("APP_DAV_MAX_MULTISTATUS_RESPONSES", 10000)
 	if err != nil {
 		return nil, err
 	}
-	cfg.DAV.MaxMultistatusBytes, err = getenvPositiveIntDefault("APP_DAV_MAX_MULTISTATUS_BYTES", 67108864)
+	cfg.DAV.MaxMultistatusBytes, err = getenvLimitDefault("APP_DAV_MAX_MULTISTATUS_BYTES", 67108864)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxFilterElements, err = getenvLimitDefault("APP_DAV_MAX_FILTER_ELEMENTS", 100)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxReportElementDepth, err = getenvLimitDefault("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", 20)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxMultigetHrefs, err = getenvLimitDefault("APP_DAV_MAX_MULTIGET_HREFS", 5000)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxReportCandidateRows, err = getenvLimitDefault("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", 50000)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +243,24 @@ func getenvPositiveIntDefault(key string, def int) (int, error) {
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return n, nil
+}
+
+// getenvLimitDefault reads a DAV resource limit, where 0 turns the limit off
+// rather than being rejected. Unlimited is carried as math.MaxInt so every
+// comparison downstream keeps working without a second "is it set" test.
+func getenvLimitDefault(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer, where 0 means unlimited", key)
+	}
+	if n == 0 {
+		return math.MaxInt, nil
 	}
 	return n, nil
 }
