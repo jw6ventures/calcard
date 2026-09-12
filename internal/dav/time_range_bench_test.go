@@ -88,7 +88,7 @@ func BenchmarkFreeBusyPeriods(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		for _, candidate := range freeBusyCandidates(events, floatingZone{}) {
-			freeBusyIntervals(candidate, rangeStart, rangeEnd, true)
+			freeBusyIntervals(candidate, rangeStart, rangeEnd)
 		}
 	}
 }

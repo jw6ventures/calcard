@@ -1,3 +1,11 @@
+{{- /* RFC 4791 Section 11: the application accepts HTTP Basic only over a
+       secure transport, which holds only while every route to it terminates TLS.
+       A NodePort or LoadBalancer beside the ingress publishes the cleartext
+       container port, so the two settings are refused together rather than
+       rendered into a deployment that quietly defeats the rule. */ -}}
+{{- if and .Values.ingress.enabled (ne .Values.service.type "ClusterIP") -}}
+{{- fail (printf "service.type must be ClusterIP while ingress.enabled is true (got %s): any other type publishes the cleartext container port beside the TLS ingress" .Values.service.type) -}}
+{{- end -}}
 {{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 apiVersion: v1

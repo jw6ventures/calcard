@@ -3,7 +3,9 @@ package dav
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,8 +59,34 @@ func rejectBirthdayCalendarMutation(w http.ResponseWriter, r *http.Request) bool
 	return true
 }
 
+// listBoundedBirthdayContacts reads the contacts the generated collection is
+// built from, under the same row budget a stored collection is read with. The
+// set spans every address book the user owns, so it is the one report read
+// whose size is not bounded by a single collection -- and the one no keyset
+// column orders cheaply, which is why it is read whole under a cap rather than
+// a page at a time. One row past the budget is enough to know the report cannot
+// answer over the complete set.
+func (h *DavServer) listBoundedBirthdayContacts(ctx context.Context, userID int64) ([]store.Contact, error) {
+	rowLimit := h.reportCandidateRowLimit()
+	// A budget turned off is carried as math.MaxInt, which has no room for the
+	// extra row. Asking for the budget itself then reads one row short of
+	// knowing the set is complete, which no collection can reach anyway.
+	readLimit := rowLimit
+	if readLimit < math.MaxInt {
+		readLimit++
+	}
+	contacts, err := h.store.Contacts.ListWithBirthdaysByUserLimit(ctx, userID, readLimit)
+	if err != nil {
+		return nil, err
+	}
+	if len(contacts) > rowLimit {
+		return nil, errTooManyCandidateRows
+	}
+	return contacts, nil
+}
+
 func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([]store.Event, error) {
-	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(ctx, userID)
+	contacts, err := h.listBoundedBirthdayContacts(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -155,8 +183,28 @@ func escapeICalText(s string) string {
 // collection. targetResource names a single generated resource when the
 // Request-URI is an object resource rather than the collection.
 func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *store.User, principalHref, cleanPath, targetResource string, report reportRequest, request *http.Request) ([]response, string, error) {
+	switch report.XMLName.Local {
+	case "calendar-multiget", "calendar-query", "sync-collection":
+	default:
+		// RFC 3253 §3.6: unknown report types must be refused, not answered
+		// with a full dump of the collection. Refused ahead of the read as
+		// well, so an unknown report neither generates the collection nor
+		// answers a capacity failure in place of the refusal it is owed.
+		return nil, "", errUnsupportedReport
+	}
 	events, err := h.generateBirthdayEvents(ctx, user.ID)
 	if err != nil {
+		if errors.Is(err, errTooManyCandidateRows) {
+			// The row budget refuses the read this collection is generated
+			// from, which is a capacity failure of the whole report. §7.8 gives
+			// calendar-query the DAV:number-of-matches-within-limits
+			// postcondition for one; §7.9 and RFC 6578 give the other two
+			// reports none, so they keep the RFC 4918 capacity status.
+			if report.XMLName.Local == "calendar-query" {
+				return nil, "", errNumberOfMatchesExceeded
+			}
+			return nil, "", err
+		}
 		return nil, "", fmt.Errorf("failed to generate birthday events")
 	}
 	// Response hrefs are built from the collection, so an object-resource
@@ -209,8 +257,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		}
 		return responses, syncToken, nil
 	default:
-		// RFC 3253 §3.6: unknown report types must be refused, not answered
-		// with a full dump of the collection.
+		// Unreachable: the guard above refuses every other report type.
 		return nil, "", errUnsupportedReport
 	}
 }

@@ -15,28 +15,20 @@ import (
 // listBoundedAddressBookContacts reads an address book in keyset pages rather
 // than whole, on the same terms listBoundedCalendarEvents reads a calendar.
 func (h *DavServer) listBoundedAddressBookContacts(ctx context.Context, bookID int64) ([]store.Contact, error) {
-	rowLimit := h.reportCandidateRowLimit()
-	var contacts []store.Contact
-	afterID := int64(0)
-	for {
-		page, err := h.store.Contacts.ListForBookPageAfter(ctx, bookID, afterID, multistatusPageSize)
-		if err != nil {
-			return nil, err
-		}
-		if len(page) == 0 {
-			return contacts, nil
-		}
-		if len(contacts)+len(page) > rowLimit {
-			return nil, errTooManyCandidateRows
-		}
-		contacts = append(contacts, page...)
+	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
+		func(ctx context.Context, afterID int64) ([]store.Contact, error) {
+			return h.store.Contacts.ListForBookPageAfter(ctx, bookID, afterID, multistatusPageSize)
+		}, contactID)
+}
 
-		lastID := page[len(page)-1].ID
-		if lastID <= afterID || len(page) < multistatusPageSize {
-			return contacts, nil
-		}
-		afterID = lastID
-	}
+// listBoundedModifiedAddressBookContacts is that read narrowed to the rows an
+// incremental sync reports on, which the client's sync token decides and so
+// bounds nothing on its own.
+func (h *DavServer) listBoundedModifiedAddressBookContacts(ctx context.Context, bookID int64, since time.Time) ([]store.Contact, error) {
+	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
+		func(ctx context.Context, afterID int64) ([]store.Contact, error) {
+			return h.store.Contacts.ListModifiedSincePageAfter(ctx, bookID, afterID, since, multistatusPageSize)
+		}, contactID)
 }
 
 func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, request *http.Request) ([]response, string, error) {
@@ -240,7 +232,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	if since.IsZero() {
 		contacts, err = h.listBoundedAddressBookContacts(ctx, book.ID)
 	} else {
-		contacts, err = h.store.Contacts.ListModifiedSince(ctx, book.ID, since)
+		contacts, err = h.listBoundedModifiedAddressBookContacts(ctx, book.ID, since)
 	}
 	if err != nil {
 		if errors.Is(err, errTooManyCandidateRows) {
@@ -271,8 +263,11 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 
 	// Include deleted resources if this is an incremental sync
 	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
-		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "contact", book.ID, since)
+		deleted, err := h.listBoundedDeletedResources(ctx, "contact", book.ID, since)
 		if err != nil {
+			if errors.Is(err, errTooManyCandidateRows) {
+				return nil, "", err
+			}
 			return nil, "", fmt.Errorf("failed to list deleted contacts")
 		}
 		deletedNames := make([]string, 0, len(deleted))

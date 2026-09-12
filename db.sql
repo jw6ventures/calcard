@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.12')
+VALUES ('version', 'v1.2.0-rc7')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -73,8 +73,6 @@ CREATE TABLE app_passwords (
     digest_sha256_ha1 TEXT NULL
 );
 
-CREATE INDEX idx_events_calendar_id ON events(calendar_id);
-CREATE INDEX idx_contacts_address_book_id ON contacts(address_book_id);
 CREATE INDEX idx_app_passwords_user_id ON app_passwords(user_id);
 
 -- Automatically keep last_modified columns fresh for updates.
@@ -235,6 +233,15 @@ ALTER TABLE contacts ADD COLUMN birthday DATE;
 
 CREATE INDEX idx_contacts_birthday ON contacts(address_book_id, birthday) WHERE birthday IS NOT NULL;
 CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS NOT NULL;
+
+-- Keyset indexes for the DAV report reads, which page a single collection with
+-- WHERE <collection>=$1 AND id>$2 ORDER BY id. Without an index ordering one
+-- collection by id the planner answers that with the primary key, walking the
+-- table from the last id the caller saw and discarding every row belonging to
+-- another collection.
+CREATE INDEX idx_events_calendar_keyset ON events(calendar_id, id);
+CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);
+CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);
 
 -- Lock storage for WebDAV Class 2/3 compliance
 CREATE TABLE IF NOT EXISTS locks (

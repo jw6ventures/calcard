@@ -134,6 +134,14 @@ func (h *DavServer) multistatusBuildComplete(responses []response) bool {
 	return len(responses) >= h.multistatusBuildLimit()
 }
 
+// writeInsufficientStorage answers a request the server will not complete
+// because it exceeds a configured bound. RFC 4918 names no condition for the
+// status, so the body is the status text: the sentinels that reach here carry
+// storage and query detail a client has no business reading.
+func writeInsufficientStorage(w http.ResponseWriter) {
+	http.Error(w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+}
+
 func (h *DavServer) writeBoundedMultiStatus(w http.ResponseWriter, payload multistatus) {
 	maxResponses, maxBytes := h.multistatusLimits()
 	if maxResponses <= 0 {
@@ -143,7 +151,7 @@ func (h *DavServer) writeBoundedMultiStatus(w http.ResponseWriter, payload multi
 		maxBytes = defaultMaxMultistatusBytes
 	}
 	if len(payload.Response) > maxResponses {
-		http.Error(w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+		writeInsufficientStorage(w)
 		return
 	}
 

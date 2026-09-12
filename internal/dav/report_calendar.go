@@ -35,20 +35,55 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	// calendar-query carries a CALDAV:timezone of its own; the other reports
 	// fall back to the collection property, as §7.3 orders.
 	projection := newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, cal.Timezone))
+	req := calendarReportRequest{
+		user:           user,
+		cal:            cal,
+		principalHref:  principalHref,
+		collectionPath: responsePath,
+		targetResource: targetResource,
+		projection:     projection,
+		selector:       report.selector,
+		request:        request,
+	}
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.calendarMultiGet(ctx, user, cal, report.Hrefs, responsePath, targetResource, projection, report.selector, request)
+		res, err := h.calendarMultiGet(ctx, req, report.Hrefs)
 		return res, "", err
 	case "calendar-query":
-		res, err := h.calendarQuery(ctx, user, cal, responsePath, targetResource, report.Filter, projection, report.selector)
+		res, err := h.calendarQuery(ctx, req, report.Filter)
 		return res, "", err
 	case "sync-collection":
-		return h.calendarSyncCollection(ctx, user, cal, principalHref, responsePath, report, projection)
+		return h.calendarSyncCollection(ctx, req, report)
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
 		// with a full dump of the collection.
 		return nil, "", errUnsupportedReport
 	}
+}
+
+// calendarReportRequest is what every calendar REPORT entry point needs to know
+// about one request: who is asking, the collection it runs against, where the
+// responses it builds are rooted, and how a matching resource is projected and
+// selected from. It is built once per report so a value that has to reach all
+// four entry points -- as the §7.3 zone on the projection already does --
+// arrives through one field rather than a fourth positional argument.
+type calendarReportRequest struct {
+	user *store.User
+	cal  *store.CalendarAccess
+	// principalHref names the owner sync-collection reports on the collection.
+	principalHref string
+	// collectionPath roots every response href. It names the collection even
+	// when the Request-URI is one of its object resources.
+	collectionPath string
+	// targetResource is the resource name when the Request-URI names a calendar
+	// object resource rather than the collection, which RFC 4791 §7 allows for
+	// calendar-query and calendar-multiget. It is empty for a collection target.
+	targetResource string
+	projection     calendarDataProjection
+	selector       propertySelector
+	// request is the HTTP request the report arrived on, which multiget needs to
+	// resolve a DAV:href naming an absolute URI against.
+	request *http.Request
 }
 
 // applyCalendarFilter keeps the events a CALDAV:filter matches, resolving
@@ -340,36 +375,28 @@ func eventFilterFromTimeRange(tr *timeRange) (store.EventFilter, bool) {
 
 // listBoundedCalendarEvents reads a calendar in keyset pages rather than whole,
 // so a collection larger than the report will examine costs one page instead of
-// its full size in memory. Past that budget the report cannot answer over the
-// complete set, which is errTooManyCandidateRows.
+// its full size in memory.
 func (h *DavServer) listBoundedCalendarEvents(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
-	rowLimit := h.reportCandidateRowLimit()
-	var events []store.Event
-	afterID := int64(0)
-	for {
-		page, err := h.store.Events.ListForCalendarPageAfter(ctx, calendarID, afterID, multistatusPageSize, filter)
-		if err != nil {
-			return nil, err
-		}
-		if len(page) == 0 {
-			return events, nil
-		}
-		if len(events)+len(page) > rowLimit {
-			return nil, errTooManyCandidateRows
-		}
-		events = append(events, page...)
-
-		lastID := page[len(page)-1].ID
-		if lastID <= afterID || len(page) < multistatusPageSize {
-			return events, nil
-		}
-		afterID = lastID
-	}
+	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
+		func(ctx context.Context, afterID int64) ([]store.Event, error) {
+			return h.store.Events.ListForCalendarPageAfter(ctx, calendarID, afterID, multistatusPageSize, filter)
+		}, eventID)
 }
 
-func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, cleanPath, targetResource string, filter *calFilter, projection calendarDataProjection, selector propertySelector) ([]response, error) {
-	if targetResource != "" {
-		return h.calendarObjectQuery(ctx, user, cal, cleanPath, targetResource, filter, projection, selector)
+// listBoundedModifiedCalendarEvents is the same read narrowed to the rows an
+// incremental sync reports on. The narrowing is the client's sync token rather
+// than the server's, so it bounds nothing on its own: a token from before the
+// collection existed selects every row in it.
+func (h *DavServer) listBoundedModifiedCalendarEvents(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
+	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
+		func(ctx context.Context, afterID int64) ([]store.Event, error) {
+			return h.store.Events.ListModifiedSincePageAfter(ctx, calendarID, afterID, since, multistatusPageSize)
+		}, eventID)
+}
+
+func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest, filter *calFilter) ([]response, error) {
+	if req.targetResource != "" {
+		return h.calendarObjectQuery(ctx, req, filter)
 	}
 	databaseFilter, _ := eventFilterFromCalFilter(filter)
 	buildLimit := h.multistatusBuildLimit()
@@ -382,7 +409,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 	afterID := int64(0)
 	scanned := 0
 	for len(responses) < buildLimit {
-		events, err := h.store.Events.ListForCalendarPageAfter(ctx, cal.ID, afterID, multistatusPageSize, databaseFilter)
+		events, err := h.store.Events.ListForCalendarPageAfter(ctx, req.cal.ID, afterID, multistatusPageSize, databaseFilter)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list events")
 		}
@@ -396,13 +423,13 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 
 		matching := events
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, projection.zone)
+			matching = applyCalendarFilter(matching, filter, req.projection.zone)
 		}
-		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
+		matching, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, matching)
 		if err != nil {
 			return nil, err
 		}
-		responses = append(responses, rawCalendarResourceReportResponsesLimit(cleanPath, matching, projection, buildLimit-len(responses))...)
+		responses = append(responses, rawCalendarResourceReportResponsesLimit(req.collectionPath, matching, req.projection, buildLimit-len(responses))...)
 
 		lastID := events[len(events)-1].ID
 		if lastID <= afterID || len(events) < multistatusPageSize {
@@ -417,14 +444,14 @@ func (h *DavServer) calendarQuery(ctx context.Context, user *store.User, cal *st
 		return nil, errNumberOfMatchesExceeded
 	}
 
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
+	return h.finishCalendarReportResponses(ctx, req.user, responses, req.selector, req.projection.requested())
 }
 
-func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal *store.CalendarAccess, hrefs []string, responsePath, targetResource string, projection calendarDataProjection, selector propertySelector, request *http.Request) ([]response, error) {
+func (h *DavServer) calendarMultiGet(ctx context.Context, req calendarReportRequest, hrefs []string) ([]response, error) {
 	// RFC 4791 §9.10 requires at least one DAV:href, so the grammar pass has
 	// already refused a body carrying none: there is no hrefless multiget to
 	// answer with a dump of the collection.
-	responseBase := strings.TrimSuffix(responsePath, "/") + "/"
+	responseBase := strings.TrimSuffix(req.collectionPath, "/") + "/"
 
 	// §7.9 owes one DAV:response per href, so an href list past what the server
 	// will answer is refused rather than trimmed: a trimmed list would present
@@ -441,10 +468,10 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	uids := make([]string, 0, len(hrefs))
 	seen := make(map[string]struct{}, len(hrefs))
 	for i, href := range hrefs {
-		target, ok := h.resolveCalendarHrefForRequest(href, request)
+		target, ok := h.resolveCalendarHrefForRequest(href, req.request)
 		resolved[i] = target
-		inScope[i] = ok && calendarSegmentMatches(cal, target.Segment) &&
-			multigetHrefInScope(targetResource, target.ResourceName)
+		inScope[i] = ok && calendarSegmentMatches(req.cal, target.Segment) &&
+			multigetHrefInScope(req.targetResource, target.ResourceName)
 		if !inScope[i] {
 			continue
 		}
@@ -460,11 +487,11 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	var prefetchedACLEntries map[string][]store.ACLEntry
 	if len(uids) > 0 {
 		var err error
-		events, err = h.store.Events.ListByResourceNames(ctx, cal.ID, uids)
+		events, err = h.store.Events.ListByResourceNames(ctx, req.cal.ID, uids)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch event")
 		}
-		prefetchedACLEntries, err = h.prefetchCalendarACLEntries(ctx, user, cal.ID, events)
+		prefetchedACLEntries, err = h.prefetchCalendarACLEntries(ctx, req.user, req.cal.ID, events)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +500,7 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 	for i := range events {
 		eventsByName[eventResourceName(events[i])] = &events[i]
 	}
-	decider := newBatchedObjectACLDecider(user, cal.UserID, calendarCollectionResourcePath(cal.ID), prefetchedACLEntries)
+	decider := newBatchedObjectACLDecider(req.user, req.cal.UserID, calendarCollectionResourcePath(req.cal.ID), prefetchedACLEntries)
 
 	responses := make([]response, 0, len(hrefs))
 	for i, href := range hrefs {
@@ -482,7 +509,7 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 		// unresolvable or out-of-scope one reports 404 under the best href the
 		// request gives us instead of being dropped.
 		if !inScope[i] {
-			responses = append(responses, response{Href: multiGetFallbackHref(href, resolved[i].Path, responsePath), Status: httpStatusNotFound})
+			responses = append(responses, response{Href: multiGetFallbackHref(href, resolved[i].Path, req.collectionPath), Status: httpStatusNotFound})
 			continue
 		}
 		responseHref := calendarObjectHref(responseBase, uid)
@@ -491,17 +518,17 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, user *store.User, cal 
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		allowed, denied := calendarPrivilegeDecisionWithDecider(cal, uid, "read", decider)
+		allowed, denied := calendarPrivilegeDecisionWithDecider(req.cal, uid, "read", decider)
 		if !allowed && !denied {
-			allowed = cal.EffectivePrivileges().Allows("read")
+			allowed = req.cal.EffectivePrivileges().Allows("read")
 		}
 		if !allowed {
 			responses = append(responses, response{Href: responseHref, Status: httpStatusNotFound})
 			continue
 		}
-		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, projection))
+		responses = append(responses, rawCalendarResourceReportResponse(responseHref, *ev, req.projection))
 	}
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
+	return h.finishCalendarReportResponses(ctx, req.user, responses, req.selector, req.projection.requested())
 }
 
 // eventsWithResourceName narrows a generated event set to the one resource an
@@ -526,8 +553,8 @@ func multigetHrefInScope(targetResource, uid string) bool {
 // calendarObjectQuery answers a calendar-query whose Request-URI is a single
 // calendar object resource (RFC 4791 §7). The filter still decides whether the
 // resource is reported, so a non-matching resource yields an empty multistatus.
-func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, collectionPath, resourceName string, filter *calFilter, projection calendarDataProjection, selector propertySelector) ([]response, error) {
-	event, err := h.store.Events.GetByResourceName(ctx, cal.ID, resourceName)
+func (h *DavServer) calendarObjectQuery(ctx context.Context, req calendarReportRequest, filter *calFilter) ([]response, error) {
+	event, err := h.store.Events.GetByResourceName(ctx, req.cal.ID, req.targetResource)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch event")
 	}
@@ -535,15 +562,15 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, user *store.User, c
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, projection.zone)
+			matching = applyCalendarFilter(matching, filter, req.projection.zone)
 		}
-		matching, err = h.filterReadableCalendarEvents(ctx, user, cal, matching)
+		matching, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, matching)
 		if err != nil {
 			return nil, err
 		}
 	}
-	responses := rawCalendarResourceReportResponsesLimit(collectionPath, matching, projection, h.multistatusBuildLimit())
-	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
+	responses := rawCalendarResourceReportResponsesLimit(req.collectionPath, matching, req.projection, h.multistatusBuildLimit())
+	return h.finishCalendarReportResponses(ctx, req.user, responses, req.selector, req.projection.requested())
 }
 
 func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
@@ -560,14 +587,14 @@ func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
 	return cal.Name == segment
 }
 
-func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, cleanPath string, report reportRequest, projection calendarDataProjection) ([]response, string, error) {
-	syncToken, _ := h.calendarSyncTokenValue(cal)
-	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
+func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarReportRequest, report reportRequest) ([]response, string, error) {
+	syncToken, _ := h.calendarSyncTokenValue(req.cal)
+	collectionHref := strings.TrimSuffix(req.collectionPath, "/") + "/"
 
 	var since time.Time
 	if report.SyncToken != "" {
 		info, err := parseSyncToken(report.SyncToken)
-		if err != nil || info.Kind != "cal" || info.ID != cal.ID {
+		if err != nil || info.Kind != "cal" || info.ID != req.cal.ID {
 			return nil, "", errInvalidSyncToken
 		}
 		since = info.Timestamp
@@ -576,9 +603,9 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 	var events []store.Event
 	var err error
 	if since.IsZero() {
-		events, err = h.listBoundedCalendarEvents(ctx, cal.ID, store.EventFilter{})
+		events, err = h.listBoundedCalendarEvents(ctx, req.cal.ID, store.EventFilter{})
 	} else {
-		events, err = h.store.Events.ListModifiedSince(ctx, cal.ID, since)
+		events, err = h.listBoundedModifiedCalendarEvents(ctx, req.cal.ID, since)
 	}
 	if err != nil {
 		if errors.Is(err, errTooManyCandidateRows) {
@@ -587,15 +614,15 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 		return nil, "", errors.New("failed to list events")
 	}
 	allEvents := events
-	events, err = h.filterReadableCalendarEvents(ctx, user, cal, events)
+	events, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, events)
 	if err != nil {
 		return nil, "", err
 	}
 
 	responses := []response{
-		calendarCollectionResponseWithPrivileges(collectionHref, cal.Name, cal.Calendar, principalHref, syncToken, strconv.FormatInt(cal.CTag, 10), cal.EffectivePrivileges()),
+		calendarCollectionResponseWithPrivileges(collectionHref, req.cal.Name, req.cal.Calendar, req.principalHref, syncToken, strconv.FormatInt(req.cal.CTag, 10), req.cal.EffectivePrivileges()),
 	}
-	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
+	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, req.projection, h.multistatusBuildLimit()-len(responses))
 	responses = h.appendMultistatusResponses(responses, resourceResponses)
 
 	// Include deleted resources if this is an incremental sync
@@ -621,11 +648,14 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 			deletedHrefs[href] = struct{}{}
 		}
 		if h.multistatusBuildComplete(responses) {
-			responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
+			responses, err = h.finishCalendarReportResponses(ctx, req.user, responses, propertySelector{Prop: report.Prop}, req.projection.requested())
 			return responses, syncToken, err
 		}
-		deleted, err := h.store.DeletedResources.ListDeletedSince(ctx, "event", cal.ID, since)
+		deleted, err := h.listBoundedDeletedResources(ctx, "event", req.cal.ID, since)
 		if err != nil {
+			if errors.Is(err, errTooManyCandidateRows) {
+				return nil, "", err
+			}
 			return nil, "", fmt.Errorf("failed to list deleted events")
 		}
 		for _, d := range deleted {
@@ -645,7 +675,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, user *store.User
 		}
 	}
 
-	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
+	responses, err = h.finishCalendarReportResponses(ctx, req.user, responses, propertySelector{Prop: report.Prop}, req.projection.requested())
 	if err != nil {
 		return nil, "", err
 	}

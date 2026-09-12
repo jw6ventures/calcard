@@ -161,7 +161,7 @@ func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, bookID int64
 func (f *fakeContactRepo) ListByUIDs(ctx context.Context, bookID int64, uids []string) ([]store.Contact, error) {
 	return nil, nil
 }
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, bookID int64, since time.Time) ([]store.Contact, error) {
+func (f *fakeContactRepo) ListModifiedSincePageAfter(ctx context.Context, bookID, afterID int64, since time.Time, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
@@ -171,6 +171,9 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, bookID int64) (ti
 	return time.Time{}, nil
 }
 func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
+	return nil, nil
+}
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, from, to int64, uid, destResourceName string) error {

@@ -46,7 +46,7 @@ type EventRepository interface {
 	ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error)
 	ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*PaginatedResult[Event], error)
 	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)
-	ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error)
+	ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]Event, error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error)
 	MaxLastModified(ctx context.Context, calendarID int64) (time.Time, error)
 	MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error
@@ -75,10 +75,11 @@ type ContactRepository interface {
 	ListForBookFiltered(ctx context.Context, addressBookID int64, f ContactFilter) ([]Contact, error)
 	ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*PaginatedResult[Contact], error)
 	ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error)
-	ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error)
+	ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]Contact, error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MaxLastModified(ctx context.Context, addressBookID int64) (time.Time, error)
 	ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error)
+	ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error
 	GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*Contact, error)
 	ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]Contact, error)
@@ -98,7 +99,7 @@ type AppPasswordRepository interface {
 
 // DeletedResourceRepository handles tombstone tracking for sync.
 type DeletedResourceRepository interface {
-	ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error)
+	ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]DeletedResource, error)
 	DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error
 	Cleanup(ctx context.Context, olderThan time.Duration) (int64, error)
 }

@@ -3129,10 +3129,21 @@ func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID
 			result = append(result, event)
 		}
 	}
-	if limit >= 0 && len(result) > limit {
-		result = result[:limit]
+	return truncateToLimit(result, limit), nil
+}
+
+// truncateToLimit mirrors what every paged repository in internal/store does
+// with limit: a non-positive one reads nothing, which is the guard each
+// PostgreSQL implementation opens with. A fake reading it as "no limit" instead
+// would answer in full where storage answers with nothing.
+func truncateToLimit[T any](rows []T, limit int) []T {
+	if limit <= 0 {
+		return nil
 	}
-	return result, nil
+	if len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
 }
 
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
@@ -3149,7 +3160,7 @@ func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids [
 	return nil, nil
 }
 
-func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
+func (f *fakeEventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]store.Event, error) {
 	return nil, nil
 }
 
@@ -3310,7 +3321,7 @@ func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, u
 	return nil, nil
 }
 
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]store.Contact, error) {
+func (f *fakeContactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 
@@ -3323,6 +3334,10 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 }
 
 func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
+	return nil, nil
+}
+
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 
@@ -3580,6 +3595,10 @@ type fakeContactRepoWithBirthdays struct {
 
 func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
 	return f.birthdays, nil
+}
+
+func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
+	return truncateToLimit(f.birthdays, limit), nil
 }
 
 func (f *fakeContactRepoWithBirthdays) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {

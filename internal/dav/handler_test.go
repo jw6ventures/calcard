@@ -234,7 +234,12 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "https://cal.example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -262,7 +267,12 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -291,7 +301,12 @@ func TestCalendarMultiGetPreservesEncodedPathSeparators(t *testing.T) {
 	hrefs := []string{"/dav/calendars/2/team%2Fstandup.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -2592,7 +2607,11 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", "", nil, calendarDataProjection{}, propertySelector{})
+	responses, err := h.calendarQuery(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+	}, nil)
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -3001,7 +3020,12 @@ func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/1/", nil)
-	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "", calendarDataProjection{}, propertySelector{}, request)
+	_, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/1/",
+		request:        request,
+	}, []string{"/dav/calendars/1/e.ics"})
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -4110,9 +4134,9 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE within same calendar to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{})
+	tombstones, err := deletedRepo.ListDeletedSincePageAfter(req.Context(), "event", 2, 0, time.Time{}, multistatusPageSize)
 	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
+		t.Fatalf("ListDeletedSincePageAfter() error = %v", err)
 	}
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
@@ -6833,9 +6857,9 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{})
+	tombstones, err := deletedRepo.ListDeletedSincePageAfter(req.Context(), "contact", 6, 0, time.Time{}, multistatusPageSize)
 	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
+		t.Fatalf("ListDeletedSincePageAfter() error = %v", err)
 	}
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
@@ -8106,10 +8130,7 @@ func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
-	if limit >= 0 && len(result) > limit {
-		result = result[:limit]
-	}
-	return result, nil
+	return truncateToLimit(result, limit), nil
 }
 
 func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
@@ -8217,7 +8238,7 @@ func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids [
 	return nil, nil
 }
 
-func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
+func (f *fakeEventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]store.Event, error) {
 	var result []store.Event
 	for _, ev := range f.events {
 		if ev.CalendarID != calendarID {
@@ -8228,7 +8249,7 @@ func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64,
 			result = append(result, copy)
 		}
 	}
-	return result, nil
+	return pageByID(result, func(ev store.Event) int64 { return ev.ID }, afterID, limit), nil
 }
 
 func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -8402,7 +8423,7 @@ func (e *errorEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids 
 	return nil, errors.New("fail")
 }
 
-func (e *errorEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
+func (e *errorEventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]store.Event, error) {
 	return nil, errors.New("fail")
 }
 
@@ -8435,6 +8456,9 @@ type fakeContactRepo struct {
 	resourceLookupCount      int
 	batchResourceLookupCount int
 	pageLookupCount          int
+	birthdayLookupCount      int
+	birthdayLimit            int
+	birthdayErr              error
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -8517,7 +8541,7 @@ func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, u
 	return result, nil
 }
 
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]store.Contact, error) {
+func (f *fakeContactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]store.Contact, error) {
 	var result []store.Contact
 	for _, c := range f.contacts {
 		if c.AddressBookID != addressBookID {
@@ -8528,7 +8552,7 @@ func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID i
 			result = append(result, copy)
 		}
 	}
-	return result, nil
+	return pageByID(result, func(c store.Contact) int64 { return c.ID }, afterID, limit), nil
 }
 
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
@@ -8559,6 +8583,51 @@ func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID in
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
+	f.birthdayLookupCount++
+	f.birthdayLimit = limit
+	if f.birthdayErr != nil {
+		return nil, f.birthdayErr
+	}
+	all, err := f.ListWithBirthdaysByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	return truncateToLimit(all, limit), nil
+}
+
+// pageByID mirrors the keyset page a repository returns: the rows after
+// afterID in id order, truncated to limit. A row carrying no id is admitted on
+// the first page only, which is what ListForCalendarPageAfter above does -- a
+// fixture that leaves the column unset would otherwise be invisible to every
+// paged read.
+func pageByID[T any](rows []T, id func(T) int64, afterID int64, limit int) []T {
+	var result []T
+	for _, row := range rows {
+		if id(row) > afterID || (afterID == 0 && id(row) == 0) {
+			result = append(result, row)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return id(result[i]) < id(result[j]) })
+	return truncateToLimit(result, limit)
+}
+
+// truncateToLimit mirrors what every paged repository in internal/store does
+// with limit: a non-positive one reads nothing, which is the guard each
+// PostgreSQL implementation opens with. A fake reading it as "no limit" instead
+// would answer in full where storage answers with nothing, and hide a caller
+// that computed the limit wrongly.
+func truncateToLimit[T any](rows []T, limit int) []T {
+	if limit <= 0 {
+		return nil
+	}
+	if len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
 }
 
 func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
@@ -9014,14 +9083,14 @@ type fakeDeletedResourceRepo struct {
 	deleted []store.DeletedResource
 }
 
-func (f *fakeDeletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]store.DeletedResource, error) {
+func (f *fakeDeletedResourceRepo) ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]store.DeletedResource, error) {
 	var result []store.DeletedResource
 	for _, d := range f.deleted {
 		if d.ResourceType == resourceType && d.CollectionID == collectionID && d.DeletedAt.After(since) {
 			result = append(result, d)
 		}
 	}
-	return result, nil
+	return pageByID(result, func(d store.DeletedResource) int64 { return d.ID }, afterID, limit), nil
 }
 
 func (f *fakeDeletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {

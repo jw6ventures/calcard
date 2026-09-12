@@ -174,3 +174,90 @@ func reportCalendarDataValue(t *testing.T, h *DavServer, user *store.User, calen
 	}
 	return value
 }
+
+// syncCollectionAgainst runs one RFC 6578 sync-collection over the collection
+// and returns the multistatus with the token the server answered.
+func syncCollectionAgainst(t *testing.T, h *DavServer, user *store.User, calendarID int64, syncToken string) davMultistatus {
+	t.Helper()
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + syncToken +
+		`</D:sync-token><D:prop><D:getetag/></D:prop></D:sync-collection>`
+	req := reportRequestFor(collectionPath(calendarID), body, user)
+	req.Header.Set("Depth", "1")
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+	return decodeMultistatus(t, rr)
+}
+
+// The incremental sync reads two statements the in-memory suites only pin as
+// SQL text: the keyset page of modified rows, and the tombstone page behind it.
+// Both are driven here through real storage, so a query the fakes accept but
+// PostgreSQL rejects -- or one whose keyset resume is wrong -- fails.
+func TestPostgres_SyncCollectionReadsChangesAndRemovalsThroughStorage(t *testing.T) {
+	database := newDAVPostgresStore(t)
+	ctx := t.Context()
+	user, err := database.Users.UpsertOAuthUser(ctx, "dav-sync", "dav-sync@example.test", "Sync", "Test")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	calendar, err := database.Calendars.Create(ctx, store.Calendar{UserID: user.ID, Name: "Sync"})
+	if err != nil {
+		t.Fatalf("create calendar: %v", err)
+	}
+	h := NewDavServer(Options{Store: database})
+
+	object := func(uid string) string {
+		return strings.Join([]string{
+			"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//CalCard//Test//EN",
+			"BEGIN:VEVENT", "UID:" + uid, "DTSTAMP:20240301T080000Z",
+			"DTSTART:20240309T090000Z", "DTEND:20240309T093000Z", "SUMMARY:" + uid,
+			"END:VEVENT", "END:VCALENDAR", "",
+		}, "\r\n")
+	}
+	put := func(name string) {
+		t.Helper()
+		req := newCalendarPutRequest(objectPath(calendar.ID, name), strings.NewReader(object(name)))
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+		h.Put(rr, req)
+		if rr.Code != 201 && rr.Code != 204 {
+			t.Fatalf("PUT %s = %d: %s", name, rr.Code, rr.Body.String())
+		}
+	}
+	put("kept")
+	put("removed")
+
+	initial := syncCollectionAgainst(t, h, user, calendar.ID, "")
+	if initial.SyncToken == "" {
+		t.Fatal("initial sync returned no sync-token")
+	}
+	// The collection and both resources.
+	if len(initial.Responses) != 3 {
+		t.Fatalf("initial sync responses = %d, want 3", len(initial.Responses))
+	}
+
+	put("kept")
+	del := httptest.NewRequest("DELETE", objectPath(calendar.ID, "removed"), nil)
+	del = del.WithContext(auth.WithUser(del.Context(), user))
+	delRR := httptest.NewRecorder()
+	h.Delete(delRR, del)
+	if delRR.Code != 204 {
+		t.Fatalf("DELETE = %d: %s", delRR.Code, delRR.Body.String())
+	}
+
+	incremental := syncCollectionAgainst(t, h, user, calendar.ID, initial.SyncToken)
+	changed := map[string]string{}
+	for _, response := range incremental.Responses {
+		for _, href := range response.Hrefs {
+			changed[href] = response.Status
+		}
+	}
+	keptHref := objectPath(calendar.ID, "kept")
+	removedHref := objectPath(calendar.ID, "removed")
+	if _, ok := changed[keptHref]; !ok {
+		t.Fatalf("incremental sync omitted the modified resource; got %v", changed)
+	}
+	if status, ok := changed[removedHref]; !ok || !strings.Contains(status, "404") {
+		t.Fatalf("incremental sync did not report the removal as 404; got %q for %s in %v", status, removedHref, changed)
+	}
+}

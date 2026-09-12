@@ -698,6 +698,9 @@ func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, af
 	if limit <= 0 {
 		return []Event{}, nil
 	}
+	// idx_events_calendar_keyset orders a single calendar by id, which is what
+	// keeps this page off the primary key: without it the planner walks the
+	// table from afterID and discards every row belonging to another calendar.
 	var sb strings.Builder
 	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND id>$2`)
 	args := []any{calendarID, afterID}
@@ -792,10 +795,16 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 	}, nil
 }
 
-func (r *eventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error) {
-	const q = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
-	defer observeDB(ctx, "events.list_modified_since")()
-	rows, err := r.pool.QueryContext(ctx, q, calendarID, since)
+// ListModifiedSincePageAfter returns one keyset page of the calendar's rows
+// modified after since, ordered by id so a caller can resume from the last id
+// it saw. The sync report that reads it bounds how many pages it will take.
+func (r *eventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		return []Event{}, nil
+	}
+	const q = `SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`
+	defer observeDB(ctx, "events.list_modified_since_page_after")()
+	rows, err := r.pool.QueryContext(ctx, q, calendarID, afterID, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1424,7 +1433,7 @@ func (r *contactRepo) ListForBookPageAfter(ctx context.Context, addressBookID, a
 	if limit <= 0 {
 		return []Contact{}, nil
 	}
-	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`
+	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`
 	defer observeDB(ctx, "contacts.list_for_book_page_after")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, limit)
 	if err != nil {
@@ -1539,10 +1548,16 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 	}, nil
 }
 
-func (r *contactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error) {
-	const q = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`
-	defer observeDB(ctx, "contacts.list_modified_since")()
-	rows, err := r.pool.QueryContext(ctx, q, addressBookID, since)
+// ListModifiedSincePageAfter returns one keyset page of the address book's rows
+// modified after since, on the same terms the event repository reads a calendar
+// with.
+func (r *contactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]Contact, error) {
+	if limit <= 0 {
+		return []Contact{}, nil
+	}
+	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`
+	defer observeDB(ctx, "contacts.list_modified_since_page_after")()
+	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1606,6 +1621,40 @@ ORDER BY c.display_name
 `
 	defer observeDB(ctx, "contacts.list_with_birthdays_by_user")()
 	rows, err := r.pool.QueryContext(ctx, q, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Contact
+	for rows.Next() {
+		c, err := scanContact(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+// ListWithBirthdaysByUserLimit is that set truncated to limit rows. The set
+// spans every address book the user owns, so no column orders it within one
+// collection and a keyset page would rescan it per page; a caller bounding the
+// read asks for one row more than it will accept instead.
+func (r *contactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]Contact, error) {
+	if limit <= 0 {
+		return []Contact{}, nil
+	}
+	const q = `
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+FROM contacts c
+JOIN address_books ab ON ab.id = c.address_book_id
+WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
+ORDER BY c.display_name
+LIMIT $2
+`
+	defer observeDB(ctx, "contacts.list_with_birthdays_by_user_limit")()
+	rows, err := r.pool.QueryContext(ctx, q, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1836,10 +1885,18 @@ type deletedResourceRepo struct {
 	pool *sql.DB
 }
 
-func (r *deletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error) {
-	const q = `SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`
-	defer observeDB(ctx, "deleted_resources.list_deleted_since")()
-	rows, err := r.pool.QueryContext(ctx, q, resourceType, collectionID, since)
+// ListDeletedSincePageAfter returns one keyset page of the collection's
+// tombstones recorded after since, ordered by id so a caller can resume from
+// the last id it saw. Nothing prunes this table, so the set a client's sync
+// token selects grows without bound and the sync report that reads it bounds
+// how many pages it will take.
+func (r *deletedResourceRepo) ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]DeletedResource, error) {
+	if limit <= 0 {
+		return []DeletedResource{}, nil
+	}
+	const q = `SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5`
+	defer observeDB(ctx, "deleted_resources.list_deleted_since_page_after")()
+	rows, err := r.pool.QueryContext(ctx, q, resourceType, collectionID, afterID, since, limit)
 	if err != nil {
 		return nil, err
 	}

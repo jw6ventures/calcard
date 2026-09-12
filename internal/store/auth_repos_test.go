@@ -116,17 +116,24 @@ func TestDeletedResourceRepoListAndCleanup(t *testing.T) {
 	since := time.Now().Add(-time.Hour).UTC()
 	deletedAt := since.Add(10 * time.Minute)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`)).
-		WithArgs("event", int64(4), since).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5`)).
+		WithArgs("event", int64(4), int64(7), since, 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_type", "collection_id", "uid", "resource_name", "deleted_at"}).
 			AddRow(int64(8), "event", int64(4), "uid-1", "uid-1.ics", deletedAt))
 
-	items, err := repo.ListDeletedSince(context.Background(), "event", 4, since)
+	items, err := repo.ListDeletedSincePageAfter(context.Background(), "event", 4, 7, since, 256)
 	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
+		t.Fatalf("ListDeletedSincePageAfter() error = %v", err)
 	}
 	if len(items) != 1 || items[0].UID != "uid-1" {
-		t.Fatalf("ListDeletedSince() = %#v", items)
+		t.Fatalf("ListDeletedSincePageAfter() = %#v", items)
+	}
+	empty, err := repo.ListDeletedSincePageAfter(context.Background(), "event", 4, 7, since, 0)
+	if err != nil {
+		t.Fatalf("ListDeletedSincePageAfter(limit 0) error = %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListDeletedSincePageAfter(limit 0) = %#v", empty)
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE deleted_at < $1`)).

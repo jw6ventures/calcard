@@ -171,7 +171,7 @@ func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRan
 	sb.WriteString(fmt.Sprintf("UID:%s-%s@calcard\r\n", now.Format("20060102T150405Z"), freeBusyUIDSuffix()))
 	sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", now.Format("20060102T150405Z")))
 
-	rangeStart, rangeEnd, hasRange := calendarTimeRangeBounds(tr)
+	rangeStart, rangeEnd, _ := calendarTimeRangeBounds(tr)
 	if tr != nil {
 		if tr.Start != "" {
 			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", tr.Start))
@@ -181,9 +181,12 @@ func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRan
 		}
 	}
 
+	// §9.11 requires exactly one CALDAV:time-range, and a report whose bounds
+	// are unusable is refused before dispatch, so every period below is selected
+	// against a real range.
 	var intervals []freeBusyInterval
 	for _, candidate := range candidates {
-		intervals = append(intervals, freeBusyIntervals(candidate, rangeStart, rangeEnd, hasRange)...)
+		intervals = append(intervals, freeBusyIntervals(candidate, rangeStart, rangeEnd)...)
 	}
 	// §7.10 asks for duplicates to be dropped and consecutive or overlapping
 	// periods of the same type to be coalesced. Both are collection-wide
@@ -239,7 +242,7 @@ func freeBusyTypeParameter(fbType string) string {
 // freeBusyIntervals is every busy period one calendar object publishes.
 // RFC 4791 §7.10 considers a VEVENT that is absent TRANSP or names OPAQUE, plus
 // every VFREEBUSY, so an object can contribute through both routes.
-func freeBusyIntervals(candidate freeBusyCandidate, rangeStart, rangeEnd time.Time, hasRange bool) []freeBusyInterval {
+func freeBusyIntervals(candidate freeBusyCandidate, rangeStart, rangeEnd time.Time) []freeBusyInterval {
 	var intervals []freeBusyInterval
 	// A recurrence set belongs to the resource rather than to any one of its
 	// components, so it is expanded once from the master and each period is then
@@ -252,20 +255,20 @@ func freeBusyIntervals(candidate freeBusyCandidate, rangeStart, rangeEnd time.Ti
 	// returns for the same octets.
 	master := freeBusyMasterComponent(candidate.matcher.root)
 	if master != nil && ical.EventHasRecurrence(candidate.event.RawICAL) {
-		intervals = append(intervals, freeBusyEventIntervals(candidate, master, rangeStart, rangeEnd, hasRange)...)
+		intervals = append(intervals, freeBusyEventIntervals(candidate, master, rangeStart, rangeEnd)...)
 	} else {
 		for _, child := range candidate.matcher.root.children {
 			if child.name != "VEVENT" {
 				continue
 			}
-			if interval, ok := freeBusyStandaloneEventInterval(candidate, child, rangeStart, rangeEnd, hasRange); ok {
+			if interval, ok := freeBusyStandaloneEventInterval(candidate, child, rangeStart, rangeEnd); ok {
 				intervals = append(intervals, interval)
 			}
 		}
 	}
 	for _, child := range candidate.matcher.root.children {
 		if child.name == "VFREEBUSY" {
-			intervals = append(intervals, freeBusyStoredPeriods(candidate.matcher, child, rangeStart, rangeEnd, hasRange)...)
+			intervals = append(intervals, freeBusyStoredPeriods(candidate.matcher, child, rangeStart, rangeEnd)...)
 		}
 	}
 	return intervals
@@ -345,19 +348,15 @@ func freeBusyEventType(node *icalNode) (string, bool) {
 // occupies, each tagged with the FBTYPE of the component that describes its
 // instance. master is the component defining that set, which the caller has
 // established does define one.
-func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, rangeStart, rangeEnd time.Time, hasRange bool) []freeBusyInterval {
+func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, rangeStart, rangeEnd time.Time) []freeBusyInterval {
 	extent, ok := candidate.extent(master)
 	if !ok {
 		return nil
 	}
-	periods := []ical.BusyPeriod{{Start: extent.start, End: extent.start.Add(extent.length)}}
-	if hasRange {
-		// The expansion reads its EXDATEs and RDATEs through the same resolver
-		// that placed the start, so an exception still names an occurrence the
-		// zone moved.
-		periods = ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
-			rangeStart, rangeEnd, ical.MaxRecurrenceInstances, extent.resolve)
-	}
+	// The expansion reads its EXDATEs and RDATEs through the same resolver that
+	// placed the start, so an exception still names an occurrence the zone moved.
+	periods := ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
+		rangeStart, rangeEnd, ical.MaxRecurrenceInstances, extent.resolve)
 
 	overrides := freeBusyOverrides(candidate.matcher, candidate.matcher.root, master)
 	intervals := make([]freeBusyInterval, 0, len(periods))
@@ -376,13 +375,13 @@ func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, range
 	return intervals
 }
 
-func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode, rangeStart, rangeEnd time.Time, hasRange bool) (freeBusyInterval, bool) {
+func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode, rangeStart, rangeEnd time.Time) (freeBusyInterval, bool) {
 	dtstart, ok := candidate.matcher.dateValue(node, "DTSTART", 0)
 	if !ok {
 		return freeBusyInterval{}, false
 	}
 	end := dtstart.instant.Add(freeBusyOccurrenceLength(candidate.matcher, node, dtstart, candidate.event))
-	if hasRange && !busyPeriodOverlapsRange(dtstart.instant, end, rangeStart, rangeEnd) {
+	if !busyPeriodOverlapsRange(dtstart.instant, end, rangeStart, rangeEnd) {
 		return freeBusyInterval{}, false
 	}
 	fbType, publishes := freeBusyEventType(node)
@@ -395,7 +394,7 @@ func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode
 // freeBusyStoredPeriods reads the FREEBUSY properties of a stored VFREEBUSY,
 // each under the FBTYPE its own parameter names. RFC 5545 §3.2.9 defaults that
 // to BUSY, and FREE names free time, which this report does not publish.
-func freeBusyStoredPeriods(matcher calendarTimeRangeMatcher, node *icalNode, rangeStart, rangeEnd time.Time, hasRange bool) []freeBusyInterval {
+func freeBusyStoredPeriods(matcher calendarTimeRangeMatcher, node *icalNode, rangeStart, rangeEnd time.Time) []freeBusyInterval {
 	var intervals []freeBusyInterval
 	for _, property := range node.properties {
 		if property.name != "FREEBUSY" {
@@ -413,7 +412,7 @@ func freeBusyStoredPeriods(matcher calendarTimeRangeMatcher, node *icalNode, ran
 			if !ok {
 				continue
 			}
-			if hasRange && !busyPeriodOverlapsRange(start, end, rangeStart, rangeEnd) {
+			if !busyPeriodOverlapsRange(start, end, rangeStart, rangeEnd) {
 				continue
 			}
 			intervals = append(intervals, freeBusyInterval{start: start, end: end, fbType: fbType})

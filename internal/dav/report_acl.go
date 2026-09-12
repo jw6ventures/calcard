@@ -342,9 +342,12 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 	}
 	candidates, err := h.buildPropfindResponses(r.Context(), nil, cleanPath, "infinity", user, nil)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+		switch {
+		case errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden):
 			http.Error(w, "not found", http.StatusNotFound)
-		} else {
+		case errors.Is(err, errTooManyCandidateRows):
+			writeInsufficientStorage(w)
+		default:
 			http.Error(w, "failed to enumerate collection", http.StatusInternalServerError)
 		}
 		return

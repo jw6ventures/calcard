@@ -74,6 +74,12 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			writeNeedPrivileges(w, r.URL.Path, "read")
 			return
 		}
+		// The generated birthday collection is read under the report row
+		// budget, and a PROPFIND deep enough to reach it inherits that refusal.
+		if errors.Is(err, errTooManyCandidateRows) {
+			writeInsufficientStorage(w)
+			return
+		}
 		status := http.StatusBadRequest
 		if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
 			status = http.StatusConflict
@@ -82,7 +88,7 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 		}
 		h.logger().Error("Propfind", "failed to build responses for %s (status %d): %v", r.URL.Path, status, err)
-		http.Error(w, err.Error(), status)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))

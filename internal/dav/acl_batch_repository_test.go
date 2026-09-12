@@ -172,7 +172,12 @@ func TestCalendarMultigetFallsBackToResolvedCollectionPrivileges(t *testing.T) {
 	h := &DavServer{store: &store.Store{Events: events}}
 
 	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/2/visible.ics"}, "/dav/calendars/2/", "", calendarDataProjection{}, propertySelector{}, request)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, []string{"/dav/calendars/2/visible.ics"})
 	if err != nil {
 		t.Fatalf("calendarMultiGet() error = %v", err)
 	}

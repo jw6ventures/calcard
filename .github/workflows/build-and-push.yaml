@@ -13,6 +13,7 @@ on:
       - go.mod
       - go.sum
       - db.sql
+      - .github/kind-config.yaml
       - .github/workflows/build-and-push.yaml
     tags:
       - '*'
@@ -31,6 +32,7 @@ on:
       - go.mod
       - go.sum
       - db.sql
+      - .github/kind-config.yaml
       - .github/workflows/build-and-push.yaml
   workflow_dispatch:
 # Least privilege by default. Only docker-build-push publishes anything, and it
@@ -73,6 +75,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # internal/deploy shells out to helm, and skips every case when it is
+      # absent. Installing it here is what turns those tests into a gate.
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
       - name: Check formatting
         run: |
           unformatted=$(gofmt -l cmd internal)
@@ -94,39 +101,53 @@ jobs:
       - name: Test concurrency under the race detector
         run: go test -race -count=2 ./internal/dav ./internal/store ./internal/auth
 
-  docker-build-push:
-    if: github.event_name != 'pull_request'
+      # The same cases run under "Test" above; this re-runs them verbosely so a
+      # skip -- which is how they report a missing helm -- fails the job instead
+      # of passing as a green package.
+      - name: Lint and render the Helm chart
+        run: |
+          set -euo pipefail
+          # tee rather than a captured substitution: under `set -e` an
+          # assignment from a failing command exits the step before anything is
+          # echoed, which would report a real chart failure as a red step
+          # carrying none of the output that explains it.
+          go test ./internal/deploy -count=1 -v 2>&1 | tee chart-tests.log
+          if grep -q -- "--- SKIP" chart-tests.log; then
+            echo "::error::chart render tests skipped; helm must be on PATH for this gate"
+            exit 1
+          fi
+
+  # The deployment gate. RFC 4791 Section 11 forbids HTTP Basic without TLS, and
+  # the application enforces that per request; this job is the evidence that a
+  # real deployment gives it a transport to enforce it on -- DAV reachable and
+  # Basic accepted through the TLS ingress, and neither of those true on the
+  # cleartext path. It runs on pull requests as well as pushes: a chart or
+  # workflow change that breaks the deployment has to fail before the merge.
+  deploy-test:
     needs: test
     runs-on: ubuntu-latest
-    # contents for the tag-only GitHub Release, packages for the GHCR image and
-    # Helm chart pushes.
-    permissions:
-      contents: write
-      packages: write
     env:
-      DEFAULT_BRANCH: main
-      BETA_BRANCH: develop
-      CHART_REPOSITORY: calcard-helm
+      DAV_HOST: calcard.local
+      DAV_USER: dav-tester@example.test
+      INGRESS_NGINX_REF: controller-v1.12.1
+      # Kind's default pod subnet. The application believes X-Forwarded-Proto
+      # only from a peer in APP_TRUSTED_PROXIES, so without this the ingress
+      # cannot tell it that the client leg was TLS -- and with it too wide, any
+      # pod could. The controller runs in this range and nothing outside the
+      # cluster can reach the Service at all.
+      POD_SUBNET: 10.244.0.0/16
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # For the bcrypt helper below, which seeds the app password Basic
+      # authentication is tested with.
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          fetch-depth: 0
-
-      - name: Test workflow helpers
-        run: bash .github/scripts/tag-source-branch_test.sh
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+          go-version-file: go.mod
+          cache: true
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -138,16 +159,9 @@ jobs:
         uses: helm/kind-action@v1.10.0
         with:
           cluster_name: kind
+          config: .github/kind-config.yaml
 
-      - name: Login to GHCR for Helm
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "${GHCR_PASSWORD}" | helm registry login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-
-      - name: Build image for Helm test
+      - name: Build image for the cluster
         run: |
           set -euo pipefail
           docker build -t calcard:test .
@@ -210,46 +224,38 @@ jobs:
                 targetPort: 80
           EOF
 
+      - name: Install ingress-nginx
+        run: |
+          set -euo pipefail
+          kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${INGRESS_NGINX_REF}/deploy/static/provider/kind/deploy.yaml"
+          # rollout status first: apply creates the Deployment synchronously but
+          # not its pods, and "kubectl wait pod" against a selector matching
+          # none fails outright rather than waiting for one to appear.
+          kubectl rollout status --namespace ingress-nginx \
+            deployment/ingress-nginx-controller --timeout=300s
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+      # Self-signed, because what is under test is that the transport is TLS at
+      # all, not who vouches for it. Every client below passes -k for the same
+      # reason.
+      - name: Issue a self-signed certificate for the ingress
+        run: |
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout tls.key -out tls.crt \
+            -subj "/CN=${DAV_HOST}" \
+            -addext "subjectAltName=DNS:${DAV_HOST}"
+          kubectl create secret tls calcard-tls --cert=tls.crt --key=tls.key
+          rm -f tls.key tls.crt
+
       - name: Helm install and test
         run: |
           set -euo pipefail
-          helm upgrade --install calcard-test deploy/helm/calcard \
-            --set image.repository=calcard \
-            --set image.tag=test \
-            --set image.pullPolicy=IfNotPresent \
-            --set app.baseUrl="http://calcard.local" \
-            --set app.oauth.clientId="test-client" \
-            --set app.oauth.clientSecret="test-client-secret" \
-            --set app.oauth.discoveryUrl="http://oidc-mock.default.svc.cluster.local/.well-known/openid-configuration" \
-            --set app.sessionSecret="this-is-a-very-long-session-secret-32chars" \
-            --set app.db.user=postgres \
-            --set app.db.password=postgres \
-            --set app.db.name=app \
-            --set postgres.enabled=true \
-            --set postgres.persistence.enabled=false \
-            --wait --timeout 5m || {
-              echo "Helm install failed; dumping diagnostics..."
-              helm get manifest calcard-test || true
-              kubectl get pods -o wide || true
-              kubectl describe deploy/calcard || true
-              kubectl describe pod -l app.kubernetes.io/name=calcard || true
-              kubectl logs deploy/calcard --tail=200 || true
-              kubectl logs deploy/calcard --previous --tail=200 || true
-              POD_NAME="$(kubectl get pod -l app.kubernetes.io/name=calcard -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-              if [ -n "${POD_NAME}" ]; then
-                echo "Logs for ${POD_NAME}:"
-                kubectl logs "${POD_NAME}" --tail=200 --timestamps || true
-                kubectl logs "${POD_NAME}" --previous --tail=200 --timestamps || true
-              fi
-              kubectl get configmap calcard-config -o yaml || true
-              kubectl get secret calcard-secret -o yaml || true
-              kubectl get secret calcard-db-secret -o yaml || true
-              kubectl logs statefulset/calcard-postgres --tail=200 || true
-              kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
-              exit 1
-            }
-          helm test calcard-test --timeout 2m || {
-            echo "Helm test failed; dumping diagnostics..."
+          dump_diagnostics() {
+            echo "Dumping diagnostics..."
             helm get manifest calcard-test || true
             kubectl get pods -o wide || true
             kubectl describe deploy/calcard || true
@@ -262,13 +268,240 @@ jobs:
               kubectl logs "${POD_NAME}" --tail=200 --timestamps || true
               kubectl logs "${POD_NAME}" --previous --tail=200 --timestamps || true
             fi
+            kubectl get ingress -o yaml || true
             kubectl get configmap calcard-config -o yaml || true
             kubectl get secret calcard-secret -o yaml || true
             kubectl get secret calcard-db-secret -o yaml || true
             kubectl logs statefulset/calcard-postgres --tail=200 || true
+            kubectl logs -n ingress-nginx deploy/ingress-nginx-controller --tail=200 || true
             kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
-            exit 1
           }
+
+          helm upgrade --install calcard-test deploy/helm/calcard \
+            --set image.repository=calcard \
+            --set image.tag=test \
+            --set image.pullPolicy=IfNotPresent \
+            --set app.baseUrl="https://${DAV_HOST}" \
+            --set app.trustedProxies="${POD_SUBNET}" \
+            --set app.oauth.clientId="test-client" \
+            --set app.oauth.clientSecret="test-client-secret" \
+            --set app.oauth.discoveryUrl="http://oidc-mock.default.svc.cluster.local/.well-known/openid-configuration" \
+            --set app.sessionSecret="this-is-a-very-long-session-secret-32chars" \
+            --set app.db.user=postgres \
+            --set app.db.password=postgres \
+            --set app.db.name=app \
+            --set postgres.enabled=true \
+            --set postgres.persistence.enabled=false \
+            --set ingress.enabled=true \
+            --set ingress.className=nginx \
+            --set ingress.tls.enabled=true \
+            --set ingress.tls.secretName=calcard-tls \
+            --wait --timeout 5m || { echo "Helm install failed"; dump_diagnostics; exit 1; }
+
+          helm test calcard-test --timeout 2m || { echo "Helm test failed"; dump_diagnostics; exit 1; }
+
+      # Basic authentication validates an app password against a bcrypt hash, so
+      # a real credential has to exist for the HTTPS case below to be a
+      # successful authentication rather than a rejected one. The generator is a
+      # throwaway module rather than a command in this repository: bcrypt's
+      # stored form carries its own cost and salt, so any implementation of it
+      # produces a hash the server can verify.
+      - name: Seed a DAV user and app password
+        run: |
+          set -euo pipefail
+          DAV_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::${DAV_PASSWORD}"
+          echo "DAV_PASSWORD=${DAV_PASSWORD}" >> "${GITHUB_ENV}"
+
+          TOOL="$(mktemp -d)"
+          cat > "${TOOL}/main.go" <<'EOF'
+          package main
+
+          import (
+          	"fmt"
+          	"os"
+
+          	"golang.org/x/crypto/bcrypt"
+          )
+
+          func main() {
+          	hash, err := bcrypt.GenerateFromPassword([]byte(os.Args[1]), bcrypt.DefaultCost)
+          	if err != nil {
+          		fmt.Fprintln(os.Stderr, err)
+          		os.Exit(1)
+          	}
+          	fmt.Print(string(hash))
+          }
+          EOF
+          (
+            cd "${TOOL}"
+            go mod init calcard-ci-bcrypt >/dev/null
+            go get golang.org/x/crypto/bcrypt >/dev/null
+          )
+          TOKEN_HASH="$(cd "${TOOL}" && go run . "${DAV_PASSWORD}")"
+
+          kubectl wait --for=condition=ready pod/calcard-postgres-0 --timeout=120s
+          kubectl exec -i calcard-postgres-0 -- env PGPASSWORD=postgres \
+            psql -U postgres -d app -v ON_ERROR_STOP=1 \
+            -v hash="${TOKEN_HASH}" -v email="${DAV_USER}" <<'SQL'
+          INSERT INTO users (oauth_subject, primary_email, full_name, first_name)
+          VALUES ('ci-dav-tester', :'email', 'DAV Tester', 'DAV')
+          ON CONFLICT (oauth_subject) DO UPDATE SET primary_email = EXCLUDED.primary_email;
+
+          INSERT INTO app_passwords (user_id, label, token_hash)
+          SELECT id, 'ci', :'hash' FROM users WHERE oauth_subject = 'ci-dav-tester';
+          SQL
+
+      - name: DAV discovery and Basic authentication over HTTPS
+        run: |
+          set -euo pipefail
+          https() { curl -sS -k --resolve "${DAV_HOST}:443:127.0.0.1" "$@"; }
+
+          # helm --wait covers the application, not the controller having loaded
+          # the new Ingress. Without this the first assertion below races that
+          # reload and the gate fails for a reason that is not the one it tests.
+          # The probe is OPTIONS, which /dav serves unauthenticated: a DAV
+          # header can only have come from CalCard, so it separates "routed" from
+          # the controller's own default backend answering while no rule exists.
+          echo "== waiting for the ingress to route ${DAV_HOST} =="
+          for attempt in $(seq 1 30); do
+            if https -o /dev/null -D - -X OPTIONS "https://${DAV_HOST}/dav/" 2>/dev/null | tr -d '\r' | grep -qi '^DAV:'; then
+              echo "ingress routing after ${attempt} attempt(s)"
+              break
+            fi
+            if [ "${attempt}" -eq 30 ]; then
+              echo "::error::the ingress did not route ${DAV_HOST} to CalCard within 60s"
+              kubectl get ingress -o wide || true
+              kubectl logs -n ingress-nginx deploy/ingress-nginx-controller --tail=100 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "== .well-known discovery redirects =="
+          location="$(https -o /dev/null -D - -X PROPFIND "https://${DAV_HOST}/.well-known/caldav" | tr -d '\r' | awk 'tolower($1) == "location:" { print $2 }')"
+          if [ "${location}" != "/dav/" ]; then
+            echo "::error::.well-known/caldav did not redirect to /dav/ (got '${location}')"
+            exit 1
+          fi
+
+          echo "== OPTIONS advertises the DAV compliance classes =="
+          dav_header="$(https -o /dev/null -D - -X OPTIONS "https://${DAV_HOST}/dav/" | tr -d '\r' | awk 'tolower($1) == "dav:" { $1 = ""; print }')"
+          for class in calendar-access addressbook; do
+            case "${dav_header}" in
+              *"${class}"*) ;;
+              *) echo "::error::DAV header does not advertise ${class} (got '${dav_header}')"; exit 1 ;;
+            esac
+          done
+
+          echo "== an unauthenticated PROPFIND is challenged, and the challenge offers Basic =="
+          headers="$(https -o /dev/null -D - -X PROPFIND -H 'Depth: 0' "https://${DAV_HOST}/dav/")"
+          status="$(echo "${headers}" | grep -m1 '^HTTP/' || true)"
+          case "${status}" in
+            *401*) ;;
+            *) echo "::error::unauthenticated PROPFIND over HTTPS was not challenged: ${status}"; exit 1 ;;
+          esac
+          if ! echo "${headers}" | tr -d '\r' | grep -qi '^WWW-Authenticate: *Basic'; then
+            echo "::error::HTTPS challenge did not offer Basic; the app did not see the request as secure"
+            echo "${headers}"
+            exit 1
+          fi
+
+          echo "== Basic authentication succeeds and reaches the DAV handlers =="
+          code="$(https -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \
+            -u "${DAV_USER}:${DAV_PASSWORD}" "https://${DAV_HOST}/dav/")"
+          if [ "${code}" != "207" ]; then
+            echo "::error::authenticated PROPFIND over HTTPS returned ${code}, want 207"
+            kubectl logs deploy/calcard --tail=100 || true
+            exit 1
+          fi
+
+      - name: The cleartext path can neither authenticate nor reach the DAV handlers
+        run: |
+          set -euo pipefail
+
+          echo "== the published port 80 does not serve /dav =="
+          headers="$(curl -sS -o /dev/null -D - --resolve "${DAV_HOST}:80:127.0.0.1" \
+            -X PROPFIND -H 'Depth: 0' -u "${DAV_USER}:${DAV_PASSWORD}" "http://${DAV_HOST}/dav/")"
+          status="$(echo "${headers}" | grep -m1 '^HTTP/' || true)"
+          case "${status}" in
+            *30[178]*) ;;
+            *) echo "::error::cleartext /dav was answered rather than redirected to TLS: ${status}"; echo "${headers}"; exit 1 ;;
+          esac
+
+          # The redirect above is the ingress's decision. This one is the
+          # application's: reached directly over the in-cluster cleartext
+          # Service, with credentials that work over TLS, it must refuse Basic
+          # and must not offer it in the challenge.
+          echo "== the application refuses Basic on a cleartext transport =="
+          # -i rather than "-o /dev/null -D -": the body has to reach the file
+          # for the multistatus assertion below to be capable of failing.
+          kubectl run dav-cleartext-probe \
+            --image=curlimages/curl:8.6.0 --restart=Never --quiet --rm --attach \
+            --command -- curl -sS -i \
+            -X PROPFIND -H 'Depth: 0' -u "${DAV_USER}:${DAV_PASSWORD}" \
+            "http://calcard/dav/" > cleartext-response.txt
+          cat cleartext-response.txt
+          # By match rather than by position: kubectl can write a line of its own
+          # into the attached output.
+          status="$(grep -m1 '^HTTP/' cleartext-response.txt || true)"
+          case "${status}" in
+            *401*) ;;
+            *) echo "::error::the application answered Basic over cleartext: ${status}"; exit 1 ;;
+          esac
+          if tr -d '\r' < cleartext-response.txt | grep -qi '^WWW-Authenticate: *Basic'; then
+            echo "::error::the cleartext challenge offered Basic"
+            exit 1
+          fi
+          if grep -qi 'multistatus' cleartext-response.txt; then
+            echo "::error::the cleartext request reached the DAV handlers"
+            exit 1
+          fi
+
+  docker-build-push:
+    if: github.event_name != 'pull_request'
+    needs: [test, deploy-test]
+    runs-on: ubuntu-latest
+    # contents for the tag-only GitHub Release, packages for the GHCR image and
+    # Helm chart pushes.
+    permissions:
+      contents: write
+      packages: write
+    env:
+      DEFAULT_BRANCH: main
+      BETA_BRANCH: develop
+      CHART_REPOSITORY: calcard-helm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test workflow helpers
+        run: bash .github/scripts/tag-source-branch_test.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR for Helm
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_PASSWORD}" | helm registry login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
 
       - name: Build and push image
         env:
@@ -344,7 +577,12 @@ jobs:
               SAFE_BRANCH="branch"
             fi
             CHART_VERSION="${BASE_VERSION}-${SAFE_BRANCH}.${SHORT_SHA}"
-            APP_VERSION="$(sed -n 's/^const version = \"\\(v[^\\\"]*\\)\"$/\\1/p' cmd/server/main.go | head -n1 | sed 's/^v//')"
+            # appVersion names the build the chart deploys. The binary takes
+            # its own version from VCS at build time, so the tag this commit
+            # descends from -- with the distance and short hash git appends --
+            # is the nearest the chart can name it without the Go toolchain in
+            # this job. --always still answers when no tag is reachable.
+            APP_VERSION="$(git describe --tags --always 2>/dev/null | sed 's/^v//' || true)"
             if [ -z "${APP_VERSION}" ]; then
               APP_VERSION="${SHORT_SHA}"
             fi

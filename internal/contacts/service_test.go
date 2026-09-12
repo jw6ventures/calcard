@@ -139,7 +139,7 @@ func (f *fakeContacts) ListForBookPaginated(context.Context, int64, int, int) (*
 func (f *fakeContacts) ListByUIDs(context.Context, int64, []string) ([]store.Contact, error) {
 	return nil, nil
 }
-func (f *fakeContacts) ListModifiedSince(context.Context, int64, time.Time) ([]store.Contact, error) {
+func (f *fakeContacts) ListModifiedSincePageAfter(context.Context, int64, int64, time.Time, int) ([]store.Contact, error) {
 	return nil, nil
 }
 func (f *fakeContacts) ListRecentByUser(context.Context, int64, int) ([]store.Contact, error) {
@@ -149,6 +149,9 @@ func (f *fakeContacts) MaxLastModified(context.Context, int64) (time.Time, error
 	return time.Time{}, nil
 }
 func (f *fakeContacts) ListWithBirthdaysByUser(context.Context, int64) ([]store.Contact, error) {
+	return nil, nil
+}
+func (f *fakeContacts) ListWithBirthdaysByUserLimit(context.Context, int64, int) ([]store.Contact, error) {
 	return nil, nil
 }
 func (f *fakeContacts) MoveToAddressBook(context.Context, int64, int64, string, string) error {

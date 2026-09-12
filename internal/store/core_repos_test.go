@@ -633,16 +633,67 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	}
 
 	since := now.Add(-time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
-		WithArgs(int64(7), since).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`)).
+		WithArgs(int64(7), int64(1), since, 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, nil, nil, true, now))
-	modified, err := eventRepo.ListModifiedSince(context.Background(), 7, since)
+	modified, err := eventRepo.ListModifiedSincePageAfter(context.Background(), 7, 1, since, 256)
 	if err != nil {
-		t.Fatalf("ListModifiedSince() error = %v", err)
+		t.Fatalf("ListModifiedSincePageAfter() error = %v", err)
 	}
 	if len(modified) != 1 || !modified[0].AllDay {
-		t.Fatalf("ListModifiedSince() = %#v", modified)
+		t.Fatalf("ListModifiedSincePageAfter() = %#v", modified)
+	}
+	empty, err := eventRepo.ListModifiedSincePageAfter(context.Background(), 7, 1, since, 0)
+	if err != nil {
+		t.Fatalf("ListModifiedSincePageAfter(limit 0) error = %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListModifiedSincePageAfter(limit 0) = %#v", empty)
+	}
+
+	// The unfiltered calendar page is the read idx_events_calendar_keyset
+	// exists for, and it is the one statement assembled through a builder
+	// rather than written as a literal -- so the assembled text is what has to
+	// be pinned. A leading column or an ORDER BY that stopped matching the
+	// index would drop the read back onto the primary key while staying
+	// correct, which no result assertion can see.
+	eventColumnNames := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`)).
+		WithArgs(int64(7), int64(4), 256).
+		WillReturnRows(sqlmock.NewRows(eventColumnNames).
+			AddRow(int64(5), int64(7), "uid-5", "uid-5.ics", "BEGIN:VCALENDAR", "etag-5", "Paged", nil, nil, nil, nil, true, now))
+	page, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 256, EventFilter{})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter() error = %v", err)
+	}
+	if len(page) != 1 || page[0].ID != 5 {
+		t.Fatalf("ListForCalendarPageAfter() = %#v", page)
+	}
+
+	// A time-range narrows the same page. The filter is appended between the
+	// keyset predicate and the ORDER BY, so this pins that the range does not
+	// displace either of them.
+	rangeStart := now.Add(-24 * time.Hour)
+	rangeEnd := now.Add(24 * time.Hour)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= $3 AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= $4 ORDER BY id ASC LIMIT $5`)).
+		WithArgs(int64(7), int64(4), rangeStart.UTC(), rangeEnd.UTC(), 256).
+		WillReturnRows(sqlmock.NewRows(eventColumnNames).
+			AddRow(int64(6), int64(7), "uid-6", "uid-6.ics", "BEGIN:VCALENDAR", "etag-6", "In range", nil, nil, nil, nil, true, now))
+	filtered, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 256, EventFilter{Start: &rangeStart, End: &rangeEnd})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter(filtered) error = %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != 6 {
+		t.Fatalf("ListForCalendarPageAfter(filtered) = %#v", filtered)
+	}
+
+	emptyPage, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 0, EventFilter{})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter(limit 0) error = %v", err)
+	}
+	if len(emptyPage) != 0 {
+		t.Fatalf("ListForCalendarPageAfter(limit 0) = %#v", emptyPage)
 	}
 
 	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*FROM events e.*acl_entries.*ORDER BY e.last_modified DESC.*LIMIT \$2`).
@@ -1561,16 +1612,16 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 		t.Fatalf("ListForBookPaginated() = %#v", page)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
-		WithArgs(int64(5), since).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`)).
+		WithArgs(int64(5), int64(0), since, 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
 			AddRow(int64(4), int64(5), "uid-4", "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
-	modified, err := repo.ListModifiedSince(context.Background(), 5, since)
+	modified, err := repo.ListModifiedSincePageAfter(context.Background(), 5, 0, since, 256)
 	if err != nil {
-		t.Fatalf("ListModifiedSince() error = %v", err)
+		t.Fatalf("ListModifiedSincePageAfter() error = %v", err)
 	}
 	if len(modified) != 1 || modified[0].PrimaryEmail == nil || *modified[0].PrimaryEmail != "chris@example.com" {
-		t.Fatalf("ListModifiedSince() = %#v", modified)
+		t.Fatalf("ListModifiedSincePageAfter() = %#v", modified)
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
@@ -1619,6 +1670,32 @@ ORDER BY c.display_name
 	}
 	if len(withBirthdays) != 1 || withBirthdays[0].Birthday == nil {
 		t.Fatalf("ListWithBirthdaysByUser() = %#v", withBirthdays)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
+FROM contacts c
+JOIN address_books ab ON ab.id = c.address_book_id
+WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
+ORDER BY c.display_name
+LIMIT $2
+`)).
+		WithArgs(int64(4), 257).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
+			AddRow(int64(7), int64(5), "uid-7", "uid-7", "BEGIN:VCARD", "etag-7", "Later Birthday", nil, birthday, now))
+	cappedBirthdays, err := repo.ListWithBirthdaysByUserLimit(context.Background(), 4, 257)
+	if err != nil {
+		t.Fatalf("ListWithBirthdaysByUserLimit() error = %v", err)
+	}
+	if len(cappedBirthdays) != 1 || cappedBirthdays[0].UID != "uid-7" {
+		t.Fatalf("ListWithBirthdaysByUserLimit() = %#v", cappedBirthdays)
+	}
+	emptyBirthdays, err := repo.ListWithBirthdaysByUserLimit(context.Background(), 4, 0)
+	if err != nil {
+		t.Fatalf("ListWithBirthdaysByUserLimit(limit 0) error = %v", err)
+	}
+	if len(emptyBirthdays) != 0 {
+		t.Fatalf("ListWithBirthdaysByUserLimit(limit 0) = %#v", emptyBirthdays)
 	}
 
 	mock.ExpectBegin()
@@ -2346,6 +2423,11 @@ func TestStoreCopyEventAndStateRollsBackWhenDestinationStateClearFails(t *testin
 	}
 }
 
+// baselineSchemaVersionRow is the version db.sql seeds, which every migration
+// test below asserts against: a fresh install and one upgraded through the
+// newest migration have to report the same schema version.
+const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0-rc7')"
+
 // TestCalendarPropertyColumnsMigration pins that the migration and the flattened
 // baseline schema both add the columns the calendar live properties are read
 // from, so a deployment upgraded by migration and one created from db.sql agree.
@@ -2359,7 +2441,7 @@ func TestCalendarPropertyColumnsMigration(t *testing.T) {
 		"../../db.sql": {
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[]",
-			"VALUES ('version', 'v1.1.12')",
+			baselineSchemaVersionRow,
 		},
 	}
 	for path, expected := range sources {
@@ -2392,7 +2474,7 @@ func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T)
 			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
 			"digest_md5_ha1 TEXT NULL",
 			"digest_sha256_ha1 TEXT NULL",
-			"VALUES ('version', 'v1.1.12')",
+			baselineSchemaVersionRow,
 		},
 	}
 	for path, expected := range sources {
@@ -2427,7 +2509,7 @@ func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
 		"../../db.sql": {
 			startIndex,
 			untilIndex,
-			"VALUES ('version', 'v1.1.12')",
+			baselineSchemaVersionRow,
 		},
 		"postgres.go": {
 			"COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= ",
@@ -2443,6 +2525,67 @@ func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
 			if !strings.Contains(string(contents), want) {
 				t.Errorf("%s is missing %q", path, want)
 			}
+		}
+	}
+}
+
+// Each keyset index exists for the statements that page a collection by id, so
+// the indexes and every one of those statements are pinned together: a leading
+// column or an ORDER BY that stopped matching would silently drop the read back
+// onto the primary key, which stays correct while costing the whole table.
+func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
+	eventsIndex := "CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset\n    ON events (calendar_id, id)"
+	contactsIndex := "CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset\n    ON contacts (address_book_id, id)"
+	deletedIndex := "CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset\n    ON deleted_resources (resource_type, collection_id, id)"
+
+	sources := map[string][]string{
+		"../../migrations/v1.2.0-rc7.sql": {
+			eventsIndex,
+			contactsIndex,
+			deletedIndex,
+			"DROP INDEX IF EXISTS idx_events_calendar_id",
+			"DROP INDEX IF EXISTS idx_contacts_address_book_id",
+			"UPDATE application SET value = 'v1.2.0-rc7'",
+		},
+		"../../db.sql": {
+			"CREATE INDEX idx_events_calendar_keyset ON events(calendar_id, id);",
+			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);",
+			"CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);",
+			baselineSchemaVersionRow,
+		},
+		"postgres.go": {
+			"FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3",
+			"FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5",
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+// db.sql must not still create an index the newest migration drops, or a fresh
+// install carries one an upgraded deployment does not.
+func TestBaselineSchemaDropsSupersededIndexes(t *testing.T) {
+	contents, err := os.ReadFile("../../db.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(db.sql) error = %v", err)
+	}
+	for _, superseded := range []string{
+		"CREATE INDEX idx_events_calendar_id ON events(calendar_id);",
+		"CREATE INDEX idx_contacts_address_book_id ON contacts(address_book_id);",
+	} {
+		if strings.Contains(string(contents), superseded) {
+			t.Errorf("db.sql still creates %q, which the keyset migration drops", superseded)
 		}
 	}
 }

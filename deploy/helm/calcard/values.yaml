@@ -82,7 +82,7 @@ app:
 
 # Kubernetes Service that fronts the app pods.
 service:
-  type: ClusterIP # Service type: ClusterIP, NodePort, or LoadBalancer.
+  type: ClusterIP # Service type. Must stay ClusterIP while ingress.enabled is true: the app accepts HTTP Basic only over TLS (RFC 4791 Section 11), so no route may publish the cleartext port beside the ingress. Set NodePort or LoadBalancer only with ingress.enabled=false, terminating TLS yourself.
   port: 80 # Port the Service listens on (the container always listens on 8080).
 
 # Ingress for external HTTP(S) access.

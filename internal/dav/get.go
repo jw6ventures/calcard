@@ -47,6 +47,10 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 		if calendarID == birthdayCalendarID {
 			events, err := h.generateBirthdayEvents(r.Context(), user.ID)
 			if err != nil {
+				if errors.Is(err, errTooManyCandidateRows) {
+					writeInsufficientStorage(w)
+					return
+				}
 				http.Error(w, "failed to load birthday events", http.StatusInternalServerError)
 				return
 			}

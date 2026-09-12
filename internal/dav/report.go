@@ -277,7 +277,7 @@ func writeReportError(w http.ResponseWriter, err error) {
 	case errors.Is(err, errNumberOfMatchesExceeded):
 		writeNumberOfMatchesWithinLimits(w)
 	case errors.Is(err, errTooManyHrefs), errors.Is(err, errTooManyCandidateRows):
-		http.Error(w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+		writeInsufficientStorage(w)
 	case errors.Is(err, errUnsupportedReport):
 		writeDAVError(w, http.StatusForbidden, "supported-report")
 	case errors.Is(err, errInvalidSyncToken):
@@ -310,16 +310,28 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if report.XMLName.Local == "free-busy-query" {
-		events, err := h.generateBirthdayEvents(r.Context(), user.ID)
-		if err != nil {
-			http.Error(w, "failed to generate birthday events", http.StatusInternalServerError)
-			return
-		}
-		// Free-busy carries no CALDAV:timezone element of its own, and the
-		// generated birthday collection defines no CALDAV:calendar-timezone, so
-		// §7.3 leaves UTC as the only source for a floating value.
+		// Out of Depth reach the report publishes nothing, so the collection is
+		// not generated at all -- the stored path answers §7.10's empty
+		// VFREEBUSY without a read, and a budget this request cannot spend must
+		// not refuse it either.
 		var candidates []freeBusyCandidate
 		if !freeBusyExcludedByDepth(r, report) {
+			events, err := h.generateBirthdayEvents(r.Context(), user.ID)
+			if err != nil {
+				if errors.Is(err, errTooManyCandidateRows) {
+					// §7.10 gives free-busy-query the §7.8 postcondition, which
+					// the stored path already answers a refused candidate read
+					// with.
+					writeReportError(w, errNumberOfMatchesExceeded)
+					return
+				}
+				http.Error(w, "failed to generate birthday events", http.StatusInternalServerError)
+				return
+			}
+			// Free-busy carries no CALDAV:timezone element of its own, and the
+			// generated birthday collection defines no
+			// CALDAV:calendar-timezone, so §7.3 leaves UTC as the only source
+			// for a floating value.
 			candidates = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
 		}
 		freeBusyData := h.generateFreeBusy(candidates, report.TimeRange)
