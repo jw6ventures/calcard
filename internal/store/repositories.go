@@ -78,7 +78,6 @@ type ContactRepository interface {
 	ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]Contact, error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MaxLastModified(ctx context.Context, addressBookID int64) (time.Time, error)
-	ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error)
 	ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error
 	GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*Contact, error)

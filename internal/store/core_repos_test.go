@@ -633,7 +633,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	}
 
 	since := now.Add(-time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4`)).
 		WithArgs(int64(7), int64(1), since, 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, nil, nil, true, now))
@@ -659,7 +659,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	// index would drop the read back onto the primary key while staying
 	// correct, which no result assertion can see.
 	eventColumnNames := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) ORDER BY calendar_id ASC, id ASC LIMIT $3`)).
 		WithArgs(int64(7), int64(4), 256).
 		WillReturnRows(sqlmock.NewRows(eventColumnNames).
 			AddRow(int64(5), int64(7), "uid-5", "uid-5.ics", "BEGIN:VCALENDAR", "etag-5", "Paged", nil, nil, nil, nil, true, now))
@@ -676,7 +676,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 	// displace either of them.
 	rangeStart := now.Add(-24 * time.Hour)
 	rangeEnd := now.Add(24 * time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND id>$2 AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= $3 AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= $4 ORDER BY id ASC LIMIT $5`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= $3 AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= $4 ORDER BY calendar_id ASC, id ASC LIMIT $5`)).
 		WithArgs(int64(7), int64(4), rangeStart.UTC(), rangeEnd.UTC(), 256).
 		WillReturnRows(sqlmock.NewRows(eventColumnNames).
 			AddRow(int64(6), int64(7), "uid-6", "uid-6.ics", "BEGIN:VCALENDAR", "etag-6", "In range", nil, nil, nil, nil, true, now))
@@ -1612,7 +1612,7 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 		t.Fatalf("ListForBookPaginated() = %#v", page)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4`)).
 		WithArgs(int64(5), int64(0), since, 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
 			AddRow(int64(4), int64(5), "uid-4", "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
@@ -1652,24 +1652,6 @@ LIMIT $2
 	}
 	if max.Location() != time.UTC || max.Hour() != 14 {
 		t.Fatalf("MaxLastModified() = %v", max)
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
-FROM contacts c
-JOIN address_books ab ON ab.id = c.address_book_id
-WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
-ORDER BY c.display_name
-`)).
-		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(6), int64(5), "uid-6", "uid-6", "BEGIN:VCARD", "etag-6", "Birthday Person", nil, birthday, now))
-	withBirthdays, err := repo.ListWithBirthdaysByUser(context.Background(), 4)
-	if err != nil {
-		t.Fatalf("ListWithBirthdaysByUser() error = %v", err)
-	}
-	if len(withBirthdays) != 1 || withBirthdays[0].Birthday == nil {
-		t.Fatalf("ListWithBirthdaysByUser() = %#v", withBirthdays)
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
@@ -2426,7 +2408,7 @@ func TestStoreCopyEventAndStateRollsBackWhenDestinationStateClearFails(t *testin
 // baselineSchemaVersionRow is the version db.sql seeds, which every migration
 // test below asserts against: a fresh install and one upgraded through the
 // newest migration have to report the same schema version.
-const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0-rc7')"
+const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0-rc8')"
 
 // TestCalendarPropertyColumnsMigration pins that the migration and the flattened
 // baseline schema both add the columns the calendar live properties are read
@@ -2529,34 +2511,56 @@ func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
 	}
 }
 
-// Each keyset index exists for the statements that page a collection by id, so
-// the indexes and every one of those statements are pinned together: a leading
-// column or an ORDER BY that stopped matching would silently drop the read back
-// onto the primary key, which stays correct while costing the whole table.
+// Each keyset index exists for the statements that page a collection, so the
+// indexes and every one of those statements are pinned together. Two things have
+// to stay in step or the read silently drops back onto the primary key, which
+// stays correct while costing the whole table: the row-comparison cursor, which
+// is what the primary key cannot answer as an index bound, and the ORDER BY that
+// names the leading column so the index provides the order. The trailing filter
+// columns are pinned for the same reason -- without them the predicate moves off
+// the index tuple and back onto the heap.
+//
+// The collection equality is pinned for a different reason, and a stronger one:
+// it is not a duplicate of the row comparison but the clause that scopes the read
+// to one collection. `(collection, id) > ($1, $2)` on its own also admits every
+// row of every collection whose id is higher, which is another user's data, so
+// removing the equality as redundant would turn a paged read into a cross-
+// collection one.
 func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
-	eventsIndex := "CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset\n    ON events (calendar_id, id)"
-	contactsIndex := "CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset\n    ON contacts (address_book_id, id)"
-	deletedIndex := "CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset\n    ON deleted_resources (resource_type, collection_id, id)"
+	eventsIndex := "idx_events_calendar_keyset ON events (\n    calendar_id, id, last_modified,\n" +
+		"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
+		"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz))"
+	contactsIndex := "idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified)"
 
 	sources := map[string][]string{
-		"../../migrations/v1.2.0-rc7.sql": {
+		"../../migrations/v1.2.0-rc8.sql": {
 			eventsIndex,
 			contactsIndex,
-			deletedIndex,
+			"DROP INDEX IF EXISTS idx_events_calendar_keyset",
+			"DROP INDEX IF EXISTS idx_contacts_book_keyset",
+			"UPDATE application SET value = 'v1.2.0-rc8'",
+		},
+		"../../migrations/v1.2.0-rc7.sql": {
+			"CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset\n    ON deleted_resources (resource_type, collection_id, id)",
 			"DROP INDEX IF EXISTS idx_events_calendar_id",
 			"DROP INDEX IF EXISTS idx_contacts_address_book_id",
 			"UPDATE application SET value = 'v1.2.0-rc7'",
 		},
 		"../../db.sql": {
-			"CREATE INDEX idx_events_calendar_keyset ON events(calendar_id, id);",
-			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);",
+			"CREATE INDEX idx_events_calendar_keyset ON events(\n    calendar_id, id, last_modified,\n" +
+				"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
+				"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));",
+			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);",
 			"CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);",
 			baselineSchemaVersionRow,
 		},
 		"postgres.go": {
-			"FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4",
-			"FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4",
-			"FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3",
+			"FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) ORDER BY address_book_id ASC, id ASC LIMIT $3",
+			// deleted_resources keeps the plain cursor: its lookup index leads on
+			// deleted_at, which is the more selective bound for every sync that
+			// reads it, and the row comparison does not improve on that plan.
 			"FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5",
 		},
 	}

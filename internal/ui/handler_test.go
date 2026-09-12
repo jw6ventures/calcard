@@ -3333,10 +3333,6 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 	return time.Time{}, nil
 }
 
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	return nil, nil
-}
-
 func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
@@ -3590,14 +3586,12 @@ func (f *fakeContactRepoWithUpsert) MoveToAddressBook(ctx context.Context, fromA
 
 type fakeContactRepoWithBirthdays struct {
 	fakeContactRepo
-	birthdays []store.Contact
-}
-
-func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	return f.birthdays, nil
+	birthdays     []store.Contact
+	birthdayLimit int
 }
 
 func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
+	f.birthdayLimit = limit
 	return truncateToLimit(f.birthdays, limit), nil
 }
 
@@ -4209,5 +4203,74 @@ func TestUpdateEventRequiresDates(t *testing.T) {
 	}
 	if !strings.Contains(updatedEvent.RawICAL, "Original Summary") {
 		t.Error("event summary should remain unchanged when dates are missing")
+	}
+}
+
+// The rendered birthdays page serializes the whole set into the page, so an
+// unbounded read is an unbounded response. It shares MaxReportCandidateRows with
+// the DAV birthday collection, which is generated from the same rows.
+func TestViewBirthdaysBoundsTheContactRead(t *testing.T) {
+	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "John Doe"
+	birthdays := make([]store.Contact, 0, 40)
+	for id := int64(1); id <= 40; id++ {
+		birthdays = append(birthdays, store.Contact{
+			ID: id, UID: fmt.Sprintf("contact-%d", id), DisplayName: &displayName, Birthday: &bday,
+		})
+	}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays:       birthdays,
+	}
+	cfg := &config.Config{}
+	cfg.DAV.MaxReportCandidateRows = 10
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if contactRepo.birthdayLimit != 11 {
+		t.Fatalf("read limit = %d, want the budget plus the row that proves it was exceeded", contactRepo.birthdayLimit)
+	}
+	body := w.Body.String()
+	if strings.Count(body, `"ContactUID"`) != 10 {
+		t.Fatalf("rendered %d contacts, want the 10 the budget allows; body: %s", strings.Count(body, `"ContactUID"`), body)
+	}
+	// A page showing part of the set has to say so, or it reads as the whole.
+	if !strings.Contains(body, "Not all of your birthdays are shown") {
+		t.Fatalf("a truncated page carries no notice; body: %s", body)
+	}
+}
+
+// Inside the budget the page is complete and carries no notice.
+func TestViewBirthdaysInsideTheBudgetIsComplete(t *testing.T) {
+	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "John Doe"
+	birthdays := []store.Contact{
+		{ID: 1, UID: "contact-1", DisplayName: &displayName, Birthday: &bday},
+	}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays:       birthdays,
+	}
+	cfg := &config.Config{}
+	cfg.DAV.MaxReportCandidateRows = 10
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if strings.Contains(w.Body.String(), "Not all of your birthdays are shown") {
+		t.Fatal("a complete page carries a truncation notice")
 	}
 }

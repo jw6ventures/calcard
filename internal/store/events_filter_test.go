@@ -76,7 +76,7 @@ func TestListForCalendarPageAfterUsesKeysetAndFilter(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`(?s)FROM events WHERE calendar_id=\$1 AND id>\$2.*COALESCE\(recurrence_until, dtend, 'infinity'::timestamptz\) >= \$3.*summary ILIKE \$4.*ORDER BY id ASC LIMIT \$5`).
+	mock.ExpectQuery(`(?s)FROM events WHERE calendar_id=\$1 AND \(calendar_id, id\) > \(\$1, \$2\).*COALESCE\(recurrence_until, dtend, 'infinity'::timestamptz\) >= \$3.*summary ILIKE \$4.*ORDER BY calendar_id ASC, id ASC LIMIT \$5`).
 		WithArgs(int64(7), int64(100), start, `%planning%`, 256).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag",

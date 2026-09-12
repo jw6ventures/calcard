@@ -42,10 +42,19 @@ data:
   {{- if hasKey . "maxReportElementDepth" }}
   APP_DAV_MAX_REPORT_ELEMENT_DEPTH: {{ .maxReportElementDepth | quote }}
   {{- end }}
+  {{- if hasKey . "maxCardDAVQueryBytes" }}
+  APP_DAV_MAX_CARDDAV_QUERY_BYTES: {{ .maxCardDAVQueryBytes | quote }}
+  {{- end }}
+  {{- if hasKey . "maxAddressDataProperties" }}
+  APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: {{ .maxAddressDataProperties | quote }}
+  {{- end }}
   {{- if hasKey . "maxMultigetHrefs" }}
   APP_DAV_MAX_MULTIGET_HREFS: {{ .maxMultigetHrefs | quote }}
   {{- end }}
   {{- if hasKey . "maxReportCandidateRows" }}
   APP_DAV_MAX_REPORT_CANDIDATE_ROWS: {{ .maxReportCandidateRows | quote }}
+  {{- end }}
+  {{- if hasKey . "syncHistoryRetention" }}
+  APP_DAV_SYNC_HISTORY_RETENTION: {{ .syncHistoryRetention | quote }}
   {{- end }}
   {{- end }}

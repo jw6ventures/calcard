@@ -364,6 +364,26 @@ func collationFold(s, collation string) string {
 	}
 }
 
+// prepareCardFilter folds search text once for the request, including parameter
+// matches. The decoded filter belongs exclusively to this request.
+func prepareCardFilter(filter *cardFilter) {
+	if filter == nil {
+		return
+	}
+	prepare := func(match *textMatch) {
+		if match != nil {
+			folded := collationFold(strings.TrimSpace(match.Text), match.Collation)
+			match.foldedText = &folded
+		}
+	}
+	for _, prop := range filter.PropFilter {
+		prepare(prop.TextMatch)
+		for _, param := range prop.ParamFilter {
+			prepare(param.TextMatch)
+		}
+	}
+}
+
 func matchTextValue(value string, textMatch *textMatch) bool {
 	if textMatch == nil {
 		return true
@@ -373,7 +393,12 @@ func matchTextValue(value string, textMatch *textMatch) bool {
 		collation = textMatch.Collation
 	}
 	candidate := collationFold(value, collation)
-	needle := collationFold(strings.TrimSpace(textMatch.Text), collation)
+	var needle string
+	if textMatch.foldedText != nil {
+		needle = *textMatch.foldedText
+	} else {
+		needle = collationFold(strings.TrimSpace(textMatch.Text), collation)
+	}
 	matchType := strings.ToLower(strings.TrimSpace(textMatch.MatchType))
 	matches := false
 	switch matchType {

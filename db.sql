@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.2.0-rc7')
+VALUES ('version', 'v1.2.0-rc8')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -234,13 +234,15 @@ ALTER TABLE contacts ADD COLUMN birthday DATE;
 CREATE INDEX idx_contacts_birthday ON contacts(address_book_id, birthday) WHERE birthday IS NOT NULL;
 CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS NOT NULL;
 
--- Keyset indexes for the DAV report reads, which page a single collection with
--- WHERE <collection>=$1 AND id>$2 ORDER BY id. Without an index ordering one
--- collection by id the planner answers that with the primary key, walking the
--- table from the last id the caller saw and discarding every row belonging to
--- another collection.
-CREATE INDEX idx_events_calendar_keyset ON events(calendar_id, id);
-CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);
+-- Keyset indexes for the DAV report reads, which page a single collection by
+-- (collection, id). The reads spell the cursor as a row comparison, which the
+-- primary key cannot answer as an index bound, so these are what serves them
+-- whatever fraction of the table one collection holds. The trailing columns are
+-- the predicates the paged reads narrow on: carried here they are evaluated on
+-- the index tuple, so a page no longer visits the heap for a row it discards.
+-- idx_events_calendar_keyset is created below, with the recurrence columns its
+-- trailing expressions read.
+CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);
 CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);
 
 -- Lock storage for WebDAV Class 2/3 compliance
@@ -382,6 +384,13 @@ CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
 
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
     ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
+
+-- The events keyset index, created here rather than beside the other two
+-- because its trailing expressions read the recurrence columns added just above.
+CREATE INDEX idx_events_calendar_keyset ON events(
+    calendar_id, id, last_modified,
+    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
+    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
 -- Persistent WebDAV dead properties and batched ACL lookup support.
 CREATE TABLE IF NOT EXISTS dav_dead_properties (

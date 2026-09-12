@@ -50,14 +50,15 @@ func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.
 }
 
 func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, filter *cardFilter, reqProp *reportProp, addressDataReq *addressDataQuery, limit *addressbookLimit) ([]response, error) {
-	targetResourceName := ""
 	if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathAddressBook && target.Resource {
-		targetResourceName = target.ResourceName
+		baseHref := strings.TrimSuffix(strings.TrimSuffix(cleanPath, "/"), "/"+target.ResourceName+".vcf") + "/"
+		return h.addressBookObjectQuery(ctx, user, book, baseHref, target.ResourceName, filter, reqProp, addressDataReq)
 	}
-	baseHref := strings.TrimSuffix(cleanPath, "/") + "/"
-	if targetResourceName != "" {
-		baseHref = strings.TrimSuffix(strings.TrimSuffix(cleanPath, "/"), "/"+targetResourceName+".vcf") + "/"
-	}
+	baseHref := ensureCollectionHref(cleanPath)
+	// The §8.6.2 truncation marker names the Request-URI, which is this
+	// collection: cleanPath has had any trailing slash cleaned off it, and a
+	// collection href carries one.
+	requestHref := baseHref
 	stopAfter := h.multistatusBuildLimit()
 	clientLimit := 0
 	if limit != nil && limit.NResults > 0 {
@@ -66,6 +67,9 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 			stopAfter = clientLimit + 1
 		}
 	}
+	rowLimit := h.reportCandidateRowLimit()
+	truncated := false
+	scanned := 0
 	var responses []response
 	afterID := int64(0)
 	for len(responses) < stopAfter {
@@ -75,6 +79,21 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 		}
 		if len(contacts) == 0 {
 			break
+		}
+		// A filter matching nothing costs the same parse per contact as one
+		// matching everything, so the row budget is what bounds a query whose
+		// response count never grows. A page reaching past the budget is trimmed
+		// to what is left of it rather than dropped, so no candidate row the
+		// budget allows goes unexamined -- dropping it would answer nothing at
+		// all for a budget shorter than one page. The query then stops reading
+		// and reports what it has under the §8.6.2 truncation marker.
+		scanned += len(contacts)
+		if scanned > rowLimit {
+			contacts = contacts[:len(contacts)-(scanned-rowLimit)]
+			truncated = true
+			if len(contacts) == 0 {
+				break
+			}
 		}
 		resourceNames := make([]string, 0, len(contacts))
 		for _, contact := range contacts {
@@ -87,9 +106,6 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 		decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
 		for _, contact := range contacts {
 			resourceName := contactResourceName(contact)
-			if targetResourceName != "" && resourceName != targetResourceName {
-				continue
-			}
 			if !canReadAddressBookContactWithDecider(resourceName, decider) || !contactMatchesCardFilter(contact, filter) {
 				continue
 			}
@@ -103,19 +119,71 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 				break
 			}
 		}
+		if truncated {
+			break
+		}
 		lastID := contacts[len(contacts)-1].ID
 		if lastID <= afterID || len(contacts) < multistatusPageSize {
 			break
 		}
 		afterID = lastID
 	}
+	// RFC 6352 §8.6.2 covers a limit the client asked for and a limit the server
+	// imposes "to limit the amount of work expended in processing a query" with
+	// one answer: a 207 whose DAV:response for the Request-URI carries 507 and
+	// the DAV:number-of-matches-within-limits precondition, beside the partial
+	// results. §8.6.2 excludes that marker from a client-requested count, so the
+	// client limit trims to itself; the server's own response ceiling counts
+	// every DAV:response it returns, so the matches are capped one slot short of
+	// it to leave the marker room.
 	if clientLimit > 0 && len(responses) > clientLimit {
 		responses = responses[:clientLimit]
+		truncated = true
+	}
+	if maxResponses := h.maxReportResponses(); len(responses) >= maxResponses {
+		if len(responses) > maxResponses {
+			truncated = true
+		}
+		if truncated {
+			responses = responses[:maxResponses-1]
+		}
+	}
+	if truncated {
 		responses = append(responses, response{
-			Href:   cleanPath,
+			Href:   requestHref,
 			Status: "HTTP/1.1 507 Insufficient Storage",
 			Error:  &responseError{NumberOfMatchesWithinLimits: &struct{}{}},
 		})
+	}
+	return h.finishReportResponses(ctx, user, responses, propertySelector{Prop: reqProp}, false, addressDataReq)
+}
+
+// addressBookObjectQuery answers the report RFC 6352 §8.6 serves on an address
+// object resource, which is one read of the resource the Request-URI names. The
+// collection path above cannot serve it: paging the whole book to find one
+// contact spends the candidate-row budget on rows the report can never answer
+// over, so a book past that budget would answer the §8.6.2 truncation marker
+// instead of the resource asked for. It is the CardDAV counterpart of
+// calendarObjectQuery.
+func (h *DavServer) addressBookObjectQuery(ctx context.Context, user *store.User, book *store.AddressBook, baseHref, resourceName string, filter *cardFilter, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
+	contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, resourceName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch contact")
+	}
+	var responses []response
+	if contact != nil && contactMatchesCardFilter(*contact, filter) {
+		visible, err := h.filterReadableAddressBookContacts(ctx, user, book, []store.Contact{*contact})
+		if err != nil {
+			return nil, err
+		}
+		for _, readable := range visible {
+			href := addressObjectHref(baseHref, contactResourceName(readable))
+			resp, err := h.buildAddressObjectReportResponse(href, readable, reqProp, addressDataReq)
+			if err != nil {
+				return nil, err
+			}
+			responses = append(responses, resp)
+		}
 	}
 	return h.finishReportResponses(ctx, user, responses, propertySelector{Prop: reqProp}, false, addressDataReq)
 }
@@ -124,8 +192,13 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	if len(hrefs) == 0 {
 		return nil, fmt.Errorf("href required")
 	}
-	if buildLimit := h.multistatusBuildLimit(); len(hrefs) > buildLimit {
-		hrefs = hrefs[:buildLimit]
+	// RFC 6352 §8.7 owes one DAV:response per DAV:href and states no truncation
+	// rule of its own -- §8.6.2 is scoped to addressbook-query -- so a list past
+	// what the server will answer is refused with the RFC 4918 capacity status
+	// rather than trimmed, which would present the leading hrefs as the whole
+	// answer.
+	if len(hrefs) > h.multigetHrefLimit() {
+		return nil, errTooManyHrefs
 	}
 	bookID := book.ID
 	targetResourceName := ""
@@ -224,6 +297,9 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		if err != nil || info.Kind != "card" || info.ID != book.ID {
 			return nil, "", errInvalidSyncToken
 		}
+		if !h.syncTokenAnswerable(info.Timestamp, book.UpdatedAt) {
+			return nil, "", errInvalidSyncToken
+		}
 		since = info.Timestamp
 	}
 
@@ -298,6 +374,9 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	responses, err = h.finishReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, false, addressDataReq)
 	if err != nil {
 		return nil, "", err
+	}
+	if !h.syncTokenAnswerable(since, book.UpdatedAt) {
+		return nil, "", errInvalidSyncToken
 	}
 	return responses, syncToken, nil
 }

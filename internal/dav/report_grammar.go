@@ -189,3 +189,7 @@ func davQName(local string) xml.Name {
 func calDAVQName(local string) xml.Name {
 	return xml.Name{Space: namespaceCalDAV, Local: local}
 }
+
+func cardDAVQName(local string) xml.Name {
+	return xml.Name{Space: namespaceCardDAV, Local: local}
+}

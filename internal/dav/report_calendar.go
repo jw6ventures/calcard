@@ -597,6 +597,9 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 		if err != nil || info.Kind != "cal" || info.ID != req.cal.ID {
 			return nil, "", errInvalidSyncToken
 		}
+		if !h.syncTokenAnswerable(info.Timestamp, req.cal.UpdatedAt) {
+			return nil, "", errInvalidSyncToken
+		}
 		since = info.Timestamp
 	}
 
@@ -678,6 +681,9 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 	responses, err = h.finishCalendarReportResponses(ctx, req.user, responses, propertySelector{Prop: report.Prop}, req.projection.requested())
 	if err != nil {
 		return nil, "", err
+	}
+	if !h.syncTokenAnswerable(since, req.cal.UpdatedAt) {
+		return nil, "", errInvalidSyncToken
 	}
 	return responses, syncToken, nil
 }

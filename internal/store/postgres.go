@@ -698,11 +698,23 @@ func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, af
 	if limit <= 0 {
 		return []Event{}, nil
 	}
-	// idx_events_calendar_keyset orders a single calendar by id, which is what
-	// keeps this page off the primary key: without it the planner walks the
-	// table from afterID and discards every row belonging to another calendar.
+	// The cursor is a row comparison rather than `id>$2`, which is what keeps
+	// this page on idx_events_calendar_keyset. Spelled the plain way,
+	// events_pkey answers the ORDER BY as well, and the planner costs a pkey
+	// scan by assuming the calendar's rows are spread evenly through the id
+	// range -- wrong in the expensive direction for a calendar holding a large
+	// fraction of the table, where the scan discards every row belonging to
+	// another calendar. A row comparison is not an index bound the primary key
+	// can use at all.
+	//
+	// The equality beside it is what scopes the read to one calendar and may not
+	// be dropped as a duplicate of the row comparison: `(calendar_id, id) >
+	// ($1, $2)` also admits every row of every calendar whose id is higher,
+	// which is another user's collection.
+	//
+	// The two together are one index bound, so the equality costs nothing.
 	var sb strings.Builder
-	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND id>$2`)
+	sb.WriteString(`SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2)`)
 	args := []any{calendarID, afterID}
 	placeholder := func(v any) string {
 		args = append(args, v)
@@ -738,7 +750,10 @@ func (r *eventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, af
 		sb.WriteString(p)
 		sb.WriteString(`)`)
 	}
-	sb.WriteString(` ORDER BY id ASC LIMIT `)
+	// The sort key names the leading column so the index provides the order.
+	// With calendar_id fixed by the equality the two spellings select the same
+	// rows in the same order.
+	sb.WriteString(` ORDER BY calendar_id ASC, id ASC LIMIT `)
 	sb.WriteString(placeholder(limit))
 
 	defer observeDB(ctx, "events.list_for_calendar_page_after")()
@@ -802,7 +817,9 @@ func (r *eventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, 
 	if limit <= 0 {
 		return []Event{}, nil
 	}
-	const q = `SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`
+	// The collection equality scopes the read and the row comparison pins the
+	// keyset index; ListForCalendarPageAfter carries why neither may be dropped.
+	const q = `SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4`
 	defer observeDB(ctx, "events.list_modified_since_page_after")()
 	rows, err := r.pool.QueryContext(ctx, q, calendarID, afterID, since, limit)
 	if err != nil {
@@ -1433,7 +1450,9 @@ func (r *contactRepo) ListForBookPageAfter(ctx context.Context, addressBookID, a
 	if limit <= 0 {
 		return []Contact{}, nil
 	}
-	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`
+	// The collection equality scopes the read and the row comparison pins the
+	// keyset index; ListForCalendarPageAfter carries why neither may be dropped.
+	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) ORDER BY address_book_id ASC, id ASC LIMIT $3`
 	defer observeDB(ctx, "contacts.list_for_book_page_after")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, limit)
 	if err != nil {
@@ -1555,7 +1574,9 @@ func (r *contactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBoo
 	if limit <= 0 {
 		return []Contact{}, nil
 	}
-	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND id>$2 AND last_modified > $3 ORDER BY id ASC LIMIT $4`
+	// The collection equality scopes the read and the row comparison pins the
+	// keyset index; ListForCalendarPageAfter carries why neither may be dropped.
+	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4`
 	defer observeDB(ctx, "contacts.list_modified_since_page_after")()
 	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, since, limit)
 	if err != nil {
@@ -1609,32 +1630,6 @@ func (r *contactRepo) MaxLastModified(ctx context.Context, addressBookID int64) 
 		return time.Time{}, err
 	}
 	return ts.UTC(), nil
-}
-
-func (r *contactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error) {
-	const q = `
-SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
-FROM contacts c
-JOIN address_books ab ON ab.id = c.address_book_id
-WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
-ORDER BY c.display_name
-`
-	defer observeDB(ctx, "contacts.list_with_birthdays_by_user")()
-	rows, err := r.pool.QueryContext(ctx, q, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var result []Contact
-	for rows.Next() {
-		c, err := scanContact(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, c)
-	}
-	return result, rows.Err()
 }
 
 // ListWithBirthdaysByUserLimit is that set truncated to limit rows. The set

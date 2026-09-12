@@ -53,11 +53,18 @@ type Config struct {
 		PropfindInfinityEnabled bool
 		MaxMultistatusResponses int
 		MaxMultistatusBytes     int
-		// MaxFilterElements bounds how many filter elements one CALDAV:filter
-		// may carry. Every one of them is evaluated against every candidate
-		// resource, so an unbounded count is the CPU exhaustion RFC 4791 §11
-		// asks a server to guard against.
+		// MaxFilterElements bounds how many filter elements one CALDAV:filter or
+		// CARDDAV:filter may carry. Every one of them is evaluated against every
+		// candidate resource, so an unbounded count is the CPU exhaustion
+		// RFC 4791 §11 asks a server to guard against; the two grammars cost the
+		// same per element and share the one budget, though which failure they
+		// raise past it differs, since RFC 6352 defines no CALDAV:valid-filter
+		// counterpart.
 		MaxFilterElements int
+		// MaxCardDAVQueryBytes bounds the combined serialized filter and
+		// address-data metadata evaluated for each contact in a REPORT.
+		MaxCardDAVQueryBytes     int
+		MaxAddressDataProperties int
 		// MaxReportElementDepth bounds the nesting of the recursive REPORT
 		// grammar elements, CALDAV:comp-filter and the CALDAV:comp of
 		// CALDAV:calendar-data. RFC 4791's own component tree reaches
@@ -71,6 +78,21 @@ type Config struct {
 		// reads and parses before its matches are declared outside the
 		// server's predefined limits.
 		MaxReportCandidateRows int
+		// SyncHistoryRetention is how far back the server keeps deletion
+		// history for incremental sync. It sets two things at once, because
+		// they are the same fact: tombstones older than this are pruned, and a
+		// DAV:sync-token naming an instant before it is refused with
+		// DAV:valid-sync-token so the client falls back to a full
+		// synchronization, as RFC 6578 §3.2 provides for. Pruning without that
+		// refusal would lose a deletion silently. Zero turns pruning off and
+		// leaves every token answerable, at the cost of a table that only
+		// grows.
+		//
+		// The window may be narrowed at will but widened only when no client
+		// holds a token older than the previous one: raising it re-admits tokens
+		// whose tombstones the old window already pruned, and the deletions
+		// between the two windows are then never reported.
+		SyncHistoryRetention time.Duration
 	}
 
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
@@ -161,6 +183,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.DAV.MaxCardDAVQueryBytes, err = getenvLimitDefault("APP_DAV_MAX_CARDDAV_QUERY_BYTES", 65536)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxAddressDataProperties, err = getenvLimitDefault("APP_DAV_MAX_ADDRESS_DATA_PROPERTIES", 100)
+	if err != nil {
+		return nil, err
+	}
 	cfg.DAV.MaxReportElementDepth, err = getenvLimitDefault("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", 20)
 	if err != nil {
 		return nil, err
@@ -170,6 +200,13 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.DAV.MaxReportCandidateRows, err = getenvLimitDefault("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", 50000)
+	if err != nil {
+		return nil, err
+	}
+	// 90 days is four times the "3 weeks worth of changes" RFC 6578 §3.2 offers
+	// as its own example of a retention a server may hold, so a client syncing
+	// anything like regularly is never sent back for a full synchronization.
+	cfg.DAV.SyncHistoryRetention, err = getenvWindowDefault("APP_DAV_SYNC_HISTORY_RETENTION", 90*24*time.Hour)
 	if err != nil {
 		return nil, err
 	}
@@ -273,6 +310,23 @@ func getenvDurationDefault(key string, def time.Duration) (time.Duration, error)
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return d, nil
+}
+
+// getenvWindowDefault reads a duration where 0 turns the behavior off rather
+// than being rejected, which is what getenvLimitDefault does for the integer
+// limits. A window carries no unlimited sentinel: zero is the off state every
+// reader of it already tests for, since a window that is not enforced is not the
+// same thing as one of unbounded length.
+func getenvWindowDefault(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative duration, where 0 turns it off", key)
 	}
 	return d, nil
 }

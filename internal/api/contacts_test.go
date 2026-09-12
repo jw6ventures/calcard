@@ -170,9 +170,6 @@ func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, li
 func (f *fakeContactRepo) MaxLastModified(ctx context.Context, bookID int64) (time.Time, error) {
 	return time.Time{}, nil
 }
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	return nil, nil
-}
 func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }

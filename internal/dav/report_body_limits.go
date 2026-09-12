@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 )
 
 const (
-	defaultMaxFilterElements     = 100
-	defaultMaxReportElementDepth = 20
+	defaultMaxFilterElements        = 100
+	defaultMaxReportElementDepth    = 20
+	defaultMaxCardDAVQueryBytes     = 65536
+	defaultMaxAddressDataProperties = 100
 )
 
 // maxRecursiveGrammarDepth is the ceiling the recursive decoders hold
@@ -26,7 +29,8 @@ const maxRecursiveGrammarDepth = 1000
 // take adequate precautions against a report crafted to spend its CPU and
 // memory: both recursive REPORT grammars -- CALDAV:comp-filter and the
 // CALDAV:comp of CALDAV:calendar-data -- descend once per nested element, and
-// each CalDAV filter element is evaluated against every candidate resource.
+// each filter element, CalDAV or CardDAV, is evaluated against every candidate
+// resource.
 //
 // It measures the body once, iteratively, ahead of every decode, because the
 // permissive struct decode recurses through the same body the grammar pass
@@ -34,20 +38,26 @@ const maxRecursiveGrammarDepth = 1000
 // after the cost had already been paid.
 //
 // Depth is measured over the whole document, since every recursive decoder
-// descends with it. The element count is scoped to CALDAV:filter, where a
-// legitimate body carries a handful of elements and each one multiplies the
-// collection scan; the rest of a body is bounded by its element depth and by
-// the request size cap.
+// descends with it. The element count is scoped to the two filter grammars,
+// where a legitimate body carries a handful of elements and each one multiplies
+// the collection scan. CardDAV filter and address-data subtrees also share a
+// byte budget, and address-data selectors have a count limit: their names and
+// text are work repeated per contact even when the filter itself is small.
 func (h *DavServer) checkReportBodyLimits(body []byte) *reportGrammarFault {
 	maxDepth := h.reportElementDepthLimit()
 	maxFilterElements := h.filterElementLimit()
+	maxQueryBytes, maxAddressProperties := h.cardDAVQueryLimits()
 
 	decoder := xml.NewDecoder(bytes.NewReader(body))
 	decoder.Entity = xml.HTMLEntity
 	depth := 0
 	filterDepth := 0
+	filterSpace := ""
 	filterElements := 0
+	queryDepth, addressDataDepth, addressProperties := 0, 0, 0
+	queryBytes := int64(0)
 	for {
+		startOffset := decoder.InputOffset()
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -60,30 +70,94 @@ func (h *DavServer) checkReportBodyLimits(body []byte) *reportGrammarFault {
 		switch token := token.(type) {
 		case xml.StartElement:
 			depth++
-			inFilter := filterDepth > 0
-			if !inFilter && token.Name == calDAVQName("filter") {
-				filterDepth = depth
-				inFilter = true
+			if queryDepth == 0 && (token.Name == cardDAVQName("filter") || token.Name == cardDAVQName("address-data")) {
+				queryDepth = depth
 			}
-			if inFilter {
+			if addressDataDepth == 0 && token.Name == cardDAVQName("address-data") {
+				addressDataDepth = depth
+			}
+			if addressDataDepth > 0 && token.Name == cardDAVQName("prop") {
+				addressProperties++
+				if addressProperties > maxAddressProperties {
+					return malformedReport("CARDDAV:address-data carries more than the %d properties this server selects", maxAddressProperties)
+				}
+			}
+			if filterDepth == 0 && isReportFilterName(token.Name) {
+				filterDepth = depth
+				filterSpace = token.Name.Space
+			}
+			if filterDepth > 0 {
 				filterElements++
 				if filterElements > maxFilterElements {
-					return invalidFilter("CALDAV:filter carries more than the %d elements this server evaluates", maxFilterElements)
+					return filterBudgetFault(filterSpace,
+						fmt.Sprintf("carries more than the %d elements this server evaluates", maxFilterElements))
 				}
 			}
 			if depth > maxDepth {
-				if inFilter {
-					return invalidFilter("CALDAV:filter nests deeper than the %d elements this server evaluates", maxDepth)
+				if filterDepth > 0 {
+					return filterBudgetFault(filterSpace,
+						fmt.Sprintf("nests deeper than the %d elements this server evaluates", maxDepth))
 				}
 				return malformedReport("REPORT body nests deeper than the %d elements this server reads", maxDepth)
 			}
 		case xml.EndElement:
 			if filterDepth > 0 && depth == filterDepth {
 				filterDepth = 0
+				filterSpace = ""
 			}
 			depth--
 		}
+		if queryDepth > 0 {
+			// Count wire bytes, including attributes and markup, so long names
+			// cannot replace long text as work repeated for every contact.
+			queryBytes += decoder.InputOffset() - startOffset
+			if queryBytes > int64(maxQueryBytes) {
+				return malformedReport("CardDAV query metadata exceeds %d bytes", maxQueryBytes)
+			}
+			if depth < queryDepth {
+				queryDepth = 0
+			}
+		}
+		if addressDataDepth > depth {
+			addressDataDepth = 0
+		}
 	}
+}
+
+func (h *DavServer) cardDAVQueryLimits() (int, int) {
+	queryBytes, properties := defaultMaxCardDAVQueryBytes, defaultMaxAddressDataProperties
+	if h != nil && h.cfg != nil {
+		if h.cfg.DAV.MaxCardDAVQueryBytes > 0 {
+			queryBytes = h.cfg.DAV.MaxCardDAVQueryBytes
+		}
+		if h.cfg.DAV.MaxAddressDataProperties > 0 {
+			properties = h.cfg.DAV.MaxAddressDataProperties
+		}
+	}
+	return queryBytes, properties
+}
+
+// isReportFilterName reports whether name is one of the two REPORT filter
+// elements whose size is bounded: CALDAV:filter (RFC 4791 §9.7) and
+// CARDDAV:filter (RFC 6352 §10.5).
+func isReportFilterName(name xml.Name) bool {
+	return name == calDAVQName("filter") || name == cardDAVQName("filter")
+}
+
+// filterBudgetFault names the failure a filter past the server's element or
+// nesting budget raises, which differs by grammar because the two
+// specifications do. RFC 4791 §7.8.7 defines CALDAV:valid-filter, broad enough
+// to carry a validity bound of the server's own. RFC 6352 defines no
+// counterpart, and §8.5 and §8.6 scope CARDDAV:supported-filter to a filter
+// naming a vCard property or parameter the server cannot query -- which a
+// filter of well-formed elements does not do -- so a CardDAV filter past the
+// budget violates no named precondition and answers 400, the general rule for a
+// body no precondition reaches.
+func filterBudgetFault(namespace, reason string) *reportGrammarFault {
+	if namespace == namespaceCardDAV {
+		return malformedReport("CARDDAV:filter %s", reason)
+	}
+	return invalidFilter("CALDAV:filter %s", reason)
 }
 
 func (h *DavServer) reportElementDepthLimit() int {

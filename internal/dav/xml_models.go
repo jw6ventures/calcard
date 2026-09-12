@@ -464,6 +464,7 @@ type textMatch struct {
 	Collation       string `xml:"collation,attr,omitempty"`
 	MatchType       string `xml:"match-type,attr,omitempty"`
 	NegateCondition string `xml:"negate-condition,attr,omitempty"`
+	foldedText      *string
 }
 
 type timeRange struct {

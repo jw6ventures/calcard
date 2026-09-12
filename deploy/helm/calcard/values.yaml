@@ -75,10 +75,14 @@ app:
     # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
     # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
     # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
-    # maxFilterElements: 100 # Elements one CALDAV:filter may carry; each is evaluated against every candidate resource.
+    # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.
+    # maxCardDAVQueryBytes: 65536 # Combined serialized CARDDAV:filter and CARDDAV:address-data bytes per REPORT. Set 0 to disable.
+    # maxAddressDataProperties: 100 # CARDDAV:address-data property selectors per REPORT. Set 0 to disable.
     # maxReportElementDepth: 20 # Element nesting one REPORT body may reach.
     # maxMultigetHrefs: 5000 # DAV:href elements one calendar-multiget may carry.
     # maxReportCandidateRows: 50000 # Stored resources one report will read and parse while looking for matches.
+    # syncHistoryRetention: 2160h # How far back sync deletion history is kept. Tombstones older than this are pruned, and a DAV:sync-token naming an earlier instant is refused with DAV:valid-sync-token so the client re-syncs in full (RFC 6578 Section 3.2). Set 0 to prune nothing, at the cost of a table that only grows.
+    # Narrow this freely. Widening it re-admits tokens whose tombstones the old window already pruned, which loses those deletions silently, so widen only when no client holds a token older than the previous window.
 
 # Kubernetes Service that fronts the app pods.
 service:

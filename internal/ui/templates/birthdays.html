@@ -260,6 +260,8 @@
     <p>This calendar shows birthdays from all your contacts. Events are read-only and automatically generated.</p>
 </div>
 
+{{if .BirthdaysTruncated}}<div class="alert alert-warning">⚠ Not all of your birthdays are shown: you have more contacts with birthdays than this page will load.</div>{{end}}
+
 <div class="month-nav">
     <button id="prev-month">&larr;</button>
     <span class="month-title" id="month-title"></span>

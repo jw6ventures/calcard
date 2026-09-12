@@ -48,6 +48,45 @@ func parseSyncToken(token string) (syncTokenInfo, error) {
 	return info, nil
 }
 
+// syncTokenAnswerable reports whether the server can still report every change
+// since tokenTime. RFC 6578 §3.2 lets a server invalidate a token it cannot
+// answer and names this case: a server that "might only be able to maintain up
+// to 3 weeks worth of changes to a collection" refuses the token, and the client
+// falls back to a full synchronization. CalCard's history is as long as the
+// tombstones it keeps, so the retention window is the answer to both questions.
+//
+// collectionUpdatedAt is the collection's own last-change watermark, and a token
+// naming it is answerable however old it is: nothing has changed since, so there
+// is no deletion to report and none can have been pruned out from under it.
+// Without that case a collection nobody has touched in longer than the window
+// would force a full resync on every sync forever, since the token the server
+// hands back names that same instant.
+//
+// Sync handlers check again after all history reads: cleanup can advance its
+// cutoff while an accepted request is reading, invalidating its earlier check.
+func (h *DavServer) syncTokenAnswerable(tokenTime, collectionUpdatedAt time.Time) bool {
+	retention := h.syncHistoryRetention()
+	if retention <= 0 {
+		// Nothing is pruned, so no token becomes unanswerable through age.
+		return true
+	}
+	if tokenTime.IsZero() {
+		// An initial sync reports the collection whole and reads no tombstones.
+		return true
+	}
+	if !time.Now().UTC().Add(-retention).After(tokenTime) {
+		return true
+	}
+	return collectionUpdatedAt.Equal(tokenTime)
+}
+
+func (h *DavServer) syncHistoryRetention() time.Duration {
+	if h != nil && h.cfg != nil {
+		return h.cfg.DAV.SyncHistoryRetention
+	}
+	return 0
+}
+
 func (h *DavServer) calendarSyncTokenValue(cal *store.CalendarAccess) (string, time.Time) {
 	return buildSyncToken("cal", cal.ID, cal.UpdatedAt), cal.UpdatedAt
 }

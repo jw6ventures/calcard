@@ -8572,28 +8572,17 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 	return max, nil
 }
 
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	if f.contacts == nil {
-		return nil, nil
-	}
-	var result []store.Contact
-	for _, c := range f.contacts {
-		if c.Birthday != nil {
-			result = append(result, *c)
-		}
-	}
-	return result, nil
-}
-
 func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	f.birthdayLookupCount++
 	f.birthdayLimit = limit
 	if f.birthdayErr != nil {
 		return nil, f.birthdayErr
 	}
-	all, err := f.ListWithBirthdaysByUser(ctx, userID)
-	if err != nil {
-		return nil, err
+	var all []store.Contact
+	for _, c := range f.contacts {
+		if c.Birthday != nil {
+			all = append(all, *c)
+		}
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	return truncateToLimit(all, limit), nil

@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jw6ventures/calcard/internal/config"
@@ -98,7 +99,10 @@ func TestAddressBookQuerySkipsDeniedMatchesAcrossPages(t *testing.T) {
 	}
 }
 
-func TestAddressBookQueryHardResponseCapUsesTopLevelLimitSignal(t *testing.T) {
+// A response ceiling of one leaves room for nothing but the RFC 6352 §8.6.2
+// truncation marker, so the whole answer is that marker: every match is outside
+// the limit and the marker is the DAV:response that says so.
+func TestAddressBookQueryHardResponseCapReturnsOnlyTheTruncationMarker(t *testing.T) {
 	repo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
 	for id := int64(1); id <= 3; id++ {
 		contact := pagedContact(id, "Visible")
@@ -114,8 +118,13 @@ func TestAddressBookQueryHardResponseCapUsesTopLevelLimitSignal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("addressBookQuery() error = %v", err)
 	}
-	if len(responses) != 2 {
-		t.Fatalf("hard-cap build responses = %d, want max+1 signal", len(responses))
+	if len(responses) != 1 {
+		t.Fatalf("hard-cap build responses = %d, want the truncation marker alone", len(responses))
+	}
+	marker := responses[0]
+	if marker.Href != "/dav/addressbooks/5/" || !strings.Contains(marker.Status, "507") ||
+		marker.Error == nil || marker.Error.NumberOfMatchesWithinLimits == nil {
+		t.Fatalf("hard-cap response = %#v, want a 507 marker for the collection", marker)
 	}
 	if repo.pageLookupCount != 1 {
 		t.Fatalf("page lookups = %d, want 1", repo.pageLookupCount)

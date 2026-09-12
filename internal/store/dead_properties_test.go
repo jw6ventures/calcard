@@ -194,7 +194,7 @@ func TestContactRepositoryListsKeysetPage(t *testing.T) {
 	defer db.Close()
 
 	now := time.Now().UTC()
-	mock.ExpectQuery(`FROM contacts WHERE address_book_id=\$1 AND id>\$2 ORDER BY id ASC LIMIT \$3`).
+	mock.ExpectQuery(`FROM contacts WHERE address_book_id=\$1 AND \(address_book_id, id\) > \(\$1, \$2\) ORDER BY address_book_id ASC, id ASC LIMIT \$3`).
 		WithArgs(int64(5), int64(100), 256).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
 			AddRow(int64(101), int64(5), "alice", "alice", "BEGIN:VCARD\r\nEND:VCARD\r\n", "etag", "Alice", "alice@example.com", nil, now))

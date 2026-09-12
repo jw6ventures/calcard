@@ -308,12 +308,18 @@ func TestHelmChartCarriesTrustedProxies(t *testing.T) {
 func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 	documents := renderChart(t,
 		"--set", "app.dav.maxFilterElements=25",
+		"--set", "app.dav.maxCardDAVQueryBytes=4096",
+		"--set", "app.dav.maxAddressDataProperties=0",
 		"--set", "app.dav.maxReportCandidateRows=0",
+		"--set", "app.dav.syncHistoryRetention=504h",
 	)
 	configmap := requireDocument(t, documents, "configmap.yaml")
 	for _, want := range []string{
 		`APP_DAV_MAX_FILTER_ELEMENTS: "25"`,
+		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "4096"`,
+		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "0"`,
 		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`,
+		`APP_DAV_SYNC_HISTORY_RETENTION: "504h"`,
 	} {
 		if !hasLine(configmap, want) {
 			t.Errorf("configmap is missing %s:\n%s", want, configmap)

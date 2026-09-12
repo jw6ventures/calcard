@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"html/template"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -200,7 +202,7 @@ func dashboardEventURL(ev store.Event) string {
 func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 
-	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(r.Context(), user.ID)
+	contacts, truncated, err := h.listBoundedBirthdayContacts(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "failed to load contacts", http.StatusInternalServerError)
 		return
@@ -241,11 +243,46 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := h.withFlash(r, map[string]any{
-		"Title":          "Birthdays",
-		"User":           user,
-		"BirthdayEvents": birthdayEvents,
+		"Title":              "Birthdays",
+		"User":               user,
+		"BirthdayEvents":     birthdayEvents,
+		"BirthdaysTruncated": truncated,
 	})
 	h.render(w, r, "birthdays.html", data)
+}
+
+// birthdayPageRows is the fallback bound on the contacts the birthdays page
+// reads, used when no APP_DAV_MAX_REPORT_CANDIDATE_ROWS budget is configured.
+// It matches the DAV default, since the generated birthday calendar is built
+// from the same rows.
+const birthdayPageRows = 50000
+
+// listBoundedBirthdayContacts reads the contacts the birthdays page is built
+// from under the row budget the DAV birthday collection is read with. The whole
+// set is serialized into the rendered page, so an unbounded read is an
+// unbounded response. It reports whether the set was cut short: one row past
+// the budget is enough to know the page cannot show the complete set, and a
+// page showing part of it has to say so.
+func (h *Handler) listBoundedBirthdayContacts(ctx context.Context, userID int64) ([]store.Contact, bool, error) {
+	rowLimit := birthdayPageRows
+	if h.cfg != nil && h.cfg.DAV.MaxReportCandidateRows > 0 {
+		rowLimit = h.cfg.DAV.MaxReportCandidateRows
+	}
+	// A budget turned off is carried as math.MaxInt, which has no room for the
+	// extra row; asking for the budget itself then reads one row short of
+	// knowing the set is complete, at a size no collection reaches.
+	readLimit := rowLimit
+	if readLimit < math.MaxInt {
+		readLimit++
+	}
+	contacts, err := h.store.Contacts.ListWithBirthdaysByUserLimit(ctx, userID, readLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(contacts) > rowLimit {
+		return contacts[:rowLimit], true, nil
+	}
+	return contacts, false, nil
 }
 
 // Help shows a dedicated, resumable help page mirroring the first-login welcome

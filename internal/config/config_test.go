@@ -62,6 +62,9 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.MaxFilterElements != 100 {
 		t.Fatalf("DAV.MaxFilterElements = %d, want 100", cfg.DAV.MaxFilterElements)
 	}
+	if cfg.DAV.MaxCardDAVQueryBytes != 65536 || cfg.DAV.MaxAddressDataProperties != 100 {
+		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
+	}
 	if cfg.DAV.MaxReportElementDepth != 20 {
 		t.Fatalf("DAV.MaxReportElementDepth = %d, want 20", cfg.DAV.MaxReportElementDepth)
 	}
@@ -70,6 +73,9 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	}
 	if cfg.DAV.MaxReportCandidateRows != 50000 {
 		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 50000", cfg.DAV.MaxReportCandidateRows)
+	}
+	if cfg.DAV.SyncHistoryRetention != 90*24*time.Hour {
+		t.Fatalf("DAV.SyncHistoryRetention = %s, want 90 days", cfg.DAV.SyncHistoryRetention)
 	}
 	if cfg.TrafficCaptureFile != "" {
 		t.Fatalf("TrafficCaptureFile = %q, want disabled by default", cfg.TrafficCaptureFile)
@@ -102,9 +108,12 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	t.Setenv("APP_DAV_MAX_MULTISTATUS_RESPONSES", "321")
 	t.Setenv("APP_DAV_MAX_MULTISTATUS_BYTES", "654321")
 	t.Setenv("APP_DAV_MAX_FILTER_ELEMENTS", "17")
+	t.Setenv("APP_DAV_MAX_CARDDAV_QUERY_BYTES", "4096")
+	t.Setenv("APP_DAV_MAX_ADDRESS_DATA_PROPERTIES", "12")
 	t.Setenv("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", "7")
 	t.Setenv("APP_DAV_MAX_MULTIGET_HREFS", "42")
 	t.Setenv("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", "9876")
+	t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", "36h")
 
 	cfg, err := Load()
 	if err != nil {
@@ -119,6 +128,9 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	if cfg.DAV.MaxFilterElements != 17 {
 		t.Fatalf("DAV.MaxFilterElements = %d, want 17", cfg.DAV.MaxFilterElements)
 	}
+	if cfg.DAV.MaxCardDAVQueryBytes != 4096 || cfg.DAV.MaxAddressDataProperties != 12 {
+		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
+	}
 	if cfg.DAV.MaxReportElementDepth != 7 {
 		t.Fatalf("DAV.MaxReportElementDepth = %d, want 7", cfg.DAV.MaxReportElementDepth)
 	}
@@ -128,6 +140,9 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	if cfg.DAV.MaxReportCandidateRows != 9876 {
 		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 9876", cfg.DAV.MaxReportCandidateRows)
 	}
+	if cfg.DAV.SyncHistoryRetention != 36*time.Hour {
+		t.Fatalf("DAV.SyncHistoryRetention = %s, want 36h", cfg.DAV.SyncHistoryRetention)
+	}
 }
 
 // davLimitKeys is every DAV resource limit, which share one loader and one
@@ -136,6 +151,8 @@ var davLimitKeys = []string{
 	"APP_DAV_MAX_MULTISTATUS_RESPONSES",
 	"APP_DAV_MAX_MULTISTATUS_BYTES",
 	"APP_DAV_MAX_FILTER_ELEMENTS",
+	"APP_DAV_MAX_CARDDAV_QUERY_BYTES",
+	"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES",
 	"APP_DAV_MAX_REPORT_ELEMENT_DEPTH",
 	"APP_DAV_MAX_MULTIGET_HREFS",
 	"APP_DAV_MAX_REPORT_CANDIDATE_ROWS",
@@ -171,12 +188,14 @@ func TestLoadRejectsNegativeAndNonNumericDAVLimits(t *testing.T) {
 // who disables one knob does not silently get the default back.
 func TestLoadTreatsZeroDAVLimitAsUnlimited(t *testing.T) {
 	read := map[string]func(*Config) int{
-		"APP_DAV_MAX_MULTISTATUS_RESPONSES": func(c *Config) int { return c.DAV.MaxMultistatusResponses },
-		"APP_DAV_MAX_MULTISTATUS_BYTES":     func(c *Config) int { return c.DAV.MaxMultistatusBytes },
-		"APP_DAV_MAX_FILTER_ELEMENTS":       func(c *Config) int { return c.DAV.MaxFilterElements },
-		"APP_DAV_MAX_REPORT_ELEMENT_DEPTH":  func(c *Config) int { return c.DAV.MaxReportElementDepth },
-		"APP_DAV_MAX_MULTIGET_HREFS":        func(c *Config) int { return c.DAV.MaxMultigetHrefs },
-		"APP_DAV_MAX_REPORT_CANDIDATE_ROWS": func(c *Config) int { return c.DAV.MaxReportCandidateRows },
+		"APP_DAV_MAX_MULTISTATUS_RESPONSES":   func(c *Config) int { return c.DAV.MaxMultistatusResponses },
+		"APP_DAV_MAX_MULTISTATUS_BYTES":       func(c *Config) int { return c.DAV.MaxMultistatusBytes },
+		"APP_DAV_MAX_FILTER_ELEMENTS":         func(c *Config) int { return c.DAV.MaxFilterElements },
+		"APP_DAV_MAX_CARDDAV_QUERY_BYTES":     func(c *Config) int { return c.DAV.MaxCardDAVQueryBytes },
+		"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES": func(c *Config) int { return c.DAV.MaxAddressDataProperties },
+		"APP_DAV_MAX_REPORT_ELEMENT_DEPTH":    func(c *Config) int { return c.DAV.MaxReportElementDepth },
+		"APP_DAV_MAX_MULTIGET_HREFS":          func(c *Config) int { return c.DAV.MaxMultigetHrefs },
+		"APP_DAV_MAX_REPORT_CANDIDATE_ROWS":   func(c *Config) int { return c.DAV.MaxReportCandidateRows },
 	}
 	for _, key := range davLimitKeys {
 		t.Run(key, func(t *testing.T) {
@@ -189,6 +208,43 @@ func TestLoadTreatsZeroDAVLimitAsUnlimited(t *testing.T) {
 			}
 			if got := read[key](cfg); got != math.MaxInt {
 				t.Fatalf("%s = %d, want math.MaxInt", key, got)
+			}
+		})
+	}
+}
+
+// The sync-history retention window turns off at 0, on the same terms every
+// DAV resource limit does: an operator who does not want tombstones pruned must
+// not silently get the default window, because pruning is what makes a sync
+// token past the window unanswerable.
+func TestLoadTreatsZeroSyncHistoryRetentionAsOff(t *testing.T) {
+	for _, value := range []string{"0", "0s"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", value)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want 0 accepted as retention off", err)
+			}
+			if cfg.DAV.SyncHistoryRetention != 0 {
+				t.Fatalf("DAV.SyncHistoryRetention = %s, want 0", cfg.DAV.SyncHistoryRetention)
+			}
+		})
+	}
+}
+
+// A negative window would prune tombstones the server still owes a client, and a
+// value the duration parser cannot read must not fall back to the default.
+func TestLoadRejectsNegativeAndNonDurationSyncHistoryRetention(t *testing.T) {
+	for _, value := range []string{"-1h", "invalid", "90"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "APP_DAV_SYNC_HISTORY_RETENTION must be a non-negative duration") {
+				t.Fatalf("Load() error = %v, want non-negative validation for %q", err, value)
 			}
 		})
 	}

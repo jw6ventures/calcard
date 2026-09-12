@@ -26,7 +26,7 @@ func limitsTestServer(t *testing.T, cfg *config.Config, events int) *DavServer {
 	t.Helper()
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
-			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: limitsFixtureModified}, Editor: true},
 		},
 	}
 	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event, events)}
@@ -420,6 +420,8 @@ func TestReportsAnswerWithEveryLimitDisabled(t *testing.T) {
 		cfg.DAV.MaxMultistatusResponses = math.MaxInt
 		cfg.DAV.MaxMultistatusBytes = math.MaxInt
 		cfg.DAV.MaxFilterElements = math.MaxInt
+		cfg.DAV.MaxCardDAVQueryBytes = math.MaxInt
+		cfg.DAV.MaxAddressDataProperties = math.MaxInt
 		cfg.DAV.MaxReportElementDepth = math.MaxInt
 		cfg.DAV.MaxMultigetHrefs = math.MaxInt
 		cfg.DAV.MaxReportCandidateRows = math.MaxInt

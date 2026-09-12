@@ -389,6 +389,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		}
 		return
 	}
+	prepareCardFilter(report.CardFilter)
 
 	target := parsedDAVTarget(r.Context(), cleanPath)
 	if !target.Valid || target.Domain != davPathAddressBook || target.CollectionSegment == "" {

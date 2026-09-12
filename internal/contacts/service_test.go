@@ -148,9 +148,6 @@ func (f *fakeContacts) ListRecentByUser(context.Context, int64, int) ([]store.Co
 func (f *fakeContacts) MaxLastModified(context.Context, int64) (time.Time, error) {
 	return time.Time{}, nil
 }
-func (f *fakeContacts) ListWithBirthdaysByUser(context.Context, int64) ([]store.Contact, error) {
-	return nil, nil
-}
 func (f *fakeContacts) ListWithBirthdaysByUserLimit(context.Context, int64, int) ([]store.Contact, error) {
 	return nil, nil
 }
