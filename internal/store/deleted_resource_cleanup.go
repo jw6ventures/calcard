@@ -23,7 +23,7 @@ import (
 // The first pass runs immediately rather than after one interval, because a
 // process restarted more often than the interval would otherwise never prune.
 func StartDeletedResourceCleanup(ctx context.Context, repo DeletedResourceRepository, interval, retention time.Duration) {
-	if retention <= 0 {
+	if repo == nil || retention <= 0 {
 		return
 	}
 

@@ -9,7 +9,7 @@ import (
 )
 
 func TestCalendarCurrentUserPrivilegeSet_Writable(t *testing.T) {
-	privs := calendarCurrentUserPrivilegeSet(false)
+	privs := calendarCurrentUserPrivilegeSetForCalendar(store.CalendarPrivileges{Read: true, WriteContent: true, WriteProperties: true, Bind: true, Unbind: true})
 	if privs == nil {
 		t.Fatal("expected non-nil privilege set")
 	}
@@ -34,7 +34,7 @@ func TestCalendarCurrentUserPrivilegeSet_Writable(t *testing.T) {
 }
 
 func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
-	privs := calendarCurrentUserPrivilegeSet(true)
+	privs := birthdayCalendarCurrentUserPrivilegeSet()
 	if privs == nil {
 		t.Fatal("expected non-nil privilege set")
 	}
@@ -46,7 +46,7 @@ func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
 	output := string(data)
 
 	// Read-only calendars must NOT include write privileges
-	for _, forbidden := range []string{"d:write>", "d:write-content>", "d:write-properties>", "d:bind>", "d:unbind>"} {
+	for _, forbidden := range []string{"d:write>", "d:write-content>", "d:write-properties>", "d:bind>", "d:unbind>", "d:write-acl>", "d:unlock>"} {
 		if strings.Contains(output, forbidden) {
 			t.Errorf("read-only calendar should not have privilege %q in: %s", forbidden, output)
 		}
@@ -62,9 +62,9 @@ func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
 }
 
 func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
-	resp := calendarCollectionResponse(
+	resp := calendarCollectionResponseWithPrivileges(
 		"/dav/calendars/1/", "Test Calendar", store.Calendar{},
-		"/dav/principals/user@example.com/", "sync-token", "1", false,
+		"/dav/principals/user@example.com/", "sync-token", "1", store.CalendarPrivileges{Read: true, WriteContent: true, WriteProperties: true, Bind: true, Unbind: true},
 	)
 
 	data, err := xml.Marshal(resp)
@@ -82,9 +82,9 @@ func TestCalendarCollectionResponse_WritableHasNoReadOnlyFlag(t *testing.T) {
 }
 
 func TestCalendarCollectionResponse_ReadOnlyHasFlag(t *testing.T) {
-	resp := calendarCollectionResponse(
+	resp := birthdayCalendarCollectionResponse(
 		"/dav/calendars/-1/", "Birthdays", store.Calendar{},
-		"/dav/principals/user@example.com/", "sync-token", "0", true,
+		"/dav/principals/user@example.com/", "sync-token", "0",
 	)
 
 	data, err := xml.Marshal(resp)

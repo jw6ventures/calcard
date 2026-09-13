@@ -3,8 +3,8 @@ package contacts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -197,17 +197,6 @@ func (f *fakeACL) ListByPrincipal(_ context.Context, principalHref string) ([]st
 }
 func (f *fakeACL) HasPrivilege(context.Context, string, string, string) (bool, error) {
 	return false, nil
-}
-func (f *fakeACL) DeletePrincipalEntriesByResourcePrefix(_ context.Context, principalHref, prefix string) error {
-	kept := f.entries[:0:0]
-	for _, e := range f.entries {
-		if e.PrincipalHref == principalHref && strings.HasPrefix(e.ResourcePath, prefix) {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	f.entries = kept
-	return nil
 }
 func (f *fakeACL) MoveResourcePath(context.Context, string, string) error { return nil }
 func (f *fakeACL) Delete(context.Context, string) error                   { return nil }
@@ -531,5 +520,57 @@ func TestListAccessibleIncludesSharedBook(t *testing.T) {
 	}
 	if len(books) != 1 || books[0].ID != 1 || !books[0].Shared || !books[0].Editor {
 		t.Fatalf("sharee accessible=%+v, want shared editor book 1", books)
+	}
+}
+
+func TestManagedShareAfterBroadReadGrant(t *testing.T) {
+	for _, principal := range []string{"DAV:all", "DAV:authenticated"} {
+		t.Run(principal, func(t *testing.T) {
+			entries := []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read", Position: 1},
+			}
+			if !hasEffectiveManagedShare(entries, 2) {
+				t.Fatal("broad read grant hid the user's managed share")
+			}
+			entries[0].IsGrant = false
+			if hasEffectiveManagedShare(entries, 2) {
+				t.Fatal("earlier deny must still hide the share")
+			}
+			entries[0].IsGrant = true
+			if hasEffectiveManagedShare(entries[:1], 2) {
+				t.Fatal("broad grant alone is not a managed share")
+			}
+		})
+	}
+}
+
+type changedDeleteContactRepo struct{ *fakeContacts }
+
+func (r *changedDeleteContactRepo) GetByResourceName(ctx context.Context, collectionID int64, name string) (*store.Contact, error) {
+	item, err := r.fakeContacts.GetByResourceName(ctx, collectionID, name)
+	if item != nil {
+		item.RawVCard = "updated data"
+	}
+	return item, err
+}
+func TestDeleteContactConcurrentChange(t *testing.T) {
+	for _, conditional := range []bool{false, true} {
+		t.Run(fmt.Sprint(conditional), func(t *testing.T) {
+			base := &fakeContacts{items: map[string]store.Contact{"1:changed": {AddressBookID: 1, UID: "changed", ResourceName: "changed", ETag: "old-etag"}}}
+			svc, _ := newTestService()
+			svc.store.Contacts = &changedDeleteContactRepo{base}
+			match, want := "", ErrConflict
+			if conditional {
+				match, want = "old-etag", ErrPreconditionFailed
+			}
+			err := svc.DeleteContact(context.Background(), owner, 1, "changed", match, "")
+			if !errors.Is(err, want) {
+				t.Fatalf("error = %v, want %v", err, want)
+			}
+			if len(base.items) != 1 {
+				t.Fatal("concurrent update was deleted")
+			}
+		})
 	}
 }

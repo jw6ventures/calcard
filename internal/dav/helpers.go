@@ -19,16 +19,11 @@ func collectionResponse(href, name string) response {
 	}
 }
 
-// calendarCollectionResponse builds a calendar collection response whose
-// privileges follow a single read-only flag rather than a resolved privilege
-// set, which is what the virtual birthday collection needs.
-func calendarCollectionResponse(href, name string, cal store.Calendar, principalHref, syncToken, ctag string, readOnly bool) response {
+func birthdayCalendarCollectionResponse(href, name string, cal store.Calendar, principalHref, syncToken, ctag string) response {
 	resp := calendarCollectionPropstatResponse(href, name, cal, principalHref, syncToken, ctag)
 	p := &resp.Propstat[0].Prop
-	p.CurrentUserPrivilegeSet = calendarCurrentUserPrivilegeSet(readOnly)
-	if readOnly {
-		p.CalendarServerReadOnly = &struct{}{}
-	}
+	p.CurrentUserPrivilegeSet = birthdayCalendarCurrentUserPrivilegeSet()
+	p.CalendarServerReadOnly = &struct{}{}
 	return resp
 }
 
@@ -392,24 +387,14 @@ func isASCIILower(r rune) bool {
 	return r >= 'a' && r <= 'z'
 }
 
-func calendarCurrentUserPrivilegeSet(readOnly bool) *currentUserPrivilegeSet {
+func birthdayCalendarCurrentUserPrivilegeSet() *currentUserPrivilegeSet {
 	privs := []privilege{
 		{Read: &readPrivilege{}},
 		{ReadFreeBusy: &struct{}{}},
 		{ReadACL: &struct{}{}},
 		{ReadCurrentUserPrivilegeSet: &struct{}{}},
 	}
-	if !readOnly {
-		privs = append(privs,
-			privilege{Write: &struct{}{}},
-			privilege{WriteContent: &struct{}{}},
-			privilege{WriteProperties: &struct{}{}},
-			privilege{Bind: &struct{}{}},
-			privilege{Unbind: &struct{}{}},
-			privilege{WriteACL: &struct{}{}},
-			privilege{Unlock: &struct{}{}},
-		)
-	}
+
 	return &currentUserPrivilegeSet{Privileges: privs}
 }
 

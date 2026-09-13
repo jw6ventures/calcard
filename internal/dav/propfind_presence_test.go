@@ -181,7 +181,7 @@ func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 			}
 		})
 		t.Run(k.name+"/valued", func(t *testing.T) {
-			okXML, _ := filter(k.href, k.rtype, calendarCurrentUserPrivilegeSet(true))
+			okXML, _ := filter(k.href, k.rtype, birthdayCalendarCurrentUserPrivilegeSet())
 			if !strings.Contains(okXML, "<d:privilege>") {
 				t.Fatalf("expected present-nonempty privilege set in 200 propstat, got %q", okXML)
 			}
@@ -193,7 +193,10 @@ func TestCurrentUserPrivilegeSetForOwnedGenericPathsReportsEffectivePrivileges(t
 	h := &DavServer{store: &store.Store{}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 	for _, path := range []string{"/dav/principals/1/", "/dav/", "/dav/calendars/", "/dav/addressbooks/"} {
-		privs := h.currentUserPrivilegeSetForPath(context.Background(), user, path)
+		privs, err := h.currentUserPrivilegeSetForPath(context.Background(), user, path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if privs == nil {
 			t.Fatalf("%s: expected a privilege set, got nil", path)
 		}
@@ -320,7 +323,10 @@ func TestCurrentUserPrivilegeSetZeroPrivilegesIsPresentEmpty(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
-	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privs != nil {
 		t.Fatalf("expected an inaccessible resource to have no visible privilege set, got %#v", privs)
 	}

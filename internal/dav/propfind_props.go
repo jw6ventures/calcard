@@ -295,7 +295,13 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 			p.currentUserPrivilegesForbidden = true
 		} else {
 			if h.store == nil || h.store.ACLEntries != nil || h.isResourceOwner(ctx, user, resourcePath) || p.CurrentUserPrivilegeSet == nil {
-				p.CurrentUserPrivilegeSet = h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+				// CalendarPrivileges omits ACL-management privileges, so stored ACLs
+				// must still supply the complete property even when a preset exists.
+				privileges, err := h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+				if err != nil {
+					return err
+				}
+				p.CurrentUserPrivilegeSet = privileges
 			}
 		}
 	}
@@ -375,14 +381,14 @@ func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User,
 	return h.principalURL(user), nil
 }
 
-func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
+func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) (*currentUserPrivilegeSet, error) {
 	if user == nil {
-		return nil
+		return nil, nil
 	}
 
 	cleanPath := normalizeDAVHref(resourcePath)
 	if h.isResourceOwner(ctx, user, cleanPath) && isGenericDAVPrivilegePath(cleanPath) {
-		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames)
+		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames), nil
 	}
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
 		if isBirthdayCalendarPath(ctx, cleanPath) {
@@ -390,7 +396,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 			// resolve privileges from, so its collection and objects report the
 			// read-only set their collection response advertises rather than
 			// reporting the property absent.
-			return calendarCurrentUserPrivilegeSet(true)
+			return birthdayCalendarCurrentUserPrivilegeSet(), nil
 		}
 		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
 		if segment == "" {
@@ -401,24 +407,36 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		if segment == "" {
 			// The calendar home collection (/dav/calendars/) is a generic
 			// collection the property applies to: present-empty, not a 404.
-			return &currentUserPrivilegeSet{}
+			return &currentUserPrivilegeSet{}, nil
 		}
 
 		calendarID, ok, err := h.resolveCalendarID(ctx, user, segment)
-		if err != nil || !ok {
-			return nil
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
 		}
 		access, err := h.loadCalendarWithAnyPrivilege(ctx, user, calendarID, cleanPath)
-		if err != nil || access == nil {
-			return nil
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if access == nil {
+			return nil, nil
 		}
 		cal := &access.Calendar
 
 		// Resolve the ACL state once and decide every privilege from it
 		// instead of one full path/entry resolution per privilege name.
 		pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
-		if err != nil || pc == nil {
-			return nil
+		if err != nil {
+			return nil, err
+		}
+		if pc == nil {
+			return nil, nil
 		}
 		privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
 		for _, name := range calendarCurrentPrivilegeNames {
@@ -429,7 +447,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		// The property applies to this resource, so it is present even when the
 		// user holds no privileges. RFC 3744 defines the content model as
 		// privilege*, so zero privileges is a present-empty 200, not a 404.
-		return &currentUserPrivilegeSet{Privileges: privileges}
+		return &currentUserPrivilegeSet{Privileges: privileges}, nil
 	}
 
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
@@ -445,21 +463,33 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	if segment == "" {
 		// The address-book home collection (/dav/addressbooks/) is a generic
 		// collection the property applies to: present-empty, not a 404.
-		return &currentUserPrivilegeSet{}
+		return &currentUserPrivilegeSet{}, nil
 	}
 
 	bookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
-	if err != nil || !ok {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
 	}
 	book, err := h.getAddressBook(ctx, bookID)
-	if err != nil || book == nil {
-		return nil
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return nil, nil
 	}
 
 	pc, err := h.addressBookPrivilegeContextFor(ctx, user, book, cleanPath)
-	if err != nil || pc == nil {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if pc == nil {
+		return nil, nil
 	}
 	privileges := make([]privilege, 0, len(addressBookCurrentPrivilegeNames))
 	for _, name := range addressBookCurrentPrivilegeNames {
@@ -469,20 +499,20 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	}
 	// Present even with zero privileges (privilege* content model): return a
 	// present-empty set rather than a property-level 404.
-	return &currentUserPrivilegeSet{Privileges: privileges}
+	return &currentUserPrivilegeSet{Privileges: privileges}, nil
 }
 
-func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
+func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *store.User, resourcePath string) (*currentUserPrivilegeSet, error) {
 	if h == nil || h.store == nil || h.store.ACLEntries == nil {
-		return &currentUserPrivilegeSet{}
+		return &currentUserPrivilegeSet{}, nil
 	}
 	entries, err := h.aclEntriesForResource(ctx, resourcePath)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	principals, err := h.applicablePrincipalsForPath(ctx, user, resourcePath, entries)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
 	for _, name := range calendarCurrentPrivilegeNames {
@@ -490,7 +520,7 @@ func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *st
 			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
-	return &currentUserPrivilegeSet{Privileges: privileges}
+	return &currentUserPrivilegeSet{Privileges: privileges}, nil
 }
 
 func isGenericDAVPrivilegePath(resourcePath string) bool {

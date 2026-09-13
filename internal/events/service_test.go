@@ -994,10 +994,6 @@ func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalH
 	return false, nil
 }
 
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	return nil
-}
-
 func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
 	return nil
 }
@@ -1030,5 +1026,35 @@ func TestCalendarLimitsEnforceTheAdvertisedCalDAVValues(t *testing.T) {
 		"END:VEVENT\r\nEND:VCALENDAR\r\n", ical.MaxRecurrenceInstances+1)
 	if err := validateStrictICalendar(overInstances); err == nil {
 		t.Errorf("an object generating %d instances was accepted", ical.MaxRecurrenceInstances+1)
+	}
+}
+
+type changedDeleteEventRepo struct{ *fakeEventRepo }
+
+func (r *changedDeleteEventRepo) GetByResourceName(ctx context.Context, collectionID int64, name string) (*store.Event, error) {
+	item, err := r.fakeEventRepo.GetByResourceName(ctx, collectionID, name)
+	if item != nil {
+		item.RawICAL = "updated data"
+	}
+	return item, err
+}
+func TestDeleteEventConcurrentChange(t *testing.T) {
+	for _, conditional := range []bool{false, true} {
+		t.Run(fmt.Sprint(conditional), func(t *testing.T) {
+			base := &fakeEventRepo{events: map[string]store.Event{"1:changed": {CalendarID: 1, UID: "changed", ResourceName: "changed", ETag: "old-etag"}}}
+			svc := newServiceWithRepos(true, base)
+			svc.store.Events = &changedDeleteEventRepo{base}
+			match, want := "", ErrConflict
+			if conditional {
+				match, want = "old-etag", ErrPreconditionFailed
+			}
+			err := svc.DeleteEvent(context.Background(), &store.User{ID: 1}, 1, "changed", match, "")
+			if !errors.Is(err, want) {
+				t.Fatalf("error = %v, want %v", err, want)
+			}
+			if len(base.events) != 1 {
+				t.Fatal("concurrent update was deleted")
+			}
+		})
 	}
 }

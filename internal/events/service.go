@@ -406,7 +406,14 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
-	return s.store.DeleteEventAndState(ctx, calendarID, store.EventDAVResourceState(existing), resourcePaths[0], nil)
+	err = s.store.DeleteEventAndState(ctx, calendarID, store.EventDAVResourceState(existing), resourcePaths[0], nil)
+	if errors.Is(err, store.ErrResourceStateChanged) {
+		if ifMatch != "" || ifNoneMatch != "" {
+			return ErrPreconditionFailed
+		}
+		return ErrConflict
+	}
+	return err
 }
 
 func (s *Service) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) error {

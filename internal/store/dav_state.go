@@ -381,7 +381,7 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, expec
 		if err != nil {
 			return err
 		}
-		if !eventDAVStateMatches(expected, current) {
+		if current == nil || !eventDAVStateMatches(expected, current) {
 			return ErrResourceStateChanged
 		}
 		if err := s.Events.DeleteByUID(ctx, calendarID, expected.UID); err != nil {
@@ -409,7 +409,7 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, expec
 	if err != nil {
 		return err
 	}
-	if !eventDAVStateMatches(expected, current) {
+	if current == nil || !eventDAVStateMatches(expected, current) {
 		return ErrResourceStateChanged
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id=$1`, current.ID); err != nil {
@@ -433,7 +433,7 @@ func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, 
 		if err != nil {
 			return err
 		}
-		if !contactDAVStateMatches(expected, current) {
+		if current == nil || !contactDAVStateMatches(expected, current) {
 			return ErrResourceStateChanged
 		}
 		if err := s.Contacts.DeleteByUID(ctx, addressBookID, expected.UID); err != nil {
@@ -461,7 +461,7 @@ func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, 
 	if err != nil {
 		return err
 	}
-	if !contactDAVStateMatches(expected, current) {
+	if current == nil || !contactDAVStateMatches(expected, current) {
 		return ErrResourceStateChanged
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM contacts WHERE id=$1`, current.ID); err != nil {
@@ -1049,7 +1049,7 @@ func validateContactTransferViaRepository(ctx context.Context, contacts ContactR
 	if err != nil {
 		return err
 	}
-	if !contactDAVStateMatches(expected.Source, source) {
+	if source == nil || !contactDAVStateMatches(expected.Source, source) {
 		return ErrResourceStateChanged
 	}
 	destination, err := contacts.GetByResourceName(ctx, toAddressBookID, destResourceName)
@@ -1095,7 +1095,7 @@ func transferContactTx(ctx context.Context, tx *sql.Tx, operation contactTransfe
 	if err != nil {
 		return nil, false, err
 	}
-	if !contactDAVStateMatches(expected.Source, source) || source.UID != uid {
+	if source == nil || !contactDAVStateMatches(expected.Source, source) || source.UID != uid {
 		return nil, false, ErrResourceStateChanged
 	}
 

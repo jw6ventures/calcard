@@ -99,3 +99,9 @@ func TestStartDeletedResourceCleanupOffPrunesNothing(t *testing.T) {
 		t.Fatalf("cleanup with retention off pruned %v", calls)
 	}
 }
+
+func TestStartDeletedResourceCleanupWithNilRepository(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	StartDeletedResourceCleanup(ctx, nil, time.Hour, time.Hour)
+}

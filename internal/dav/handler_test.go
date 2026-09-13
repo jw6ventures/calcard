@@ -3521,7 +3521,10 @@ func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T)
 	}}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privilegeSet := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privilegeSet, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privilegeSet == nil {
 		t.Fatal("expected privilege set for readable calendar")
 	}
@@ -5816,7 +5819,11 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 		},
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
-	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/"); privs == nil || len(privs.Privileges) == 0 {
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
 
@@ -5862,7 +5869,11 @@ func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
-	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/"); privs == nil || len(privs.Privileges) == 0 {
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
 
@@ -5898,7 +5909,10 @@ func TestCalendarCurrentUserPrivilegeSetForReadFreeBusyDelegate(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privs == nil {
 		t.Fatal("expected computed privilege set for read-free-busy delegate")
 	}
@@ -5925,7 +5939,10 @@ func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenie
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privs == nil {
 		t.Fatal("expected computed privilege set")
 	}

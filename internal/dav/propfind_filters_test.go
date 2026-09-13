@@ -327,7 +327,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 			SyncToken:               "sync-token",
 			CTag:                    "9",
 			ScheduleCalendarTransp:  &scheduleCalendarTransp{Opaque: &struct{}{}},
-			CurrentUserPrivilegeSet: calendarCurrentUserPrivilegeSet(true),
+			CurrentUserPrivilegeSet: birthdayCalendarCurrentUserPrivilegeSet(),
 			ACL:                     &aclProp{},
 			Owner:                   &hrefProp{Href: "/dav/principals/1/"},
 		},

@@ -31,20 +31,3 @@ func (h *DavServer) moveStatePaths(ctx context.Context, user *store.User, fromPa
 	}
 	return fromCanonical, toCanonical, nil
 }
-
-func (h *DavServer) deleteDAVACLState(ctx context.Context, user *store.User, resourcePath string) error {
-	canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
-	if err != nil {
-		return err
-	}
-	if canonicalPath == "" || h == nil || h.store == nil || h.store.ACLEntries == nil {
-		return nil
-	}
-	defer invalidateDAVRequestState(ctx)
-	for _, statePath := range davStatePaths(canonicalPath) {
-		if err := h.store.ACLEntries.Delete(ctx, statePath); err != nil {
-			return err
-		}
-	}
-	return nil
-}

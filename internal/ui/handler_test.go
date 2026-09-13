@@ -3446,13 +3446,12 @@ func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64)
 }
 
 type fakeACLRepo struct {
-	entries                                   []store.ACLEntry
-	deletePrincipalEntriesByResourcePrefixErr error
-	setACLErr                                 error
-	listByResourceCalls                       int
-	listByPrincipalCalls                      int
-	listByResourcesAndPrincipalsCalls         int
-	batchedResourcePaths                      []string
+	entries                           []store.ACLEntry
+	setACLErr                         error
+	listByResourceCalls               int
+	listByPrincipalCalls              int
+	listByResourcesAndPrincipalsCalls int
+	batchedResourcePaths              []string
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
@@ -3521,21 +3520,6 @@ func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {
 		if entry.ResourcePath == resourcePath {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	f.entries = filtered
-	return nil
-}
-
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	if f.deletePrincipalEntriesByResourcePrefixErr != nil {
-		return f.deletePrincipalEntriesByResourcePrefixErr
-	}
-	filtered := f.entries[:0]
-	for _, entry := range f.entries {
-		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -4272,5 +4256,27 @@ func TestViewBirthdaysInsideTheBudgetIsComplete(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "Not all of your birthdays are shown") {
 		t.Fatal("a complete page carries a truncation notice")
+	}
+}
+
+func TestManagedShareAfterBroadReadGrant(t *testing.T) {
+	for _, principal := range []string{"DAV:all", "DAV:authenticated"} {
+		t.Run(principal, func(t *testing.T) {
+			entries := []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
+			}
+			if !hasEffectiveManagedCalendarShare(entries, 200) {
+				t.Fatal("broad read grant hid the user's managed share")
+			}
+			entries[0].IsGrant = false
+			if hasEffectiveManagedCalendarShare(entries, 200) {
+				t.Fatal("earlier deny must still hide the share")
+			}
+			entries[0].IsGrant = true
+			if hasEffectiveManagedCalendarShare(entries[:1], 200) {
+				t.Fatal("broad grant alone is not a managed share")
+			}
+		})
 	}
 }

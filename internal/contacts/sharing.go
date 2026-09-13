@@ -354,11 +354,13 @@ func (s *Service) UnshareAddressBook(ctx context.Context, user *store.User, book
 func hasEffectiveManagedShare(entries []store.ACLEntry, userID int64) bool {
 	principalHref := sharePrincipalHref(userID)
 	applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
+	if read, _ := acl.DecisionForPrivilege(entries, applicable, "read"); !read {
+		return false
+	}
 	for _, entry := range entries {
-		if _, ok := applicable[acl.NormalizePrincipalHref(entry.PrincipalHref)]; !ok || !acl.PrivilegeMatches(entry.Privilege, "read") {
-			continue
+		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && acl.PrivilegeMatches(entry.Privilege, "read") && shareManagedPrivilege(entry.Privilege) {
+			return true
 		}
-		return entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && shareManagedPrivilege(entry.Privilege)
 	}
 	return false
 }

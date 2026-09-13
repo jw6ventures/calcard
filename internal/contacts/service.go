@@ -239,7 +239,14 @@ func (s *Service) DeleteContact(ctx context.Context, user *store.User, bookID in
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
-	return s.store.DeleteContactAndState(ctx, bookID, store.ContactDAVResourceState(existing), resourcePaths[0], nil)
+	err = s.store.DeleteContactAndState(ctx, bookID, store.ContactDAVResourceState(existing), resourcePaths[0], nil)
+	if errors.Is(err, store.ErrResourceStateChanged) {
+		if ifMatch != "" || ifNoneMatch != "" {
+			return ErrPreconditionFailed
+		}
+		return ErrConflict
+	}
+	return err
 }
 
 func (s *Service) requireOwnedBook(ctx context.Context, user *store.User, bookID int64) (*store.AddressBook, error) {

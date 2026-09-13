@@ -665,11 +665,13 @@ func (h *Handler) removeCalendarShare(ctx context.Context, calendarID, userID in
 func hasEffectiveManagedCalendarShare(entries []store.ACLEntry, userID int64) bool {
 	principalHref := calendarSharePrincipalHref(userID)
 	applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
+	if read, _ := acl.DecisionForPrivilege(entries, applicable, "read"); !read {
+		return false
+	}
 	for _, entry := range entries {
-		if _, ok := applicable[acl.NormalizePrincipalHref(entry.PrincipalHref)]; !ok || !acl.PrivilegeMatches(entry.Privilege, "read") {
-			continue
+		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && acl.PrivilegeMatches(entry.Privilege, "read") && calendarShareManagedPrivilege(entry.Privilege) {
+			return true
 		}
-		return entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && calendarShareManagedPrivilege(entry.Privilege)
 	}
 	return false
 }

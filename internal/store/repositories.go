@@ -136,7 +136,6 @@ type ACLRepository interface {
 	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
 	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
-	DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
 }

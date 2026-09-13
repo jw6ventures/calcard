@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -282,7 +283,10 @@ func TestCurrentUserPrivilegeSetForObjectPathsIsPresent(t *testing.T) {
 		"/dav/addressbooks/6/alice.vcf",
 		"/dav/calendars/-1/birthday-alice@calcard.ics",
 	} {
-		privs := h.currentUserPrivilegeSetForPath(context.Background(), owner, path)
+		privs, err := h.currentUserPrivilegeSetForPath(context.Background(), owner, path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if privs == nil {
 			t.Fatalf("%s: expected a present privilege set (non-nil), got nil", path)
 		}
@@ -299,7 +303,10 @@ func TestCurrentUserPrivilegeSetForDelegatedPrincipalReportsGrantedPrivileges(t 
 		{ResourcePath: "/dav/principals/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read-current-user-privilege-set"},
 	}}}}
 
-	privileges := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/principals/2/")
+	privileges, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/principals/2/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privileges == nil {
 		t.Fatal("expected a present privilege set")
 	}
@@ -315,7 +322,10 @@ func TestCurrentUserPrivilegeSetForAddressBookIncludesSupportedReadFreeBusy(t *t
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	h := privilegeKindsHandler("read-free-busy", "read-current-user-privilege-set")
 
-	privileges := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/6/")
+	privileges, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/6/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privileges == nil {
 		t.Fatal("expected a present privilege set")
 	}
@@ -458,4 +468,27 @@ func TestApplicablePrincipalsForPathSkipsOwnerLookupWithoutResourceForms(t *test
 			t.Errorf("unexpectedly applied %q: %#v", principal, got)
 		}
 	}
+}
+
+type unavailablePrivilegeCalendarRepo struct {
+	store.CalendarRepository
+	err error
+}
+
+func (r unavailablePrivilegeCalendarRepo) GetByID(context.Context, int64) (*store.Calendar, error) {
+	return nil, r.err
+}
+
+func TestDecoratePrivilegeSetPropagatesRepositoryFailure(t *testing.T) {
+	failure := errors.New("calendar repository unavailable")
+	h := &DavServer{store: &store.Store{Calendars: unavailablePrivilegeCalendarRepo{err: failure}}}
+	p := &prop{}
+	err := h.decorateDAVProp(context.Background(), &store.User{ID: 1}, "/dav/calendars/5", p, propDecorationMask{currentUserPrivilegeSet: true})
+	if !errors.Is(err, failure) {
+		t.Fatalf("error = %v, want repository error instead of an absent property", err)
+	}
+}
+
+func (r unavailablePrivilegeCalendarRepo) GetAccessible(context.Context, int64, int64) (*store.CalendarAccess, error) {
+	return nil, r.err
 }

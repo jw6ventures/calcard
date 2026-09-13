@@ -55,17 +55,6 @@ func (f *fakeACLRepo) ListByPrincipal(_ context.Context, principalHref string) (
 func (f *fakeACLRepo) HasPrivilege(context.Context, string, string, string) (bool, error) {
 	return false, nil
 }
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(_ context.Context, principalHref, prefix string) error {
-	kept := f.entries[:0:0]
-	for _, e := range f.entries {
-		if e.PrincipalHref == principalHref && strings.HasPrefix(e.ResourcePath, prefix) {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	f.entries = kept
-	return nil
-}
 func (f *fakeACLRepo) MoveResourcePath(context.Context, string, string) error { return nil }
 func (f *fakeACLRepo) Delete(context.Context, string) error                   { return nil }
 

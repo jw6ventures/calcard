@@ -27,7 +27,7 @@ func birthdayCalendarSyncToken() string {
 
 func birthdayCalendarCollection(href, principalHref string) response {
 	description := birthdayCalendarDescription
-	return calendarCollectionResponse(href, birthdayCalendarName, store.Calendar{Description: &description}, principalHref, birthdayCalendarSyncToken(), "0", true)
+	return birthdayCalendarCollectionResponse(href, birthdayCalendarName, store.Calendar{Description: &description}, principalHref, birthdayCalendarSyncToken(), "0")
 }
 
 func isBirthdayCalendarTarget(target davTarget) bool {

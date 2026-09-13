@@ -2683,54 +2683,6 @@ SELECT COALESCE((
 	return exists, nil
 }
 
-func (r *aclRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	defer observeDB(ctx, "acl.delete_principal_entries_by_resource_prefix")()
-
-	tx, err := r.pool.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(resourcePathPrefix)
-	likePrefix := escaped + "/%"
-
-	const listQ = `SELECT DISTINCT resource_path FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\') ORDER BY resource_path`
-	rows, err := tx.QueryContext(ctx, listQ, principalHref, resourcePathPrefix, likePrefix)
-	if err != nil {
-		return err
-	}
-	var affected []string
-	for rows.Next() {
-		var resourcePath string
-		if err := rows.Scan(&resourcePath); err != nil {
-			rows.Close()
-			return err
-		}
-		affected = append(affected, resourcePath)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-
-	const deleteQ = `DELETE FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')`
-	if _, err := tx.ExecContext(ctx, deleteQ, principalHref, resourcePathPrefix, likePrefix); err != nil {
-		return err
-	}
-
-	for _, resourcePath := range affected {
-		if err := touchACLDependentState(ctx, tx, resourcePath); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
 func (r *aclRepo) Delete(ctx context.Context, resourcePath string) error {
 	const q = `DELETE FROM acl_entries WHERE resource_path=$1`
 	defer observeDB(ctx, "acl.delete")()

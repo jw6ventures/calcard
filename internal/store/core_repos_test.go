@@ -1872,51 +1872,6 @@ func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
 	}
 }
 
-func TestACLRepoDeletePrincipalEntriesByResourcePrefixUsesSingleTransaction(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New() error = %v", err)
-	}
-	defer db.Close()
-
-	repo := &aclRepo{pool: db}
-	principalHref := "/dav/principals/2/"
-	resourcePrefix := "/dav/calendars/1"
-	likePrefix := "/dav/calendars/1/%"
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT resource_path FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\') ORDER BY resource_path`)).
-		WithArgs(principalHref, resourcePrefix, likePrefix).
-		WillReturnRows(sqlmock.NewRows([]string{"resource_path"}).
-			AddRow("/dav/calendars/1").
-			AddRow("/dav/calendars/1/private-event"))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')`)).
-		WithArgs(principalHref, resourcePrefix, likePrefix).
-		WillReturnResult(sqlmock.NewResult(0, 3))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
-		WithArgs(int64(1), "private-event", "private-event.ics").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	err = repo.DeletePrincipalEntriesByResourcePrefix(context.Background(), principalHref, resourcePrefix)
-	if err != nil {
-		t.Fatalf("DeletePrincipalEntriesByResourcePrefix() error = %v", err)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
 func TestLockRepoCreateRejectsDepthInfinityWhenDescendantLocked(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -2591,5 +2546,71 @@ func TestBaselineSchemaDropsSupersededIndexes(t *testing.T) {
 		if strings.Contains(string(contents), superseded) {
 			t.Errorf("db.sql still creates %q, which the keyset migration drops", superseded)
 		}
+	}
+}
+
+func TestDeleteMissingDAVResourceState(t *testing.T) {
+	for _, kind := range []string{"event", "contact"} {
+		t.Run(kind, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			st := New(db)
+			mock.ExpectBegin()
+			table, collection := "events", "calendar_id"
+			if kind == "contact" {
+				table, collection = "contacts", "address_book_id"
+			}
+			mock.ExpectQuery("SELECT .* FROM "+table+" WHERE "+collection+`=\$1 AND resource_name=\$2 FOR UPDATE`).WithArgs(int64(7), "").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectRollback()
+			defer func() {
+				if value := recover(); value != nil {
+					t.Errorf("missing resource panicked: %v", value)
+				}
+			}()
+			if kind == "event" {
+				err = st.DeleteEventAndState(context.Background(), 7, DAVResourceState{}, "/dav/calendars/7/missing", nil)
+			} else {
+				err = st.DeleteContactAndState(context.Background(), 7, DAVResourceState{}, "/dav/addressbooks/7/missing", nil)
+			}
+			if !errors.Is(err, ErrResourceStateChanged) {
+				t.Fatalf("error = %v, want ErrResourceStateChanged", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTransferContactMissingSourceState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).WithArgs(int64(7), "").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectRollback()
+	defer func() {
+		tx.Rollback()
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer func() {
+		if value := recover(); value != nil {
+			t.Errorf("missing source panicked: %v", value)
+		}
+	}()
+	_, _, err = transferContactTx(context.Background(), tx, contactTransferMove, 7, 8, "missing", "missing", "", ContactTransferExpectation{})
+	if !errors.Is(err, ErrResourceStateChanged) {
+		t.Fatalf("error = %v, want ErrResourceStateChanged", err)
 	}
 }

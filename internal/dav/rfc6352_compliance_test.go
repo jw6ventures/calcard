@@ -264,18 +264,6 @@ func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 	return nil
 }
 
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	filtered := f.entries[:0]
-	for _, entry := range f.entries {
-		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	f.entries = filtered
-	return nil
-}
-
 func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
 	if f.moveResourcePathHook != nil {
 		f.moveResourcePathHook(fromPath, toPath)
