@@ -2363,17 +2363,17 @@ func TestStoreCopyEventAndStateRollsBackWhenDestinationStateClearFails(t *testin
 // baselineSchemaVersionRow is the version db.sql seeds, which every migration
 // test below asserts against: a fresh install and one upgraded through the
 // newest migration have to report the same schema version.
-const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0-rc8')"
+const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0')"
 
 // TestCalendarPropertyColumnsMigration pins that the migration and the flattened
 // baseline schema both add the columns the calendar live properties are read
 // from, so a deployment upgraded by migration and one created from db.sql agree.
 func TestCalendarPropertyColumnsMigration(t *testing.T) {
 	sources := map[string][]string{
-		"../../migrations/v1.1.10.sql": {
+		"../../migrations/v1.2.0.sql": {
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[]",
-			"UPDATE application SET value = 'v1.1.10'",
+			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
 			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
@@ -2396,14 +2396,14 @@ func TestCalendarPropertyColumnsMigration(t *testing.T) {
 
 func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T) {
 	sources := map[string][]string{
-		"../../migrations/v1.1.11.sql": {
+		"../../migrations/v1.2.0.sql": {
 			"ALTER TABLE acl_entries ADD COLUMN IF NOT EXISTS ace_order INTEGER NOT NULL DEFAULT 0",
 			"ROW_NUMBER() OVER (PARTITION BY resource_path ORDER BY created_at, id)",
 			"DROP INDEX IF EXISTS idx_acl_unique",
 			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
 			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT",
 			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_sha256_ha1 TEXT",
-			"UPDATE application SET value = 'v1.1.11'",
+			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
 			"ace_order INTEGER NOT NULL DEFAULT 0",
@@ -2436,12 +2436,12 @@ func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
 	untilIndex := "CREATE INDEX IF NOT EXISTS idx_events_recurrence_until\n    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz))"
 
 	sources := map[string][]string{
-		"../../migrations/v1.1.12.sql": {
+		"../../migrations/v1.2.0.sql": {
 			"DROP INDEX IF EXISTS idx_events_recurrence_start",
 			"DROP INDEX IF EXISTS idx_events_recurrence_until",
 			startIndex,
 			untilIndex,
-			"UPDATE application SET value = 'v1.1.12'",
+			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
 			startIndex,
@@ -2488,18 +2488,15 @@ func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
 	contactsIndex := "idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified)"
 
 	sources := map[string][]string{
-		"../../migrations/v1.2.0-rc8.sql": {
+		"../../migrations/v1.2.0.sql": {
 			eventsIndex,
 			contactsIndex,
 			"DROP INDEX IF EXISTS idx_events_calendar_keyset",
 			"DROP INDEX IF EXISTS idx_contacts_book_keyset",
-			"UPDATE application SET value = 'v1.2.0-rc8'",
-		},
-		"../../migrations/v1.2.0-rc7.sql": {
 			"CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset\n    ON deleted_resources (resource_type, collection_id, id)",
 			"DROP INDEX IF EXISTS idx_events_calendar_id",
 			"DROP INDEX IF EXISTS idx_contacts_address_book_id",
-			"UPDATE application SET value = 'v1.2.0-rc7'",
+			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
 			"CREATE INDEX idx_events_calendar_keyset ON events(\n    calendar_id, id, last_modified,\n" +
