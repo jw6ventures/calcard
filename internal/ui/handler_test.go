@@ -930,6 +930,191 @@ func TestCreateContactHandler(t *testing.T) {
 	}
 }
 
+// A contact created in the UI is addressed over DAV by its resource name, so
+// the create path has to store that identity itself rather than leave the
+// column for a repository default to fill in: the resource name is what the
+// sync reports build an href from.
+func TestCreateContactStoresDAVResourceName(t *testing.T) {
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil)
+
+	form := url.Values{
+		"display_name": {"Johnny Appleseed"},
+		"first_name":   {"Johnny"},
+		"last_name":    {"Appleseed"},
+		"email":        {"johnny@apple.seed"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "test@example.com"}))
+
+	response := httptest.NewRecorder()
+	handler.CreateContact(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("CreateContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("CreateContact() stored %d contacts, want 1", len(contactRepo.contacts))
+	}
+	for _, stored := range contactRepo.contacts {
+		if stored.UID == "" || stored.ResourceName != stored.UID {
+			t.Fatalf("stored resource name = %q, want it to equal the contact UID %q", stored.ResourceName, stored.UID)
+		}
+		if !strings.Contains(stored.RawVCard, "FN:Johnny Appleseed") {
+			t.Fatalf("stored vCard = %q, want it to carry the display name", stored.RawVCard)
+		}
+		if stored.ETag == "" {
+			t.Fatal("CreateContact() stored no ETag")
+		}
+	}
+}
+
+// contactFormRouter serves the contact routes with a signed-in user, so a case
+// exercises the handlers through the same chi routing the server mounts.
+func contactFormRouter(h *Handler, userID int64) http.Handler {
+	router := chi.NewRouter()
+	router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := &store.User{ID: userID, PrimaryEmail: "test@example.com"}
+			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+		})
+	})
+	router.Put("/addressbooks/{id}/contacts/{uid}", h.UpdateContact)
+	router.Post("/addressbooks/{id}/import", h.ImportAddressBook)
+	return router
+}
+
+// A contact stored by a CardDAV PUT carries the resource name that PUT chose,
+// and that name is the last segment of every href the sync reports publish for
+// it. Editing the contact in the UI changes the contact, not its identity, so
+// the resource name has to survive the write: rewriting it to the UID retracts
+// one href and publishes another for the same contact.
+func TestUpdateContactPreservesDAVResourceName(t *testing.T) {
+	const (
+		uid          = "alice@calcard"
+		resourceName = "alice-from-the-phone"
+	)
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: resourceName, ETag: "etag-old"},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil)
+
+	form := url.Values{"display_name": {"Alice Renamed"}}
+	req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("UpdateContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	stored := contactRepo.contacts["1:"+uid]
+	if stored == nil {
+		t.Fatal("UpdateContact() stored no contact")
+	}
+	if stored.ResourceName != resourceName {
+		t.Fatalf("stored resource name = %q, want the name the CardDAV PUT chose, %q", stored.ResourceName, resourceName)
+	}
+	if !strings.Contains(stored.RawVCard, "FN:Alice Renamed") {
+		t.Fatalf("stored vCard = %q, want it to carry the new display name", stored.RawVCard)
+	}
+}
+
+// An imported vCard is a contact like any other: it needs the DAV resource
+// name the sync reports build an href from, and re-importing a file replaces
+// the contacts it already carries rather than failing on their UIDs.
+func TestImportAddressBookStoresContactsThroughTheService(t *testing.T) {
+	const uid = "imported@calcard"
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil)
+
+	importVCF := func(t *testing.T, displayName string) {
+		t.Helper()
+		vcf := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + displayName + "\r\nEND:VCARD\r\n"
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", "contacts.vcf")
+		if err != nil {
+			t.Fatalf("CreateFormFile() error = %v", err)
+		}
+		if _, err := part.Write([]byte(vcf)); err != nil {
+			t.Fatalf("write vCard: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close multipart writer: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/import", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		response := httptest.NewRecorder()
+
+		contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("ImportAddressBook() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if location := response.Header().Get("Location"); strings.Contains(location, "error") {
+			t.Fatalf("ImportAddressBook() redirected with an error: %s", location)
+		}
+	}
+
+	importVCF(t, "Imported Person")
+
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("ImportAddressBook() stored %d contacts, want 1", len(contactRepo.contacts))
+	}
+	stored := contactRepo.contacts["1:"+uid]
+	if stored == nil {
+		t.Fatalf("ImportAddressBook() stored no contact under %q", uid)
+	}
+	if stored.ResourceName != uid {
+		t.Fatalf("stored resource name = %q, want the contact UID %q", stored.ResourceName, uid)
+	}
+	if stored.ETag == "" {
+		t.Fatal("ImportAddressBook() stored no ETag")
+	}
+
+	// Re-importing the same UID replaces the contact instead of being refused.
+	importVCF(t, "Imported Person Revised")
+
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("re-import stored %d contacts, want the original replaced", len(contactRepo.contacts))
+	}
+	stored = contactRepo.contacts["1:"+uid]
+	if stored == nil || !strings.Contains(stored.RawVCard, "FN:Imported Person Revised") {
+		t.Fatalf("re-import stored vCard = %#v, want the revised display name", stored)
+	}
+	if stored.ResourceName != uid {
+		t.Fatalf("re-import resource name = %q, want %q", stored.ResourceName, uid)
+	}
+}
+
 func TestViewBirthdaysHandler(t *testing.T) {
 	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
 	displayName := "John Doe"
@@ -3792,6 +3977,115 @@ func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
 	if !strings.Contains(location, "/addressbooks/1") {
 		t.Fatalf("expected redirect back to source book, got %q", location)
 	}
+}
+
+// Contact UIDs routinely contain characters that must be percent-encoded in a
+// path segment, and chi routes on the raw path, so handlers receive the encoded
+// form and have to decode it before hitting the repositories.
+func TestContactHandlersDecodePercentEncodedUID(t *testing.T) {
+	const (
+		decodedUID = "1789347992637824340-ynnkm8nj@calcard"
+		encodedUID = "1789347992637824340-ynnkm8nj%40calcard"
+	)
+
+	newRouter := func(h *Handler) http.Handler {
+		router := chi.NewRouter()
+		router.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				user := &store.User{ID: 100, PrimaryEmail: "test@example.com"}
+				next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+			})
+		})
+		router.Put("/addressbooks/{id}/contacts/{uid}", h.UpdateContact)
+		router.Delete("/addressbooks/{id}/contacts/{uid}", h.DeleteContact)
+		router.Post("/addressbooks/{id}/contacts/{uid}/move", h.MoveContact)
+		return router
+	}
+
+	t.Run("move", func(t *testing.T) {
+		contactRepo := &fakeContactRepoWithMove{
+			fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+				2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+			}},
+			Contacts: contactRepo,
+		}, nil)
+
+		form := url.Values{"target_address_book_id": {"2"}}
+		req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts/"+encodedUID+"/move", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("MoveContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if !contactRepo.moved {
+			t.Fatal("MoveContact() did not move the contact")
+		}
+		if contactRepo.tombstoneUID != decodedUID {
+			t.Fatalf("MoveContact() tombstone UID = %q, want %q", contactRepo.tombstoneUID, decodedUID)
+		}
+		if location := response.Header().Get("Location"); !strings.Contains(location, "/addressbooks/2") {
+			t.Fatalf("MoveContact() redirect location = %q, want it to contain /addressbooks/2", location)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		resourcePath := "/dav/addressbooks/1/" + decodedUID
+		deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+			resourcePath: {{ResourcePath: resourcePath, NamespaceURI: "urn:test", LocalName: "note"}},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			}},
+			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+			DeadProperties: deadProperties,
+		}, nil)
+
+		req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/"+encodedUID, nil)
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("DeleteContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if len(deadProperties.properties[resourcePath]) != 0 {
+			t.Fatalf("DeleteContact() retained dead properties: %#v", deadProperties.properties)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			}},
+			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+		}, nil)
+
+		form := url.Values{"display_name": {"Renamed Contact"}}
+		req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+encodedUID, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("UpdateContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+	})
 }
 
 type fakeContactRepoWithMove struct {

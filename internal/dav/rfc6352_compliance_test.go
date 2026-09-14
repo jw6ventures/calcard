@@ -1573,7 +1573,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice-v4.vcf", nil)
-		req.Header.Set("Accept", `text/vcard; version="3.0"`)
+		req.Header.Set("Accept", `text/vcard; version="2.1"`)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
 
@@ -3622,7 +3622,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 		h := &DavServer{store: &store.Store{
 			AddressBooks: bookRepo,
 			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
-				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: buildVCard("4.0", "UID:alice-v4", "FN:Alice Example"), ETag: "etag-v4"},
+				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: "BEGIN:VCARD\r\nUID:alice-v4\r\nFN:Alice Example\r\nEND:VCARD\r\n", ETag: "etag-v4"},
 			}},
 		}}
 
@@ -3658,7 +3658,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 		h := &DavServer{store: &store.Store{
 			AddressBooks: bookRepo,
 			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
-				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: buildVCard("4.0", "UID:alice-v4", "FN:Alice Example"), ETag: "etag-v4"},
+				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: "BEGIN:VCARD\r\nUID:alice-v4\r\nFN:Alice Example\r\nEND:VCARD\r\n", ETag: "etag-v4"},
 			}},
 		}}
 

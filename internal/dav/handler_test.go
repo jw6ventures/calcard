@@ -1061,7 +1061,7 @@ func TestGetRejectsWildcardAcceptRangeWithZeroQuality(t *testing.T) {
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
-	req.Header.Set("Accept", `text/vcard; version="4.0", */*;q=0`)
+	req.Header.Set("Accept", `text/vcard; version="2.1", */*;q=0`)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 

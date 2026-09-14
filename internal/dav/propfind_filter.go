@@ -556,12 +556,20 @@ func filterAddressObjectPropfindResponse(resp response, req *propfindRequest) re
 	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
 		return resp
 	}
-	src := resp.Propstat[0].Prop
-	if !req.suppressData && req.Prop.AddressData != nil && !canServeRequestedAddressData(string(src.AddressData), req.Prop.AddressData) {
-		resp.Propstat = nil
-		resp.Status = httpStatusNotAcceptable
-		resp.Error = &responseError{SupportedAddressDataConversion: &struct{}{}}
-		return resp
+	if !req.suppressData && req.Prop.AddressData != nil {
+		converted, ok := addressDataForQuery(string(resp.Propstat[0].Prop.AddressData), req.Prop.AddressData)
+		if !ok {
+			resp.Propstat = nil
+			resp.Status = httpStatusNotAcceptable
+			resp.Error = &responseError{SupportedAddressDataConversion: &struct{}{}}
+			return resp
+		}
+		// The converted data belongs to this response alone, so the propstat is
+		// copied rather than rewritten where the caller built it.
+		propstats := make([]propstat, len(resp.Propstat))
+		copy(propstats, resp.Propstat)
+		propstats[0].Prop.AddressData = cdataString(converted)
+		resp.Propstat = propstats
 	}
 	resp.Status = ""
 	resp.Error = nil

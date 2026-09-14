@@ -159,7 +159,8 @@ func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if !acceptsVCardData(contact.RawVCard, r.Header.Get("Accept")) {
+	data, acceptable := vcardDataForAccept(contact.RawVCard, r.Header.Get("Accept"))
+	if !acceptable {
 		writeCardDAVPrecondition(w, http.StatusNotAcceptable, "supported-address-data-conversion")
 		return
 	}
@@ -168,5 +169,5 @@ func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Reque
 	if !contact.LastModified.IsZero() {
 		w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
 	}
-	_, _ = w.Write([]byte(contact.RawVCard))
+	_, _ = w.Write([]byte(data))
 }

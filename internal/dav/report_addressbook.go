@@ -294,7 +294,10 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	var since time.Time
 	if report.SyncToken != "" {
 		info, err := parseSyncToken(report.SyncToken)
-		if err != nil || info.Kind != "card" || info.ID != book.ID {
+		// A stored collection reports changes since an instant and never
+		// spells a whole-state token, so one carrying that segment was not
+		// issued for it.
+		if err != nil || info.Kind != "card" || info.ID != book.ID || info.State != "" {
 			return nil, "", errInvalidSyncToken
 		}
 		if !h.syncTokenAnswerable(info.Timestamp, book.UpdatedAt) {
@@ -325,11 +328,18 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, strconv.FormatInt(book.CTag, 10)),
 	}
 	addressDataReq := reportAddressData(report)
+	// A resource name freed by a deletion can be bound again, which leaves a
+	// tombstone naming an href the collection now holds. RFC 6578 §3.2 fixes no
+	// order over the DAV:response elements, so reporting both the addition and
+	// the removal lets a client apply them in either order and lose the
+	// resource; the stored contact is the authority over its own href.
+	liveHrefs := make(map[string]struct{}, len(contacts))
 	for _, contact := range contacts {
 		if h.multistatusBuildComplete(responses) {
 			break
 		}
 		href := addressObjectHref(collectionHref, contactResourceName(contact))
+		liveHrefs[href] = struct{}{}
 		resp, err := h.buildAddressObjectReportResponse(href, contact, report.Prop, addressDataReq)
 		if err != nil {
 			return nil, "", err
@@ -367,6 +377,9 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 				continue
 			}
 			href := addressObjectHref(collectionHref, resourceName)
+			if _, live := liveHrefs[href]; live {
+				continue
+			}
 			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
 		}
 	}

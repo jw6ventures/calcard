@@ -200,7 +200,19 @@ func TestFilterAddressObjectPropfindResponseBranches(t *testing.T) {
 		t.Fatalf("expected nil request to return response unchanged, got %#v", got)
 	}
 
-	notAcceptable := filterAddressObjectPropfindResponse(base, &propfindRequest{Prop: &propfindPropQuery{
+	converted := filterAddressObjectPropfindResponse(base, &propfindRequest{Prop: &propfindPropQuery{
+		AddressData: &addressDataQuery{ContentType: "text/vcard", Version: "3.0"},
+	}})
+	if len(converted.Propstat) == 0 || !strings.Contains(string(converted.Propstat[0].Prop.AddressData), "VERSION:3.0") {
+		t.Fatalf("expected the stored card to be converted to the requested version, got %#v", converted.Propstat)
+	}
+
+	unversioned := base
+	unversioned.Propstat = []propstat{{
+		Prop:   prop{AddressData: cdataString("BEGIN:VCARD\r\nUID:alice\r\nFN:Alice Example\r\nEND:VCARD\r\n")},
+		Status: httpStatusOK,
+	}}
+	notAcceptable := filterAddressObjectPropfindResponse(unversioned, &propfindRequest{Prop: &propfindPropQuery{
 		AddressData: &addressDataQuery{ContentType: "text/vcard", Version: "3.0"},
 	}})
 	if notAcceptable.Status != httpStatusNotAcceptable || notAcceptable.Error == nil || len(notAcceptable.Propstat) != 0 {

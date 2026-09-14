@@ -275,7 +275,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 				p.ACL.ACE = append(p.ACL.ACE, inherited.ACE...)
 			}
 			if ownerHref != "" {
-				p.ACL.ACE = append([]aceResp{protectedOwnerACE(ownerHref)}, p.ACL.ACE...)
+				p.ACL.ACE = append([]aceResp{protectedOwnerACEForPath(ctx, resourcePath, ownerHref)}, p.ACL.ACE...)
 			}
 		}
 	}

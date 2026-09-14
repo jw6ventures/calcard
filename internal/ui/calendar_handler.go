@@ -1298,11 +1298,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawUID := chi.URLParam(r, "uid")
-	uid, err := url.PathUnescape(rawUID)
-	if err != nil || uid == "" {
-		uid = rawUID
-	}
+	uid := resourceUIDParam(r)
 	if uid == "" {
 		http.Error(w, "invalid event uid", http.StatusBadRequest)
 		return
@@ -1497,11 +1493,7 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawUID := chi.URLParam(r, "uid")
-	uid, err := url.PathUnescape(rawUID)
-	if err != nil || uid == "" {
-		uid = rawUID
-	}
+	uid := resourceUIDParam(r)
 	if uid == "" {
 		http.Error(w, "invalid event uid", http.StatusBadRequest)
 		return

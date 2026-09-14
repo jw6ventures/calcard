@@ -594,7 +594,10 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 	var since time.Time
 	if report.SyncToken != "" {
 		info, err := parseSyncToken(report.SyncToken)
-		if err != nil || info.Kind != "cal" || info.ID != req.cal.ID {
+		// A stored collection reports changes since an instant and never
+		// spells a whole-state token, so one carrying that segment was not
+		// issued for it.
+		if err != nil || info.Kind != "cal" || info.ID != req.cal.ID || info.State != "" {
 			return nil, "", errInvalidSyncToken
 		}
 		if !h.syncTokenAnswerable(info.Timestamp, req.cal.UpdatedAt) {
@@ -630,10 +633,18 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 
 	// Include deleted resources if this is an incremental sync
 	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
-		deletedHrefs := make(map[string]struct{})
+		// A resource name freed by a deletion can be bound again, which leaves
+		// a tombstone naming an href the collection now holds. RFC 6578 §3.2
+		// fixes no order over the DAV:response elements, so reporting both the
+		// addition and the removal lets a client apply them in either order and
+		// lose the resource; seeding the reported-removed set with the live
+		// hrefs makes the stored event the authority over its own href.
+		deletedHrefs := make(map[string]struct{}, len(events))
 		visible := make(map[string]struct{}, len(events))
 		for _, event := range events {
-			visible[eventResourceName(event)] = struct{}{}
+			resourceName := eventResourceName(event)
+			visible[resourceName] = struct{}{}
+			deletedHrefs[calendarObjectHref(collectionHref, resourceName)] = struct{}{}
 		}
 		for _, event := range allEvents {
 			if h.multistatusBuildComplete(responses) {

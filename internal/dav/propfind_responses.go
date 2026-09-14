@@ -380,7 +380,11 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 
 			// Add the virtual birthday calendar first
 			birthdayHref := birthdayCalendarHref()
-			res = h.appendMultistatusResponses(res, []response{birthdayCalendarCollection(birthdayHref, principalHref)})
+			birthdayState, err := h.birthdayCollectionState(ctx, user.ID)
+			if err != nil {
+				return nil, err
+			}
+			res = h.appendMultistatusResponses(res, []response{birthdayCalendarCollection(birthdayHref, principalHref, birthdayState)})
 			if depth == "infinity" && !h.multistatusBuildComplete(res) && h.store != nil && h.store.Contacts != nil {
 				events, err := h.generateBirthdayEvents(ctx, user.ID)
 				if err != nil {
@@ -425,7 +429,11 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 	if calID == birthdayCalendarID {
 		href := birthdayCalendarHref()
 		principalHref := h.principalURL(user)
-		res := []response{birthdayCalendarCollection(href, principalHref)}
+		state, err := h.birthdayCollectionState(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		res := []response{birthdayCalendarCollection(href, principalHref, state)}
 
 		if depthIncludesChildren(depth) {
 			events, err := h.generateBirthdayEvents(ctx, user.ID)

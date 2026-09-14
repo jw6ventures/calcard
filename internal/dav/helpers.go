@@ -388,14 +388,7 @@ func isASCIILower(r rune) bool {
 }
 
 func birthdayCalendarCurrentUserPrivilegeSet() *currentUserPrivilegeSet {
-	privs := []privilege{
-		{Read: &readPrivilege{}},
-		{ReadFreeBusy: &struct{}{}},
-		{ReadACL: &struct{}{}},
-		{ReadCurrentUserPrivilegeSet: &struct{}{}},
-	}
-
-	return &currentUserPrivilegeSet{Privileges: privs}
+	return currentUserPrivilegeSetForNames(birthdayCalendarPrivilegeNames)
 }
 
 func calendarCurrentUserPrivilegeSetForCalendar(privileges store.CalendarPrivileges) *currentUserPrivilegeSet {

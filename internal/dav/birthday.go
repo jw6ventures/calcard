@@ -21,13 +21,64 @@ func birthdayCalendarHref() string {
 	return ensureCollectionHref(fmt.Sprintf("/dav/calendars/%d", birthdayCalendarID))
 }
 
-func birthdayCalendarSyncToken() string {
-	return buildSyncToken("cal", birthdayCalendarID, time.Unix(0, 0))
+// birthdayCollectionState versions the generated birthday collection. The
+// collection is built from every contact the user owns, and the address books
+// those contacts live in already carry that state: a book's ctag counts every
+// contact inserted, updated and deleted in it, and the number of books catches
+// a book removed whole, which takes its contacts with it without touching any
+// surviving book. The ctag moves for contacts carrying no birthday too, so the
+// collection is re-read more often than its content strictly changes -- the
+// error a client can absorb, unlike a change it is never told about.
+type birthdayCollectionState struct {
+	books     int
+	ctagSum   int64
+	updatedAt time.Time
 }
 
-func birthdayCalendarCollection(href, principalHref string) response {
+// tag is the state rendered as one opaque token. updatedAt is carried alongside
+// the counts because a book removed and another added can land on the same pair
+// of counts, and it cannot land on the same instant.
+func (s birthdayCollectionState) tag() string {
+	return fmt.Sprintf("%d-%d-%d", s.books, s.ctagSum, syncTokenNanos(s.updatedAt))
+}
+
+func (s birthdayCollectionState) syncToken() string {
+	return buildSyncTokenWithState("cal", birthdayCalendarID, s.updatedAt, s.tag())
+}
+
+// birthdayCollectionState reads the version of the generated collection. A
+// store with no address books behind it leaves the zero state, which is the
+// version of a collection that generates nothing.
+func (h *DavServer) birthdayCollectionState(ctx context.Context, userID int64) (birthdayCollectionState, error) {
+	var state birthdayCollectionState
+	if h == nil || h.store == nil || h.store.AddressBooks == nil {
+		return state, nil
+	}
+	books, err := h.store.AddressBooks.ListByUser(ctx, userID)
+	if err != nil {
+		return birthdayCollectionState{}, err
+	}
+	state.books = len(books)
+	for i := range books {
+		state.ctagSum += books[i].CTag
+		if books[i].UpdatedAt.After(state.updatedAt) {
+			state.updatedAt = books[i].UpdatedAt
+		}
+	}
+	return state, nil
+}
+
+func birthdayCalendarCollection(href, principalHref string, state birthdayCollectionState) response {
 	description := birthdayCalendarDescription
-	return birthdayCalendarCollectionResponse(href, birthdayCalendarName, store.Calendar{Description: &description}, principalHref, birthdayCalendarSyncToken(), "0")
+	return birthdayCalendarCollectionResponse(href, birthdayCalendarName, store.Calendar{Description: &description}, principalHref, state.syncToken(), state.tag())
+}
+
+// birthdayCalendarPrivilegeNames is what the generated birthday collection
+// grants its owner. It is read-only and has no stored calendar row, so it is
+// both the privilege set the collection advertises and the set the privilege
+// checks enforce, rather than two lists that can drift apart.
+var birthdayCalendarPrivilegeNames = []string{
+	"read", "read-free-busy", "read-acl", "read-current-user-privilege-set",
 }
 
 func isBirthdayCalendarTarget(target davTarget) bool {
@@ -192,6 +243,13 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		// answers a capacity failure in place of the refusal it is owed.
 		return nil, "", errUnsupportedReport
 	}
+	state, err := h.birthdayCollectionState(ctx, user.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read birthday collection state")
+	}
+	if report.XMLName.Local == "sync-collection" && report.SyncToken != "" {
+		return h.birthdayCalendarSyncFromToken(ctx, user, principalHref, cleanPath, state, report)
+	}
 	events, err := h.generateBirthdayEvents(ctx, user.ID)
 	if err != nil {
 		if errors.Is(err, errTooManyCandidateRows) {
@@ -236,18 +294,11 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, birthdayCalendarDataProjection(report))
 		return res, "", err
 	case "sync-collection":
-		if report.SyncToken != "" {
-			info, err := parseSyncToken(report.SyncToken)
-			if err != nil || info.Kind != "cal" || info.ID != birthdayCalendarID {
-				return nil, "", errInvalidSyncToken
-			}
-		}
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
-		// Use a stable sync-token (epoch time) since we always return all events
-		syncToken := birthdayCalendarSyncToken()
+		syncToken := state.syncToken()
 		projection := birthdayCalendarDataProjection(report)
 		responses := []response{
-			birthdayCalendarCollection(collectionHref, principalHref),
+			birthdayCalendarCollection(collectionHref, principalHref, state),
 		}
 		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
 		responses = h.appendMultistatusResponses(responses, resourceResponses)
@@ -260,6 +311,31 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		// Unreachable: the guard above refuses every other report type.
 		return nil, "", errUnsupportedReport
 	}
+}
+
+// birthdayCalendarSyncFromToken answers a DAV:sync-collection that carries a
+// client token. The collection is generated per request and keeps no change
+// history, so the only token it can answer is one naming the state it is in
+// right now: there is then nothing to report. Any older token is refused under
+// RFC 6578 §3.2, and the client resynchronizes against the collection whole --
+// the only way a contact removed since the token was issued is reported gone.
+func (h *DavServer) birthdayCalendarSyncFromToken(ctx context.Context, user *store.User, principalHref, cleanPath string, state birthdayCollectionState, report reportRequest) ([]response, string, error) {
+	info, err := parseSyncToken(report.SyncToken)
+	if err != nil || info.Kind != "cal" || info.ID != birthdayCalendarID {
+		return nil, "", errInvalidSyncToken
+	}
+	syncToken := state.syncToken()
+	if report.SyncToken != syncToken {
+		return nil, "", errInvalidSyncToken
+	}
+	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
+	responses := []response{birthdayCalendarCollection(collectionHref, principalHref, state)}
+	projection := birthdayCalendarDataProjection(report)
+	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
+	if err != nil {
+		return nil, "", err
+	}
+	return responses, syncToken, nil
 }
 
 // birthdayCalendarDataProjection is the §9.6 selection for the generated

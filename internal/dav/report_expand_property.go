@@ -213,7 +213,7 @@ func (h *DavServer) reportExpandProperty(w http.ResponseWriter, r *http.Request,
 		http.Error(w, http.StatusText(status), status)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+	h.writeReportMultiStatus(w, r, "expand-property", responses, "")
 }
 
 // expandPropertyResponses builds the DAV:response for one resource with each

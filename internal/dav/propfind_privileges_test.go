@@ -492,3 +492,113 @@ func TestDecoratePrivilegeSetPropagatesRepositoryFailure(t *testing.T) {
 func (r unavailablePrivilegeCalendarRepo) GetAccessible(context.Context, int64, int64) (*store.CalendarAccess, error) {
 	return nil, r.err
 }
+
+// A store with ACL entries configured is the production shape: the virtual
+// birthday calendar has no stored row to own, so an owner check against the
+// calendars table denies every privilege on it and the property comes back
+// 403 Forbidden. DAVx5 then falls back to assuming the collection is writable.
+func TestPropfindBirthdayCalendarPrivilegeSetWithACLStore(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars:  &fakeCalendarRepo{},
+		Contacts:   &fakeContactRepo{},
+		ACLEntries: &fakeACLRepo{},
+	}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-privilege-set/></d:prop></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/-1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+	}
+	resp := rr.Body.String()
+	if strings.Contains(resp, httpStatusForbidden) {
+		t.Fatalf("the birthday calendar owner must be able to read its privilege set, got %s", resp)
+	}
+	for _, want := range []string{"<d:read>", "<cal:read-free-busy>", "<d:read-acl>", "<d:read-current-user-privilege-set>"} {
+		if !strings.Contains(resp, want) {
+			t.Fatalf("expected %s in the birthday privilege set, got %s", want, resp)
+		}
+	}
+	for _, unwanted := range []string{"<d:write>", "<d:write-content>", "<d:bind>", "<d:unbind>", "<d:write-acl>", "<d:all>"} {
+		if strings.Contains(resp, unwanted) {
+			t.Fatalf("the birthday calendar is read-only but advertised %s: %s", unwanted, resp)
+		}
+	}
+}
+
+// The DAV:acl the birthday collection reports has to agree with the privileges
+// it actually enforces, or a client is told the owner may write to a
+// collection every mutating method refuses.
+func TestPropfindBirthdayCalendarACLMatchesEnforcedPrivileges(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars:  &fakeCalendarRepo{},
+		Contacts:   &fakeContactRepo{},
+		ACLEntries: &fakeACLRepo{},
+	}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:acl/></d:prop></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/-1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	resp := rr.Body.String()
+	if strings.Contains(resp, httpStatusForbidden) {
+		t.Fatalf("the birthday calendar owner may read its ACL, got %s", resp)
+	}
+	if !strings.Contains(resp, "<d:read>") {
+		t.Fatalf("expected the owner ACE to grant read, got %s", resp)
+	}
+	if strings.Contains(resp, "<d:all>") {
+		t.Fatalf("the owner ACE must not grant privileges the collection refuses: %s", resp)
+	}
+}
+
+// The privileges the generated collection grants stop at reading: every
+// mutating method refuses it, so the check must not report otherwise.
+func TestBirthdayCalendarPrivilegeCheckDeniesWrites(t *testing.T) {
+	user := &store.User{ID: 1}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{}, ACLEntries: &fakeACLRepo{}}}
+	ctx := auth.WithUser(context.Background(), user)
+
+	// The collection is reached with and without the trailing slash (a parent
+	// lookup strips it) and by its zero-padded alias.
+	for _, path := range []string{"/dav/calendars/-1/", "/dav/calendars/-1", "/dav/calendars/-01/", "/dav/calendars/-1/birthday-alice@calcard.ics"} {
+		for _, privilege := range []string{"read", "read-free-busy", "read-acl", "read-current-user-privilege-set"} {
+			allowed, err := h.checkACLPrivilege(ctx, user, path, privilege)
+			if err != nil {
+				t.Fatalf("checkACLPrivilege(%s, %s): %v", path, privilege, err)
+			}
+			if !allowed {
+				t.Errorf("%s must be granted on %s", privilege, path)
+			}
+		}
+		for _, privilege := range []string{"write", "write-content", "write-properties", "bind", "unbind", "write-acl", "unlock", "all"} {
+			allowed, err := h.checkACLPrivilege(ctx, user, path, privilege)
+			if err != nil {
+				t.Fatalf("checkACLPrivilege(%s, %s): %v", path, privilege, err)
+			}
+			if allowed {
+				t.Errorf("%s must be denied on %s", privilege, path)
+			}
+		}
+		allowed, err := h.checkACLPrivilege(context.Background(), nil, path, "read")
+		if err != nil {
+			t.Fatalf("checkACLPrivilege(no user, %s): %v", path, err)
+		}
+		if allowed {
+			t.Errorf("an unauthenticated request must not be granted read on %s", path)
+		}
+	}
+}

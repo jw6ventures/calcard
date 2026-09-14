@@ -327,7 +327,7 @@ const maxEventLimit = 1000
 
 // parseEventFilter builds a store.EventFilter from the request query string.
 // Supported params: start, end (RFC3339 or YYYY-MM-DD), title, description,
-// location, q (matches any text field), limWere it, offset.
+// location, q (matches any text field), limit, offset.
 func parseEventFilter(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	var f store.EventFilter

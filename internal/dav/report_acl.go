@@ -296,7 +296,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		http.Error(w, "failed to build ACL principal response", http.StatusInternalServerError)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+	h.writeReportMultiStatus(w, r, "acl-principal-prop-set", responses, "")
 }
 
 func (h *DavServer) aclPrincipalResponse(ctx context.Context, current *store.User, href string) (response, error) {
@@ -384,7 +384,7 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "failed to build principal-match response", http.StatusInternalServerError)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+	h.writeReportMultiStatus(w, r, "principal-match", responses, "")
 }
 
 func (h *DavServer) principalPropertyHref(ctx context.Context, user *store.User, candidate response, property xml.Name) (string, error) {
@@ -464,7 +464,7 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 		http.Error(w, "failed to build principal search response", http.StatusInternalServerError)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+	h.writeReportMultiStatus(w, r, "principal-property-search", responses, "")
 }
 
 // principalMatchesSearches applies the RFC 3744 §9.4 conjunction: a principal

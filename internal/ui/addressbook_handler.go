@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -346,24 +347,21 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	firstName := strings.TrimSpace(r.FormValue("first_name"))
-	lastName := strings.TrimSpace(r.FormValue("last_name"))
-	email := strings.TrimSpace(r.FormValue("email"))
-	phone := strings.TrimSpace(r.FormValue("phone"))
-	birthday := strings.TrimSpace(r.FormValue("birthday"))
-	notes := strings.TrimSpace(r.FormValue("notes"))
-	company := strings.TrimSpace(r.FormValue("company"))
-
-	uid := utils.GenerateUID()
-	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes, company)
-	etag := utils.GenerateETag(vcard)
-
-	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{
-		AddressBookID: bookID,
-		UID:           uid,
-		RawVCard:      vcard,
-		ETag:          etag,
-	}); err != nil {
+	user, _ := auth.UserFromContext(r.Context())
+	input := contacts.StructuredInput{
+		DisplayName: displayName,
+		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
+		LastName:    strings.TrimSpace(r.FormValue("last_name")),
+		Email:       strings.TrimSpace(r.FormValue("email")),
+		Phone:       strings.TrimSpace(r.FormValue("phone")),
+		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
+		Notes:       strings.TrimSpace(r.FormValue("notes")),
+		Company:     strings.TrimSpace(r.FormValue("company")),
+	}
+	// The service owns the UID, vCard and DAV resource name a contact is
+	// stored with, so a contact written here and one written by a CardDAV PUT
+	// carry the same identity.
+	if _, _, err := h.contacts.CreateContact(r.Context(), user, bookID, contacts.UpsertInput{Structured: &input}); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to create contact"})
 		return
 	}
@@ -406,7 +404,7 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uid := chi.URLParam(r, "uid")
+	uid := resourceUIDParam(r)
 	if uid == "" {
 		http.Error(w, "invalid contact uid", http.StatusBadRequest)
 		return
@@ -416,40 +414,36 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := h.store.Contacts.GetByUID(r.Context(), bookID, uid)
-	if err != nil {
-		http.Error(w, "failed to load contact", http.StatusInternalServerError)
-		return
-	}
-	if existing == nil {
-		http.Error(w, "contact not found", http.StatusNotFound)
-		return
-	}
-
 	displayName := strings.TrimSpace(r.FormValue("display_name"))
 	if displayName == "" {
 		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "name is required"})
 		return
 	}
 
-	firstName := strings.TrimSpace(r.FormValue("first_name"))
-	lastName := strings.TrimSpace(r.FormValue("last_name"))
-	email := strings.TrimSpace(r.FormValue("email"))
-	phone := strings.TrimSpace(r.FormValue("phone"))
-	birthday := strings.TrimSpace(r.FormValue("birthday"))
-	notes := strings.TrimSpace(r.FormValue("notes"))
-	company := strings.TrimSpace(r.FormValue("company"))
-
-	vcard := utils.BuildVCard(uid, displayName, firstName, lastName, email, phone, birthday, notes, company)
-	etag := utils.GenerateETag(vcard)
-
-	if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{
-		AddressBookID: bookID,
-		UID:           uid,
-		RawVCard:      vcard,
-		ETag:          etag,
-	}); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to update contact"})
+	user, _ := auth.UserFromContext(r.Context())
+	input := contacts.StructuredInput{
+		UID:         uid,
+		DisplayName: displayName,
+		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
+		LastName:    strings.TrimSpace(r.FormValue("last_name")),
+		Email:       strings.TrimSpace(r.FormValue("email")),
+		Phone:       strings.TrimSpace(r.FormValue("phone")),
+		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
+		Notes:       strings.TrimSpace(r.FormValue("notes")),
+		Company:     strings.TrimSpace(r.FormValue("company")),
+	}
+	// An edit changes the contact, not its identity: the service carries the
+	// stored resource name across the write, which keeps the href the sync
+	// reports publish for this contact stable.
+	if _, _, err := h.contacts.UpdateContact(r.Context(), user, bookID, uid, contacts.UpsertInput{Structured: &input}); err != nil {
+		switch contacts.StatusCode(err) {
+		case http.StatusNotFound:
+			http.Error(w, "contact not found", http.StatusNotFound)
+		case http.StatusForbidden:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		default:
+			h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to update contact"})
+		}
 		return
 	}
 
@@ -464,7 +458,7 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uid := chi.URLParam(r, "uid")
+	uid := resourceUIDParam(r)
 	if uid == "" {
 		http.Error(w, "invalid contact uid", http.StatusBadRequest)
 		return
@@ -509,7 +503,7 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uid := chi.URLParam(r, "uid")
+	uid := resourceUIDParam(r)
 	if uid == "" {
 		http.Error(w, "invalid contact uid", http.StatusBadRequest)
 		return
@@ -632,29 +626,13 @@ func (h *Handler) ImportAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Import each vCard
+	user, _ := auth.UserFromContext(r.Context())
 	imported := 0
 	for _, vcard := range vcards {
-		// Extract UID or generate one if missing
-		uid := utils.ExtractVCardUID(vcard)
-		if uid == "" {
-			uid = utils.GenerateUID()
-			// Inject UID into vCard if missing
-			vcard = strings.Replace(vcard, "BEGIN:VCARD\r\n", fmt.Sprintf("BEGIN:VCARD\r\nUID:%s\r\n", uid), 1)
+		// Continue importing other contacts even if one fails.
+		if h.importContact(r.Context(), user, bookID, vcard) {
+			imported++
 		}
-
-		etag := utils.GenerateETag(vcard)
-
-		if _, err := h.store.Contacts.Upsert(r.Context(), store.Contact{
-			AddressBookID: bookID,
-			UID:           uid,
-			RawVCard:      vcard,
-			ETag:          etag,
-		}); err != nil {
-			// Continue importing other contacts even if one fails
-			continue
-		}
-		imported++
 	}
 
 	if imported == 0 {
@@ -664,4 +642,24 @@ func (h *Handler) ImportAddressBook(w http.ResponseWriter, r *http.Request) {
 
 	statusMsg := fmt.Sprintf("imported %d contact(s)", imported)
 	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": statusMsg})
+}
+
+// importContact stores one vCard from an uploaded file. A file re-imported
+// after an edit carries UIDs the book already holds, so a vCard naming a stored
+// contact replaces it and only an unknown UID creates one; the service supplies
+// the UID for a vCard that carries none. Reports whether the contact was
+// stored.
+func (h *Handler) importContact(ctx context.Context, user *store.User, bookID int64, vcard string) bool {
+	input := contacts.UpsertInput{RawVCard: vcard}
+	if uid := utils.ExtractVCardUID(vcard); uid != "" {
+		_, _, err := h.contacts.UpdateContact(ctx, user, bookID, uid, input)
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, contacts.ErrNotFound) {
+			return false
+		}
+	}
+	_, _, err := h.contacts.CreateContact(ctx, user, bookID, input)
+	return err == nil
 }

@@ -234,7 +234,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	canonicalPath := path.Join("/dav/calendars", fmt.Sprint(cal.ID))
 	if calendarQueryExcludedByDepth(r, report, resourceName) {
-		h.writeBoundedMultiStatus(w, newMultistatus(nil, ""))
+		h.writeReportMultiStatus(w, r, report.XMLName.Local, nil, "")
 		return
 	}
 	if report.XMLName.Local == "free-busy-query" {
@@ -247,7 +247,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			var err error
 			freeBusyData, err = h.freeBusyQuery(r.Context(), user, cal, report.TimeRange)
 			if err != nil {
-				writeReportError(w, err)
+				h.writeReportFailure(w, r, report.XMLName.Local, err)
 				return
 			}
 		}
@@ -262,10 +262,27 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			http.Error(w, "calendar object not found", http.StatusNotFound)
 			return
 		}
-		writeReportError(w, err)
+		h.writeReportFailure(w, r, report.XMLName.Local, err)
 		return
 	}
+	h.writeReportMultiStatus(w, r, report.XMLName.Local, responses, syncToken)
+}
+
+// writeReportMultiStatus answers a REPORT and records what it answered with.
+// A REPORT that returns fewer responses than the client expected is otherwise
+// indistinguishable in the log from one the client mishandled, and the report
+// name and response count are what separate the two.
+func (h *DavServer) writeReportMultiStatus(w http.ResponseWriter, r *http.Request, reportName string, responses []response, syncToken string) {
+	h.logger().Debug("Report", "%s %s returned %d responses", reportName, r.URL.Path, len(responses))
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
+}
+
+// writeReportFailure records a refused REPORT under the same component tag the
+// answered ones use, so a client that received no responses and one that
+// received a refusal are told apart in the log.
+func (h *DavServer) writeReportFailure(w http.ResponseWriter, r *http.Request, reportName string, err error) {
+	h.logger().Error("Report", "%s failed for %s: %v", reportName, r.URL.Path, err)
+	writeReportError(w, err)
 }
 
 // writeReportError answers a failed REPORT. The sentinels are shared by the
@@ -306,7 +323,7 @@ func (h *DavServer) calendarMultigetHrefIdentifiesResource(ctx context.Context, 
 
 func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath, targetResource string, report reportRequest) {
 	if calendarQueryExcludedByDepth(r, report, targetResource) {
-		h.writeBoundedMultiStatus(w, newMultistatus(nil, ""))
+		h.writeReportMultiStatus(w, r, report.XMLName.Local, nil, "")
 		return
 	}
 	if report.XMLName.Local == "free-busy-query" {
@@ -322,7 +339,7 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 					// §7.10 gives free-busy-query the §7.8 postcondition, which
 					// the stored path already answers a refused candidate read
 					// with.
-					writeReportError(w, errNumberOfMatchesExceeded)
+					h.writeReportFailure(w, r, report.XMLName.Local, errNumberOfMatchesExceeded)
 					return
 				}
 				http.Error(w, "failed to generate birthday events", http.StatusInternalServerError)
@@ -347,10 +364,10 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "calendar object not found", http.StatusNotFound)
 			return
 		}
-		writeReportError(w, err)
+		h.writeReportFailure(w, r, report.XMLName.Local, err)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
+	h.writeReportMultiStatus(w, r, report.XMLName.Local, responses, syncToken)
 }
 
 func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, report reportRequest) {
@@ -450,13 +467,13 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 	// itself, not its children — return empty multistatus after access checks.
 	depth := strings.TrimSpace(r.Header.Get("Depth"))
 	if report.XMLName.Local == "addressbook-query" && !target.Resource && depth == "0" {
-		h.writeBoundedMultiStatus(w, newMultistatus(nil, ""))
+		h.writeReportMultiStatus(w, r, report.XMLName.Local, nil, "")
 		return
 	}
 	responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, r)
 	if err != nil {
-		writeReportError(w, err)
+		h.writeReportFailure(w, r, report.XMLName.Local, err)
 		return
 	}
-	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
+	h.writeReportMultiStatus(w, r, report.XMLName.Local, responses, syncToken)
 }

@@ -108,38 +108,36 @@ func extractVCardVersion(raw string) (string, error) {
 	}
 }
 
-func canServeRequestedAddressData(raw string, query *addressDataQuery) bool {
-	if query == nil || strings.TrimSpace(query.Version) == "" {
-		return true
+// addressDataForQuery returns the vCard data a CARDDAV:address-data request
+// should receive, converting the stored copy when the client asked for the
+// other advertised version. It reports false for the
+// CARDDAV:supported-address-data-conversion precondition.
+func addressDataForQuery(raw string, query *addressDataQuery) (string, bool) {
+	if query == nil {
+		return raw, true
 	}
-	version, err := extractVCardVersion(raw)
-	if err != nil {
-		return false
-	}
-	return version == strings.TrimSpace(query.Version)
+	return addressDataForVersion(raw, query.Version)
 }
 
-func acceptsVCardData(rawVCard, acceptHeader string) bool {
+// vcardDataForAccept negotiates the vCard version named by an Accept header,
+// converting the stored copy when the client asked for the other advertised
+// version. It reports false when nothing the client accepts can be produced.
+func vcardDataForAccept(rawVCard, acceptHeader string) (string, bool) {
 	acceptHeader = strings.TrimSpace(acceptHeader)
 	if acceptHeader == "" {
-		return true
+		return rawVCard, true
 	}
 
-	rawVersion, err := extractVCardVersion(rawVCard)
-	if err != nil {
-		return false
-	}
-
+	var requestedVersions []string
 	for _, rawRange := range strings.Split(acceptHeader, ",") {
 		parts := strings.Split(rawRange, ";")
-		mediaType := strings.ToLower(strings.TrimSpace(parts[0]))
-		quality := 1.0
-		switch mediaType {
+		switch strings.ToLower(strings.TrimSpace(parts[0])) {
 		case "*/*", "text/*", "text/vcard":
 		default:
 			continue
 		}
 
+		quality := 1.0
 		requestedVersion := ""
 		for _, part := range parts[1:] {
 			param := strings.SplitN(strings.TrimSpace(part), "=", 2)
@@ -162,12 +160,25 @@ func acceptsVCardData(rawVCard, acceptHeader string) bool {
 		if quality <= 0 {
 			continue
 		}
-		if requestedVersion == "" || requestedVersion == rawVersion {
-			return true
+		if requestedVersion == "" {
+			return rawVCard, true
 		}
+		requestedVersions = append(requestedVersions, requestedVersion)
 	}
 
-	return false
+	if storedVersion, err := extractVCardVersion(rawVCard); err == nil {
+		for _, version := range requestedVersions {
+			if version == storedVersion {
+				return rawVCard, true
+			}
+		}
+	}
+	for _, version := range requestedVersions {
+		if converted, ok := convertVCardVersion(rawVCard, version); ok {
+			return converted, true
+		}
+	}
+	return "", false
 }
 
 func validateCardFilter(filter *cardFilter) error {
@@ -529,15 +540,14 @@ func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDa
 
 func (h *DavServer) buildAddressObjectReportResponse(href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) (response, error) {
 	addressDataReq := effectiveAddressDataRequest(req, topLevelAddressData)
-	if addressDataReq != nil && !canServeRequestedAddressData(contact.RawVCard, addressDataReq) {
+	rawData, ok := addressDataForQuery(contact.RawVCard, addressDataReq)
+	if !ok {
 		return response{
 			Href:   href,
 			Status: httpStatusNotAcceptable,
 			Error:  &responseError{SupportedAddressDataConversion: &struct{}{}},
 		}, nil
 	}
-
-	rawData := contact.RawVCard
 	if addressDataReq != nil {
 		rawData = filterVCardData(rawData, addressDataReq)
 	}

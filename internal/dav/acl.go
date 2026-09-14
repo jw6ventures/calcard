@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -477,6 +478,14 @@ func (h *DavServer) checkACLPrivilege(ctx context.Context, user *store.User, res
 		return false, err
 	}
 
+	// The birthday collection is generated per user rather than stored, so an
+	// owner lookup against the calendars table finds nothing and would deny
+	// even reading it. Whoever is authenticated owns their own birthdays, and
+	// the collection is read-only.
+	if user != nil && isBirthdayCalendarPath(ctx, resourcePath) {
+		return slices.Contains(birthdayCalendarPrivilegeNames, privilege), nil
+	}
+
 	// Check if user is the resource owner — owners always have all privileges
 	if h.isResourceOwner(ctx, user, resourcePath) {
 		return true, nil
@@ -760,10 +769,22 @@ func buildACLPropFromEntries(entries []store.ACLEntry) *aclProp {
 	return &aclProp{ACE: aces}
 }
 
-func protectedOwnerACE(ownerHref string) aceResp {
+// protectedOwnerACEForPath reports the ACE an owner holds on a resource. That
+// is DAV:all everywhere except the generated birthday collection, which is
+// read-only for everyone including its owner, so DAV:acl and
+// DAV:current-user-privilege-set agree about it.
+func protectedOwnerACEForPath(ctx context.Context, resourcePath, ownerHref string) aceResp {
+	names := []string{"all"}
+	if isBirthdayCalendarPath(ctx, resourcePath) {
+		names = birthdayCalendarPrivilegeNames
+	}
+	privileges := make([]acePrivilegeResp, 0, len(names))
+	for _, name := range names {
+		privileges = append(privileges, privilegeNameToResp(name))
+	}
 	return aceResp{
 		Principal: acePrincipalResp{Href: ownerHref},
-		Grant:     &aceGrantResp{Privileges: []acePrivilegeResp{{All: &struct{}{}}}},
+		Grant:     &aceGrantResp{Privileges: privileges},
 		Protected: &struct{}{},
 	}
 }

@@ -108,25 +108,37 @@ func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
 // the address book side RFC 6352, and neither may answer a token the other
 // refuses.
 var syncWindowCollections = []struct {
-	name   string
-	kind   string
-	id     int64
-	server func(t *testing.T, cfg *config.Config) *DavServer
-	report func(t *testing.T, h *DavServer, body string) *httptest.ResponseRecorder
+	name string
+	kind string
+	id   int64
+	// resourceType, liveResourceName and liveHref name one resource the
+	// fixture stores, so a case can tombstone a name the collection still
+	// holds.
+	resourceType     string
+	liveResourceName string
+	liveHref         string
+	server           func(t *testing.T, cfg *config.Config) *DavServer
+	report           func(t *testing.T, h *DavServer, body string) *httptest.ResponseRecorder
 }{
 	{
-		name:   "calendar",
-		kind:   "cal",
-		id:     1,
-		server: func(t *testing.T, cfg *config.Config) *DavServer { return limitsTestServer(t, cfg, 2) },
-		report: limitsReportRequest,
+		name:             "calendar",
+		kind:             "cal",
+		id:               1,
+		resourceType:     "event",
+		liveResourceName: "event-1",
+		liveHref:         "/dav/calendars/1/event-1.ics",
+		server:           func(t *testing.T, cfg *config.Config) *DavServer { return limitsTestServer(t, cfg, 2) },
+		report:           limitsReportRequest,
 	},
 	{
-		name:   "address book",
-		kind:   "card",
-		id:     5,
-		server: func(t *testing.T, cfg *config.Config) *DavServer { return cardLimitsTestServer(t, cfg, 2) },
-		report: cardLimitsReportRequest,
+		name:             "address book",
+		kind:             "card",
+		id:               5,
+		resourceType:     "contact",
+		liveResourceName: "contact-00001",
+		liveHref:         "/dav/addressbooks/5/contact-00001.vcf",
+		server:           func(t *testing.T, cfg *config.Config) *DavServer { return cardLimitsTestServer(t, cfg, 2) },
+		report:           cardLimitsReportRequest,
 	},
 }
 
@@ -203,6 +215,52 @@ func TestSyncCollectionWithRetentionOffAnswersAnyAge(t *testing.T) {
 			rr := collection.report(t, h, syncCollectionBody(buildSyncToken(collection.kind, collection.id, ancient)))
 
 			decodeMultistatus(t, rr)
+		})
+	}
+}
+
+// A resource deleted and then recreated under the same name is live again, and
+// the tombstone the deletion left behind still names that href. RFC 6578 §3.2
+// fixes no order over the DAV:response elements a sync report returns, so a
+// report carrying both the addition and the removal lets the client apply them
+// in either order; one of those orders drops a resource the server still holds.
+// The live resource is the authority, so the removal is not reported at all.
+func TestSyncCollectionDoesNotReportALiveResourceAsDeleted(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(0))
+			tombstones, ok := h.store.DeletedResources.(*fakeDeletedResourceRepo)
+			if !ok {
+				t.Fatalf("fixture deleted-resource repository = %T, want *fakeDeletedResourceRepo", h.store.DeletedResources)
+			}
+			tombstones.deleted = append(tombstones.deleted, store.DeletedResource{
+				ID:           1,
+				ResourceType: collection.resourceType,
+				CollectionID: collection.id,
+				UID:          collection.liveResourceName,
+				ResourceName: collection.liveResourceName,
+				DeletedAt:    limitsFixtureModified.Add(-time.Minute),
+			})
+
+			token := buildSyncToken(collection.kind, collection.id, limitsFixtureModified.Add(-time.Hour))
+			rr := collection.report(t, h, syncCollectionBody(token))
+			ms := decodeMultistatus(t, rr)
+
+			var live, removed int
+			for _, resp := range ms.Responses {
+				if len(resp.Hrefs) != 1 || resp.Hrefs[0] != collection.liveHref {
+					continue
+				}
+				if strings.Contains(resp.Status, "404") {
+					removed++
+					continue
+				}
+				live++
+			}
+			if live != 1 || removed != 0 {
+				t.Fatalf("%s reported live %d times and deleted %d times, want 1 and 0; body: %s",
+					collection.liveHref, live, removed, rr.Body.String())
+			}
 		})
 	}
 }

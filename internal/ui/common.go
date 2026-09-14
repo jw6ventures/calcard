@@ -6,11 +6,24 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/http/csrf"
 	"github.com/jw6ventures/calcard/internal/http/errors"
 )
 
 const defaultPageSize = 50
+
+// resourceUIDParam returns the {uid} route parameter with percent-encoding
+// resolved. chi routes on the raw path, so a UID containing characters that
+// must be escaped in a path segment (notably "@") arrives still encoded.
+func resourceUIDParam(r *http.Request) string {
+	raw := chi.URLParam(r, "uid")
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || decoded == "" {
+		return raw
+	}
+	return decoded
+}
 
 // parsePagination extracts page and limit from query parameters.
 func (h *Handler) parsePagination(r *http.Request) (page, limit int) {
