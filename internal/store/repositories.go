@@ -128,6 +128,17 @@ type LockRepository interface {
 	Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*Lock, error)
 }
 
+// DigestNonceRepository records the HTTP Digest nonce counts that have already
+// been spent. The state is shared rather than per-process because a nonce this
+// server issues verifies at every instance holding the configured session
+// secret, and across a restart.
+type DigestNonceRepository interface {
+	// Consume claims one (nonce, count) pair for a token, reporting whether the
+	// claim was the first. A false result is a replay.
+	Consume(ctx context.Context, tokenID int64, nonce string, nonceCount uint32, expiresAt time.Time) (bool, error)
+	DeleteExpired(ctx context.Context) (int64, error)
+}
+
 // ACLRepository handles WebDAV access control entries.
 type ACLRepository interface {
 	SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error

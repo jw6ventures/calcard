@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"golang.org/x/time/rate"
 )
 
@@ -82,11 +83,25 @@ func TestGetLimiterEvictsOldestEntryWhenAtCapacity(t *testing.T) {
 	}
 }
 
-func TestParseIP(t *testing.T) {
-	if got := parseIP("198.51.100.10:1234").String(); got != "198.51.100.10" {
-		t.Fatalf("parseIP() = %q", got)
-	}
-	if got := parseIP("2001:db8::5").String(); got != "2001:db8::5" {
-		t.Fatalf("parseIP() = %q", got)
+// The forwarded-address middleware resolves the client into RemoteAddr before
+// this runs, so the trusted-proxy test has to read the peer instead: asking
+// whether the client is a proxy answers no for every real client, which skips
+// the walk that picks the client out of the chain.
+//
+// The chain is walked from the right because the proxy appends its own hop: the
+// entries to its left are whatever the client sent, and the rightmost hop no
+// trusted proxy wrote is the furthest one this server has any reason to believe.
+func TestGetClientIPReadsThePeerAndTheRightmostUntrustedHop(t *testing.T) {
+	limiter := NewIPRateLimiter(rate.Limit(1), 1, time.Hour, []string{"10.0.0.0/8"})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// What middleware.RealIP leaves behind: the leftmost X-Forwarded-For entry,
+	// which here is the one the client wrote for itself.
+	req.RemoteAddr = "203.0.113.9"
+	req.Header.Set("X-Forwarded-For", "203.0.113.9, 198.51.100.7, 10.1.2.3")
+	req = req.WithContext(clientip.WithPeerAddr(req.Context(), "10.1.2.3:4567"))
+
+	if got := limiter.getClientIP(req); got != "198.51.100.7" {
+		t.Fatalf("getClientIP() = %q, want 198.51.100.7", got)
 	}
 }

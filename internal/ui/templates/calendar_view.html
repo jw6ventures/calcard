@@ -1637,18 +1637,31 @@
     var baseEvents = [];
     var events = [];
 
-    function parseServerDate(value) {
+    // An all-day value names a date, not an instant: the server parses the DATE
+    // as UTC midnight and sends it as RFC3339, while every reader here takes
+    // local calendar parts off the result. West of UTC that instant lands on the
+    // previous day, so the event rendered -- and saved -- one day early.
+    // Rebuilding it on local midnight is what parseICALDate already does for the
+    // iCal fallback, so both paths land an all-day event on the same day.
+    function parseServerDate(value, allDay) {
         if (!value) return null;
         var parsed = new Date(value);
-        return isNaN(parsed.getTime()) ? null : parsed;
+        if (isNaN(parsed.getTime())) return null;
+        if (!allDay) return parsed;
+        return new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
     }
 
     function normalizeServerEvent(raw) {
         var parsed = Object.assign({}, raw);
-        parsed.dtstart = parseServerDate(raw.dtstart);
-        parsed.dtend = parseServerDate(raw.dtend);
-        parsed.recurrenceId = parseServerDate(raw.recurrenceId);
-        parsed.exdates = (raw.exdates || []).map(parseServerDate).filter(Boolean);
+        var allDay = !!raw.allDay;
+        parsed.dtstart = parseServerDate(raw.dtstart, allDay);
+        parsed.dtend = parseServerDate(raw.dtend, allDay);
+        parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);
+        // Passing parseServerDate to map directly would hand it the index as the
+        // all-day flag.
+        parsed.exdates = (raw.exdates || []).map(function(value) {
+            return parseServerDate(value, allDay);
+        }).filter(Boolean);
         parsed.overrides = (raw.overrides || []).map(normalizeServerEvent);
         if (!parsed.dtstart && raw.ical) {
             var fallback = parseICAL(raw.ical);
@@ -1695,6 +1708,22 @@
         var result = new Date(date);
         result.setDate(result.getDate() + count);
         return result;
+    }
+
+    // An all-day event's DTEND is exclusive -- the day after the last one it
+    // covers -- and that is the end every event object here carries. The form's
+    // end date is the last day itself, which the server converts back by adding
+    // a day, so the stored value has to be stepped back before it is shown.
+    // Submitting it unconverted re-counted a day the event already had, and the
+    // event grew by one on every save.
+    function inclusiveAllDayEnd(start, exclusiveEnd) {
+        var inclusive = addDays(exclusiveEnd, -1);
+        return inclusive < start ? new Date(start) : inclusive;
+    }
+
+    function exclusiveAllDayEnd(start, lastDay) {
+        var exclusive = addDays(lastDay, 1);
+        return exclusive <= start ? addDays(start, 1) : exclusive;
     }
 
     // Fetch events for an explicit date range (used by every view).
@@ -2797,6 +2826,11 @@
     // Make showEventModal accessible globally for edit functionality
     window.showEventModal = showEventModal;
     window.baseEvents = baseEvents;
+    // The create/edit modal functions below live outside this closure and need
+    // the same all-day date arithmetic it uses internally.
+    window.startOfDay = startOfDay;
+    window.inclusiveAllDayEnd = inclusiveAllDayEnd;
+    window.exclusiveAllDayEnd = exclusiveAllDayEnd;
 })();
 
 // Create Event Modal
@@ -2817,10 +2851,7 @@ function showCreateEventModal(prefill) {
             endInput.type = 'date';
             startInput.value = formatDateForInput(prefill.start);
             // The form uses an inclusive end date; prefill.end is exclusive (day after).
-            var inclusiveEnd = new Date(prefill.end);
-            inclusiveEnd.setDate(inclusiveEnd.getDate() - 1);
-            if (inclusiveEnd < prefill.start) inclusiveEnd = new Date(prefill.start);
-            endInput.value = formatDateForInput(inclusiveEnd);
+            endInput.value = formatDateForInput(window.inclusiveAllDayEnd(window.startOfDay(prefill.start), prefill.end));
         } else {
             startInput.type = 'datetime-local';
             endInput.type = 'datetime-local';
@@ -2909,10 +2940,10 @@ function showEditEventModal(event, scope) {
     
     if (event.dtend) {
         if (event.allDay) {
-            // For all-day, DTEND is exclusive so subtract a day for display
-            var displayEnd = new Date(event.dtend);
-            displayEnd.setDate(displayEnd.getDate() - 1);
-            document.getElementById('edit-dtend').value = formatDateForInput(displayEnd);
+            // For all-day, DTEND is exclusive so subtract a day for display.
+            var allDayStart = window.startOfDay(event.dtstart || event.dtend);
+            document.getElementById('edit-dtend').value =
+                formatDateForInput(window.inclusiveAllDayEnd(allDayStart, event.dtend));
         } else {
             document.getElementById('edit-dtend').value = formatDateTimeForInput(event.dtend);
         }
@@ -3078,8 +3109,22 @@ function toggleAllDay(prefix, preserveValues) {
         startInput.type = 'date';
         endInput.type = 'date';
         if (!preserveValues) {
-            if (startVal) startInput.value = startVal.split('T')[0];
-            if (endVal) endInput.value = endVal.split('T')[0];
+            if (startVal && endVal) {
+                // A timed end before its start must not carry over as an
+                // all-day end before its start. A bare date string (already
+                // all-day) parses as UTC midnight, unlike one with a time
+                // component, so it needs a local time-of-day appended first.
+                var toLocalDate = function(value) {
+                    return new Date(value.indexOf('T') === -1 ? value + 'T00:00:00' : value);
+                };
+                var toggledStart = window.startOfDay(toLocalDate(startVal));
+                var toggledEnd = window.exclusiveAllDayEnd(toggledStart, window.startOfDay(toLocalDate(endVal)));
+                startInput.value = formatDateForInput(toggledStart);
+                endInput.value = formatDateForInput(window.inclusiveAllDayEnd(toggledStart, toggledEnd));
+            } else {
+                if (startVal) startInput.value = startVal.split('T')[0];
+                if (endVal) endInput.value = endVal.split('T')[0];
+            }
         }
     } else {
         // Switch to datetime-local inputs

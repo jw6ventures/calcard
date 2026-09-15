@@ -2,18 +2,22 @@ package httpserver
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/dav"
+	"github.com/jw6ventures/calcard/internal/http/ratelimit"
 	"github.com/jw6ventures/calcard/internal/store"
+	"golang.org/x/time/rate"
 )
 
 func TestOverrideMethodOnlyPromotesPutAndDeleteOnPost(t *testing.T) {
@@ -394,4 +398,74 @@ func TestSpoofedForwardedHeadersDoNotUnlockBasicOverCleartext(t *testing.T) {
 	if secure {
 		t.Fatal("a spoofed X-Real-IP made a cleartext request look secure, which would unlock HTTP Basic")
 	}
+}
+
+// The defect's positive shape. A proxy the deployment trusts terminates TLS and
+// forwards for a client that is, as clients are, outside the proxy CIDRs. The
+// request is secure, and it has to stay secure once the forwarded address has
+// been resolved into RemoteAddr -- otherwise every Basic app password behind a
+// TLS-terminating proxy stops working, with no Digest to fall back to.
+func TestTrustedProxyRequestStaysSecureAfterForwardedAddressResolution(t *testing.T) {
+	trustedProxies := []string{"10.0.0.0/8"}
+
+	req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+	req.RemoteAddr = "10.1.2.3:4567"
+	req.Header.Set("X-Real-IP", "198.51.100.7")
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	if !auth.RequestIsSecure(req, trustedProxies) {
+		t.Fatal("a trusted proxy's forwarded request was not secure before the middleware")
+	}
+
+	var (
+		secure     bool
+		remoteAddr string
+	)
+	handler := trustedRealIP(trustedProxies)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		secure = auth.RequestIsSecure(r, trustedProxies)
+		remoteAddr = r.RemoteAddr
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if remoteAddr != "198.51.100.7" {
+		t.Fatalf("RemoteAddr = %q, want the forwarded client address", remoteAddr)
+	}
+	if !secure {
+		t.Fatal("resolving the forwarded client address made a trusted proxy's HTTPS request look insecure")
+	}
+}
+
+// A rate-limit bucket has to name the client the trusted proxy is forwarding
+// for, and nothing the client can choose. The proxy appends its own hop to
+// X-Forwarded-For, so the entries to its left are the client's to write: if the
+// bucket follows one of them, a single client rotates the value and is never
+// limited at all.
+//
+// The composition is what matters here -- trustedRealIP resolves the forwarded
+// address into RemoteAddr before the limiter runs, so the limiter's own peer
+// test cannot read that field.
+func TestRateLimiterBucketsByTheClientNotAForwardedHeader(t *testing.T) {
+	trustedProxies := []string{"10.0.0.0/8"}
+	limiter := ratelimit.NewIPRateLimiter(rate.Limit(1), 2, time.Minute, trustedProxies)
+	handler := trustedRealIP(trustedProxies)(limiter.Middleware()(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })))
+
+	// One client behind the proxy, writing whatever it likes ahead of the hop
+	// the proxy appends for it.
+	send := func(clientWritten string) int {
+		req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+		req.RemoteAddr = "10.1.2.3:4567"
+		req.Header.Set("X-Forwarded-For", clientWritten+", 198.51.100.7")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	for attempt := 0; attempt < 50; attempt++ {
+		if send(fmt.Sprintf("203.0.113.%d", attempt)) == http.StatusTooManyRequests {
+			return
+		}
+	}
+	t.Fatal("rotating the leftmost X-Forwarded-For entry kept the client out of its own bucket for 50 requests")
 }

@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
@@ -70,6 +73,46 @@ func (m *appPasswordRepoMock) TouchLastUsed(ctx context.Context, id int64) error
 		return m.touchLastUsedFn(ctx, id)
 	}
 	return nil
+}
+
+// digestNonceRepoMock is the shared record of spent nonce counts. Tests that
+// stand up two Services point both at one instance, which is what the database
+// is to two server processes.
+type digestNonceRepoMock struct {
+	mu        sync.Mutex
+	consumed  map[string]struct{}
+	consumeFn func(context.Context, int64, string, uint32, time.Time) (bool, error)
+}
+
+func (m *digestNonceRepoMock) Consume(ctx context.Context, tokenID int64, nonce string, nonceCount uint32, expiresAt time.Time) (bool, error) {
+	if m.consumeFn != nil {
+		return m.consumeFn(ctx, tokenID, nonce, nonceCount, expiresAt)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.consumed == nil {
+		m.consumed = make(map[string]struct{})
+	}
+	key := strconv.FormatInt(tokenID, 10) + "\x00" + nonce + "\x00" + strconv.FormatUint(uint64(nonceCount), 10)
+	if _, duplicate := m.consumed[key]; duplicate {
+		return false, nil
+	}
+	m.consumed[key] = struct{}{}
+	return true, nil
+}
+
+func (m *digestNonceRepoMock) DeleteExpired(context.Context) (int64, error) { return 0, nil }
+
+// digestTestStore is the store shape every Digest test needs: the user, the
+// tokens, and the shared nonce-count record the replay guard now consults.
+func digestTestStore(nonces store.DigestNonceRepository, tokens func(context.Context, int64) ([]store.AppPassword, error)) *store.Store {
+	return &store.Store{
+		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
+			return &store.User{ID: 7, PrimaryEmail: email}, nil
+		}},
+		AppPasswords: &appPasswordRepoMock{findValidByUserFn: tokens},
+		DigestNonces: nonces,
+	}
 }
 
 func TestBeginOAuthSetsStateCookieAndRedirects(t *testing.T) {
@@ -431,14 +474,9 @@ func TestRequireDAVAuthAcceptsSHA256AndMD5DigestAndRejectsReplay(t *testing.T) {
 	)
 	service := &Service{cfg: testAuthConfig("https://calcard.example")}
 	md5HA1, sha256HA1 := sealedTestHA1s(t, service, username, password)
-	service.store = &store.Store{
-		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-			return &store.User{ID: 7, PrimaryEmail: email}, nil
-		}},
-		AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(_ context.Context, userID int64) ([]store.AppPassword, error) {
-			return []store.AppPassword{{ID: 3, DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}}, nil
-		}},
-	}
+	service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{{ID: 3, DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}}, nil
+	})
 	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, ok := UserFromContext(r.Context())
 		if !ok || user.ID != 7 {
@@ -481,6 +519,111 @@ func TestRequireDAVAuthAcceptsSHA256AndMD5DigestAndRejectsReplay(t *testing.T) {
 				t.Fatalf("replayed digest status = %d, want 401", replayRec.Code)
 			}
 		})
+	}
+}
+
+// A Digest nonce is signed with a key derived from the configured session
+// secret, so it verifies at every instance holding that secret and after a
+// restart. The record of which nonce counts have been spent has to be shared the
+// same way: with it held per process, a captured Authorization header replayed
+// at a second instance -- or at the same one after a restart -- authenticated
+// again for the whole nonce lifetime.
+func TestDigestReplayIsRejectedAtASecondInstance(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	nonces := &digestNonceRepoMock{}
+	newInstance := func() http.Handler {
+		service := &Service{cfg: testAuthConfig("https://calcard.example")}
+		_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+		service.store = digestTestStore(nonces, func(context.Context, int64) ([]store.AppPassword, error) {
+			return []store.AppPassword{{ID: 3, DigestSHA256HA1: sha256HA1}}, nil
+		})
+		return service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+	}
+	first, second := newInstance(), newInstance()
+
+	challengeRec := httptest.NewRecorder()
+	first.ServeHTTP(challengeRec, davRequest(http.MethodPut, "/dav/calendars/1/event.ics"))
+	challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
+	authorization := testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodPut, "/dav/calendars/1/event.ics", "00000001", "cnonce")
+
+	accepted := httptest.NewRecorder()
+	acceptedReq := davRequest(http.MethodPut, "/dav/calendars/1/event.ics")
+	acceptedReq.Header.Set("Authorization", authorization)
+	first.ServeHTTP(accepted, acceptedReq)
+	if accepted.Code != http.StatusNoContent {
+		t.Fatalf("first instance status = %d, want 204: %s", accepted.Code, accepted.Body.String())
+	}
+
+	// The same bytes, at an instance that never saw the original request. The
+	// nonce still verifies there, which is exactly why the count must not.
+	replayed := httptest.NewRecorder()
+	replayedReq := davRequest(http.MethodPut, "/dav/calendars/1/event.ics")
+	replayedReq.Header.Set("Authorization", authorization)
+	second.ServeHTTP(replayed, replayedReq)
+	if replayed.Code != http.StatusUnauthorized {
+		t.Fatalf("second instance accepted the replayed credentials: status = %d, want 401", replayed.Code)
+	}
+}
+
+// The request shape a TLS-terminating proxy produces once the forwarded-address
+// middleware has run: RemoteAddr carries the client, the recorded peer is the
+// proxy, and the proxy describes its own leg as HTTPS. Basic has to be offered
+// and accepted here -- an app password issued before Digest credentials existed
+// has nothing else to authenticate with.
+//
+// internal/http asserts that the middleware produces exactly this shape; this
+// asserts what the authenticator then does with it.
+func TestRequireDAVAuthAcceptsBasicForwardedByATrustedProxy(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	cfg := testAuthConfig("https://calcard.example")
+	cfg.TrustedProxies = []string{"10.0.0.0/8"}
+	service := &Service{
+		cfg: cfg,
+		store: digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+			return []store.AppPassword{{ID: 3, TokenHash: string(hash)}}, nil
+		}),
+	}
+	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	proxied := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+		req.RemoteAddr = "198.51.100.7:4567"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		return req.WithContext(clientip.WithPeerAddr(req.Context(), "10.1.2.3:4567"))
+	}
+
+	challenge := httptest.NewRecorder()
+	handler.ServeHTTP(challenge, proxied())
+	offersBasic := false
+	for _, value := range challenge.Header().Values("WWW-Authenticate") {
+		if strings.HasPrefix(value, "Basic ") {
+			offersBasic = true
+		}
+	}
+	if !offersBasic {
+		t.Fatalf("a trusted proxy's HTTPS request was not offered Basic: %#v", challenge.Header().Values("WWW-Authenticate"))
+	}
+
+	req := proxied()
+	req.SetBasicAuth(username, password)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -548,46 +691,97 @@ func TestRequestIsSecureRejectsSpoofedForwardedHeadersFromUntrustedPeers(t *test
 	}
 }
 
-func TestTrustedProxiesAllowsPeer(t *testing.T) {
-	tests := []struct {
-		name       string
-		remoteAddr string
-		trusted    []string
-		want       bool
-	}{
-		// An unconfigured deployment keeps the documented posture: every peer's
-		// forwarded headers are honoured, and the config loader warns about it.
-		{name: "no configured proxies trusts every peer", remoteAddr: "203.0.113.9:4567", want: true},
-		{name: "a peer inside the CIDR", remoteAddr: "10.1.2.3:4567", trusted: []string{"10.0.0.0/8"}, want: true},
-		{name: "a peer outside the CIDR", remoteAddr: "203.0.113.9:4567", trusted: []string{"10.0.0.0/8"}},
-		{name: "a bare IP entry", remoteAddr: "192.0.2.7:1234", trusted: []string{"192.0.2.7"}, want: true},
-		{name: "an address with no port", remoteAddr: "10.1.2.3", trusted: []string{"10.0.0.0/8"}, want: true},
-		{name: "an unparseable address", remoteAddr: "not-an-address", trusted: []string{"10.0.0.0/8"}},
+func TestDigestNonceCountAcceptsUniqueOutOfOrderValues(t *testing.T) {
+	ctx := context.Background()
+	service := &Service{
+		digestNow: func() time.Time { return time.Unix(1_700_000_000, 0) },
+		store:     &store.Store{DigestNonces: &digestNonceRepoMock{}},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := NewTrustedProxies(tt.trusted).AllowsPeer(tt.remoteAddr); got != tt.want {
-				t.Fatalf("NewTrustedProxies(%v).AllowsPeer(%q) = %v, want %v", tt.trusted, tt.remoteAddr, got, tt.want)
-			}
-		})
+	if claimed, err := service.acceptDigestNonceCount(ctx, 7, "nonce", 2); !claimed || err != nil {
+		t.Fatalf("first nonce count = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if claimed, err := service.acceptDigestNonceCount(ctx, 7, "nonce", 1); !claimed || err != nil {
+		t.Fatalf("unique out-of-order nonce count = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if claimed, err := service.acceptDigestNonceCount(ctx, 7, "nonce", 2); claimed || err != nil {
+		t.Fatalf("duplicate nonce count = (%v, %v), want (false, nil)", claimed, err)
+	}
+	if claimed, err := service.acceptDigestNonceCount(ctx, 7, "nonce", 1); claimed || err != nil {
+		t.Fatalf("duplicate out-of-order nonce count = (%v, %v), want (false, nil)", claimed, err)
 	}
 }
 
-func TestDigestNonceCountAcceptsUniqueOutOfOrderValues(t *testing.T) {
-	service := &Service{digestNow: func() time.Time { return time.Unix(1_700_000_000, 0) }}
+// A store failure and a genuine replay must both refuse the claim -- this
+// server cannot tell an unrecorded count apart from a replayed one when the
+// store cannot answer -- but they have to be reported differently so a
+// transient outage is not indistinguishable from an actual replay: only the
+// store failure carries an error.
+func TestDigestNonceCountRejectsWhenTheStoreFails(t *testing.T) {
+	ctx := context.Background()
+	now := func() time.Time { return time.Unix(1_700_000_000, 0) }
 
-	if !service.acceptDigestNonceCount(7, "nonce", 2) {
-		t.Fatal("first nonce count was rejected")
+	failing := &Service{
+		digestNow: now,
+		store: &store.Store{DigestNonces: &digestNonceRepoMock{
+			consumeFn: func(context.Context, int64, string, uint32, time.Time) (bool, error) {
+				return false, errors.New("database unreachable")
+			},
+		}},
 	}
-	if !service.acceptDigestNonceCount(7, "nonce", 1) {
-		t.Fatal("unique out-of-order nonce count was rejected")
+	if claimed, err := failing.acceptDigestNonceCount(ctx, 7, "nonce", 1); claimed {
+		t.Fatal("a failed replay-state write admitted the request")
+	} else if err == nil {
+		t.Fatal("a failed replay-state write was not reported as an error")
 	}
-	if service.acceptDigestNonceCount(7, "nonce", 2) {
-		t.Fatal("duplicate nonce count was accepted")
+
+	replaying := &Service{digestNow: now, store: &store.Store{DigestNonces: &digestNonceRepoMock{}}}
+	if claimed, err := replaying.acceptDigestNonceCount(ctx, 7, "nonce", 1); !claimed || err != nil {
+		t.Fatalf("first claim = (%v, %v), want (true, nil)", claimed, err)
 	}
-	if service.acceptDigestNonceCount(7, "nonce", 1) {
-		t.Fatal("duplicate out-of-order nonce count was accepted")
+	if claimed, err := replaying.acceptDigestNonceCount(ctx, 7, "nonce", 1); claimed || err != nil {
+		t.Fatalf("a genuine replay = (%v, %v), want (false, nil): a replay must not be reported as a store error", claimed, err)
+	}
+}
+
+// A replay-guard store failure is not a credential problem, so the challenge
+// must carry stale=true -- unlike a genuine replay -- so a well-behaved client
+// retries with a fresh nonce instead of re-prompting the user for credentials
+// that were never at fault.
+func TestRequireDAVAuthDigestMarksStoreFailureStaleUnlikeAGenuineReplay(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	service := &Service{cfg: testAuthConfig("https://calcard.example")}
+	_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+	service.store = digestTestStore(&digestNonceRepoMock{
+		consumeFn: func(context.Context, int64, string, uint32, time.Time) (bool, error) {
+			return false, errors.New("database unreachable")
+		},
+	}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{{ID: 3, DigestSHA256HA1: sha256HA1}}, nil
+	})
+	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	challengeRec := httptest.NewRecorder()
+	handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodGet, "/dav/", nil))
+	challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
+	authorization := testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/", "00000001", "cnonce")
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	req.Header.Set("Authorization", authorization)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	for _, value := range rec.Header().Values("WWW-Authenticate")[:2] {
+		if !strings.Contains(value, "stale=true") {
+			t.Fatalf("store-failure challenge = %q, want stale=true", value)
+		}
 	}
 }
 
@@ -614,37 +808,47 @@ func TestRequireDAVAuthDigestRejectsBadRevokedExpiredAndMismatchedCredentials(t 
 		password = "app-secret"
 	)
 	now := time.Now()
-	md5HA1 := testDigestHash("MD5", username+":"+davDigestRealm+":"+password)
-	sha256HA1 := testDigestHash("SHA-256", username+":"+davDigestRealm+":"+password)
-	service := &Service{
-		cfg: testAuthConfig("https://calcard.example"),
-		store: &store.Store{
-			Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-				return &store.User{ID: 7, PrimaryEmail: email}, nil
-			}},
-			AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(_ context.Context, userID int64) ([]store.AppPassword, error) {
-				return []store.AppPassword{
-					{ID: 1, DigestSHA256HA1: &sha256HA1, RevokedAt: &now},
-					{ID: 2, DigestSHA256HA1: &sha256HA1, ExpiresAt: ptrTime(now.Add(-time.Minute))},
-					{ID: 3, DigestMD5HA1: &md5HA1, DigestSHA256HA1: &sha256HA1},
-				}, nil
-			}},
-		},
-	}
+	service := &Service{cfg: testAuthConfig("https://calcard.example")}
+	md5HA1, sha256HA1 := sealedTestHA1s(t, service, username, password)
+	service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{
+			{ID: 1, DigestSHA256HA1: sha256HA1, RevokedAt: &now},
+			{ID: 2, DigestSHA256HA1: sha256HA1, ExpiresAt: ptrTime(now.Add(-time.Minute))},
+			{ID: 3, DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1},
+		}, nil
+	})
 	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	challengeRec := httptest.NewRecorder()
 	handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodGet, "/dav/", nil))
 	challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
 
 	valid := testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/", "00000001", "cnonce")
-	for name, authorization := range map[string]string{
-		"bad response":        strings.Replace(valid, `response="`, `response="00`, 1),
-		"different URI":       strings.Replace(valid, `uri="/dav/"`, `uri="/dav/other"`, 1),
-		"malformed duplicate": valid + `, username="attacker@example.com"`,
-	} {
+
+	// Each rejection below has to be attributable to the tampering it names, so
+	// establish first that the untampered header authenticates. Without this the
+	// subtests pass whenever nothing at all can authenticate.
+	acceptedRec := httptest.NewRecorder()
+	acceptedReq := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	acceptedReq.Header.Set("Authorization", valid)
+	handler.ServeHTTP(acceptedRec, acceptedReq)
+	if acceptedRec.Code != http.StatusNoContent {
+		t.Fatalf("untampered status = %d, want 204", acceptedRec.Code)
+	}
+	tamper := map[string]func(string) string{
+		"bad response":        func(header string) string { return strings.Replace(header, `response="`, `response="00`, 1) },
+		"different URI":       func(header string) string { return strings.Replace(header, `uri="/dav/"`, `uri="/dav/other"`, 1) },
+		"malformed duplicate": func(header string) string { return header + `, username="attacker@example.com"` },
+	}
+	nonceCount := 1
+	for name, corrupt := range tamper {
+		nonceCount++
 		t.Run(name, func(t *testing.T) {
+			// A fresh nonce count per case: the replay guard would otherwise
+			// reject the second request whatever its contents.
+			fresh := testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/",
+				fmt.Sprintf("%08x", nonceCount), "cnonce")
 			req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
-			req.Header.Set("Authorization", authorization)
+			req.Header.Set("Authorization", corrupt(fresh))
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)
 			if rec.Code != http.StatusUnauthorized {
@@ -654,49 +858,57 @@ func TestRequireDAVAuthDigestRejectsBadRevokedExpiredAndMismatchedCredentials(t 
 	}
 }
 
+// Revocation and expiry each have to be the reason the credential is refused.
+// Every leg therefore authenticates the same sealed credential first and only
+// then applies the flag under test: a Digest credential this server cannot read
+// at all is refused for its own reasons, and a test built on one proves nothing
+// about either flag.
 func TestRequireDAVAuthDigestRejectsRevokedAndExpiredTokensInIsolation(t *testing.T) {
 	clock := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	const (
 		username = "user@example.com"
 		password = "app-secret"
 	)
-	ha1 := testDigestHash("SHA-256", username+":"+davDigestRealm+":"+password)
 	tests := []struct {
-		name  string
-		token store.AppPassword
+		name     string
+		suppress func(*store.AppPassword)
 	}{
-		{name: "revoked", token: store.AppPassword{ID: 1, DigestSHA256HA1: &ha1, RevokedAt: &clock}},
-		{name: "expired", token: store.AppPassword{ID: 2, DigestSHA256HA1: &ha1, ExpiresAt: &clock}},
+		{name: "revoked", suppress: func(token *store.AppPassword) { token.RevokedAt = &clock }},
+		{name: "expired", suppress: func(token *store.AppPassword) { token.ExpiresAt = &clock }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			service := &Service{
-				cfg:       &config.Config{BaseURL: "https://calcard.example"},
+				cfg:       testAuthConfig("https://calcard.example"),
 				digestNow: func() time.Time { return clock },
-				store: &store.Store{
-					Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-						return &store.User{ID: 7, PrimaryEmail: email}, nil
-					}},
-					AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
-						return []store.AppPassword{tt.token}, nil
-					}},
-				},
 			}
+			_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+			token := store.AppPassword{ID: 1, DigestSHA256HA1: sha256HA1}
+			service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+				return []store.AppPassword{token}, nil
+			})
 			handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
-			challengeRec := httptest.NewRecorder()
-			handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodGet, "/dav/", nil))
-			challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
-			authorization := testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/", "00000001", "cnonce")
-			req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
-			req.Header.Set("Authorization", authorization)
-			rec := httptest.NewRecorder()
+			authenticate := func(nonceCount string) int {
+				challengeRec := httptest.NewRecorder()
+				handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodGet, "/dav/", nil))
+				challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
+				req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+				req.Header.Set("Authorization", testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/", nonceCount, "cnonce"))
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				return rec.Code
+			}
 
-			handler.ServeHTTP(rec, req)
+			if code := authenticate("00000001"); code != http.StatusNoContent {
+				t.Fatalf("status before %s = %d, want 204", tt.name, code)
+			}
 
-			if rec.Code != http.StatusUnauthorized {
-				t.Fatalf("status = %d, want 401", rec.Code)
+			tt.suppress(&token)
+
+			if code := authenticate("00000002"); code != http.StatusUnauthorized {
+				t.Fatalf("status after %s = %d, want 401", tt.name, code)
 			}
 		})
 	}
@@ -711,14 +923,12 @@ func TestLegacyAppPasswordWithoutDigestHA1RemainsBasicOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateFromPassword() error = %v", err)
 	}
-	service := &Service{cfg: testAuthConfig("https://calcard.example"), store: &store.Store{
-		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-			return &store.User{ID: 7, PrimaryEmail: email}, nil
-		}},
-		AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
+	service := &Service{
+		cfg: testAuthConfig("https://calcard.example"),
+		store: digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
 			return []store.AppPassword{{ID: 3, TokenHash: string(hash)}}, nil
-		}},
-	}}
+		}),
+	}
 	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -749,19 +959,14 @@ func TestRequireDAVAuthDigestMarksExpiredSignedNonceStale(t *testing.T) {
 		username = "user@example.com"
 		password = "app-secret"
 	)
-	sha256HA1 := testDigestHash("SHA-256", username+":"+davDigestRealm+":"+password)
 	service := &Service{
-		cfg:       &config.Config{BaseURL: "https://calcard.example"},
+		cfg:       testAuthConfig("https://calcard.example"),
 		digestNow: func() time.Time { return clock },
-		store: &store.Store{
-			Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-				return &store.User{ID: 7, PrimaryEmail: email}, nil
-			}},
-			AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(_ context.Context, userID int64) ([]store.AppPassword, error) {
-				return []store.AppPassword{{ID: 3, DigestSHA256HA1: &sha256HA1}}, nil
-			}},
-		},
 	}
+	_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+	service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{{ID: 3, DigestSHA256HA1: sha256HA1}}, nil
+	})
 	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	challengeRec := httptest.NewRecorder()
 	handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodGet, "/dav/", nil))
@@ -977,5 +1182,35 @@ func TestSecureRequestTrustsTLSAndForwardedProto(t *testing.T) {
 				t.Fatalf("RequestIsSecure() = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+// secureRequest sits on the DAV auth hot path, so it must not re-parse
+// APP_TRUSTED_PROXIES on every call the way the exported, per-call
+// RequestIsSecure necessarily does. This compares the two paths' allocation
+// rates rather than asserting zero, because parsing the request's own remote
+// address is unavoidable per-call work; only the trusted-proxy CIDR parsing
+// is supposed to be shared across calls.
+func TestSecureRequestCachesTrustedProxiesInsteadOfReparsingPerRequest(t *testing.T) {
+	trustedProxies := []string{"10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32"}
+	cfg := testAuthConfig("https://calcard.example")
+	cfg.TrustedProxies = trustedProxies
+	service := &Service{cfg: cfg}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	req.RemoteAddr = "10.1.2.3:4567"
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	if !service.secureRequest(req) {
+		t.Fatal("expected a trusted proxy's forwarded HTTPS request to be secure")
+	}
+
+	cachedAllocs := testing.AllocsPerRun(200, func() { service.secureRequest(req) })
+	reparsedAllocs := testing.AllocsPerRun(200, func() { RequestIsSecure(req, trustedProxies) })
+
+	if cachedAllocs >= reparsedAllocs {
+		t.Fatalf("secureRequest() allocated %.1f/call, RequestIsSecure() allocated %.1f/call: "+
+			"the Service path should reuse a cached trusted-proxy set instead of re-parsing the CIDRs on every request",
+			cachedAllocs, reparsedAllocs)
 	}
 }

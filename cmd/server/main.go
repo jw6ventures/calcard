@@ -101,6 +101,9 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	}
 
 	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
+	// Every authenticated Digest request writes one nonce count, and each stops
+	// being presentable one nonce lifetime after it was written.
+	go store.StartDigestNonceCleanup(ctx, stor.DigestNonces, 5*time.Minute)
 	// The retention window is measured in weeks, so an hourly pass keeps the
 	// table bounded without the prune ever being the reason a query is slow.
 	go store.StartDeletedResourceCleanup(ctx, stor.DeletedResources, time.Hour, cfg.DAV.SyncHistoryRetention)

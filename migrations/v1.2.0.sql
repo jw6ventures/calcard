@@ -20,22 +20,76 @@ ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];
 -- from APP_SESSION_SECRET, not the bare HA1: an HA1 authenticates its holder
 -- without the password, so a database read must not yield usable credentials.
 
-ALTER TABLE acl_entries ADD COLUMN IF NOT EXISTS ace_order INTEGER NOT NULL DEFAULT 0;
+-- The backfill runs only on the upgrade that introduces ace_order. An
+-- installation already carrying the column carries orderings an ACL request
+-- established, and reordering those would discard them. Recording the column's
+-- absence before the ALTER is what distinguishes the two; the whole block is
+-- one statement, so it cannot commit the column without the backfill. The table
+-- is named through regclass so it resolves against search_path exactly as the
+-- ALTER below does.
+--
+-- Denials sort ahead of grants because the evaluation rule changes with this
+-- column. Unordered ACLs were read deny-first -- a denial anywhere suppressed
+-- every grant -- while an ordered ACL is read first-match (RFC 3744 section
+-- 5.5.2). Ordering by age alone would let a DAV:all grant written before a
+-- user-specific denial answer first and admit a principal the installation had
+-- denied.
+--
+-- The partition is resource_path_norm, the column the object-level predicates
+-- join on, so an ACE stored as /path/x.ics and one stored as /path/x order
+-- against each other here exactly as they are evaluated. The resulting
+-- ace_order values are not contiguous within a single resource_path, which
+-- nothing requires: the ACL method rewrites every position on write, and the
+-- reader groups on a change of position rather than on its value.
+DO $$
+DECLARE
+    backfill_needed BOOLEAN;
+BEGIN
+    SELECT NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'acl_entries'::regclass
+          AND attname = 'ace_order'
+          AND NOT attisdropped
+    ) INTO backfill_needed;
 
-WITH ordered AS (
-    SELECT id, ROW_NUMBER() OVER (PARTITION BY resource_path ORDER BY created_at, id) - 1 AS position
-    FROM acl_entries
-)
-UPDATE acl_entries AS entry
-SET ace_order = ordered.position
-FROM ordered
-WHERE entry.id = ordered.id;
+    ALTER TABLE acl_entries ADD COLUMN IF NOT EXISTS ace_order INTEGER NOT NULL DEFAULT 0;
+
+    IF backfill_needed THEN
+        WITH ordered AS (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY resource_path_norm ORDER BY is_grant, created_at, id) - 1 AS position
+            FROM acl_entries
+        )
+        UPDATE acl_entries AS entry
+        SET ace_order = ordered.position
+        FROM ordered
+        WHERE entry.id = ordered.id;
+    END IF;
+END $$;
 
 DROP INDEX IF EXISTS idx_acl_unique;
 CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
 
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT;
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_sha256_ha1 TEXT;
+
+-- Consumed Digest nonce counts. RFC 7616 section 3.4 makes the (nonce, nc) pair
+-- single-use, and the nonce this server issues is signed with a key derived
+-- from the configured session secret, so it verifies on any instance holding
+-- that secret and across a restart. Holding the consumed counts in process
+-- memory therefore left captured credentials replayable at any other instance,
+-- and at the same one after a restart, for the nonce lifetime. The primary key
+-- is the uniqueness constraint: the insert that loses the race changes no row,
+-- and that is what identifies a replay.
+CREATE TABLE IF NOT EXISTS digest_nonce_counts (
+    token_id    BIGINT NOT NULL REFERENCES app_passwords(id) ON DELETE CASCADE,
+    nonce       TEXT NOT NULL,
+    nonce_count BIGINT NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (token_id, nonce, nonce_count)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
+    ON digest_nonce_counts (expires_at);
 
 -- v1.1.12: convert the two time-range expression indexes to the expressions
 -- ListForCalendarFiltered now uses, replacing the v1.1.7 pair

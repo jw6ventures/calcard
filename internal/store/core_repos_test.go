@@ -2398,11 +2398,22 @@ func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T)
 	sources := map[string][]string{
 		"../../migrations/v1.2.0.sql": {
 			"ALTER TABLE acl_entries ADD COLUMN IF NOT EXISTS ace_order INTEGER NOT NULL DEFAULT 0",
-			"ROW_NUMBER() OVER (PARTITION BY resource_path ORDER BY created_at, id)",
+			// Denials first: an unordered ACL was read deny-first, an ordered one
+			// is read first-match, and ordering by age alone would let an older
+			// blanket grant answer ahead of the denial that suppressed it.
+			"ROW_NUMBER() OVER (PARTITION BY resource_path_norm ORDER BY is_grant, created_at, id)",
+			// And only on the upgrade that introduces the column, so an
+			// installation already carrying ACL orderings keeps them.
+			"IF backfill_needed THEN",
+			"attrelid = 'acl_entries'::regclass",
 			"DROP INDEX IF EXISTS idx_acl_unique",
 			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
 			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT",
 			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_sha256_ha1 TEXT",
+			"CREATE TABLE IF NOT EXISTS digest_nonce_counts",
+			// The whole of the uint32 nc range validateDAVDigest accepts has to fit.
+			"nonce_count BIGINT NOT NULL",
+			"PRIMARY KEY (token_id, nonce, nonce_count)",
 			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
@@ -2411,6 +2422,9 @@ func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T)
 			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
 			"digest_md5_ha1 TEXT NULL",
 			"digest_sha256_ha1 TEXT NULL",
+			"CREATE TABLE IF NOT EXISTS digest_nonce_counts",
+			"nonce_count BIGINT NOT NULL",
+			"PRIMARY KEY (token_id, nonce, nonce_count)",
 			baselineSchemaVersionRow,
 		},
 	}
@@ -2609,5 +2623,67 @@ func TestTransferContactMissingSourceState(t *testing.T) {
 	_, _, err = transferContactTx(context.Background(), tx, contactTransferMove, 7, 8, "missing", "missing", "", ContactTransferExpectation{})
 	if !errors.Is(err, ErrResourceStateChanged) {
 		t.Fatalf("error = %v, want ErrResourceStateChanged", err)
+	}
+}
+
+// Consume reports the replay, and it does so from the row count rather than a
+// read: two instances handed the same captured header race here, and only the
+// insert that changed a row may authenticate.
+func TestDigestNonceRepoConsumeReportsFirstClaimAndReplay(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &digestNonceRepo{pool: db}
+	expiresAt := time.Date(2026, time.August, 3, 12, 5, 0, 0, time.UTC)
+	const insert = `INSERT INTO digest_nonce_counts (token_id, nonce, nonce_count, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (token_id, nonce, nonce_count) DO NOTHING`
+
+	tests := []struct {
+		name     string
+		affected int64
+		want     bool
+	}{
+		{name: "first claim", affected: 1, want: true},
+		{name: "replay", affected: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock.ExpectExec(regexp.QuoteMeta(insert)).
+				WithArgs(int64(7), "nonce-value", int64(1), expiresAt).
+				WillReturnResult(sqlmock.NewResult(0, tt.affected))
+
+			claimed, err := repo.Consume(context.Background(), 7, "nonce-value", 1, expiresAt)
+			if err != nil {
+				t.Fatalf("Consume() error = %v", err)
+			}
+			if claimed != tt.want {
+				t.Fatalf("Consume() = %v, want %v", claimed, tt.want)
+			}
+		})
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestDigestNonceRepoConsumeReturnsTheStoreError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec(`INSERT INTO digest_nonce_counts`).WillReturnError(errors.New("database unreachable"))
+
+	claimed, err := (&digestNonceRepo{pool: db}).Consume(context.Background(), 7, "nonce-value", 1, time.Now())
+	if err == nil {
+		t.Fatal("Consume() error = nil, want the store error")
+	}
+	if claimed {
+		t.Fatal("Consume() claimed the count despite the store failing")
 	}
 }

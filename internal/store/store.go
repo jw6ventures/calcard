@@ -25,6 +25,7 @@ type Store struct {
 	AddressBooks        AddressBookRepository
 	Contacts            ContactRepository
 	AppPasswords        AppPasswordRepository
+	DigestNonces        DigestNonceRepository
 	DeletedResources    DeletedResourceRepository
 	Sessions            SessionRepository
 	Locks               LockRepository
@@ -42,6 +43,7 @@ func New(pool *sql.DB) *Store {
 		AddressBooks:     &addressBookRepo{pool: pool},
 		Contacts:         &contactRepo{pool: pool},
 		AppPasswords:     &appPasswordRepo{pool: pool},
+		DigestNonces:     &digestNonceRepo{pool: pool},
 		DeletedResources: &deletedResourceRepo{pool: pool},
 		Sessions:         &sessionRepo{pool: pool},
 		Locks:            &lockRepo{pool: pool},

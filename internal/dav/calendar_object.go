@@ -977,7 +977,14 @@ func submittedTimezoneOffsetBefore(root *icalNode, tzid string, bound time.Time,
 		for _, rule := range observance.rrules {
 			// The rule generates local values, so it is walked up to the bound
 			// moved onto that same scale.
-			candidate, found := ical.LatestRecurrenceOnOrBefore(observance.dtstart, bound.Add(-toBoundScale), rule)
+			candidate, found, complete := ical.LatestRecurrenceOnOrBefore(observance.dtstart, bound.Add(-toBoundScale), rule)
+			if !complete {
+				// The rule describes more than this server will generate, so
+				// which observance is in force cannot be established. Answering
+				// from the transitions that did resolve would apply an offset
+				// this definition does not support, so the object is refused.
+				return 0, false
+			}
 			if found {
 				consider(candidate)
 			}

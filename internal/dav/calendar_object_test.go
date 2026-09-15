@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -239,6 +240,60 @@ func TestSubmittedVTimezoneResolverAppliesRecurringObservances(t *testing.T) {
 		if !ok || got != tt.want {
 			t.Errorf("submittedTimezoneOffset(%s) = %s, %t; want %s", tt.wall, got, ok, tt.want)
 		}
+	}
+}
+
+// An observance rule describing more candidate starts than the server will
+// generate leaves the resolver unable to say which observance is in force. The
+// offset reachable from a half-generated period is the wrong one and reads
+// exactly like the right one, so the object is refused rather than stored
+// against it.
+func TestSubmittedVTimezoneObservanceTooLargeToResolveIsRefused(t *testing.T) {
+	enumerate := func(n int) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = strconv.Itoa(i)
+		}
+		return strings.Join(parts, ",")
+	}
+	monthDays := make([]string, 0, 31)
+	for day := 1; day <= 31; day++ {
+		monthDays = append(monthDays, strconv.Itoa(day))
+	}
+	dense := "RRULE:FREQ=YEARLY;BYMONTH=1,2,3,4,5,6" +
+		";BYMONTHDAY=" + strings.Join(monthDays, ",") +
+		";BYHOUR=" + enumerate(24) +
+		";BYMINUTE=" + enumerate(60) +
+		";BYSECOND=" + enumerate(60)
+
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(
+		buildComponent("VTIMEZONE",
+			"TZID:Example/Dense",
+			buildComponent("STANDARD",
+				"DTSTART:20200101T000000",
+				"TZOFFSETFROM:-0400",
+				"TZOFFSETTO:-0500",
+				dense)),
+		buildVEvent("dense-observance", "DTSTART;TZID=Example/Dense:20260115T100000"))
+
+	root, err := parseICalendarObject(body)
+	if err != nil {
+		t.Fatalf("parse calendar: %v", err)
+	}
+	if _, ok := submittedTimezoneOffset(root, "Example/Dense", time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)); ok {
+		t.Fatal("an observance the server cannot resolve still produced an offset")
+	}
+	if fault := validateCalendarObject(root); fault == nil {
+		t.Fatal("an object whose VTIMEZONE cannot be resolved was accepted")
+	}
+
+	rr := putCalendarObject(t, h, "dense-observance.ics", body)
+	if rr.Code < 400 {
+		t.Fatalf("status = %d, want a refusal", rr.Code)
+	}
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("object with an unresolvable VTIMEZONE was stored: %#v", eventRepo.events)
 	}
 }
 

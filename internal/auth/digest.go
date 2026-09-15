@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -14,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,11 +44,6 @@ const (
 // stored HA1s can be neither written nor read. Digest then has no credentials
 // to verify against and app passwords remain usable over Basic alone.
 var errDigestHA1KeyUnavailable = errors.New("digest credential key unavailable")
-
-type digestReplayEntry struct {
-	nonceCounts map[uint32]struct{}
-	expiresAt   time.Time
-}
 
 func digestHash(algorithm, value string) string {
 	switch strings.ToUpper(algorithm) {
@@ -331,7 +328,16 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 		if len(expected) != len(params["response"]) || subtle.ConstantTimeCompare([]byte(expected), []byte(strings.ToLower(params["response"]))) != 1 {
 			continue
 		}
-		if !s.acceptDigestNonceCount(token.ID, params["nonce"], uint32(nonceCount64)) {
+		claimed, err := s.acceptDigestNonceCount(r.Context(), token.ID, params["nonce"], uint32(nonceCount64))
+		if err != nil {
+			// The credential itself checked out; only the replay-guard write
+			// failed. stale=true lets a well-behaved client retry with a fresh
+			// nonce instead of re-prompting the user for credentials that were
+			// never the problem.
+			log.Printf("dav digest: replay guard unavailable for app password %d: %v", token.ID, err)
+			return nil, true, errors.New("digest replay guard unavailable")
+		}
+		if !claimed {
 			return nil, false, errors.New("replayed digest credentials")
 		}
 		s.touchLastUsedThrottled(token)
@@ -340,32 +346,28 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 	return nil, false, errors.New("invalid digest credentials")
 }
 
-func (s *Service) acceptDigestNonceCount(tokenID int64, nonce string, nonceCount uint32) bool {
-	now := s.digestTime()
-	key := strconv.FormatInt(tokenID, 10) + "\x00" + nonce
-	s.digestMu.Lock()
-	defer s.digestMu.Unlock()
-	if s.digestReplay == nil {
-		s.digestReplay = make(map[string]digestReplayEntry)
+// acceptDigestNonceCount claims one (nonce, nonce count) pair, which RFC 7616
+// section 3.4 allows a client to present once.
+//
+// The claim is recorded in the database rather than in this process. A nonce is
+// signed with a key derived from the configured session secret, so it verifies
+// at every instance holding that secret and after a restart; a per-process
+// record of what had been spent would leave captured credentials replayable
+// anywhere else for the nonce lifetime.
+//
+// The bool and the error are both needed: a store that cannot answer fails the
+// claim exactly like a spent nonce count does (admitting the request would be
+// admitting one this server cannot tell apart from a replay), but the caller
+// still needs to tell the two apart to report and challenge them differently.
+func (s *Service) acceptDigestNonceCount(ctx context.Context, tokenID int64, nonce string, nonceCount uint32) (bool, error) {
+	if s.store == nil || s.store.DigestNonces == nil {
+		return false, errors.New("digest nonce store not configured")
 	}
-	for replayKey, entry := range s.digestReplay {
-		if !entry.expiresAt.After(now) {
-			delete(s.digestReplay, replayKey)
-		}
+	claimed, err := s.store.DigestNonces.Consume(ctx, tokenID, nonce, nonceCount, s.digestTime().Add(davDigestNonceTTL))
+	if err != nil {
+		return false, fmt.Errorf("consume digest nonce count: %w", err)
 	}
-	entry, exists := s.digestReplay[key]
-	if !exists {
-		entry = digestReplayEntry{
-			nonceCounts: make(map[uint32]struct{}),
-			expiresAt:   now.Add(davDigestNonceTTL),
-		}
-	}
-	if _, duplicate := entry.nonceCounts[nonceCount]; duplicate {
-		return false
-	}
-	entry.nonceCounts[nonceCount] = struct{}{}
-	s.digestReplay[key] = entry
-	return true
+	return claimed, nil
 }
 
 func parseDigestParameters(input string) (map[string]string, error) {

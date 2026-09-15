@@ -1,3 +1,14 @@
+-- Historical snapshot: db.sql exactly as it stood at the v1.1.9 baseline
+-- (commit af41c05, the commit that set application.version to v1.1.9). It is the
+-- schema migrations/v1.2.0.sql actually meets on an upgrading installation, so the
+-- migration tests seed from it rather than from the current db.sql.
+--
+-- Never edit this file. It records what a released version shipped; changing it
+-- would make the upgrade tests assert against a database that never existed.
+--
+-- The v1.1.x *tags* in this repository point at unrelated history and must not be
+-- used to reconstruct a baseline.
+
 -- CalCard baseline schema (flattened migrations)
 
 CREATE TABLE IF NOT EXISTS application (
@@ -6,7 +17,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.2.0')
+VALUES ('version', 'v1.1.9')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -65,31 +76,12 @@ CREATE TABLE app_passwords (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NULL,
     revoked_at TIMESTAMPTZ NULL,
-    last_used_at TIMESTAMPTZ NULL,
-    -- Encrypted HTTP Digest HA1s (AES-256-GCM under a key derived from
-    -- APP_SESSION_SECRET). An HA1 is password-equivalent for the DAV realm, so
-    -- it is never stored as the bare hash Digest computes.
-    digest_md5_ha1 TEXT NULL,
-    digest_sha256_ha1 TEXT NULL
+    last_used_at TIMESTAMPTZ NULL
 );
 
+CREATE INDEX idx_events_calendar_id ON events(calendar_id);
+CREATE INDEX idx_contacts_address_book_id ON contacts(address_book_id);
 CREATE INDEX idx_app_passwords_user_id ON app_passwords(user_id);
-
--- Consumed Digest nonce counts. RFC 7616 section 3.4 makes the (nonce, nc) pair
--- single-use, and the nonce this server issues verifies at every instance
--- holding the configured session secret and across a restart, so the record of
--- which counts have been spent has to be shared the same way. The primary key
--- is the uniqueness constraint: the insert that changes no row is the replay.
-CREATE TABLE IF NOT EXISTS digest_nonce_counts (
-    token_id    BIGINT NOT NULL REFERENCES app_passwords(id) ON DELETE CASCADE,
-    nonce       TEXT NOT NULL,
-    nonce_count BIGINT NOT NULL,
-    expires_at  TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (token_id, nonce, nonce_count)
-);
-
-CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
-    ON digest_nonce_counts (expires_at);
 
 -- Automatically keep last_modified columns fresh for updates.
 CREATE OR REPLACE FUNCTION touch_last_modified()
@@ -250,17 +242,6 @@ ALTER TABLE contacts ADD COLUMN birthday DATE;
 CREATE INDEX idx_contacts_birthday ON contacts(address_book_id, birthday) WHERE birthday IS NOT NULL;
 CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS NOT NULL;
 
--- Keyset indexes for the DAV report reads, which page a single collection by
--- (collection, id). The reads spell the cursor as a row comparison, which the
--- primary key cannot answer as an index bound, so these are what serves them
--- whatever fraction of the table one collection holds. The trailing columns are
--- the predicates the paged reads narrow on: carried here they are evaluated on
--- the index tuple, so a page no longer visits the heap for a row it discards.
--- idx_events_calendar_keyset is created below, with the recurrence columns its
--- trailing expressions read.
-CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);
-CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);
-
 -- Lock storage for WebDAV Class 2/3 compliance
 CREATE TABLE IF NOT EXISTS locks (
     id BIGSERIAL PRIMARY KEY,
@@ -285,13 +266,12 @@ CREATE TABLE IF NOT EXISTS acl_entries (
     principal_href TEXT NOT NULL,
     is_grant BOOLEAN NOT NULL DEFAULT TRUE,
     privilege TEXT NOT NULL,
-    ace_order INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_acl_resource ON acl_entries(resource_path);
 CREATE INDEX IF NOT EXISTS idx_acl_principal ON acl_entries(principal_href);
 DROP INDEX IF EXISTS idx_acl_unique;
-CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_acl_unique ON acl_entries(resource_path, principal_href, privilege, is_grant);
 
 -- Add slug column for MKCALENDAR path mapping
 ALTER TABLE calendars ADD COLUMN slug TEXT;
@@ -392,21 +372,11 @@ CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
 ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
 
--- These expressions have to match the ListForCalendarFiltered predicates
--- verbatim or the indexes stop applying; internal/store/postgres.go carries why
--- each COALESCE reads the columns it does.
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
-    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+    ON events (calendar_id, COALESCE(recurrence_start, dtstart));
 
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
-    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
-
--- The events keyset index, created here rather than beside the other two
--- because its trailing expressions read the recurrence columns added just above.
-CREATE INDEX idx_events_calendar_keyset ON events(
-    calendar_id, id, last_modified,
-    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
-    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+    ON events (calendar_id, COALESCE(recurrence_until, dtend, dtstart));
 
 -- Persistent WebDAV dead properties and batched ACL lookup support.
 CREATE TABLE IF NOT EXISTS dav_dead_properties (
@@ -431,12 +401,3 @@ ALTER TABLE contacts
 
 CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
     ON contacts (object_acl_path);
-
--- description_lang holds the xml:lang attribute RFC 4918 section 4.3 requires a
--- server to return with the property value it was set with; NULL means the
--- calendar description carries no language tag. supported_components holds the
--- component names a calendar collection accepts, as set by MKCALENDAR; NULL
--- means the collection imposes no restriction of its own and the server default
--- applies.
-ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT;
-ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];

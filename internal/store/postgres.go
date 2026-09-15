@@ -1875,6 +1875,46 @@ func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
 	return err
 }
 
+// digestNonceRepo implements DigestNonceRepository.
+type digestNonceRepo struct {
+	pool *sql.DB
+}
+
+// Consume claims the pair by inserting it. The primary key decides the race, so
+// two instances handed the same captured Authorization header cannot both see
+// an insert: the loser changes no row and reads that as the replay it is.
+func (r *digestNonceRepo) Consume(ctx context.Context, tokenID int64, nonce string, nonceCount uint32, expiresAt time.Time) (bool, error) {
+	const q = `
+INSERT INTO digest_nonce_counts (token_id, nonce, nonce_count, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (token_id, nonce, nonce_count) DO NOTHING
+`
+	defer observeDB(ctx, "digest_nonce.consume")()
+	res, err := r.pool.ExecContext(ctx, q, tokenID, nonce, int64(nonceCount), expiresAt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+
+func (r *digestNonceRepo) DeleteExpired(ctx context.Context) (int64, error) {
+	const q = `DELETE FROM digest_nonce_counts WHERE expires_at < NOW()`
+	defer observeDB(ctx, "digest_nonce.delete_expired")()
+	res, err := r.pool.ExecContext(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
 // deletedResourceRepo implements DeletedResourceRepository.
 type deletedResourceRepo struct {
 	pool *sql.DB

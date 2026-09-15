@@ -16,6 +16,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
@@ -34,10 +35,12 @@ type Service struct {
 	authMu    sync.Mutex
 	authCache map[string]authCacheEntry
 
-	digestMu     sync.Mutex
-	digestKey    []byte
-	digestReplay map[string]digestReplayEntry
-	digestNow    func() time.Time
+	digestMu  sync.Mutex
+	digestKey []byte
+	digestNow func() time.Time
+
+	trustedProxiesOnce sync.Once
+	trustedProxies     clientip.TrustedProxies
 }
 
 func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (*Service, error) {
@@ -311,7 +314,27 @@ func (s *Service) secureRequest(r *http.Request) bool {
 	if s == nil || s.cfg == nil {
 		return r != nil && r.TLS != nil
 	}
-	return RequestIsSecure(r, s.cfg.TrustedProxies)
+	return requestIsSecure(r, s.trustedProxySet())
+}
+
+// trustedProxySet returns the Service's parsed trusted-proxy set, built once
+// and cached from then on -- this sits on the DAV auth hot path via
+// secureRequest, which runs for every Basic-authenticated DAV request, and
+// re-parsing the configured CIDRs on every call would allocate for no reason.
+//
+// Building it lazily here, rather than requiring callers to go through
+// NewService, keeps a Service assembled as a bare struct literal -- as most of
+// this package's tests do -- correct: the first call parses cfg.TrustedProxies
+// on demand instead of silently behaving as if none were configured.
+func (s *Service) trustedProxySet() clientip.TrustedProxies {
+	s.trustedProxiesOnce.Do(func() {
+		var configured []string
+		if s.cfg != nil {
+			configured = s.cfg.TrustedProxies
+		}
+		s.trustedProxies = clientip.NewTrustedProxies(configured)
+	})
+	return s.trustedProxies
 }
 
 // RequestIsSecure reports whether this request reached the server over TLS.
@@ -323,21 +346,26 @@ func (s *Service) secureRequest(r *http.Request) bool {
 // X-Forwarded-Proto, matching how the forwarded client IP is resolved and the
 // warning the configuration loader prints at startup.
 //
+// The peer is read through PeerAddr, not r.RemoteAddr: the forwarded-address
+// middleware resolves the client into RemoteAddr, and the client is not the
+// proxy this is asking about.
+//
 // It is exported because the DAV href resolver needs the same answer: a
 // DAV:href naming an absolute URI is compared against the Request-URI scheme,
 // and behind a TLS-terminating proxy only this rule can supply it.
 func RequestIsSecure(r *http.Request, trustedProxies []string) bool {
+	return requestIsSecure(r, clientip.NewTrustedProxies(trustedProxies))
+}
+
+func requestIsSecure(r *http.Request, trusted clientip.TrustedProxies) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	if trusted := parseTrustedProxies(trustedProxies); len(trusted) > 0 {
-		remoteIP, _ := parseRemoteAddr(r.RemoteAddr)
-		if remoteIP == nil || !isTrustedProxy(remoteIP, trusted) {
-			return false
-		}
+	if !trusted.AllowsPeer(clientip.PeerAddr(r)) {
+		return false
 	}
 	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
 	return strings.EqualFold(strings.TrimSpace(proto), "https")

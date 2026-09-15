@@ -1,6 +1,9 @@
 package ical
 
 import (
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -733,5 +736,328 @@ func TestRecurrenceInstancesKeepDistinctSlotsAtTheSameScheduledTime(t *testing.T
 	}
 	if instances[0].RecurrenceID.Equal(instances[1].RecurrenceID) {
 		t.Fatalf("recurrence IDs = %v and %v, want distinct slots", instances[0].RecurrenceID, instances[1].RecurrenceID)
+	}
+}
+
+// enumeratedInts spells out a full BY* list, which is how a compact rule
+// describes an enormous period.
+func enumeratedInts(n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = strconv.Itoa(i)
+	}
+	return strings.Join(parts, ",")
+}
+
+func recurringTestComponent(rrule string) string {
+	return "BEGIN:VCALENDAR\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:dense\r\n" +
+		"DTSTART:20240101T000000Z\r\n" +
+		"RRULE:" + rrule + "\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+}
+
+// A yearly rule naming every day, hour, minute and second describes about 31.5
+// million candidate starts for one period. Validating a PUT against it must not
+// generate them: the answer needs the first thousand and one, or the one
+// BYSETPOS selects. The allocation bound is the assertion -- the defect was not
+// that this was slow but that a request could make the server hold gigabytes.
+func TestRecurrenceSetExceedsLimitDoesNotMaterializeADensePeriod(t *testing.T) {
+	dense := "BYDAY=MO,TU,WE,TH,FR,SA,SU" +
+		";BYHOUR=" + enumeratedInts(24) +
+		";BYMINUTE=" + enumeratedInts(60) +
+		";BYSECOND=" + enumeratedInts(60)
+
+	tests := map[string]struct {
+		rrule   string
+		exceeds bool
+	}{
+		// One instance in total, selected by the first position of the period.
+		"positive BYSETPOS with COUNT": {
+			rrule:   "FREQ=YEARLY;" + dense + ";COUNT=1;BYSETPOS=1",
+			exceeds: false,
+		},
+		// The period cannot be enumerated within the work bound, and a period
+		// that large is past the advertised instance limit either way.
+		"negative BYSETPOS": {
+			rrule:   "FREQ=YEARLY;" + dense + ";BYSETPOS=-1",
+			exceeds: true,
+		},
+		// No positional selection: the limit is reached in the first day.
+		"no BYSETPOS": {
+			rrule:   "FREQ=YEARLY;" + dense,
+			exceeds: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := recurringTestComponent(tt.rrule)
+
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			exceeds, valid := RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances)
+			runtime.ReadMemStats(&after)
+
+			if !valid {
+				t.Fatal("RecurrenceSetExceedsLimit() valid = false")
+			}
+			if exceeds != tt.exceeds {
+				t.Fatalf("RecurrenceSetExceedsLimit() exceeds = %t, want %t", exceeds, tt.exceeds)
+			}
+			// Generous next to the 8.7 GiB the materializing generator took, and
+			// far below any figure that could be reached by holding a period.
+			const allocationBudget = 64 << 20
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > allocationBudget {
+				t.Fatalf("allocated %d bytes, want at most %d: the period is being materialized", allocated, allocationBudget)
+			}
+		})
+	}
+}
+
+// Streaming the period replaced a sort over the whole of it, so the order and
+// the selection have to be what that sort produced -- including for a rule
+// whose days are generated out of order.
+func TestRecurrenceInstancesAppliesBySetPosOverTheWholePeriod(t *testing.T) {
+	tests := map[string]struct {
+		rrule string
+		want  []string
+	}{
+		"first of the month": {
+			rrule: "FREQ=MONTHLY;BYMONTHDAY=15,1;BYSETPOS=1;COUNT=3",
+			want:  []string{"20240101T000000Z", "20240201T000000Z", "20240301T000000Z"},
+		},
+		"last of the month": {
+			rrule: "FREQ=MONTHLY;BYMONTHDAY=15,1;BYSETPOS=-1;COUNT=3",
+			want:  []string{"20240115T000000Z", "20240215T000000Z", "20240315T000000Z"},
+		},
+		"both ends": {
+			rrule: "FREQ=MONTHLY;BYMONTHDAY=15,1;BYSETPOS=1,-1;COUNT=4",
+			want:  []string{"20240101T000000Z", "20240115T000000Z", "20240201T000000Z", "20240215T000000Z"},
+		},
+		"position past the end of the period": {
+			rrule: "FREQ=MONTHLY;BYMONTHDAY=15,1;BYSETPOS=3;COUNT=2",
+			want:  nil,
+		},
+		"last weekday of the month": {
+			rrule: "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=3",
+			want:  []string{"20240131T000000Z", "20240229T000000Z", "20240329T000000Z"},
+		},
+		"day list out of order without BYSETPOS": {
+			rrule: "FREQ=MONTHLY;BYMONTHDAY=15,1;COUNT=4",
+			want:  []string{"20240101T000000Z", "20240115T000000Z", "20240201T000000Z", "20240215T000000Z"},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+			instances := RecurrenceInstances(recurringTestComponent(tt.rrule), "VEVENT", dtstart, time.Hour,
+				dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+
+			var got []string
+			for _, instance := range instances {
+				got = append(got, instance.Start.UTC().Format("20060102T150405Z"))
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("starts = %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("starts = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// A VTIMEZONE observance is resolved through LatestRecurrenceOnOrBefore, so an
+// answer it cannot complete has to say so: the offset picked from a half-generated
+// period is the wrong one, and the caller cannot tell it apart from the right one.
+func TestLatestRecurrenceOnOrBeforeReportsAnIncompletePeriod(t *testing.T) {
+	dense := ";BYMONTH=1,2,3,4,5,6;BYMONTHDAY=" + rangeInts(1, 31) +
+		";BYHOUR=" + enumeratedInts(24) + ";BYMINUTE=" + enumeratedInts(60) + ";BYSECOND=" + enumeratedInts(60)
+	dtstart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := map[string]struct {
+		rrule    string
+		dtstart  time.Time
+		before   time.Time
+		complete bool
+		found    bool
+		want     string
+	}{
+		// The shape every real VTIMEZONE observance has.
+		"ordinary observance rule": {
+			rrule:    "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+			dtstart:  time.Date(2007, 3, 11, 2, 0, 0, 0, time.UTC),
+			before:   time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			complete: true,
+			found:    true,
+			want:     "20260308T020000Z",
+		},
+		// Generating the period exhausts the work bound partway through, so the
+		// maximum reached is not the period's maximum.
+		"period too large to generate": {
+			rrule: "FREQ=YEARLY" + dense, dtstart: dtstart, before: before,
+			complete: false,
+		},
+		// BYSETPOS resolves only once the period ends, so an abandoned period
+		// selects nothing at all -- not even a partial answer.
+		"period too large to generate with BYSETPOS": {
+			rrule: "FREQ=YEARLY;BYSETPOS=-1" + dense, dtstart: dtstart, before: before,
+			complete: false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			latest, found, complete := LatestRecurrenceOnOrBefore(tt.dtstart, tt.before, tt.rrule)
+			if complete != tt.complete {
+				t.Fatalf("complete = %t, want %t", complete, tt.complete)
+			}
+			if !tt.complete {
+				return
+			}
+			if found != tt.found {
+				t.Fatalf("found = %t, want %t", found, tt.found)
+			}
+			if got := latest.UTC().Format("20060102T150405Z"); found && got != tt.want {
+				t.Fatalf("latest = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// rangeInts spells out an inclusive range, the compact way a rule names every day
+// of a month.
+func rangeInts(lo, hi int) string {
+	parts := make([]string, 0, hi-lo+1)
+	for i := lo; i <= hi; i++ {
+		parts = append(parts, strconv.Itoa(i))
+	}
+	return strings.Join(parts, ",")
+}
+
+// Chile's 2024-09-08 00:00 DST gap normalizes weeklyDays' Sunday entry
+// backwards onto 2024-09-07, the same calendar date as its Saturday entry. The
+// day list has to collapse those into one date rather than keep both instants,
+// or the date's whole candidate set is produced twice.
+func TestVisitRecurrenceCandidatesDedupesDayListByCalendarDate(t *testing.T) {
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23", loc, nil)
+	if !ok {
+		t.Fatal("parseRecurrenceRule() ok = false")
+	}
+	dtstart := time.Date(2024, 9, 2, 0, 30, 0, 0, loc)
+	periodStart := recurrencePeriodStart(dtstart, rule)
+
+	var got []time.Time
+	visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
+		got = append(got, current)
+		return false
+	})
+
+	want := []time.Time{
+		time.Date(2024, 9, 7, 0, 30, 0, 0, loc),
+		time.Date(2024, 9, 7, 23, 30, 0, 0, loc),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("candidates = %v, want %v", got, want)
+		}
+	}
+}
+
+// The same Chilean DST gap, this time with BYSETPOS applied. The period holds
+// exactly two real candidates once the day list is deduplicated by date; a
+// stream that still offers each of them twice breaks both the position count
+// (BYSETPOS=3 should select nothing) and the ascending order BYSETPOS relies on.
+func TestVisitRecurrenceCandidatesBySetPosOverDeduplicatedDayList(t *testing.T) {
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	dtstart := time.Date(2024, 9, 2, 0, 30, 0, 0, loc)
+	first := time.Date(2024, 9, 7, 0, 30, 0, 0, loc)
+	last := time.Date(2024, 9, 7, 23, 30, 0, 0, loc)
+
+	tests := map[string]struct {
+		bysetpos string
+		want     []time.Time
+	}{
+		"first of the two real candidates": {bysetpos: "1", want: []time.Time{first}},
+		"last of the two real candidates":  {bysetpos: "-1", want: []time.Time{last}},
+		"position past the real count":     {bysetpos: "3", want: nil},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23;BYSETPOS="+tt.bysetpos, loc, nil)
+			if !ok {
+				t.Fatal("parseRecurrenceRule() ok = false")
+			}
+			periodStart := recurrencePeriodStart(dtstart, rule)
+
+			var got []time.Time
+			visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
+				got = append(got, current)
+				return false
+			})
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("candidates = %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if !got[i].Equal(tt.want[i]) {
+					t.Fatalf("candidates = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// finishSparseRecurrence's DAILY branch discards visitRecurrenceCandidates'
+// overBudget flag. A single real day can never trip recurrencePeriodWorkLimit
+// (24 hours * 60 minutes * 61 BYSECOND values tops out at 87,840), but a rule
+// built by hand rather than through parseRecurrenceRule can, and the caller
+// must fail closed exactly like every other visitRecurrenceCandidates caller
+// rather than silently treating the day as producing nothing.
+func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
+	dtstart := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2030, 12, 31, 23, 59, 59, 0, time.UTC)
+
+	hours := make([]int, 200)
+	for i := range hours {
+		hours[i] = i % 24
+	}
+	minutes := make([]int, 600)
+	for i := range minutes {
+		minutes[i] = i % 60
+	}
+	rule := recurrenceRule{
+		Freq:     "DAILY",
+		Interval: 1,
+		Until:    &until,
+		ByHour:   hours,
+		ByMinute: minutes,
+	}
+
+	occurrences := 0
+	exceeds, handled := finishSparseRecurrence(dtstart, dtstart, rule, &occurrences, func(time.Time) bool {
+		return false
+	})
+	if !handled || !exceeds {
+		t.Fatalf("finishSparseRecurrence() = (exceeds=%t, handled=%t), want (true, true) when a day's clock combinations exceed recurrencePeriodWorkLimit", exceeds, handled)
 	}
 }

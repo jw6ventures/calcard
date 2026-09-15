@@ -413,20 +413,33 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	periodStart := recurrencePeriodStart(dtstart, rule)
 	occurrences := 0
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-		for _, current := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+		bounded, exceeded := false, false
+		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
 			if current.Before(dtstart) {
-				continue
+				return false
 			}
 			if rule.Until != nil && current.After(*rule.Until) {
-				return len(instances) > limit, true
+				bounded = true
+				return true
 			}
 			occurrences++
 			if rule.Count > 0 && occurrences > rule.Count {
-				return len(instances) > limit, true
+				bounded = true
+				return true
 			}
 			if add(current) {
-				return true, true
+				exceeded = true
+				return true
 			}
+			return false
+		})
+		// A period too large to generate is a period too large to be inside the
+		// advertised instance limit, so it answers the question on its own.
+		if overBudget || exceeded {
+			return true, true
+		}
+		if bounded {
+			return len(instances) > limit, true
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
 		if !next.After(periodStart) {
@@ -690,18 +703,28 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 				if day.Before(periodStart) || !dailyRecurrencePeriodAligned(day, dtstart, rule.Interval) {
 					continue
 				}
-				for _, current := range recurrenceCandidatesForPeriod(day, dtstart, rule) {
+				stopped, overBudget := visitRecurrenceCandidates(day, dtstart, rule, func(current time.Time) bool {
 					if current.Before(dtstart) {
-						continue
+						return false
 					}
-					if addCandidate(current) {
-						return exceeds, complete
-					}
+					return addCandidate(current)
+				})
+				// A day over budget leaves its candidates only partly visited, so
+				// it is failed closed rather than treated as producing none, the
+				// same way every other visitRecurrenceCandidates caller handles it.
+				if overBudget {
+					return true, true
+				}
+				if stopped {
+					return exceeds, complete
 				}
 				continue
 			}
 
-			if visitSparseSubDailyPeriods(day, periodStart, dtstart, until, rule, &remainingWork, addCandidate) {
+			if stop, overBudget := visitSparseSubDailyPeriods(day, periodStart, dtstart, until, rule, &remainingWork, addCandidate); stop {
+				if overBudget {
+					return true, true
+				}
 				if remainingWork <= 0 {
 					return true, true
 				}
@@ -712,10 +735,10 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 	return false, true
 }
 
-func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule recurrenceRule, remainingWork *int, add func(time.Time) bool) bool {
+func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule recurrenceRule, remainingWork *int, add func(time.Time) bool) (stop, overBudget bool) {
 	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
 	if !ok {
-		return false
+		return false, false
 	}
 	base := recurrencePeriodStart(dtstart, rule)
 	dayEnd := day.AddDate(0, 0, 1)
@@ -735,23 +758,27 @@ func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule
 	for periodUnix := firstUnix; periodUnix < lastUnix; {
 		(*remainingWork)--
 		if *remainingWork <= 0 {
-			return true
+			return true, false
 		}
 		period := time.Unix(periodUnix, 0).In(day.Location())
-		for _, current := range recurrenceCandidatesForPeriod(period, dtstart, rule) {
+		stopped, periodOverBudget := visitRecurrenceCandidates(period, dtstart, rule, func(current time.Time) bool {
 			if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
-				continue
+				return false
 			}
-			if add(current) {
-				return true
-			}
+			return add(current)
+		})
+		if periodOverBudget {
+			return true, true
+		}
+		if stopped {
+			return true, false
 		}
 		if periodUnix > int64(^uint64(0)>>1)-stepSeconds {
 			break
 		}
 		periodUnix += stepSeconds
 	}
-	return false
+	return false, false
 }
 
 func dailyRecurrencePeriodAligned(day, dtstart time.Time, interval int) bool {
@@ -804,10 +831,19 @@ func recurrenceInstantKey(value time.Time) string {
 // LatestRecurrenceOnOrBefore returns the latest generated recurrence start at
 // or before the supplied wall-clock value. It is used to apply the observance
 // rules in a submitted VTIMEZONE definition.
-func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool) {
+//
+// found reports that such a start exists. complete reports that the search
+// reached the end of what the rule describes; it is false when a period was too
+// large to generate within recurrencePeriodWorkLimit, or when either scan bound
+// ran out. A latest returned alongside complete == false is at best the maximum
+// over the part that was searched, which is not the rule's, so the caller has to
+// refuse the value rather than apply it -- an observance chosen from a
+// half-generated period names the wrong UTC offset, and nothing downstream can
+// tell.
+func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
 	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
 	if !ok || before.Before(dtstart) {
-		return time.Time{}, false
+		return time.Time{}, false, true
 	}
 	threshold := before
 	if rule.Until != nil && rule.Until.Before(threshold) {
@@ -818,51 +854,70 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (time.T
 		periodStart = fastForwardRecurrencePeriod(periodStart, threshold, rule)
 	}
 
-	var latest time.Time
 	occurrences := 0
 	if rule.Count > 0 {
 		periodStart = recurrencePeriodStart(dtstart, rule)
 		for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-			for _, candidate := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+			done := false
+			_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
 				if candidate.Before(dtstart) {
-					continue
+					return false
 				}
 				if rule.Until != nil && candidate.After(*rule.Until) {
-					return latest, !latest.IsZero()
+					done = true
+					return true
 				}
 				occurrences++
 				if occurrences > rule.Count || candidate.After(before) {
-					return latest, !latest.IsZero()
+					done = true
+					return true
 				}
 				latest = candidate
+				return false
+			})
+			if overBudget {
+				return latest, !latest.IsZero(), false
+			}
+			if done {
+				return latest, !latest.IsZero(), true
 			}
 			periodStart = advanceRecurrencePeriod(periodStart, rule)
 		}
-		return latest, !latest.IsZero()
+		// The scan bound ran out with the rule still generating, so what was
+		// reached is not the end of it.
+		return latest, !latest.IsZero(), false
 	}
 
 	for scanned := 0; scanned < 1000; scanned++ {
-		for _, candidate := range recurrenceCandidatesForPeriod(periodStart, dtstart, rule) {
+		// The whole period is wanted here, so a period too large to generate
+		// leaves no usable answer: without BYSETPOS the maximum reached is only
+		// the maximum of the days that were generated, and with it nothing is
+		// selected at all, because BYSETPOS resolves only once the period ends.
+		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
 			if candidate.Before(dtstart) || candidate.After(before) {
-				continue
+				return false
 			}
 			if rule.Until != nil && candidate.After(*rule.Until) {
-				continue
+				return false
 			}
 			if latest.IsZero() || candidate.After(latest) {
 				latest = candidate
 			}
+			return false
+		})
+		if overBudget {
+			return latest, !latest.IsZero(), false
 		}
 		if !latest.IsZero() {
-			return latest, true
+			return latest, true, true
 		}
 		previous := retreatRecurrencePeriod(periodStart, rule)
 		if !previous.Before(periodStart) || previous.Before(dtstart) {
-			break
+			return time.Time{}, false, true
 		}
 		periodStart = previous
 	}
-	return time.Time{}, false
+	return time.Time{}, false, false
 }
 
 func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
@@ -923,21 +978,23 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		occurrences = skipped
 	}
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-		candidates := recurrenceCandidatesForPeriod(periodStart, recurrenceStart, rule)
-		for _, current := range candidates {
+		done := false
+		_, overBudget := visitRecurrenceCandidates(periodStart, recurrenceStart, rule, func(current time.Time) bool {
 			if current.Before(recurrenceStart) {
-				continue
+				return false
 			}
 			resolvedCurrent, resolved := resolveCandidate(current)
 			if !resolved {
-				continue
+				return false
 			}
 			if rule.Until != nil && resolvedCurrent.After(*rule.Until) {
-				return periods, true
+				done = true
+				return true
 			}
 			occurrences++
 			if rule.Count > 0 && occurrences > rule.Count {
-				return periods, true
+				done = true
+				return true
 			}
 			period := BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
 			// resolvedCurrent is the slot the rule generated; the shared
@@ -946,8 +1003,16 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 				periods = append(periods, recurrenceOccurrence{recurrenceID: resolvedCurrent, original: period, period: period})
 			}
 			if len(periods) >= expansion.maxInstances {
-				return periods, true
+				done = true
+				return true
 			}
+			return false
+		})
+		// Reads answer with what they reached. A period too large to generate is
+		// far past the instance cap this expansion is already bounded by, and
+		// PUT validation refuses to store one.
+		if done || overBudget {
+			return periods, true
 		}
 
 		next := advanceRecurrencePeriod(periodStart, rule)
@@ -1812,50 +1877,223 @@ func advanceRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 	}
 }
 
-func recurrenceCandidatesForPeriod(periodStart, dtstart time.Time, rule recurrenceRule) []time.Time {
-	hours := defaultedInts(rule.ByHour, dtstart.Hour())
-	minutes := defaultedInts(rule.ByMinute, dtstart.Minute())
-	seconds := defaultedInts(rule.BySecond, dtstart.Second())
-	var candidates []time.Time
-	addTimesForDay := func(day time.Time) {
-		if !dateMatchesRule(day, rule) {
-			return
-		}
-		for _, hour := range hours {
-			for _, minute := range minutes {
-				for _, second := range seconds {
-					candidates = appendValidTime(candidates, day.Year(), day.Month(), day.Day(), hour, minute, second, day.Location())
-				}
-			}
-		}
-	}
+// recurrencePeriodWorkLimit bounds the date/time combinations one recurrence
+// period may generate.
+//
+// A period's candidate set is the product of its days and its BYHOUR, BYMINUTE
+// and BYSECOND lists, so a yearly rule naming every day, hour, minute and
+// second describes about 31.5 million of them. Generating that set to answer a
+// question about its first thousand entries is work no answer needs, and the
+// PUT validation path reaches it. Exhausting the bound fails closed on
+// max-instances, as sparseRecurrenceWorkLimit does: a period this large is over
+// any instance limit the server advertises.
+//
+// One day cannot exceed the bound on its own -- 24 hours, 60 minutes and the 61
+// second values BYSECOND admits come to 87,840 -- so a rule is only ever refused
+// for spanning several such days. The sparse path is therefore always inside the
+// bound: it generates a DAILY period, which is one day, or a sub-daily one, which
+// is at most an hour.
+const recurrencePeriodWorkLimit = 100_000
+
+// visitRecurrenceCandidates hands visit each of the period's candidate starts in
+// ascending order, stopping as soon as visit returns true. Candidates are
+// streamed rather than collected so a caller that needs the first few -- every
+// caller with a COUNT, an UNTIL or an instance limit -- pays for the first few.
+//
+// stopped reports that visit asked to stop. overBudget reports that the period
+// exceeded recurrencePeriodWorkLimit, which leaves the candidate set only
+// partly visited and is never a set the caller may treat as complete.
+func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRule, visit func(time.Time) bool) (stopped, overBudget bool) {
+	selector := newBySetPosSelector(rule.BySetPos, visit)
 
 	switch rule.Freq {
 	case "SECONDLY", "MINUTELY", "HOURLY":
-		candidates = subDailyCandidatesForPeriod(periodStart, dtstart, rule)
-	case "DAILY":
-		addTimesForDay(periodStart)
-	case "WEEKLY":
-		days := weeklyDays(periodStart, dtstart, rule)
-		for _, day := range days {
-			addTimesForDay(day)
+		// At most one hour of minutes and seconds, so the whole period is
+		// already small enough to hold.
+		candidates := subDailyCandidatesForPeriod(periodStart, dtstart, rule)
+		sortTimes(candidates)
+		for _, candidate := range uniqueTimes(candidates) {
+			if selector.offer(candidate) {
+				return true, false
+			}
+			if selector.exhausted() {
+				break
+			}
 		}
-	case "MONTHLY":
-		for _, day := range monthlyDays(periodStart.Year(), periodStart.Month(), dtstart, rule) {
-			addTimesForDay(day)
-		}
-	case "YEARLY":
-		for _, day := range yearlyDays(periodStart.Year(), dtstart, rule) {
-			addTimesForDay(day)
-		}
+		return selector.finish(), false
 	}
 
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Before(candidates[j]) })
-	candidates = uniqueTimes(candidates)
-	if len(rule.BySetPos) > 0 {
-		candidates = applyBySetPos(candidates, rule.BySetPos)
+	var days []time.Time
+	switch rule.Freq {
+	case "DAILY":
+		days = []time.Time{periodStart}
+	case "WEEKLY":
+		days = weeklyDays(periodStart, dtstart, rule)
+	case "MONTHLY":
+		days = monthlyDays(periodStart.Year(), periodStart.Month(), dtstart, rule)
+	case "YEARLY":
+		days = yearlyDays(periodStart.Year(), dtstart, rule)
+	default:
+		return false, false
 	}
-	return candidates
+	// The day list is bounded by the length of the period, so ordering it here
+	// is what lets the times below stream out already sorted. It is deduplicated
+	// by calendar date rather than by instant: a DST transition can land two
+	// day-list entries on the same date at different instants (e.g. a gap that
+	// normalizes one entry onto the previous day), and generating that date's
+	// times twice would break both the ascending stream and BYSETPOS's count.
+	sortTimes(days)
+	days = uniqueDates(days)
+
+	hours := defaultedInts(rule.ByHour, dtstart.Hour())
+	minutes := defaultedInts(rule.ByMinute, dtstart.Minute())
+	seconds := defaultedInts(rule.BySecond, dtstart.Second())
+	perDay := len(hours) * len(minutes) * len(seconds)
+
+	budget := recurrencePeriodWorkLimit
+	dayTimes := make([]time.Time, 0, perDay)
+	for _, day := range days {
+		if !dateMatchesRule(day, rule) {
+			continue
+		}
+		if perDay > budget {
+			return false, true
+		}
+		budget -= perDay
+
+		// A day is sorted rather than assumed ordered: a UTC offset change can
+		// reorder one day's wall-clock times against each other, and never
+		// reaches across the day boundary the outer loop steps over.
+		dayTimes = dayTimes[:0]
+		for _, hour := range hours {
+			for _, minute := range minutes {
+				for _, second := range seconds {
+					dayTimes = appendValidTime(dayTimes, day.Year(), day.Month(), day.Day(), hour, minute, second, day.Location())
+				}
+			}
+		}
+		sortTimes(dayTimes)
+		for _, candidate := range uniqueTimes(dayTimes) {
+			if selector.offer(candidate) {
+				return true, false
+			}
+			if selector.exhausted() {
+				return selector.finish(), false
+			}
+		}
+	}
+	return selector.finish(), false
+}
+
+// bySetPosSelector applies BYSETPOS to a streamed period.
+//
+// Without BYSETPOS it is a pass-through. With it, RFC 5545 section 3.3.10
+// numbers positions within the period, so a positive one is known as it streams
+// past and a negative one needs only the tail: the selector holds
+// max(|negative position|) candidates, never the period. Once the largest
+// positive position has gone by and no negative position is waiting on the
+// tail, nothing further can be selected and the period stops early.
+type bySetPosSelector struct {
+	positions []int
+	visit     func(time.Time) bool
+
+	seen      int
+	maxPos    int
+	tail      []time.Time
+	tailStart int
+	selected  []time.Time
+	// lastOffered is how the ascending stream is made unique without holding
+	// what came before it: a repeat can only ever be the value just seen.
+	lastOffered time.Time
+	offered     bool
+}
+
+func newBySetPosSelector(positions []int, visit func(time.Time) bool) *bySetPosSelector {
+	selector := &bySetPosSelector{positions: positions, visit: visit}
+	if len(positions) == 0 {
+		return selector
+	}
+	tailLen := 0
+	for _, position := range positions {
+		switch {
+		case position > 0 && position > selector.maxPos:
+			selector.maxPos = position
+		case position < 0 && -position > tailLen:
+			tailLen = -position
+		}
+	}
+	if tailLen > 0 {
+		selector.tail = make([]time.Time, tailLen)
+	}
+	return selector
+}
+
+// offer takes the next candidate of the period in ascending order and reports
+// whether the caller asked to stop.
+func (s *bySetPosSelector) offer(candidate time.Time) bool {
+	if s.offered && candidate.Equal(s.lastOffered) {
+		return false
+	}
+	s.lastOffered = candidate
+	s.offered = true
+	if len(s.positions) == 0 {
+		return s.visit(candidate)
+	}
+	s.seen++
+	if s.seen <= s.maxPos {
+		for _, position := range s.positions {
+			if position == s.seen {
+				s.selected = append(s.selected, candidate)
+				break
+			}
+		}
+	}
+	if len(s.tail) > 0 {
+		s.tail[s.tailStart] = candidate
+		s.tailStart = (s.tailStart + 1) % len(s.tail)
+	}
+	return false
+}
+
+// finish selects the negative positions, which only the end of the period
+// resolves, and hands the whole selection over in ascending order.
+func (s *bySetPosSelector) finish() bool {
+	if len(s.positions) == 0 {
+		return false
+	}
+	for _, position := range s.positions {
+		if position >= 0 {
+			continue
+		}
+		// -1 names the period's last candidate, which is the slot before the
+		// ring's next write. A position naming more than the period produced, or
+		// more than the ring holds, selects nothing.
+		offset := -position
+		if offset > s.seen || offset > len(s.tail) {
+			continue
+		}
+		s.selected = append(s.selected, s.tail[(s.tailStart-offset+2*len(s.tail))%len(s.tail)])
+	}
+	sortTimes(s.selected)
+	for _, candidate := range uniqueTimes(s.selected) {
+		if s.visit(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// exhausted reports that nothing the period has left to offer can be selected,
+// so the caller may stop generating it.
+func (s *bySetPosSelector) exhausted() bool {
+	return len(s.positions) > 0 && len(s.tail) == 0 && s.seen >= s.maxPos
+}
+
+func sortTimes(values []time.Time) {
+	if len(values) < 2 {
+		return
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Before(values[j]) })
 }
 
 func subDailyCandidatesForPeriod(periodStart, dtstart time.Time, rule recurrenceRule) []time.Time {
@@ -2073,7 +2311,7 @@ func daysByWeekNoInYear(year int, weekNumbers []int, wkst time.Weekday, loc *tim
 			days = append(days, weekStart.AddDate(0, 0, day))
 		}
 	}
-	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
+	sortTimes(days)
 	return uniqueTimes(days)
 }
 
@@ -2222,24 +2460,6 @@ func weekdayMatchesForRule(day time.Time, rule recurrenceRule) bool {
 	return weekdayMatches(day, rule.ByDay)
 }
 
-func applyBySetPos(candidates []time.Time, positions []int) []time.Time {
-	var selected []time.Time
-	for _, pos := range positions {
-		idx := pos
-		if idx > 0 {
-			idx--
-		} else {
-			idx = len(candidates) + idx
-		}
-		if idx < 0 || idx >= len(candidates) {
-			continue
-		}
-		selected = append(selected, candidates[idx])
-	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Before(selected[j]) })
-	return uniqueTimes(selected)
-}
-
 func uniqueTimes(values []time.Time) []time.Time {
 	if len(values) < 2 {
 		return values
@@ -2247,6 +2467,23 @@ func uniqueTimes(values []time.Time) []time.Time {
 	unique := values[:1]
 	for _, value := range values[1:] {
 		if value.Equal(unique[len(unique)-1]) {
+			continue
+		}
+		unique = append(unique, value)
+	}
+	return unique
+}
+
+// uniqueDates compacts a sorted slice down to one entry per calendar date. A
+// DST transition can map two different instants onto the same date, and
+// uniqueTimes' instant comparison would keep both.
+func uniqueDates(values []time.Time) []time.Time {
+	if len(values) < 2 {
+		return values
+	}
+	unique := values[:1]
+	for _, value := range values[1:] {
+		if sameDate(value, unique[len(unique)-1]) {
 			continue
 		}
 		unique = append(unique, value)

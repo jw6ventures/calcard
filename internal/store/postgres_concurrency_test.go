@@ -27,6 +27,21 @@ const postgresDSNEnv = "CALCARD_TEST_POSTGRES_DSN"
 // database as it found it and two runs cannot collide.
 func newPostgresStore(t *testing.T) *Store {
 	t.Helper()
+	return New(newPostgresPool(t))
+}
+
+// newPostgresPool is newPostgresStore's schema setup, handed back as the pool
+// itself for the tests that run schema statements rather than repository calls.
+func newPostgresPool(t *testing.T) *sql.DB {
+	t.Helper()
+	return newPostgresSchemaPool(t, filepath.Join("..", "..", "db.sql"))
+}
+
+// newPostgresSchemaPool builds the pool over the named schema file. Upgrade tests
+// pass a baseline an earlier release shipped, which is the schema a migration
+// actually meets.
+func newPostgresSchemaPool(t *testing.T, schemaPath string) *sql.DB {
+	t.Helper()
 	dsn := os.Getenv(postgresDSNEnv)
 	if dsn == "" {
 		t.Skipf("%s is unset; set it to a PostgreSQL connection string to run the concurrency tests", postgresDSNEnv)
@@ -59,14 +74,14 @@ func newPostgresStore(t *testing.T) *Store {
 		admin.Close()
 	})
 
-	schemaSQL, err := os.ReadFile(filepath.Join("..", "..", "db.sql"))
+	schemaSQL, err := os.ReadFile(schemaPath)
 	if err != nil {
-		t.Fatalf("read db.sql: %v", err)
+		t.Fatalf("read %s: %v", schemaPath, err)
 	}
 	if _, err := pool.Exec(string(schemaSQL)); err != nil {
-		t.Fatalf("apply db.sql: %v", err)
+		t.Fatalf("apply %s: %v", schemaPath, err)
 	}
-	return New(pool)
+	return pool
 }
 
 func withSearchPath(t *testing.T, dsn, schema string) string {
