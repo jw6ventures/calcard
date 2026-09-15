@@ -30,6 +30,9 @@ data:
   {{- if hasKey . "propfindInfinityEnabled" }}
   APP_DAV_PROPFIND_INFINITY_ENABLED: {{ .propfindInfinityEnabled | quote }}
   {{- end }}
+  {{- if hasKey . "digestEnabled" }}
+  APP_DAV_DIGEST_ENABLED: {{ .digestEnabled | quote }}
+  {{- end }}
   {{- if hasKey . "maxMultistatusResponses" }}
   APP_DAV_MAX_MULTISTATUS_RESPONSES: {{ .maxMultistatusResponses | quote }}
   {{- end }}

@@ -128,9 +128,11 @@ Environment variables:
 - Sign in to the web UI
 - Generate an app-password to use in your DAV client
 - Start service discovery from the DAV root at `<base-url>/dav` (recommended) or from the collection homes at `/dav/calendars/` and `/dav/addressbooks/`. Calendar collections live at `/dav/calendars/<calendar-id>/` (numeric IDs are visible in the web UI and PROPFIND responses).
-- Authenticate with HTTP Basic over HTTPS, or HTTP Digest (SHA-256 or MD5), using your **primary email address** as the username and the generated **App Password** as the password. Other identifiers (display names, OAuth subject, etc.) are not accepted.
+- Authenticate with HTTP Basic over HTTPS, or HTTP Digest (SHA-256 or MD5) where the server offers it, using your **primary email address** as the username and the generated **App Password** as the password. Other identifiers (display names, OAuth subject, etc.) are not accepted.
 - When TLS terminates at a reverse proxy, forward `X-Forwarded-Proto: https` and include the proxy's peer address or CIDR in `APP_TRUSTED_PROXIES`. Basic authentication is rejected when CalCard cannot verify that the request used HTTPS.
-- App passwords created before Digest support remain valid for Basic over HTTPS. Their bcrypt hashes cannot be converted into Digest credentials. Correcting proxy forwarding restores Basic access without replacing passwords; create a new app password if the client requires Digest. Keep `APP_SESSION_SECRET` stable because it protects stored Digest credentials.
+- Digest is off by default and is enabled with `APP_DAV_DIGEST_ENABLED=true`. Digest verifies against a stored HA1, which an app password issued before Digest support does not have, so a server that offered Digest unconditionally would answer such a password with 401 whenever the client selected that scheme. Leaving it off keeps every existing client working across the upgrade.
+- App passwords gain their Digest credentials when they are issued, or the first time they authenticate over Basic over HTTPS -- a bcrypt hash cannot be converted into one, but a successful Basic authentication supplies the password itself. `/app-passwords` marks each one **Digest ready** or **Basic only**, so you can turn `APP_DAV_DIGEST_ENABLED` on once your credentials have caught up. Keep `APP_SESSION_SECRET` stable, because it protects stored Digest credentials; without it configured, app passwords stay Basic-only.
+- Correcting proxy forwarding restores Basic access without replacing passwords.
 - Create and manage App Passwords from the web UI at `/app-passwords` after signing in through OAuth. Passwords can be revoked at any time; make sure the one you use is not expired or revoked.
 
 ## Health probes

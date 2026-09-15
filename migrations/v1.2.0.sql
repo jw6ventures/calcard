@@ -204,4 +204,49 @@ CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset ON events (
 DROP INDEX IF EXISTS idx_contacts_book_keyset;
 CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified);
 
+-- Repair the recurrence bounds v1.1.7 did not backfill.
+--
+-- That backfill recognised RRULE and RDATE only, but a resource made solely of
+-- detached instances -- RECURRENCE-ID components with neither property anywhere
+-- -- is recurring too: ical.ConservativeRecurrenceBounds counts a
+-- RECURRENCE-ID, so every write since has stored bounds for one. The rows the
+-- backfill skipped kept NULL bounds, and the candidate filter then COALESCEs to
+-- the first component's dtstart/dtend and drops the resource before the
+-- recurrence matcher can look at the other instances.
+--
+-- The repair lives here rather than in v1.1.7, which has shipped and is left
+-- exactly as it ran. This covers every path into this release: a database at
+-- v1.1.7 or later never executes that file again, because the runner applies a
+-- migration only when its version is above the database's; and one still below
+-- it runs that file first, since migrations are applied in ascending version
+-- order, so this block repairs what it just missed.
+--
+-- Scoped to rows that still have a NULL bound, so a precise value written by a
+-- later PUT is never replaced by a sentinel, and the whole block can be run
+-- again. The sentinels match ical.RecurrenceStartSentinel and
+-- ical.RecurrenceUntilSentinel: deliberately open-ended, so a repaired row is a
+-- candidate for every range and the in-memory RFC 4791 Section 9.9 pass makes
+-- the decision.
+UPDATE events
+    SET recurrence_start = COALESCE(recurrence_start, '1900-01-01T00:00:00Z'),
+        recurrence_until = COALESCE(recurrence_until, '9999-12-31T23:59:59Z')
+    WHERE (recurrence_start IS NULL OR recurrence_until IS NULL)
+      AND (
+          EXISTS (
+              SELECT 1
+              FROM regexp_matches(events.raw_ical, $re$BEGIN:VEVENT([[:space:][:print:]]*?)END:VEVENT$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM regexp_matches(events.raw_ical, $re$BEGIN:VTODO([[:space:][:print:]]*?)END:VTODO$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM regexp_matches(events.raw_ical, $re$BEGIN:VJOURNAL([[:space:][:print:]]*?)END:VJOURNAL$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+          )
+      );
+
 UPDATE application SET value = 'v1.2.0' WHERE key = 'version';

@@ -2687,3 +2687,41 @@ func TestDigestNonceRepoConsumeReturnsTheStoreError(t *testing.T) {
 		t.Fatal("Consume() claimed the count despite the store failing")
 	}
 }
+
+// A calendar collection accepts only the component types its
+// CALDAV:supported-calendar-component-set names, and a collection that set none
+// of its own falls back to the server default RFC 4791 Section 5.2.3 makes the
+// meaning of an absent property. The rule lives on the model because both the
+// DAV handlers and the UI write into these collections and have to apply the
+// same one.
+func TestCalendarAcceptsComponent(t *testing.T) {
+	tests := []struct {
+		name      string
+		supported []string
+		component string
+		want      bool
+	}{
+		{name: "no restriction accepts the default set", supported: nil, component: "VEVENT", want: true},
+		{name: "no restriction accepts VTODO", supported: nil, component: "VTODO", want: true},
+		{name: "no restriction accepts VJOURNAL", supported: nil, component: "VJOURNAL", want: true},
+		{name: "no restriction accepts VFREEBUSY", supported: nil, component: "VFREEBUSY", want: true},
+		// VTIMEZONE is outside the default set: Section 5.2.3 admits it only
+		// from a server that stores VTIMEZONE-only object resources.
+		{name: "no restriction refuses VTIMEZONE", supported: nil, component: "VTIMEZONE", want: false},
+		{name: "a restriction admits what it names", supported: []string{"VTODO"}, component: "VTODO", want: true},
+		{name: "a restriction refuses what it omits", supported: []string{"VTODO"}, component: "VEVENT", want: false},
+		{name: "component names are case-insensitive", supported: []string{"VTODO"}, component: "vtodo", want: true},
+		// An explicitly empty set is a restriction that names nothing, which is
+		// not the same as carrying no restriction at all.
+		{name: "an empty restriction accepts nothing", supported: []string{}, component: "VEVENT", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calendar := Calendar{SupportedComponents: tt.supported}
+			if got := calendar.AcceptsComponent(tt.component); got != tt.want {
+				t.Errorf("AcceptsComponent(%q) with %#v = %v, want %v", tt.component, tt.supported, got, tt.want)
+			}
+		})
+	}
+}

@@ -414,6 +414,21 @@ func decideCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resour
 	return granted, nil
 }
 
+// uiCalendarComponent is the component type every calendar object resource the
+// UI writes carries. The event forms build a VEVENT and nothing else, so the
+// destination's CALDAV:supported-calendar-component-set is judged against it.
+const uiCalendarComponent = "VEVENT"
+
+// calendarAcceptsUIWrite reports whether a collection admits what the UI is
+// about to store in it. RFC 4791 Section 5.2.3 makes
+// CALDAV:supported-calendar-component-set a restriction on the collection's
+// contents, which the DAV PUT path enforces; a UI write that ignored it would
+// leave the collection holding content it advertises it does not accept, and
+// clients reading that property would never ask for it.
+func calendarAcceptsUIWrite(cal *store.CalendarAccess) bool {
+	return cal != nil && cal.AcceptsComponent(uiCalendarComponent)
+}
+
 func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourcePath, privilege string) error {
 	if cal == nil || user == nil {
 		return store.ErrNotFound
@@ -803,10 +818,14 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		metas = append(metas, calendarMeta{
-			ID:        cal.ID,
-			Name:      cal.Name,
+			ID:   cal.ID,
+			Name: cal.Name,
+			// Bind alone does not make a collection somewhere an event may go:
+			// one restricted to VTODO is writable and still refuses it. The
+			// page gates the new-event button and the move destinations on
+			// this, so both have to mean the same thing the handlers enforce.
 			Color:     calendarColor(cal.Calendar.Color, i),
-			CanCreate: canCreate,
+			CanCreate: canCreate && calendarAcceptsUIWrite(&cal),
 		})
 	}
 
@@ -1069,6 +1088,10 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if !calendarAcceptsUIWrite(cal) {
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "this calendar does not accept events"})
+		return
+	}
 
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "invalid form data"})
@@ -1264,6 +1287,10 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	if !calendarAcceptsUIWrite(cal) {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "this calendar does not accept events"})
+		return
+	}
 	ical := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, opts)
 	etag := utils.GenerateETag(ical)
 
@@ -1366,6 +1393,10 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		destinationPath := calendarEventResourcePath(destinationCalendarID, resourceName)
 		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, destinationPath, "bind"); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !calendarAcceptsUIWrite(destinationCalendar) {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar does not accept events"})
 			return
 		}
 

@@ -51,6 +51,15 @@ type Config struct {
 		// refuses them with 403 DAV:propfind-finite-depth, which §9.1.1
 		// permits for deployments where deep listings are a DoS concern.
 		PropfindInfinityEnabled bool
+		// DigestEnabled advertises and accepts HTTP Digest on the DAV
+		// endpoints (RFC 7616). It is off by default because Digest verifies
+		// against a stored HA1, and an app password issued before Digest
+		// existed has none: advertising the scheme to a client that then
+		// selects it would answer a valid credential with 401. An app password
+		// gains its HA1 when it is issued, or the first time it authenticates
+		// over Basic, so a deployment turns this on once its credentials have
+		// caught up.
+		DigestEnabled           bool
 		MaxMultistatusResponses int
 		MaxMultistatusBytes     int
 		// MaxFilterElements bounds how many filter elements one CALDAV:filter or
@@ -171,6 +180,7 @@ func Load() (*Config, error) {
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
 	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
+	cfg.DAV.DigestEnabled = getenvBool("APP_DAV_DIGEST_ENABLED", false)
 	cfg.DAV.MaxMultistatusResponses, err = getenvLimitDefault("APP_DAV_MAX_MULTISTATUS_RESPONSES", 10000)
 	if err != nil {
 		return nil, err

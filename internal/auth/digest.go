@@ -150,18 +150,34 @@ func (s *Service) deriveDigestKey(info string) ([]byte, error) {
 	return hkdf.Key(sha256.New, []byte(s.cfg.Session.Secret), nil, info, 32)
 }
 
+// digestEnabled reports whether this deployment has opted into the DAV Digest
+// scheme. Digest verifies against a stored HA1, which an app password issued
+// before Digest existed does not have, so offering the scheme unconditionally
+// would answer a valid credential with 401 for as long as the client kept
+// selecting it.
+func (s *Service) digestEnabled() bool {
+	return s != nil && s.cfg != nil && s.cfg.DAV.DigestEnabled
+}
+
 func (s *Service) writeDAVAuthChallenge(w http.ResponseWriter, r *http.Request, stale bool) error {
-	nonce, opaque, err := s.newDigestNonce()
-	if err != nil {
-		return err
-	}
-	staleParameter := ""
-	if stale {
-		staleParameter = ", stale=true"
-	}
 	w.Header().Del("WWW-Authenticate")
-	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce=%q, opaque=%q, algorithm=SHA-256, qop="auth"%s`, davDigestRealm, nonce, opaque, staleParameter))
-	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce=%q, opaque=%q, algorithm=MD5, qop="auth"%s`, davDigestRealm, nonce, opaque, staleParameter))
+	if s.digestEnabled() {
+		nonce, opaque, err := s.newDigestNonce()
+		if err != nil {
+			return err
+		}
+		staleParameter := ""
+		if stale {
+			staleParameter = ", stale=true"
+		}
+		w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce=%q, opaque=%q, algorithm=SHA-256, qop="auth"%s`, davDigestRealm, nonce, opaque, staleParameter))
+		w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Digest realm=%q, nonce=%q, opaque=%q, algorithm=MD5, qop="auth"%s`, davDigestRealm, nonce, opaque, staleParameter))
+	}
+	// RFC 4791 Section 11 forbids Basic without TLS, so a cleartext transport
+	// with Digest turned off leaves no scheme this server will honour and the
+	// 401 carries no challenge. RFC 7235 Section 3.1 asks for one, but naming a
+	// scheme that would then be refused is the worse answer, and a deployment
+	// serving DAV over cleartext at all is already misconfigured.
 	if s.secureRequest(r) {
 		w.Header().Add("WWW-Authenticate", `Basic realm="CalCard DAV"`)
 	}

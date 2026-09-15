@@ -982,8 +982,7 @@ func TestFreeBusyPeriodsResolveFloatingValuesThroughTheCollectionTimezone(t *tes
 	// June) it is 15:00Z, and only the latter is the instant §7.3 names.
 	columnStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	columnEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
-	chicago := "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
-		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	chicago := chicagoVTimezone()
 
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -1034,8 +1033,7 @@ func TestFreeBusyPeriodsHonourExDateUnderTheCollectionTimezone(t *testing.T) {
 	}
 	columnStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	columnEnd := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
-	chicago := "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
-		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	chicago := chicagoVTimezone()
 
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -1566,7 +1564,7 @@ func TestBirthdayCalendarQueryResolvesDatesThroughTheRequestTimezone(t *testing.
 		t.Fatalf("without a request timezone the range is outside the UTC day, got %d responses", len(got.Responses))
 	}
 
-	chicago := `<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`
+	chicago := `<C:timezone>` + grammarChicagoVTimezone() + `</C:timezone>`
 	if got := query(chicago); len(got.Responses) != 1 {
 		t.Fatalf("calendar-query responses = %d, want 1; the request timezone was not applied", len(got.Responses))
 	}

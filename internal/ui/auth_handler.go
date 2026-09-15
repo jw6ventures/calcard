@@ -168,6 +168,9 @@ func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A cached credential is served without reading the database, so the
+	// revocation only takes effect once the cache has been told about it.
+	h.authService.InvalidateAppPassword(id)
 
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
 }
@@ -201,6 +204,7 @@ func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to delete app password", http.StatusInternalServerError)
 		return
 	}
+	h.authService.InvalidateAppPassword(id)
 
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
 }
@@ -233,6 +237,11 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 			"status":     status,
 			"revoked":    revoked,
 			"expired":    expired,
+			// Whether this credential can answer a Digest challenge. One issued
+			// before Digest existed cannot until it has authenticated over
+			// Basic once, and a deployment should not turn Digest on before its
+			// credentials have caught up.
+			"digest_ready": p.DigestMD5HA1 != nil && p.DigestSHA256HA1 != nil,
 		})
 	}
 	data := h.withFlash(r, map[string]any{

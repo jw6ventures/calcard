@@ -165,6 +165,7 @@ func convertVCardVersion(raw, target string) (string, bool) {
 
 	lines := ical.UnfoldLines(raw)
 	out := make([]string, 0, len(lines))
+	var formattedName, structuredName string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -181,12 +182,128 @@ func convertVCardVersion(raw, target string) (string, bool) {
 		if !keep {
 			continue
 		}
+		switch strings.ToUpper(vcardPropertyBaseName(converted.name)) {
+		case "FN":
+			if formattedName == "" {
+				formattedName = converted.value
+			}
+		case "N":
+			if structuredName == "" {
+				structuredName = converted.value
+			}
+		}
 		out = append(out, converted.String())
 	}
 	if len(out) == 0 {
 		return "", false
 	}
-	return strings.Join(out, "\r\n") + "\r\n", true
+
+	// Rewriting content lines one at a time cannot produce a property the
+	// source version never had, and the two versions do not require the same
+	// ones. Deriving the missing one is what keeps the conversion a conversion:
+	// refusing instead would hide the resource from the client for good, since
+	// the sync token advances either way and the card is never asked for again.
+	if target == "3.0" && structuredName == "" && formattedName != "" {
+		out = insertBeforeVCardEnd(out, "N:"+structuredNameFromFormatted(formattedName))
+	}
+	if target == "4.0" && formattedName == "" && structuredName != "" {
+		if derived := formattedNameFromStructured(structuredName); derived != "" {
+			out = insertBeforeVCardEnd(out, "FN:"+derived)
+		}
+	}
+
+	converted := strings.Join(out, "\r\n") + "\r\n"
+	if err := validateVCardForVersion(converted, target); err != nil {
+		// Judged against the card that was stored, not against the target
+		// version alone. A card already invalid in its own version is handed
+		// back converted as far as it goes: refusing it would hide the resource
+		// from the client for good, since the sync token advances either way
+		// and the card is never asked for again. A *valid* card that will not
+		// convert is the real
+		// CARDDAV:supported-address-data-conversion precondition, and with the
+		// repairs above nothing should reach it -- which is what makes this
+		// worth checking rather than assuming.
+		if validateVCardForVersion(raw, source) == nil {
+			return "", false
+		}
+	}
+	return converted, true
+}
+
+// insertBeforeVCardEnd puts a derived content line where a property belongs,
+// which is inside the card rather than after it.
+func insertBeforeVCardEnd(lines []string, line string) []string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(lines[i]), "END:VCARD") {
+			return append(lines[:i:i], append([]string{line}, lines[i:]...)...)
+		}
+	}
+	return append(lines, line)
+}
+
+// structuredNameFromFormatted derives the N value RFC 2426 Section 3.1.2
+// requires from the FN a vCard 4.0 card is guaranteed to carry.
+//
+// The last whitespace-separated word becomes the family name and the rest the
+// given name, which is the reading that makes a converted card sort and display
+// the way a 3.0 client expects. It is a guess about a name -- no split can be
+// derived from FN with certainty -- so it is only ever made when the card has no
+// N of its own, and never overwrites one.
+func structuredNameFromFormatted(formatted string) string {
+	words := strings.Fields(formatted)
+	switch len(words) {
+	case 0:
+		return ";;;;"
+	case 1:
+		return words[0] + ";;;;"
+	default:
+		return words[len(words)-1] + ";" + strings.Join(words[:len(words)-1], " ") + ";;;"
+	}
+}
+
+// formattedNameFromStructured derives the FN RFC 6350 Section 6.2.1 makes
+// mandatory from the N components, read in the order a name is spoken rather
+// than the order the property stores them.
+func formattedNameFromStructured(structured string) string {
+	components := splitVCardComponents(structured)
+	component := func(i int) string {
+		if i < len(components) {
+			return strings.TrimSpace(components[i])
+		}
+		return ""
+	}
+	// prefix, given, additional, family, suffix
+	ordered := []string{component(3), component(1), component(2), component(0), component(4)}
+	spoken := make([]string, 0, len(ordered))
+	for _, part := range ordered {
+		if part != "" {
+			spoken = append(spoken, part)
+		}
+	}
+	return strings.Join(spoken, " ")
+}
+
+// splitVCardComponents splits a structured property value on its unescaped
+// semicolons, leaving every escape sequence in the components untouched.
+func splitVCardComponents(value string) []string {
+	var components []string
+	var current strings.Builder
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			current.WriteByte(value[i])
+			if i+1 < len(value) {
+				i++
+				current.WriteByte(value[i])
+			}
+		case ';':
+			components = append(components, current.String())
+			current.Reset()
+		default:
+			current.WriteByte(value[i])
+		}
+	}
+	return append(components, current.String())
 }
 
 // addressDataForVersion returns the data to hand a client that asked for a
@@ -316,14 +433,18 @@ func downgradeBinaryValue(line *vcardLine, name string) {
 		return
 	}
 	if !strings.HasPrefix(strings.ToLower(line.value), "data:") {
+		markVCardURIValue(line)
 		return
 	}
 	header, data, found := strings.Cut(line.value[len("data:"):], ",")
 	if !found {
+		markVCardURIValue(line)
 		return
 	}
 	if !strings.HasSuffix(strings.ToLower(header), ";base64") {
-		// Only base64 payloads can be expressed as a vCard 3.0 inline value.
+		// Only base64 payloads can be expressed as a vCard 3.0 inline value;
+		// the rest stay the URI they already are.
+		markVCardURIValue(line)
 		return
 	}
 	mediaType := header[:len(header)-len(";base64")]
@@ -333,6 +454,22 @@ func downgradeBinaryValue(line *vcardLine, name string) {
 	if typeValue, ok := vcardBinaryTypeParams[strings.ToLower(strings.TrimSpace(mediaType))]; ok {
 		line.setParamValues("TYPE", append(line.paramValues("TYPE"), typeValue))
 	}
+}
+
+// vcardURIValue matches a value written as a URI, which is the only shape that
+// may be labelled VALUE=uri.
+var vcardURIValue = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
+
+// markVCardURIValue labels a binary property that carries a URI rather than a
+// payload. RFC 2426 Section 4 defaults PHOTO, LOGO, SOUND and KEY to an inline
+// binary value, so a vCard 3.0 client reading an unlabelled "https://..." reads
+// it as a corrupt image -- while RFC 6350 made the URI the only form, which is
+// why nothing in the 4.0 card had to say so.
+func markVCardURIValue(line *vcardLine) {
+	if !vcardURIValue.MatchString(line.value) {
+		return
+	}
+	line.setParamValues("VALUE", []string{"uri"})
 }
 
 // vcardMediaTypeFor resolves the media type of an inline vCard 3.0 binary

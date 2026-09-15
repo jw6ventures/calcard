@@ -1868,6 +1868,14 @@ func (r *appPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
 	return err
 }
 
+func (r *appPasswordRepo) SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error {
+	const q = `UPDATE app_passwords SET digest_md5_ha1=$2, digest_sha256_ha1=$3
+        WHERE id=$1 AND digest_md5_ha1 IS NULL AND digest_sha256_ha1 IS NULL`
+	defer observeDB(ctx, "app_passwords.set_digest_credentials")()
+	_, err := r.pool.ExecContext(ctx, q, id, md5HA1, sha256HA1)
+	return err
+}
+
 func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
 	const q = `UPDATE app_passwords SET last_used_at = NOW() WHERE id=$1`
 	defer observeDB(ctx, "app_passwords.touch_last_used")()

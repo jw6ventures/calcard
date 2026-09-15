@@ -18,10 +18,15 @@ var recurringTimeRangeComponents = nameSet("VEVENT", "VTODO", "VJOURNAL")
 // §7.3 makes the request's CALDAV:timezone, else the collection's
 // CALDAV:calendar-timezone, else UTC.
 //
-// A zone is held as a *time.Location whenever the TZID names one the host knows,
-// which is the case for the IANA identifiers clients send. For any other
-// spelling the VTIMEZONE shipped with the definition is walked instead, because
-// Go cannot build a multi-transition location without TZif data.
+// The observances the definition ships are what answer, because the definition
+// is the reference §7.3 names. A TZID that also happens to name an IANA zone
+// does not make the host's copy authoritative: the two can disagree, and
+// answering from the host's would resolve the value against a zone the request
+// never described.
+//
+// loc holds the host's location only as the fallback for a definition this
+// server cannot walk -- one carrying no usable STANDARD or DAYLIGHT observance.
+// The two are never both in force, so whichever is set is the zone.
 type floatingZone struct {
 	loc  *time.Location
 	root *icalNode
@@ -46,6 +51,11 @@ func newFloatingZone(icalText string) floatingZone {
 		if tzid == "" {
 			return floatingZone{}
 		}
+		if observances, ok := submittedTimezoneObservances(root, tzid); ok && len(observances) > 0 {
+			return floatingZone{root: root, tzid: tzid}
+		}
+		// Nothing walkable was submitted. The host's database is the only
+		// remaining source of rules for this name.
 		if loc, err := time.LoadLocation(tzid); err == nil {
 			return floatingZone{loc: loc, root: root, tzid: tzid}
 		}
@@ -90,7 +100,21 @@ func (z floatingZone) resolve(value string) (time.Time, bool) {
 // addDays advances by a nominal number of days: the same wall-clock time on a
 // later date rather than a fixed multiple of 24 hours, which is what the +P1D
 // the §9.9 tables imply for a DATE value means across a zone transition.
+//
+// The submitted observances answer here for the same reason they answer in
+// resolve. Reading them for the offset and then doing the arithmetic in UTC
+// would put the two on different zones, and the day that spans a transition --
+// the only day whose length this function exists to get right -- is exactly
+// where they would disagree.
 func (z floatingZone) addDays(instant time.Time, days int) time.Time {
+	if z.root != nil {
+		if offset, ok := submittedTimezoneOffsetAtInstant(z.root, z.tzid, instant); ok {
+			wall := instant.Add(offset).UTC().AddDate(0, 0, days)
+			if shifted, ok := submittedTimezoneOffset(z.root, z.tzid, wall); ok {
+				return wall.Add(-shifted).UTC()
+			}
+		}
+	}
 	if z.loc == nil {
 		return instant.AddDate(0, 0, days)
 	}

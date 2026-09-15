@@ -94,6 +94,11 @@ type AppPasswordRepository interface {
 	Revoke(ctx context.Context, id int64) error
 	DeleteRevoked(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error
+	// SetDigestCredentials attaches sealed Digest HA1s to an app password that
+	// was issued without them, which is every app password predating Digest.
+	// It writes only while both columns are still NULL, so a concurrent caller
+	// cannot replace a credential that is already usable.
+	SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error
 }
 
 // DeletedResourceRepository handles tombstone tracking for sync.

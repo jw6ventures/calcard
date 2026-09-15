@@ -1099,3 +1099,57 @@ func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCa
 func key(calendarID int64, uid string) string {
 	return strconv.FormatInt(calendarID, 10) + ":" + uid
 }
+
+// chi routes on r.URL.RawPath when it is set and on the already-decoded
+// r.URL.Path when it is not, so a {uid} reaches the handler encoded only in the
+// first case. Unescaping it unconditionally decodes the second case twice, and
+// "literal%2541" then names "literalA" -- a different resource, which the
+// update and delete routes below would mutate.
+func TestUIDRouteParamsDecodeExactlyOnceThroughChiRouting(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment string
+		want    string
+	}{
+		{name: "escaped percent", segment: "literal%2541", want: `literal%41`},
+		{name: "decoded twin", segment: "literalA", want: "literalA"},
+		{name: "escaped at sign", segment: "a%40b.com", want: "a@b.com"},
+		{name: "literal at sign", segment: "a@b.com", want: "a@b.com"},
+		{name: "escaped space", segment: "sp%20ace", want: "sp ace"},
+		{name: "plain", segment: "plain-uid", want: "plain-uid"},
+	}
+
+	// Both readers, behind the route shapes the server mounts them on.
+	readers := map[string]struct {
+		pattern string
+		read    func(http.ResponseWriter, *http.Request) (int64, string, bool)
+	}{
+		"events":   {pattern: "/calendars/{id}/events/{uid}", read: parseCalendarIDAndUID},
+		"contacts": {pattern: "/addressbooks/{id}/contacts/{uid}", read: parseBookIDAndUID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for name, reader := range readers {
+				var got string
+				var ok bool
+				router := chi.NewRouter()
+				router.Get(reader.pattern, func(w http.ResponseWriter, r *http.Request) {
+					_, got, ok = reader.read(w, r)
+				})
+
+				target := strings.Replace(reader.pattern, "{id}", "1", 1)
+				target = strings.Replace(target, "{uid}", tt.segment, 1)
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, target, nil))
+
+				if !ok {
+					t.Errorf("%s rejected %q", name, tt.segment)
+					continue
+				}
+				if got != tt.want {
+					t.Errorf("%s with %q resolved to %q, want %q", name, tt.segment, got, tt.want)
+				}
+			}
+		})
+	}
+}

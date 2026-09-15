@@ -309,16 +309,35 @@ func parseCalendarIDAndUID(w http.ResponseWriter, r *http.Request) (int64, strin
 	if !ok {
 		return 0, "", false
 	}
-	rawUID := chi.URLParam(r, "uid")
-	uid, err := url.PathUnescape(rawUID)
-	if err != nil || uid == "" {
-		uid = rawUID
-	}
+	uid := routeUID(r)
 	if uid == "" {
 		http.Error(w, "invalid event uid", http.StatusBadRequest)
 		return 0, "", false
 	}
 	return calendarID, uid, true
+}
+
+// routeUID returns the {uid} route parameter with percent-encoding resolved
+// exactly once.
+//
+// Which of the two path forms chi matched on decides whether there is anything
+// to resolve. chi routes on r.URL.RawPath when net/url set it -- which happens
+// only when the request spelled a segment differently from how the decoded path
+// re-encodes, as "a%40b.com" does for "@" -- and on the already-decoded
+// r.URL.Path otherwise. Unescaping in the second case decodes the value a
+// second time, so a UID carrying a literal percent ("literal%41", requested as
+// "literal%2541") would come back as "literalA": a different resource, and one
+// the caller never named.
+func routeUID(r *http.Request) string {
+	raw := chi.URLParam(r, "uid")
+	if r.URL.RawPath == "" {
+		return raw
+	}
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || decoded == "" {
+		return raw
+	}
+	return decoded
 }
 
 const maxEventSearchLen = 256

@@ -221,13 +221,49 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 			continue
 		}
 		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
+			s.backfillDigestCredentials(ctx, user, t, password)
 			s.touchLastUsedThrottled(t)
-			s.authCachePut(cacheKey, user, t.ID)
+			s.authCachePut(cacheKey, user, t.ID, t.ExpiresAt)
 			return user, nil
 		}
 	}
 
 	return nil, errors.New("invalid app password")
+}
+
+// backfillDigestCredentials attaches Digest HA1s to an app password issued
+// without them. An HA1 cannot be derived from the stored bcrypt hash, so a
+// successful Basic authentication is the only moment the server can produce
+// one for an existing credential; every app password predating Digest depends
+// on this to become able to answer a Digest challenge.
+//
+// Every failure here is logged and swallowed. The password has already been
+// verified, and refusing the request because a convenience write did not land
+// would turn a working credential into a broken one -- the exact outcome this
+// exists to prevent.
+func (s *Service) backfillDigestCredentials(ctx context.Context, user *store.User, token store.AppPassword, password string) {
+	if token.DigestMD5HA1 != nil || token.DigestSHA256HA1 != nil {
+		return
+	}
+	if user == nil || user.PrimaryEmail == "" || s.store == nil || s.store.AppPasswords == nil {
+		return
+	}
+	// Hashed over the account's own address rather than the spelling the
+	// request carried, so the value matches what issuing the password would
+	// have produced and what the Digest lookup resolves the username to.
+	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, password)
+	if err != nil {
+		log.Printf("dav digest: could not seal credentials for app password %d: %v", token.ID, err)
+		return
+	}
+	if md5HA1 == nil || sha256HA1 == nil {
+		// No session secret, so there is no key and no HA1 to store. The app
+		// password stays Basic-only, which is the state it was already in.
+		return
+	}
+	if err := s.store.AppPasswords.SetDigestCredentials(ctx, token.ID, *md5HA1, *sha256HA1); err != nil {
+		log.Printf("dav digest: could not store credentials for app password %d: %v", token.ID, err)
+	}
 }
 
 func (s *Service) RequireSession(next http.Handler) http.Handler {
@@ -272,6 +308,10 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 			}
 			user, err = s.ValidateAppPassword(r.Context(), username, password)
 		case strings.EqualFold(scheme, "Digest"):
+			if !s.digestEnabled() {
+				err = errors.New("digest authentication is not enabled")
+				break
+			}
 			user, stale, err = s.validateDAVDigest(r)
 		default:
 			err = errors.New("authentication required")

@@ -53,6 +53,9 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if !cfg.DAV.PropfindInfinityEnabled {
 		t.Fatal("expected DAV.PropfindInfinityEnabled to default to true")
 	}
+	if cfg.DAV.DigestEnabled {
+		t.Fatal("expected DAV.DigestEnabled to default to false")
+	}
 	if cfg.DAV.MaxMultistatusResponses != 10000 {
 		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 10000", cfg.DAV.MaxMultistatusResponses)
 	}
@@ -264,6 +267,26 @@ func TestLoadDisablesPropfindInfinity(t *testing.T) {
 	}
 	if cfg.DAV.PropfindInfinityEnabled {
 		t.Fatal("expected APP_DAV_PROPFIND_INFINITY_ENABLED=false to disable Depth: infinity PROPFIND")
+	}
+}
+
+// App passwords issued before Digest existed carry no HA1, so advertising
+// Digest to a client that would then select it is what an upgrade must not do
+// on its own. The scheme is therefore opt-in rather than defaulted on.
+func TestLoadEnablesDAVDigestOnlyWhenOptedIn(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_DIGEST_ENABLED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.DAV.DigestEnabled {
+		t.Fatal("expected APP_DAV_DIGEST_ENABLED=true to enable DAV Digest")
 	}
 }
 

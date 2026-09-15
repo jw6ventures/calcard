@@ -330,6 +330,23 @@ func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 	}
 }
 
+// The DAV Digest scheme is opt-in because an app password issued before Digest
+// existed cannot answer a Digest challenge. An operator has to be able to reach
+// the switch, and an unset value has to leave the server on its own default
+// rather than arriving as an empty string the loader would read as "off" by
+// coincidence.
+func TestHelmChartDAVDigestSwitchIsOptInAndReachable(t *testing.T) {
+	defaults := requireDocument(t, renderChart(t), "configmap.yaml")
+	if strings.Contains(defaults, "APP_DAV_DIGEST_ENABLED") {
+		t.Errorf("an unset app.dav.digestEnabled reached the server:\n%s", defaults)
+	}
+
+	enabled := requireDocument(t, renderChart(t, "--set", "app.dav.digestEnabled=true"), "configmap.yaml")
+	if !hasLine(enabled, `APP_DAV_DIGEST_ENABLED: "true"`) {
+		t.Errorf("configmap does not carry app.dav.digestEnabled:\n%s", enabled)
+	}
+}
+
 // TestChartPathExists keeps a moved chart from turning every test above into a
 // helm error that reads like a chart defect.
 func TestChartPathExists(t *testing.T) {

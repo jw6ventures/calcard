@@ -14,10 +14,21 @@ import (
 const defaultPageSize = 50
 
 // resourceUIDParam returns the {uid} route parameter with percent-encoding
-// resolved. chi routes on the raw path, so a UID containing characters that
-// must be escaped in a path segment (notably "@") arrives still encoded.
+// resolved exactly once.
+//
+// Which of the two path forms chi matched on decides whether there is anything
+// to resolve. chi routes on r.URL.RawPath when net/url set it -- which happens
+// only when the request spelled a segment differently from how the decoded path
+// re-encodes, as "a%40b.com" does for "@" -- and on the already-decoded
+// r.URL.Path otherwise. Unescaping in the second case decodes the value a
+// second time, so a UID carrying a literal percent ("literal%41", requested as
+// "literal%2541") would come back as "literalA": a different resource, and one
+// the caller never named.
 func resourceUIDParam(r *http.Request) string {
 	raw := chi.URLParam(r, "uid")
+	if r.URL.RawPath == "" {
+		return raw
+	}
 	decoded, err := url.PathUnescape(raw)
 	if err != nil || decoded == "" {
 		return raw

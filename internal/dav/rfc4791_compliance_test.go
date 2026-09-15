@@ -3045,14 +3045,14 @@ func TestRFC4791_ExpandResolvesFloatingValuesThroughTheReportTimezone(t *testing
 	})
 
 	t.Run("the request timezone is honoured", func(t *testing.T) {
-		body := queryBody(`<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`)
+		body := queryBody(`<C:timezone>` + grammarChicagoVTimezone() + `</C:timezone>`)
 		if got := expandedStarts(t, newServer(nil), body); len(got) != 0 {
 			t.Errorf("expanded DTSTARTs = %v, want none: 09:00 Chicago is outside the requested day", got)
 		}
 	})
 
 	t.Run("the collection timezone answers when the request names none", func(t *testing.T) {
-		chicago := vTimezoneObject("America/Chicago")
+		chicago := chicagoVTimezoneObject()
 		if got := expandedStarts(t, newServer(&chicago), queryBody("")); len(got) != 0 {
 			t.Errorf("expanded DTSTARTs = %v, want none: the collection zone was not consulted", got)
 		}
@@ -3060,7 +3060,7 @@ func TestRFC4791_ExpandResolvesFloatingValuesThroughTheReportTimezone(t *testing
 
 	t.Run("the request timezone outranks the collection one", func(t *testing.T) {
 		utc := vTimezoneObject("UTC")
-		body := queryBody(`<C:timezone>` + grammarVTimezoneFor("America/Chicago") + `</C:timezone>`)
+		body := queryBody(`<C:timezone>` + grammarChicagoVTimezone() + `</C:timezone>`)
 		if got := expandedStarts(t, newServer(&utc), body); len(got) != 0 {
 			t.Errorf("expanded DTSTARTs = %v, want none: the collection zone outranked the request", got)
 		}
@@ -4797,8 +4797,8 @@ func TestRFC4791_SupportedCalendarComponentSetOmitsVTimezone(t *testing.T) {
 // Section 5.2.3: with no CALDAV:supported-calendar-component-set of its own, a
 // collection accepts every component type the server implements.
 func TestRFC4791_CollectionWithoutComponentSetAcceptsEveryComponentType(t *testing.T) {
-	if got := calendarSupportedComponents(nil); !slices.Equal(got, defaultSupportedCalendarComponents) {
-		t.Fatalf("calendarSupportedComponents(nil) = %v, want the server default %v", got, defaultSupportedCalendarComponents)
+	if got := calendarSupportedComponents(nil); !slices.Equal(got, store.DefaultSupportedCalendarComponents) {
+		t.Fatalf("calendarSupportedComponents(nil) = %v, want the server default %v", got, store.DefaultSupportedCalendarComponents)
 	}
 
 	objects := map[string]string{

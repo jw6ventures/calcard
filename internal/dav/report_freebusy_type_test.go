@@ -566,8 +566,7 @@ func heterogeneousFreeBusyServer(t *testing.T) *DavServer {
 	if _, err := time.LoadLocation("America/Chicago"); err != nil {
 		t.Skipf("tzdata unavailable: %v", err)
 	}
-	chicago := "BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
-		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	chicago := chicagoVTimezone()
 
 	object := func(lines ...string) string {
 		all := append([]string{"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//CalCard//EN"}, lines...)

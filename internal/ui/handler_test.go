@@ -995,6 +995,103 @@ func contactFormRouter(h *Handler, userID int64) http.Handler {
 	return router
 }
 
+// chi routes on r.URL.RawPath when it is set and on the already-decoded
+// r.URL.Path when it is not, so a route parameter reaches the handler encoded
+// only in the first case. Unescaping unconditionally decodes the second case
+// twice, which turns "literal%2541" into "literalA" instead of "literal%41" --
+// a different contact, and one a mutation must not reach.
+func TestResourceUIDParamDecodesExactlyOnceThroughChiRouting(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment string
+		want    string
+	}{
+		// The escape has to survive: "%25" is a percent sign, and decoding it a
+		// second time reads the two characters after it as an escape of their
+		// own. chi leaves RawPath empty here, because re-escaping the decoded
+		// path reproduces the request exactly.
+		{name: "escaped percent", segment: "literal%2541", want: "literal%41"},
+		// The identity the double decode collides with, asked for directly.
+		{name: "decoded twin", segment: "literalA", want: "literalA"},
+		// The encoding resourceUIDParam exists for: chi sets RawPath, because
+		// "@" needs no escape in a path segment, so the parameter is encoded.
+		{name: "escaped at sign", segment: "a%40b.com", want: "a@b.com"},
+		{name: "literal at sign", segment: "a@b.com", want: "a@b.com"},
+		{name: "escaped space", segment: "sp%20ace", want: "sp ace"},
+		{name: "plain", segment: "plain-uid", want: "plain-uid"},
+	}
+
+	// Every route that reads a {uid}, spelled as the server mounts them.
+	patterns := []string{
+		"/calendars/{id}/events/{uid}",
+		"/calendars/{id}/events/{uid}/delete",
+		"/addressbooks/{id}/contacts/{uid}",
+		"/addressbooks/{id}/contacts/{uid}/delete",
+		"/addressbooks/{id}/contacts/{uid}/move",
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, pattern := range patterns {
+				var got string
+				router := chi.NewRouter()
+				router.Get(pattern, func(_ http.ResponseWriter, r *http.Request) {
+					got = resourceUIDParam(r)
+				})
+
+				target := strings.Replace(pattern, "{id}", "1", 1)
+				target = strings.Replace(target, "{uid}", tt.segment, 1)
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, target, nil))
+
+				if got != tt.want {
+					t.Errorf("%s with %q resolved to %q, want %q", pattern, tt.segment, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// The consequence of decoding twice, at the route that mutates: two contacts
+// whose identities differ only by an escape, and the request names the escaped
+// one. Reaching the other would edit a contact the client never asked for.
+func TestUpdateContactTargetsTheRequestedIdentityNotItsDecodedTwin(t *testing.T) {
+	const (
+		requested = `literal%41`
+		twin      = "literalA"
+	)
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:" + requested: {ID: 1, AddressBookID: 1, UID: requested, ResourceName: requested, ETag: "etag-requested"},
+			"1:" + twin:      {ID: 2, AddressBookID: 1, UID: twin, ResourceName: twin, ETag: "etag-twin"},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil)
+
+	form := url.Values{"display_name": {"Renamed By The Request"}}
+	// url.PathEscape(`literal%41`) is "literal%2541": the percent is escaped, so
+	// the request names the first contact and not the second.
+	req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(requested), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("UpdateContact() status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+	}
+	if stored := contactRepo.contacts["1:"+requested]; stored == nil || !strings.Contains(stored.RawVCard, "Renamed By The Request") {
+		t.Fatalf("the requested contact was not updated: %#v", stored)
+	}
+	if stored := contactRepo.contacts["1:"+twin]; stored == nil || stored.ETag != "etag-twin" {
+		t.Fatalf("the mutation reached the wrong contact: %#v", stored)
+	}
+}
+
 // A contact stored by a CardDAV PUT carries the resource name that PUT chose,
 // and that name is the last segment of every href the sync reports publish for
 // it. Editing the contact in the UI changes the contact, not its identity, so
@@ -1589,6 +1686,64 @@ func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
 	}
 	if strings.Contains(body, "example.app.calcard.app") {
 		t.Fatalf("expected app password guidance not to contain hard-coded example host, got %s", body)
+	}
+}
+
+// Digest is opt-in because an app password issued before Digest existed carries
+// no HA1 and cannot answer a Digest challenge. A credential gains one the first
+// time it authenticates over Basic, so the page has to say which have caught up
+// -- that readiness is what tells an operator the switch is safe to turn on.
+func TestAppPasswordsPageReportsDigestReadiness(t *testing.T) {
+	sealed := "v1:sealed"
+	handler := NewHandler(&config.Config{BaseURL: "https://calcard.example/"}, &store.Store{
+		AppPasswords: &fakeAppPasswordRepo{list: []store.AppPassword{
+			{ID: 1, Label: "ready-token", DigestMD5HA1: &sealed, DigestSHA256HA1: &sealed},
+			{ID: 2, Label: "legacy-token"},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.AppPasswords(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("AppPasswords() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Digest ready") {
+		t.Fatalf("expected the Digest-capable credential to be marked ready, got %s", body)
+	}
+	if !strings.Contains(body, "Basic only") {
+		t.Fatalf("expected the legacy credential to be marked Basic only, got %s", body)
+	}
+}
+
+// Revoking an app password has to reach the auth cache: a cache hit answers
+// without reading the database, so an entry left behind keeps the revoked
+// credential working for the rest of its lifetime. What the cache then does
+// with the call is auth.Service's own business and is covered there; this pins
+// the handler's half -- that the revocation happens and that the notification
+// is made even when no auth service is wired in, as the UI tests construct it.
+func TestRevokeAppPasswordRevokesAndNotifiesTheAuthService(t *testing.T) {
+	repo := &fakeAppPasswordRepo{list: []store.AppPassword{{ID: 7, UserID: 100, Label: "phone"}}}
+	handler := NewHandler(&config.Config{}, &store.Store{AppPasswords: repo}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/app-passwords/7", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "7")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+
+	handler.RevokeAppPassword(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("RevokeAppPassword() status = %d, want %d: %s", w.Code, http.StatusFound, w.Body.String())
+	}
+	if repo.revoked != 7 {
+		t.Fatalf("Revoke() was called for app password %d, want 7", repo.revoked)
 	}
 }
 
@@ -2605,6 +2760,49 @@ func TestAllCalendarEventsJSONPerResourceCapabilities(t *testing.T) {
 	}
 }
 
+// canCreate gates both the new-event button and the move destinations the
+// editor offers, so a calendar that does not accept VEVENT has to be excluded
+// there as well as refused at the handler. Offering a destination the server
+// will then reject is a dead end the user has no way to see coming.
+func TestViewAllCalendarsExcludesCalendarsThatDoNotAcceptEvents(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Events"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			{
+				// Writable, but a task list: bind alone does not make it a
+				// place an event may go.
+				Calendar:           store.Calendar{ID: 2, UserID: 100, Name: "Tasks", SupportedComponents: []string{"VTODO"}},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+		}},
+	}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewAllCalendars(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewAllCalendars() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"name":"Events","color":"`) || !strings.Contains(body, `"canCreate":true`) {
+		t.Fatalf("the event calendar was not offered: %s", body)
+	}
+	tasks := strings.Index(body, `"name":"Tasks"`)
+	if tasks < 0 {
+		t.Fatalf("the task list is missing from the calendar metadata: %s", body)
+	}
+	if !strings.Contains(body[tasks:], `"canCreate":false`) {
+		t.Fatalf("a calendar that does not accept events was offered as a destination: %s", body[tasks:])
+	}
+}
+
 func TestViewAllCalendarsIncludesWritableCalendarMetadata(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
@@ -3562,7 +3760,10 @@ type fakeUserRepo struct {
 	users map[int64]*store.User
 }
 
-type fakeAppPasswordRepo struct{}
+type fakeAppPasswordRepo struct {
+	list    []store.AppPassword
+	revoked int64
+}
 
 func (f *fakeAppPasswordRepo) Create(ctx context.Context, token store.AppPassword) (*store.AppPassword, error) {
 	return nil, nil
@@ -3573,14 +3774,25 @@ func (f *fakeAppPasswordRepo) FindValidByUser(ctx context.Context, userID int64)
 }
 
 func (f *fakeAppPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]store.AppPassword, error) {
-	return nil, nil
+	return f.list, nil
 }
 
 func (f *fakeAppPasswordRepo) GetByID(ctx context.Context, id int64) (*store.AppPassword, error) {
+	for i := range f.list {
+		if f.list[i].ID == id {
+			found := f.list[i]
+			return &found, nil
+		}
+	}
 	return nil, nil
 }
 
 func (f *fakeAppPasswordRepo) Revoke(ctx context.Context, id int64) error {
+	f.revoked = id
+	return nil
+}
+
+func (f *fakeAppPasswordRepo) SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error {
 	return nil
 }
 
@@ -4324,6 +4536,148 @@ func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
 	if eventRepo.events["1:event-1"] == nil || eventRepo.events["2:event-1"] != nil {
 		t.Fatalf("denied move mutated events: %#v", eventRepo.events)
 	}
+}
+
+// A calendar collection advertises the component types it accepts in
+// CALDAV:supported-calendar-component-set, and RFC 4791 Section 5.2.3 makes
+// that a restriction on what may be stored in it -- which the PUT path enforces
+// and DAV clients read. The UI writes into the same collections, so a write it
+// admits that PUT would refuse leaves the collection holding content it says it
+// does not.
+func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
+	const raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	// Source accepts events; the destination is a task list that does not.
+	newStore := func(eventRepo store.EventRepository) *store.Store {
+		return &store.Store{
+			Calendars: &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+				"1:100": {
+					Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Source"},
+					Privileges:         store.FullCalendarPrivileges(),
+					PrivilegesResolved: true,
+				},
+				"2:100": {
+					Calendar:           store.Calendar{ID: 2, UserID: 100, Name: "Tasks", SupportedComponents: []string{"VTODO"}},
+					Privileges:         store.FullCalendarPrivileges(),
+					PrivilegesResolved: true,
+				},
+			}},
+			Events: eventRepo,
+		}
+	}
+
+	t.Run("a move into a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+			}},
+		}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil)
+
+		form := url.Values{
+			"summary":                 {"Updated"},
+			"dtstart":                 {"2026-07-24T10:00"},
+			"dtend":                   {"2026-07-24T10:30"},
+			"destination_calendar_id": {"2"},
+		}
+		req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "1")
+		chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.UpdateEvent(w, req)
+
+		// Neither calendar may change: the refusal has to come before the move,
+		// not leave the event half-moved.
+		if eventRepo.events["1:event-1"] == nil || eventRepo.events["2:event-1"] != nil {
+			t.Fatalf("a refused move mutated events: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("UpdateEvent() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
+
+	t.Run("creating an event in a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil)
+
+		form := url.Values{
+			"summary": {"New"},
+			"dtstart": {"2026-07-24T10:00"},
+			"dtend":   {"2026-07-24T10:30"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/2/events", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "2")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.CreateEvent(w, req)
+
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("an event was created in a calendar that does not accept one: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("CreateEvent() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
+
+	t.Run("a calendar with no restriction still accepts an event", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil)
+
+		form := url.Values{
+			"summary": {"New"},
+			"dtstart": {"2026-07-24T10:00"},
+			"dtend":   {"2026-07-24T10:30"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.CreateEvent(w, req)
+
+		if len(eventRepo.events) != 1 {
+			t.Fatalf("a calendar carrying no component restriction refused an event: %#v", eventRepo.events)
+		}
+	})
+
+	t.Run("importing events into a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil)
+
+		var body bytes.Buffer
+		form := multipart.NewWriter(&body)
+		part, err := form.CreateFormFile("ics_file", "import.ics")
+		if err != nil {
+			t.Fatalf("CreateFormFile() error = %v", err)
+		}
+		if _, err := part.Write([]byte(raw)); err != nil {
+			t.Fatalf("write ICS: %v", err)
+		}
+		if err := form.Close(); err != nil {
+			t.Fatalf("close form: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/calendars/2/import", &body)
+		req.Header.Set("Content-Type", form.FormDataContentType())
+		req = withRouteID(req, "2")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.ImportCalendar(w, req)
+
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("events were imported into a calendar that does not accept them: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("ImportCalendar() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
 }
 
 func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {

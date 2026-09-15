@@ -564,14 +564,7 @@ func TestTimeRangeResolvesFloatingValuesThroughTheSelectedZone(t *testing.T) {
 		"DTSTART:20240601T100000",
 		"DTEND:20240601T110000",
 	)...)
-	zoneDefinition := wrapCalendar(componentLines("VTIMEZONE",
-		"TZID:America/Chicago",
-		"BEGIN:STANDARD",
-		"DTSTART:19701101T020000",
-		"TZOFFSETFROM:-0500",
-		"TZOFFSETTO:-0600",
-		"END:STANDARD",
-	)...)
+	zoneDefinition := chicagoVTimezoneObject()
 
 	// Read as UTC the event is 10:00-11:00Z; in America/Chicago (CDT, -0500 in
 	// June) the same wall clock is 15:00-16:00Z.
@@ -583,8 +576,8 @@ func TestTimeRangeResolvesFloatingValuesThroughTheSelectedZone(t *testing.T) {
 	}
 
 	zone := newFloatingZone(zoneDefinition)
-	if zone.loc == nil {
-		t.Fatal("newFloatingZone() did not resolve America/Chicago")
+	if zone.tzid != "America/Chicago" {
+		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", zone.tzid)
 	}
 	if assertComponentInRange(t, raw, "VEVENT", utcRange[0], utcRange[1], zone) {
 		t.Fatal("floating value still resolved as UTC despite a request timezone")
@@ -885,16 +878,9 @@ func TestRecurrenceDatesResolveThroughTheSelectedZone(t *testing.T) {
 		t.Skipf("tzdata unavailable: %v", err)
 	}
 	// CDT in June, so a 10:00 wall clock is 15:00Z and a date starts at 05:00Z.
-	chicago := newFloatingZone(wrapCalendar(componentLines("VTIMEZONE",
-		"TZID:America/Chicago",
-		"BEGIN:STANDARD",
-		"DTSTART:19701101T020000",
-		"TZOFFSETFROM:-0500",
-		"TZOFFSETTO:-0600",
-		"END:STANDARD",
-	)...))
-	if chicago.loc == nil {
-		t.Fatal("newFloatingZone() did not resolve America/Chicago")
+	chicago := newFloatingZone(chicagoVTimezoneObject())
+	if chicago.tzid != "America/Chicago" {
+		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", chicago.tzid)
 	}
 	// A TZID no host knows, resolved by walking the observances the definition
 	// ships. That path yields no *time.Location, so the offset has to reach the
@@ -1135,10 +1121,7 @@ func TestReportFloatingZoneFollowsTheSectionSevenThreeOrder(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			zone := reportFloatingZone(tt.request, tt.collection)
-			got := ""
-			if zone.loc != nil {
-				got = zone.loc.String()
-			}
+			got := zone.tzid
 			if got != tt.want {
 				t.Fatalf("reportFloatingZone() resolved %q, want %q", got, tt.want)
 			}
@@ -1150,7 +1133,7 @@ func TestReportFloatingZoneFollowsTheSectionSevenThreeOrder(t *testing.T) {
 	// calendarTimezoneValue envelopes it on the way out.
 	bare := "BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
 		"TZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
-	if zone := reportFloatingZone("", &bare); zone.loc == nil || zone.loc.String() != "Europe/Berlin" {
+	if zone := reportFloatingZone("", &bare); zone.tzid != "Europe/Berlin" {
 		t.Fatalf("a bare stored VTIMEZONE did not resolve: %#v", zone)
 	}
 }
@@ -1166,16 +1149,9 @@ func TestTimeRangeAllDayValueSpansItsNominalDayAcrossAZoneTransition(t *testing.
 	if err != nil {
 		t.Skipf("tzdata unavailable: %v", err)
 	}
-	zone := newFloatingZone(wrapCalendar(componentLines("VTIMEZONE",
-		"TZID:America/Chicago",
-		"BEGIN:STANDARD",
-		"DTSTART:19701101T020000",
-		"TZOFFSETFROM:-0500",
-		"TZOFFSETTO:-0600",
-		"END:STANDARD",
-	)...))
-	if zone.loc == nil {
-		t.Fatal("newFloatingZone() did not resolve America/Chicago")
+	zone := newFloatingZone(chicagoVTimezoneObject())
+	if zone.tzid != "America/Chicago" {
+		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", zone.tzid)
 	}
 
 	tests := []struct {
@@ -1282,5 +1258,109 @@ func TestSubmittedTimezoneWallClockUsesAbsoluteTransitions(t *testing.T) {
 				t.Fatalf("wallClock(%v) = %s, want %s", test.instant, got, test.want)
 			}
 		})
+	}
+}
+
+// RFC 4791 Section 7.3 makes the request's CALDAV:timezone -- else the
+// collection's CALDAV:calendar-timezone -- the reference a floating value is
+// resolved against. The definition the client submitted is that reference, so
+// the observances it ships decide the offset even when its TZID happens to name
+// a zone the host's database also knows. Reading the host's rules instead
+// silently answers with a different zone than the one the request described.
+func TestFloatingZonePrefersSubmittedObservancesOverTheHostDatabase(t *testing.T) {
+	// A TZID the host database certainly knows, shipped with observances that
+	// deliberately disagree with it.
+	submitted := strings.Join([]string{
+		"BEGIN:VCALENDAR",
+		"BEGIN:VTIMEZONE",
+		"TZID:America/New_York",
+		"BEGIN:STANDARD",
+		"DTSTART:19700101T000000",
+		"TZOFFSETFROM:+0200",
+		"TZOFFSETTO:+0200",
+		"END:STANDARD",
+		"END:VTIMEZONE",
+		"END:VCALENDAR",
+		"",
+	}, "\r\n")
+
+	zone := newFloatingZone(submitted)
+	got, ok := zone.resolve("20260615T100000")
+	if !ok {
+		t.Fatal("the submitted zone did not resolve a floating value")
+	}
+	want := time.Date(2026, 6, 15, 8, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("floating 10:00 resolved to %s, want %s (the submitted +02:00, not the host's America/New_York)", got.UTC(), want)
+	}
+}
+
+// addDays advances a nominal day, which is the same wall clock on the next date
+// rather than a fixed 24 hours. It is what the DATE-valued Section 9.9 rows are
+// tested with, so it has to read the submitted observances too -- otherwise
+// preferring them above would move the offset off the arithmetic that uses it.
+func TestFloatingZoneAddDaysFollowsSubmittedTransitions(t *testing.T) {
+	// A zone that falls back one hour at 02:00 local on 2026-11-01.
+	submitted := strings.Join([]string{
+		"BEGIN:VCALENDAR",
+		"BEGIN:VTIMEZONE",
+		"TZID:America/New_York",
+		"BEGIN:DAYLIGHT",
+		"DTSTART:19700308T020000",
+		"TZOFFSETFROM:-0500",
+		"TZOFFSETTO:-0400",
+		"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+		"END:DAYLIGHT",
+		"BEGIN:STANDARD",
+		"DTSTART:19701101T020000",
+		"TZOFFSETFROM:-0400",
+		"TZOFFSETTO:-0500",
+		"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+		"END:STANDARD",
+		"END:VTIMEZONE",
+		"END:VCALENDAR",
+		"",
+	}, "\r\n")
+
+	zone := newFloatingZone(submitted)
+	// Midnight local on the day the transition happens, in daylight time.
+	start, ok := zone.resolve("20261101T000000")
+	if !ok {
+		t.Fatal("the submitted zone did not resolve a floating value")
+	}
+	if want := time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC); !start.Equal(want) {
+		t.Fatalf("floating midnight resolved to %s, want %s", start.UTC(), want)
+	}
+
+	// The next midnight is 25 hours later, not 24: the zone fell back in
+	// between, and a nominal day is a wall clock rather than a duration.
+	got := zone.addDays(start, 1)
+	if want := time.Date(2026, 11, 2, 5, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("addDays across the submitted fall back = %s, want %s", got.UTC(), want)
+	}
+}
+
+// A definition the server cannot walk -- no STANDARD or DAYLIGHT observance at
+// all -- is not a reference. The host database is the fallback, not the
+// default.
+func TestFloatingZoneFallsBackToTheHostDatabaseWithoutObservances(t *testing.T) {
+	submitted := strings.Join([]string{
+		"BEGIN:VCALENDAR",
+		"BEGIN:VTIMEZONE",
+		"TZID:America/New_York",
+		"END:VTIMEZONE",
+		"END:VCALENDAR",
+		"",
+	}, "\r\n")
+
+	zone := newFloatingZone(submitted)
+	got, ok := zone.resolve("20260615T100000")
+	if !ok {
+		t.Fatal("the fallback zone did not resolve a floating value")
+	}
+	// America/New_York is UTC-4 in June.
+	want := time.Date(2026, 6, 15, 14, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("floating 10:00 resolved to %s, want %s (the host's America/New_York)", got.UTC(), want)
 	}
 }

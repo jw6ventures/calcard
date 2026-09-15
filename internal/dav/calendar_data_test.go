@@ -37,6 +37,44 @@ func vTimezoneObject(tzid string) string {
 		"END:VTIMEZONE\r\nEND:VCALENDAR\r\n"
 }
 
+// chicagoVTimezone is America/Chicago as a client actually submits it: both
+// observances with the yearly rules that generate their transitions, so the
+// definition describes CST (-06:00) and CDT (-05:00) rather than one fixed
+// offset.
+//
+// A fixture meaning "this zone's offsets" has to carry them. RFC 4791 §7.3
+// resolves a floating value against the definition the request supplied, so a
+// stub claiming +00:00 under an IANA name describes a zone that is not the one
+// it is named after, and any case asserting the named zone's arithmetic would
+// only pass by the host's database answering over it.
+func chicagoVTimezone() string {
+	return strings.Join([]string{
+		"BEGIN:VTIMEZONE",
+		"TZID:America/Chicago",
+		"BEGIN:DAYLIGHT",
+		"DTSTART:20070311T020000",
+		"TZOFFSETFROM:-0600",
+		"TZOFFSETTO:-0500",
+		"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+		"END:DAYLIGHT",
+		"BEGIN:STANDARD",
+		"DTSTART:20071104T020000",
+		"TZOFFSETFROM:-0500",
+		"TZOFFSETTO:-0600",
+		"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+		"END:STANDARD",
+		"END:VTIMEZONE",
+		"",
+	}, "\r\n")
+}
+
+// chicagoVTimezoneObject is chicagoVTimezone wrapped in the VCALENDAR a
+// CALDAV:timezone value carries.
+func chicagoVTimezoneObject() string {
+	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
+		chicagoVTimezone() + "END:VCALENDAR\r\n"
+}
+
 // componentNames lists the top-level components of a projection. It parses
 // rather than analyzes, because RFC 4791 §9.6 permits returned data to be
 // invalid per its media type when the request selected less than the media type
@@ -784,7 +822,7 @@ func TestCalendarDataExpandResolvesFloatingValuesThroughTheReportTimezone(t *tes
 	// The range ends at 12:00Z. Read as UTC the first instance starts at 09:00Z
 	// and is inside it; read in Chicago it starts at 14:00Z and is not.
 	selection := &calendarDataEl{Expand: expandRange(t, "20240601T000000Z", "20240601T120000Z")}
-	chicago := newFloatingZone(vTimezoneObject("America/Chicago"))
+	chicago := newFloatingZone(chicagoVTimezoneObject())
 
 	utcInstances := len(icalendarPropertiesIn(t, projectFor(raw, selection), "VCALENDAR", "VEVENT")["DTSTART"])
 	if utcInstances != 1 {

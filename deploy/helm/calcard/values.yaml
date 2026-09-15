@@ -73,6 +73,7 @@ app:
   # turns that limit off entirely.
   dav: {}
     # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
+    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default: an app password issued before Digest existed carries no HA1 and cannot answer a Digest challenge, so enabling this before those credentials have caught up breaks existing clients. A password gains its HA1 when it is issued, or the first time it authenticates over Basic; the App Passwords page shows which are ready.
     # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
     # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
     # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.

@@ -23,7 +23,7 @@ func BenchmarkAuthCacheGet_Hit(b *testing.B) {
 	s := &Service{}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 	key := authCacheKey(user.PrimaryEmail, "secret")
-	s.authCachePut(key, user, 1)
+	s.authCachePut(key, user, 1, nil)
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -40,14 +40,14 @@ func BenchmarkAuthCachePut(b *testing.B) {
 		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
 			s := &Service{}
 			for i := 0; i < n; i++ {
-				s.authCachePut(authCacheKey(fmt.Sprintf("u%d", i), "p"), &store.User{ID: int64(i)}, int64(i))
+				s.authCachePut(authCacheKey(fmt.Sprintf("u%d", i), "p"), &store.User{ID: int64(i)}, int64(i), nil)
 			}
 			key := authCacheKey("hot@example.com", "secret")
 			user := &store.User{ID: 999}
 
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				s.authCachePut(key, user, 999)
+				s.authCachePut(key, user, 999, nil)
 			}
 		})
 	}

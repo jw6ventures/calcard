@@ -65,6 +65,37 @@ type Calendar struct {
 	UpdatedAt           time.Time
 }
 
+// DefaultSupportedCalendarComponents is the component set a calendar collection
+// accepts when MKCALENDAR set none of its own. VTIMEZONE is deliberately
+// absent: RFC 4791 Section 5.2.3 admits it only from a server that stores
+// VTIMEZONE-only calendar object resources, which CalCard does not.
+var DefaultSupportedCalendarComponents = []string{"VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY"}
+
+// SupportedComponentsOrDefault returns the component names a collection
+// accepts. A nil stored set means the collection carries no restriction of its
+// own, which RFC 4791 Section 5.2.3 makes the meaning of an absent
+// CALDAV:supported-calendar-component-set, so the server default applies. An
+// empty non-nil set is a restriction that names nothing and is left as it is.
+func SupportedComponentsOrDefault(stored []string) []string {
+	if stored == nil {
+		return DefaultSupportedCalendarComponents
+	}
+	return stored
+}
+
+// AcceptsComponent reports whether this collection admits a calendar object
+// resource carrying the named top-level component. It lives on the model rather
+// than in one package because the DAV handlers and the UI both write into these
+// collections, and a restriction only one of them enforces is not a restriction.
+func (c Calendar) AcceptsComponent(name string) bool {
+	for _, allowed := range SupportedComponentsOrDefault(c.SupportedComponents) {
+		if strings.EqualFold(allowed, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // CalendarProperties is the mutable live-property set of a calendar collection,
 // as PROPPATCH may rewrite it.
 type CalendarProperties struct {

@@ -252,20 +252,12 @@ func aclRootCollectionSupportedReports() []supportedReport {
 	return aclCollectionSupportedReports()
 }
 
-// defaultSupportedCalendarComponents is the component set a calendar collection
-// accepts when MKCALENDAR set none of its own. VTIMEZONE is deliberately absent:
-// RFC 4791 §5.2.3 admits it only from a server that stores VTIMEZONE-only
-// calendar object resources, which CalCard does not.
-var defaultSupportedCalendarComponents = []string{"VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY"}
-
 // calendarSupportedComponents returns the component names a collection accepts.
-// A nil stored set means the collection carries no restriction of its own, so
-// the server default applies.
+// The rule lives on the store model because the UI writes into these
+// collections too, and a restriction only the DAV handlers enforce is not a
+// restriction.
 func calendarSupportedComponents(stored []string) []string {
-	if stored == nil {
-		return defaultSupportedCalendarComponents
-	}
-	return stored
+	return store.SupportedComponentsOrDefault(stored)
 }
 
 func supportedCalendarComponents(stored []string) *supportedCalendarComponentSet {

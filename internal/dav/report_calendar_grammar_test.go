@@ -61,6 +61,14 @@ var grammarVTimezone = grammarVTimezoneFor("Etc/UTC")
 // zero-offset placeholder, which is all a test about the element itself needs;
 // a test about how values resolve names an IANA zone and lets the host's tzdata
 // supply the real offsets.
+// grammarChicagoVTimezone is chicagoVTimezone with the line breaks written as
+// the XML character references a CALDAV:timezone element carries them as.
+func grammarChicagoVTimezone() string {
+	return `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
+		strings.ReplaceAll(chicagoVTimezone(), "\r\n", "&#13;&#10;") +
+		`END:VCALENDAR&#13;&#10;`
+}
+
 func grammarVTimezoneFor(tzid string) string {
 	return `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
 		`BEGIN:VTIMEZONE&#13;&#10;TZID:` + tzid + `&#13;&#10;BEGIN:STANDARD&#13;&#10;DTSTART:19700101T000000&#13;&#10;` +

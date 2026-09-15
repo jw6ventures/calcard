@@ -170,10 +170,14 @@ func TestConvertVCardVersion(t *testing.T) {
 			want:   []string{"PHOTO;ENCODING=b;TYPE=PNG:iVBORw0K"},
 		},
 		{
-			name:   "photo URI references survive both ways",
+			// RFC 2426 Section 4 defaults PHOTO to an inline binary value, so
+			// a 3.0 client reading an unlabelled "https://..." reads it as a
+			// corrupt image. RFC 6350 made the URI the only form, which is why
+			// the 4.0 card does not have to say so and the 3.0 one does.
+			name:   "photo URI references survive both ways, labelled as URIs",
 			target: "3.0",
 			source: []string{"PHOTO;MEDIATYPE=image/jpeg:https://example.com/a.jpg"},
-			want:   []string{"PHOTO:https://example.com/a.jpg"},
+			want:   []string{"PHOTO;VALUE=uri:https://example.com/a.jpg"},
 		},
 		{
 			name:   "vcard3 group members use the address book server names",
@@ -200,10 +204,13 @@ func TestConvertVCardVersion(t *testing.T) {
 			want:   []string{"FN:Alice Adams"},
 		},
 		{
+			// The N is derived rather than dropped: RFC 2426 Section 3.1.2
+			// requires it and RFC 6350 Section 6.2.2 made it optional, so a
+			// valid 4.0 card can arrive without one.
 			name:   "properties vcard3 cannot express are dropped",
 			target: "3.0",
 			source: []string{"FN:Alice Adams", "LANG:en", "XML:<x/>", "CLIENTPIDMAP:1;urn:uuid:1", "RELATED;TYPE=friend:urn:uuid:bob"},
-			want:   []string{"FN:Alice Adams"},
+			want:   []string{"FN:Alice Adams", "N:Adams;Alice;;;"},
 		},
 		{
 			name:   "parameters vcard3 cannot express are dropped",
@@ -340,6 +347,146 @@ func TestConvertVCardVersionRoundTripPreservesContactData(t *testing.T) {
 	} {
 		if !strings.Contains(roundTripped, want) {
 			t.Errorf("round trip lost %q:\n%s", want, roundTripped)
+		}
+	}
+}
+
+// Conversion rewrote content lines one at a time and never asked whether the
+// result was a valid card of the version it claimed. RFC 2426 Section 3.1.2
+// requires N, which RFC 6350 made optional, and Section 4 defaults PHOTO, LOGO,
+// SOUND and KEY to a binary value -- so a 4.0 card with no N and a remote URI
+// photo downgraded into a 3.0 card that clients reject or read as a corrupt
+// inline image.
+func TestDowngradedVCardIsValidForItsVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		wantLines   []string
+		absentLines []string
+	}{
+		{
+			name: "synthesizes the N vCard 3.0 requires",
+			raw: buildVCard("4.0",
+				"UID:alice",
+				"FN:Alice Adams",
+			),
+			wantLines: []string{"N:Adams;Alice;;;"},
+		},
+		{
+			name: "single-word FN becomes the family name alone",
+			raw: buildVCard("4.0",
+				"UID:cher",
+				"FN:Cher",
+			),
+			wantLines: []string{"N:Cher;;;;"},
+		},
+		{
+			name: "an existing N is left alone",
+			raw: buildVCard("4.0",
+				"UID:alice",
+				"FN:Alice Adams",
+				"N:Adams;Alice;Q;Dr.;PhD",
+			),
+			wantLines: []string{"N:Adams;Alice;Q;Dr.;PhD"},
+		},
+		{
+			name: "a remote photo URI is marked as one",
+			raw: buildVCard("4.0",
+				"UID:alice",
+				"FN:Alice Adams",
+				"N:Adams;Alice;;;",
+				"PHOTO:https://example.com/alice.jpg",
+			),
+			wantLines: []string{"PHOTO;VALUE=uri:https://example.com/alice.jpg"},
+		},
+		{
+			name: "an inline photo still unpacks to base64",
+			raw: buildVCard("4.0",
+				"UID:alice",
+				"FN:Alice Adams",
+				"N:Adams;Alice;;;",
+				"PHOTO:data:image/jpeg;base64,QUJD",
+			),
+			wantLines:   []string{"ENCODING=b", "TYPE=JPEG", "QUJD"},
+			absentLines: []string{"VALUE=uri"},
+		},
+		{
+			name: "every binary property carrying a URI is marked",
+			raw: buildVCard("4.0",
+				"UID:alice",
+				"FN:Alice Adams",
+				"N:Adams;Alice;;;",
+				"LOGO:https://example.com/logo.png",
+				"SOUND:https://example.com/name.ogg",
+				"KEY:https://example.com/alice.asc",
+			),
+			wantLines: []string{
+				"LOGO;VALUE=uri:https://example.com/logo.png",
+				"SOUND;VALUE=uri:https://example.com/name.ogg",
+				"KEY;VALUE=uri:https://example.com/alice.asc",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := convertVCardVersion(tc.raw, "3.0")
+			if !ok {
+				t.Fatalf("convertVCardVersion(_, %q) refused a convertible card", "3.0")
+			}
+			if err := validateVCardForVersion(got, "3.0"); err != nil {
+				t.Fatalf("converted card is not valid vCard 3.0: %v\n%s", err, got)
+			}
+			for _, want := range tc.wantLines {
+				if !strings.Contains(got, want) {
+					t.Errorf("converted card is missing %q:\n%s", want, got)
+				}
+			}
+			for _, absent := range tc.absentLines {
+				if strings.Contains(got, absent) {
+					t.Errorf("converted card should not carry %q:\n%s", absent, got)
+				}
+			}
+		})
+	}
+}
+
+// RFC 6350 Section 6.2.1 makes FN mandatory, and RFC 2426 does not require a
+// 3.0 card to carry one. The upgrade owes the same structural repair the
+// downgrade does.
+func TestUpgradedVCardIsValidForItsVersion(t *testing.T) {
+	raw := buildVCard("3.0",
+		"UID:alice",
+		"N:Adams;Alice;;;",
+	)
+	got, ok := convertVCardVersion(raw, "4.0")
+	if !ok {
+		t.Fatal("vCard 3.0 without FN must still upgrade")
+	}
+	if err := validateVCardForVersion(got, "4.0"); err != nil {
+		t.Fatalf("converted card is not valid vCard 4.0: %v\n%s", err, got)
+	}
+	if !strings.Contains(got, "FN:Alice Adams") {
+		t.Errorf("upgrade did not derive FN from N:\n%s", got)
+	}
+}
+
+// Refusing a card makes the resource invisible to the client -- the sync token
+// advances either way, so it is never asked for again. A card that was already
+// invalid in its stored version is therefore converted as far as it goes rather
+// than refused: the conversion is not what made it invalid, and handing back
+// something a client can read beats handing back nothing at all.
+func TestConvertVCardVersionDoesNotRefuseAnAlreadyInvalidStoredCard(t *testing.T) {
+	// Neither FN nor N, so neither can be derived from the other, and RFC 6350
+	// Section 6.2.1 already made this invalid as a 4.0 card.
+	raw := buildVCard("4.0", "UID:alice", "EMAIL:alice@example.com")
+	got, ok := convertVCardVersion(raw, "3.0")
+	if !ok {
+		t.Fatal("an already-invalid stored card must still be handed back converted")
+	}
+	for _, want := range []string{"VERSION:3.0", "UID:alice", "EMAIL:alice@example.com"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("converted card is missing %q:\n%s", want, got)
 		}
 	}
 }
