@@ -58,20 +58,61 @@ We reserve the right to prioritize, review, or decline such contributions at our
 - Write clear, readable code
 - Add comments where necessary, but prefer code that is self-documenting
 
-## Contributor License Agreement (CLA)
+## CalCard Contributor License Agreement (CLA)
 
-By submitting a contribution to this repository, you agree to the following:
+Version 1.1 — 7/29/2026
 
-1. You certify that you have the right to submit your contribution and that it does not violate any third-party rights.
-2. You grant JW6 Ventures LLC a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, distribute, sublicense, and otherwise exploit your contributions as part of CalCard.
-3. You agree that your contributions may be licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only) or other licenses at the discretion of JW6 Ventures LLC.
-4. You agree that JW6 Ventures LLC may offer your contributions as part of a commercial or proprietary product or service.
+Thank you for contributing to CalCard.
 
-If you do not agree to these terms, do not submit a contribution.
+You keep ownership of your Contributions and remain free to use or license them for any other purpose. This agreement gives JW6 Ventures LLC the permissions needed to maintain CalCard, distribute it as open-source software, and offer commercial or proprietary editions such as CalCard Pro.
 
-## License
+### 1. Contributions
 
-By contributing, you agree that your contributions will be licensed under the terms described in the LICENSE file.
+A **“Contribution”** is any original source code, documentation, design, or other work that you intentionally submit to a public CalCard repository for inclusion in CalCard.
+
+General discussion, feature requests, bug reports, and other communications are not Contributions unless you clearly intend them to be incorporated into CalCard.
+
+### 2. Copyright License
+
+You grant JW6 Ventures LLC a perpetual, worldwide, non-exclusive, royalty-free, irrevocable copyright license to:
+
+- use, reproduce, modify, and prepare derivative works from your Contributions;
+- publicly display, publicly perform, and distribute them;
+- sublicense and relicense them; and
+- include them in open-source, commercial, or proprietary versions of CalCard, including CalCard Pro, and in related products and services.
+
+JW6 Ventures LLC may license your Contributions under the GNU Affero General Public License v3.0, another open-source license, or commercial or proprietary terms.
+
+However, any Contribution accepted into the public CalCard repository will also remain available under the AGPL-3.0-only license or another OSI-approved open-source license. Commercial licensing does not revoke rights already granted for an open-source release.
+
+### 3. Patent License
+
+To the extent that you can license them, you grant JW6 Ventures LLC and recipients of CalCard a perpetual, worldwide, non-exclusive, royalty-free patent license to make, have made, use, sell, offer for sale, import, and otherwise distribute your Contribution as part of CalCard.
+
+This license applies only to patent claims that are necessarily infringed by your Contribution alone or by its combination with the version of CalCard to which it was submitted.
+
+If a person or entity brings patent litigation alleging that your Contribution or CalCard infringes a patent, the patent licenses granted to that person or entity under this agreement terminate when that litigation is filed.
+
+### 4. Your Assurances
+
+You represent that:
+
+- you have the legal right to submit and license your Contribution;
+- your Contribution is your original work, except for third-party material that you clearly identify;
+- you will disclose any known third-party licenses or restrictions affecting your Contribution; and
+- if an employer or another organization may own rights in your Contribution, you have obtained any permission needed to submit it.
+
+### 5. No Support or Warranty
+
+You are not required to provide support for your Contribution.
+
+Unless required by law or separately agreed in writing, your Contribution is provided **“as is,” without warranties or conditions of any kind**, including warranties of title, non-infringement, merchantability, or fitness for a particular purpose.
+
+### 6. Acceptance and Future Contributions
+
+By electronically accepting this agreement through CalCard’s contribution process and submitting a Contribution, you agree to these terms.
+
+This agreement applies to that Contribution and future Contributions you submit. You may withdraw your agreement for future Contributions by providing written notice to JW6 Ventures LLC, but the licenses already granted for previously submitted Contributions remain in effect.
 
 ## Project Direction
 
