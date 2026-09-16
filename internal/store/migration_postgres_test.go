@@ -429,3 +429,48 @@ func TestPostgres_V120MigrationCreatesClaimableDigestNonceTable(t *testing.T) {
 		t.Fatalf("nonce count %d was claimed twice", uint32(maxNonceCount))
 	}
 }
+
+func TestPostgres_UpgradeRepairsFoldedRecurrenceBounds(t *testing.T) {
+	pool := newPostgresSchemaPool(t, "testdata/schema_v1.0.13.sql")
+	var calendarID int64
+	if err := pool.QueryRow(`WITH u AS (INSERT INTO users(oauth_subject, primary_email) VALUES ('folded','folded@example.test') RETURNING id) INSERT INTO calendars(user_id,name) SELECT id,'Folded' FROM u RETURNING id`).Scan(&calendarID); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ uid, component, property string }{
+		{"rrule", "VE\r\n VENT", "RRU\r\n LE:FREQ=DAILY;COUNT=365"},
+		{"rdate", "VT\r\n\tODO", "RDA\r\n\tTE:20260615T100000Z"},
+		{"detached", "VJOU\r\n RNAL", "RECURRENCE-\r\n ID:20260615T100000Z"},
+		{"lf", "VE\n VENT", "RRU\n LE:FREQ=DAILY;COUNT=365"},
+	} {
+		raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:" + test.component + "\r\nUID:" + test.uid + "\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\n" + test.property + "\r\nEND:" + test.component + "\r\nEND:VCALENDAR\r\n"
+		if _, err := pool.Exec(`INSERT INTO events(calendar_id,uid,resource_name,raw_ical,etag,dtstart,dtend) VALUES ($1,$2,$2,$3,'e','2026-01-15T10:00:00Z','2026-01-15T11:00:00Z')`, calendarID, test.uid, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, version := range []string{"v1.1.3.sql", "v1.1.4.sql", "v1.1.6.sql", "v1.1.7.sql", "v1.1.8.sql", "v1.1.9.sql"} {
+		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", version))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(string(body)); err != nil {
+			t.Fatalf("%s: %v", version, err)
+		}
+	}
+	applyV120Migration(t, pool)
+	start := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 0, 1)
+	events, err := New(pool).Events.ListForCalendarFiltered(t.Context(), calendarID, EventFilter{Start: &start, End: &end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("June candidates = %d, want 4", len(events))
+	}
+	var repaired int
+	if err := pool.QueryRow(`SELECT count(*) FROM events WHERE recurrence_start = $1 AND recurrence_until = $2`, icalpkg.RecurrenceStartSentinel, icalpkg.RecurrenceUntilSentinel).Scan(&repaired); err != nil {
+		t.Fatal(err)
+	}
+	if repaired != 4 {
+		t.Fatalf("repaired bounds = %d, want 4", repaired)
+	}
+}

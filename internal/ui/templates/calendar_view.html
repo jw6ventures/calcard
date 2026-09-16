@@ -2475,8 +2475,8 @@
                 var segmentEnd = eventEnd > nextDay ? nextDay : eventEnd;
                 return {
                     event: event,
-                    startMinute: Math.max(0, (segmentStart - day) / 60000),
-                    endMinute: Math.min(1440, (segmentEnd - day) / 60000)
+                    startMinute: segmentStart.getHours() * 60 + segmentStart.getMinutes() + segmentStart.getSeconds() / 60,
+                    endMinute: segmentEnd >= nextDay ? 1440 : segmentEnd.getHours() * 60 + segmentEnd.getMinutes() + segmentEnd.getSeconds() / 60
                 };
             }).sort(function(a, b) {
                 return a.startMinute - b.startMinute || a.endMinute - b.endMinute;
@@ -2488,7 +2488,8 @@
                     return endMinute <= segment.startMinute;
                 });
                 if (column === -1) column = columnEnds.length;
-                columnEnds[column] = segment.endMinute;
+                // Repeated clock hours share rows; backward intervals retain a visible block.
+                columnEnds[column] = Math.min(1440, Math.max(segment.endMinute, segment.startMinute + 20 / 56 * 60));
                 segment.column = column;
             });
             var columnCount = Math.max(1, columnEnds.length);
@@ -2498,7 +2499,7 @@
                 eventElement.className = 'timed-event';
                 eventElement.style.backgroundColor = CAL_COLOR;
                 eventElement.style.top = (segment.startMinute / 30 * 28) + 'px';
-                eventElement.style.height = Math.max(20, (segment.endMinute - segment.startMinute) / 30 * 28 - 1) + 'px';
+                eventElement.style.height = Math.min((1440 - segment.startMinute) / 30 * 28, Math.max(20, (segment.endMinute - segment.startMinute) / 30 * 28 - 1)) + 'px';
                 eventElement.style.left = 'calc(' + (segment.column * 100 / columnCount) + '% + 2px)';
                 eventElement.style.width = 'calc(' + (100 / columnCount) + '% - 4px)';
                 eventElement.textContent = segment.event.summary || 'Untitled';

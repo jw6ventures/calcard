@@ -17,13 +17,13 @@ import (
 // projectFor runs the §9.6 projection over raw with no zone, which is the UTC
 // reading every fixture here is written in.
 func projectFor(raw string, selection *calendarDataEl) string {
-	return filterICalendarData(raw, newCalendarDataProjection(selection, floatingZone{}))
+	return mustReportText(filterICalendarData(raw, newCalendarDataProjection(selection, floatingZone{})))
 }
 
 // projectForZone is projectFor against the zone RFC 4791 §7.3 gives the report,
 // which is what a floating value in the stored octets resolves through.
 func projectForZone(raw string, selection *calendarDataEl, zone floatingZone) string {
-	return filterICalendarData(raw, newCalendarDataProjection(selection, zone))
+	return mustReportText(filterICalendarData(raw, newCalendarDataProjection(selection, zone)))
 }
 
 // vTimezoneObject is an iCalendar object carrying one VTIMEZONE. The observance
@@ -1768,7 +1768,7 @@ func TestCalendarDataSelectionCostIsIndependentOfSelectorCount(t *testing.T) {
 	projection := newCalendarDataProjection(selection, floatingZone{})
 	start := time.Now()
 	for i := 0; i < 2000; i++ {
-		if got := filterICalendarData(projectionFixture, projection); got == "" {
+		if got := mustReportText(filterICalendarData(projectionFixture, projection)); got == "" {
 			t.Fatal("projection returned nothing")
 		}
 	}
@@ -1780,7 +1780,7 @@ func TestCalendarDataSelectionCostIsIndependentOfSelectorCount(t *testing.T) {
 			len(selectors), elapsed)
 	}
 
-	assertICalendarComponentProperties(t, filterICalendarData(projectionFixture, projection), "VEVENT", map[string]string{
+	assertICalendarComponentProperties(t, mustReportText(filterICalendarData(projectionFixture, projection)), "VEVENT", map[string]string{
 		"UID":     "event-1",
 		"SUMMARY": "Test Event",
 	})
@@ -1827,9 +1827,16 @@ func TestCalendarDataProjectionWithoutTheSharedIndexProjectsTheSame(t *testing.T
 		}},
 	}}
 
-	indexed := filterICalendarData(projectionFixture, newCalendarDataProjection(selection, floatingZone{}))
-	bare := filterICalendarData(projectionFixture, calendarDataProjection{selection: selection})
+	indexed := mustReportText(filterICalendarData(projectionFixture, newCalendarDataProjection(selection, floatingZone{})))
+	bare := mustReportText(filterICalendarData(projectionFixture, calendarDataProjection{selection: selection}))
 	if indexed != bare {
 		t.Fatalf("projection without the shared index differs:\nindexed:\n%s\nbare:\n%s", indexed, bare)
 	}
+}
+
+func mustReportText(value string, err error) string {
+	if err != nil {
+		panic(err)
+	}
+	return value
 }

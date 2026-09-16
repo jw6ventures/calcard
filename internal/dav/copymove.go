@@ -318,6 +318,10 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 }
 
 func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
+	h.copyContactWithRetry(w, r, user, srcBookID, srcUID, destPath, overwrite, maxResourceStateRetries)
+}
+
+func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -343,6 +347,10 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 		return
 	}
 
+	if !h.checkConditionalHeadersContact(r, src) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
 		http.Error(w, "destination not found", http.StatusNotFound)
@@ -427,7 +435,16 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 			h.writeContactCopyMoveConflict(w, r, destBookID, destResourceName, src.UID)
 			return
 		}
-		if errors.Is(err, store.ErrResourceStateChanged) || errors.Is(err, store.ErrPreconditionFailed) {
+		if errors.Is(err, store.ErrResourceStateChanged) {
+			if retries > 0 {
+				invalidateDAVRequestState(r.Context())
+				h.copyContactWithRetry(w, r, user, srcBookID, srcUID, destPath, overwrite, retries-1)
+				return
+			}
+			http.Error(w, "resource changed; retry the request", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, store.ErrPreconditionFailed) {
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}
@@ -707,6 +724,10 @@ func (h *DavServer) writeCalendarCopyMoveConflict(w http.ResponseWriter, r *http
 }
 
 func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool) {
+	h.moveContactWithRetry(w, r, user, srcBookID, srcUID, destPath, overwrite, maxResourceStateRetries)
+}
+
+func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -741,6 +762,10 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 		return
 	}
 
+	if !h.checkConditionalHeadersContact(r, src) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
 		http.Error(w, "destination not found", http.StatusNotFound)
@@ -817,7 +842,16 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 			h.writeContactCopyMoveConflict(w, r, destBookID, destResourceName, src.UID)
 			return
 		}
-		if errors.Is(err, store.ErrResourceStateChanged) || errors.Is(err, store.ErrPreconditionFailed) {
+		if errors.Is(err, store.ErrResourceStateChanged) {
+			if retries > 0 {
+				invalidateDAVRequestState(r.Context())
+				h.moveContactWithRetry(w, r, user, srcBookID, srcUID, destPath, overwrite, retries-1)
+				return
+			}
+			http.Error(w, "resource changed; retry the request", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, store.ErrPreconditionFailed) {
 			http.Error(w, "resource state changed", http.StatusPreconditionFailed)
 			return
 		}

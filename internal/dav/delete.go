@@ -11,6 +11,10 @@ import (
 )
 
 func (h *DavServer) delete(w http.ResponseWriter, r *http.Request) {
+	h.deleteWithRetry(w, r, maxResourceStateRetries)
+}
+
+func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retries int) {
 	h.logger().Trace("Delete", "DELETE %s", r.URL.Path)
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -156,7 +160,12 @@ func (h *DavServer) delete(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if errors.Is(err, store.ErrResourceStateChanged) {
-				http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+				if retries > 0 {
+					invalidateDAVRequestState(r.Context())
+					h.deleteWithRetry(w, r, retries-1)
+					return
+				}
+				http.Error(w, "resource changed while deleting; retry the request", http.StatusConflict)
 				return
 			}
 			h.logger().Error("Delete", "failed to delete contact %q from address book %d: %v", existing.UID, addressBookID, err)

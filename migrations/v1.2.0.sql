@@ -226,7 +226,7 @@ CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id
 -- again. The sentinels match ical.RecurrenceStartSentinel and
 -- ical.RecurrenceUntilSentinel: deliberately open-ended, so a repaired row is a
 -- candidate for every range and the in-memory RFC 4791 Section 9.9 pass makes
--- the decision.
+-- the decision. Unfold content lines before matching component and property names.
 UPDATE events
     SET recurrence_start = COALESCE(recurrence_start, '1900-01-01T00:00:00Z'),
         recurrence_until = COALESCE(recurrence_until, '9999-12-31T23:59:59Z')
@@ -234,17 +234,17 @@ UPDATE events
       AND (
           EXISTS (
               SELECT 1
-              FROM regexp_matches(events.raw_ical, $re$BEGIN:VEVENT([[:space:][:print:]]*?)END:VEVENT$re$, 'gi') AS component(match)
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VEVENT([[:space:][:print:]]*?)END:VEVENT$re$, 'gi') AS component(match)
               WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
           )
           OR EXISTS (
               SELECT 1
-              FROM regexp_matches(events.raw_ical, $re$BEGIN:VTODO([[:space:][:print:]]*?)END:VTODO$re$, 'gi') AS component(match)
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VTODO([[:space:][:print:]]*?)END:VTODO$re$, 'gi') AS component(match)
               WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
           )
           OR EXISTS (
               SELECT 1
-              FROM regexp_matches(events.raw_ical, $re$BEGIN:VJOURNAL([[:space:][:print:]]*?)END:VJOURNAL$re$, 'gi') AS component(match)
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VJOURNAL([[:space:][:print:]]*?)END:VJOURNAL$re$, 'gi') AS component(match)
               WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
           )
       );

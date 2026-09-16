@@ -242,7 +242,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		// matches, answered without reading the collection at all.
 		var freeBusyData string
 		if freeBusyExcludedByDepth(r, report) {
-			freeBusyData = h.generateFreeBusy(nil, report.TimeRange)
+			freeBusyData, _ = h.generateFreeBusy(nil, report.TimeRange)
 		} else {
 			var err error
 			freeBusyData, err = h.freeBusyQuery(r.Context(), user, cal, report.TimeRange)
@@ -349,9 +349,17 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			// generated birthday collection defines no
 			// CALDAV:calendar-timezone, so §7.3 leaves UTC as the only source
 			// for a floating value.
-			candidates = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
+			candidates, err = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
+			if err != nil {
+				h.writeReportFailure(w, r, report.XMLName.Local, err)
+				return
+			}
 		}
-		freeBusyData := h.generateFreeBusy(candidates, report.TimeRange)
+		freeBusyData, err := h.generateFreeBusy(candidates, report.TimeRange)
+		if err != nil {
+			h.writeReportFailure(w, r, report.XMLName.Local, err)
+			return
+		}
 		w.Header().Set("Content-Type", "text/calendar")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(freeBusyData))

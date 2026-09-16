@@ -88,18 +88,25 @@ type calendarReportRequest struct {
 
 // applyCalendarFilter keeps the events a CALDAV:filter matches, resolving
 // floating values through zone, which RFC 4791 §7.3 orders ahead of UTC.
-func applyCalendarFilter(events []store.Event, filter *calFilter, zone floatingZone) []store.Event {
+func applyCalendarFilter(events []store.Event, filter *calFilter, zone floatingZone) ([]store.Event, error) {
 	if filter == nil {
-		return events
+		return events, nil
 	}
 
 	var filtered []store.Event
 	for _, event := range events {
-		if eventMatchesFilter(event, filter, zone) {
+		matcher, parsed := newEventTimeRangeMatcher(event, zone)
+		if !parsed {
+			continue
+		}
+		if matcherMatchesFilter(matcher, filter) {
 			filtered = append(filtered, event)
 		}
+		if *matcher.expansionError != nil {
+			return nil, *matcher.expansionError
+		}
 	}
-	return filtered
+	return filtered, nil
 }
 
 // eventMatchesFilter applies one CALDAV:filter to a calendar object resource.
@@ -423,7 +430,10 @@ func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest
 
 		matching := events
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(matching, filter, req.projection.zone)
+			if err != nil {
+				return nil, err
+			}
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, matching)
 		if err != nil {
@@ -562,7 +572,10 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, req calendarReportR
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching = applyCalendarFilter(matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(matching, filter, req.projection.zone)
+			if err != nil {
+				return nil, err
+			}
 		}
 		matching, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, matching)
 		if err != nil {

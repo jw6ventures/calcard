@@ -384,6 +384,10 @@ func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http
 }
 
 func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string) {
+	h.putContactWithRetry(w, r, user, addressBookID, cleanPath, body, bodyText, etag, maxResourceStateRetries)
+}
+
+func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string, retries int) {
 	book, err := h.getAddressBook(r.Context(), addressBookID)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -501,7 +505,15 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 	case errors.Is(err, store.ErrConflict):
 		writeCardDAVUIDConflict(w, cleanPath)
 		return
-	case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrResourceStateChanged):
+	case errors.Is(err, store.ErrResourceStateChanged):
+		if retries > 0 {
+			invalidateDAVRequestState(r.Context())
+			h.putContactWithRetry(w, r, user, addressBookID, cleanPath, body, bodyText, etag, retries-1)
+			return
+		}
+		http.Error(w, "resource changed while writing; retry the request", http.StatusConflict)
+		return
+	case errors.Is(err, store.ErrPreconditionFailed):
 		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	case errors.Is(err, store.ErrLockConflict):

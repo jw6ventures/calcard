@@ -289,7 +289,10 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 			// values against the request's CALDAV:timezone, else UTC. Its
 			// entries are DTSTART;VALUE=DATE, so the zone decides which instants
 			// the implied day covers.
-			events = applyCalendarFilter(events, report.Filter, reportFloatingZone(report.Timezone, nil))
+			events, err = applyCalendarFilter(events, report.Filter, reportFloatingZone(report.Timezone, nil))
+			if err != nil {
+				return nil, "", err
+			}
 		}
 		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, birthdayCalendarDataProjection(report))
 		return res, "", err

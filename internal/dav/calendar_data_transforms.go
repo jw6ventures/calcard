@@ -428,8 +428,12 @@ func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, 
 			return false
 		}
 		window := m.occurrenceWindow(master, dtstart)
-		slots := ical.RecurrenceSlots(m.raw, master.name, dtstart.instant, window,
+		slots, err := ical.RecurrenceSlots(m.raw, master.name, dtstart.instant, window,
 			r.Start, r.End, ical.MaxRecurrenceInstances, m.resolveContentLine)
+		if err != nil {
+			*m.expansionError = err
+			return false
+		}
 		for _, slot := range slots {
 			if slot.ExactOverride || !slot.GoverningRangeRecurrenceID.Equal(original.instant) {
 				continue

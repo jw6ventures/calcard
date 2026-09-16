@@ -55,8 +55,7 @@ func calendarResourceResponsesFilteredLimit(base string, events []store.Event, p
 			break
 		}
 		href := calendarObjectHref(baseHref, eventResourceName(ev))
-		rawData := filterICalendarData(ev.RawICAL, projection)
-		responses = append(responses, resourceResponse(href, etagProp(ev.ETag, rawData, true)))
+		responses = append(responses, rawCalendarResourceReportResponse(href, ev, projection))
 	}
 	return responses
 }
@@ -92,7 +91,10 @@ func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, 
 }
 
 func rawCalendarResourceReportResponse(href string, event store.Event, projection calendarDataProjection) response {
-	rawData := filterICalendarData(event.RawICAL, projection)
+	rawData, err := filterICalendarData(event.RawICAL, projection)
+	if err != nil {
+		return response{Href: href, Status: "HTTP/1.1 500 Internal Server Error"}
+	}
 	return resourceResponse(href, etagProp(event.ETag, rawData, true))
 }
 

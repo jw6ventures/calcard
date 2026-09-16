@@ -32,13 +32,16 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 		return "", errors.New("failed to list events")
 	}
 
-	candidates := filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, zone), tr)
+	candidates, err := filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, zone), tr)
+	if err != nil {
+		return "", err
+	}
 	candidates, err = h.filterFreeBusyCandidatesByPrivilege(ctx, user, cal, candidates)
 	if err != nil {
 		return "", err
 	}
 
-	return h.generateFreeBusy(candidates, tr), nil
+	return h.generateFreeBusy(candidates, tr)
 }
 
 // freeBusyCandidate is one calendar object under consideration, parsed once so
@@ -64,17 +67,20 @@ func freeBusyCandidates(events []store.Event, zone floatingZone) []freeBusyCandi
 	return candidates
 }
 
-func filterFreeBusyCandidatesByTimeRange(candidates []freeBusyCandidate, tr *timeRange) []freeBusyCandidate {
+func filterFreeBusyCandidatesByTimeRange(candidates []freeBusyCandidate, tr *timeRange) ([]freeBusyCandidate, error) {
 	if tr == nil {
-		return candidates
+		return candidates, nil
 	}
 	kept := make([]freeBusyCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if matcherInTimeRange(candidate.matcher, tr) {
 			kept = append(kept, candidate)
 		}
+		if *candidate.matcher.expansionError != nil {
+			return nil, *candidate.matcher.expansionError
+		}
 	}
-	return kept
+	return kept, nil
 }
 
 // filterFreeBusyCandidatesByPrivilege applies the CALDAV:read-free-busy check
@@ -157,7 +163,7 @@ func freeBusyHasTimeRange(tr *timeRange) bool {
 // generateFreeBusy builds the §7.10 response body. Each candidate resolves its
 // periods through the zone it was parsed with, which RFC 4791 §7.3 makes the
 // collection's CALDAV:calendar-timezone for this report.
-func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRange) string {
+func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRange) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
@@ -187,6 +193,9 @@ func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRan
 	var intervals []freeBusyInterval
 	for _, candidate := range candidates {
 		intervals = append(intervals, freeBusyIntervals(candidate, rangeStart, rangeEnd)...)
+		if *candidate.matcher.expansionError != nil {
+			return "", *candidate.matcher.expansionError
+		}
 	}
 	// §7.10 asks for duplicates to be dropped and consecutive or overlapping
 	// periods of the same type to be coalesced. Both are collection-wide
@@ -202,7 +211,7 @@ func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRan
 	sb.WriteString("END:VFREEBUSY\r\n")
 	sb.WriteString("END:VCALENDAR\r\n")
 
-	return sb.String()
+	return sb.String(), nil
 }
 
 var freeBusyUIDFallbackSequence atomic.Uint64
@@ -355,9 +364,13 @@ func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, range
 	}
 	// The expansion reads its EXDATEs and RDATEs through the same resolver that
 	// placed the start, so an exception still names an occurrence the zone moved.
-	periods := ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
+	periods, err := ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
 		rangeStart, rangeEnd, ical.MaxRecurrenceInstances, extent.resolve)
 
+	if err != nil {
+		*candidate.matcher.expansionError = err
+		return nil
+	}
 	overrides := freeBusyOverrides(candidate.matcher, candidate.matcher.root, master)
 	intervals := make([]freeBusyInterval, 0, len(periods))
 	for _, period := range periods {

@@ -154,3 +154,19 @@ func TestCalendarViewAllDayEndRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestTimeGridDST(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command(node, "testdata/time_grid_dst.mjs", filepath.Join("templates", name))
+			cmd.Env = append(os.Environ(), "TZ=America/New_York")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+		})
+	}
+}

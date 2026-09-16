@@ -47,7 +47,7 @@ func publishedFreeBusyOver(t *testing.T, tr *timeRange, events ...store.Event) [
 // in, which RFC 5545 §3.8.2.6 constrains and the sorted view above discards.
 func publishedFreeBusyInEmissionOrder(t *testing.T, tr *timeRange, events ...store.Event) []string {
 	t.Helper()
-	body := (&DavServer{}).generateFreeBusy(freeBusyCandidates(events, floatingZone{}), tr)
+	body := mustReportText((&DavServer{}).generateFreeBusy(freeBusyCandidates(events, floatingZone{}), tr))
 	return parsedFreeBusyLines(t, body)
 }
 

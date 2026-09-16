@@ -155,13 +155,15 @@ type icalTimeValue struct {
 // refuses those names too, but this evaluator answers independently rather than
 // trusting that, since it also runs over stored data the grammar never saw.
 type calendarTimeRangeMatcher struct {
-	raw  string
-	root *icalNode
-	zone floatingZone
+	// Copies made during the component walk share expansion failures.
+	expansionError *error
+	raw            string
+	root           *icalNode
+	zone           floatingZone
 }
 
 func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) calendarTimeRangeMatcher {
-	return calendarTimeRangeMatcher{raw: raw, root: root, zone: zone}
+	return calendarTimeRangeMatcher{raw: raw, root: root, zone: zone, expansionError: new(error)}
 }
 
 // dateValue resolves one date-valued property of node, shifting it by shift so
@@ -322,8 +324,12 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	if lead := m.alarmScanLead(node, window); lead > 0 {
 		scanStart, scanEnd = start.Add(-lead), end.Add(lead)
 	}
-	generated := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
+	generated, err := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
 		scanStart, scanEnd, ical.MaxRecurrenceInstances, m.resolveContentLine)
+	if err != nil {
+		*m.expansionError = err
+		return nil, false
+	}
 	instances := make([]recurrenceInstance, 0, len(generated))
 	for _, instance := range generated {
 		instances = append(instances, recurrenceInstance{

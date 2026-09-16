@@ -73,14 +73,14 @@ func reportCalendarData(report reportRequest) *calendarDataEl {
 // and a report that only names CALDAV:calendar-data owes the client exactly
 // what was PUT. Octets that do not parse are likewise returned as they stand,
 // since a projection cannot be derived from a tree that was never built.
-func filterICalendarData(raw string, projection calendarDataProjection) string {
+func filterICalendarData(raw string, projection calendarDataProjection) (string, error) {
 	selection := projection.selection
 	if selection == nil || selection.empty() {
-		return raw
+		return raw, nil
 	}
 	root, err := parseICalendarObject(raw)
 	if err != nil {
-		return raw
+		return raw, nil
 	}
 	index := projection.index
 	if index == nil && selection.Comp != nil {
@@ -88,7 +88,11 @@ func filterICalendarData(raw string, projection calendarDataProjection) string {
 		// correctly, at the per-resource cost the index exists to avoid.
 		index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
 	}
-	return writeICalendarObject(projectCalendarData(root, raw, selection, index, projection.zone))
+	projected, err := projectCalendarData(root, raw, selection, index, projection.zone)
+	if err != nil {
+		return "", err
+	}
+	return writeICalendarObject(projected), nil
 }
 
 // projectCalendarData applies the recurrence transform, then the free-busy
@@ -101,7 +105,7 @@ func filterICalendarData(raw string, projection calendarDataProjection) string {
 // it was stored. A transform hands the next one the tree it produced, which is
 // not the document any more -- expansion removes the VTIMEZONE a later value
 // may still name -- so the zone lookups have to keep answering from the parse.
-func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone) *icalNode {
+func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone) (*icalNode, error) {
 	m := newCalendarTimeRangeMatcher(raw, root, zone)
 	source := root
 	switch {
@@ -113,8 +117,11 @@ func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, 
 	if selection.LimitFreeBusySet != nil {
 		source = limitCalendarFreeBusySet(m, source, *selection.LimitFreeBusySet)
 	}
+	if *m.expansionError != nil {
+		return nil, *m.expansionError
+	}
 	if selection.Comp == nil {
-		return source
+		return source, nil
 	}
 	// §9.6.5 requires an expanded instance to carry the RECURRENCE-ID naming it,
 	// unconditionally. §9.6's permission to return data that is invalid per its
@@ -127,9 +134,9 @@ func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, 
 	}
 	projected := selectComponent(source, index, mandatory)
 	if projected == nil {
-		return nil
+		return nil, nil
 	}
-	return projected
+	return projected, nil
 }
 
 // calendarDataRootSelection scopes the request's CALDAV:comp to the VCALENDAR

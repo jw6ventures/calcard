@@ -243,7 +243,7 @@ func TestRecurringBusyPeriodsExpandsWeeklyRuleWithExdate(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
+	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 
 	// Mondays Jan 6, 13, 27 (Jan 20 excluded by EXDATE).
 	want := []time.Time{
@@ -283,7 +283,7 @@ func TestRecurringBusyPeriodsAppliesOverride(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
+	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 
 	overridden := time.Date(2025, 1, 13, 15, 0, 0, 0, time.UTC)
 	foundOverride := false
@@ -315,9 +315,9 @@ func TestRecurrenceInstancesExpandNonEventComponents(t *testing.T) {
 			if !componentHasRecurrence(raw, component) {
 				t.Fatalf("componentHasRecurrence(%s) = false", component)
 			}
-			got := instanceStarts(RecurrenceInstances(raw, component, dtstart, 0,
+			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, component, dtstart, 0,
 				time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-				time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil))
+				time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)))
 
 			want := []time.Time{
 				time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC),
@@ -351,7 +351,7 @@ func TestRecurrenceInstancesIncludeOccurrencesOnTheBounds(t *testing.T) {
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
 	boundary := time.Date(2025, 1, 7, 10, 0, 0, 0, time.UTC)
 
-	got := instanceStarts(RecurrenceInstances(raw, "VEVENT", dtstart, 0, boundary, boundary, 1000, nil))
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, 0, boundary, boundary, 1000, nil)))
 	if len(got) != 1 || !got[0].Equal(boundary) {
 		t.Fatalf("RecurrenceInstances() = %v, want exactly %v", got, boundary)
 	}
@@ -374,9 +374,9 @@ func TestRecurrenceInstancesOmitOverriddenInstances(t *testing.T) {
 		"END:VCALENDAR\r\n"
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
 
-	got := instanceStarts(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
 		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil))
+		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)))
 
 	for _, start := range got {
 		if start.Equal(time.Date(2025, 1, 13, 10, 0, 0, 0, time.UTC)) {
@@ -422,7 +422,7 @@ func TestRecurrenceInstancesUseTheSuppliedResolver(t *testing.T) {
 		t.Fatal("resolver rejected the DTSTART")
 	}
 
-	got := instanceStarts(RecurrenceInstances(raw, "VEVENT", dtstart, 0, scanStart, scanEnd, 1000, behind))
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, 0, scanStart, scanEnd, 1000, behind)))
 	want := []time.Time{
 		time.Date(2025, 1, 6, 13, 0, 0, 0, time.UTC),
 		time.Date(2025, 1, 20, 13, 0, 0, 0, time.UTC),
@@ -439,7 +439,7 @@ func TestRecurrenceInstancesUseTheSuppliedResolver(t *testing.T) {
 	// A nil resolver keeps the ParsePropertyDateTimeLocal reading, which is what
 	// every caller holding no zone of its own relies on.
 	plain, _ := ParsePropertyDateTimeLocal("DTSTART", "20250106T100000")
-	bare := instanceStarts(RecurrenceInstances(raw, "VEVENT", plain, 0, scanStart, scanEnd, 1000, nil))
+	bare := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", plain, 0, scanStart, scanEnd, 1000, nil)))
 	if len(bare) != 2 || !bare[0].Equal(plain) {
 		t.Fatalf("a nil resolver did not read as ParsePropertyDateTimeLocal: %v", bare)
 	}
@@ -505,9 +505,9 @@ func TestRecurrenceInstancesResolveEveryGeneratedCivilTime(t *testing.T) {
 				"END:VEVENT\r\n" +
 				"END:VCALENDAR\r\n"
 
-			got := instanceStarts(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
 				test.wantStarts[0].Add(-time.Hour), test.wantStarts[len(test.wantStarts)-1].Add(2*time.Hour),
-				1000, resolve))
+				1000, resolve)))
 			if len(got) != len(test.wantStarts) {
 				t.Fatalf("RecurrenceInstances() = %v, want %v", got, test.wantStarts)
 			}
@@ -604,7 +604,7 @@ func TestRecurrenceInstancesReportsTheSlotSeparatelyFromTheOccurrence(t *testing
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 4 {
 		t.Fatalf("instances = %d, want 4: %#v", len(instances), instances)
 	}
@@ -659,9 +659,9 @@ func TestRecurrenceSlotsExposeOverridePrecedence(t *testing.T) {
 		"END:VEVENT\r\n" +
 		"END:VCALENDAR\r\n"
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
-	slots := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour,
+	slots := requireRecurrenceResult[RecurrenceSlot](t)(RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour,
 		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)
+		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil))
 	if len(slots) != 4 {
 		t.Fatalf("slots = %d, want 4: %#v", len(slots), slots)
 	}
@@ -696,7 +696,7 @@ func TestRecurrenceInstancesSlotMatchesTheStartWithoutAnOverride(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 3 {
 		t.Fatalf("instances = %d, want 3", len(instances))
 	}
@@ -727,7 +727,7 @@ func TestRecurrenceInstancesKeepDistinctSlotsAtTheSameScheduledTime(t *testing.T
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil)
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 2 {
 		t.Fatalf("instances = %d, want 2 distinct recurrence slots: %#v", len(instances), instances)
 	}
@@ -855,8 +855,8 @@ func TestRecurrenceInstancesAppliesBySetPosOverTheWholePeriod(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-			instances := RecurrenceInstances(recurringTestComponent(tt.rrule), "VEVENT", dtstart, time.Hour,
-				dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+			instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(recurringTestComponent(tt.rrule), "VEVENT", dtstart, time.Hour,
+				dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil))
 
 			var got []string
 			for _, instance := range instances {
@@ -1059,5 +1059,48 @@ func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
 	})
 	if !handled || !exceeds {
 		t.Fatalf("finishSparseRecurrence() = (exceeds=%t, handled=%t), want (true, true) when a day's clock combinations exceed recurrencePeriodWorkLimit", exceeds, handled)
+	}
+}
+
+func requireRecurrenceResult[T any](t *testing.T) func([]T, error) []T {
+	t.Helper()
+	return func(values []T, err error) []T {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return values
+	}
+}
+
+func TestSparseRecurrenceReadsPreserveCountAndExceptions(t *testing.T) {
+	start := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	for _, freq := range []string{"MINUTELY", "SECONDLY"} {
+		for _, test := range []struct {
+			name, extra, override string
+			year, hour, count     int
+		}{
+			{name: "second occurrence", year: 2027, hour: 9, count: 1},
+			{name: "count exhausted", year: 2028, hour: 9, count: 0},
+			{name: "excluded first still counts", extra: "EXDATE:20260101T090000Z\r\n", year: 2028, hour: 9, count: 0},
+			{name: "excluded second", extra: "EXDATE:20270101T090000Z\r\n", year: 2027, hour: 9, count: 0},
+			{name: "override", override: "BEGIN:VEVENT\r\nUID:sparse\r\nRECURRENCE-ID:20270101T090000Z\r\nDTSTART:20270101T120000Z\r\nDTEND:20270101T130000Z\r\nEND:VEVENT\r\n", year: 2027, hour: 12, count: 1},
+			{name: "range override", override: "BEGIN:VEVENT\r\nUID:sparse\r\nRECURRENCE-ID;RANGE=THISANDFUTURE:20260101T090000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nEND:VEVENT\r\n", year: 2027, hour: 12, count: 1},
+		} {
+			t.Run(freq+"/"+test.name, func(t *testing.T) {
+				raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:sparse\r\nDTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\nRRULE:FREQ=" + freq + ";BYMONTH=1;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0;BYSECOND=0;COUNT=2\r\n" + test.extra + "END:VEVENT\r\n" + test.override + "END:VCALENDAR\r\n"
+				from := time.Date(test.year, 1, 1, test.hour, 0, 0, 0, time.UTC)
+				periods, err := RecurringBusyPeriods(raw, start, time.Hour, from, from.Add(time.Hour), 1000, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(periods) != test.count {
+					t.Fatalf("periods = %#v, want %d", periods, test.count)
+				}
+				if len(periods) > 0 && !periods[0].Start.Equal(from) {
+					t.Fatalf("start = %v, want %v", periods[0].Start, from)
+				}
+			})
+		}
 	}
 }
