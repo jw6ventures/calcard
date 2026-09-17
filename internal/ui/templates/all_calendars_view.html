@@ -775,6 +775,7 @@
             <input type="hidden" id="event-editor-method" name="_method" value="PUT" disabled>
             <input type="hidden" id="event-return-to" name="return_to">
             <input type="hidden" id="event-recurrence-id" name="recurrence_id">
+            <input type="hidden" id="event-recurrence-timezone" name="recurrence_timezone">
             <input type="hidden" id="event-recurrence-all-day" name="recurrence_all_day">
 
             <div class="form-row">
@@ -801,11 +802,11 @@
             <div class="form-row">
                 <div class="form-group">
                     <label for="event-dtstart">Start *</label>
-                    <input type="datetime-local" id="event-dtstart" name="dtstart" required>
+                    <input type="datetime-local" step="1" id="event-dtstart" name="dtstart" required>
                 </div>
                 <div class="form-group">
                     <label for="event-dtend">End *</label>
-                    <input type="datetime-local" id="event-dtend" name="dtend" required>
+                    <input type="datetime-local" step="1" id="event-dtend" name="dtend" required>
                 </div>
             </div>
             <div class="form-group">
@@ -955,6 +956,7 @@
             <input type="hidden" id="delete-return-to" name="return_to">
             <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="delete-recurrence-id" name="recurrence_id">
+            <input type="hidden" id="delete-recurrence-timezone" name="recurrence_timezone">
             <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day">
             <input type="hidden" id="delete-timezone" name="timezone">
         </form>
@@ -1675,15 +1677,24 @@
         return formatLocalDate(date);
     }
 
-    function formatDateTimeInput(date) {
+    function formatDateTimeInput(date, timezone) {
+        if (timezone) {
+            var parts = {};
+            new Intl.DateTimeFormat('en-US', {
+                timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+            }).formatToParts(date).forEach(function(part) { parts[part.type] = part.value; });
+            return parts.year + '-' + parts.month + '-' + parts.day + 'T' + parts.hour + ':' + parts.minute +
+                (parts.second === '00' ? '' : ':' + parts.second);
+        }
         return formatLocalDate(date) + 'T' +
             String(date.getHours()).padStart(2, '0') + ':' +
             String(date.getMinutes()).padStart(2, '0');
     }
 
-    function formatRecurrenceInput(date, allDay) {
+    function formatRecurrenceInput(date, allDay, timezone) {
         if (!date) return '';
-        return allDay ? formatDateInput(date) : formatDateTimeInput(date);
+        return allDay ? formatDateInput(date) : formatDateTimeInput(date, timezone);
     }
 
     // An all-day event's DTEND is exclusive -- the day after the last one it
@@ -1703,13 +1714,13 @@
     }
 
     // end is always the exclusive end; allDay decides how it is presented.
-    function setEditorDateValues(start, end, allDay) {
+    function setEditorDateValues(start, end, allDay, timezone) {
         var startInput = document.getElementById('event-dtstart');
         var endInput = document.getElementById('event-dtend');
         startInput.type = allDay ? 'date' : 'datetime-local';
         endInput.type = allDay ? 'date' : 'datetime-local';
-        startInput.value = allDay ? formatDateInput(start) : formatDateTimeInput(start);
-        endInput.value = allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end);
+        startInput.value = allDay ? formatDateInput(start) : formatDateTimeInput(start, timezone);
+        endInput.value = allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end, timezone);
         document.getElementById('event-all-day').checked = allDay;
     }
 
@@ -1815,7 +1826,7 @@
         document.getElementById('event-summary').value = event.summary || '';
         document.getElementById('event-location').value = event.location || '';
         document.getElementById('event-description').value = event.description || '';
-        document.getElementById('event-timezone').value = event.timezone || '';
+        document.getElementById('event-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
         document.getElementById('event-status').value = event.status || '';
         document.getElementById('event-visibility').value = event.class || '';
         document.getElementById('event-availability').value = event.transp || '';
@@ -1830,10 +1841,11 @@
         // of one day, which is an exclusive end of the day after DTSTART.
         var eventEnd = event.dtend ||
             (event.allDay ? addDays(startOfDay(event.dtstart), 1) : new Date(event.dtstart.getTime() + 30 * 60000));
-        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay);
+        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay, event.timezone || 'UTC');
         var recurrenceID = event.recurrenceId || (event.isOccurrence ? event.dtstart : null);
         document.getElementById('event-recurrence-id').value =
-            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay);
+            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay, event.recurrenceTimezone || event.timezone || 'UTC');
+        document.getElementById('event-recurrence-timezone').value = event.recurrenceTimezone || event.timezone || 'UTC';
         document.getElementById('event-recurrence-all-day').value =
             event.recurrenceIdAllDay ? 'true' : 'false';
         document.getElementById('event-edit-scope-group').style.display = event.isOccurrence ? 'block' : 'none';
@@ -1867,11 +1879,12 @@
             '/calendars/' + event.calendarId + '/events/' + encodedUID + '/delete';
         document.getElementById('event-return-to').value = currentReturnPath();
         document.getElementById('delete-return-to').value = currentReturnPath();
+        document.getElementById('delete-recurrence-timezone').value = document.getElementById('event-recurrence-timezone').value;
         document.getElementById('delete-recurrence-id').value =
             document.getElementById('event-recurrence-id').value;
         document.getElementById('delete-recurrence-all-day').value =
             document.getElementById('event-recurrence-all-day').value;
-        document.getElementById('delete-timezone').value = event.timezone || '';
+        document.getElementById('delete-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
 
         modal.classList.remove('show');
         editorModal.classList.add('show');

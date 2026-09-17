@@ -1104,3 +1104,31 @@ func TestSparseRecurrenceReadsPreserveCountAndExceptions(t *testing.T) {
 		}
 	}
 }
+
+func TestRecurrenceInstancePeriodDurationAndRangeOverride(t *testing.T) {
+	start := time.Date(2024, 6, 1, 9, 0, 0, 0, time.UTC)
+	base := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:period\r\nDTSTART:20240601T090000Z\r\nDTEND:20240601T100000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nRDATE;VALUE=PERIOD:20240605T090000Z/PT3H\r\nEND:VEVENT\r\n"
+	for _, override := range []bool{false, true} {
+		t.Run(strconv.FormatBool(override), func(t *testing.T) {
+			raw := base
+			if override {
+				raw += "BEGIN:VEVENT\r\nUID:period\r\nRECURRENCE-ID;RANGE=THISANDFUTURE:20240603T090000Z\r\nDTSTART:20240603T100000Z\r\nDTEND:20240603T140000Z\r\nEND:VEVENT\r\n"
+			}
+			raw += "END:VCALENDAR\r\n"
+			instances, err := RecurrenceInstances(raw, "VEVENT", start, time.Hour, start.AddDate(0, 0, 4), start.AddDate(0, 0, 5), 10, nil)
+			if err != nil || len(instances) != 1 {
+				t.Fatalf("%+v, %v", instances, err)
+			}
+			wantStart := start.AddDate(0, 0, 4)
+			wantEnd := wantStart.Add(3 * time.Hour)
+			if override {
+				wantStart = wantStart.Add(time.Hour)
+				wantEnd = wantStart.Add(4 * time.Hour)
+			}
+			got := instances[0]
+			if !got.Start.Equal(wantStart) || !got.End.Equal(wantEnd) || !got.RecurrenceID.Equal(start.AddDate(0, 0, 4)) {
+				t.Fatalf("got %+v, want %s/%s", got, wantStart, wantEnd)
+			}
+		})
+	}
+}

@@ -814,3 +814,27 @@ func TestResourceNameForUID(t *testing.T) {
 		t.Fatalf("ResourceNameForUID() = %q", got)
 	}
 }
+
+func TestFormatICalDateTimeUTCRecurrenceIdentity(t *testing.T) {
+	got, err := FormatICalDateTime("2025-07-24T09:00", false, false, "RECURRENCE-ID", "UTC")
+	if err != nil || got != "RECURRENCE-ID:20250724T090000Z" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestSameRecurrenceID(t *testing.T) {
+	for _, tc := range []struct {
+		left, right string
+		want        bool
+	}{
+		{"RECURRENCE-ID;TZID=UTC:20250724T090000", "RECURRENCE-ID:20250724T090000Z", true},
+		{"RECURRENCE-ID;TZID=America/New_York:20250724T090000", "RECURRENCE-ID:20250724T130000Z", true},
+		{"RECURRENCE-ID;TZID=America/New_York:20250724T090000", "RECURRENCE-ID;TZID=America/Los_Angeles:20250724T090000", false},
+		{"RECURRENCE-ID;VALUE=DATE:20250724", "RECURRENCE-ID:20250724T000000Z", false},
+		{"RECURRENCE-ID:20250724T090000", "RECURRENCE-ID:20250724T090000Z", false},
+	} {
+		if got := SameRecurrenceID([]string{tc.left}, []string{tc.right}); got != tc.want {
+			t.Errorf("%s vs %s: %t", tc.left, tc.right, got)
+		}
+	}
+}

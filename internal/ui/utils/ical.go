@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // GenerateUID creates a unique identifier for calendar/contact objects.
@@ -127,6 +129,9 @@ func FormatICalDateTime(value string, allDay bool, exclusiveEnd bool, prop strin
 			t, err := parseDateTimeLocal(value, loc)
 			if err != nil {
 				return "", err
+			}
+			if tzid == "UTC" {
+				return fmt.Sprintf("%s:%s", prop, t.Format("20060102T150405Z")), nil
 			}
 			return fmt.Sprintf("%s;TZID=%s:%s", prop, tzid, t.Format("20060102T150405")), nil
 		}
@@ -673,6 +678,34 @@ func RecurrenceIDValue(lines []string) string {
 		}
 	}
 	return ""
+}
+
+// SameRecurrenceID compares occurrence identities, including equivalent timezone spellings.
+func SameRecurrenceID(left, right []string) bool {
+	read := func(lines []string) (string, string) {
+		for _, line := range lines {
+			key, value, ok := strings.Cut(line, ":")
+			if ok && (key == "RECURRENCE-ID" || strings.HasPrefix(key, "RECURRENCE-ID;")) {
+				return key, value
+			}
+		}
+		return "", ""
+	}
+	lk, lv := read(left)
+	rk, rv := read(right)
+	if lv == "" || rv == "" {
+		return false
+	}
+	floating := func(key, value string) bool { return len(value) == 15 && !strings.Contains(key, "TZID=") }
+	if (len(lv) == 8) != (len(rv) == 8) || floating(lk, lv) != floating(rk, rv) {
+		return false
+	}
+	lt, lok := ical.ParsePropertyDateTimeLocal(lk, lv)
+	rt, rok := ical.ParsePropertyDateTimeLocal(rk, rv)
+	if lok && rok {
+		return lt.Equal(rt)
+	}
+	return lk == rk && lv == rv
 }
 
 // HasPropertyValue checks if a property has a specific value.

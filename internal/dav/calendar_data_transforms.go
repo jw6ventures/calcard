@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,10 +59,15 @@ func expandCalendarData(m calendarTimeRangeMatcher, root *icalNode, r calendarRa
 			continue
 		}
 		budget := ical.MaxRecurrenceInstances - len(expanded.children)
-		if budget <= 0 {
-			break
+		children := expandComponent(m, root, child, r, budget)
+		if *m.expansionError != nil {
+			return expanded
 		}
-		expanded.children = append(expanded.children, expandComponent(m, root, child, r, budget)...)
+		if len(children) > budget {
+			*m.expansionError = ical.ErrRecurrenceExpansionLimit
+			return expanded
+		}
+		expanded.children = append(expanded.children, children...)
 	}
 	return expanded
 }
@@ -104,13 +110,15 @@ func expandComponent(m calendarTimeRangeMatcher, root, node *icalNode, r calenda
 
 	var expanded []*icalNode
 	for _, instance := range instances {
-		if len(expanded) >= budget {
-			break
-		}
-		if !m.componentInTimeRange(node, root, r.Start, r.End, instance.shift) {
+		occurrence := expandedInstance(m, root, node, instance)
+		if !m.componentInTimeRange(occurrence, root, r.Start, r.End, 0) {
 			continue
 		}
-		expanded = append(expanded, expandedInstance(m, root, node, instance))
+		if len(expanded) >= budget {
+			*m.expansionError = ical.ErrRecurrenceExpansionLimit
+			return expanded
+		}
+		expanded = append(expanded, occurrence)
 	}
 	return expanded
 }
@@ -167,6 +175,36 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 	}
 
 	expanded := utcComponent(m, content, contentShift)
+	if start, ok := m.dateValue(content, "DTSTART", 0); ok {
+		delta := instance.duration - m.occurrenceWindow(content, start)
+		if delta != 0 {
+			adjusted := false
+			for i, property := range expanded.properties {
+				switch property.name {
+				case "DTEND", "DUE":
+					if end, ok := utcProperty(m, property, delta); ok {
+						expanded.properties[i] = end
+						adjusted = true
+					}
+				case "DURATION":
+					expanded.properties[i].value = "PT" + strconv.FormatInt(int64(instance.duration/time.Second), 10) + "S"
+					adjusted = true
+				}
+			}
+			if !adjusted && (master.name == "VEVENT" || master.name == "VTODO") {
+				property, _ := firstICalProperty(content, "DTSTART")
+				end, ok := utcProperty(m, property, contentShift+instance.duration)
+				if ok {
+					end.name = "DTEND"
+					if master.name == "VTODO" {
+						end.name = "DUE"
+					}
+					end.keyPart = end.name + propertyParameterPart(end.keyPart)
+					expanded.properties = append(expanded.properties, end)
+				}
+			}
+		}
+	}
 	expanded.properties = dropProperties(expanded.properties, recurrenceIDName)
 	if id, ok := recurrenceIDProperty(m, master, instance.slotShift); ok {
 		expanded.properties = append(expanded.properties, id)

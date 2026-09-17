@@ -319,9 +319,15 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		}
 		return nil, "", errors.New("failed to list contacts")
 	}
+	candidateCount := len(contacts)
 	contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
 	if err != nil {
 		return nil, "", err
+	}
+
+	// Reconcile lost visibility without disclosing names the requester cannot read.
+	if !since.IsZero() && len(contacts) != candidateCount {
+		return nil, "", errInvalidSyncToken
 	}
 
 	responses := []response{
@@ -374,7 +380,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 				break
 			}
 			if !canReadAddressBookContactWithDecider(resourceName, decider) {
-				continue
+				return nil, "", errInvalidSyncToken
 			}
 			href := addressObjectHref(collectionHref, resourceName)
 			if _, live := liveHrefs[href]; live {

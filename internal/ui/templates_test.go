@@ -1,11 +1,16 @@
 package ui
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
 
 func TestTemplatesEmbedded(t *testing.T) {
@@ -32,7 +37,7 @@ func TestAggregateEditorConvertsAllDayEndForDisplay(t *testing.T) {
 	for _, want := range []string{
 		"function inclusiveAllDayEnd(start, exclusiveEnd)",
 		"function exclusiveAllDayEnd(start, lastDay)",
-		"allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end)",
+		"allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end, timezone)",
 	} {
 		if !strings.Contains(string(source), want) {
 			t.Errorf("all_calendars_view.html is missing %q: an all-day end reaches the form unconverted", want)
@@ -168,5 +173,56 @@ func TestTimeGridDST(t *testing.T) {
 				t.Fatalf("%v\n%s", err, output)
 			}
 		})
+	}
+}
+
+func TestTimedEditorTimezoneRoundTrip(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	for _, template := range []string{"all_calendars_view.html", "calendar_view.html"} {
+		for _, browserZone := range []string{"America/Los_Angeles", "UTC", "Pacific/Kiritimati"} {
+			t.Run(template+"/"+browserZone, func(t *testing.T) {
+				cmd := exec.Command(node, filepath.Join("testdata", "timed_editor_roundtrip.mjs"), filepath.Join("templates", template))
+				cmd.Env = append(os.Environ(), "TZ="+browserZone)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("template helpers: %v: %s", err, output)
+				}
+				var cases []struct {
+					Start, End, Zone, RecurrenceZone string
+					Values                           []string
+				}
+				if err := json.Unmarshal(output, &cases); err != nil {
+					t.Fatal(err)
+				}
+				for _, c := range cases {
+					for i, prop := range []string{"DTSTART", "DTEND", "RECURRENCE-ID"} {
+						zone := c.Zone
+						if i == 2 {
+							zone = c.RecurrenceZone
+						}
+						line, err := utils.FormatICalDateTime(c.Values[i], false, false, prop, zone)
+						if err != nil {
+							t.Fatal(err)
+						}
+						key, value, _ := strings.Cut(line, ":")
+						got, ok := ical.ParsePropertyDateTimeLocal(key, value)
+						original := c.Start
+						if i == 1 {
+							original = c.End
+						}
+						want, err := time.Parse(time.RFC3339, original)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !ok || !got.Equal(want) {
+							t.Errorf("%s: %s submitted as %s, want instant %s", prop, original, line, want)
+						}
+					}
+				}
+			})
+		}
 	}
 }

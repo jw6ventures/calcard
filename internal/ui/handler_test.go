@@ -4928,3 +4928,31 @@ func TestManagedShareAfterBroadReadGrant(t *testing.T) {
 		})
 	}
 }
+
+func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
+	for _, method := range []string{"edit", "delete"} {
+		t.Run(method, func(t *testing.T) {
+			raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=America/New_York:20250724T090000\r\nDTEND;TZID=America/New_York:20250724T100000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+			repo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{"1:event": {ID: 1, CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: raw, ETag: "original"}}}}
+			h := NewHandler(&config.Config{}, &store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100}}}, Events: repo}, nil)
+			form := url.Values{"summary": {"Changed"}, "dtstart": {"2025-07-25T09:00"}, "dtend": {"2025-07-25T10:00"}, "timezone": {"America/Los_Angeles"}, "edit_scope": {"occurrence"}, "recurrence_id": {"2025-07-25T09:00"}, "recurrence_timezone": {"America/New_York"}}
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			rctx.URLParams.Add("uid", "event")
+			req = req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100}), chi.RouteCtxKey, rctx))
+			rr := httptest.NewRecorder()
+			prop := "RECURRENCE-ID"
+			if method == "delete" {
+				h.DeleteEvent(rr, req)
+				prop = "EXDATE"
+			} else {
+				h.UpdateEvent(rr, req)
+			}
+			if rr.Code != 302 || !strings.Contains(repo.events["1:event"].RawICAL, prop+";TZID=America/New_York:20250725T090000") {
+				t.Fatalf("%d %s: %s", rr.Code, rr.Body.String(), repo.events["1:event"].RawICAL)
+			}
+		})
+	}
+}

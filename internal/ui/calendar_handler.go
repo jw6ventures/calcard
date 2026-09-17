@@ -1449,18 +1449,21 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		// Update only a single occurrence by replacing/adding a RECURRENCE-ID component.
 		header, components, footer := utils.SplitComponents(existing.RawICAL)
 		override := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "", opts)
-		if recLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", opts.Timezone); err == nil && recLine != "" {
+		recurrenceZone := strings.TrimSpace(r.FormValue("recurrence_timezone"))
+		if recurrenceZone == "" {
+			recurrenceZone = opts.Timezone
+		}
+		if recLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", recurrenceZone); err == nil && recLine != "" {
 			if len(override) >= 2 {
 				override = append(override[:2], append([]string{recLine}, override[2:]...)...)
 			} else {
 				override = append([]string{recLine}, override...)
 			}
 		}
-		targetRecID := utils.RecurrenceIDValue(override)
 
 		var newComponents [][]string
 		for _, comp := range components {
-			if utils.RecurrenceIDValue(comp) == targetRecID {
+			if utils.SameRecurrenceID(comp, override) {
 				continue
 			}
 			newComponents = append(newComponents, comp)
@@ -1556,7 +1559,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		timezone := strings.TrimSpace(r.FormValue("timezone"))
+		timezone := strings.TrimSpace(r.FormValue("recurrence_timezone"))
+		if timezone == "" {
+			timezone = strings.TrimSpace(r.FormValue("timezone"))
+		}
 		exdateLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "EXDATE", timezone)
 		if err != nil || exdateLine == "" {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
@@ -1572,9 +1578,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		header, components, footer := utils.SplitComponents(existing.RawICAL)
 		var newComponents [][]string
 		masterHandled := false
+		targetIdentity := []string{strings.Replace(exdateLine, "EXDATE", "RECURRENCE-ID", 1)}
 		for _, comp := range components {
 			recID := utils.RecurrenceIDValue(comp)
-			if recID == targetValue {
+			if utils.SameRecurrenceID(comp, targetIdentity) {
 				// Drop an overridden occurrence matching the target.
 				continue
 			}
@@ -1901,6 +1908,7 @@ type calendarEventMetadata struct {
 	Reminders          []int
 	RecurrenceID       *time.Time
 	RecurrenceIDAllDay bool
+	RecurrenceTimezone string
 	Overrides          []calendarEventMetadata
 }
 
@@ -1972,6 +1980,7 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 	if m.RecurrenceID != nil {
 		payload["recurrenceId"] = m.RecurrenceID.Format(time.RFC3339)
 		payload["recurrenceIdAllDay"] = m.RecurrenceIDAllDay
+		payload["recurrenceTimezone"] = m.RecurrenceTimezone
 	}
 	if len(m.Overrides) > 0 {
 		overrides := make([]map[string]any, 0, len(m.Overrides))
@@ -2094,6 +2103,10 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 			if t, allDay := parseCalendarEventDate(value, params); t != nil {
 				event.RecurrenceID = t
 				event.RecurrenceIDAllDay = allDay
+				event.RecurrenceTimezone = params["TZID"]
+				if event.RecurrenceTimezone == "" && !allDay {
+					event.RecurrenceTimezone = "UTC"
+				}
 			}
 		case "X-ALT-DESC":
 			if strings.EqualFold(params["FMTTYPE"], "text/html") {

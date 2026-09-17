@@ -243,15 +243,27 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 		// none of them must not suppress a trigger that does fall in the range.
 		return m.alarmInTimeRange(node, parent, start, end, 0)
 	}
-	shifts, expandable := m.instanceShifts(node, m.recurrenceMaster(node, parent), start, end)
+	master := m.recurrenceMaster(node, parent)
+	instances, expandable := m.recurrenceInstances(node, master, start, end)
 	if !expandable {
 		// A frequency this server cannot expand is kept rather than filtered
 		// out: reporting nothing would hide a resource that does occur in the
 		// range.
 		return true
 	}
-	for _, shift := range shifts {
-		if m.componentInTimeRange(node, parent, start, end, shift) {
+	for _, instance := range instances {
+		content, enclosing := node, parent
+		shift := instance.shift
+		if master != nil {
+			occurrence := expandedInstance(m, m.root, master, instance)
+			if node == master {
+				content = occurrence
+			} else {
+				enclosing = occurrence
+			}
+			shift = 0
+		}
+		if m.componentInTimeRange(content, enclosing, start, end, shift) {
 			return true
 		}
 	}
@@ -272,29 +284,6 @@ func (m calendarTimeRangeMatcher) recurrenceMaster(node, parent *icalNode) *ical
 	return nil
 }
 
-// instanceShifts yields the offsets from the master's DTSTART at which its
-// generated instances start, so a caller can re-read a date-valued property
-// once per instance.
-//
-// A recurring master is represented only by its expanded instance set, never
-// also by a zero shift: its own DTSTART is the first instance, and an EXDATE
-// naming that date removes it, so adding the unshifted reading back would match
-// a date the recurrence set does not contain.
-//
-// expandable is false for a frequency this server cannot expand, which the
-// caller keeps rather than filters out.
-func (m calendarTimeRangeMatcher) instanceShifts(node, master *icalNode, start, end time.Time) ([]time.Duration, bool) {
-	instances, ok := m.recurrenceInstances(node, master, start, end)
-	if !ok {
-		return nil, false
-	}
-	shifts := make([]time.Duration, 0, len(instances))
-	for _, instance := range instances {
-		shifts = append(shifts, instance.shift)
-	}
-	return shifts, true
-}
-
 // recurrenceInstance is one generated occurrence expressed as offsets from the
 // master's DTSTART: where the occurrence falls, and which slot of the pattern it
 // belongs to. The two differ only when a RANGE=THISANDFUTURE override moved it,
@@ -303,11 +292,10 @@ func (m calendarTimeRangeMatcher) instanceShifts(node, master *icalNode, start, 
 type recurrenceInstance struct {
 	shift     time.Duration
 	slotShift time.Duration
+	duration  time.Duration
 }
 
-// recurrenceInstances is instanceShifts with the slot kept alongside each
-// occurrence. instanceShifts is the §9.9 evaluator's view, which only ever needs
-// to judge where an occurrence falls.
+// recurrenceInstances retains the effective duration and original identity of each occurrence.
 func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) ([]recurrenceInstance, bool) {
 	if master == nil {
 		return []recurrenceInstance{{}}, true
@@ -324,8 +312,10 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	if lead := m.alarmScanLead(node, window); lead > 0 {
 		scanStart, scanEnd = start.Add(-lead), end.Add(lead)
 	}
+	// Inclusive candidate bounds can add an instance at each endpoint that the
+	// component-specific test excludes. The output budget is checked after that test.
 	generated, err := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
-		scanStart, scanEnd, ical.MaxRecurrenceInstances, m.resolveContentLine)
+		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine)
 	if err != nil {
 		*m.expansionError = err
 		return nil, false
@@ -335,6 +325,7 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 		instances = append(instances, recurrenceInstance{
 			shift:     instance.Start.Sub(dtstart.instant),
 			slotShift: instance.RecurrenceID.Sub(dtstart.instant),
+			duration:  instance.End.Sub(instance.Start),
 		})
 	}
 	return instances, true
@@ -704,7 +695,7 @@ func (m calendarTimeRangeMatcher) propertyInTimeRange(property icalProperty, nod
 	if !recurrenceShiftedProperties.contains(property.name) {
 		return !start.After(instant) && end.After(instant)
 	}
-	return m.shiftedInstantInTimeRange(instant, node, parent, start, end)
+	return m.shiftedInstantInTimeRange(instant, property.name, node, parent, start, end)
 }
 
 // inferredTimeRangeProperties are the two properties §9.9 directs the
@@ -732,19 +723,30 @@ func (m calendarTimeRangeMatcher) inferredPropertyInTimeRange(name string, node,
 	if !ok {
 		return false
 	}
-	return m.shiftedInstantInTimeRange(dtstart.instant.Add(duration), node, parent, start, end)
+	return m.shiftedInstantInTimeRange(dtstart.instant.Add(duration), name, node, parent, start, end)
 }
 
 // shiftedInstantInTimeRange applies `start <= value AND end > value` to the
 // value as each generated recurrence instance carries it, since §9.9 requires
 // every instance to be considered and makes one match enough.
-func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, node, parent *icalNode, start, end time.Time) bool {
-	shifts, expandable := m.instanceShifts(node, m.recurrenceMaster(node, parent), start, end)
+func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, name string, node, parent *icalNode, start, end time.Time) bool {
+	master := m.recurrenceMaster(node, parent)
+	instances, expandable := m.recurrenceInstances(node, master, start, end)
 	if !expandable {
 		return true
 	}
-	for _, shift := range shifts {
-		effective := instant.Add(shift)
+	for _, instance := range instances {
+		effective := instant.Add(instance.shift)
+		if master == node {
+			occurrence := expandedInstance(m, m.root, master, instance)
+			if value, ok := m.dateValue(occurrence, name, 0); ok {
+				effective = value.instant
+			} else if name == "DTEND" || name == "DUE" {
+				if start, ok := m.dateValue(occurrence, "DTSTART", 0); ok {
+					effective = start.instant.Add(instance.duration)
+				}
+			}
+		}
 		if !start.After(effective) && end.After(effective) {
 			return true
 		}

@@ -29,6 +29,7 @@ type BusyPeriod struct {
 type RecurrenceInstance struct {
 	RecurrenceID time.Time
 	Start        time.Time
+	End          time.Time
 }
 
 // RecurrenceSlot is one identity in a master's recurrence pattern together
@@ -140,6 +141,7 @@ func RecurrenceInstances(raw, componentName string, dtstart time.Time, duration 
 		instances = append(instances, RecurrenceInstance{
 			RecurrenceID: occurrence.recurrenceID,
 			Start:        occurrence.period.Start,
+			End:          occurrence.period.End,
 		})
 	}
 	return instances, nil
@@ -187,17 +189,29 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 	exdates := eventExDates(component, expansion.resolve)
 	overrides := componentRecurrenceOverrides(components, duration, expansion.resolve)
 	rdates := componentRDatePeriods(component, expansion.resolve)
+	periodEnds := make(map[time.Time]time.Time)
+	for _, rdate := range rdates {
+		if !rdate.End.IsZero() {
+			periodEnds[rdate.Start.UTC()] = rdate.End
+		}
+	}
 	seen := make(map[string]struct{})
 	periods := make([]recurrenceOccurrence, 0)
+	var limitErr error
 	// recurrenceID is the slot the occurrence belongs to, which a
 	// RANGE=THISANDFUTURE shift moves the period away from. EXDATE and an
 	// ordinary RECURRENCE-ID override both name that slot, not the shifted start.
 	addPeriod := func(recurrenceID time.Time, original BusyPeriod, generated, applyExDates bool) {
-		if len(periods) >= expansion.maxInstances {
+		if limitErr != nil {
 			return
 		}
 		if applyExDates && isExcludedDate(recurrenceID, exdates) {
 			return
+		}
+		if generated {
+			if end, ok := periodEnds[recurrenceID.UTC()]; ok {
+				original.End = end
+			}
 		}
 		effective := original
 		suppressed := false
@@ -216,6 +230,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		}
 		key := recurrenceID.UTC().Format(time.RFC3339Nano)
 		if _, ok := seen[key]; ok {
+			return
+		}
+		if len(periods) >= expansion.maxInstances {
+			limitErr = ErrRecurrenceExpansionLimit
 			return
 		}
 		seen[key] = struct{}{}
@@ -241,15 +259,15 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		scanExpansion.reaches = func(_ BusyPeriod, effective BusyPeriod, _ bool, rangeStart, rangeEnd time.Time) bool {
 			return periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
 		}
-		generated, ok, err := rruleBusyPeriods(component, dtstart, duration, rrule, exdates, scanStart, scanEnd, scanExpansion)
+		ok, err := rruleBusyPeriods(component, dtstart, duration, rrule, exdates, scanStart, scanEnd, scanExpansion, func(id time.Time, period BusyPeriod) bool {
+			addPeriod(id, period, true, true)
+			return limitErr != nil
+		})
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
-		}
-		for _, occurrence := range generated {
-			addPeriod(occurrence.recurrenceID, occurrence.period, true, true)
 		}
 	} else if len(rdates) > 0 {
 		addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
@@ -272,6 +290,9 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		}
 	}
 
+	if limitErr != nil {
+		return nil, limitErr
+	}
 	return periods, nil
 }
 
@@ -983,13 +1004,12 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // than 24 hours.
 const recurrenceCivilScanPad = 24 * time.Hour
 
-func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) ([]recurrenceOccurrence, bool, error) {
+func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod) bool) (bool, error) {
 	recurrenceStart, resolveCandidate, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
 	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), expansion.resolve)
 	if !ok {
-		return nil, false, nil
+		return false, nil
 	}
-	var periods []recurrenceOccurrence
 
 	scanStart, scanEnd := rangeStart, rangeEnd
 	if civil {
@@ -1005,7 +1025,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		periodStart = fastForwardRecurrencePeriod(periodStart, scanStart.Add(-duration), rule)
 	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
 		if skipped >= rule.Count {
-			return periods, true, nil
+			return true, nil
 		}
 		periodStart = fastForwardedStart
 		occurrences = skipped
@@ -1032,39 +1052,38 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		// resolvedCurrent is the slot the rule generated; the shared
 		// expansion applies any RANGE=THISANDFUTURE transform afterwards.
 		if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !isExcludedDate(resolvedCurrent, exdates) {
-			periods = append(periods, recurrenceOccurrence{recurrenceID: resolvedCurrent, original: period, period: period})
-		}
-		if len(periods) >= expansion.maxInstances {
-			done = true
-			return true
+			if add(resolvedCurrent, period) {
+				done = true
+				return true
+			}
 		}
 		return false
 	}
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
 		_, overBudget := visitRecurrenceCandidates(periodStart, recurrenceStart, rule, visit)
 		if overBudget {
-			return nil, false, ErrRecurrenceExpansionLimit
+			return false, ErrRecurrenceExpansionLimit
 		}
 		if done {
-			return periods, true, nil
+			return true, nil
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
 		if !next.After(periodStart) {
-			return nil, false, ErrRecurrenceExpansionLimit
+			return false, ErrRecurrenceExpansionLimit
 		}
 		periodStart = next
 		if periodStart.After(scanEnd) || (rule.Count > 0 && occurrences >= rule.Count) {
-			return periods, true, nil
+			return true, nil
 		}
 	}
 	switch rule.Freq {
 	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
 		_, overBudget := visitSparseRecurrence(periodStart, recurrenceStart, scanEnd, rule, visit)
 		if !overBudget {
-			return periods, true, nil
+			return true, nil
 		}
 	}
-	return nil, false, ErrRecurrenceExpansionLimit
+	return false, ErrRecurrenceExpansionLimit
 }
 
 func recurrenceGenerationStart(component *Component, fallback time.Time, resolve PropertyTimeResolver) (time.Time, func(time.Time) (time.Time, bool), bool) {

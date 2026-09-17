@@ -220,7 +220,11 @@ func (h *DavServer) reportExpandProperty(w http.ResponseWriter, r *http.Request,
 // named href-valued property expanded. depth bounds the recursion the request's
 // own nesting drives.
 func (h *DavServer) expandPropertyResponses(ctx context.Context, r *http.Request, user *store.User, targetPath string, properties []expandPropertyElement, depth int, budget *expandPropertyBudget) ([]response, error) {
-	request := &propfindRequest{Prop: propfindQueryFromExpandProperties(properties)}
+	query, err := propfindQueryFromExpandProperties(properties)
+	if err != nil {
+		return nil, err
+	}
+	request := &propfindRequest{Prop: query}
 	if request.Prop == nil {
 		// RFC 3253 §3.8 names the reported properties in the body; a body
 		// naming none reports the resource with no properties at all.
@@ -414,15 +418,15 @@ func nestedExpandProperties(properties []expandPropertyElement, name xml.Name) (
 // two methods cannot disagree about what a property name selects and a name the
 // server does not define lands in CustomXML for its 404 exactly as it would
 // under PROPFIND.
-func propfindQueryFromExpandProperties(properties []expandPropertyElement) *propfindPropQuery {
+func propfindQueryFromExpandProperties(properties []expandPropertyElement) (*propfindPropQuery, error) {
 	if len(properties) == 0 {
-		return nil
+		return nil, nil
 	}
 	var body bytes.Buffer
 	encoder := xml.NewEncoder(&body)
 	root := xml.StartElement{Name: xml.Name{Space: namespaceDAV, Local: "prop"}}
 	if err := encoder.EncodeToken(root); err != nil {
-		return nil
+		return nil, err
 	}
 	for _, property := range properties {
 		name := xml.Name{Space: property.Namespace, Local: property.Name}
@@ -434,21 +438,21 @@ func propfindQueryFromExpandProperties(properties []expandPropertyElement) *prop
 		}
 		start := xml.StartElement{Name: name}
 		if err := encoder.EncodeToken(start); err != nil {
-			return nil
+			return nil, err
 		}
 		if err := encoder.EncodeToken(start.End()); err != nil {
-			return nil
+			return nil, err
 		}
 	}
 	if err := encoder.EncodeToken(root.End()); err != nil {
-		return nil
+		return nil, err
 	}
 	if err := encoder.Flush(); err != nil {
-		return nil
+		return nil, err
 	}
 	var query propfindPropQuery
 	if err := safeUnmarshalXML(body.Bytes(), &query); err != nil {
-		return nil
+		return nil, err
 	}
-	return &query
+	return &query, nil
 }

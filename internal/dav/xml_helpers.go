@@ -57,7 +57,10 @@ func validXMLNameToken(value string) bool {
 	if value == "" || strings.TrimSpace(value) != value {
 		return false
 	}
-	for _, r := range value {
+	for i, r := range value {
+		if i == 0 && !xmlNameStartCharacter(r) {
+			return false
+		}
 		if xmlNameStartCharacter(r) || r == '-' || r == '.' || r >= '0' && r <= '9' ||
 			r == '·' || r >= '̀' && r <= 'ͯ' || r >= '‿' && r <= '⁀' {
 			continue

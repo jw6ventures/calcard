@@ -281,10 +281,8 @@ func TestExpandOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	if rr.Code != http.StatusMultiStatus {
 		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
 	}
-	// A year of one-second instances is 31,536,000 components. The expansion
-	// budget is what keeps the response to the instance limit instead.
-	if instances := strings.Count(rr.Body.String(), "BEGIN:VEVENT"); instances > ical.MaxRecurrenceInstances {
-		t.Fatalf("expanded instances = %d, want at most %d", instances, ical.MaxRecurrenceInstances)
+	if !strings.Contains(rr.Body.String(), "500 Internal Server Error") || strings.Contains(rr.Body.String(), "BEGIN:VEVENT") {
+		t.Fatalf("incomplete expansion published: %s", rr.Body.String())
 	}
 }
 
@@ -301,8 +299,8 @@ func TestFreeBusyOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
 	}
 	if periods := strings.Count(rr.Body.String(), "FREEBUSY"); periods > ical.MaxRecurrenceInstances {
 		t.Fatalf("free-busy periods = %d, want at most %d", periods, ical.MaxRecurrenceInstances)

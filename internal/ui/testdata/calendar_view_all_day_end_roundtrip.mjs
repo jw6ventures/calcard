@@ -112,7 +112,7 @@ check('edit degenerate DTEND == DTSTART', document.getElementById('edit-dtend').
 
 // A timed event is untouched by the all-day conversion.
 mod.showEditEventModal({
-  uid: 'e4', allDay: false,
+  uid: 'e4', allDay: false, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   dtstart: new Date(2025, 6, 24, 10, 0), dtend: new Date(2025, 6, 24, 10, 30),
 });
 check('edit timed: shows end', document.getElementById('edit-dtend').value, '2025-07-24T10:30');
