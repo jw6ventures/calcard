@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/http/csrf"
@@ -54,14 +57,70 @@ func (h *Handler) parsePagination(r *http.Request) (page, limit int) {
 	return
 }
 
+// flashMessages maps the status keys handlers redirect with to the sentence the
+// page shows. A key missing here is rendered as itself, so every key a handler
+// emits needs an entry; TestFlashMessageResolvesEveryHandlerStatusKey enforces
+// that. Keys name their resource because a redirect target is reached from more
+// than one handler, and "Created." alone does not say what was created.
+var flashMessages = map[string]string{
+	"addressbook_created":  "Address book created.",
+	"addressbook_deleted":  "Address book deleted.",
+	"addressbook_renamed":  "Address book renamed.",
+	"addressbook_shared":   "Address book shared.",
+	"addressbook_updated":  "Address book updated.",
+	"app_password_created": "App password created. Copy it now -- it is not shown again.",
+	"calendar_created":     "Calendar created.",
+	"calendar_deleted":     "Calendar deleted.",
+	"calendar_renamed":     "Calendar renamed.",
+	"calendar_shared":      "Calendar shared.",
+	"calendar_updated":     "Calendar updated.",
+	"contact_created":      "Contact created.",
+	"contact_deleted":      "Contact deleted.",
+	"contact_moved":        "Contact moved.",
+	"contact_updated":      "Contact updated.",
+	"event_created":        "Event created.",
+	"event_deleted":        "Event deleted.",
+	"event_updated":        "Event updated.",
+	"occurrence_deleted":   "Occurrence deleted.",
+	"sessions_revoked":     "All other sessions revoked.",
+	"session_revoked":      "Session revoked.",
+}
+
+// flashMessage resolves a status key to its sentence. The import handlers build
+// their message from a count rather than picking a key, so an unmapped value is
+// passed through as prose.
+func flashMessage(status string) string {
+	if message, ok := flashMessages[status]; ok {
+		return message
+	}
+	return sentenceCase(status)
+}
+
+// sentenceCase renders a message the way the flash table already spells its
+// entries, so a handler-supplied string and a mapped key do not sit next to
+// each other in different styles. It assumes the message opens with an ordinary
+// word; a message that must keep a lowercase first letter belongs in
+// flashMessages rather than here.
+func sentenceCase(message string) string {
+	if message == "" {
+		return ""
+	}
+	first, width := utf8.DecodeRuneInString(message)
+	message = string(unicode.ToUpper(first)) + message[width:]
+	if last, _ := utf8.DecodeLastRuneInString(message); !strings.ContainsRune(".!?", last) {
+		message += "."
+	}
+	return message
+}
+
 // withFlash adds flash messages and CSRF token to template data.
 func (h *Handler) withFlash(r *http.Request, data map[string]any) map[string]any {
 	q := r.URL.Query()
 	if status := q.Get("status"); status != "" {
-		data["FlashMessage"] = status
+		data["FlashMessage"] = flashMessage(status)
 	}
 	if err := q.Get("error"); err != "" {
-		data["FlashError"] = err
+		data["FlashError"] = sentenceCase(err)
 	}
 	if token := q.Get("token"); token != "" {
 		data["PlainToken"] = token

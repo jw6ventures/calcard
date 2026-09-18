@@ -777,6 +777,7 @@
             <input type="hidden" id="event-recurrence-id" name="recurrence_id">
             <input type="hidden" id="event-recurrence-timezone" name="recurrence_timezone">
             <input type="hidden" id="event-recurrence-all-day" name="recurrence_all_day">
+            <div class="alert alert-error" id="event-editor-error" role="alert" style="display:none"></div>
 
             <div class="form-row">
                 <div class="form-group">
@@ -1215,9 +1216,12 @@
         if (email.toLowerCase().indexOf('mailto:') === 0) {
             email = email.substring(7);
         }
-        var name = params && params['CN'] ? params['CN'] : '';
         if (!email) return '';
-        return name ? (name + ' <' + email + '>') : email;
+        var name = (params && params['CN'] ? params['CN'] : '').trim();
+        // Clients that have no display name for an attendee often set CN to the
+        // address itself, which would otherwise render it twice.
+        if (!name || name.toLowerCase() === email.toLowerCase()) return email;
+        return name + ' <' + email + '>';
     }
 
     function parseTriggerMinutes(value) {
@@ -1892,7 +1896,36 @@
 
     function closeEventEditor() {
         editorModal.classList.remove('show');
+        showEventEditorError(null);
         currentEditorEvent = null;
+    }
+
+    // createEventDateError reports why the entered range cannot be saved, or
+    // null when it can. The server rejects a backwards range with a redirect
+    // that drops the whole form, so catching it here is what keeps the entered
+    // values. An incomplete range is not an error: both inputs are required, so
+    // the browser refuses the submit before this runs.
+    function createEventDateError(startValue, endValue, allDay) {
+        if (!startValue || !endValue) return null;
+        // Both values come from the same input type, so they parse the same way
+        // -- a bare date as UTC midnight, a datetime as local -- and compare
+        // cleanly.
+        var start = new Date(startValue);
+        var end = new Date(endValue);
+        if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+        if (allDay) {
+            // The form's end date is the event's last day, so a one-day event
+            // ends on the day it starts.
+            return end < start ? 'End date must be on or after the start date.' : null;
+        }
+        return end <= start ? 'End time must be after the start time.' : null;
+    }
+
+    function showEventEditorError(message) {
+        var box = document.getElementById('event-editor-error');
+        if (!box) return;
+        box.textContent = message || '';
+        box.style.display = message ? 'flex' : 'none';
     }
 
     document.getElementById('new-event-btn').addEventListener('click', function() {
@@ -1949,7 +1982,18 @@
             openEditEditor(currentEditorEvent.seriesEvent);
         }
     });
-    editorForm.addEventListener('submit', function() {
+    editorForm.addEventListener('submit', function(e) {
+        var dateError = createEventDateError(
+            document.getElementById('event-dtstart').value,
+            document.getElementById('event-dtend').value,
+            document.getElementById('event-all-day').checked);
+        if (dateError) {
+            e.preventDefault();
+            showEventEditorError(dateError);
+            document.getElementById('event-dtend').focus();
+            return;
+        }
+        showEventEditorError(null);
         document.getElementById('event-return-to').value = currentReturnPath();
         if (!currentEditorEvent) {
             editorForm.action = '/calendars/' + encodeURIComponent(editorCalendar.value) + '/events';

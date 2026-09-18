@@ -153,7 +153,7 @@
     <div class="session-card {{if .IsCurrent}}current{{end}}">
         <div class="session-info">
             <h3>
-                <span class="device-icon">{{if .IsCurrent}}💻{{else}}📱{{end}}</span>
+                <span class="device-icon">{{if eq .DeviceKind "phone"}}📱{{else if eq .DeviceKind "tablet"}}📲{{else if eq .DeviceKind "unknown"}}❔{{else}}💻{{end}}</span>
                 {{if .UserAgent}}{{truncate .UserAgent 60}}{{else}}Unknown Device{{end}}
                 {{if .IsCurrent}}<span class="badge badge-primary">Current Session</span>{{end}}
             </h3>

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"path"
 	"strconv"
 	"strings"
@@ -118,7 +119,7 @@ func (h *Handler) CreateAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "failed to create"})
 		return
 	}
-	h.redirect(w, r, "/addressbooks", map[string]string{"status": "created"})
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_created"})
 }
 
 // RenameAddressBook renames an existing address book.
@@ -151,7 +152,7 @@ func (h *Handler) RenameAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "rename failed"})
 		return
 	}
-	h.redirect(w, r, "/addressbooks", map[string]string{"status": "renamed"})
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_renamed"})
 }
 
 // DeleteAddressBook deletes an address book.
@@ -166,7 +167,7 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": "delete failed"})
 		return
 	}
-	h.redirect(w, r, "/addressbooks", map[string]string{"status": "deleted"})
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_deleted"})
 }
 
 // ShareAddressBook shares an address book with another user.
@@ -191,7 +192,7 @@ func (h *Handler) ShareAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
 		return
 	}
-	h.redirect(w, r, "/addressbooks", map[string]string{"status": "shared"})
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_shared"})
 }
 
 // UnshareAddressBook removes a share (owner) or leaves a shared book (sharee).
@@ -211,7 +212,7 @@ func (h *Handler) UnshareAddressBook(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/addressbooks", map[string]string{"error": addressBookShareError(err)})
 		return
 	}
-	h.redirect(w, r, "/addressbooks", map[string]string{"status": "updated"})
+	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_updated"})
 }
 
 // writeContactAccessError maps a contacts.Service error to an HTTP response for
@@ -347,12 +348,18 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	email := strings.TrimSpace(r.FormValue("email"))
+	if err := validateContactEmail(email); err != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": err.Error()})
+		return
+	}
+
 	user, _ := auth.UserFromContext(r.Context())
 	input := contacts.StructuredInput{
 		DisplayName: displayName,
 		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
 		LastName:    strings.TrimSpace(r.FormValue("last_name")),
-		Email:       strings.TrimSpace(r.FormValue("email")),
+		Email:       email,
 		Phone:       strings.TrimSpace(r.FormValue("phone")),
 		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
 		Notes:       strings.TrimSpace(r.FormValue("notes")),
@@ -367,6 +374,25 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_created"})
+}
+
+// validateContactEmail rejects an address no mail system could route. vCard
+// EMAIL carries no domain policy (RFC 6350 section 6.4.2), and a CardDAV client
+// may store whatever it likes there, so this only catches the shapes that are
+// certainly typos -- a missing "@", a missing side of it, an embedded space --
+// rather than judging the domain. An empty field means the contact has no
+// email, which is not an error.
+func validateContactEmail(email string) error {
+	if email == "" {
+		return nil
+	}
+	// ParseAddress also accepts the "Name <addr>" form; the field holds a bare
+	// address, so anything it had to strip means the value was not one.
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email {
+		return fmt.Errorf("%q is not a valid email address", email)
+	}
+	return nil
 }
 
 // requireEditableAddressBook resolves an address book the current user may
@@ -420,13 +446,19 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	email := strings.TrimSpace(r.FormValue("email"))
+	if err := validateContactEmail(email); err != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": err.Error()})
+		return
+	}
+
 	user, _ := auth.UserFromContext(r.Context())
 	input := contacts.StructuredInput{
 		UID:         uid,
 		DisplayName: displayName,
 		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
 		LastName:    strings.TrimSpace(r.FormValue("last_name")),
-		Email:       strings.TrimSpace(r.FormValue("email")),
+		Email:       email,
 		Phone:       strings.TrimSpace(r.FormValue("phone")),
 		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
 		Notes:       strings.TrimSpace(r.FormValue("notes")),

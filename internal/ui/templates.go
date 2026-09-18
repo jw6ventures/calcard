@@ -17,73 +17,21 @@ var templateFS embed.FS
 var templates = mustParseTemplates()
 
 var funcMap = template.FuncMap{
-	"formatTime": func(t interface{}) string {
-		switch v := t.(type) {
-		case nil:
-			return ""
-		case time.Time:
-			if v.IsZero() {
-				return ""
-			}
-			return v.UTC().Format(time.RFC3339)
-		case *time.Time:
-			if v == nil {
-				return ""
-			}
-			return v.UTC().Format(time.RFC3339)
-		}
-		return ""
-	},
 	"formatDate": func(t interface{}) string {
-		switch v := t.(type) {
-		case nil:
-			return ""
-		case time.Time:
-			if v.IsZero() {
-				return ""
-			}
-			return v.Format("Jan 2, 2006")
-		case *time.Time:
-			if v == nil {
-				return ""
-			}
-			return v.Format("Jan 2, 2006")
-		}
-		return ""
+		return formatTemplateTime(t, "Jan 2, 2006")
 	},
 	"formatDateTime": func(t interface{}) string {
-		switch v := t.(type) {
-		case nil:
-			return ""
-		case time.Time:
-			if v.IsZero() {
-				return ""
-			}
-			return v.Format("Jan 2, 2006 3:04 PM")
-		case *time.Time:
-			if v == nil {
-				return ""
-			}
-			return v.Format("Jan 2, 2006 3:04 PM")
-		}
-		return ""
+		return formatTemplateTime(t, "Jan 2, 2006 3:04 PM")
+	},
+	"formatMonthAbbrev": func(t interface{}) string {
+		return strings.ToUpper(formatTemplateTime(t, "Jan"))
+	},
+	"formatDayOfMonth": func(t interface{}) string {
+		return formatTemplateTime(t, "2")
 	},
 	"relativeTime": func(t interface{}) string {
-		var timestamp time.Time
-		switch v := t.(type) {
-		case nil:
-			return ""
-		case time.Time:
-			if v.IsZero() {
-				return ""
-			}
-			timestamp = v
-		case *time.Time:
-			if v == nil {
-				return ""
-			}
-			timestamp = *v
-		default:
+		timestamp, ok := templateTime(t)
+		if !ok {
 			return ""
 		}
 
@@ -175,6 +123,31 @@ var funcMap = template.FuncMap{
 		}
 		return template.CSS(strings.ToUpper(color))
 	},
+}
+
+// templateTime unwraps the time a template hands a formatting function. A
+// timestamp reaches a template either as a value or as the pointer a nullable
+// column is read into, and a zero time is an absent one rather than year 1.
+func templateTime(v interface{}) (time.Time, bool) {
+	switch t := v.(type) {
+	case time.Time:
+		return t, !t.IsZero()
+	case *time.Time:
+		if t == nil {
+			return time.Time{}, false
+		}
+		return *t, !t.IsZero()
+	}
+	return time.Time{}, false
+}
+
+// formatTemplateTime renders a timestamp, or nothing when there is none.
+func formatTemplateTime(v interface{}, layout string) string {
+	t, ok := templateTime(v)
+	if !ok {
+		return ""
+	}
+	return t.Format(layout)
 }
 
 func templateColorString(v interface{}) (string, bool) {

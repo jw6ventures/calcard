@@ -731,9 +731,10 @@
             <span class="modal-title">New Event</span>
             <button class="modal-close" onclick="closeCreateEventModal()">&times;</button>
         </div>
-        <form method="POST" action="/calendars/{{.Calendar.ID}}/events">
+        <form id="create-event-form" method="POST" action="/calendars/{{.Calendar.ID}}/events">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
             <input type="hidden" id="create-return-to" name="return_to">
+            <div class="alert alert-error" id="create-event-error" role="alert" style="display: none;"></div>
             <div class="form-group">
                 <label for="create-summary">Title *</label>
                 <input type="text" id="create-summary" name="summary" required>
@@ -1422,9 +1423,12 @@
         if (email.toLowerCase().indexOf('mailto:') === 0) {
             email = email.substring(7);
         }
-        var name = params && params['CN'] ? params['CN'] : '';
         if (!email) return '';
-        return name ? (name + ' <' + email + '>') : email;
+        var name = (params && params['CN'] ? params['CN'] : '').trim();
+        // Clients that have no display name for an attendee often set CN to the
+        // address itself, which would otherwise render it twice.
+        if (!name || name.toLowerCase() === email.toLowerCase()) return email;
+        return name + ' <' + email + '>';
     }
 
     function parseTriggerMinutes(value) {
@@ -2873,8 +2877,110 @@ function showCreateEventModal(prefill) {
     setReminderList('create', null, true);
 }
 
+// The create form posts and is answered with a redirect, so a server-side
+// rejection arrives as a fresh page with an empty form. The draft below carries
+// the submitted values across that redirect; createEventDateError catches the
+// one rejection the browser can reach on its own, before anything is sent.
+var CREATE_EVENT_DRAFT_KEY = 'calcard:create-event-draft:{{.Calendar.ID}}';
+var CREATE_EVENT_DRAFT_SKIP = {'_csrf': true, 'return_to': true};
+var CREATE_EVENT_REJECTION = {{if .FlashError}}{{.FlashError}}{{else}}""{{end}};
+
+// createEventDateError reports why the entered range cannot be saved, or null
+// when it can. An incomplete range is not an error here: the inputs are
+// required, so the browser refuses the submit before this runs.
+function createEventDateError(startValue, endValue, allDay) {
+    if (!startValue || !endValue) return null;
+    // Both values come from the same input type, so they parse the same way --
+    // a bare date as UTC midnight, a datetime as local -- and compare cleanly.
+    var start = new Date(startValue);
+    var end = new Date(endValue);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+    if (allDay) {
+        // The form's end date is the event's last day, so a one-day event ends
+        // on the day it starts.
+        return end < start ? 'End date must be on or after the start date.' : null;
+    }
+    return end <= start ? 'End time must be after the start time.' : null;
+}
+
+function showCreateEventError(message) {
+    var box = document.getElementById('create-event-error');
+    if (!box) return;
+    box.textContent = message || '';
+    box.style.display = message ? 'flex' : 'none';
+}
+
+function saveCreateEventDraft(form) {
+    if (!form) return;
+    var draft = {};
+    // FormData omits unchecked boxes and includes every dynamically added
+    // reminder row, which is exactly what restoring needs to reproduce.
+    new FormData(form).forEach(function(value, name) {
+        if (CREATE_EVENT_DRAFT_SKIP[name]) return;
+        (draft[name] = draft[name] || []).push(value);
+    });
+    try {
+        window.sessionStorage.setItem(CREATE_EVENT_DRAFT_KEY, JSON.stringify(draft));
+    } catch (e) {
+        // A full or disabled sessionStorage costs the draft, not the submit.
+    }
+}
+
+function clearCreateEventDraft() {
+    try {
+        window.sessionStorage.removeItem(CREATE_EVENT_DRAFT_KEY);
+    } catch (e) {}
+}
+
+// restoreCreateEventDraft reopens the create modal on the values a rejected
+// submit carried. The draft is consumed either way, so a reload after the
+// restore does not reopen the modal a second time.
+function restoreCreateEventDraft() {
+    var raw = null;
+    try {
+        raw = window.sessionStorage.getItem(CREATE_EVENT_DRAFT_KEY);
+    } catch (e) {
+        return false;
+    }
+    clearCreateEventDraft();
+    if (!raw) return false;
+
+    var draft;
+    try {
+        draft = JSON.parse(raw);
+    } catch (e) {
+        return false;
+    }
+    var form = document.getElementById('create-event-form');
+    if (!draft || typeof draft !== 'object' || !form) return false;
+
+    showCreateEventModal();
+
+    // The all-day flag decides whether the date inputs accept a date or a
+    // datetime, so it has to be applied before their values are.
+    document.getElementById('create-all-day').checked = !!(draft.all_day && draft.all_day.length);
+    toggleAllDay('create', true);
+
+    Array.prototype.forEach.call(form.elements, function(field) {
+        if (!field.name || CREATE_EVENT_DRAFT_SKIP[field.name]) return;
+        var values = draft[field.name];
+        if (field.type === 'checkbox' || field.type === 'radio') {
+            field.checked = !!values && values.indexOf(field.value) !== -1;
+        } else if (values && values.length) {
+            field.value = values[0];
+        }
+    });
+
+    // Reminder rows are created on demand, so they are not in form.elements yet.
+    setReminderList('create', draft.reminder_minutes || [], false);
+    toggleRecurrenceOptions('create');
+    toggleRecurrenceEnd('create');
+    return true;
+}
+
 function closeCreateEventModal() {
     document.getElementById('create-event-modal').classList.remove('show');
+    showCreateEventError(null);
     document.getElementById('create-summary').value = '';
     document.getElementById('create-dtstart').value = '';
     document.getElementById('create-dtend').value = '';
@@ -3286,6 +3392,35 @@ document.getElementById('edit-event-modal').addEventListener('click', function(e
 document.getElementById('import-modal').addEventListener('click', function(e) {
     if (e.target === this) closeImportModal();
 });
+
+var createEventForm = document.getElementById('create-event-form');
+if (createEventForm) {
+    createEventForm.addEventListener('submit', function(e) {
+        var dateError = createEventDateError(
+            document.getElementById('create-dtstart').value,
+            document.getElementById('create-dtend').value,
+            document.getElementById('create-all-day').checked);
+        if (dateError) {
+            e.preventDefault();
+            showCreateEventError(dateError);
+            document.getElementById('create-dtend').focus();
+            return;
+        }
+        saveCreateEventDraft(this);
+    });
+
+    // Read from the rendered flash rather than the query string: the view
+    // bootstrap above has already replaced the URL with one carrying only the
+    // view and date, so the error parameter is gone by the time this runs.
+    if (CREATE_EVENT_REJECTION) {
+        // The page-level banner sits behind the modal once it reopens, so the
+        // reason is repeated inside it.
+        if (restoreCreateEventDraft()) showCreateEventError(CREATE_EVENT_REJECTION);
+    } else {
+        // A submit that was accepted must not leave a draft to restore later.
+        clearCreateEventDraft();
+    }
+}
 
 var editTimezoneInput = document.getElementById('edit-timezone');
 if (editTimezoneInput) {

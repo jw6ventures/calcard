@@ -113,7 +113,7 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "failed to create"})
 		return
 	}
-	h.redirect(w, r, "/calendars", map[string]string{"status": "created"})
+	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_created"})
 }
 
 // RenameCalendar renames an existing calendar.
@@ -154,7 +154,7 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
 	}
-	h.redirect(w, r, "/calendars", map[string]string{"status": "renamed"})
+	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_renamed"})
 }
 
 func calendarColorFromForm(r *http.Request, existing *string) (*string, error) {
@@ -195,7 +195,7 @@ func (h *Handler) DeleteCalendar(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
 		return
 	}
-	h.redirect(w, r, "/calendars", map[string]string{"status": "deleted"})
+	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_deleted"})
 }
 
 // ShareCalendar shares a calendar with another user.
@@ -237,7 +237,7 @@ func (h *Handler) ShareCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.redirect(w, r, "/calendars", map[string]string{"status": "shared"})
+	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_shared"})
 }
 
 // UnshareCalendar removes a share or allows a user to leave a shared calendar.
@@ -278,7 +278,7 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.redirect(w, r, "/calendars", map[string]string{"status": "updated"})
+	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_updated"})
 }
 
 func calendarACLResourcePath(calendarID int64) string {

@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -184,6 +187,78 @@ func TestWithFlash(t *testing.T) {
 	}
 }
 
+// Every status key a handler redirects with has to resolve to a sentence. A key
+// missing from the table reaches the page as itself, which is how "contact_updated"
+// ended up on screen.
+func TestFlashMessageResolvesEveryHandlerStatusKey(t *testing.T) {
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusKey := regexp.MustCompile(`"status": *"([a-z_]+)"`)
+	seen := map[string]bool{}
+	for _, name := range sources {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range statusKey.FindAllStringSubmatch(string(body), -1) {
+			seen[match[1]] = true
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("found no status keys to check; the scan is broken, not the code")
+	}
+	for key := range seen {
+		if _, ok := flashMessages[key]; !ok {
+			t.Errorf("status key %q has no entry in flashMessages, so the raw key is shown to the user", key)
+		}
+	}
+}
+
+func TestFlashMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   string
+	}{
+		{"known key becomes a sentence", "contact_updated", "Contact updated."},
+		{"key is not shown verbatim", "event_created", "Event created."},
+		{"generic keys are scoped to their resource", "calendar_created", "Calendar created."},
+		{"dynamic message passes through sentence-cased", "imported 3 contact(s)", "Imported 3 contact(s)."},
+		{"already a sentence is left alone", "Imported 3 event(s).", "Imported 3 event(s)."},
+		{"terminal punctuation is preserved", "Really?", "Really?"},
+		{"empty stays empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := flashMessage(tt.status); got != tt.want {
+				t.Errorf("flashMessage(%q) = %q, want %q", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWithFlashHumanizesStatusAndError(t *testing.T) {
+	h := &Handler{}
+	r := &http.Request{URL: &url.URL{RawQuery: url.Values{
+		"status": []string{"contact_updated"},
+		"error":  []string{"end date must be after start date"},
+	}.Encode()}}
+
+	data := h.withFlash(r, map[string]any{})
+
+	if got := data["FlashMessage"]; got != "Contact updated." {
+		t.Errorf("FlashMessage = %q, want %q", got, "Contact updated.")
+	}
+	if got := data["FlashError"]; got != "End date must be after start date." {
+		t.Errorf("FlashError = %q, want %q", got, "End date must be after start date.")
+	}
+}
+
 func TestRedirect(t *testing.T) {
 	h := &Handler{}
 
@@ -304,6 +379,112 @@ func TestRender(t *testing.T) {
 			body := w.Body.String()
 			if tt.wantBody != "" && !strings.Contains(body, tt.wantBody) {
 				t.Errorf("render() body = %q, want to contain %q", body, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestSessionDeviceKind(t *testing.T) {
+	tests := []struct {
+		name      string
+		userAgent string
+		want      string
+	}{
+		{
+			name:      "desktop firefox on linux",
+			userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+			want:      "desktop",
+		},
+		{
+			name:      "desktop chrome on windows",
+			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+			want:      "desktop",
+		},
+		{
+			name:      "desktop safari on macos",
+			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+			want:      "desktop",
+		},
+		{
+			name:      "iphone safari",
+			userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+			want:      "phone",
+		},
+		{
+			name:      "android phone chrome",
+			userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+			want:      "phone",
+		},
+		{
+			name:      "android phone firefox",
+			userAgent: "Mozilla/5.0 (Android 14; Mobile; rv:153.0) Gecko/153.0 Firefox/153.0",
+			want:      "phone",
+		},
+		{
+			name:      "ipad safari",
+			userAgent: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+			want:      "tablet",
+		},
+		{
+			// Android tablets differ from Android phones only by the absent
+			// "Mobile" token, so the tablet check has to run before the phone one.
+			name:      "android tablet chrome",
+			userAgent: "Mozilla/5.0 (Linux; Android 14; SM-X200) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+			want:      "tablet",
+		},
+		{
+			name:      "empty user agent",
+			userAgent: "",
+			want:      "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sessionDeviceKind(tt.userAgent); got != tt.want {
+				t.Errorf("sessionDeviceKind(%q) = %q, want %q", tt.userAgent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateContactEmail(t *testing.T) {
+	tests := []struct {
+		name    string
+		email   string
+		wantErr bool
+	}{
+		{name: "empty is allowed", email: ""},
+		{name: "plain address", email: "james@jameswilliams.business"},
+		{name: "plus tag", email: "james+calcard@example.com"},
+		{name: "subdomain", email: "james@mail.example.co.uk"},
+		{
+			// A label that reads like a typo is still a routable domain, and
+			// vCard EMAIL carries no domain policy, so this is accepted.
+			name:  "unusual but syntactically valid tld",
+			email: "apple-load-001@example.not-an-email",
+		},
+		{name: "missing at sign", email: "jamesexample.com", wantErr: true},
+		{name: "missing domain", email: "james@", wantErr: true},
+		{name: "missing local part", email: "@example.com", wantErr: true},
+		{name: "embedded space", email: "james williams@example.com", wantErr: true},
+		{name: "two at signs", email: "james@@example.com", wantErr: true},
+		{
+			// The field holds a bare address; a display name belongs in FN.
+			name:    "display name form",
+			email:   "James <james@example.com>",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateContactEmail(tt.email)
+			if tt.wantErr && err == nil {
+				t.Errorf("validateContactEmail(%q) = nil, want an error", tt.email)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("validateContactEmail(%q) = %v, want nil", tt.email, err)
 			}
 		})
 	}

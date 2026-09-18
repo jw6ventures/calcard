@@ -72,6 +72,18 @@
     .recent-icon.event {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: #fff;
+        flex-direction: column;
+        gap: 1px;
+        line-height: 1;
+    }
+    .recent-icon-month {
+        font-size: 0.5rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+    }
+    .recent-icon-day {
+        font-size: 1rem;
+        font-weight: 700;
     }
     .recent-icon.contact {
         background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
@@ -252,7 +264,14 @@
             {{else}}
             {{range .RecentEvents}}
             <a class="recent-item" href="{{.EventURL}}">
-                <div class="recent-icon event">&#128197;</div>
+                <div class="recent-icon event" aria-hidden="true">
+                    {{if .DTStart}}
+                    <span class="recent-icon-month">{{formatMonthAbbrev .DTStart}}</span>
+                    <span class="recent-icon-day">{{formatDayOfMonth .DTStart}}</span>
+                    {{else}}
+                    <span class="recent-icon-day">&ndash;</span>
+                    {{end}}
+                </div>
                 <div class="recent-info">
                     <div class="recent-title">{{.Summary}}</div>
                     <div class="recent-meta">

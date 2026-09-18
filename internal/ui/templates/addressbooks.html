@@ -341,7 +341,7 @@
         <div class="addressbook-card-body">
             <div class="addressbook-info">
                 <div class="info-label">{{if $book.Shared}}Access{{else}}Created{{end}}</div>
-                <div class="info-value">{{if $book.Shared}}{{if $book.Editor}}Shared with you (editor){{else}}Shared with you (read-only){{end}}{{else}}{{formatTime $book.CreatedAt}}{{end}}</div>
+                <div class="info-value">{{if $book.Shared}}{{if $book.Editor}}Shared with you (editor){{else}}Shared with you (read-only){{end}}{{else}}{{formatDateTime $book.CreatedAt}}{{end}}</div>
             </div>
 
             <div class="addressbook-actions">

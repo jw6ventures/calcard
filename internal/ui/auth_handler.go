@@ -37,6 +37,7 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 		sessionData = append(sessionData, map[string]any{
 			"ID":         s.ID,
 			"UserAgent":  userAgent,
+			"DeviceKind": sessionDeviceKind(userAgent),
 			"IPAddress":  ipAddress,
 			"CreatedAt":  s.CreatedAt,
 			"ExpiresAt":  s.ExpiresAt,
@@ -51,6 +52,36 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 		"Sessions": sessionData,
 	})
 	h.render(w, r, "sessions.html", data)
+}
+
+// sessionDeviceKind classifies a session's user agent so the sessions page can
+// show what the session was opened from.
+//
+// The tablet check has to run first: an Android tablet's user agent is an
+// Android phone's minus the "Mobile" token, and an iPad's still carries the
+// "Mobile/<build>" token an iPhone's does. An unrecognized agent is treated as
+// a desktop, which is what a browser sending one is; only a missing agent is
+// reported as unknown. iPadOS Safari requesting a desktop site sends a
+// Macintosh agent with nothing left to tell it apart, so it reads as a desktop.
+func sessionDeviceKind(userAgent string) string {
+	agent := strings.ToLower(userAgent)
+	if strings.TrimSpace(agent) == "" {
+		return "unknown"
+	}
+	switch {
+	case strings.Contains(agent, "ipad"),
+		strings.Contains(agent, "tablet"),
+		strings.Contains(agent, "kindle"),
+		strings.Contains(agent, "playbook"),
+		strings.Contains(agent, "android") && !strings.Contains(agent, "mobile"):
+		return "tablet"
+	case strings.Contains(agent, "iphone"),
+		strings.Contains(agent, "ipod"),
+		strings.Contains(agent, "windows phone"),
+		strings.Contains(agent, "mobile"):
+		return "phone"
+	}
+	return "desktop"
 }
 
 // RevokeSession revokes a single session.
@@ -74,7 +105,7 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.redirect(w, r, "/sessions", map[string]string{"status": "revoked"})
+	h.redirect(w, r, "/sessions", map[string]string{"status": "session_revoked"})
 }
 
 // RevokeAllSessions revokes all sessions except the current one.
@@ -96,7 +127,7 @@ func (h *Handler) RevokeAllSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.redirect(w, r, "/sessions", map[string]string{"status": "all_revoked"})
+	h.redirect(w, r, "/sessions", map[string]string{"status": "sessions_revoked"})
 }
 
 // AppPasswords displays the app passwords page (GET only).
@@ -252,7 +283,7 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 	})
 	if plaintext != "" {
 		data["PlainToken"] = plaintext
-		data["FlashMessage"] = "created"
+		data["FlashMessage"] = flashMessage("app_password_created")
 	}
 	h.render(w, r, "app_passwords.html", data)
 }
