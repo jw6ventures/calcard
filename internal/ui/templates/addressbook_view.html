@@ -879,10 +879,19 @@
         if (e.target === modal) modal.classList.remove('show');
     });
     
+    // Photo, telephone and email values reach a double-quoted attribute here,
+    // so the quotes are escaped as well as the markup delimiters: a textContent
+    // round trip through the DOM escapes only & < >, which leaves a vCard field
+    // free to close the attribute it sits in and open an event handler. The
+    // ampersand is rewritten first so the entities introduced below are not
+    // escaped twice.
     function escapeHtml(str) {
-        var div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
+        return (str === null ? '' : String(str))
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function safeUrl(raw) {

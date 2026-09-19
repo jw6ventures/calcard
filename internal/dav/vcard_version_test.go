@@ -198,19 +198,35 @@ func TestConvertVCardVersion(t *testing.T) {
 			want:   []string{"X-ANNIVERSARY:2010-06-15", "X-GENDER:F"},
 		},
 		{
-			name:   "properties vcard4 removed are dropped",
+			// Carried under an x-name rather than dropped, so the next edit a
+			// client PUTs back does not delete them. The round trip is pinned by
+			// TestConvertVCardVersionPreservesVersionSpecificProperties.
+			name:   "properties vcard4 removed are carried",
 			target: "4.0",
 			source: []string{"FN:Alice Adams", "LABEL;TYPE=HOME:1 Main St", "CLASS:PUBLIC", "MAILER:Mutt", "SORT-STRING:Adams"},
-			want:   []string{"FN:Alice Adams"},
+			want: []string{
+				"FN:Alice Adams",
+				"X-CALCARD-LABEL;TYPE=HOME:1 Main St",
+				"X-CALCARD-CLASS:PUBLIC",
+				"X-CALCARD-MAILER:Mutt",
+				"X-CALCARD-SORT-STRING:Adams",
+			},
 		},
 		{
 			// The N is derived rather than dropped: RFC 2426 Section 3.1.2
 			// requires it and RFC 6350 Section 6.2.2 made it optional, so a
 			// valid 4.0 card can arrive without one.
-			name:   "properties vcard3 cannot express are dropped",
+			name:   "properties vcard3 cannot express are carried",
 			target: "3.0",
 			source: []string{"FN:Alice Adams", "LANG:en", "XML:<x/>", "CLIENTPIDMAP:1;urn:uuid:1", "RELATED;TYPE=friend:urn:uuid:bob"},
-			want:   []string{"FN:Alice Adams", "N:Adams;Alice;;;"},
+			want: []string{
+				"FN:Alice Adams",
+				"X-CALCARD-LANG:en",
+				"X-CALCARD-XML:<x/>",
+				"X-CALCARD-CLIENTPIDMAP:1;urn:uuid:1",
+				"X-CALCARD-RELATED;TYPE=friend:urn:uuid:bob",
+				"N:Adams;Alice;;;",
+			},
 		},
 		{
 			name:   "parameters vcard3 cannot express are dropped",
@@ -488,5 +504,93 @@ func TestConvertVCardVersionDoesNotRefuseAnAlreadyInvalidStoredCard(t *testing.T
 		if !strings.Contains(got, want) {
 			t.Errorf("converted card is missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// A client reads a card in its preferred version, edits one field, and PUTs the
+// result back, which replaces the stored copy. Any property the conversion drops
+// is therefore deleted from the server on the next ordinary edit, so a property
+// with no counterpart in the target version has to survive the trip rather than
+// be discarded.
+func TestConvertVCardVersionPreservesVersionSpecificProperties(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		source     string
+		target     string
+		card       string
+		properties []string
+	}{
+		{
+			name:   "3.0 properties survive a 4.0 round trip",
+			source: "3.0",
+			target: "4.0",
+			card: buildVCard("3.0",
+				"UID:round-trip",
+				"FN:Alice Example",
+				"N:Example;Alice;;;",
+				"CLASS:CONFIDENTIAL",
+				"MAILER:PigeonMail 3.2",
+				"PROFILE:VCARD",
+				"NAME:Alice's Card",
+				"SORT-STRING:Example",
+				"LABEL;TYPE=HOME:1 Main St\\nSpringfield",
+			),
+			properties: []string{
+				"CLASS:CONFIDENTIAL",
+				"MAILER:PigeonMail 3.2",
+				"PROFILE:VCARD",
+				"NAME:Alice's Card",
+				"SORT-STRING:Example",
+				"LABEL;TYPE=HOME:1 Main St\\nSpringfield",
+			},
+		},
+		{
+			name:   "4.0 properties survive a 3.0 round trip",
+			source: "4.0",
+			target: "3.0",
+			card: buildVCard("4.0",
+				"UID:round-trip",
+				"FN:Bob Example",
+				"N:Example;Bob;;;",
+				"LANG;PREF=1:en-US",
+				"RELATED;TYPE=friend:urn:uuid:03a0e51f-d1aa-4bbc-9141-1a2b3c4d5e6f",
+				"CLIENTPIDMAP:1;urn:uuid:9c6f2a1e-5f6a-4a1e-9b1a-2c3d4e5f6a7b",
+			),
+			properties: []string{
+				"LANG;PREF=1:en-US",
+				"RELATED;TYPE=friend:urn:uuid:03a0e51f-d1aa-4bbc-9141-1a2b3c4d5e6f",
+				"CLIENTPIDMAP:1;urn:uuid:9c6f2a1e-5f6a-4a1e-9b1a-2c3d4e5f6a7b",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			converted, ok := convertVCardVersion(tt.card, tt.target)
+			if !ok {
+				t.Fatalf("converting to %s failed", tt.target)
+			}
+			if err := validateVCardForVersion(converted, tt.target); err != nil {
+				t.Fatalf("converted card is not valid %s: %v", tt.target, err)
+			}
+			// The carrier has to hold the value, not merely a placeholder.
+			for _, property := range tt.properties {
+				_, value, _ := strings.Cut(property, ":")
+				if !strings.Contains(converted, value) {
+					t.Errorf("converting to %s lost the value %q:\n%s", tt.target, value, converted)
+				}
+			}
+
+			back, ok := convertVCardVersion(converted, tt.source)
+			if !ok {
+				t.Fatalf("converting back to %s failed", tt.source)
+			}
+			if err := validateVCardForVersion(back, tt.source); err != nil {
+				t.Fatalf("round-tripped card is not valid %s: %v", tt.source, err)
+			}
+			for _, property := range tt.properties {
+				if !strings.Contains(back, property) {
+					t.Errorf("round trip through %s lost %q:\n%s", tt.target, property, back)
+				}
+			}
+		})
 	}
 }

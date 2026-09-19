@@ -175,6 +175,11 @@ func TestRecurrenceSetExceedsLimitFinishesImpossibleSparseUntilRule(t *testing.T
 	}
 }
 
+// 2562048 hours is a little over 292 years, the point where a step stops fitting
+// in a time.Duration. The interval has to be carried in seconds rather than a
+// Duration for the rule to be measured at all; done that way it is simply a very
+// sparse rule -- one instance every three centuries -- and nothing about it is
+// over the instance limit.
 func TestRecurrenceSetExceedsLimitHandlesLargeSubDailyInterval(t *testing.T) {
 	raw := "BEGIN:VCALENDAR\r\n" +
 		"BEGIN:VEVENT\r\n" +
@@ -188,8 +193,8 @@ func TestRecurrenceSetExceedsLimitHandlesLargeSubDailyInterval(t *testing.T) {
 	if !valid {
 		t.Fatal("RecurrenceSetExceedsLimit() valid = false")
 	}
-	if !exceeds {
-		t.Fatal("RecurrenceSetExceedsLimit() exceeds = false, want true")
+	if exceeds {
+		t.Fatal("RecurrenceSetExceedsLimit() exceeds = true for one instance every 292 years")
 	}
 }
 
@@ -1130,5 +1135,124 @@ func TestRecurrenceInstancePeriodDurationAndRangeOverride(t *testing.T) {
 				t.Fatalf("got %+v, want %s/%s", got, wantStart, wantEnd)
 			}
 		})
+	}
+}
+
+// A recurrence rule arrives from the network, so no rule may take unbounded
+// time to evaluate. Both entry points below are reachable before storage: the
+// first from a VTIMEZONE observance on PUT, the second from a REPORT whose
+// time-range has no end. A rule whose BY parts can never be satisfied, or whose
+// DTSTART predates the request by more than time.Duration's ~292-year range,
+// used to leave the fast-forward stepping one period at a time.
+func TestRecurrenceEvaluationAlwaysTerminates(t *testing.T) {
+	// Exchange emits 16010101 as the DTSTART of a VTIMEZONE observance, so the
+	// span from dtstart to the query is past what time.Duration can represent.
+	dtstart := time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
+
+	rules := []string{
+		"FREQ=SECONDLY",
+		"FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=30",
+		"FREQ=SECONDLY;BYYEARDAY=366;BYMONTH=1",
+		"FREQ=MINUTELY;BYMONTH=2;BYMONTHDAY=30",
+		"FREQ=HOURLY;BYMONTH=2;BYMONTHDAY=30",
+		"FREQ=SECONDLY;UNTIL=16010101T001000Z",
+	}
+	for _, rule := range rules {
+		t.Run(rule, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				LatestRecurrenceOnOrBefore(dtstart, before, rule)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("LatestRecurrenceOnOrBefore did not return for %q", rule)
+			}
+		})
+	}
+}
+
+// A stored sub-daily rule that ended long ago must not be walked forward one
+// period at a time to reach a far-future range start: the scan can stop at
+// UNTIL, because no instance exists past it.
+func TestRecurringBusyPeriodsTerminatesForAFinishedSubDailyRule(t *testing.T) {
+	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	raw := "BEGIN:VEVENT\r\nDTSTART:20240101T000000Z\r\n" +
+		"RRULE:FREQ=SECONDLY;UNTIL=20240101T000959Z\r\nEND:VEVENT\r\n"
+	rangeStart := time.Date(2400, 1, 1, 0, 0, 0, 0, time.UTC)
+	rangeEnd := rangeStart.AddDate(0, 0, 1)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RecurringBusyPeriods did not return for a rule that ended in 2024")
+	}
+}
+
+// A rule with neither COUNT nor UNTIL generates instances forever, so
+// CALDAV:max-instances cannot be read as a count of the whole set without
+// refusing "repeats weekly, no end date" -- the shape iOS, Thunderbird,
+// Evolution and DAVx5 all emit by default. The limit is applied instead to the
+// instances the rule generates in one year from DTSTART, which still refuses
+// the sub-daily rules whose expansion is genuinely expensive.
+func TestRecurrenceSetExceedsLimitAdmitsOrdinaryUnboundedRules(t *testing.T) {
+	object := func(rrule string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:unbounded\r\n" +
+			"DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\n" +
+			rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	for _, tt := range []struct {
+		rrule       string
+		wantExceeds bool
+	}{
+		{rrule: "RRULE:FREQ=DAILY", wantExceeds: false},
+		{rrule: "RRULE:FREQ=WEEKLY", wantExceeds: false},
+		{rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", wantExceeds: false},
+		{rrule: "RRULE:FREQ=MONTHLY", wantExceeds: false},
+		{rrule: "RRULE:FREQ=YEARLY", wantExceeds: false},
+		{rrule: "RRULE:FREQ=DAILY;INTERVAL=2", wantExceeds: false},
+		// Sub-daily rules stay refused: an unbounded hourly rule is already
+		// past the limit inside the first year.
+		{rrule: "RRULE:FREQ=HOURLY", wantExceeds: true},
+		{rrule: "RRULE:FREQ=MINUTELY", wantExceeds: true},
+		{rrule: "RRULE:FREQ=SECONDLY", wantExceeds: true},
+		// A rule that declares its own size is still measured against it.
+		{rrule: "RRULE:FREQ=DAILY;COUNT=2001", wantExceeds: true},
+		{rrule: "RRULE:FREQ=DAILY;COUNT=100", wantExceeds: false},
+	} {
+		t.Run(tt.rrule, func(t *testing.T) {
+			exceeds, valid := RecurrenceSetExceedsLimit(object(tt.rrule), MaxRecurrenceInstances)
+			if !valid {
+				t.Fatalf("%s was not recognized as a valid recurrence set", tt.rrule)
+			}
+			if exceeds != tt.wantExceeds {
+				t.Errorf("%s: exceeds=%v, want %v", tt.rrule, exceeds, tt.wantExceeds)
+			}
+		})
+	}
+}
+
+// An accepted unbounded rule has to be stored with an open-ended upper bound,
+// or the SQL candidate filter drops it from every time-range query past the
+// bound it did record.
+func TestConservativeRecurrenceBoundsLeaveUnboundedRulesOpenEnded(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:unbounded\r\n" +
+		"DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\n" +
+		"RRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	bounds := ConservativeRecurrenceBounds(raw)
+	if !bounds.Recurring {
+		t.Fatal("an unbounded weekly rule was not recognized as recurring")
+	}
+	// UntilUnknown is the signal the store turns into RecurrenceUntilSentinel.
+	// A computed upper bound here would cut the series off at it.
+	if !bounds.UntilUnknown {
+		t.Errorf("unbounded rule reported a known upper bound (%v), so it would stop being a time-range candidate past it", bounds.Until)
 	}
 }

@@ -584,6 +584,11 @@ func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath strin
 		return nil, err
 	}
 
+	// Only the creator is told the token. Every other reader still sees the
+	// activelock element, so a client can tell the resource is locked and that
+	// it does not hold the lock.
+	user, _ := auth.UserFromContext(ctx)
+
 	now := time.Now()
 	activeLocks := make([]activeLock, 0, len(locks))
 	for i := range locks {
@@ -595,7 +600,7 @@ func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath strin
 		if lockPath != resourcePath && lock.Depth != "infinity" {
 			continue
 		}
-		activeLocks = append(activeLocks, activeLockFromStoreLock(&lock))
+		activeLocks = append(activeLocks, activeLockFromStoreLock(&lock, user != nil && lock.UserID == user.ID))
 	}
 
 	return &lockDiscoveryProp{ActiveLocks: activeLocks}, nil

@@ -14,9 +14,9 @@ import (
 // refusal makes the resource invisible to the client, and the sync token still
 // moves, so the client never asks again.
 
-// Properties RFC 6350 removed from vCard 3.0. Nothing in vCard 4.0 can carry
-// them, so an upgrade drops them rather than emitting data a 4.0 parser must
-// reject.
+// Properties RFC 6350 removed from vCard 3.0. Nothing in vCard 4.0 names them,
+// so an upgrade carries them across under vcardPreservedPropertyPrefix instead
+// of emitting a property a 4.0 parser must reject.
 var vcard3OnlyProperties = map[string]struct{}{
 	"AGENT":       {},
 	"CLASS":       {},
@@ -28,12 +28,34 @@ var vcard3OnlyProperties = map[string]struct{}{
 }
 
 // Properties RFC 6350 introduced that RFC 2426 has no equivalent for, not even
-// a conventional X- name.
+// a conventional X- name, so a downgrade carries them the same way.
 var vcard4OnlyProperties = map[string]struct{}{
 	"CLIENTPIDMAP": {},
 	"LANG":         {},
 	"RELATED":      {},
 	"XML":          {},
+}
+
+// vcardPreservedPropertyPrefix carries a property the target version has no
+// name for. Clients read a card in their preferred version, edit one field and
+// PUT the whole card back, which replaces the stored copy -- so a property
+// dropped on the way out is deleted from the server on the next ordinary edit.
+// Riding across under an x-name, legal in both RFC 2426 Section 4 and RFC 6350
+// Section 6.10, keeps the value intact for the reverse conversion to restore.
+const vcardPreservedPropertyPrefix = "X-CALCARD-"
+
+// restoreVCardProperty undoes the carry when a card is converted back to the
+// version that named the property. The prefix is sliced off the verbatim name
+// rather than the upper-cased one so the client's original spelling survives.
+func restoreVCardProperty(line *vcardLine, upperName string, named map[string]struct{}) bool {
+	if !strings.HasPrefix(upperName, vcardPreservedPropertyPrefix) {
+		return false
+	}
+	if _, ok := named[upperName[len(vcardPreservedPropertyPrefix):]]; !ok {
+		return false
+	}
+	line.name = line.name[len(vcardPreservedPropertyPrefix):]
+	return true
 }
 
 // Group membership predates vCard 4.0 KIND/MEMBER; 3.0 clients (and DAVx5's
@@ -325,8 +347,14 @@ func upgradeVCardLine(line vcardLine) (vcardLine, bool) {
 		line.value = "4.0"
 		return line, true
 	}
+	// Carried and restored verbatim: the value means nothing to this version,
+	// so any rewriting below would only corrupt what the other version reads.
 	if _, removed := vcard3OnlyProperties[name]; removed {
-		return vcardLine{}, false
+		line.name = vcardPreservedPropertyPrefix + line.name
+		return line, true
+	}
+	if restoreVCardProperty(&line, name, vcard4OnlyProperties) {
+		return line, true
 	}
 
 	// vCard 4.0 is always UTF-8 and spells the URI value type "uri".
@@ -360,8 +388,13 @@ func downgradeVCardLine(line vcardLine) (vcardLine, bool) {
 		line.value = "3.0"
 		return line, true
 	}
+	// Carried and restored verbatim, as on the upgrade path above.
 	if _, added := vcard4OnlyProperties[name]; added {
-		return vcardLine{}, false
+		line.name = vcardPreservedPropertyPrefix + line.name
+		return line, true
+	}
+	if restoreVCardProperty(&line, name, vcard3OnlyProperties) {
+		return line, true
 	}
 
 	downgradePreferenceParam(&line)

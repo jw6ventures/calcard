@@ -386,3 +386,68 @@ func TestHelmChartAllowsAPublishedServiceWithoutTheIngress(t *testing.T) {
 		t.Fatalf("service.type was not honoured with the ingress disabled:\n%s", service)
 	}
 }
+
+// Schema migrations run in the container before the HTTP listener opens, so
+// nothing answers /healthz until they finish. Without a startup probe the
+// liveness probe begins immediately and restarts the container about thirty
+// seconds in, rolling the migration back; the next attempt starts it over, so a
+// migration longer than that window can never complete. A startup probe
+// suspends liveness and readiness until it passes, which is what makes the
+// budget below the migration's, not the liveness probe's.
+func TestHelmChartGivesMigrationsAStartupBudget(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t), "app-deployment.yaml")
+
+	startup, ok := blockUnder(deployment, "startupProbe:")
+	if !ok {
+		t.Fatalf("app deployment has no startupProbe, so the liveness probe restarts the container during a migration:\n%s", deployment)
+	}
+	for _, want := range []string{"path: /healthz", "periodSeconds: 10", "failureThreshold: 60"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe is missing %q:\n%s", want, startup)
+		}
+	}
+
+	// The liveness probe must stay tight: once startup succeeds it is the only
+	// thing that restarts a process that wedges while serving.
+	liveness, ok := blockUnder(deployment, "livenessProbe:")
+	if !ok {
+		t.Fatalf("app deployment has no livenessProbe:\n%s", deployment)
+	}
+	for _, want := range []string{"periodSeconds: 10", "failureThreshold: 3"} {
+		if !hasLine(liveness, want) {
+			t.Errorf("livenessProbe is missing %q:\n%s", want, liveness)
+		}
+	}
+}
+
+// The v1.2.0 migration instructs that it be applied with the application
+// stopped. A rolling update does the opposite: it brings the new pod up while
+// the old one still serves, so the previous release keeps reading and writing a
+// schema the new one is rewriting. Recreate is what makes the deployment obey
+// the instruction the migration states.
+func TestHelmChartReplacesPodsRatherThanRollingThem(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t), "app-deployment.yaml")
+
+	strategy, ok := blockUnder(deployment, "strategy:")
+	if !ok {
+		t.Fatalf("app deployment declares no strategy, so a rolling update runs the old release against a half-migrated schema:\n%s", deployment)
+	}
+	if !hasLine(strategy, "type: Recreate") {
+		t.Errorf("strategy is not Recreate:\n%s", strategy)
+	}
+}
+
+// The startup budget scales with the events table, so an operator has to be
+// able to raise it without forking the chart.
+func TestHelmChartStartupBudgetIsConfigurable(t *testing.T) {
+	documents := renderChart(t, "--set", "startupProbe.failureThreshold=180", "--set", "startupProbe.periodSeconds=15")
+	startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+	if !ok {
+		t.Fatal("app deployment has no startupProbe")
+	}
+	for _, want := range []string{"periodSeconds: 15", "failureThreshold: 180"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe did not take the configured value %q:\n%s", want, startup)
+		}
+	}
+}

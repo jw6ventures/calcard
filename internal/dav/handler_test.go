@@ -1315,6 +1315,7 @@ func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
 		"opaquelocktoken:report-lock": {
 			Token:          "opaquelocktoken:report-lock",
 			ResourcePath:   "/dav/calendars/1/event",
+			UserID:         1,
 			LockScope:      "exclusive",
 			LockType:       "write",
 			Depth:          "0",
@@ -1444,6 +1445,7 @@ func TestAddressBookSyncReturnsOnlyRequestedObjectProperties(t *testing.T) {
 		"opaquelocktoken:address-report-lock": {
 			Token:          "opaquelocktoken:address-report-lock",
 			ResourcePath:   "/dav/addressbooks/5/alice",
+			UserID:         1,
 			LockScope:      "exclusive",
 			LockType:       "write",
 			Depth:          "0",

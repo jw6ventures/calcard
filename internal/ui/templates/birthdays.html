@@ -348,10 +348,18 @@
         modal.classList.add('show');
     }
     
+    // Escapes the quotes as well as the markup delimiters, so a value stays
+    // inert wherever it is interpolated: a textContent round trip through the
+    // DOM escapes only & < >, which leaves a value free to close a
+    // double-quoted attribute and open an event handler. The ampersand is
+    // rewritten first so the entities introduced below are not escaped twice.
     function escapeHtml(str) {
-        var div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
+        return (str === null ? '' : String(str))
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
     
     function renderCalendar() {

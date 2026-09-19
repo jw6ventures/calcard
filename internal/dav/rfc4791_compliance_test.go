@@ -3773,7 +3773,10 @@ func TestRFC4791_PutExceedsMaxInstances(t *testing.T) {
 // any range can absorb. RFC 4791 §5.2.8 bounds the stored resource by
 // CALDAV:max-instances however the pattern spells itself, so the validator has
 // to answer these rather than run them out.
-func TestRFC4791_PutRejectsUnboundedAndSubSecondRecurrence(t *testing.T) {
+// A rule with no COUNT or UNTIL is measured over one year, which leaves the
+// sub-daily frequencies past CALDAV:max-instances while admitting the
+// calendar-scale ones (see TestRFC4791_PutAcceptsUnboundedCalendarRecurrence).
+func TestRFC4791_PutRejectsSubDailyAndOversizedRecurrence(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		rrule string
@@ -3781,7 +3784,7 @@ func TestRFC4791_PutRejectsUnboundedAndSubSecondRecurrence(t *testing.T) {
 		{name: "unbounded secondly", rrule: "RRULE:FREQ=SECONDLY"},
 		{name: "unbounded secondly with interval", rrule: "RRULE:FREQ=SECONDLY;INTERVAL=1"},
 		{name: "unbounded minutely", rrule: "RRULE:FREQ=MINUTELY"},
-		{name: "unbounded daily", rrule: "RRULE:FREQ=DAILY"},
+		{name: "unbounded hourly", rrule: "RRULE:FREQ=HOURLY"},
 		{name: "secondly past the limit", rrule: "RRULE:FREQ=SECONDLY;COUNT=100000"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3834,10 +3837,10 @@ func TestRFC4791_PutExceedsMaxInstancesWithoutCount(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	tests := map[string]string{
-		"unbounded rule": buildCalendarObject(buildVEvent("unbounded",
-			"DTSTART:20240101T000000Z", "RRULE:FREQ=DAILY")),
 		"UNTIL beyond limit": buildCalendarObject(buildVEvent("until",
 			"DTSTART:20240101T000000Z", "RRULE:FREQ=DAILY;UNTIL=20270101T000000Z")),
+		"COUNT beyond limit": buildCalendarObject(buildVEvent("count",
+			"DTSTART:20240101T000000Z", "RRULE:FREQ=DAILY;COUNT=1500")),
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -5691,4 +5694,44 @@ func TestRFC4791_MkcalendarStoresUnrecognizedPropertiesAsDeadProperties(t *testi
 	decodeMultistatus(t, rr).
 		responseForHref(t, "/dav/calendars/1/").
 		assertPropValue(t, qn("urn:example:vendor", "note"), http.StatusOK, "keep me")
+}
+
+// "Repeats weekly, no end date" is the default recurring shape iOS Calendar,
+// Thunderbird, Evolution and DAVx5 all emit, so refusing every rule without a
+// COUNT or UNTIL makes the server unusable with them. CALDAV:max-instances is
+// measured over a year for such a rule instead of over a set that never ends.
+func TestRFC4791_PutAcceptsUnboundedCalendarRecurrence(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		rrule string
+	}{
+		{name: "unbounded daily", rrule: "RRULE:FREQ=DAILY"},
+		{name: "unbounded weekly", rrule: "RRULE:FREQ=WEEKLY"},
+		{name: "unbounded weekly on weekdays", rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"},
+		{name: "unbounded monthly", rrule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=15"},
+		{name: "unbounded yearly", rrule: "RRULE:FREQ=YEARLY"},
+		{name: "unbounded every other day", rrule: "RRULE:FREQ=DAILY;INTERVAL=2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				accessible: []store.CalendarAccess{
+					{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+				},
+			}
+			eventRepo := &fakeEventRepo{}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+			icalData := buildCalendarObject(buildVEvent("unbounded",
+				"DTSTART:20240101T090000Z", "DTEND:20240101T100000Z", tt.rrule))
+			req := newCalendarPutRequest("/dav/calendars/1/unbounded.ics", strings.NewReader(icalData))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Put(rr, req)
+
+			if rr.Code != http.StatusCreated && rr.Code != http.StatusNoContent {
+				t.Fatalf("%s was refused: status = %d, body: %s", tt.rrule, rr.Code, rr.Body.String())
+			}
+		})
+	}
 }

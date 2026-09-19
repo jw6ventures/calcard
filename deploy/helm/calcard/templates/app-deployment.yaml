@@ -14,6 +14,13 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # Migrations run on startup and expect the application stopped while they
+  # apply. A rolling update starts the new pod first and keeps the old one
+  # serving, which runs the previous release against a schema being migrated
+  # out from under it; Recreate terminates the old pod before the new one
+  # starts, so only one version ever meets the database.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ $name }}
@@ -66,11 +73,25 @@ spec:
                 name: {{ $fullname }}-config
             - secretRef:
                 name: {{ $fullname }}-secret
+          # Migrations run before the listener opens, so the port stays closed
+          # for as long as the schema takes to reach the app's version. While
+          # this probe is running the kubelet holds off the liveness and
+          # readiness probes entirely, which is what stops a migration from
+          # being killed mid-transaction and restarted from the beginning on
+          # every backoff.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: 2
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          # Takes over once the startup probe succeeds, so a process that wedges
+          # while serving is restarted within roughly 30 seconds.
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3

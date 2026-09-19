@@ -369,3 +369,43 @@ func TestTimedEditorTimezoneRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// The event modal builds a markup string and assigns it to innerHTML, so every
+// value interpolated into it has to be escaped at the point of interpolation.
+// formatRRule reads its parts straight out of the stored RRULE, which arrives
+// over CalDAV PUT or an ICS import and is never sanitized on the way in.
+func TestEventModalEscapesRecurrenceSummary(t *testing.T) {
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		source, err := templateFS.ReadFile("templates/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if !strings.Contains(string(source), "escapeHtml(formatRRule(event.rrule))") {
+			t.Errorf("%s interpolates formatRRule output into the modal unescaped", name)
+		}
+	}
+}
+
+// escapeHtml and safeHref are the only guards between stored calendar data and
+// the modal's innerHTML, and both are duplicated per template. Running the
+// templates' own copies keeps the two from drifting apart.
+func TestEventModalEscapingHelpers(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; skipping the template JavaScript escaping checks")
+	}
+	for _, name := range []string{
+		"calendar_view.html",
+		"all_calendars_view.html",
+		"addressbook_view.html",
+		"birthdays.html",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command(node, filepath.Join("testdata", "modal_escaping.mjs"),
+				filepath.Join("templates", name))
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("escaping helpers: %v\n%s", err, output)
+			}
+		})
+	}
+}

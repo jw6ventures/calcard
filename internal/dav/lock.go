@@ -665,7 +665,7 @@ type lockResponseProp struct {
 func writeLockResponse(w http.ResponseWriter, lock *store.Lock, status int) {
 	resp := lockResponseProp{
 		XmlnsD:        "DAV:",
-		LockDiscovery: &lockDiscoveryProp{ActiveLocks: []activeLock{activeLockFromStoreLock(lock)}},
+		LockDiscovery: &lockDiscoveryProp{ActiveLocks: []activeLock{activeLockFromStoreLock(lock, true)}},
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -761,6 +761,12 @@ func lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.L
 	}
 	now := time.Now()
 	ifHeader := r.Header.Get("If")
+	// RFC 4918 Section 6.4 requires the authenticated principal to match the
+	// lock creator as well as the token to be submitted. Token possession alone
+	// cannot carry the decision: DAV:lockdiscovery reports a lock to every
+	// principal that can read the resource, so on a shared collection the token
+	// is not a secret the creator holds.
+	user, _ := auth.UserFromContext(r.Context())
 
 	hasActiveLock := false
 	for _, lock := range locks {
@@ -773,6 +779,9 @@ func lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.L
 			continue
 		}
 		hasActiveLock = true
+		if user == nil || lock.UserID != user.ID {
+			continue
+		}
 		for _, token := range ifLockTokensForPaths(ifHeader, target.requestPath, target.canonicalPath, lock.ResourcePath, lockPath) {
 			if lock.Token == token {
 				return true
@@ -969,7 +978,11 @@ func defaultSupportedLock() *supportedLockProp {
 	}
 }
 
-func activeLockFromStoreLock(lock *store.Lock) activeLock {
+// revealToken carries whether DAV:locktoken may be reported. RFC 4918 Section
+// 15.8 leaves the token optional in DAV:lockdiscovery, and it has to stay out
+// of a response to any principal but the creator: the write check treats a
+// submitted token as proof the request comes from the lock's owner.
+func activeLockFromStoreLock(lock *store.Lock, revealToken bool) activeLock {
 	scopeEl := activeLockScope{Exclusive: &struct{}{}}
 	if lock.LockScope == "shared" {
 		scopeEl = activeLockScope{Shared: &struct{}{}}
@@ -984,13 +997,18 @@ func activeLockFromStoreLock(lock *store.Lock) activeLock {
 		}
 	}
 
+	var lockToken *lockTokenProp
+	if revealToken {
+		lockToken = &lockTokenProp{Href: lock.Token}
+	}
+
 	return activeLock{
 		LockScope: scopeEl,
 		LockType:  activeLockType{Write: &struct{}{}},
 		Depth:     lock.Depth,
 		Owner:     owner,
 		Timeout:   fmt.Sprintf("Second-%d", lock.TimeoutSeconds),
-		LockToken: &lockTokenProp{Href: lock.Token},
+		LockToken: lockToken,
 		LockRoot:  &hrefProp{Href: publicDAVLockRoot(lock.ResourcePath)},
 	}
 }

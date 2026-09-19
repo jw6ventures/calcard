@@ -111,6 +111,17 @@ postgres:
     storageClassName: "" # StorageClass for the PVC. Leave empty to use the cluster default.
   resources: {} # CPU/memory requests and limits for the Postgres container.
 
+# Startup gate for the app container. Schema migrations run before the server
+# starts listening, and the liveness probe is held off until this one succeeds,
+# so this budget is what keeps a long migration from being killed and rolled
+# back part way -- which on the next restart simply starts the migration again.
+# The default allows 10 minutes. Raise it if an upgrade has to rebuild indexes
+# over a large events table; the cost of a larger value is only that a process
+# that wedges during startup takes that long to be restarted.
+startupProbe:
+  periodSeconds: 10 # Seconds between startup checks.
+  failureThreshold: 60 # Consecutive failures tolerated before the container is restarted. Startup budget is periodSeconds x failureThreshold.
+
 resources: {} # CPU/memory requests and limits for the app container.
 nodeSelector: {} # Constrain app pods to nodes with matching labels.
 tolerations: [] # Tolerations allowing app pods to schedule onto tainted nodes.

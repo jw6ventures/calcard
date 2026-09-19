@@ -2287,10 +2287,18 @@
         return result;
     }
 
+    // Several results land inside a double-quoted attribute, so the quotes are
+    // escaped as well as the markup delimiters: a textContent round trip
+    // through the DOM escapes only & < >, which leaves a value free to close
+    // the attribute it sits in and open an event handler. The ampersand is
+    // rewritten first so the entities introduced below are not escaped twice.
     function escapeHtml(str) {
-        var div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
+        return (str === null ? '' : String(str))
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function safeHref(raw) {
@@ -2301,7 +2309,10 @@
             var u = new URL(value, window.location.origin);
             var protocol = (u.protocol || '').toLowerCase();
             if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
-                return escapeHtml(value);
+                // The parsed href, not the caller's text: URL percent-encodes
+                // the quotes and control characters that would otherwise ride
+                // through into the href attribute unchanged.
+                return escapeHtml(u.href);
             }
         } catch (e) {}
         return '';

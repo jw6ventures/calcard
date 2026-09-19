@@ -155,9 +155,15 @@ func busyPeriodOverlapsRange(periodStart, periodEnd, rangeStart, rangeEnd time.T
 // freeBusyHasTimeRange reports whether the range the §9.11 grammar required
 // carries usable bounds. Without them the report degenerates into a
 // full-collection read and an unbounded text/calendar response.
+//
+// The end has to be one the request spelled, which is more than §9.9 asks of a
+// time-range in general. §7.10 answers with the periods the range covers rather
+// than with which resources reach it, and an open end covers endlessly many: the
+// report has no answer to give, so it is refused instead of attempted. An open
+// start is left alone, since no period precedes the earliest DTSTART stored.
 func freeBusyHasTimeRange(tr *timeRange) bool {
-	_, _, ok := calendarTimeRangeBounds(tr)
-	return ok
+	_, end, ok := calendarTimeRangeBounds(tr)
+	return ok && !openTimeRangeEnd(end)
 }
 
 // generateFreeBusy builds the §7.10 response body. Each candidate resolves its

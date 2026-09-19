@@ -99,7 +99,13 @@ func expandComponent(m calendarTimeRangeMatcher, root, node *icalNode, r calenda
 		return expandedSingleton(m, root, node, r)
 	}
 
-	instances, expandable := m.recurrenceInstances(node, master, r.Start, r.End)
+	instances, expandable, settled := m.recurrenceInstances(node, master, r.Start, r.End)
+	if expandable && !settled {
+		// §9.6.5 owes every instance of the range, which both attributes of the
+		// element bound, so a prefix of the set is not an answer it can give.
+		*m.expansionError = ical.ErrRecurrenceExpansionLimit
+		return nil
+	}
 	if !expandable {
 		// A frequency this server cannot enumerate yields no instances to
 		// return. Keeping the component with its RRULE would break the §9.6.5

@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -244,7 +245,7 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 		return m.alarmInTimeRange(node, parent, start, end, 0)
 	}
 	master := m.recurrenceMaster(node, parent)
-	instances, expandable := m.recurrenceInstances(node, master, start, end)
+	instances, expandable, settled := m.recurrenceInstances(node, master, start, end)
 	if !expandable {
 		// A frequency this server cannot expand is kept rather than filtered
 		// out: reporting nothing would hide a resource that does occur in the
@@ -267,7 +268,10 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 			return true
 		}
 	}
-	return false
+	// No instance of the prefix matched, which settles the question only when the
+	// prefix was the whole set. Otherwise the resource is kept on the same ground
+	// an inexpressible frequency is.
+	return !settled
 }
 
 // recurrenceMaster is the component whose recurrence set governs node: node
@@ -295,17 +299,32 @@ type recurrenceInstance struct {
 	duration  time.Duration
 }
 
-// recurrenceInstances retains the effective duration and original identity of each occurrence.
-func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) ([]recurrenceInstance, bool) {
+// openTimeRangeEnd reports whether the end of a range is the +infinity RFC 4791
+// §9.9 gives an omitted CALDAV:time-range attribute rather than an instant the
+// client spelled. The two are told apart by the value alone because every
+// spelled endpoint is first checked against CALDAV:max-date-time, which the
+// sentinel calendarTimeRangeBounds substitutes sits far beyond: no request can
+// name this instant itself.
+func openTimeRangeEnd(end time.Time) bool {
+	_, maxTime := ical.DateLimits()
+	return end.After(maxTime)
+}
+
+// recurrenceInstances retains the effective duration and original identity of
+// each occurrence. expandable is false when nothing here can be enumerated at
+// all. settled is false when the instances returned are a prefix of the set and
+// that prefix does not answer the question asked of it, which a caller deciding
+// a §9.9 match has to read as "no answer" rather than "no match".
+func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) (_ []recurrenceInstance, expandable, settled bool) {
 	if master == nil {
-		return []recurrenceInstance{{}}, true
+		return []recurrenceInstance{{}}, true, true
 	}
 	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
-		return nil, false
+		return nil, false, false
 	}
 	dtstart, ok := m.dateValue(master, "DTSTART", 0)
 	if !ok {
-		return []recurrenceInstance{{}}, true
+		return []recurrenceInstance{{}}, true, true
 	}
 	window := m.occurrenceWindow(master, dtstart)
 	scanStart, scanEnd := start, end
@@ -316,9 +335,20 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	// component-specific test excludes. The output budget is checked after that test.
 	generated, err := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
 		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine)
-	if err != nil {
+	// Exhausting the budget against an open end is not a failure. No budget
+	// covers an infinity, so refusing would fail every report a client scopes
+	// that way rather than the one resource -- and the prefix settles the match
+	// without the rest of the set, since an instance had to reach the range to
+	// be generated at all. A spelled end asks a finite question the server
+	// undertook to answer exactly, so there the budget still refuses.
+	truncated := errors.Is(err, ical.ErrRecurrenceExpansionLimit)
+	if err != nil && !truncated {
 		*m.expansionError = err
-		return nil, false
+		return nil, false, false
+	}
+	if truncated && !openTimeRangeEnd(end) {
+		*m.expansionError = err
+		return nil, false, false
 	}
 	instances := make([]recurrenceInstance, 0, len(generated))
 	for _, instance := range generated {
@@ -328,7 +358,10 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 			duration:  instance.End.Sub(instance.Start),
 		})
 	}
-	return instances, true
+	// A truncated prefix reaching here came from an open end, so it settles a
+	// match it contains. Whether it settles the absence of one is the caller's
+	// question, and truncated is what tells it apart.
+	return instances, true, !truncated
 }
 
 // alarmScanLead is how far outside the requested range an instance can start
@@ -731,7 +764,7 @@ func (m calendarTimeRangeMatcher) inferredPropertyInTimeRange(name string, node,
 // every instance to be considered and makes one match enough.
 func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, name string, node, parent *icalNode, start, end time.Time) bool {
 	master := m.recurrenceMaster(node, parent)
-	instances, expandable := m.recurrenceInstances(node, master, start, end)
+	instances, expandable, settled := m.recurrenceInstances(node, master, start, end)
 	if !expandable {
 		return true
 	}
@@ -751,5 +784,5 @@ func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, n
 			return true
 		}
 	}
-	return false
+	return !settled
 }
