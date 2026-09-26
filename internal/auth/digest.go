@@ -15,12 +15,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -41,8 +42,7 @@ const (
 )
 
 // errDigestHA1KeyUnavailable reports that no session secret is configured, so
-// stored HA1s can be neither written nor read. Digest then has no credentials
-// to verify against and app passwords remain usable over Basic alone.
+// stored HA1s can be neither written nor read.
 var errDigestHA1KeyUnavailable = errors.New("digest credential key unavailable")
 
 func digestHash(algorithm, value string) string {
@@ -59,9 +59,8 @@ func digestHash(algorithm, value string) string {
 }
 
 // digestHA1 derives the HA1 that RFC 7616 section 3.4.2 hashes the credentials
-// against. It is password-equivalent for this realm: anything holding it can
-// authenticate without knowing the password, which is why it is only ever
-// persisted through encryptDigestHA1.
+// against. It is password-equivalent for this realm, so it is only ever
+// persisted through sealDigestCredentials.
 func digestHA1(algorithm, username, password string) string {
 	return digestHash(algorithm, username+":"+davDigestRealm+":"+password)
 }
@@ -69,8 +68,8 @@ func digestHA1(algorithm, username, password string) string {
 // encryptDigestHA1 seals an HA1 for storage. The algorithm is authenticated
 // alongside the ciphertext so a value written for one algorithm cannot be moved
 // into the other's column and still verify.
-func (s *Service) encryptDigestHA1(algorithm, ha1 string) (string, error) {
-	aead, err := s.digestHA1AEAD()
+func encryptDigestHA1(cfg *config.Config, algorithm, ha1 string) (string, error) {
+	aead, err := digestHA1AEAD(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -85,7 +84,7 @@ func (s *Service) encryptDigestHA1(algorithm, ha1 string) (string, error) {
 // decryptDigestHA1 opens a stored HA1. A value that does not carry a known
 // version prefix is rejected rather than treated as plaintext: accepting an
 // unsealed HA1 would silently restore the exposure sealing exists to remove.
-func (s *Service) decryptDigestHA1(algorithm, stored string) (string, error) {
+func decryptDigestHA1(cfg *config.Config, algorithm, stored string) (string, error) {
 	version, encoded, ok := strings.Cut(stored, ":")
 	if !ok || version != digestHA1Version {
 		return "", errors.New("unrecognized digest credential encoding")
@@ -94,7 +93,7 @@ func (s *Service) decryptDigestHA1(algorithm, stored string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	aead, err := s.digestHA1AEAD()
+	aead, err := digestHA1AEAD(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -110,13 +109,24 @@ func (s *Service) decryptDigestHA1(algorithm, stored string) (string, error) {
 }
 
 // sealDigestCredentials returns the sealed MD5 and SHA-256 HA1s to persist for
-// a newly issued app password, or two nils when no key is configured. A missing
-// key is not an error: it leaves the app password Basic-only, the same state
-// every app password issued before Digest existed is already in.
+// an app password, or two nils when there is nothing to persist, which leaves
+// the app password Basic-only.
+//
+// Nothing is produced unless the deployment has opted into Digest. An HA1
+// authenticates its holder without the password, and although it is sealed, the
+// key is derived from APP_SESSION_SECRET -- so the row and the secret together
+// recover it, and those two are routinely captured together in an environment
+// block, a Kubernetes Secret, or a backup. A bcrypt hash alone gives an attacker
+// holding the database nothing, and an operator who left Digest off never agreed
+// to trade that away. Gating here rather than at each caller keeps the rule on
+// the one function whose output exists to be written to a row.
 func (s *Service) sealDigestCredentials(username, password string) (*string, *string, error) {
+	if !s.digestEnabled() {
+		return nil, nil, nil
+	}
 	sealed := make([]*string, 0, 2)
 	for _, algorithm := range []string{"MD5", "SHA-256"} {
-		value, err := s.encryptDigestHA1(algorithm, digestHA1(algorithm, username, password))
+		value, err := encryptDigestHA1(s.cfg, algorithm, digestHA1(algorithm, username, password))
 		if errors.Is(err, errDigestHA1KeyUnavailable) {
 			return nil, nil, nil
 		}
@@ -128,8 +138,23 @@ func (s *Service) sealDigestCredentials(username, password string) (*string, *st
 	return sealed[0], sealed[1], nil
 }
 
-func (s *Service) digestHA1AEAD() (cipher.AEAD, error) {
-	key, err := s.deriveDigestKey(digestHA1KeyInfo)
+// cachedDigestHA1AEAD is the HA1 cipher for the most recently used session
+// secret. A process runs with one secret, so one entry saves the HKDF expansion
+// and key schedule on every seal, every Digest verification and every row the
+// readiness badge checks. GCM keeps no per-call state, so the one instance
+// serves concurrent callers.
+type cachedDigestHA1AEAD struct {
+	secret string
+	aead   cipher.AEAD
+}
+
+var digestHA1AEADCache atomic.Pointer[cachedDigestHA1AEAD]
+
+func digestHA1AEAD(cfg *config.Config) (cipher.AEAD, error) {
+	if cached := digestHA1AEADCache.Load(); cached != nil && cfg != nil && cached.secret == cfg.Session.Secret {
+		return cached.aead, nil
+	}
+	key, err := deriveDigestKey(cfg, digestHA1KeyInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -137,26 +162,70 @@ func (s *Service) digestHA1AEAD() (cipher.AEAD, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cipher.NewGCM(block)
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	digestHA1AEADCache.Store(&cachedDigestHA1AEAD{secret: cfg.Session.Secret, aead: aead})
+	return aead, nil
 }
 
 // deriveDigestKey expands the configured session secret into one purpose-bound
 // key. Deriving rather than generating is what lets nonces survive a restart and
 // lets every replica accept the others' nonces and read the others' HA1s.
-func (s *Service) deriveDigestKey(info string) ([]byte, error) {
-	if s == nil || s.cfg == nil || s.cfg.Session.Secret == "" {
+func deriveDigestKey(cfg *config.Config, info string) ([]byte, error) {
+	if cfg == nil || cfg.Session.Secret == "" {
 		return nil, errDigestHA1KeyUnavailable
 	}
-	return hkdf.Key(sha256.New, []byte(s.cfg.Session.Secret), nil, info, 32)
+	return hkdf.Key(sha256.New, []byte(cfg.Session.Secret), nil, info, 32)
 }
 
-// digestEnabled reports whether this deployment has opted into the DAV Digest
-// scheme. Digest verifies against a stored HA1, which an app password issued
-// before Digest existed does not have, so offering the scheme unconditionally
-// would answer a valid credential with 401 for as long as the client kept
-// selecting it.
+// DigestEnabled reports whether this deployment has opted into the DAV Digest
+// scheme. It gates offering and accepting the scheme and writing any HA1; see
+// sealDigestCredentials.
+func DigestEnabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.DAV.DigestEnabled
+}
+
 func (s *Service) digestEnabled() bool {
-	return s != nil && s.cfg != nil && s.cfg.DAV.DigestEnabled
+	return s != nil && DigestEnabled(s.cfg)
+}
+
+// DigestReady reports whether an app password can answer a DAV Digest challenge
+// right now: the scheme is enabled, both HA1s are present, and this server can
+// open them. A value sealed under a since-rotated session secret verifies
+// nothing, so non-null columns alone are not enough.
+func DigestReady(cfg *config.Config, token store.AppPassword) bool {
+	if !DigestEnabled(cfg) {
+		return false
+	}
+	return digestCredentialOpens(cfg, "MD5", token.DigestMD5HA1) && digestCredentialOpens(cfg, "SHA-256", token.DigestSHA256HA1)
+}
+
+func digestCredentialOpens(cfg *config.Config, algorithm string, stored *string) bool {
+	if stored == nil || *stored == "" {
+		return false
+	}
+	_, err := decryptDigestHA1(cfg, algorithm, *stored)
+	return err == nil
+}
+
+// reportUnreadableDigestCredential names the condition behind a stored HA1
+// that will not open. Without a line for it, Digest failing across the
+// deployment is indistinguishable from users mistyping passwords.
+//
+// It reports once per process. This runs before the response is checked, so any
+// client that can obtain a challenge reaches it, and a per-request line would
+// let an unauthenticated one flood the log. The condition is global, not
+// per-credential, so one line is enough.
+func (s *Service) reportUnreadableDigestCredential(algorithm string, tokenID int64, err error) {
+	s.digestUnreadableOnce.Do(func() {
+		if errors.Is(err, errDigestHA1KeyUnavailable) {
+			s.logger().Error("dav_digest", "stored %s credential for app password %d cannot be opened because APP_SESSION_SECRET is not configured; Digest cannot verify any app password until it is", algorithm, tokenID)
+			return
+		}
+		s.logger().Error("dav_digest", "stored %s credential for app password %d could not be opened, so Digest cannot verify it; APP_SESSION_SECRET was most likely rotated. An affected app password is re-sealed the next time it authenticates over Basic, which is only accepted over HTTPS; where DAV is served without HTTPS, affected app passwords must be revoked and reissued: %v", algorithm, tokenID, err)
+	})
 }
 
 func (s *Service) writeDAVAuthChallenge(w http.ResponseWriter, r *http.Request, stale bool) error {
@@ -213,7 +282,7 @@ func (s *Service) ensureDigestKeyLocked() error {
 	if len(s.digestKey) != 0 {
 		return nil
 	}
-	if derived, err := s.deriveDigestKey(digestNonceKeyInfo); err == nil {
+	if derived, err := deriveDigestKey(s.cfg, digestNonceKeyInfo); err == nil {
 		s.digestKey = derived
 		return nil
 	} else if !errors.Is(err, errDigestHA1KeyUnavailable) {
@@ -335,8 +404,9 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 		if stored == nil || *stored == "" {
 			continue
 		}
-		ha1, err := s.decryptDigestHA1(algorithm, *stored)
+		ha1, err := decryptDigestHA1(s.cfg, algorithm, *stored)
 		if err != nil {
+			s.reportUnreadableDigestCredential(algorithm, token.ID, err)
 			continue
 		}
 		ha2 := digestHash(algorithm, r.Method+":"+requestTarget)
@@ -350,7 +420,7 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 			// failed. stale=true lets a well-behaved client retry with a fresh
 			// nonce instead of re-prompting the user for credentials that were
 			// never the problem.
-			log.Printf("dav digest: replay guard unavailable for app password %d: %v", token.ID, err)
+			s.logger().Error("dav_digest", "replay guard unavailable for app password %d: %v", token.ID, err)
 			return nil, true, errors.New("digest replay guard unavailable")
 		}
 		if !claimed {

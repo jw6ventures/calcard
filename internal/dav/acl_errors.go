@@ -11,7 +11,8 @@ import (
 )
 
 type privilegeRequirementError struct {
-	cause           error
+	cause error
+	// href is the decoded path of the resource; writeNeedPrivileges escapes it.
 	href            string
 	privilege       string
 	concealNotFound bool
@@ -23,18 +24,18 @@ func (e *privilegeRequirementError) Error() string {
 
 func (e *privilegeRequirementError) Unwrap() error { return e.cause }
 
-func requirePrivilegeAt(err error, href, privilege string) error {
+func requirePrivilegeAt(err error, resourcePath, privilege string) error {
 	if err == nil {
 		return nil
 	}
-	return &privilegeRequirementError{cause: err, href: normalizeDAVHref(href), privilege: privilege}
+	return &privilegeRequirementError{cause: err, href: cleanDAVPath(resourcePath), privilege: privilege}
 }
 
-func requirePrivatePrivilegeAt(err error, href, privilege string) error {
+func requirePrivatePrivilegeAt(err error, resourcePath, privilege string) error {
 	if err == nil {
 		return nil
 	}
-	return &privilegeRequirementError{cause: err, href: normalizeDAVHref(href), privilege: privilege, concealNotFound: true}
+	return &privilegeRequirementError{cause: err, href: cleanDAVPath(resourcePath), privilege: privilege, concealNotFound: true}
 }
 
 func writePrivilegeRequirementError(w http.ResponseWriter, err error) bool {
@@ -55,9 +56,11 @@ func writePrivilegeRequirementError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
-func writeNeedPrivileges(w http.ResponseWriter, href, privilege string) {
+// writeNeedPrivileges answers 403 DAV:need-privileges for resourcePath, a
+// decoded path, which the response names by its href.
+func writeNeedPrivileges(w http.ResponseWriter, resourcePath, privilege string) {
 	var escapedHref strings.Builder
-	_ = xml.EscapeText(&escapedHref, []byte(normalizeDAVHref(href)))
+	_ = xml.EscapeText(&escapedHref, []byte(escapeDAVPath(cleanDAVPath(resourcePath))))
 	privilegeXML := davPrivilegeErrorElement(privilege)
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(http.StatusForbidden)

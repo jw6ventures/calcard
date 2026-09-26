@@ -4,6 +4,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // icalProperty is one parsed RFC 5545 content line. keyPart keeps the name and
@@ -37,11 +39,10 @@ var knownICalendarParameters = map[string]struct{}{
 }
 
 func parseICalProperty(line string) (icalProperty, bool) {
-	colon := delimiterOutsideQuotes(line, ':')
-	if colon <= 0 {
+	keyPart, value, ok := ical.SplitContentLine(line)
+	if !ok || keyPart == "" {
 		return icalProperty{}, false
 	}
-	keyPart := line[:colon]
 	parts, ok := splitOutsideQuotes(keyPart, ';')
 	if !ok || len(parts) == 0 {
 		return icalProperty{}, false
@@ -53,7 +54,7 @@ func parseICalProperty(line string) (icalProperty, bool) {
 	property := icalProperty{
 		name:       name,
 		keyPart:    keyPart,
-		value:      line[colon+1:],
+		value:      value,
 		parameters: make(map[string]string, len(parts)-1),
 	}
 	for _, rawParameter := range parts[1:] {
@@ -75,21 +76,6 @@ func parseICalProperty(line string) (icalProperty, bool) {
 		return icalProperty{}, false
 	}
 	return property, true
-}
-
-func delimiterOutsideQuotes(value string, delimiter byte) int {
-	quoted := false
-	for i := 0; i < len(value); i++ {
-		switch value[i] {
-		case '"':
-			quoted = !quoted
-		case delimiter:
-			if !quoted {
-				return i
-			}
-		}
-	}
-	return -1
 }
 
 func splitOutsideQuotes(value string, delimiter byte) ([]string, bool) {

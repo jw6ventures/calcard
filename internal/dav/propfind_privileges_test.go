@@ -228,7 +228,7 @@ func TestPropfindBirthdayCalendarObjectPrivilegeSet(t *testing.T) {
 	if rr.Code != http.StatusMultiStatus {
 		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
 	}
-	objectResponse := davResponseForHref(t, rr.Body.String(), "/dav/calendars/-1/birthday-alice@calcard.ics")
+	objectResponse := davResponseForHref(t, rr.Body.String(), calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(6, "alice")))
 	if !strings.Contains(objectResponse, "<d:read>") {
 		t.Fatalf("expected read privilege on a birthday object, got %s", objectResponse)
 	}
@@ -281,7 +281,7 @@ func TestCurrentUserPrivilegeSetForObjectPathsIsPresent(t *testing.T) {
 	for _, path := range []string{
 		"/dav/calendars/5/event.ics",
 		"/dav/addressbooks/6/alice.vcf",
-		"/dav/calendars/-1/birthday-alice@calcard.ics",
+		calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(6, "alice")),
 	} {
 		privs, err := h.currentUserPrivilegeSetForPath(context.Background(), owner, path)
 		if err != nil {
@@ -574,7 +574,7 @@ func TestBirthdayCalendarPrivilegeCheckDeniesWrites(t *testing.T) {
 
 	// The collection is reached with and without the trailing slash (a parent
 	// lookup strips it) and by its zero-padded alias.
-	for _, path := range []string{"/dav/calendars/-1/", "/dav/calendars/-1", "/dav/calendars/-01/", "/dav/calendars/-1/birthday-alice@calcard.ics"} {
+	for _, path := range []string{"/dav/calendars/-1/", "/dav/calendars/-1", "/dav/calendars/-01/", calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(6, "alice"))} {
 		for _, privilege := range []string{"read", "read-free-busy", "read-acl", "read-current-user-privilege-set"} {
 			allowed, err := h.checkACLPrivilege(ctx, user, path, privilege)
 			if err != nil {

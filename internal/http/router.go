@@ -116,6 +116,15 @@ func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service
 	return NewRouterWithOptions(cfg, store, authService, RouterOptions{})
 }
 
+// oauthCallbackPath returns the path the OAuth callback is served at.
+// config.Load has already validated a configured value.
+func oauthCallbackPath(cfg *config.Config) string {
+	if cfg.OAuth.RedirectPath == "" {
+		return config.DefaultOAuthRedirectPath
+	}
+	return cfg.OAuth.RedirectPath
+}
+
 // NewRouterWithOptions wires all HTTP routes and optional integrations.
 func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *auth.Service, opts RouterOptions) http.Handler {
 	r := chi.NewRouter()
@@ -194,8 +203,10 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	r.Route("/auth", func(r chi.Router) {
 		r.Use(authRateLimiter.Middleware())
 		r.Get("/login", authService.BeginOAuth)
-		r.Get("/callback", authService.HandleOAuthCallback)
 	})
+	// Registered on the root rather than under /auth because the auth service
+	// sends the identity provider to BaseURL+RedirectPath, wherever that is.
+	r.With(authRateLimiter.Middleware()).Get(oauthCallbackPath(cfg), authService.HandleOAuthCallback)
 
 	r.With(authService.RequireSession, csrf.Middleware(cfg)).Post("/auth/logout", uiHandler.Logout)
 

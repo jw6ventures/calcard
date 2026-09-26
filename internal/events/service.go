@@ -331,6 +331,11 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	if err != nil {
 		return nil, false, err
 	}
+	// The UID is also the resource name; both are unique index keys, whose
+	// entries PostgreSQL bounds in size.
+	if len(uid) > store.MaxIdentifierOctets {
+		return nil, false, fmt.Errorf("%w: uid must be at most %d octets", ErrBadRequest, store.MaxIdentifierOctets)
+	}
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, false, err

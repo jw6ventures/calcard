@@ -210,7 +210,8 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 
 	// Generate birthday events
 	var birthdayEvents []map[string]any
-	currentYear := time.Now().Year()
+	// UTC, as the generated birthday calendar judges birth years.
+	currentYear := time.Now().UTC().Year()
 
 	for _, c := range contacts {
 		if c.Birthday == nil {
@@ -222,21 +223,17 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 			displayName = *c.DisplayName
 		}
 
-		// Create birthday event for current year
-		bdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
-
-		// Calculate age if birth year is known (year > 1900, since older years are likely placeholders)
-		var age *int
-		if c.Birthday.Year() > 1900 {
-			a := currentYear - c.Birthday.Year()
-			age = &a
+		// The page works out the age for whichever year it shows.
+		var birthYear *int
+		if birthYearKnown(c.Birthday.Year(), currentYear) {
+			year := c.Birthday.Year()
+			birthYear = &year
 		}
 
 		birthdayEvents = append(birthdayEvents, map[string]any{
 			"ContactUID":  c.UID,
 			"DisplayName": displayName,
-			"Date":        bdayThisYear,
-			"Age":         age,
+			"BirthYear":   birthYear,
 			"Month":       int(c.Birthday.Month()),
 			"Day":         c.Birthday.Day(),
 		})
@@ -249,6 +246,15 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 		"BirthdaysTruncated": truncated,
 	})
 	h.render(w, r, "birthdays.html", data)
+}
+
+// birthYearKnown reports whether a stored birthday's year is a real birth
+// year. A year-less BDAY is stored in store.NoYearBirthdayYear, and clients
+// that cannot write a year-less date use a stand-in year of their own (Apple
+// writes 1604), so only years from 1900 up to the current one yield an age.
+// The DAV birthday calendar applies the same rule.
+func birthYearKnown(year, currentYear int) bool {
+	return year >= 1900 && year <= currentYear
 }
 
 // birthdayPageRows is the fallback bound on the contacts the birthdays page

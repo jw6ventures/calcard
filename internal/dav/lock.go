@@ -166,7 +166,7 @@ func ifLockTokensForPaths(header string, resourcePaths ...string) []string {
 	seen := make(map[string]struct{})
 	var tokens []string
 	for _, resourcePath := range resourcePaths {
-		resourcePath = normalizeDAVHref(resourcePath)
+		resourcePath = cleanDAVPath(resourcePath)
 		if resourcePath == "" {
 			continue
 		}
@@ -235,6 +235,11 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	if targetExists {
 		requiredPrivilege = "write-content"
 		requiredPrivilegePath = canonicalPath
+	}
+	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
+		return
 	}
 	allowed, err := h.canLockPath(r.Context(), user, cleanPath)
 	if err != nil {
@@ -345,7 +350,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer invalidateDAVRequestState(r.Context())
-	created, err := h.store.Locks.Create(r.Context(), newLock)
+	created, err := h.store.CreateLockAndState(r.Context(), newLock, aclGuard)
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is already locked", http.StatusLocked)
@@ -383,13 +388,11 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 		if err != nil || calendarID == birthdayCalendarID {
 			return err
 		}
-		cal, err := h.getCalendar(ctx, calendarID)
-		if err != nil {
+		if _, err := h.getCalendar(ctx, calendarID); err != nil {
 			return err
 		}
 		lock.ExpectedCollection = "calendar"
 		lock.ExpectedCollectionID = calendarID
-		lock.ExpectedCollectionCTag = &cal.CTag
 		if target.Resource && h.store.Events != nil {
 			event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
 			if err != nil {
@@ -409,13 +412,11 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 		if err != nil {
 			return err
 		}
-		book, err := h.getAddressBook(ctx, addressBookID)
-		if err != nil {
+		if _, err := h.getAddressBook(ctx, addressBookID); err != nil {
 			return err
 		}
 		lock.ExpectedCollection = "addressbook"
 		lock.ExpectedCollectionID = addressBookID
-		lock.ExpectedCollectionCTag = &book.CTag
 		if target.Resource && h.store.Contacts != nil {
 			contact, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, target.ResourceName)
 			if err != nil {
@@ -741,7 +742,7 @@ type resolvedLockTarget struct {
 }
 
 func (h *DavServer) resolveLockTarget(r *http.Request, resourcePath string) resolvedLockTarget {
-	requestPath := normalizeDAVHref(resourcePath)
+	requestPath := cleanDAVPath(resourcePath)
 	canonicalPath := requestPath
 	if user, ok := auth.UserFromContext(r.Context()); ok {
 		if canonical, err := h.canonicalDAVPath(r.Context(), user, requestPath); err == nil && canonical != "" {
@@ -847,7 +848,7 @@ func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, 
 	}
 	byPath := make(map[string][]store.Lock, len(locks))
 	for i := range locks {
-		key := normalizeDAVHref(locks[i].ResourcePath)
+		key := cleanDAVPath(locks[i].ResourcePath)
 		byPath[key] = append(byPath[key], locks[i])
 	}
 	for _, target := range targets {
@@ -939,7 +940,7 @@ func lockLookupPaths(canonicalPath string) []string {
 	seen := map[string]struct{}{}
 	var paths []string
 	addPath := func(p string) {
-		p = normalizeDAVHref(p)
+		p = cleanDAVPath(p)
 		if p == "" {
 			return
 		}
@@ -1009,7 +1010,7 @@ func activeLockFromStoreLock(lock *store.Lock, revealToken bool) activeLock {
 		Owner:     owner,
 		Timeout:   fmt.Sprintf("Second-%d", lock.TimeoutSeconds),
 		LockToken: lockToken,
-		LockRoot:  &hrefProp{Href: publicDAVLockRoot(lock.ResourcePath)},
+		LockRoot:  &hrefProp{Href: escapeDAVPath(publicDAVLockRoot(lock.ResourcePath))},
 	}
 }
 
@@ -1021,5 +1022,5 @@ func publicDAVLockRoot(resourcePath string) string {
 	if legacyPaths := legacyDAVResourcePaths(canonicalPath); len(legacyPaths) > 0 {
 		return legacyPaths[0]
 	}
-	return normalizeDAVHref(resourcePath)
+	return cleanDAVPath(resourcePath)
 }

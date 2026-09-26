@@ -94,11 +94,15 @@ type AppPasswordRepository interface {
 	Revoke(ctx context.Context, id int64) error
 	DeleteRevoked(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error
-	// SetDigestCredentials attaches sealed Digest HA1s to an app password that
-	// was issued without them, which is every app password predating Digest.
-	// It writes only while both columns are still NULL, so a concurrent caller
-	// cannot replace a credential that is already usable.
-	SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error
+	// ReplaceDigestCredentials swaps one app password's sealed HA1 columns in
+	// a single compare-and-swap: it writes newMD5/newSHA256 (nil clears) only
+	// while the row still holds oldMD5/oldSHA256, and reports whether it did.
+	// A caller acting on a stale read therefore loses instead of overwriting.
+	ReplaceDigestCredentials(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error)
+	// PurgeDigestCredentials returns every app password's HA1 columns to NULL
+	// and reports how many rows it changed. It never touches the token hash,
+	// so no credential loses Basic access.
+	PurgeDigestCredentials(ctx context.Context) (int64, error)
 }
 
 // DeletedResourceRepository handles tombstone tracking for sync.
@@ -147,6 +151,21 @@ type DigestNonceRepository interface {
 // ACLRepository handles WebDAV access control entries.
 type ACLRepository interface {
 	SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error
+	// UpdateACL replaces the resource's ACL with mutate's result. The ACL is
+	// locked before it is read, so a caller that derives the new ACL from the old
+	// one cannot lose a concurrent writer's entries. mutate runs inside the
+	// transaction and must not block or touch the store.
+	UpdateACL(ctx context.Context, resourcePath string, mutate func([]ACLEntry) ([]ACLEntry, error)) error
+	// RevokePrincipalGrants removes, in one transaction, the principal's grants of
+	// collectionPrivileges on collectionPath plus every grant the principal holds
+	// on resources beneath it. The collection's other grants are the owner's to
+	// manage through the ACL method on that collection. A member grant records
+	// no origin, so one a share left behind cannot be told from one the owner
+	// set through the ACL method on that resource, and both are taken: a revoked
+	// principal keeps no access anywhere in the collection, even where the owner
+	// had granted it separately. Deny entries are never removed: revoking access
+	// must not widen it.
+	RevokePrincipalGrants(ctx context.Context, collectionPath, principalHref string, collectionPrivileges []string) error
 	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
 	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)
 	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)

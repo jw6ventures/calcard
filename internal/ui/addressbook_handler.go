@@ -15,6 +15,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/contacts"
+	httperrors "github.com/jw6ventures/calcard/internal/http/errors"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -288,6 +290,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 			"Email":        email,
 			"LastModified": c.LastModified,
 			"RawVCard":     c.RawVCard,
+			"ETag":         c.ETag,
 		})
 	}
 
@@ -342,38 +345,121 @@ func (h *Handler) CreateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	displayName := strings.TrimSpace(r.FormValue("display_name"))
-	if displayName == "" {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "name is required"})
-		return
-	}
-
-	email := strings.TrimSpace(r.FormValue("email"))
-	if err := validateContactEmail(email); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": err.Error()})
-		return
-	}
-
 	user, _ := auth.UserFromContext(r.Context())
 	input := contacts.StructuredInput{
-		DisplayName: displayName,
+		DisplayName: strings.TrimSpace(r.FormValue("display_name")),
 		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
 		LastName:    strings.TrimSpace(r.FormValue("last_name")),
-		Email:       email,
+		Email:       strings.TrimSpace(r.FormValue("email")),
 		Phone:       strings.TrimSpace(r.FormValue("phone")),
 		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
 		Notes:       strings.TrimSpace(r.FormValue("notes")),
 		Company:     strings.TrimSpace(r.FormValue("company")),
 	}
+	// The service does not judge an address's shape, so that check is the
+	// form's own.
+	if validateContactEmail(input.Email) != nil {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "The email address is not valid."})
+		return
+	}
 	// The service owns the UID, vCard and DAV resource name a contact is
 	// stored with, so a contact written here and one written by a CardDAV PUT
 	// carry the same identity.
 	if _, _, err := h.contacts.CreateContact(r.Context(), user, bookID, contacts.UpsertInput{Structured: &input}); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to create contact"})
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID),
+			map[string]string{"error": contactWriteFlashError(r, err, "failed to create contact")})
 		return
 	}
 
 	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_created"})
+}
+
+// contactWriteFlashError is the flash text for a failed contact write. A
+// refusal is described by the error's type, in words for the person filling in
+// the form: the errors' own text is written for DAV clients and logs. Anything
+// other than a refusal is a fault of this server rather than of the
+// submission, so it is logged and answered with the caller's fallback.
+func contactWriteFlashError(r *http.Request, err error, fallback string) string {
+	const unclassified = "The contact could not be saved because some of its details are not valid."
+	var fieldErr *contacts.FieldError
+	switch {
+	case errors.As(err, &fieldErr):
+		if message := contactFieldMessage(fieldErr); message != "" {
+			return message
+		}
+		return unclassified
+	case errors.Is(err, utils.ErrInvalidBirthday):
+		return "The birthday is not a valid date."
+	case errors.Is(err, utils.ErrInvalidUID):
+		return "The contact ID cannot be stored."
+	case errors.Is(err, utils.ErrControlCharacter):
+		return "The contact contains characters it cannot store."
+	case errors.Is(err, contacts.ErrCardNotEditable):
+		return "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead."
+	case errors.Is(err, contacts.ErrPreconditionFailed):
+		return "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again."
+	case contacts.StatusCode(err) == http.StatusBadRequest:
+		return unclassified
+	}
+	httperrors.LogError(r, fallback, err)
+	return fallback
+}
+
+// contactFieldLabels names the structured fields the way the form does.
+var contactFieldLabels = map[string]string{
+	"uid":         "contact ID",
+	"displayName": "display name",
+	"firstName":   "first name",
+	"lastName":    "last name",
+	"email":       "email address",
+	"phone":       "phone number",
+	"birthday":    "birthday",
+	"company":     "company",
+	"notes":       "notes",
+}
+
+// contactFieldMessage words a refused field for the flash, or returns "" for a
+// field the form does not know. The submitted value is never quoted back,
+// because the flash travels in the redirect URL.
+func contactFieldMessage(err *contacts.FieldError) string {
+	label, ok := contactFieldLabels[err.Field]
+	if !ok {
+		return ""
+	}
+	switch err.Reason {
+	case contacts.ReasonRequired:
+		return "Enter a " + label + "."
+	case contacts.ReasonControlCharacters:
+		return "The " + label + " contains characters a contact cannot store."
+	case contacts.ReasonUIDCharacters:
+		return "The " + label + " " + contacts.ReasonUIDCharacters + "."
+	default:
+		return "The " + label + " " + strings.TrimSuffix(err.Reason, ".") + "."
+	}
+}
+
+// storedContactHasEmail reports whether the stored contact's card carries
+// email as one of its EMAIL values, as the page read it: the raw value, before
+// any unescaping. A contact that cannot be read carries none.
+func (h *Handler) storedContactHasEmail(ctx context.Context, user *store.User, bookID int64, uid, email string) bool {
+	contact, err := h.contacts.GetContact(ctx, user, bookID, uid)
+	if err != nil || contact == nil {
+		return false
+	}
+	for _, line := range utils.UnfoldLines(contact.RawVCard) {
+		keyPart, value, ok := ical.SplitContentLine(line)
+		if !ok {
+			continue
+		}
+		name, _, _ := strings.Cut(keyPart, ";")
+		if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+			name = name[dot+1:]
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "EMAIL") && strings.TrimSpace(value) == email {
+			return true
+		}
+	}
+	return false
 }
 
 // validateContactEmail rejects an address no mail system could route. vCard
@@ -390,7 +476,7 @@ func validateContactEmail(email string) error {
 	// address, so anything it had to strip means the value was not one.
 	parsed, err := mail.ParseAddress(email)
 	if err != nil || parsed.Address != email {
-		return fmt.Errorf("%q is not a valid email address", email)
+		return errors.New("not a valid email address")
 	}
 	return nil
 }
@@ -440,41 +526,41 @@ func (h *Handler) UpdateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	displayName := strings.TrimSpace(r.FormValue("display_name"))
-	if displayName == "" {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "name is required"})
-		return
-	}
-
-	email := strings.TrimSpace(r.FormValue("email"))
-	if err := validateContactEmail(email); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": err.Error()})
-		return
-	}
-
 	user, _ := auth.UserFromContext(r.Context())
 	input := contacts.StructuredInput{
 		UID:         uid,
-		DisplayName: displayName,
+		DisplayName: strings.TrimSpace(r.FormValue("display_name")),
 		FirstName:   strings.TrimSpace(r.FormValue("first_name")),
 		LastName:    strings.TrimSpace(r.FormValue("last_name")),
-		Email:       email,
+		Email:       strings.TrimSpace(r.FormValue("email")),
 		Phone:       strings.TrimSpace(r.FormValue("phone")),
 		Birthday:    strings.TrimSpace(r.FormValue("birthday")),
 		Notes:       strings.TrimSpace(r.FormValue("notes")),
 		Company:     strings.TrimSpace(r.FormValue("company")),
 	}
+	// The service does not judge an address's shape, so that check is the
+	// form's own. An address the stored card already carries is sent back
+	// unchanged by the form, and is left to whichever client wrote it.
+	if validateContactEmail(input.Email) != nil && !h.storedContactHasEmail(r.Context(), user, bookID, uid, input.Email) {
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "The email address is not valid."})
+		return
+	}
 	// An edit changes the contact, not its identity: the service carries the
 	// stored resource name across the write, which keeps the href the sync
 	// reports publish for this contact stable.
-	if _, _, err := h.contacts.UpdateContact(r.Context(), user, bookID, uid, contacts.UpsertInput{Structured: &input}); err != nil {
+	// The form posts the ETag of the card it was built from, so a form built
+	// before another client changed the contact is refused rather than
+	// writing its stale values over that change.
+	update := contacts.UpsertInput{Structured: &input, IfMatch: strings.TrimSpace(r.FormValue("etag"))}
+	if _, _, err := h.contacts.UpdateContact(r.Context(), user, bookID, uid, update); err != nil {
 		switch contacts.StatusCode(err) {
 		case http.StatusNotFound:
 			http.Error(w, "contact not found", http.StatusNotFound)
 		case http.StatusForbidden:
 			http.Error(w, "forbidden", http.StatusForbidden)
 		default:
-			h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to update contact"})
+			h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID),
+				map[string]string{"error": contactWriteFlashError(r, err, "failed to update contact")})
 		}
 		return
 	}
@@ -646,52 +732,75 @@ func (h *Handler) ImportAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse VCF file
-	vcards, err := utils.ParseVCFFile(string(contentBytes))
-	if err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to parse VCF file"})
-		return
-	}
-
-	if len(vcards) == 0 {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "no contacts found in file"})
-		return
-	}
-
 	user, _ := auth.UserFromContext(r.Context())
-	imported := 0
-	for _, vcard := range vcards {
-		// Continue importing other contacts even if one fails.
-		if h.importContact(r.Context(), user, bookID, vcard) {
-			imported++
+	target := fmt.Sprintf("/addressbooks/%d", bookID)
+	result, err := h.contacts.ImportVCards(r.Context(), user, bookID, string(contentBytes))
+	if err != nil {
+		switch contacts.StatusCode(err) {
+		case http.StatusBadRequest:
+			h.redirect(w, r, target, map[string]string{"error": "no contacts found in file"})
+		case http.StatusNotFound, http.StatusForbidden:
+			h.writeContactAccessError(w, err)
+		default:
+			httperrors.LogError(r, "import contacts", err)
+			h.redirect(w, r, target, map[string]string{"error": "failed to import contacts"})
 		}
-	}
-
-	if imported == 0 {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to import any contacts"})
 		return
 	}
 
-	statusMsg := fmt.Sprintf("imported %d contact(s)", imported)
-	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": statusMsg})
+	flash := map[string]string{"error": importSkipFlash(result.Skipped)}
+	if result.Imported > 0 {
+		flash["status"] = fmt.Sprintf("Imported %d %s.", result.Imported, plural(result.Imported, "contact", "contacts"))
+	}
+	h.redirect(w, r, target, flash)
 }
 
-// importContact stores one vCard from an uploaded file. A file re-imported
-// after an edit carries UIDs the book already holds, so a vCard naming a stored
-// contact replaces it and only an unknown UID creates one; the service supplies
-// the UID for a vCard that carries none. Reports whether the contact was
-// stored.
-func (h *Handler) importContact(ctx context.Context, user *store.User, bookID int64, vcard string) bool {
-	input := contacts.UpsertInput{RawVCard: vcard}
-	if uid := utils.ExtractVCardUID(vcard); uid != "" {
-		_, _, err := h.contacts.UpdateContact(ctx, user, bookID, uid, input)
-		if err == nil {
-			return true
-		}
-		if !errors.Is(err, contacts.ErrNotFound) {
-			return false
-		}
+// importSkipMessage words a skipped card's reason from its code alone. The
+// flash travels in the redirect URL and a skip's Reason may quote the file, so
+// nothing from it is repeated.
+func importSkipMessage(skip contacts.ImportSkip) string {
+	switch skip.Code {
+	case contacts.ImportSkipMissingFN:
+		return "it has no name"
+	case contacts.ImportSkipUnsupportedCharset:
+		return "it uses a character set this server cannot read"
+	case contacts.ImportSkipMalformed:
+		return "it is not a well-formed vCard"
+	case contacts.ImportSkipDuplicateUID:
+		return "another contact already uses this UID"
+	case contacts.ImportSkipForbidden:
+		return "you may not change this contact"
+	case contacts.ImportSkipChanged:
+		return "the contact changed while it was being imported"
+	default:
+		return "not a vCard this server can read"
 	}
-	_, _, err := h.contacts.CreateContact(ctx, user, bookID, input)
-	return err == nil
+}
+
+// maxImportSkipsShown bounds the skipped cards the flash names.
+const maxImportSkipsShown = 3
+
+// importSkipFlash is the flash for the cards an import skipped, or "" when it
+// skipped none. Cards are named by position, never by UID, which is file
+// content.
+func importSkipFlash(skipped []contacts.ImportSkip) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, maxImportSkipsShown+1)
+	for i, skip := range skipped {
+		if i == maxImportSkipsShown {
+			parts = append(parts, fmt.Sprintf("and %d more", len(skipped)-maxImportSkipsShown))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("card %d (%s)", skip.Card, importSkipMessage(skip)))
+	}
+	return fmt.Sprintf("%d %s skipped: %s.", len(skipped), plural(len(skipped), "card", "cards"), strings.Join(parts, ", "))
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

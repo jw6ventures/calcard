@@ -50,7 +50,13 @@ func TestSparseRecurrenceReports(t *testing.T) {
 	}
 }
 
-func TestRecurrenceReportsRejectIncompleteExpansion(t *testing.T) {
+// A period too large to generate leaves the recurrence set only partly known.
+// Each report answers that within its own contract: §9.9 needs one intersecting
+// instance and keeps a resource it cannot rule out, §7.10 owes every busy period
+// of the range and refuses with the §7.8 postcondition rather than publish a
+// prefix that would report the rest of the range as free, and §9.6.5 owes the
+// whole instance set and fails that one resource inside the multistatus.
+func TestRecurrenceReportsHandleIncompleteExpansion(t *testing.T) {
 	values := func(n int) string {
 		parts := make([]string, n)
 		for i := range parts {
@@ -75,12 +81,25 @@ func TestRecurrenceReportsRejectIncompleteExpansion(t *testing.T) {
 			req.Header.Set("Depth", "1")
 			rr := httptest.NewRecorder()
 			h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
-			if kind == "expand" {
+			switch kind {
+			case "expand":
 				if rr.Code != 207 || !strings.Contains(rr.Body.String(), "500 Internal Server Error") || strings.Contains(rr.Body.String(), "BEGIN:VEVENT") {
 					t.Fatalf("incomplete expansion published: %d %s", rr.Code, rr.Body.String())
 				}
-			} else if rr.Code != 500 {
-				t.Fatalf("incomplete %s succeeded: %d %s", kind, rr.Code, rr.Body.String())
+			case "free-busy":
+				if rr.Code != 403 || !strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
+					t.Fatalf("incomplete free-busy answered %d %s, want a 403 carrying the §7.8 postcondition", rr.Code, rr.Body.String())
+				}
+				if strings.Contains(rr.Body.String(), "FREEBUSY") {
+					t.Fatalf("a refused free-busy published busy time: %s", rr.Body.String())
+				}
+			default:
+				// BYSETPOS=-1 does select the last candidate of 2026, so the
+				// resource genuinely matches the range and keeping it is the
+				// §9.9 answer as well as the conservative one.
+				if rr.Code != 207 || !strings.Contains(rr.Body.String(), "large.ics") {
+					t.Fatalf("a resource that could not be fully expanded was dropped: %d %s", rr.Code, rr.Body.String())
+				}
 			}
 		})
 	}

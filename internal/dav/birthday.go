@@ -33,13 +33,23 @@ type birthdayCollectionState struct {
 	books     int
 	ctagSum   int64
 	updatedAt time.Time
+	// year is the calendar year the collection is generated in. Whether a
+	// stored year counts as a birth year depends on it, so it versions the
+	// collection too.
+	year int
 }
+
+// birthdayGeneratorVersion names how events are generated from contacts. A
+// change to that moves every resource's body or href without touching an
+// address book, so it is part of the collection's version and a client holding
+// a token from before resynchronizes once.
+const birthdayGeneratorVersion = 3
 
 // tag is the state rendered as one opaque token. updatedAt is carried alongside
 // the counts because a book removed and another added can land on the same pair
 // of counts, and it cannot land on the same instant.
 func (s birthdayCollectionState) tag() string {
-	return fmt.Sprintf("%d-%d-%d", s.books, s.ctagSum, syncTokenNanos(s.updatedAt))
+	return fmt.Sprintf("g%d-y%d-%d-%d-%d", birthdayGeneratorVersion, s.year, s.books, s.ctagSum, syncTokenNanos(s.updatedAt))
 }
 
 func (s birthdayCollectionState) syncToken() string {
@@ -50,7 +60,7 @@ func (s birthdayCollectionState) syncToken() string {
 // store with no address books behind it leaves the zero state, which is the
 // version of a collection that generates nothing.
 func (h *DavServer) birthdayCollectionState(ctx context.Context, userID int64) (birthdayCollectionState, error) {
-	var state birthdayCollectionState
+	state := birthdayCollectionState{year: birthdayGenerationYear()}
 	if h == nil || h.store == nil || h.store.AddressBooks == nil {
 		return state, nil
 	}
@@ -142,8 +152,7 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		return nil, err
 	}
 
-	now := time.Now()
-	currentYear := now.Year()
+	currentYear := birthdayGenerationYear()
 	var events []store.Event
 
 	for _, c := range contacts {
@@ -156,29 +165,25 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 			displayName = *c.DisplayName
 		}
 
-		// Generate UID for this birthday event (based on contact UID to be stable)
-		uid := fmt.Sprintf("birthday-%s@calcard", c.UID)
+		// The href is built from the event UID, so X-CALCARD-CONTACT-UID
+		// carries the same escaped spelling rather than the stored UID.
+		contactUID := icalSafeUID(c.UID)
+		uid := birthdayEventUID(c.AddressBookID, c.UID)
 
 		// No age in the summary: the event recurs yearly, so a baked-in
 		// "(turning N)" would be wrong every year after the first.
 		summary := fmt.Sprintf("🎂 %s's Birthday", displayName)
 
-		startYear := currentYear
-		birthdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 23, 59, 59, 0, time.UTC)
-		if birthdayThisYear.Before(now) {
-			startYear = currentYear + 1
-		}
-
-		dtstart := time.Date(startYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
+		dtstart, rrule := birthdayRecurrence(*c.Birthday, currentYear)
 		dtstartStr := dtstart.Format("20060102")
 
 		// Build the iCal event with yearly recurrence
 		var sb strings.Builder
-		sb.WriteString("BEGIN:VCALENDAR\r\n")
-		sb.WriteString("VERSION:2.0\r\n")
-		sb.WriteString("PRODID:-//CalCard//Birthdays//EN\r\n")
-		sb.WriteString("BEGIN:VEVENT\r\n")
-		sb.WriteString(fmt.Sprintf("UID:%s\r\n", uid))
+		writeFoldedContentLine(&sb, "BEGIN:VCALENDAR")
+		writeFoldedContentLine(&sb, "VERSION:2.0")
+		writeFoldedContentLine(&sb, "PRODID:-//CalCard//Birthdays//EN")
+		writeFoldedContentLine(&sb, "BEGIN:VEVENT")
+		writeFoldedContentLine(&sb, "UID:"+uid)
 		// DTSTAMP derives from the contact so the generated iCal (and its
 		// ETag) stays stable across requests; time.Now() here would force
 		// clients to re-download every birthday on every sync.
@@ -186,21 +191,21 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		if c.LastModified.IsZero() {
 			dtstamp = time.Unix(0, 0).UTC()
 		}
-		sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", dtstamp.Format("20060102T150405Z")))
-		sb.WriteString(fmt.Sprintf("DTSTART;VALUE=DATE:%s\r\n", dtstartStr))
-		sb.WriteString(fmt.Sprintf("SUMMARY:%s\r\n", escapeICalText(summary)))
-		sb.WriteString("RRULE:FREQ=YEARLY\r\n")  // Recurring yearly
-		sb.WriteString("TRANSP:TRANSPARENT\r\n") // Free/busy: free time
-		sb.WriteString("CLASS:PUBLIC\r\n")
+		writeFoldedContentLine(&sb, "DTSTAMP:"+dtstamp.Format("20060102T150405Z"))
+		writeFoldedContentLine(&sb, "DTSTART;VALUE=DATE:"+dtstartStr)
+		writeFoldedContentLine(&sb, "SUMMARY:"+escapeICalText(summary))
+		writeFoldedContentLine(&sb, "RRULE:"+rrule)
+		writeFoldedContentLine(&sb, "TRANSP:TRANSPARENT") // Free/busy: free time
+		writeFoldedContentLine(&sb, "CLASS:PUBLIC")
 
 		// RFC 5545 §3.8.8.2: a non-standard property the server defines for its
 		// own use carries a vendor id, so it cannot collide with another
 		// implementation's property of the same purpose.
-		sb.WriteString("X-CALCARD-TYPE:BIRTHDAY\r\n")
-		sb.WriteString(fmt.Sprintf("X-CALCARD-CONTACT-UID:%s\r\n", c.UID))
+		writeFoldedContentLine(&sb, "X-CALCARD-TYPE:BIRTHDAY")
+		writeFoldedContentLine(&sb, "X-CALCARD-CONTACT-UID:"+contactUID)
 
-		sb.WriteString("END:VEVENT\r\n")
-		sb.WriteString("END:VCALENDAR\r\n")
+		writeFoldedContentLine(&sb, "END:VEVENT")
+		writeFoldedContentLine(&sb, "END:VCALENDAR")
 
 		rawICAL := sb.String()
 		etag := fmt.Sprintf("%x", sha256.Sum256([]byte(rawICAL)))
@@ -222,12 +227,122 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 	return events, nil
 }
 
+// escapeICalText escapes a string for use as an RFC 5545 §3.3.11 TEXT value. A
+// line break becomes the literal \n escape sequence, and every other control
+// character is dropped: a raw CR or LF would end the content line the value is
+// written into, leaving the remainder to be read as properties -- or whole
+// components -- of its own.
 func escapeICalText(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, ";", "\\;")
-	s = strings.ReplaceAll(s, ",", "\\,")
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	return s
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\', ';', ',':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case '\r':
+			b.WriteString("\\n")
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++
+			}
+		case '\n':
+			b.WriteString("\\n")
+		default:
+			if isICalControlOctet(c) {
+				continue
+			}
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// birthdayEventUID names a contact's birthday resource. A contact is identified
+// by its UID within one address book, so the book is part of the name.
+func birthdayEventUID(addressBookID int64, contactUID string) string {
+	return fmt.Sprintf("birthday-%d-%s@calcard", addressBookID, icalSafeUID(contactUID))
+}
+
+// birthdayNoYearStartYear anchors the DTSTART of a year-less birthday. It is a
+// leap year so February 29 is a valid start.
+const birthdayNoYearStartYear = 1972
+
+// birthdayGenerationYear is the year birth years are judged against.
+func birthdayGenerationYear() int {
+	return time.Now().UTC().Year()
+}
+
+// birthYearKnown reports whether a stored year is a real birth year. The store
+// keeps a year-less birthday in store.NoYearBirthdayYear, and clients that
+// cannot write one use an early stand-in year of their own (Apple writes
+// 1604), so only years from 1900 to the current one count.
+func birthYearKnown(year, currentYear int) bool {
+	return year >= 1900 && year <= currentYear
+}
+
+// birthdayRecurrence returns a birthday's DTSTART and RRULE. DTSTART is the
+// birth date, or birthdayNoYearStartYear when the year is not a birth year, so
+// the body depends only on the contact and the year it is generated in. A
+// February 29 birthday recurs on the last day of February, so it falls on
+// February 28 in common years.
+func birthdayRecurrence(birthday time.Time, currentYear int) (time.Time, string) {
+	year := birthday.Year()
+	if !birthYearKnown(year, currentYear) {
+		year = birthdayNoYearStartYear
+	}
+	start := time.Date(year, birthday.Month(), birthday.Day(), 0, 0, 0, 0, time.UTC)
+	if birthday.Month() == time.February && birthday.Day() == 29 {
+		return start, "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1"
+	}
+	return start, "FREQ=YEARLY"
+}
+
+// icalSafeUID percent-encodes the octets of a stored UID that a TEXT value
+// cannot carry unescaped: control octets, the TEXT delimiters , ; \ and the %
+// introducer itself, so distinct UIDs keep distinct spellings. Other UIDs are
+// returned unchanged, so their hrefs stay stable.
+func icalSafeUID(uid string) string {
+	escapeFrom := -1
+	for i := 0; i < len(uid); i++ {
+		if needsICalUIDEscape(uid[i]) {
+			escapeFrom = i
+			break
+		}
+	}
+	if escapeFrom < 0 {
+		return uid
+	}
+	const hexDigits = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(uid) + 2)
+	b.WriteString(uid[:escapeFrom])
+	for i := escapeFrom; i < len(uid); i++ {
+		c := uid[i]
+		if !needsICalUIDEscape(c) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hexDigits[c>>4])
+		b.WriteByte(hexDigits[c&0x0F])
+	}
+	return b.String()
+}
+
+func needsICalUIDEscape(c byte) bool {
+	switch c {
+	case '%', ',', ';', '\\':
+		return true
+	}
+	return isICalControlOctet(c)
+}
+
+// isICalControlOctet reports whether an octet may not appear in a content line.
+// RFC 5545 §3.1 admits tab and the printable characters; every other C0 octet,
+// and DEL, is excluded. The test is safe to apply octet by octet because no
+// octet of a multi-octet UTF-8 sequence falls below 0x80.
+func isICalControlOctet(c byte) bool {
+	return (c < 0x20 && c != '\t') || c == 0x7F
 }
 
 // birthdayCalendarReportResponses runs one REPORT against the virtual birthday

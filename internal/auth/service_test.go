@@ -21,6 +21,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/store"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 )
@@ -49,18 +50,20 @@ func (m *userRepoMock) ListActive(context.Context) ([]store.User, error)    { re
 func (m *userRepoMock) MarkOnboardingComplete(context.Context, int64) error { return nil }
 
 type appPasswordRepoMock struct {
-	createFn               func(context.Context, store.AppPassword) (*store.AppPassword, error)
-	findValidByUserFn      func(context.Context, int64) ([]store.AppPassword, error)
-	touchLastUsedFn        func(context.Context, int64) error
-	setDigestCredentialsFn func(context.Context, int64, string, string) error
+	createFn                   func(context.Context, store.AppPassword) (*store.AppPassword, error)
+	findValidByUserFn          func(context.Context, int64) ([]store.AppPassword, error)
+	touchLastUsedFn            func(context.Context, int64) error
+	replaceDigestCredentialsFn func(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error)
 }
 
-func (m *appPasswordRepoMock) SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error {
-	if m.setDigestCredentialsFn != nil {
-		return m.setDigestCredentialsFn(ctx, id, md5HA1, sha256HA1)
+func (m *appPasswordRepoMock) ReplaceDigestCredentials(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error) {
+	if m.replaceDigestCredentialsFn != nil {
+		return m.replaceDigestCredentialsFn(ctx, id, newMD5, newSHA256, oldMD5, oldSHA256)
 	}
-	return nil
+	return false, nil
 }
+
+func (m *appPasswordRepoMock) PurgeDigestCredentials(context.Context) (int64, error) { return 0, nil }
 
 func (m *appPasswordRepoMock) Create(ctx context.Context, token store.AppPassword) (*store.AppPassword, error) {
 	return m.createFn(ctx, token)
@@ -121,6 +124,82 @@ func digestTestStore(nonces store.DigestNonceRepository, tokens func(context.Con
 		AppPasswords: &appPasswordRepoMock{findValidByUserFn: tokens},
 		DigestNonces: nonces,
 	}
+}
+
+// digestCredentialRow is one app_passwords row, answering reads and applying
+// the compare-and-swap ReplaceDigestCredentials performs in PostgreSQL.
+type digestCredentialRow struct {
+	t     *testing.T
+	token store.AppPassword
+	swaps int
+}
+
+func (r *digestCredentialRow) find(context.Context, int64) ([]store.AppPassword, error) {
+	return []store.AppPassword{r.token}, nil
+}
+
+func (r *digestCredentialRow) replace(_ context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error) {
+	if id != r.token.ID {
+		r.t.Errorf("ReplaceDigestCredentials id = %d, want %d", id, r.token.ID)
+	}
+	if !sameStoredHA1(r.token.DigestMD5HA1, oldMD5) || !sameStoredHA1(r.token.DigestSHA256HA1, oldSHA256) {
+		return false, nil
+	}
+	r.token.DigestMD5HA1, r.token.DigestSHA256HA1 = newMD5, newSHA256
+	r.swaps++
+	return true, nil
+}
+
+func (r *digestCredentialRow) backingStore() *store.Store {
+	return &store.Store{
+		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
+			return &store.User{ID: 7, PrimaryEmail: email}, nil
+		}},
+		AppPasswords: &appPasswordRepoMock{findValidByUserFn: r.find, replaceDigestCredentialsFn: r.replace},
+		DigestNonces: &digestNonceRepoMock{},
+	}
+}
+
+func sameStoredHA1(a, b *string) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
+// recordingLogSink captures what a Service logs, so a test can assert on it
+// without swapping the process-wide standard logger.
+type recordingLogSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (s *recordingLogSink) Log(_, _ string, _ jw6_utils.LogLevel, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lines = append(s.lines, message)
+}
+
+func (s *recordingLogSink) count(substring string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matches := 0
+	for _, line := range s.lines {
+		if strings.Contains(line, substring) {
+			matches++
+		}
+	}
+	return matches
+}
+
+func (s *recordingLogSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.lines, "\n")
+}
+
+func loggedService(cfg *config.Config) (*Service, *recordingLogSink) {
+	sink := &recordingLogSink{}
+	service := &Service{cfg: cfg}
+	service.SetLogger(sink)
+	return service, sink
 }
 
 func TestBeginOAuthSetsStateCookieAndRedirects(t *testing.T) {
@@ -238,7 +317,7 @@ func TestCreateAndValidateAppPassword(t *testing.T) {
 	user := &store.User{ID: 9, PrimaryEmail: "user@example.com"}
 
 	service := &Service{
-		cfg: testAuthConfig("https://calcard.example"),
+		cfg: testDigestAuthConfig("https://calcard.example"),
 		store: &store.Store{
 			Users: &userRepoMock{
 				getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
@@ -303,7 +382,7 @@ func TestCreateAndValidateAppPassword(t *testing.T) {
 		if *tc.stored == bare || strings.Contains(*tc.stored, bare) {
 			t.Fatalf("%s HA1 stored in the clear: %q", tc.algorithm, *tc.stored)
 		}
-		opened, err := service.decryptDigestHA1(tc.algorithm, *tc.stored)
+		opened, err := decryptDigestHA1(service.cfg, tc.algorithm, *tc.stored)
 		if err != nil {
 			t.Fatalf("decryptDigestHA1(%s) error = %v", tc.algorithm, err)
 		}
@@ -316,7 +395,7 @@ func TestCreateAndValidateAppPassword(t *testing.T) {
 		if tc.algorithm == "SHA-256" {
 			other = "MD5"
 		}
-		if _, err := service.decryptDigestHA1(other, *tc.stored); err == nil {
+		if _, err := decryptDigestHA1(service.cfg, other, *tc.stored); err == nil {
 			t.Fatalf("%s HA1 opened as %s", tc.algorithm, other)
 		}
 	}
@@ -1047,11 +1126,10 @@ func TestRequireDAVAuthDigestRejectsRevokedAndExpiredTokensInIsolation(t *testin
 }
 
 // Digest verifies against a stored HA1, and every app password issued before
-// Digest existed has none -- a database read cannot produce one, because the
+// Digest was enabled has none -- a database read cannot produce one, because the
 // password is only ever stored as a bcrypt hash. A successful Basic
 // authentication is the one moment the server holds the plaintext again, so it
-// is where the credential catches up. Without this an upgrade leaves a valid
-// password permanently unable to answer a Digest challenge.
+// is where the credential catches up.
 func TestLegacyAppPasswordGainsDigestCredentialsOnBasicAuth(t *testing.T) {
 	const (
 		username = "user@example.com"
@@ -1062,36 +1140,9 @@ func TestLegacyAppPasswordGainsDigestCredentialsOnBasicAuth(t *testing.T) {
 		t.Fatalf("GenerateFromPassword() error = %v", err)
 	}
 
-	var mu sync.Mutex
-	token := store.AppPassword{ID: 3, TokenHash: string(hash)}
-	writes := 0
-	repo := &appPasswordRepoMock{
-		findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			return []store.AppPassword{token}, nil
-		},
-		setDigestCredentialsFn: func(_ context.Context, id int64, md5HA1, sha256HA1 string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			if id != 3 {
-				t.Errorf("SetDigestCredentials id = %d, want 3", id)
-			}
-			writes++
-			token.DigestMD5HA1, token.DigestSHA256HA1 = &md5HA1, &sha256HA1
-			return nil
-		},
-	}
-	service := &Service{
-		cfg: testDigestAuthConfig("https://calcard.example"),
-		store: &store.Store{
-			Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-				return &store.User{ID: 7, PrimaryEmail: email}, nil
-			}},
-			AppPasswords: repo,
-			DigestNonces: &digestNonceRepoMock{},
-		},
-	}
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash)}}
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	service.store = row.backingStore()
 	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -1104,16 +1155,13 @@ func TestLegacyAppPasswordGainsDigestCredentialsOnBasicAuth(t *testing.T) {
 		t.Fatalf("legacy Basic status = %d, want 204", basicRec.Code)
 	}
 
-	mu.Lock()
-	sealedMD5, sealedSHA256 := token.DigestMD5HA1, token.DigestSHA256HA1
-	mu.Unlock()
-	if sealedMD5 == nil || sealedSHA256 == nil {
+	if row.token.DigestMD5HA1 == nil || row.token.DigestSHA256HA1 == nil {
 		t.Fatal("Basic authentication did not backfill the Digest credentials")
 	}
 	// Sealed, never the bare HA1: the stored value authenticates its holder
 	// without the password, which is the whole reason it is encrypted at rest.
-	for algorithm, sealed := range map[string]*string{"MD5": sealedMD5, "SHA-256": sealedSHA256} {
-		opened, err := service.decryptDigestHA1(algorithm, *sealed)
+	for algorithm, sealed := range map[string]*string{"MD5": row.token.DigestMD5HA1, "SHA-256": row.token.DigestSHA256HA1} {
+		opened, err := decryptDigestHA1(service.cfg, algorithm, *sealed)
 		if err != nil {
 			t.Fatalf("decryptDigestHA1(%s) error = %v", algorithm, err)
 		}
@@ -1125,7 +1173,6 @@ func TestLegacyAppPasswordGainsDigestCredentialsOnBasicAuth(t *testing.T) {
 		}
 	}
 
-	// The credential is now Digest-capable, which is the point of the backfill.
 	challengeRec := httptest.NewRecorder()
 	handler.ServeHTTP(challengeRec, davRequest(http.MethodGet, "/dav/"))
 	challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
@@ -1137,10 +1184,12 @@ func TestLegacyAppPasswordGainsDigestCredentialsOnBasicAuth(t *testing.T) {
 		t.Fatalf("Digest status after backfill = %d, want 204", digestRec.Code)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if writes != 1 {
-		t.Fatalf("SetDigestCredentials calls = %d, want exactly 1", writes)
+	if row.swaps != 1 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d, want exactly 1", row.swaps)
+	}
+	// Filling an empty row is routine and not a repair.
+	if logged.count("re-sealed") != 0 {
+		t.Fatalf("a first backfill was reported as a re-seal:\n%s", logged)
 	}
 }
 
@@ -1156,60 +1205,283 @@ func TestAppPasswordWithDigestCredentialsIsNotRewrittenOnBasicAuth(t *testing.T)
 		t.Fatalf("GenerateFromPassword() error = %v", err)
 	}
 	service := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
-	md5HA1, sha256HA1, err := service.sealDigestCredentials(username, password)
-	if err != nil {
-		t.Fatalf("sealDigestCredentials() error = %v", err)
-	}
-	service.store = &store.Store{
-		Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-			return &store.User{ID: 7, PrimaryEmail: email}, nil
-		}},
-		AppPasswords: &appPasswordRepoMock{
-			findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
-				return []store.AppPassword{{ID: 3, TokenHash: string(hash), DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}}, nil
-			},
-			setDigestCredentialsFn: func(context.Context, int64, string, string) error {
-				t.Error("SetDigestCredentials called for a credential that already has HA1s")
-				return nil
-			},
-		},
-		DigestNonces: &digestNonceRepoMock{},
-	}
+	md5HA1, sha256HA1 := sealedTestHA1s(t, service, username, password)
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash), DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}}
+	service.store = row.backingStore()
 
 	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
 		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.swaps != 0 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d for a credential that already has HA1s, want 0", row.swaps)
 	}
 }
 
 // Without a session secret there is no key to seal an HA1 under. That is the
 // state tooling and tests run in, and it must leave Basic working rather than
-// fail the request or write something unreadable.
+// fail the request or write something unreadable. Digest is on here so the
+// setting is not what stops the write.
 func TestBasicAuthWithoutSessionSecretStoresNoDigestCredential(t *testing.T) {
 	const password = "app-secret"
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("GenerateFromPassword() error = %v", err)
 	}
-	service := &Service{
-		cfg: &config.Config{BaseURL: "https://calcard.example"},
-		store: &store.Store{
-			Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
-				return &store.User{ID: 7, PrimaryEmail: email}, nil
-			}},
-			AppPasswords: &appPasswordRepoMock{
-				findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
-					return []store.AppPassword{{ID: 3, TokenHash: string(hash)}}, nil
-				},
-				setDigestCredentialsFn: func(context.Context, int64, string, string) error {
-					t.Error("SetDigestCredentials called with no key to seal under")
-					return nil
-				},
-			},
-		},
-	}
+	secretless := &config.Config{BaseURL: "https://calcard.example"}
+	secretless.DAV.DigestEnabled = true
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash)}}
+	service := &Service{cfg: secretless, store: row.backingStore()}
 
 	if _, err := service.ValidateAppPassword(context.Background(), "user@example.com", password); err != nil {
 		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.swaps != 0 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d with no key to seal under, want 0", row.swaps)
+	}
+}
+
+// A deployment that has not opted into Digest must never have an HA1 written:
+// neither when an app password is issued nor when an existing one
+// authenticates over Basic. Turning the setting on has to restore both writes,
+// or the scheme is unusable.
+func TestDigestCredentialsAreWrittenOnlyWhileDigestIsEnabled(t *testing.T) {
+	const password = "app-secret"
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	user := &store.User{ID: 9, PrimaryEmail: "user@example.com"}
+
+	for _, tc := range []struct {
+		name      string
+		cfg       *config.Config
+		wantWrite bool
+	}{
+		{name: "disabled", cfg: testAuthConfig("https://calcard.example")},
+		{name: "enabled", cfg: testDigestAuthConfig("https://calcard.example"), wantWrite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var issued store.AppPassword
+			row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash)}}
+			service := &Service{
+				cfg: tc.cfg,
+				store: &store.Store{
+					Users: &userRepoMock{
+						getByIDFn:    func(_ context.Context, id int64) (*store.User, error) { return user, nil },
+						getByEmailFn: func(context.Context, string) (*store.User, error) { return user, nil },
+					},
+					AppPasswords: &appPasswordRepoMock{
+						createFn: func(_ context.Context, token store.AppPassword) (*store.AppPassword, error) {
+							token.ID = 77
+							issued = token
+							return &token, nil
+						},
+						findValidByUserFn:          row.find,
+						replaceDigestCredentialsFn: row.replace,
+					},
+				},
+			}
+
+			if _, _, err := service.CreateAppPassword(context.Background(), user.ID, "laptop", nil); err != nil {
+				t.Fatalf("CreateAppPassword() error = %v", err)
+			}
+			if got := issued.DigestMD5HA1 != nil || issued.DigestSHA256HA1 != nil; got != tc.wantWrite {
+				t.Fatalf("issued app password carries HA1s = %v, want %v (md5=%v sha256=%v)", got, tc.wantWrite, issued.DigestMD5HA1, issued.DigestSHA256HA1)
+			}
+
+			if _, err := service.ValidateAppPassword(context.Background(), user.PrimaryEmail, password); err != nil {
+				t.Fatalf("ValidateAppPassword() error = %v", err)
+			}
+			if got := row.token.DigestMD5HA1 != nil || row.token.DigestSHA256HA1 != nil; got != tc.wantWrite {
+				t.Fatalf("Basic authentication backfilled HA1s = %v, want %v", got, tc.wantWrite)
+			}
+		})
+	}
+}
+
+// With Digest off, an HA1 an earlier run stored is cleared the next time its
+// app password authenticates over Basic, so an active credential does not wait
+// on the periodic purge -- and Basic keeps working throughout.
+func TestBasicAuthWithDigestDisabledClearsStoredDigestCredentials(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	md5HA1, sha256HA1 := sealedTestHA1s(t, &Service{cfg: testDigestAuthConfig("https://calcard.example")}, username, password)
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash), DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}}
+	service, logged := loggedService(testAuthConfig("https://calcard.example"))
+	service.store = row.backingStore()
+
+	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.token.DigestMD5HA1 != nil || row.token.DigestSHA256HA1 != nil {
+		t.Fatalf("stored HA1s survived Basic authentication with Digest off: md5=%v sha256=%v", row.token.DigestMD5HA1, row.token.DigestSHA256HA1)
+	}
+	if row.swaps != 1 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d, want 1", row.swaps)
+	}
+	if logged.count("cleared") != 1 {
+		t.Fatalf("clearing was not reported exactly once:\n%s", logged)
+	}
+}
+
+// A stored HA1 that no longer opens -- the state every app password is left in
+// when APP_SESSION_SECRET is rotated -- cannot verify anything, so the row is
+// re-sealed from the password a Basic authentication supplies.
+func TestBasicAuthReplacesDigestCredentialsSealedUnderARotatedSecret(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	previous := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+	previous.cfg.Session.Secret = "the-previous-session-secret-at-least-32-bytes"
+	staleMD5, staleSHA256 := sealedTestHA1s(t, previous, username, password)
+
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash), DigestMD5HA1: staleMD5, DigestSHA256HA1: staleSHA256}}
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	service.store = row.backingStore()
+
+	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.swaps != 1 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d, want exactly 1", row.swaps)
+	}
+	for algorithm, sealed := range map[string]*string{"MD5": row.token.DigestMD5HA1, "SHA-256": row.token.DigestSHA256HA1} {
+		opened, err := decryptDigestHA1(service.cfg, algorithm, *sealed)
+		if err != nil {
+			t.Fatalf("decryptDigestHA1(%s) error = %v", algorithm, err)
+		}
+		if want := digestHA1(algorithm, username, password); opened != want {
+			t.Fatalf("re-sealed %s HA1 = %q, want %q", algorithm, opened, want)
+		}
+	}
+	if logged.count("re-sealed") != 1 {
+		t.Fatalf("the re-seal was not reported exactly once:\n%s", logged)
+	}
+
+	// The repaired credential answers a Digest challenge, which is what the
+	// rotation had silently taken away.
+	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	challengeRec := httptest.NewRecorder()
+	handler.ServeHTTP(challengeRec, davRequest(http.MethodGet, "/dav/"))
+	digestReq := davRequest(http.MethodGet, "/dav/")
+	digestReq.Header.Set("Authorization", testDigestAuthorization(t,
+		digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256"),
+		"SHA-256", username, password, http.MethodGet, "/dav/", "00000001", "cnonce"))
+	digestRec := httptest.NewRecorder()
+	handler.ServeHTTP(digestRec, digestReq)
+	if digestRec.Code != http.StatusNoContent {
+		t.Fatalf("Digest status after repair = %d, want 204", digestRec.Code)
+	}
+}
+
+// A row holding only one of the two HA1s cannot answer every Digest challenge,
+// so it is re-sealed as a whole, and the swap compares against the partial
+// state it actually read.
+func TestBasicAuthReSealsAPartialDigestCredential(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash), DigestSHA256HA1: sha256HA1}}
+	service.store = row.backingStore()
+
+	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.swaps != 1 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d, want 1", row.swaps)
+	}
+	if !DigestReady(service.cfg, row.token) {
+		t.Fatalf("partial row was not re-sealed into a Digest-ready one: md5=%v sha256=%v", row.token.DigestMD5HA1, row.token.DigestSHA256HA1)
+	}
+	if logged.count("re-sealed") != 1 {
+		t.Fatalf("the re-seal was not reported exactly once:\n%s", logged)
+	}
+}
+
+// Two requests can read the same unreadable row. When another has already
+// replaced it by the time this one writes, the compare-and-swap loses: the
+// concurrent value stands, and nothing claims this request re-sealed it.
+func TestReSealThatLosesTheCompareAndSwapKeepsTheConcurrentValue(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	previous := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+	previous.cfg.Session.Secret = "the-previous-session-secret-at-least-32-bytes"
+	staleMD5, staleSHA256 := sealedTestHA1s(t, previous, username, password)
+
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	concurrentMD5, concurrentSHA256 := sealedTestHA1s(t, service, username, password)
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash), DigestMD5HA1: staleMD5, DigestSHA256HA1: staleSHA256}}
+	service.store = row.backingStore()
+	service.store.AppPasswords.(*appPasswordRepoMock).replaceDigestCredentialsFn = func(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error) {
+		row.token.DigestMD5HA1, row.token.DigestSHA256HA1 = concurrentMD5, concurrentSHA256
+		return row.replace(ctx, id, newMD5, newSHA256, oldMD5, oldSHA256)
+	}
+
+	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if row.swaps != 0 {
+		t.Fatalf("ReplaceDigestCredentials swaps = %d against a row that changed underneath it, want 0", row.swaps)
+	}
+	if row.token.DigestMD5HA1 != concurrentMD5 || row.token.DigestSHA256HA1 != concurrentSHA256 {
+		t.Fatal("the losing re-seal overwrote the concurrently stored credentials")
+	}
+	if logged.count("re-sealed") != 0 {
+		t.Fatalf("a re-seal that lost the compare-and-swap was reported as done:\n%s", logged)
+	}
+}
+
+// DigestReady backs the readiness badge on /app-passwords. It answers what the
+// credential can actually do right now, so it stays false while the scheme is
+// off and false for a value this server can no longer open.
+func TestDigestReadyRequiresTheSettingAndAReadableCredential(t *testing.T) {
+	enabled := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+	md5HA1, sha256HA1 := sealedTestHA1s(t, enabled, "user@example.com", "app-secret")
+	unreadable := "v1:" + strings.Repeat("A", 64)
+
+	for _, tc := range []struct {
+		name  string
+		cfg   *config.Config
+		token store.AppPassword
+		want  bool
+	}{
+		{name: "sealed and enabled", cfg: enabled.cfg, token: store.AppPassword{DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}, want: true},
+		{name: "sealed but disabled", cfg: testAuthConfig("https://calcard.example"), token: store.AppPassword{DigestMD5HA1: md5HA1, DigestSHA256HA1: sha256HA1}},
+		{name: "never backfilled", cfg: enabled.cfg, token: store.AppPassword{}},
+		{name: "one column only", cfg: enabled.cfg, token: store.AppPassword{DigestSHA256HA1: sha256HA1}},
+		{name: "unreadable after a secret rotation", cfg: enabled.cfg, token: store.AppPassword{DigestMD5HA1: &unreadable, DigestSHA256HA1: &unreadable}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DigestReady(tc.cfg, tc.token); got != tc.want {
+				t.Fatalf("DigestReady() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1538,5 +1810,157 @@ func TestSecureRequestCachesTrustedProxiesInsteadOfReparsingPerRequest(t *testin
 		t.Fatalf("secureRequest() allocated %.1f/call, RequestIsSecure() allocated %.1f/call: "+
 			"the Service path should reuse a cached trusted-proxy set instead of re-parsing the CIDRs on every request",
 			cachedAllocs, reparsedAllocs)
+	}
+}
+
+// The re-seal is reported only once the replacement is stored. A line claiming
+// success ahead of a write that then fails would tell an operator the rotation
+// was repaired while the credential still cannot answer Digest.
+func TestFailedReSealIsNotReportedAsDone(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	previous := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+	previous.cfg.Session.Secret = "the-previous-session-secret-at-least-32-bytes"
+	staleMD5, staleSHA256 := sealedTestHA1s(t, previous, username, password)
+
+	attempts := 0
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{{ID: 3, TokenHash: string(hash), DigestMD5HA1: staleMD5, DigestSHA256HA1: staleSHA256}}, nil
+	})
+	service.store.AppPasswords.(*appPasswordRepoMock).replaceDigestCredentialsFn = func(context.Context, int64, *string, *string, *string, *string) (bool, error) {
+		attempts++
+		return false, errors.New("write failed")
+	}
+
+	if _, err := service.ValidateAppPassword(context.Background(), username, password); err != nil {
+		t.Fatalf("ValidateAppPassword() error = %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("re-seal attempts = %d, want 1", attempts)
+	}
+	if logged.count("could not store") != 1 {
+		t.Fatalf("the failed write was not reported:\n%s", logged)
+	}
+	if logged.count("re-sealed") != 0 {
+		t.Fatalf("a failed re-seal was reported as done:\n%s", logged)
+	}
+}
+
+// An unreadable stored HA1 is reached before the response is checked, so any
+// client that can fetch a challenge can trigger the report. It must be written
+// once per process however many requests hit it.
+func TestUnreadableDigestCredentialIsReportedOnce(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	previous := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+	previous.cfg.Session.Secret = "the-previous-session-secret-at-least-32-bytes"
+	staleMD5, staleSHA256 := sealedTestHA1s(t, previous, username, password)
+
+	service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+	service.store = digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+		return []store.AppPassword{{ID: 3, DigestMD5HA1: staleMD5, DigestSHA256HA1: staleSHA256}}, nil
+	})
+	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		challengeRec := httptest.NewRecorder()
+		handler.ServeHTTP(challengeRec, davRequest(http.MethodGet, "/dav/"))
+		req := davRequest(http.MethodGet, "/dav/")
+		req.Header.Set("Authorization", testDigestAuthorization(t,
+			digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256"),
+			"SHA-256", username, password, http.MethodGet, "/dav/", fmt.Sprintf("%08x", attempt), "cnonce"))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("Digest status with an unreadable credential = %d, want 401", rec.Code)
+		}
+	}
+	if got := logged.count("could not be opened"); got != 1 {
+		t.Fatalf("unreadable credential reported %d times, want 1:\n%s", got, logged)
+	}
+}
+
+// The report tells an operator what to do. A missing secret and a rotated one
+// need different answers, and the rotation remedy has to hold for deployments
+// that serve DAV without TLS, where Basic -- and so the re-seal -- is refused.
+func TestUnreadableDigestCredentialReportNamesTheCause(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		want     []string
+		unwanted []string
+	}{
+		{
+			name:     "no secret configured",
+			err:      fmt.Errorf("open: %w", errDigestHA1KeyUnavailable),
+			want:     []string{"APP_SESSION_SECRET is not configured"},
+			unwanted: []string{"rotated"},
+		},
+		{
+			name: "secret rotated",
+			err:  errors.New("cipher: message authentication failed"),
+			want: []string{"rotated", "HTTPS", "reissued"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, logged := loggedService(testDigestAuthConfig("https://calcard.example"))
+			service.reportUnreadableDigestCredential("SHA-256", 3, tc.err)
+			for _, want := range tc.want {
+				if logged.count(want) != 1 {
+					t.Errorf("report does not mention %q:\n%s", want, logged)
+				}
+			}
+			for _, unwanted := range tc.unwanted {
+				if logged.count(unwanted) != 0 {
+					t.Errorf("report mentions %q:\n%s", unwanted, logged)
+				}
+			}
+		})
+	}
+}
+
+// Sealing, verification and the per-row readiness badge all need the HA1
+// cipher; deriving it anew on each call repeats HKDF and the AES key schedule.
+// It is reused for the same secret and never for a different one.
+func TestDigestHA1AEADIsDerivedOncePerSecret(t *testing.T) {
+	cfg := testDigestAuthConfig("https://calcard.example")
+	first, err := digestHA1AEAD(cfg)
+	if err != nil {
+		t.Fatalf("digestHA1AEAD() error = %v", err)
+	}
+	again, err := digestHA1AEAD(cfg)
+	if err != nil {
+		t.Fatalf("digestHA1AEAD() error = %v", err)
+	}
+	if first != again {
+		t.Fatal("the HA1 cipher was derived again for an unchanged secret")
+	}
+
+	rotated := testDigestAuthConfig("https://calcard.example")
+	rotated.Session.Secret = "the-previous-session-secret-at-least-32-bytes"
+	other, err := digestHA1AEAD(rotated)
+	if err != nil {
+		t.Fatalf("digestHA1AEAD() error = %v", err)
+	}
+	if other == first {
+		t.Fatal("a different secret reused the cached HA1 cipher")
+	}
+	sealed, err := encryptDigestHA1(cfg, "MD5", "ha1")
+	if err != nil {
+		t.Fatalf("encryptDigestHA1() error = %v", err)
+	}
+	if _, err := decryptDigestHA1(rotated, "MD5", sealed); err == nil {
+		t.Fatal("a value sealed under one secret opened under another")
 	}
 }

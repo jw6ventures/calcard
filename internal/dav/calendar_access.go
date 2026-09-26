@@ -380,7 +380,7 @@ func (h *DavServer) prefetchACLEntries(ctx context.Context, user *store.User, re
 	}
 	result := make(map[string][]store.ACLEntry, len(relevantPaths))
 	for _, entry := range entries {
-		resourcePath := normalizeDAVHref(entry.ResourcePath)
+		resourcePath := cleanDAVPath(entry.ResourcePath)
 		result[resourcePath] = append(result[resourcePath], entry)
 	}
 	return result, nil
@@ -409,7 +409,7 @@ func newBatchedObjectACLDecider(user *store.User, ownerID int64, collectionPath 
 			OwnerHref: acl.PrincipalHref(ownerID),
 		}),
 		entriesByPath:  entriesByPath,
-		collectionPath: normalizeDAVHref(collectionPath),
+		collectionPath: cleanDAVPath(collectionPath),
 	}
 	decider.collectionEntries = entriesByPath[decider.collectionPath]
 	decider.collectionHasApplicable = acl.HasApplicablePrincipal(decider.collectionEntries, decider.principals)

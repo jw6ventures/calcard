@@ -182,7 +182,7 @@ func mustParseTemplates() map[string]*template.Template {
 		panic(err)
 	}
 
-	base := template.Must(template.New("base.html").Funcs(funcMap).ParseFS(templateFS, "templates/base.html"))
+	base := template.Must(template.New("base.html").Funcs(funcMap).ParseFS(templateFS, "templates/base.html", "templates/partials/*.tmpl"))
 
 	sets := make(map[string]*template.Template)
 	for _, file := range files {

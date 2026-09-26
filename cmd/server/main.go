@@ -99,7 +99,11 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth service: %w", err)
 	}
+	authService.SetLogger(&jw6utils)
 
+	// With Digest off, clears any HA1 an earlier run stored; repeating it
+	// retries a failed pass without waiting for a restart.
+	go store.StartDigestCredentialPurge(ctx, stor.AppPasswords, appauth.DigestEnabled(cfg), time.Hour)
 	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
 	// Every authenticated Digest request writes one nonce count, and each stops
 	// being presentable one nonce lifetime after it was written.

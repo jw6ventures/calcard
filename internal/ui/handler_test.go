@@ -6,18 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
 
 func TestViewCalendarHandler(t *testing.T) {
@@ -990,6 +996,7 @@ func contactFormRouter(h *Handler, userID int64) http.Handler {
 			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
 		})
 	})
+	router.Post("/addressbooks/{id}/contacts", h.CreateContact)
 	router.Put("/addressbooks/{id}/contacts/{uid}", h.UpdateContact)
 	router.Post("/addressbooks/{id}/import", h.ImportAddressBook)
 	return router
@@ -1136,6 +1143,118 @@ func TestUpdateContactPreservesDAVResourceName(t *testing.T) {
 	}
 }
 
+// A file mixing a vCard 2.1 card (with a quoted-printable soft line break), a
+// card the server refuses and a good 3.0 card stores the two it can and says
+// which one it skipped and why -- in the server's own words only, since the
+// flash travels in the redirect URL and a skip reason may quote the file.
+func TestImportAddressBookReportsSkippedCards(t *testing.T) {
+	vcf := strings.Join([]string{
+		"BEGIN:VCARD",
+		"VERSION:2.1",
+		"UID:legacy@calcard",
+		"N:Lovelace;Ada",
+		"FN;ENCODING=QUOTED-PRINTABLE:Ada =",
+		"Lovelace",
+		"END:VCARD",
+		"BEGIN:VCARD",
+		"VERSION:3.0",
+		"UID:nameless@calcard",
+		"NOTE:no name here <script>",
+		"END:VCARD",
+		"BEGIN:VCARD",
+		"VERSION:3.0",
+		"UID:modern@calcard",
+		"FN:Grace Hopper",
+		"END:VCARD",
+		"",
+	}, "\r\n")
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "contacts.vcf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte(vcf)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/import", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+	}
+	legacy := contactRepo.contacts["1:legacy@calcard"]
+	if legacy == nil || !strings.Contains(legacy.RawVCard, "FN:Ada Lovelace") {
+		t.Fatalf("the 2.1 card was not stored whole: %#v", legacy)
+	}
+	if contactRepo.contacts["1:modern@calcard"] == nil {
+		t.Fatal("the 3.0 card was not stored")
+	}
+	if contactRepo.contacts["1:nameless@calcard"] != nil {
+		t.Fatal("the card without FN was stored")
+	}
+
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := location.Query().Get("status"); got != "Imported 2 contacts." {
+		t.Errorf("status = %q, want the imported count", got)
+	}
+	if got := location.Query().Get("error"); got != "1 card skipped: card 2 (it has no name)." {
+		t.Errorf("error = %q, want the skipped card and its reason", got)
+	}
+	for _, leaked := range []string{"nameless", "script", "no name here"} {
+		if strings.Contains(location.RawQuery, leaked) || strings.Contains(location.Query().Get("error"), leaked) {
+			t.Errorf("the redirect carries text from the file (%q): %s", leaked, location)
+		}
+	}
+}
+
+// Only reasons the server words itself are repeated in the flash; one that
+// quotes the file, or that nobody listed, is summarized, and the list is
+// bounded however many cards were skipped.
+func TestImportSkipFlash(t *testing.T) {
+	skips := []contacts.ImportSkip{
+		{Card: 1, UID: "a", Code: contacts.ImportSkipMissingFN, Reason: "VCARD must contain FN"},
+		{Card: 4, UID: "evil<script>", Code: contacts.ImportSkipMalformed, Reason: `vCard 2.1: malformed content line "<img src=x onerror=alert(1)>"`},
+		{Card: 5, Code: contacts.ImportSkipUnsupportedCharset, Reason: "vCard 2.1: FN: unsupported character set SHIFT_JIS"},
+		{Card: 9, Code: contacts.ImportSkipDuplicateUID, Reason: "another contact already uses this UID or resource name"},
+		{Card: 12, Code: contacts.ImportSkipMissingFN, Reason: "VCARD must contain FN"},
+	}
+	got := importSkipFlash(skips)
+	want := "5 cards skipped: card 1 (it has no name), card 4 (it is not a well-formed vCard), card 5 (it uses a character set this server cannot read), and 2 more."
+	if got != want {
+		t.Fatalf("importSkipFlash() = %q\nwant %q", got, want)
+	}
+	for code, message := range map[contacts.ImportSkipCode]string{
+		contacts.ImportSkipDuplicateUID: "another contact already uses this UID",
+		contacts.ImportSkipForbidden:    "you may not change this contact",
+		contacts.ImportSkipChanged:      "the contact changed while it was being imported",
+		contacts.ImportSkipInvalid:      "not a vCard this server can read",
+		"":                              "not a vCard this server can read",
+	} {
+		if got := importSkipFlash([]contacts.ImportSkip{{Card: 2, Code: code, Reason: "VCARD must contain FN"}}); got != "1 card skipped: card 2 ("+message+")." {
+			t.Errorf("code %q: flash = %q", code, got)
+		}
+	}
+}
+
 // An imported vCard is a contact like any other: it needs the DAV resource
 // name the sync reports build an href from, and re-importing a file replaces
 // the contacts it already carries rather than failing on their UIDs.
@@ -1242,6 +1361,88 @@ func TestViewBirthdaysHandler(t *testing.T) {
 	body := w.Body.String()
 	if len(body) == 0 {
 		t.Error("expected non-empty response body")
+	}
+}
+
+// The page is handed month and day, never a date built in the current year:
+// 29 February rebuilt in a year without one is 1 March. The year decides only
+// the age, and a year the store uses as a stand-in for "no year" gives none.
+func TestViewBirthdaysKeepsLeapDayAndKnownYears(t *testing.T) {
+	leapDay := time.Date(2000, time.February, 29, 0, 0, 0, 0, time.UTC)
+	born1900 := time.Date(1900, time.May, 15, 0, 0, 0, 0, time.UTC)
+	noYear := time.Date(store.NoYearBirthdayYear, time.February, 29, 0, 0, 0, 0, time.UTC)
+	legacyNoYear := time.Date(1, time.July, 4, 0, 0, 0, 0, time.UTC)
+	future := time.Date(time.Now().Year()+5, time.March, 3, 0, 0, 0, 0, time.UTC)
+	names := []string{"Leap", "Old", "Yearless", "Future", "Legacy"}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays: []store.Contact{
+			{ID: 1, UID: "leap", DisplayName: &names[0], Birthday: &leapDay},
+			{ID: 2, UID: "old", DisplayName: &names[1], Birthday: &born1900},
+			{ID: 3, UID: "yearless", DisplayName: &names[2], Birthday: &noYear},
+			{ID: 5, UID: "legacy-yearless", DisplayName: &names[4], Birthday: &legacyNoYear},
+			{ID: 4, UID: "future", DisplayName: &names[3], Birthday: &future},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{Contacts: contactRepo}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	body := w.Body.String()
+	_, rest, ok := strings.Cut(body, "var birthdays = (")
+	if !ok {
+		t.Fatalf("no birthday payload in the page: %s", body)
+	}
+	payload, _, ok := strings.Cut(rest, " || [])")
+	if !ok {
+		t.Fatalf("unterminated birthday payload: %s", rest)
+	}
+	var events []map[string]any
+	if err := json.Unmarshal([]byte(payload), &events); err != nil {
+		t.Fatalf("birthday payload %s: %v", payload, err)
+	}
+	byUID := make(map[string]map[string]any, len(events))
+	for _, event := range events {
+		if _, ok := event["Date"]; ok {
+			t.Errorf("%v carries a date rebuilt in the current year", event["ContactUID"])
+		}
+		byUID[event["ContactUID"].(string)] = event
+	}
+
+	// The page works the age out for the year it shows, so it is sent the
+	// birth year rather than an age fixed to the server's year.
+	tests := []struct {
+		uid        string
+		month, day float64
+		birthYear  any
+	}{
+		{uid: "leap", month: 2, day: 29, birthYear: float64(2000)},
+		{uid: "old", month: 5, day: 15, birthYear: float64(1900)},
+		{uid: "yearless", month: 2, day: 29, birthYear: nil},
+		{uid: "legacy-yearless", month: 7, day: 4, birthYear: nil},
+		{uid: "future", month: 3, day: 3, birthYear: nil},
+	}
+	for _, tt := range tests {
+		event, ok := byUID[tt.uid]
+		if !ok {
+			t.Errorf("%s is missing from the page", tt.uid)
+			continue
+		}
+		if event["Month"] != tt.month || event["Day"] != tt.day {
+			t.Errorf("%s = month %v day %v, want %v/%v", tt.uid, event["Month"], event["Day"], tt.month, tt.day)
+		}
+		if event["BirthYear"] != tt.birthYear {
+			t.Errorf("%s birth year = %v, want %v", tt.uid, event["BirthYear"], tt.birthYear)
+		}
+		if _, ok := event["Age"]; ok {
+			t.Errorf("%s carries an age fixed to the server's year", tt.uid)
+		}
 	}
 }
 
@@ -1689,35 +1890,108 @@ func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
 	}
 }
 
-// Digest is opt-in because an app password issued before Digest existed carries
-// no HA1 and cannot answer a Digest challenge. A credential gains one the first
-// time it authenticates over Basic, so the page has to say which have caught up
-// -- that readiness is what tells an operator the switch is safe to turn on.
+// Sealed under digestReadinessSecret by the auth package's own sealing, because
+// nothing else produces a value this server can open and the badge turns on
+// exactly when it can. A change to the sealing scheme is meant to fail here.
+const (
+	digestReadinessSecret    = "test-session-secret-at-least-32-bytes-long"
+	sealedDigestReadinessMD5 = "v1:U9tCARRuQGmw48l6B2QaVwDFCp7hhDhe87DKpfj_jA4sLXAXXvBhq9nJQQxb4LxwcsN0e_LSJrohQK__"
+	sealedDigestReadinessSHA = "v1:6kpQrKv6Lywq9D0iLN8XgbFrv9Neebg9yj05fziCeuLt6T5vjUvsJ8SVYUx2m2gcNrG7MAucdNBej96shoWXw94fzKrnLlITkKi4_X98qSEjZDqn1GLJ4LRaZig"
+)
+
+// An app password gains its HA1 the first time it authenticates over Basic
+// after Digest is turned on, so the page has to say which have caught up. The
+// badge answers about what the credential can do now: it stays off entirely
+// while the scheme is disabled, it does not claim readiness for a value this
+// server cannot open (every stored value after APP_SESSION_SECRET is rotated),
+// and it is not shown for a credential that can no longer authenticate at all.
 func TestAppPasswordsPageReportsDigestReadiness(t *testing.T) {
-	sealed := "v1:sealed"
-	handler := NewHandler(&config.Config{BaseURL: "https://calcard.example/"}, &store.Store{
-		AppPasswords: &fakeAppPasswordRepo{list: []store.AppPassword{
-			{ID: 1, Label: "ready-token", DigestMD5HA1: &sealed, DigestSHA256HA1: &sealed},
-			{ID: 2, Label: "legacy-token"},
+	md5HA1, sha256HA1 := sealedDigestReadinessMD5, sealedDigestReadinessSHA
+	unreadable := "v1:" + strings.Repeat("A", 64)
+	past := time.Now().Add(-time.Hour)
+	digestCfg := func(enabled bool) *config.Config {
+		cfg := &config.Config{BaseURL: "https://calcard.example/"}
+		cfg.Session.Secret = digestReadinessSecret
+		cfg.DAV.DigestEnabled = enabled
+		return cfg
+	}
+	const (
+		noBadge     = ""
+		digestReady = "Digest ready"
+		basicOnly   = "Basic only"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		cfg        *config.Config
+		wantBadges map[string]string
+	}{
+		{name: "enabled", cfg: digestCfg(true), wantBadges: map[string]string{
+			"ready-token":   digestReady,
+			"legacy-token":  basicOnly,
+			"rotated-token": basicOnly,
+			"expired-token": noBadge,
+			"revoked-token": noBadge,
 		}},
-	}, nil)
+		{name: "disabled", cfg: digestCfg(false), wantBadges: map[string]string{
+			"ready-token":   noBadge,
+			"legacy-token":  noBadge,
+			"rotated-token": noBadge,
+			"expired-token": noBadge,
+			"revoked-token": noBadge,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewHandler(tc.cfg, &store.Store{
+				AppPasswords: &fakeAppPasswordRepo{list: []store.AppPassword{
+					{ID: 1, Label: "ready-token", DigestMD5HA1: &md5HA1, DigestSHA256HA1: &sha256HA1},
+					{ID: 2, Label: "legacy-token"},
+					{ID: 3, Label: "rotated-token", DigestMD5HA1: &unreadable, DigestSHA256HA1: &unreadable},
+					{ID: 4, Label: "expired-token", ExpiresAt: &past},
+					{ID: 5, Label: "revoked-token", RevokedAt: &past},
+				}},
+			}, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
-	w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+			w := httptest.NewRecorder()
 
-	handler.AppPasswords(w, req)
+			handler.AppPasswords(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("AppPasswords() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("AppPasswords() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+			}
+			rows := appPasswordRowsByLabel(t, w.Body.String())
+			for label, want := range tc.wantBadges {
+				row, ok := rows[label]
+				if !ok {
+					t.Fatalf("no row for %s in %s", label, w.Body.String())
+				}
+				for _, badge := range []string{digestReady, basicOnly} {
+					if got := strings.Contains(row, badge); got != (badge == want) {
+						t.Errorf("%s shows %q = %v, want badge %q: %s", label, badge, got, want, row)
+					}
+				}
+			}
+		})
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "Digest ready") {
-		t.Fatalf("expected the Digest-capable credential to be marked ready, got %s", body)
+}
+
+// appPasswordRowsByLabel splits the app passwords table into its rows, keyed by
+// the label each row leads with.
+func appPasswordRowsByLabel(t *testing.T, body string) map[string]string {
+	t.Helper()
+	rows := make(map[string]string)
+	for _, row := range strings.Split(body, "<tr>")[1:] {
+		row, _, _ = strings.Cut(row, "</tr>")
+		_, label, ok := strings.Cut(row, "<strong>")
+		if !ok {
+			continue
+		}
+		label, _, _ = strings.Cut(label, "</strong>")
+		rows[label] = row
 	}
-	if !strings.Contains(body, "Basic only") {
-		t.Fatalf("expected the legacy credential to be marked Basic only, got %s", body)
-	}
+	return rows
 }
 
 // Revoking an app password has to reach the auth cache: a cache hit answers
@@ -1939,6 +2213,58 @@ func TestCalendarEventJSONSupportsExplicitDateRange(t *testing.T) {
 	}
 	if strings.Contains(body, `"uid":"out"`) {
 		t.Fatalf("expected out-of-range event to be omitted, got %s", body)
+	}
+}
+
+// RFC 5545 section 3.1 lets a quoted parameter value hold a colon, and Exchange
+// writes zone names such as "(UTC-05:00) Eastern" as TZIDs. The value of such a
+// line starts at the first colon outside the quotes; split at the first colon
+// of all, the property loses its value and its parameter.
+func TestCalendarEventJSONReadsQuotedParameterColons(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:exchange\r\n" +
+		"DTSTART;TZID=\"(UTC-05:00) Eastern\":20240108T090000\r\n" +
+		"DTEND;TZID=\"(UTC-05:00) Eastern\":20240108T100000\r\n" +
+		"ATTENDEE;CN=\"Doe: Jane\":mailto:jane@example.com\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:exchange": {CalendarID: 1, UID: "exchange", ResourceName: "exchange", RawICAL: raw},
+		}},
+	}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2024-01-01&end=2024-02-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var events []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &events); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want the January event: %s", len(events), w.Body.String())
+	}
+	event := events[0]
+	if event["timezone"] != "(UTC-05:00) Eastern" {
+		t.Errorf("timezone = %v, want the quoted TZID", event["timezone"])
+	}
+	for _, key := range []string{"dtstart", "dtend"} {
+		if value, _ := event[key].(string); !strings.HasPrefix(value, "2024-01-08T") {
+			t.Errorf("%s = %v, want 8 January 2024", key, event[key])
+		}
+	}
+	attendees, _ := event["attendees"].([]any)
+	if len(attendees) != 1 || attendees[0] != "Doe: Jane <jane@example.com>" {
+		t.Errorf("attendees = %v, want the quoted CN and the address", event["attendees"])
 	}
 }
 
@@ -2945,7 +3271,7 @@ func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
 	}
 }
 
-func TestUnshareCalendarAllowsSharedUserToLeaveWithoutRemovingCustomACLs(t *testing.T) {
+func TestUnshareCalendarLeaveRevokesOwnGrantsAndKeepsOtherACLs(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: map[string]*store.CalendarAccess{
 			"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true, Editor: true},
@@ -2989,12 +3315,34 @@ func TestUnshareCalendarAllowsSharedUserToLeaveWithoutRemovingCustomACLs(t *test
 		t.Fatalf("unexpected ACL entries after leave: %#v", entries)
 	}
 
+	assertDescendantGrantRevoked(t, aclRepo)
+}
+
+// assertDescendantGrantRevoked checks that leaving a calendar takes the
+// departing principal's grant on a member resource with it — otherwise the
+// event stays readable to them indefinitely — while their deny and every other
+// principal's entries survive.
+func assertDescendantGrantRevoked(t *testing.T, aclRepo *fakeACLRepo) {
+	t.Helper()
 	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
 	if err != nil {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
-	if len(descendantEntries) != 3 {
-		t.Fatalf("expected descendant custom ACLs to remain unchanged, got %#v", descendantEntries)
+	want := map[string]struct{}{
+		"/dav/principals/200/:false:write-content": {},
+		"/dav/principals/300/:true:read":           {},
+	}
+	got := map[string]struct{}{}
+	for _, entry := range descendantEntries {
+		got[fmt.Sprintf("%s:%t:%s", entry.PrincipalHref, entry.IsGrant, entry.Privilege)] = struct{}{}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("descendant ACLs after unshare = %#v, want only the deny and the other principal's grant", descendantEntries)
+	}
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("descendant ACL %q was removed: %#v", key, descendantEntries)
+		}
 	}
 }
 
@@ -3119,13 +3467,7 @@ func TestUnshareCalendarRemovesOnlyManagedCollectionGrants(t *testing.T) {
 		}
 	}
 
-	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
-	if err != nil {
-		t.Fatalf("ListByResource() error = %v", err)
-	}
-	if len(descendantEntries) != 3 {
-		t.Fatalf("expected descendant custom ACLs to remain unchanged, got %#v", descendantEntries)
-	}
+	assertDescendantGrantRevoked(t, aclRepo)
 }
 
 func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
@@ -3262,19 +3604,70 @@ func TestDecideCalendarPrivilegeHonorsACEOrderAcrossResourceAliases(t *testing.T
 	}
 }
 
-func TestRemoveCalendarShareRejectsIneffectiveManagedGrant(t *testing.T) {
-	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
-		{ID: 1, ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 1},
-		{ID: 2, ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 2},
-	}}
-	h := NewHandler(&config.Config{}, &store.Store{ACLEntries: aclRepo}, nil)
-
-	err := h.removeCalendarShare(context.Background(), 1, 200, true)
-	if !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("removeCalendarShare() error = %v, want %v", err, store.ErrNotFound)
+// Leaving only ever takes the leaver's own grants, which cannot widen anyone's
+// access, so it has no precondition to check. A sharee whose collection grant
+// is already gone -- or never took effect -- still holds whatever per-event
+// grants the share left, and leaving is the one way they have to shed them.
+func TestUnshareCalendarLeaveSucceedsWithoutAnEffectiveCollectionShare(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []store.ACLEntry
+	}{
+		{
+			name: "only per-event grants left",
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read", Position: 2},
+			},
+		},
+		{
+			name: "collection grant shadowed by an earlier deny",
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 1},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 2},
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
+			},
+		},
 	}
-	if len(aclRepo.entries) != 2 {
-		t.Fatalf("expected denied share ACLs to remain unchanged, got %#v", aclRepo.entries)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				accessible: map[string]*store.CalendarAccess{
+					"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true},
+				},
+			}
+			aclRepo := &fakeACLRepo{entries: append([]store.ACLEntry(nil), tt.entries...)}
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, ACLEntries: aclRepo}, nil)
+
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			rctx.URLParams.Add("userId", "200")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 200}))
+			w := httptest.NewRecorder()
+			handler.UnshareCalendar(w, req)
+
+			if w.Code != http.StatusFound {
+				t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+			}
+			if location := w.Header().Get("Location"); location != "/calendars?status=calendar_updated" {
+				t.Fatalf("leave redirected to %q, want a successful leave", location)
+			}
+			for _, entry := range aclRepo.entries {
+				if entry.IsGrant && entry.PrincipalHref == "/dav/principals/200/" {
+					t.Fatalf("leave kept the leaver's grant %#v", entry)
+				}
+			}
+			for _, want := range tt.entries {
+				if want.PrincipalHref == "/dav/principals/200/" {
+					continue
+				}
+				if !slices.Contains(aclRepo.entries, want) {
+					t.Fatalf("leave removed %#v, which is not the leaver's", want)
+				}
+			}
+		})
 	}
 }
 
@@ -3792,8 +4185,12 @@ func (f *fakeAppPasswordRepo) Revoke(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (f *fakeAppPasswordRepo) SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error {
-	return nil
+func (f *fakeAppPasswordRepo) ReplaceDigestCredentials(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeAppPasswordRepo) PurgeDigestCredentials(ctx context.Context) (int64, error) {
+	return 0, nil
 }
 
 func (f *fakeAppPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
@@ -3876,6 +4273,43 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 		result = append(result, entry)
 	}
 	return result, nil
+}
+
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+// RevokePrincipalGrants mirrors the repository contract: drop the
+// principal's grants on the collection and every resource beneath it, keeping
+// denies.
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	if f.setACLErr != nil {
+		return f.setACLErr
+	}
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
 }
 
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
@@ -4907,28 +5341,6 @@ func TestViewBirthdaysInsideTheBudgetIsComplete(t *testing.T) {
 	}
 }
 
-func TestManagedShareAfterBroadReadGrant(t *testing.T) {
-	for _, principal := range []string{"DAV:all", "DAV:authenticated"} {
-		t.Run(principal, func(t *testing.T) {
-			entries := []store.ACLEntry{
-				{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
-				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
-			}
-			if !hasEffectiveManagedCalendarShare(entries, 200) {
-				t.Fatal("broad read grant hid the user's managed share")
-			}
-			entries[0].IsGrant = false
-			if hasEffectiveManagedCalendarShare(entries, 200) {
-				t.Fatal("earlier deny must still hide the share")
-			}
-			entries[0].IsGrant = true
-			if hasEffectiveManagedCalendarShare(entries[:1], 200) {
-				t.Fatal("broad grant alone is not a managed share")
-			}
-		})
-	}
-}
-
 func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
 	for _, method := range []string{"edit", "delete"} {
 		t.Run(method, func(t *testing.T) {
@@ -4954,5 +5366,298 @@ func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
 				t.Fatalf("%d %s: %s", rr.Code, rr.Body.String(), repo.events["1:event"].RawICAL)
 			}
 		})
+	}
+}
+
+// A refused contact form names the field to change, in words written for the
+// person filling it in rather than the text of a validation error, and never
+// repeats the submitted value into the redirect URL.
+func TestContactWriteRefusalNamesWhatWasWrong(t *testing.T) {
+	const uid = "alice@calcard"
+	tests := []struct {
+		name  string
+		form  url.Values
+		flash string
+	}{
+		{
+			name:  "impossible birthday",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "birthday": {"1990-02-31"}},
+			flash: "The birthday is not a valid date.",
+		},
+		{
+			name:  "impossible year-less birthday",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "birthday": {"--02-30"}},
+			flash: "The birthday is not a valid date.",
+		},
+		{
+			name:  "control character in a name",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "first_name": {"Jo\x01hn"}},
+			flash: "The first name contains characters a contact cannot store.",
+		},
+		{
+			name:  "line break in the display name",
+			form:  url.Values{"display_name": {"Johnny\nAppleseed"}},
+			flash: "The display name contains characters a contact cannot store.",
+		},
+		{
+			name:  "invalid email",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "email": {"johnny at example"}},
+			flash: "The email address is not valid.",
+		},
+		{
+			name:  "blank display name",
+			form:  url.Values{"display_name": {"   "}, "first_name": {"Johnny"}},
+			flash: "Enter a display name.",
+		},
+	}
+	for _, tt := range tests {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			t.Run(tt.name+"/"+method, func(t *testing.T) {
+				contactRepo := &fakeContactRepoWithUpsert{
+					fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+						"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-old", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:Alice\r\nEND:VCARD\r\n"},
+					}},
+				}
+				handler := NewHandler(&config.Config{}, &store.Store{
+					AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+						1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+					}},
+					Contacts: contactRepo,
+				}, nil)
+
+				target := "/addressbooks/1/contacts"
+				if method == http.MethodPut {
+					target += "/" + url.PathEscape(uid)
+				}
+				req := httptest.NewRequest(method, target, strings.NewReader(tt.form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				response := httptest.NewRecorder()
+				contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+				if response.Code != http.StatusFound {
+					t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+				}
+				if len(contactRepo.contacts) != 1 || contactRepo.contacts["1:"+uid].ETag != "etag-old" {
+					t.Fatalf("the refused payload was stored: %#v", contactRepo.contacts)
+				}
+				location, err := url.Parse(response.Header().Get("Location"))
+				if err != nil {
+					t.Fatalf("parse redirect: %v", err)
+				}
+				if got := location.Query().Get("error"); got != tt.flash {
+					t.Fatalf("flash error = %q, want %q", got, tt.flash)
+				}
+				for _, submitted := range tt.form {
+					if submitted[0] != "Johnny Appleseed" && strings.Contains(location.RawQuery+location.Query().Get("error"), submitted[0]) {
+						t.Fatalf("redirect %q repeats the submitted value %q", location, submitted[0])
+					}
+				}
+			})
+		}
+	}
+}
+
+// The address shape check is the form's own, and it must not stop an edit of
+// a contact whose stored address another client wrote in a shape it refuses:
+// the form sends that address back unchanged, and the person editing the name
+// cannot be asked to fix an address they did not touch.
+func TestUpdateContactKeepsAStoredEmailTheFormWouldRefuse(t *testing.T) {
+	const uid = "quoted@calcard"
+	const stored = `"john doe"@example.com`
+	newRepo := func() *fakeContactRepoWithUpsert {
+		return &fakeContactRepoWithUpsert{
+			fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-old",
+					RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:John\r\nitem1.EMAIL;TYPE=INTERNET:" + stored + "\r\nEND:VCARD\r\n"},
+			}},
+		}
+	}
+	submit := func(repo *fakeContactRepoWithUpsert, method, target, email string) *url.URL {
+		t.Helper()
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Contacts"}}},
+			Contacts:     repo,
+		}, nil)
+		form := url.Values{"display_name": {"John Renamed"}, "email": {email}}
+		req := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		contactFormRouter(handler, 100).ServeHTTP(response, req)
+		location, err := url.Parse(response.Header().Get("Location"))
+		if err != nil {
+			t.Fatalf("parse redirect: %v", err)
+		}
+		return location
+	}
+
+	repo := newRepo()
+	location := submit(repo, http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), stored)
+	if got := location.Query().Get("status"); got != "contact_updated" {
+		t.Fatalf("editing a contact with its stored address redirected to %s", location)
+	}
+	if !strings.Contains(repo.contacts["1:"+uid].RawVCard, "FN:John Renamed") {
+		t.Fatalf("the edit was not stored: %q", repo.contacts["1:"+uid].RawVCard)
+	}
+
+	// A changed address, and any address on a new contact, is still checked.
+	for _, attempt := range []struct{ method, target, email string }{
+		{http.MethodPut, "/addressbooks/1/contacts/" + url.PathEscape(uid), `"jane doe"@example.com`},
+		{http.MethodPost, "/addressbooks/1/contacts", stored},
+	} {
+		repo := newRepo()
+		location := submit(repo, attempt.method, attempt.target, attempt.email)
+		if got := location.Query().Get("error"); got != "The email address is not valid." {
+			t.Fatalf("%s %s with %s: error = %q, want the address refused", attempt.method, attempt.target, attempt.email, got)
+		}
+	}
+}
+
+// A refusal is answered in words written for the person filling in the form,
+// chosen by the error's type rather than its text; anything else is this
+// server's fault, which the page reports generically and the log records in
+// full.
+func TestContactWriteFlashError(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts", nil)
+	refusals := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "control character",
+			err:  &contacts.FieldError{Field: "lastName", Reason: "must not contain control characters"},
+			want: "The last name contains characters a contact cannot store.",
+		},
+		{
+			name: "required",
+			err:  &contacts.FieldError{Field: "displayName", Reason: "is required"},
+			want: "Enter a display name.",
+		},
+		{
+			name: "uid characters",
+			err:  &contacts.FieldError{Field: "uid", Reason: "may contain only letters, digits and - . _ ~ @ : + ="},
+			want: "The contact ID may contain only letters, digits and - . _ ~ @ : + =.",
+		},
+		{
+			name: "field nobody named",
+			err:  &contacts.FieldError{Field: "nickname", Reason: "is required"},
+			want: "The contact could not be saved because some of its details are not valid.",
+		},
+		{
+			name: "birthday from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrInvalidBirthday),
+			want: "The birthday is not a valid date.",
+		},
+		{
+			name: "uid from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrInvalidUID),
+			want: "The contact ID cannot be stored.",
+		},
+		{
+			name: "control character from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrControlCharacter),
+			want: "The contact contains characters it cannot store.",
+		},
+		{
+			name: "card the editor cannot update",
+			err:  contacts.ErrCardNotEditable,
+			want: "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead.",
+		},
+		{
+			name: "changed elsewhere",
+			err:  contacts.ErrPreconditionFailed,
+			want: "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again.",
+		},
+		{
+			name: "unclassified refusal",
+			err:  fmt.Errorf("%w: path uid does not match payload uid", contacts.ErrBadRequest),
+			want: "The contact could not be saved because some of its details are not valid.",
+		},
+	}
+	for _, tt := range refusals {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := contactWriteFlashError(req, tt.err, "failed to create contact"); got != tt.want {
+				t.Fatalf("flash = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if logged.Len() != 0 {
+		t.Fatalf("a refused submission was logged as a server fault: %s", logged.String())
+	}
+
+	fault := errors.New("pq: connection reset by peer")
+	if got := contactWriteFlashError(req, fault, "failed to create contact"); got != "failed to create contact" {
+		t.Fatalf("flash for a server fault = %q, want the fallback", got)
+	}
+	if !strings.Contains(logged.String(), "pq: connection reset by peer") {
+		t.Fatalf("a server fault was not logged: %q", logged.String())
+	}
+}
+
+// The edit form carries the ETag of the card it was built from, so a form
+// built before another client changed the contact is refused rather than
+// writing its stale values over that change.
+func TestUpdateContactRefusesAFormBuiltFromAnOlderVersion(t *testing.T) {
+	const uid = "alice@calcard"
+	stored := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:Alice\r\nN:;;;;\r\nTEL:+1 555 0100\r\nEND:VCARD\r\n"
+	for _, tt := range []struct {
+		name     string
+		etag     string
+		wantSave bool
+	}{
+		{name: "stale form", etag: "etag-before", wantSave: false},
+		{name: "fresh form", etag: "etag-now", wantSave: true},
+		{name: "form without an etag", etag: "", wantSave: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			contactRepo := &fakeContactRepoWithUpsert{
+				fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+					"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-now", RawVCard: stored},
+				}},
+			}
+			handler := NewHandler(&config.Config{}, &store.Store{
+				AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Test Contacts"}}},
+				Contacts:     contactRepo,
+			}, nil)
+			form := url.Values{"display_name": {"Alice"}, "phone": {"+1 555 0199"}, "etag": {tt.etag}}
+			req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+			if response.Code != http.StatusFound {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			location, err := url.Parse(response.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := strings.Contains(contactRepo.contacts["1:"+uid].RawVCard, "+1 555 0199")
+			if saved != tt.wantSave {
+				t.Fatalf("saved = %v, want %v; card:\n%s", saved, tt.wantSave, contactRepo.contacts["1:"+uid].RawVCard)
+			}
+			if !tt.wantSave && !strings.Contains(location.Query().Get("error"), "changed elsewhere") {
+				t.Fatalf("stale form flash = %q", location.Query().Get("error"))
+			}
+		})
+	}
+}
+
+// The page builds the edit form from the contact list, so the list carries
+// each contact's ETag and the form posts it back.
+func TestAddressBookPageCarriesContactETags(t *testing.T) {
+	body, err := templateFS.ReadFile("templates/addressbook_view.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, want := range []string{`name="etag"`, "raw.ETag"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("addressbook_view.html lacks %q", want)
+		}
 	}
 }

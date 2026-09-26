@@ -276,7 +276,7 @@ func (h *DavServer) expandReferencedResources(ctx context.Context, r *http.Reque
 			expanded = append(expanded, response{Href: strings.TrimSpace(href), Status: httpStatusNotFound})
 			continue
 		}
-		referenced, err := h.expandPropertyResponses(ctx, r, user, normalizeDAVHref(resolved.Path), nested, depth, budget)
+		referenced, err := h.expandPropertyResponses(ctx, r, user, cleanDAVPath(resolved.Path), nested, depth, budget)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) ||
 				isPrivilegeNotGranted(err) || errors.Is(err, http.ErrNotSupported) {

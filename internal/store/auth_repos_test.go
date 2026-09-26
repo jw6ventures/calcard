@@ -105,6 +105,133 @@ ORDER BY created_at DESC
 	}
 }
 
+// Purging may never cost a credential its Basic access, which the token hash
+// alone decides, and it has to be safe to repeat.
+func TestAppPasswordRepoPurgesDigestCredentialsWithoutBreakingBasic(t *testing.T) {
+	st := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := st.Users.UpsertOAuthUser(ctx, "subject-purge", "purge@example.test", "Test User", "Test")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
+	}
+
+	md5HA1, sha256HA1 := "sealed-md5", "sealed-sha256"
+	sealed, err := st.AppPasswords.Create(ctx, AppPassword{
+		UserID:          user.ID,
+		Label:           "sealed",
+		TokenHash:       "bcrypt-hash",
+		DigestMD5HA1:    &md5HA1,
+		DigestSHA256HA1: &sha256HA1,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	partial, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: "partial", TokenHash: "bcrypt-hash", DigestSHA256HA1: &sha256HA1})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	bare, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: "bare", TokenHash: "bcrypt-hash"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	purged, err := st.AppPasswords.PurgeDigestCredentials(ctx)
+	if err != nil {
+		t.Fatalf("PurgeDigestCredentials() error = %v", err)
+	}
+	if purged != 2 {
+		t.Fatalf("PurgeDigestCredentials() = %d, want 2 (the rows holding any HA1)", purged)
+	}
+	for _, id := range []int64{sealed.ID, partial.ID, bare.ID} {
+		requireAppPasswordDigestState(t, st, id, nil, nil)
+	}
+
+	again, err := st.AppPasswords.PurgeDigestCredentials(ctx)
+	if err != nil {
+		t.Fatalf("repeated PurgeDigestCredentials() error = %v", err)
+	}
+	if again != 0 {
+		t.Fatalf("repeated PurgeDigestCredentials() = %d, want 0", again)
+	}
+}
+
+// Replacing an HA1 is one compare-and-swap, so two requests acting on
+// different reads of the same row cannot interleave into a state neither
+// intended: the one whose read is stale changes nothing and is told so.
+func TestAppPasswordRepoReplaceDigestCredentialsIsACompareAndSwap(t *testing.T) {
+	st := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := st.Users.UpsertOAuthUser(ctx, "subject-replace", "replace@example.test", "Test User", "Test")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
+	}
+	ptr := func(value string) *string { return &value }
+
+	for _, tc := range []struct {
+		name                 string
+		storedMD5, storedSHA *string
+		oldMD5, oldSHA       *string
+		newMD5, newSHA       *string
+		wantSwapped          bool
+	}{
+		{name: "fills an empty row", newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "replaces what the caller read", storedMD5: ptr("old-md5"), storedSHA: ptr("old-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "replaces a partial row", storedSHA: ptr("old-sha"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "clears what the caller read", storedMD5: ptr("old-md5"), storedSHA: ptr("old-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), wantSwapped: true},
+		{name: "loses to a concurrent fill", storedMD5: ptr("b-md5"), storedSHA: ptr("b-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "loses to a concurrent replacement", storedMD5: ptr("b-md5"), storedSHA: ptr("b-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "loses to a concurrent clear", oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "matches both columns, not one", storedMD5: ptr("old-md5"), storedSHA: ptr("b-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			created, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: tc.name, TokenHash: "bcrypt-hash", DigestMD5HA1: tc.storedMD5, DigestSHA256HA1: tc.storedSHA})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			swapped, err := st.AppPasswords.ReplaceDigestCredentials(ctx, created.ID, tc.newMD5, tc.newSHA, tc.oldMD5, tc.oldSHA)
+			if err != nil {
+				t.Fatalf("ReplaceDigestCredentials() error = %v", err)
+			}
+			if swapped != tc.wantSwapped {
+				t.Fatalf("ReplaceDigestCredentials() = %v, want %v", swapped, tc.wantSwapped)
+			}
+			wantMD5, wantSHA := tc.storedMD5, tc.storedSHA
+			if tc.wantSwapped {
+				wantMD5, wantSHA = tc.newMD5, tc.newSHA
+			}
+			requireAppPasswordDigestState(t, st, created.ID, wantMD5, wantSHA)
+		})
+	}
+
+	swapped, err := st.AppPasswords.ReplaceDigestCredentials(ctx, 1<<40, ptr("a-md5"), ptr("a-sha"), nil, nil)
+	if err != nil || swapped {
+		t.Fatalf("ReplaceDigestCredentials() on a missing row = %v, %v; want false, nil", swapped, err)
+	}
+}
+
+func requireAppPasswordDigestState(t *testing.T, st *Store, id int64, wantMD5, wantSHA *string) {
+	t.Helper()
+	got, err := st.AppPasswords.GetByID(context.Background(), id)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID(%d) = %#v, %v", id, got, err)
+	}
+	for column, pair := range map[string][2]*string{"digest_md5_ha1": {got.DigestMD5HA1, wantMD5}, "digest_sha256_ha1": {got.DigestSHA256HA1, wantSHA}} {
+		if (pair[0] == nil) != (pair[1] == nil) || pair[0] != nil && *pair[0] != *pair[1] {
+			t.Fatalf("app password %d %s = %v, want %v", id, column, derefForLog(pair[0]), derefForLog(pair[1]))
+		}
+	}
+	if got.TokenHash != "bcrypt-hash" {
+		t.Fatalf("app password %d token hash = %q, want it untouched", id, got.TokenHash)
+	}
+}
+
+func derefForLog(value *string) string {
+	if value == nil {
+		return "<NULL>"
+	}
+	return *value
+}
+
 func TestDeletedResourceRepoListAndCleanup(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

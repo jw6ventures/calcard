@@ -84,6 +84,15 @@ func newPostgresSchemaPool(t *testing.T, schemaPath string) *sql.DB {
 	return pool
 }
 
+// blockedByQuery reports whether a session of this test's own pool, which the
+// test names after its schema, waits for a lock the session $1 holds. Test
+// packages share one database, so a session of another test's could otherwise
+// be taken for the one under test.
+const blockedByQuery = `SELECT EXISTS (
+    SELECT 1 FROM pg_stat_activity
+    WHERE application_name = current_setting('application_name')
+      AND $1 = ANY(pg_blocking_pids(pid)))`
+
 func withSearchPath(t *testing.T, dsn, schema string) string {
 	t.Helper()
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
@@ -93,10 +102,11 @@ func withSearchPath(t *testing.T, dsn, schema string) string {
 		}
 		query := parsed.Query()
 		query.Set("search_path", schema)
+		query.Set("application_name", schema)
 		parsed.RawQuery = query.Encode()
 		return parsed.String()
 	}
-	return dsn + " search_path=" + schema
+	return dsn + " search_path=" + schema + " application_name=" + schema
 }
 
 // newPostgresCalendar creates the user and calendar the concurrency tests write
@@ -987,6 +997,227 @@ func TestPostgres_ConcurrentACLReplacementsDoNotMerge(t *testing.T) {
 	}
 }
 
+// TestPostgres_ConcurrentACLUpdatesDoNotLoseGrants pins the lost update that a
+// read-modify-write over the whole ACL allows: every writer derives its result
+// from a snapshot, so without the read and the write being serialized against
+// each other the last writer silently erases the others' grants.
+func TestPostgres_ConcurrentACLUpdatesDoNotLoseGrants(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "concurrent-acl-update")
+	resourcePath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+
+	const writers = 12
+	errs := runConcurrently(writers, func(i int) error {
+		return s.ACLEntries.UpdateACL(context.Background(), resourcePath, func(entries []ACLEntry) ([]ACLEntry, error) {
+			return append(entries, ACLEntry{
+				PrincipalHref: fmt.Sprintf("/dav/principals/%d/", i+100),
+				IsGrant:       true,
+				Privilege:     "read",
+				Position:      i,
+			}), nil
+		})
+	})
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent UpdateACL() error = %v", err)
+		}
+	}
+
+	entries, err := s.ACLEntries.ListByResource(context.Background(), resourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != writers {
+		t.Fatalf("concurrent UpdateACL() left %d entries, want %d: %#v", len(entries), writers, entries)
+	}
+}
+
+// TestPostgres_ConcurrentShareAndUnshareKeepBothWrites runs the interleaving
+// that makes a revocation and a grant clobber one another: a sharee leaving
+// must not resurrect itself, and the grant landing alongside it must survive.
+func TestPostgres_ConcurrentShareAndUnshareKeepBothWrites(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "concurrent-share-unshare")
+	collectionPath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+	const leaving = "/dav/principals/200/"
+	const joining = "/dav/principals/300/"
+	ctx := context.Background()
+
+	for round := 0; round < 8; round++ {
+		if err := s.ACLEntries.SetACL(ctx, collectionPath, []ACLEntry{
+			{PrincipalHref: leaving, IsGrant: true, Privilege: "read", Position: 0},
+		}); err != nil {
+			t.Fatalf("SetACL() error = %v", err)
+		}
+
+		errs := runConcurrently(2, func(i int) error {
+			if i == 0 {
+				return s.ACLEntries.RevokePrincipalGrants(ctx, collectionPath, leaving, []string{"read", "write"})
+			}
+			return s.ACLEntries.UpdateACL(ctx, collectionPath, func(entries []ACLEntry) ([]ACLEntry, error) {
+				return append(entries, ACLEntry{PrincipalHref: joining, IsGrant: true, Privilege: "read", Position: 1}), nil
+			})
+		})
+		for _, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: error = %v", round, err)
+			}
+		}
+
+		entries, err := s.ACLEntries.ListByResource(ctx, collectionPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sawJoining, sawLeaving bool
+		for _, entry := range entries {
+			switch entry.PrincipalHref {
+			case joining:
+				sawJoining = true
+			case leaving:
+				sawLeaving = true
+			}
+		}
+		if !sawJoining {
+			t.Fatalf("round %d: the concurrent grant was lost: %#v", round, entries)
+		}
+		if sawLeaving {
+			t.Fatalf("round %d: the revoked grant came back: %#v", round, entries)
+		}
+	}
+}
+
+// TestPostgres_RevokePrincipalGrantsCoversMembers pins the revocation's scope:
+// member grants go with the share, denies and other principals stay.
+func TestPostgres_RevokePrincipalGrantsCoversMembers(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "revoke-principal-grants")
+	collectionPath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+	ctx := context.Background()
+
+	const target = "/dav/principals/200/"
+	seed := []ACLEntry{
+		{ResourcePath: collectionPath, PrincipalHref: target, IsGrant: true, Privilege: "read"},
+		{ResourcePath: collectionPath, PrincipalHref: target, IsGrant: true, Privilege: "read-acl"},
+		{ResourcePath: collectionPath, PrincipalHref: target, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: collectionPath + "/secret", PrincipalHref: target, IsGrant: true, Privilege: "read"},
+		{ResourcePath: collectionPath + "/secret", PrincipalHref: target, IsGrant: true, Privilege: "read-acl"},
+		{ResourcePath: collectionPath + "/secret", PrincipalHref: target, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: collectionPath + "/secret", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+		// A sibling collection whose path shares the prefix must not be swept up.
+		{ResourcePath: collectionPath + "0/other", PrincipalHref: target, IsGrant: true, Privilege: "read"},
+	}
+	byPath := map[string][]ACLEntry{}
+	for _, entry := range seed {
+		byPath[entry.ResourcePath] = append(byPath[entry.ResourcePath], entry)
+	}
+	for resourcePath, entries := range byPath {
+		if err := s.ACLEntries.SetACL(ctx, resourcePath, entries); err != nil {
+			t.Fatalf("SetACL(%q) error = %v", resourcePath, err)
+		}
+	}
+
+	if err := s.ACLEntries.RevokePrincipalGrants(ctx, collectionPath, target, []string{"read", "read-free-busy", "write"}); err != nil {
+		t.Fatalf("RevokePrincipalGrants() error = %v", err)
+	}
+
+	for resourcePath, want := range map[string][]string{
+		collectionPath:             {target + ":true:read-acl", target + ":false:write-content"},
+		collectionPath + "/secret": {target + ":false:write-content", "/dav/principals/300/:true:read"},
+		collectionPath + "0/other": {target + ":true:read"},
+	} {
+		entries, err := s.ACLEntries.ListByResource(ctx, resourcePath)
+		if err != nil {
+			t.Fatalf("ListByResource(%q) error = %v", resourcePath, err)
+		}
+		got := map[string]struct{}{}
+		for _, entry := range entries {
+			got[fmt.Sprintf("%s:%t:%s", entry.PrincipalHref, entry.IsGrant, entry.Privilege)] = struct{}{}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("ListByResource(%q) = %#v, want %v", resourcePath, entries, want)
+		}
+		for _, key := range want {
+			if _, ok := got[key]; !ok {
+				t.Fatalf("ListByResource(%q) lost %q: %#v", resourcePath, key, entries)
+			}
+		}
+	}
+}
+
+// TestPostgres_RevokePrincipalGrantsMatchesEitherSlashSpelling covers the
+// stored spellings the ACL evaluator folds together. Missing either would leave
+// a live grant behind.
+func TestPostgres_RevokePrincipalGrantsMatchesEitherSlashSpelling(t *testing.T) {
+	for _, tt := range []struct {
+		name, stored, revoked string
+	}{
+		{name: "unslashed grant, slashed revocation", stored: "/dav/principals/200", revoked: "/dav/principals/200/"},
+		{name: "slashed grant, unslashed revocation", stored: "/dav/principals/200/", revoked: "/dav/principals/200"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newPostgresStore(t)
+			_, calendarID := newPostgresCalendar(t, s, "revoke-principal-spelling")
+			collectionPath := fmt.Sprintf("/dav/calendars/%d", calendarID)
+			ctx := context.Background()
+
+			if err := s.ACLEntries.SetACL(ctx, collectionPath+"/secret", []ACLEntry{
+				{PrincipalHref: tt.stored, IsGrant: true, Privilege: "read"},
+			}); err != nil {
+				t.Fatalf("SetACL() error = %v", err)
+			}
+			if err := s.ACLEntries.RevokePrincipalGrants(ctx, collectionPath, tt.revoked, []string{"read"}); err != nil {
+				t.Fatalf("RevokePrincipalGrants() error = %v", err)
+			}
+			entries, err := s.ACLEntries.ListByResource(ctx, collectionPath+"/secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("ListByResource() = %#v, want the %q grant revoked", entries, tt.stored)
+			}
+		})
+	}
+}
+
+// UpdateACL rewrites every stored spelling of the resource, so the entries it
+// hands mutate have to come from all of them: a grant stored under the legacy
+// extension-suffixed path would otherwise be dropped by an unrelated update.
+func TestPostgres_UpdateACLKeepsEntriesOfEverySpelling(t *testing.T) {
+	s := newPostgresStore(t)
+	_, calendarID := newPostgresCalendar(t, s, "update-acl-spellings")
+	resourcePath := fmt.Sprintf("/dav/calendars/%d/meeting", calendarID)
+	ctx := context.Background()
+
+	pool := s.Calendars.(*calendarRepo).pool
+	if _, err := pool.ExecContext(ctx, `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order) VALUES ($1, '/dav/principals/300/', TRUE, 'read', 0)`, resourcePath+".ics"); err != nil {
+		t.Fatalf("store legacy-spelled grant: %v", err)
+	}
+
+	var seen []ACLEntry
+	err := s.ACLEntries.UpdateACL(ctx, resourcePath, func(current []ACLEntry) ([]ACLEntry, error) {
+		seen = current
+		return append(current, ACLEntry{PrincipalHref: "/dav/principals/301/", IsGrant: true, Privilege: "read", Position: 1}), nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateACL() error = %v", err)
+	}
+	if len(seen) != 1 || seen[0].PrincipalHref != "/dav/principals/300/" {
+		t.Fatalf("UpdateACL() handed mutate %#v, want the legacy-spelled grant", seen)
+	}
+
+	stored, err := s.ACLEntries.ListByResources(ctx, davStatePaths(resourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	granted := make(map[string]bool, len(stored))
+	for _, entry := range stored {
+		granted[entry.PrincipalHref] = true
+	}
+	if !granted["/dav/principals/300/"] || !granted["/dav/principals/301/"] || len(stored) != 2 {
+		t.Fatalf("stored ACL = %#v, want the legacy grant kept beside the new one", stored)
+	}
+}
+
 func isPostgresUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && string(pqErr.Code) == "23505"
@@ -1010,4 +1241,300 @@ func runConcurrently(n int, run func(i int) error) []error {
 	close(start)
 	wg.Wait()
 	return results
+}
+
+// davPathLockHolder opens a transaction, takes the advisory locks the DAV path
+// helper assigns to resourcePaths, and hands the transaction back still holding
+// them. lockTimeout turns a wait that should not happen into an error instead of
+// a hung test.
+func davPathLockHolder(pool txPool, lockTimeout string, resourcePaths ...string) (*sql.Tx, error) {
+	ctx := context.Background()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = `+pq.QuoteLiteral(lockTimeout)); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := acquireDAVPathLocks(ctx, tx, resourcePaths...); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
+func isPostgresLockTimeout(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && string(pqErr.Code) == "55P03"
+}
+
+// Advisory locks are shared by every session on one database, and test
+// packages run concurrently against the same one, so tests that assert on
+// blocking need paths no other run can collide with.
+func uniqueDAVCollectionPath(prefix string) string {
+	return fmt.Sprintf("%s/%d", prefix, time.Now().UnixNano())
+}
+
+// Every DAV path serialization set contains "/dav" and the collection kind's
+// root. Taking those exclusively would cap the whole server at one DAV write at
+// a time, so they must be shared: resources in different collections cannot
+// conflict under RFC 4918 and must not wait on each other.
+func TestPostgres_DAVPathLocksDoNotSerializeIndependentResources(t *testing.T) {
+	pool := newPostgresPool(t)
+	collection := uniqueDAVCollectionPath("/dav/calendars")
+	holder, err := davPathLockHolder(pool, "10s", collection+"/a.ics")
+	if err != nil {
+		t.Fatalf("hold member advisory locks: %v", err)
+	}
+	defer holder.Rollback()
+
+	for _, resourcePaths := range [][]string{
+		{uniqueDAVCollectionPath("/dav/calendars") + "/a.ics"},
+		{uniqueDAVCollectionPath("/dav/calendars")},
+		{uniqueDAVCollectionPath("/dav/addressbooks") + "/a.vcf"},
+	} {
+		tx, err := davPathLockHolder(pool, "2s", resourcePaths...)
+		if err != nil {
+			t.Fatalf("acquiring %q while %q is held: %v; independent resources must not serialize", resourcePaths, collection+"/a.ics", err)
+		}
+		tx.Rollback()
+	}
+}
+
+// RFC 4918 §9.10.4: a depth-infinity lock on a collection covers its members, so
+// a write to a member has to observe it, and an operation on the collection
+// itself has to exclude every member write.
+func TestPostgres_DAVPathLocksKeepCollectionScopeExclusive(t *testing.T) {
+	pool := newPostgresPool(t)
+	collection := uniqueDAVCollectionPath("/dav/calendars")
+
+	holder, err := davPathLockHolder(pool, "10s", collection)
+	if err != nil {
+		t.Fatalf("hold collection advisory locks: %v", err)
+	}
+	if _, err := davPathLockHolder(pool, "2s", collection+"/a.ics"); !isPostgresLockTimeout(err) {
+		holder.Rollback()
+		t.Fatalf("member write while the collection is held = %v, want a lock wait", err)
+	}
+	if _, err := davPathLockHolder(pool, "2s", collection); !isPostgresLockTimeout(err) {
+		holder.Rollback()
+		t.Fatalf("second collection-scoped operation = %v, want a lock wait", err)
+	}
+	holder.Rollback()
+
+	tx, err := davPathLockHolder(pool, "2s", collection+"/a.ics")
+	if err != nil {
+		t.Fatalf("member write after the collection lock released: %v", err)
+	}
+	tx.Rollback()
+}
+
+// An ACL transaction serializes on a resource's state paths and can name an
+// enclosing collection in the same pass. Acquiring a path shared as an ancestor
+// and then exclusively as a target would deadlock two transactions against each
+// other on the upgrade.
+func TestPostgres_DAVPathLocksSurviveNestedTargetSets(t *testing.T) {
+	pool := newPostgresPool(t)
+	collection := uniqueDAVCollectionPath("/dav/addressbooks")
+	targets := append(davStatePaths(collection+"/alice.vcf"), collection)
+
+	errs := runConcurrently(8, func(int) error {
+		for round := 0; round < 10; round++ {
+			tx, err := davPathLockHolder(pool, "10s", targets...)
+			if err != nil {
+				return err
+			}
+			if err := tx.Rollback(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d acquiring nested targets %q: %v", i, targets, err)
+		}
+	}
+}
+
+// LOCK takes the same path set as any other write to the member, so it waits
+// for a write to a sibling member and for an operation on the collection, but
+// not for anything in another collection.
+func TestPostgres_MemberLocksSerializeOnTheirCollection(t *testing.T) {
+	s := newPostgresStore(t)
+	userID, _ := newPostgresCalendar(t, s, "member-lock-scope")
+	collection := uniqueDAVCollectionPath("/dav/calendars")
+	ctx := context.Background()
+
+	newLock := func(resourcePath string) Lock {
+		return Lock{
+			Token:          "urn:uuid:member-" + resourcePath,
+			ResourcePath:   resourcePath,
+			UserID:         userID,
+			LockScope:      "exclusive",
+			LockType:       "write",
+			Depth:          "0",
+			TimeoutSeconds: 300,
+			ExpiresAt:      time.Now().Add(5 * time.Minute),
+		}
+	}
+	// waitsWhileHeld reports whether a LOCK on lockPath waits for holderPaths.
+	// A LOCK that has to wait is seen waiting on the holder in pg_locks before
+	// the holder lets go; one that does not finishes while the holder still
+	// holds its locks.
+	waitsWhileHeld := func(holderPaths []string, lockPath string) bool {
+		t.Helper()
+		holder, err := davPathLockHolder(s.pool, "30s", holderPaths...)
+		if err != nil {
+			t.Fatalf("hold %q: %v", holderPaths, err)
+		}
+		created := make(chan error, 1)
+		go func() {
+			_, err := s.Locks.Create(ctx, newLock(lockPath))
+			created <- err
+		}()
+		var holderPID int
+		if err := holder.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+			t.Fatalf("read holder backend: %v", err)
+		}
+		pool := s.Calendars.(*calendarRepo).pool
+		for {
+			select {
+			case err := <-created:
+				holder.Rollback()
+				if err != nil {
+					t.Fatalf("LOCK on %s: %v", lockPath, err)
+				}
+				return false
+			default:
+			}
+			var waiting bool
+			if err := pool.QueryRowContext(ctx, blockedByQuery, holderPID).Scan(&waiting); err != nil {
+				t.Fatalf("read lock waits: %v", err)
+			}
+			if waiting {
+				holder.Rollback()
+				if err := <-created; err != nil {
+					t.Fatalf("LOCK on %s after the holder released: %v", lockPath, err)
+				}
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	if !waitsWhileHeld([]string{collection + "/a.ics"}, collection+"/b.ics") {
+		t.Fatal("LOCK on a member while a sibling member write is held did not wait for it")
+	}
+	if !waitsWhileHeld([]string{collection}, collection+"/c.ics") {
+		t.Fatal("LOCK on a member while the collection is held did not wait for it")
+	}
+	if waitsWhileHeld([]string{collection + "/a.ics"}, uniqueDAVCollectionPath("/dav/calendars")+"/a.ics") {
+		t.Fatal("LOCK in another collection waited for an unrelated member write")
+	}
+}
+
+// lockPreconditionHolder opens a transaction, runs the lock-precondition gate a
+// member write runs, and hands the transaction back still holding its advisory
+// locks.
+func lockPreconditionHolder(pool txPool, lockTimeout string, resourcePaths ...string) (*sql.Tx, error) {
+	ctx := context.Background()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = `+pq.QuoteLiteral(lockTimeout)); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	preconditions := make([]LockPrecondition, 0, len(resourcePaths))
+	for _, resourcePath := range resourcePaths {
+		preconditions = append(preconditions, LockPrecondition{ResourcePath: resourcePath})
+	}
+	if err := validateLockPreconditionsTx(ctx, tx, preconditions); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
+// The paths a caller hands the gate to serialize on its own behalf are the ones
+// a later step of the same transaction writes, so the transaction has to hold
+// them however few lock preconditions the request carried: a request with none
+// still writes that state, and two of them would otherwise write it together.
+func TestPostgres_LockPreconditionGateSerializesCallerPathsWithoutPreconditions(t *testing.T) {
+	pool := newPostgresPool(t)
+	collection := uniqueDAVCollectionPath("/dav/addressbooks")
+	statePaths := davStatePaths(collection + "/alice.vcf")
+	ctx := context.Background()
+
+	holder, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer holder.Rollback()
+	if err := validateLockPreconditionsTx(ctx, holder, nil, statePaths...); err != nil {
+		t.Fatalf("validateLockPreconditionsTx() error = %v", err)
+	}
+
+	for _, statePath := range statePaths {
+		tx, err := davPathLockHolder(pool, "2s", statePath)
+		if err == nil {
+			tx.Rollback()
+			t.Fatalf("acquiring %q while the gate holds it = nil, want a lock wait", statePath)
+		}
+		if !isPostgresLockTimeout(err) {
+			t.Fatalf("acquiring %q while the gate holds it = %v, want a lock wait", statePath, err)
+		}
+	}
+}
+
+// A year-less February 29 has to survive the round trip through the DATE
+// column, and a row an earlier release stored in year 1 reads back as year-less.
+func TestPostgres_YearlessBirthdaysRoundTrip(t *testing.T) {
+	s := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := s.Users.UpsertOAuthUser(ctx, "birthday-round-trip", "birthday@example.test", "", "")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	book, err := s.AddressBooks.Create(ctx, AddressBook{UserID: user.ID, Name: "Birthdays"})
+	if err != nil {
+		t.Fatalf("create address book: %v", err)
+	}
+	for _, tt := range []struct {
+		uid, bday string
+		want      time.Time
+	}{
+		{uid: "leap", bday: "--02-29", want: time.Date(NoYearBirthdayYear, 2, 29, 0, 0, 0, 0, time.UTC)},
+		{uid: "basic", bday: "--1231", want: time.Date(NoYearBirthdayYear, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{uid: "dated", bday: "19900515", want: time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)},
+	} {
+		if _, err := s.Contacts.Upsert(ctx, Contact{
+			AddressBookID: book.ID, UID: tt.uid, ResourceName: tt.uid, ETag: tt.uid,
+			RawVCard: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:" + tt.uid + "\r\nFN:X\r\nBDAY:" + tt.bday + "\r\nEND:VCARD\r\n",
+		}); err != nil {
+			t.Fatalf("store %s: %v", tt.uid, err)
+		}
+		stored, err := s.Contacts.GetByUID(ctx, book.ID, tt.uid)
+		if err != nil || stored == nil || stored.Birthday == nil {
+			t.Fatalf("load %s: %v %+v", tt.uid, err, stored)
+		}
+		if !stored.Birthday.Equal(tt.want) {
+			t.Errorf("BDAY:%s read back as %v, want %v", tt.bday, stored.Birthday, tt.want)
+		}
+	}
+
+	pool := s.Calendars.(*calendarRepo).pool
+	if _, err := pool.ExecContext(ctx, `UPDATE contacts SET birthday = DATE '0001-07-04' WHERE address_book_id=$1 AND uid='basic'`, book.ID); err != nil {
+		t.Fatalf("store a legacy year-less birthday: %v", err)
+	}
+	legacy, err := s.Contacts.GetByUID(ctx, book.ID, "basic")
+	if err != nil || legacy == nil || legacy.Birthday == nil {
+		t.Fatalf("load legacy birthday: %v", err)
+	}
+	if want := time.Date(NoYearBirthdayYear, 7, 4, 0, 0, 0, 0, time.UTC); !legacy.Birthday.Equal(want) {
+		t.Errorf("legacy year-1 birthday read back as %v, want %v", legacy.Birthday, want)
+	}
 }

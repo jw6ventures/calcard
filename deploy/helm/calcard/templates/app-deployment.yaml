@@ -1,3 +1,18 @@
+{{- /* Schema migrations run in this container before its listener opens, and
+       the runner takes no lock: it reads the stored schema version, then
+       applies every migration file past it. Two pods coming up together read
+       the same version and apply the same files to one database, and the
+       Recreate strategy below starts every replica at once rather than in
+       sequence. Until the migrations serialize themselves, a second replica
+       buys a corrupted schema rather than availability, so it is refused here
+       instead of rendered. Zero is allowed: no pod starting races nothing.
+       values.schema.json enforces the same range; this check also covers
+       installs run with --skip-schema-validation, and compares the value's
+       text because int would truncate 1.5 to 1 and turn "abc" into 0. */ -}}
+{{- $replicas := toString .Values.replicaCount -}}
+{{- if not (has $replicas (list "0" "1")) -}}
+{{- fail (printf "replicaCount must be 1 or 0 (got %s): every replica runs the startup schema migration, and the migration runner takes no lock, so a second pod applies the same migrations to the same database concurrently" $replicas) -}}
+{{- end -}}
 {{- $name := default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 {{- $dbSecret := default (printf "%s-db-secret" $fullname) .Values.app.db.existingSecret.name -}}
@@ -13,7 +28,7 @@ metadata:
     app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ $replicas }}
   # Migrations run on startup and expect the application stopped while they
   # apply. A rolling update starts the new pod first and keeps the old one
   # serving, which runs the previous release against a schema being migrated
@@ -117,6 +132,6 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.priorityClassName }}
+      {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName | quote }}
       {{- end }}

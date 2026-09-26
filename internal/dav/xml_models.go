@@ -2,8 +2,11 @@ package dav
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -205,6 +208,9 @@ func (r rawXMLValue) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 	}
 	wrapped := "<dead-property>" + string(r) + "</dead-property>"
 	dec := xml.NewDecoder(strings.NewReader(wrapped))
+	// The property element carries its own namespace as the default
+	// declaration, so a child in that same namespace needs none of its own.
+	fragment := newXMLFragmentWriter(enc, start.Name.Space, nil, false)
 	depth := 0
 	for {
 		token, err := dec.Token()
@@ -220,7 +226,7 @@ func (r rawXMLValue) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 			if depth == 1 {
 				continue
 			}
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return err
 			}
 		case xml.EndElement:
@@ -228,19 +234,283 @@ func (r rawXMLValue) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 				depth--
 				continue
 			}
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return err
 			}
 			depth--
 		default:
 			if depth > 0 {
-				if err := enc.EncodeToken(token); err != nil {
+				if err := fragment.writeToken(token); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return enc.EncodeToken(start.End())
+}
+
+// xmlFragmentWriter re-serializes decoded XML tokens, keeping the prefixes and
+// namespace declarations they were written with (RFC 4918 Section 4.3: QName
+// content such as xs:dateTime depends on them).
+//
+// Decoder.Token resolves names but drops their prefixes, and keeps xmlns
+// attributes in Attr; handing those tokens straight to Encoder.EncodeToken
+// writes each declaration twice, which libxml2- and expat-based clients reject.
+// The writer tracks the declarations itself instead, recovers each name's
+// prefix from the bindings in scope, and spells names as prefixed local names,
+// which encoding/xml writes verbatim.
+//
+// The fragment is written into a document whose other bindings are unknown,
+// so every top-level element re-declares every binding in scope for it,
+// including those inherited from outside the fragment. Below the top level the
+// output scope then equals the input scope, and only each element's own
+// declarations need writing.
+type xmlFragmentWriter struct {
+	enc *xml.Encoder
+	// enclosingNS is the default namespace in force where the fragment is
+	// inserted.
+	enclosingNS string
+	// bindings is the input scope, innermost last; frames records its length
+	// at each open element.
+	bindings []xmlNamespaceBinding
+	frames   []int
+	// rejectUnbound refuses a prefix no declaration binds, which leaves a
+	// captured value without the namespace it names. Stored fragments are read
+	// leniently, so a legacy row still renders.
+	rejectUnbound bool
+}
+
+type xmlNamespaceBinding struct {
+	prefix string // "" for the default namespace
+	uri    string
+}
+
+var errUnboundXMLPrefix = errors.New("XML prefix is not bound to a namespace")
+
+// newXMLFragmentWriter writes a fragment into enc. enclosingNS is the default
+// namespace in force at the insertion point, and inherited the bindings the
+// fragment's own ancestors declared.
+func newXMLFragmentWriter(enc *xml.Encoder, enclosingNS string, inherited []xmlNamespaceBinding, rejectUnbound bool) *xmlFragmentWriter {
+	return &xmlFragmentWriter{
+		enc:           enc,
+		enclosingNS:   enclosingNS,
+		bindings:      append([]xmlNamespaceBinding(nil), inherited...),
+		rejectUnbound: rejectUnbound,
+	}
+}
+
+// inScopeNamespaces returns inherited extended by the declarations on start.
+func inScopeNamespaces(start xml.StartElement, inherited []xmlNamespaceBinding) []xmlNamespaceBinding {
+	scope := inherited
+	for _, attr := range start.Attr {
+		if binding, ok := xmlnsBinding(attr); ok {
+			if len(scope) == len(inherited) {
+				scope = append([]xmlNamespaceBinding(nil), inherited...)
+			}
+			scope = append(scope, binding)
+		}
+	}
+	return scope
+}
+
+func (w *xmlFragmentWriter) writeToken(token xml.Token) error {
+	switch token := token.(type) {
+	case xml.StartElement:
+		return w.writeStart(token)
+	case xml.EndElement:
+		name, _ := w.elementName(token.Name)
+		if n := len(w.frames); n > 0 {
+			w.bindings = w.bindings[:w.frames[n-1]]
+			w.frames = w.frames[:n-1]
+		}
+		return w.enc.EncodeToken(xml.EndElement{Name: xml.Name{Local: name}})
+	default:
+		return w.enc.EncodeToken(token)
+	}
+}
+
+func (w *xmlFragmentWriter) writeStart(start xml.StartElement) error {
+	topLevel := len(w.frames) == 0
+	w.frames = append(w.frames, len(w.bindings))
+	var attrs []xml.Attr
+	for _, attr := range start.Attr {
+		if binding, ok := xmlnsBinding(attr); ok {
+			w.bindings = append(w.bindings, binding)
+		}
+	}
+	if topLevel {
+		attrs = w.declareScope(attrs)
+	} else {
+		attrs = w.declareOwn(attrs, len(start.Attr))
+	}
+
+	name, bound := w.elementName(start.Name)
+	if !bound {
+		if w.rejectUnbound {
+			return fmt.Errorf("%w: element %q", errUnboundXMLPrefix, start.Name.Space)
+		}
+		// Only a legacy stored row gets here; it is written in the namespace
+		// the decoder reported, as the default.
+		w.bindings = append(w.bindings, xmlNamespaceBinding{uri: start.Name.Space})
+		attrs = slices.DeleteFunc(attrs, func(attr xml.Attr) bool { return attr.Name.Local == "xmlns" })
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: start.Name.Space})
+		name = start.Name.Local
+	}
+
+	for _, attr := range start.Attr {
+		if _, ok := xmlnsBinding(attr); ok {
+			continue
+		}
+		name, err := w.attributeName(attr.Name, &attrs)
+		if err != nil {
+			return err
+		}
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: name}, Value: attr.Value})
+	}
+	return w.enc.EncodeToken(xml.StartElement{Name: xml.Name{Local: name}, Attr: attrs})
+}
+
+// declareOwn writes the declarations the current element made, once per
+// prefix; a stored row can carry one twice.
+func (w *xmlFragmentWriter) declareOwn(attrs []xml.Attr, capacity int) []xml.Attr {
+	own := w.bindings[w.frames[len(w.frames)-1]:]
+	for i, binding := range own {
+		if w.redeclaredLater(own[i+1:], binding.prefix) {
+			continue
+		}
+		if attrs == nil {
+			attrs = make([]xml.Attr, 0, capacity)
+		}
+		attrs = append(attrs, declarationAttr(binding))
+	}
+	return attrs
+}
+
+// declareScope writes every binding in scope for a top-level element, the
+// default only where it differs from the one the insertion point has.
+func (w *xmlFragmentWriter) declareScope(attrs []xml.Attr) []xml.Attr {
+	for i, binding := range w.bindings {
+		if w.redeclaredLater(w.bindings[i+1:], binding.prefix) {
+			continue
+		}
+		if binding.prefix == "" && binding.uri == w.enclosingNS {
+			continue
+		}
+		if binding.prefix != "" && binding.uri == "" {
+			continue
+		}
+		attrs = append(attrs, declarationAttr(binding))
+	}
+	if w.lookup("") != w.enclosingNS && !w.declares("") {
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "xmlns"}})
+	}
+	return attrs
+}
+
+func (w *xmlFragmentWriter) redeclaredLater(later []xmlNamespaceBinding, prefix string) bool {
+	for _, binding := range later {
+		if binding.prefix == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *xmlFragmentWriter) declares(prefix string) bool {
+	for _, binding := range w.bindings {
+		if binding.prefix == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+func declarationAttr(binding xmlNamespaceBinding) xml.Attr {
+	if binding.prefix == "" {
+		return xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: binding.uri}
+	}
+	return xml.Attr{Name: xml.Name{Local: "xmlns:" + binding.prefix}, Value: binding.uri}
+}
+
+// lookup returns the namespace a prefix is bound to in the input scope; an
+// undeclared default is no namespace.
+func (w *xmlFragmentWriter) lookup(prefix string) string {
+	for i := len(w.bindings) - 1; i >= 0; i-- {
+		if w.bindings[i].prefix == prefix {
+			return w.bindings[i].uri
+		}
+	}
+	return ""
+}
+
+// prefixFor returns a prefix bound to uri and not shadowed, preferring the
+// default namespace when elements may use it.
+func (w *xmlFragmentWriter) prefixFor(uri string, allowDefault bool) (string, bool) {
+	if allowDefault && w.lookup("") == uri {
+		return "", true
+	}
+	for i := len(w.bindings) - 1; i >= 0; i-- {
+		binding := w.bindings[i]
+		if binding.prefix != "" && binding.uri == uri && w.lookup(binding.prefix) == uri {
+			return binding.prefix, true
+		}
+	}
+	return "", false
+}
+
+func (w *xmlFragmentWriter) elementName(name xml.Name) (string, bool) {
+	prefix, ok := w.prefixFor(name.Space, true)
+	if !ok {
+		return name.Local, false
+	}
+	if prefix == "" {
+		return name.Local, true
+	}
+	return prefix + ":" + name.Local, true
+}
+
+// attributeName spells a qualified attribute with a bound prefix. XML
+// Namespaces Section 6.2: the default declaration never reaches an attribute.
+func (w *xmlFragmentWriter) attributeName(name xml.Name, attrs *[]xml.Attr) (string, error) {
+	switch name.Space {
+	case "":
+		return name.Local, nil
+	case xmlLangNamespace:
+		return "xml:" + name.Local, nil
+	}
+	if prefix, ok := w.prefixFor(name.Space, false); ok {
+		return prefix + ":" + name.Local, nil
+	}
+	if w.rejectUnbound {
+		return "", fmt.Errorf("%w: attribute %q", errUnboundXMLPrefix, name.Space)
+	}
+	prefix := w.freshPrefix()
+	w.bindings = append(w.bindings, xmlNamespaceBinding{prefix: prefix, uri: name.Space})
+	*attrs = append(*attrs, xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: name.Space})
+	return prefix + ":" + name.Local, nil
+}
+
+func (w *xmlFragmentWriter) freshPrefix() string {
+	for n := 1; ; n++ {
+		prefix := "ns" + strconv.Itoa(n)
+		if !w.declares(prefix) {
+			return prefix
+		}
+	}
+}
+
+// xmlnsBinding reads an xmlns attribute as the binding it declares.
+// Decoder.Token leaves xmlns:d as {Space: "xmlns", Local: "d"} and a bare xmlns
+// as {Local: "xmlns"}.
+func xmlnsBinding(attr xml.Attr) (xmlNamespaceBinding, bool) {
+	switch {
+	case attr.Name.Space == "xmlns":
+		return xmlNamespaceBinding{prefix: attr.Name.Local, uri: attr.Value}, true
+	case attr.Name.Space == "" && attr.Name.Local == "xmlns":
+		return xmlNamespaceBinding{uri: attr.Value}, true
+	default:
+		return xmlNamespaceBinding{}, false
+	}
 }
 
 // langString is a text property value that carries the xml:lang attribute it
@@ -513,7 +783,10 @@ type proppatchProperty struct {
 }
 
 // xmlLangNamespace is the namespace the XML specification reserves for the
-// "xml" prefix; encoding/xml resolves xml:lang to it.
+// "xml" prefix. Decoder.Token binds that prefix itself rather than from the
+// document, so xml:lang always arrives resolved to this namespace and never as
+// the bare prefix, and this is the one spelling every reader of it compares
+// against. Only a decode path built on RawToken sees the prefix.
 const xmlLangNamespace = "http://www.w3.org/XML/1998/namespace"
 
 // inScopeLang returns the xml:lang declared on start, or inherited when start
@@ -523,7 +796,7 @@ func inScopeLang(start xml.StartElement, inherited string) string {
 		if attr.Name.Local != "lang" {
 			continue
 		}
-		if attr.Name.Space == xmlLangNamespace || attr.Name.Space == "xml" {
+		if attr.Name.Space == xmlLangNamespace {
 			return strings.TrimSpace(attr.Value)
 		}
 	}
@@ -536,6 +809,7 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 	}
 	*r = proppatchRequest{XMLName: start.Name}
 	rootLang := inScopeLang(start, "")
+	rootNS := inScopeNamespaces(start, nil)
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -546,7 +820,7 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 			if token.Name.Space != "DAV:" || (token.Name.Local != "set" && token.Name.Local != "remove") {
 				return fmt.Errorf("unexpected PROPPATCH instruction %q", xmlNameString(token.Name))
 			}
-			instruction, err := decodeProppatchInstruction(dec, token, token.Name.Local == "remove", rootLang)
+			instruction, err := decodeProppatchInstruction(dec, token, token.Name.Local == "remove", rootLang, rootNS)
 			if err != nil {
 				return err
 			}
@@ -559,9 +833,10 @@ func (r *proppatchRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElement
 	}
 }
 
-func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove bool, inheritedLang string) (proppatchInstruction, error) {
+func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove bool, inheritedLang string, inheritedNS []xmlNamespaceBinding) (proppatchInstruction, error) {
 	instruction := proppatchInstruction{Remove: remove}
 	instructionLang := inScopeLang(start, inheritedLang)
+	instructionNS := inScopeNamespaces(start, inheritedNS)
 	seenProp := false
 	for {
 		token, err := dec.Token()
@@ -574,7 +849,7 @@ func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove
 				return instruction, fmt.Errorf("PROPPATCH instruction must contain one DAV:prop")
 			}
 			seenProp = true
-			properties, err := decodeProppatchProperties(dec, token, instructionLang)
+			properties, err := decodeProppatchProperties(dec, token, instructionLang, instructionNS)
 			if err != nil {
 				return instruction, err
 			}
@@ -593,9 +868,10 @@ func decodeProppatchInstruction(dec *xml.Decoder, start xml.StartElement, remove
 	}
 }
 
-func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement, inheritedLang string) ([]proppatchProperty, error) {
+func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement, inheritedLang string, inheritedNS []xmlNamespaceBinding) ([]proppatchProperty, error) {
 	var properties []proppatchProperty
 	propLang := inScopeLang(start, inheritedLang)
+	propNS := inScopeNamespaces(start, inheritedNS)
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -603,7 +879,7 @@ func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement, inherit
 		}
 		switch token := token.(type) {
 		case xml.StartElement:
-			property, err := decodeProppatchProperty(dec, token, propLang)
+			property, err := decodeProppatchProperty(dec, token, propLang, propNS)
 			if err != nil {
 				return nil, err
 			}
@@ -616,9 +892,13 @@ func decodeProppatchProperties(dec *xml.Decoder, start xml.StartElement, inherit
 	}
 }
 
-func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement, inheritedLang string) (proppatchProperty, error) {
+func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement, inheritedLang string, inheritedNS []xmlNamespaceBinding) (proppatchProperty, error) {
 	var inner strings.Builder
 	enc := xml.NewEncoder(&inner)
+	// The fragment is stored without the property element and re-parsed on its
+	// own, so it is written with no enclosing namespace and carries every
+	// binding the request had in scope for it.
+	fragment := newXMLFragmentWriter(enc, "", inScopeNamespaces(start, inheritedNS), true)
 	var text strings.Builder
 	property := proppatchProperty{Name: start.Name, Lang: inScopeLang(start, inheritedLang)}
 	for {
@@ -629,7 +909,7 @@ func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement, inherited
 		switch token := token.(type) {
 		case xml.StartElement:
 			property.HasElement = true
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return property, err
 			}
 		case xml.EndElement:
@@ -641,16 +921,16 @@ func decodeProppatchProperty(dec *xml.Decoder, start xml.StartElement, inherited
 				property.Text = strings.TrimSpace(text.String())
 				return property, nil
 			}
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return property, err
 			}
 		case xml.CharData:
 			text.Write([]byte(token))
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return property, err
 			}
 		case xml.Comment, xml.Directive, xml.ProcInst:
-			if err := enc.EncodeToken(token); err != nil {
+			if err := fragment.writeToken(token); err != nil {
 				return property, err
 			}
 		}
@@ -684,6 +964,7 @@ func (r *mkcalendarRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElemen
 	}
 	*r = mkcalendarRequest{XMLName: start.Name}
 	rootLang := inScopeLang(start, "")
+	rootNS := inScopeNamespaces(start, nil)
 	for {
 		token, err := dec.Token()
 		if err != nil {
@@ -697,7 +978,7 @@ func (r *mkcalendarRequest) UnmarshalXML(dec *xml.Decoder, start xml.StartElemen
 			if len(r.Instructions) != 0 {
 				return fmt.Errorf("MKCALENDAR carries more than one DAV:set")
 			}
-			instruction, err := decodeProppatchInstruction(dec, token, false, rootLang)
+			instruction, err := decodeProppatchInstruction(dec, token, false, rootLang, rootNS)
 			if err != nil {
 				return err
 			}

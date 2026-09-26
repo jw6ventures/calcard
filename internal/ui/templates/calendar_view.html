@@ -1244,6 +1244,9 @@
 </datalist>
 
 <script>
+{{template "safe_html_js"}}
+</script>
+<script>
 (function() {
     // Calendar ID for API calls
     var calendarID = {{.Calendar.ID}};
@@ -1326,10 +1329,10 @@
                         event.uid = value;
                         break;
                     case 'SUMMARY':
-                        event.summary = unescapeICAL(value);
+                        event.summary = unescapeText(value);
                         break;
                     case 'DESCRIPTION':
-                        event.description = unescapeICAL(value);
+                        event.description = unescapeText(value);
                         break;
                     case 'RECURRENCE-ID':
                         event.recurrenceId = parseICALDate(value, params);
@@ -1342,7 +1345,7 @@
                         }
                         break;
                     case 'LOCATION':
-                        event.location = unescapeICAL(value);
+                        event.location = unescapeText(value);
                         break;
                     case 'DTSTART':
                         event.dtstart = parseICALDate(value, params);
@@ -1361,8 +1364,10 @@
                         event.rruleParsed = parseRRule(value);
                         break;
                     case 'EXDATE':
-                        event.exdates = event.exdates || [];
-                        event.exdates.push(parseICALDate(value, params));
+                        // One EXDATE may list several dates.
+                        event.exdates = (event.exdates || []).concat(value.split(',').map(function(v) {
+                            return parseICALDate(v, params);
+                        }));
                         break;
                     case 'STATUS':
                         event.status = value;
@@ -1409,14 +1414,6 @@
         // RFC 5545: lines are folded by inserting CRLF + space/tab
         return ical.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
     }
-    
-    function unescapeICAL(str) {
-        return str
-            .replace(/\\n/gi, '\n')
-            .replace(/\\,/g, ',')
-            .replace(/\\;/g, ';')
-            .replace(/\\\\/g, '\\');
-    }
 
     function formatEmailValue(value, params) {
         var email = value || '';
@@ -1451,22 +1448,24 @@
         return total;
     }
     
+    // Reads an iCalendar DATE or basic-format DATE-TIME (RFC 5545 section
+    // 3.3.4 and 3.3.5). A time ending in Z is UTC and is read as that instant.
+    // A floating or TZID time is wall-clock time, shown in the browser's zone,
+    // and a DATE is local midnight. Anything else is an invalid Date.
     function parseICALDate(str, params) {
-        // Handle YYYYMMDD and YYYYMMDDTHHMMSS formats
-        str = str.replace('Z', '');
-        var year, month, day, hour = 0, min = 0, sec = 0;
-        
-        if (str.length >= 8) {
-            year = parseInt(str.substring(0, 4), 10);
-            month = parseInt(str.substring(4, 6), 10) - 1;
-            day = parseInt(str.substring(6, 8), 10);
+        var match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z?))?$/.exec(String(str).trim());
+        if (!match) {
+            return new Date(NaN);
         }
-        if (str.length >= 15) {
-            hour = parseInt(str.substring(9, 11), 10);
-            min = parseInt(str.substring(11, 13), 10);
-            sec = parseInt(str.substring(13, 15), 10);
+        var year = parseInt(match[1], 10);
+        var month = parseInt(match[2], 10) - 1;
+        var day = parseInt(match[3], 10);
+        var hour = match[4] ? parseInt(match[4], 10) : 0;
+        var min = match[5] ? parseInt(match[5], 10) : 0;
+        var sec = match[6] ? parseInt(match[6], 10) : 0;
+        if (match[7] === 'Z') {
+            return new Date(Date.UTC(year, month, day, hour, min, sec));
         }
-        
         return new Date(year, month, day, hour, min, sec);
     }
     
@@ -1992,10 +1991,10 @@
             body += '<p><strong>Time zone:</strong> ' + escapeHtml(event.timezone) + '</p>';
         }
         if (event.url) {
-            var safeUrl = safeHref(event.url);
+            var eventUrl = safeHref(event.url);
             var urlLabel = escapeHtml(event.url);
-            if (safeUrl) {
-                body += '<p><strong>Link:</strong> <a href="' + safeUrl + '" target="_blank" rel="noopener">' + urlLabel + '</a></p>';
+            if (eventUrl) {
+                body += '<p><strong>Link:</strong> <a href="' + eventUrl + '" target="_blank" rel="noopener noreferrer">' + urlLabel + '</a></p>';
             } else {
                 body += '<p><strong>Link:</strong> ' + urlLabel + '</p>';
             }
@@ -2024,7 +2023,7 @@
                 var label = escapeHtml(a);
                 var href = safeHref(a);
                 if (!href) return label;
-                return '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>';
+                return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
             }).join('<br>');
             body += '<p><strong>Attachments:</strong><br>' + attLinks + '</p>';
         }
@@ -2038,8 +2037,10 @@
             body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event.rrule)) + '</p>';
         }
         if (event.htmlDescription) {
-            // Render HTML description (sanitized)
-            body += '<p><strong>Description:</strong></p><div class="event-html-desc">' + sanitizeHtml(event.htmlDescription) + '</div>';
+            // The sanitized description is appended below as a node. Serializing
+            // it back into this string would have it parsed a second time, and
+            // the allow list only ever saw the first reading.
+            body += '<p><strong>Description:</strong></p><div class="event-html-desc" id="event-html-desc"></div>';
         } else if (event.description) {
             body += '<p><strong>Description:</strong></p><p style="white-space:pre-wrap">' + escapeHtml(event.description) + '</p>';
         }
@@ -2050,6 +2051,9 @@
         body += '</div>';
         
         document.getElementById('modal-body').innerHTML = body;
+        if (event.htmlDescription) {
+            document.getElementById('event-html-desc').appendChild(sanitizeHtml(event.htmlDescription));
+        }
         var actionContainer = document.getElementById('event-action-buttons');
         actionContainer.innerHTML = '';
         var masterEvent = window.baseEvents.find(function(e) { return e.uid === event.uid; }) || event;
@@ -2075,58 +2079,6 @@
         modal.classList.add('show');
     }
     
-    // Sanitize HTML by allowing only safe tags
-    function sanitizeHtml(html) {
-        // Unescape iCal escaped characters first
-        html = html
-            .replace(/\\n/gi, '\n')
-            .replace(/\\,/g, ',')
-            .replace(/\\;/g, ';')
-            .replace(/\\\\/g, '\\');
-        
-        // Create a temporary element to parse HTML
-        var temp = document.createElement('div');
-        temp.innerHTML = html;
-        
-        // Walk the DOM and remove dangerous elements/attributes
-        function sanitizeNode(node) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-                var tagName = node.tagName.toLowerCase();
-                // Allowed tags
-                var allowedTags = ['p', 'br', 'b', 'i', 'u', 'strong', 'em', 'a', 'ul', 'ol', 'li', 
-                                   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'code',
-                                   'div', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody'];
-                
-                if (allowedTags.indexOf(tagName) === -1) {
-                    // Replace with its text content
-                    var text = document.createTextNode(node.textContent);
-                    node.parentNode.replaceChild(text, node);
-                    return;
-                }
-                
-                // Remove dangerous attributes
-                var attrs = Array.from(node.attributes);
-                attrs.forEach(function(attr) {
-                    var name = attr.name.toLowerCase();
-                    if (name.startsWith('on') || name === 'style' || name === 'class') {
-                        node.removeAttribute(attr.name);
-                    }
-                    if (name === 'href') {
-                        var value = attr.value.toLowerCase().trim();
-                        if (value.startsWith('javascript:') || value.startsWith('data:')) {
-                            node.removeAttribute('href');
-                        }
-                    }
-                });
-                
-                // Recursively sanitize children
-                Array.from(node.childNodes).forEach(sanitizeNode);
-            }
-        }
-        
-        Array.from(temp.childNodes).forEach(sanitizeNode);
-        return temp.innerHTML;
-    }
     
     function formatDate(date, allDay) {
         var opts = { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' };
@@ -2218,38 +2170,7 @@
         
         return result;
     }
-    
-    // Several results land inside a double-quoted attribute, so the quotes are
-    // escaped as well as the markup delimiters: a textContent round trip
-    // through the DOM escapes only & < >, which leaves a value free to close
-    // the attribute it sits in and open an event handler. The ampersand is
-    // rewritten first so the entities introduced below are not escaped twice.
-    function escapeHtml(str) {
-        return (str === null ? '' : String(str))
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
 
-    function safeHref(raw) {
-        if (!raw) return '';
-        var value = String(raw).trim();
-        if (!value) return '';
-        try {
-            var u = new URL(value, window.location.origin);
-            var protocol = (u.protocol || '').toLowerCase();
-            if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
-                // The parsed href, not the caller's text: URL percent-encodes
-                // the quotes and control characters that would otherwise ride
-                // through into the href attribute unchanged.
-                return escapeHtml(u.href);
-            }
-        } catch (e) {}
-        return '';
-    }
-    
     // Expanded events for calendar view (includes recurring occurrences)
     var expandedEvents = [];
 

@@ -188,6 +188,11 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string, body []byte, bodyText, etag string) {
+	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
 	cal, existingByResource, ok := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
 	if !ok {
 		return
@@ -213,6 +218,11 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 
 	uid := validated.UID
 	resourceName := resourceUID
+	if len(uid) > store.MaxIdentifierOctets || len(resourceName) > store.MaxIdentifierOctets {
+		// Both are unique index keys, which PostgreSQL bounds in size.
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
+		return
+	}
 	if existingByResource == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
 		return
 	}
@@ -233,23 +243,29 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	}
 
 	write := store.CalendarObjectWrite{
-		CalendarID:           calendarID,
-		UID:                  uid,
-		ResourceName:         resourceName,
-		RawICAL:              bodyText,
-		ETag:                 etag,
-		Metadata:             &validated.Analysis.Metadata,
-		Precondition:         calendarObjectPrecondition(r),
-		ExpectedState:        &store.CalendarObjectResourceState{Exists: existingByResource != nil},
-		ExpectedCalendarCTag: &cal.CTag,
-		LockPreconditions:    h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
+		CalendarID:        calendarID,
+		UID:               uid,
+		ResourceName:      resourceName,
+		RawICAL:           bodyText,
+		ETag:              etag,
+		Metadata:          &validated.Analysis.Metadata,
+		Precondition:      calendarObjectPrecondition(r),
+		ExpectedState:     &store.CalendarObjectResourceState{Exists: existingByResource != nil},
+		ExpectedACL:       aclGuard,
+		LockPreconditions: h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
 	}
 	result, err := h.store.PutCalendarObject(r.Context(), write)
 	for attempt := 0; attempt < maxResourceStateRetries && errors.Is(err, store.ErrResourceStateChanged); attempt++ {
-		// The per-request caches still hold the calendar row the lost attempt was
+		// The per-request caches still hold the state the lost attempt was
 		// authorized against, so they have to be dropped first: re-reading through
-		// them would resend the same stale CTag and lose again for the same reason.
+		// them would resend the same stale snapshot and lose again for the same
+		// reason.
 		invalidateDAVRequestState(r.Context())
+		currentACL, aclErr := h.aclGuard(r.Context(), user, cleanPath)
+		if aclErr != nil {
+			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			return
+		}
 		currentCal, current, authorized := h.authorizeCalendarObjectTarget(w, r, user, calendarID, resourceUID, cleanPath)
 		if !authorized {
 			return
@@ -265,7 +281,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		// against the state read here, so a writer whose own precondition is what
 		// failed still answers 412 rather than being retried into a wrong result.
 		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
-		write.ExpectedCalendarCTag = &currentCal.CTag
+		write.ExpectedACL = currentACL
 		result, err = h.store.PutCalendarObject(r.Context(), write)
 	}
 	switch {
@@ -283,6 +299,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	case errors.Is(err, store.ErrPreconditionFailed):
 		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	case errors.Is(err, store.ErrLockConflict):
+		http.Error(w, "resource is locked", http.StatusLocked)
 		return
 	case errors.Is(err, store.ErrConflict):
 		h.logger().Error("Put", "calendar object store conflict did not identify a resource for %q in calendar %d", uid, calendarID)
@@ -388,6 +407,11 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 }
 
 func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string, retries int) {
+	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
 	book, err := h.getAddressBook(r.Context(), addressBookID)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -417,6 +441,11 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 
 	// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
 	resourceName := parsedDAVTarget(r.Context(), cleanPath).ResourceName
+	if len(resourceName) > store.MaxIdentifierOctets {
+		// A unique index key, which PostgreSQL bounds in size.
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
 
 	// Check if an existing resource at this path has a different UID
 	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
@@ -482,17 +511,18 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 		return
 	}
+	expectedState := store.ContactDAVResourceState(existingByName)
+	expectedState.ACL = aclGuard
 	result, err := h.store.PutContactObject(r.Context(), store.ContactObjectWrite{
-		AddressBookID:           addressBookID,
-		UID:                     uid,
-		ResourceName:            resourceName,
-		RawVCard:                bodyText,
-		ETag:                    etag,
-		Precondition:            calendarObjectPrecondition(r),
-		ExpectedState:           store.ContactDAVResourceState(existingByName),
-		ExpectedAddressBookCTag: &book.CTag,
-		StatePath:               canonicalPath,
-		LockPreconditions:       h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
+		AddressBookID:     addressBookID,
+		UID:               uid,
+		ResourceName:      resourceName,
+		RawVCard:          bodyText,
+		ETag:              etag,
+		Precondition:      calendarObjectPrecondition(r),
+		ExpectedState:     expectedState,
+		StatePath:         canonicalPath,
+		LockPreconditions: h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
 	})
 	switch {
 	case errors.Is(err, store.ErrUIDConflict):

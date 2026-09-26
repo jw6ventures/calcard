@@ -1,13 +1,17 @@
 package dav
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
+)
 
 // parseVCardLine splits one unfolded content line into its group, name,
 // parameters, and raw value. Parameter values may be quoted and quoted values
 // may contain the ";", ":" and "," delimiters, so the split honours quoting
 // rather than scanning for the first delimiter byte.
 func parseVCardLine(line string) (vcardLine, bool) {
-	colon := delimiterOutsideQuotes(line, ':')
+	colon := ical.IndexOutsideQuotes(line, ':')
 	if colon <= 0 {
 		return vcardLine{}, false
 	}

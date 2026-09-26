@@ -451,3 +451,155 @@ func TestHelmChartStartupBudgetIsConfigurable(t *testing.T) {
 		}
 	}
 }
+
+// Schema migrations run in the app container on startup, and the runner takes
+// no lock: it reads the stored version, then applies every migration file past
+// it. The strategy above is Recreate, so a second replica does not trail the
+// first -- both start at once, read the same version and apply the same files
+// against one database. The chart refuses that rather than rendering it,
+// matching how service.type is handled: a value whose result is a corrupted
+// schema is not a value to warn about in a comment.
+//
+// values.schema.json is the first line of refusal and the template guard the
+// second, for installs run with --skip-schema-validation. Both are exercised,
+// including the values an int conversion would have let through: 1.5 truncates
+// to 1 and a non-numeric string converts to 0.
+func TestHelmChartRefusesConcurrentMigrators(t *testing.T) {
+	valuesFile := filepath.Join(t.TempDir(), "float-replicas.yaml")
+	if err := os.WriteFile(valuesFile, []byte("replicaCount: 1.5\n"), 0o600); err != nil {
+		t.Fatalf("write values file: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		values []string
+	}{
+		{"two", []string{"--set", "replicaCount=2"}},
+		{"negative", []string{"--set", "replicaCount=-1"}},
+		{"fractional string", []string{"--set", "replicaCount=1.5"}},
+		{"fractional number", []string{"-f", valuesFile}},
+		{"non-numeric", []string{"--set", "replicaCount=abc"}},
+	} {
+		for _, gate := range []struct {
+			name  string
+			flags []string
+			want  string
+		}{
+			{"schema", nil, "/replicaCount"},
+			{"template", []string{"--skip-schema-validation"}, "replicaCount must be 1 or 0"},
+		} {
+			t.Run(tc.name+"/"+gate.name, func(t *testing.T) {
+				args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+				args = append(args, gate.flags...)
+				args = append(args, tc.values...)
+				output, err := runHelm(t, args...)
+				if err == nil {
+					t.Fatalf("chart rendered %v, so pods other than a single migrator can start:\n%s", tc.values, output)
+				}
+				if !strings.Contains(output, gate.want) {
+					t.Fatalf("expected the refusal to name %q, got:\n%s", gate.want, output)
+				}
+			})
+		}
+	}
+}
+
+// Scaling to zero is how an operator stops the application without deleting the
+// release -- to take a backup, or to run a migration by hand -- and no pod
+// starting is the one case that cannot race another.
+func TestHelmChartAllowsScalingToZero(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t, "--set", "replicaCount=0"), "app-deployment.yaml")
+	if !hasLine(deployment, "replicas: 0") {
+		t.Fatalf("replicaCount=0 was not honoured:\n%s", deployment)
+	}
+}
+
+// A priority class is how an operator keeps the calendar server from being the
+// pod a pressured node evicts first, so the configured class has to reach the
+// pod spec. renderChart fails the test on a render error, which is what makes
+// this case cover the whole path rather than the field's content alone: a
+// guard that rebinds the dot around this field leaves .Values unresolvable
+// inside it, which aborts the upgrade before it rolls instead of merely
+// omitting the field.
+func TestHelmChartAppliesAPriorityClassWhenSet(t *testing.T) {
+	const priorityClass = "system-cluster-critical"
+	documents := renderChart(t, "--set", "priorityClassName="+priorityClass)
+	deployment := requireDocument(t, documents, "app-deployment.yaml")
+	if !hasLine(deployment, `priorityClassName: "`+priorityClass+`"`) {
+		t.Fatalf("app deployment does not carry the configured priority class %q:\n%s", priorityClass, deployment)
+	}
+}
+
+// The other half of the same guard. The Priority admission plugin treats an
+// empty priorityClassName exactly like an absent one, so this is not about
+// admission: it pins that an unset or explicitly empty value leaves the pod
+// spec as it was before the field existed, so upgrading does not diff it.
+func TestHelmChartOmitsThePriorityClassWhenUnset(t *testing.T) {
+	for name, extra := range map[string][]string{
+		"default": nil,
+		"empty":   {"--set", "priorityClassName="},
+	} {
+		t.Run(name, func(t *testing.T) {
+			deployment := requireDocument(t, renderChart(t, extra...), "app-deployment.yaml")
+			for _, line := range strings.Split(deployment, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "priorityClassName:") {
+					t.Fatalf("app deployment declares %q with no priority class configured:\n%s", strings.TrimSpace(line), deployment)
+				}
+			}
+		})
+	}
+}
+
+// The v1.2.0 migration tells an operator to compare the startup budget against
+// the size of their events table before upgrading, and names the chart's default
+// to compare against. That figure is only useful while it is this chart's actual
+// default: the migration runs inside the budget, a run that overruns it is killed
+// and rolled back, and the container then restarts into the same work, so a
+// deployment that is too large for the budget never comes up rather than failing
+// loudly. The rendered default is pinned by
+// TestHelmChartGivesMigrationsAStartupBudget; this reads values.yaml directly so
+// the pairing is still checked where helm is absent.
+func TestHelmChartStartupBudgetMatchesTheMigrationsOperatorNote(t *testing.T) {
+	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "v1.2.0.sql"))
+	if err != nil {
+		t.Fatalf("read v1.2.0 migration: %v", err)
+	}
+	for _, want := range []string{
+		"startupProbe.periodSeconds 10 x failureThreshold 60",
+		"startupProbe.failureThreshold",
+	} {
+		if !strings.Contains(string(migration), want) {
+			t.Fatalf("v1.2.0 operator note does not mention %q, so an operator is not told to check the budget", want)
+		}
+	}
+
+	values, err := os.ReadFile(filepath.Join(chartPath, "values.yaml"))
+	if err != nil {
+		t.Fatalf("read chart values: %v", err)
+	}
+	startup, ok := blockUnder(withoutYAMLComments(string(values)), "startupProbe:")
+	if !ok {
+		t.Fatal("chart values declare no startupProbe block")
+	}
+	for _, want := range []string{"periodSeconds: 10", "failureThreshold: 60"} {
+		if !hasLine(startup, want) {
+			t.Fatalf("chart default startupProbe is not %q, so the v1.2.0 operator note quotes a stale budget:\n%s", want, startup)
+		}
+	}
+}
+
+// withoutYAMLComments drops every "#" comment, whole-line or trailing, so
+// hasLine and blockUnder can compare values.yaml keys exactly. It assumes no
+// value contains " #", which holds for the scalars these tests read.
+func withoutYAMLComments(document string) string {
+	lines := strings.Split(document, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			lines[i] = ""
+			continue
+		}
+		if before, _, found := strings.Cut(line, " #"); found {
+			lines[i] = strings.TrimRight(before, " ")
+		}
+	}
+	return strings.Join(lines, "\n")
+}

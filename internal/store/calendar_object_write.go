@@ -69,16 +69,16 @@ func (p CalendarObjectPrecondition) satisfiedBy(existing *Event) bool {
 // uniqueness and the conditional-header requirements travel with it so they are
 // re-evaluated where the write happens rather than in a separate earlier read.
 type CalendarObjectWrite struct {
-	CalendarID           int64
-	UID                  string
-	ResourceName         string
-	RawICAL              string
-	ETag                 string
-	Metadata             *EventWriteMetadata
-	Precondition         CalendarObjectPrecondition
-	ExpectedState        *CalendarObjectResourceState
-	ExpectedCalendarCTag *int64
-	LockPreconditions    []LockPrecondition
+	CalendarID        int64
+	UID               string
+	ResourceName      string
+	RawICAL           string
+	ETag              string
+	Metadata          *EventWriteMetadata
+	Precondition      CalendarObjectPrecondition
+	ExpectedState     *CalendarObjectResourceState
+	ExpectedACL       *ACLGuard
+	LockPreconditions []LockPrecondition
 }
 
 // CalendarObjectWriteResult reports what a write did. Conflict names the
@@ -121,6 +121,9 @@ func (s *Store) PutCalendarObject(ctx context.Context, write CalendarObjectWrite
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, write.LockPreconditions); err != nil {
 			return nil, err
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, write.ExpectedACL); err != nil {
+			return nil, err
+		}
 		if s.CalendarObjects != nil {
 			return s.CalendarObjects.PutCalendarObject(ctx, write)
 		}
@@ -132,11 +135,13 @@ func (s *Store) PutCalendarObject(ctx context.Context, write CalendarObjectWrite
 		return nil, err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, write.LockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, write.LockPreconditions, calendarCollectionLockPath(write.CalendarID)); err != nil {
 		return nil, err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-		collectionCTagExpectation{id: write.CalendarID, ctag: write.ExpectedCalendarCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, write.ExpectedACL); err != nil {
+		return nil, err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "calendars", write.CalendarID); err != nil {
 		return nil, err
 	}
 
@@ -198,6 +203,9 @@ RETURNING ` + calendarObjectColumns
 		created, err := scanEvent(row.Scan)
 		if errors.Is(err, sql.ErrNoRows) {
 			return calendarObjectConflictAfterWrite(ctx, tx, write)
+		}
+		if isMissingCollection(err, "events_calendar_id_fkey") {
+			return nil, ErrResourceStateChanged
 		}
 		if err != nil {
 			return nil, err

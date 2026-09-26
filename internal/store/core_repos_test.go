@@ -1,12 +1,14 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +17,39 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/lib/pq"
 )
+
+// expectDAVPathLocks asserts the single batched advisory-lock statement a DAV
+// transaction issues. want is the complete lock set spelled out by the test:
+// every path the statement must lock, mapped to whether it must be exclusive.
+// The statement has to take them in ascending lock-key order.
+func expectDAVPathLocks(mock sqlmock.Sqlmock, want map[string]bool) {
+	type lock struct {
+		key       int64
+		exclusive bool
+	}
+	locks := make([]lock, 0, len(want))
+	for lockPath, exclusive := range want {
+		locks = append(locks, lock{key: davPathLockKey(lockPath), exclusive: exclusive})
+	}
+	slices.SortFunc(locks, func(a, b lock) int { return cmp.Compare(a.key, b.key) })
+	keys := make([]int64, len(locks))
+	modes := make([]bool, len(locks))
+	for i, l := range locks {
+		keys[i] = l.key
+		modes[i] = l.exclusive
+	}
+	mock.ExpectExec(regexp.QuoteMeta(davPathLockQuery)).
+		WithArgs(pq.Array(keys), pq.Array(modes)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectCollectionRowLock asserts the row lock a member write takes on its
+// collection before writing any member.
+func expectCollectionRowLock(mock sqlmock.Sqlmock, table string, id int64) {
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT 1 FROM ` + table + ` WHERE id=$1 FOR NO KEY UPDATE`)).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"present"}).AddRow(1))
+}
 
 func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -359,6 +394,13 @@ func TestEventRepoUpsertParsesFieldsAndPagination(t *testing.T) {
 	dtend := time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC)
 
 	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test-uid\r\nSUMMARY:Planning Day\r\nDTSTART;VALUE=DATE:20260412\r\nDTEND;VALUE=DATE:20260413\r\nEND:VEVENT\r\nEND:VCALENDAR"
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 7)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
@@ -380,6 +422,7 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, descript
 		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(1), int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, now))
+	mock.ExpectCommit()
 
 	created, err := repo.Upsert(context.Background(), Event{
 		CalendarID: 7,
@@ -444,6 +487,12 @@ func TestEventRepoMoveToCalendarRenameWithinSameCalendarCreatesTombstone(t *test
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -477,6 +526,12 @@ func TestEventRepoMoveToCalendarOverwriteWithinSameCalendarDeletesDestination(t 
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -510,6 +565,14 @@ func TestEventRepoMoveToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *te
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+		"/dav/calendars/9": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
+	expectCollectionRowLock(mock, "calendars", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("source-name"))
@@ -539,6 +602,14 @@ func TestEventRepoCopyToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *te
 	now := time.Now().UTC()
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+		"/dav/calendars/9": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
+	expectCollectionRowLock(mock, "calendars", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
@@ -756,6 +827,13 @@ func TestContactRepoUpsertAndMoveToAddressBook(t *testing.T) {
 	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nEMAIL:jane@example.com\r\nBDAY:1990-05-15\r\nEND:VCARD"
 
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -772,6 +850,7 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 		WithArgs(int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
 			AddRow(int64(1), int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday, now))
+	mock.ExpectCommit()
 
 	created, err := repo.Upsert(context.Background(), Contact{
 		AddressBookID: 5,
@@ -787,6 +866,14 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("contact-1"))
@@ -815,6 +902,14 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "missing").
 		WillReturnError(sql.ErrNoRows)
@@ -846,6 +941,12 @@ func TestContactRepoMoveToAddressBookRenameWithinSameBookCreatesTombstone(t *tes
 	repo := &contactRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
@@ -879,6 +980,12 @@ func TestContactRepoMoveToAddressBookOverwriteWithinSameBookDeletesDestination(t
 	repo := &contactRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -912,6 +1019,13 @@ func TestEventRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
 	repo := &eventRepo{pool: db}
 	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-1\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR"
 
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 7)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
@@ -931,6 +1045,7 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `)).
 		WillReturnError(&pq.Error{Code: "23505", Constraint: "events_calendar_resource_name_unique"})
+	mock.ExpectRollback()
 
 	_, err = repo.Upsert(context.Background(), Event{
 		CalendarID:   7,
@@ -958,6 +1073,13 @@ func TestContactRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
 	repo := &contactRepo{pool: db}
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
 
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -973,6 +1095,7 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 `)).
 		WithArgs(int64(5), "contact-1", "renamed", rawVCard, "etag-1", "Jane Doe", nil, nil).
 		WillReturnError(&pq.Error{Code: "23505", Constraint: "idx_contacts_resource_name"})
+	mock.ExpectRollback()
 
 	_, err = repo.Upsert(context.Background(), Contact{
 		AddressBookID: 5,
@@ -1002,6 +1125,14 @@ func TestContactRepoCopyToAddressBookRenameExistingUIDCreatesDestinationTombston
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
@@ -1105,11 +1236,13 @@ func TestStoreCreateCalendarAndStateRechecksLocksInsideTransaction(t *testing.T)
 	}}
 
 	mock.ExpectBegin()
-	for _, resourcePath := range sortedLockSerializationPaths(pendingPath) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(resourcePath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                           false,
+		"/dav/calendars":                 false,
+		"/dav/calendars/.pending":        false,
+		"/dav/calendars/.pending/4":      true,
+		"/dav/calendars/.pending/4/work": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`)).
 		WithArgs(pq.Array(lookupPaths)).
 		WillReturnRows(sqlmock.NewRows([]string{"token", "resource_path", "depth", "expires_at"}).
@@ -1238,7 +1371,13 @@ func TestStoreDeleteEventAndStateRunsInSingleTransaction(t *testing.T) {
 	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
 	expectDAVObjectIdentityLocks(mock, "calendar-object", 7, "renamed", "event-1")
+	expectCollectionRowLock(mock, "calendars", 7)
 	mock.ExpectQuery(`SELECT .* FROM events WHERE calendar_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(7), "renamed").
 		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(7), "event-1", "renamed", "raw", "etag", nil, nil, nil, nil, nil, false, now))
@@ -1275,11 +1414,12 @@ func TestStoreDeleteEventAndStateRechecksLocksInsideTransaction(t *testing.T) {
 	preconditions := []LockPrecondition{{ResourcePath: resourcePath, LookupPaths: lookupPaths}}
 
 	mock.ExpectBegin()
-	for _, lockPath := range sortedLockSerializationPaths(resourcePath) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(lockPath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                   false,
+		"/dav/calendars":         false,
+		"/dav/calendars/7":       true,
+		"/dav/calendars/7/event": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`)).
 		WithArgs(pq.Array(lookupPaths)).
 		WillReturnRows(sqlmock.NewRows([]string{"token", "resource_path", "depth", "expires_at"}).
@@ -1307,7 +1447,13 @@ func TestStoreDeleteContactAndStateRunsInSingleTransaction(t *testing.T) {
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	expectDAVObjectIdentityLocks(mock, "contact-object", 5, "contact.v1", "contact-1")
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "contact.v1").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "contact-1", "contact.v1", "raw", "etag", nil, nil, nil, now))
@@ -1340,7 +1486,13 @@ func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) 
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	expectDAVObjectIdentityLocks(mock, "contact-object", 5, "contact-1", "contact-1")
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "contact-1", "contact-1", "raw", "etag", nil, nil, nil, now))
@@ -1387,7 +1539,13 @@ func TestStoreDeleteContactAndStateDeletesACLState(t *testing.T) {
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	expectDAVObjectIdentityLocks(mock, "contact-object", 5, "contact-1", "contact-1")
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "contact-1", "contact-1", "raw", "etag", nil, nil, nil, now))
@@ -1433,11 +1591,11 @@ func TestLockRepoCreateSerializesAncestorAndDescendantPaths(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
-	for _, resourcePath := range sortedLockSerializationPaths("/dav/addressbooks/5") {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(resourcePath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
 		WithArgs("/dav/addressbooks/5").
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
@@ -1489,11 +1647,13 @@ func TestLockRepoCreateCanonicalizesPendingCalendarAfterSerialization(t *testing
 	canonicalPath := "/dav/calendars/12"
 
 	mock.ExpectBegin()
-	for _, resourcePath := range sortedLockSerializationPaths(pendingPath) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(resourcePath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                           false,
+		"/dav/calendars":                 false,
+		"/dav/calendars/.pending":        false,
+		"/dav/calendars/.pending/4":      true,
+		"/dav/calendars/.pending/4/work": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM calendars WHERE user_id=$1 AND LOWER(slug)=LOWER($2)`)).
 		WithArgs(int64(4), "work").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(12)))
@@ -1681,6 +1841,14 @@ LIMIT $2
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "uid-rollback").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
@@ -1787,11 +1955,11 @@ func TestACLRepoSetACLPreservesCreatedAtForUnchangedEntries(t *testing.T) {
 	statePaths := davStatePaths(resourcePath)
 
 	mock.ExpectBegin()
-	for _, lockPath := range sortedLockSerializationPaths(statePaths...) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(lockPath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/1": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`)).
 		WithArgs(pq.Array(statePaths)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "ace_order", "created_at"}).
@@ -1838,11 +2006,13 @@ func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
 	statePaths := davStatePaths(resourcePath)
 
 	mock.ExpectBegin()
-	for _, lockPath := range sortedLockSerializationPaths(statePaths...) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(lockPath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                         false,
+		"/dav/calendars":               false,
+		"/dav/calendars/1":             true,
+		"/dav/calendars/1/event-1":     true,
+		"/dav/calendars/1/event-1.ics": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`)).
 		WithArgs(pq.Array(statePaths)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "ace_order", "created_at"}))
@@ -1855,8 +2025,8 @@ func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
-		WithArgs(int64(1), "event-1", "event-1.ics").
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name = ANY($2)`)).
+		WithArgs(int64(1), pq.Array([]string{"event-1", "event-1.ics"})).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -1883,11 +2053,11 @@ func TestLockRepoCreateRejectsDepthInfinityWhenDescendantLocked(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
-	for _, resourcePath := range sortedLockSerializationPaths("/dav/addressbooks/5") {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(resourcePath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
 		WithArgs("/dav/addressbooks/5").
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
@@ -1959,6 +2129,19 @@ func TestStoreMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
 	st := New(db)
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                       false,
+		"/dav/calendars":             false,
+		"/dav/calendars/2":           true,
+		"/dav/calendars/3":           true,
+		"/dav/calendars/2/event":     true,
+		"/dav/calendars/2/event.ics": true,
+		"/dav/calendars/3/moved":     true,
+		"/dav/calendars/3/moved.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:moved", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(2), "event").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("event"))
@@ -2011,6 +2194,19 @@ func TestStoreMoveEventAndStateRollsBackWhenStateRebindFails(t *testing.T) {
 	st := New(db)
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                       false,
+		"/dav/calendars":             false,
+		"/dav/calendars/2":           true,
+		"/dav/calendars/3":           true,
+		"/dav/calendars/2/event":     true,
+		"/dav/calendars/2/event.ics": true,
+		"/dav/calendars/3/moved":     true,
+		"/dav/calendars/3/moved.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:moved", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(2), "event").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("event"))
@@ -2075,6 +2271,19 @@ func TestStoreUpdateAndMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                        false,
+		"/dav/calendars":              false,
+		"/dav/calendars/2":            true,
+		"/dav/calendars/3":            true,
+		"/dav/calendars/2/custom":     true,
+		"/dav/calendars/2/custom.ics": true,
+		"/dav/calendars/3/custom":     true,
+		"/dav/calendars/3/custom.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:name:custom.ics", "calendar-object:2:uid:event", "calendar-object:3:name:custom.ics", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET
 calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
 summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
@@ -2132,6 +2341,19 @@ func TestStoreUpdateAndMoveEventAndStateRollsBackOnDAVStateFailure(t *testing.T)
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                       false,
+		"/dav/calendars":             false,
+		"/dav/calendars/2":           true,
+		"/dav/calendars/3":           true,
+		"/dav/calendars/2/event":     true,
+		"/dav/calendars/2/event.ics": true,
+		"/dav/calendars/3/event":     true,
+		"/dav/calendars/3/event.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:name:event", "calendar-object:2:uid:event", "calendar-object:3:name:event", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectExec(`UPDATE events SET`).
 		WithArgs(int64(3), "event", event.RawICAL, "new-etag", nil, nil, nil, nil, nil, false, nil, nil, int64(2), "event").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -2171,9 +2393,17 @@ func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/6": true,
+	})
 	for _, key := range []string{"contact-object:5:name:alice", "contact-object:5:uid:alice", "contact-object:6:name:moved", "contact-object:6:uid:alice"} {
 		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 6)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "alice").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "alice", "alice", "", "", nil, nil, nil, now))
@@ -2222,9 +2452,17 @@ func TestStoreMoveContactAndStateRejectsLateDestinationUIDConflict(t *testing.T)
 	now := time.Now().UTC()
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/6": true,
+	})
 	for _, key := range []string{"contact-object:5:name:alice", "contact-object:5:uid:alice", "contact-object:6:name:moved", "contact-object:6:uid:alice"} {
 		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 6)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "alice").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "alice", "alice", "", "", nil, nil, nil, now))
@@ -2244,6 +2482,9 @@ func TestStoreMoveContactAndStateRejectsLateDestinationUIDConflict(t *testing.T)
 	}
 }
 
+// expectCollectionRowLocks matches the ascending-id collection row locks a
+// member transfer takes so its ctag updates cannot deadlock against a transfer
+// running the other way.
 func expectDAVStateMove(mock sqlmock.Sqlmock, fromPath, toPath string) {
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
 		WithArgs(toPath).
@@ -2260,6 +2501,15 @@ func expectDAVStateMove(mock sqlmock.Sqlmock, fromPath, toPath string) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE dav_dead_properties SET resource_path=$1, updated_at=NOW() WHERE resource_path=$2`)).
 		WithArgs(toPath, fromPath).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectIdentityLocks asserts one advisory lock per identity key, in the
+// order given.
+func expectIdentityLocks(mock sqlmock.Sqlmock, keys ...string) {
+	for _, key := range keys {
+		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+			WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
 }
 
 func expectDAVObjectIdentityLocks(mock sqlmock.Sqlmock, kind string, collectionID int64, resourceName, uid string) {
@@ -2285,6 +2535,19 @@ func TestStoreCopyEventAndStateCopiesDeadPropertiesAndClearsDestinationState(t *
 	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                        false,
+		"/dav/calendars":              false,
+		"/dav/calendars/2":            true,
+		"/dav/calendars/2/event":      true,
+		"/dav/calendars/2/event.ics":  true,
+		"/dav/calendars/3":            true,
+		"/dav/calendars/3/copied":     true,
+		"/dav/calendars/3/copied.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:copied", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(2), "event").
 		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(2), "event", "event", raw, "old-etag", nil, nil, nil, nil, nil, false, now))
@@ -2334,6 +2597,19 @@ func TestStoreCopyEventAndStateRollsBackWhenDestinationStateClearFails(t *testin
 	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                        false,
+		"/dav/calendars":              false,
+		"/dav/calendars/2":            true,
+		"/dav/calendars/2/event":      true,
+		"/dav/calendars/2/event.ics":  true,
+		"/dav/calendars/3":            true,
+		"/dav/calendars/3/copied":     true,
+		"/dav/calendars/3/copied.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:copied", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(2), "event").
 		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(2), "event", "event", raw, "old-etag", nil, nil, nil, nil, nil, false, now))
@@ -2571,9 +2847,21 @@ func TestDeleteMissingDAVResourceState(t *testing.T) {
 			st := New(db)
 			mock.ExpectBegin()
 			table, collection := "events", "calendar_id"
+			collectionTable, lockSet := "calendars", map[string]bool{
+				"/dav":             false,
+				"/dav/calendars":   false,
+				"/dav/calendars/7": true,
+			}
 			if kind == "contact" {
 				table, collection = "contacts", "address_book_id"
+				collectionTable, lockSet = "address_books", map[string]bool{
+					"/dav":                false,
+					"/dav/addressbooks":   false,
+					"/dav/addressbooks/7": true,
+				}
 			}
+			expectDAVPathLocks(mock, lockSet)
+			expectCollectionRowLock(mock, collectionTable, 7)
 			mock.ExpectQuery("SELECT .* FROM "+table+" WHERE "+collection+`=\$1 AND resource_name=\$2 FOR UPDATE`).WithArgs(int64(7), "").WillReturnRows(sqlmock.NewRows([]string{"id"}))
 			mock.ExpectRollback()
 			defer func() {

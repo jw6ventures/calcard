@@ -10,16 +10,15 @@ import (
 // and state preconditions the store verifies under lock so the write cannot be
 // applied to a resource other than the one the handler authorized.
 type ContactObjectWrite struct {
-	AddressBookID           int64
-	UID                     string
-	ResourceName            string
-	RawVCard                string
-	ETag                    string
-	Precondition            CalendarObjectPrecondition
-	ExpectedState           DAVResourceState
-	ExpectedAddressBookCTag *int64
-	StatePath               string
-	LockPreconditions       []LockPrecondition
+	AddressBookID     int64
+	UID               string
+	ResourceName      string
+	RawVCard          string
+	ETag              string
+	Precondition      CalendarObjectPrecondition
+	ExpectedState     DAVResourceState
+	StatePath         string
+	LockPreconditions []LockPrecondition
 }
 
 // ContactObjectWriteResult reports the stored contact and whether the write
@@ -48,6 +47,9 @@ func (s *Store) PutContactObject(ctx context.Context, write ContactObjectWrite) 
 		write.ResourceName = write.UID
 	}
 	if s.pool == nil {
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, write.ExpectedState.ACL); err != nil {
+			return nil, err
+		}
 		if s.ContactObjects != nil {
 			return s.ContactObjects.PutContactObject(ctx, write)
 		}
@@ -59,15 +61,17 @@ func (s *Store) PutContactObject(ctx context.Context, write ContactObjectWrite) 
 		return nil, err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, write.LockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, write.LockPreconditions, addressBookCollectionLockPath(write.AddressBookID)); err != nil {
 		return nil, err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-		collectionCTagExpectation{id: write.AddressBookID, ctag: write.ExpectedAddressBookCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, write.ExpectedState.ACL); err != nil {
 		return nil, err
 	}
 	if err := acquireDAVObjectIdentityLocks(ctx, tx, "contact-object", write.AddressBookID,
 		DAVResourceState{UID: write.UID, ResourceName: write.ResourceName}); err != nil {
+		return nil, err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "address_books", write.AddressBookID); err != nil {
 		return nil, err
 	}
 
@@ -117,6 +121,9 @@ RETURNING ` + contactDAVColumns
 			write.RawVCard, write.ETag, displayName, primaryEmail, birthday).Scan)
 		if errors.Is(err, sql.ErrNoRows) {
 			return contactObjectConflictAfterWrite(ctx, tx, write)
+		}
+		if isMissingCollection(err, "contacts_address_book_id_fkey") {
+			return nil, ErrResourceStateChanged
 		}
 		if err != nil {
 			return nil, err

@@ -139,6 +139,64 @@ func TestCalendarObjectCopyMoveRetryOneConcurrentStateChangeFromFreshSnapshot(t 
 	}
 }
 
+// RFC 7232 §3.1 and §3.2 bind If-Match and If-None-Match to the Request-URI,
+// which for COPY and MOVE is the source. A client holding a stale ETag must be
+// told 412 rather than have its rebinding applied to content it never saw.
+func TestCalendarObjectCopyMoveEvaluateConditionalHeaders(t *testing.T) {
+	tests := []struct {
+		name              string
+		header            string
+		value             string
+		destinationExists bool
+		want              int
+	}{
+		{name: "stale If-Match", header: "If-Match", value: `"stale-etag"`, want: http.StatusPreconditionFailed},
+		{name: "current If-Match", header: "If-Match", value: `"source-etag"`, want: http.StatusCreated},
+		// If-None-Match: * fails whenever the Request-URI -- the source -- has a
+		// current representation, whether or not the destination is bound.
+		{name: "If-None-Match star on existing source, bound destination", header: "If-None-Match", value: "*", destinationExists: true, want: http.StatusPreconditionFailed},
+		{name: "If-None-Match star on existing source, unbound destination", header: "If-None-Match", value: "*", destinationExists: false, want: http.StatusPreconditionFailed},
+		{name: "If-None-Match naming only the destination ETag", header: "If-None-Match", value: `"destination-etag"`, destinationExists: true, want: http.StatusNoContent},
+	}
+	for _, method := range []string{"COPY", "MOVE"} {
+		for _, test := range tests {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				calendars := &fakeCalendarRepo{accessible: []store.CalendarAccess{
+					{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}, Editor: true},
+					{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Destination"}, Editor: true},
+				}}
+				events := &fakeEventRepo{events: map[string]*store.Event{
+					"1:source": {ID: 10, CalendarID: 1, UID: "source", ResourceName: "source", RawICAL: buildCalendarObject(buildVEvent("source")), ETag: "source-etag"},
+				}}
+				if test.destinationExists {
+					events.events["2:occupant"] = &store.Event{ID: 20, CalendarID: 2, UID: "occupant", ResourceName: "destination",
+						RawICAL: buildCalendarObject(buildVEvent("occupant")), ETag: "destination-etag"}
+				}
+				h := NewDavServer(Options{Store: &store.Store{Calendars: calendars, Events: events, CalendarTransfers: events}})
+				req := httptest.NewRequest(method, "/dav/calendars/1/source.ics", nil)
+				req.Header.Set("Destination", "/dav/calendars/2/destination.ics")
+				req.Header.Set(test.header, test.value)
+				rr := httptest.NewRecorder()
+
+				h.ServeHTTP(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
+
+				if rr.Code != test.want {
+					t.Fatalf("%s with %s: %s = %d, want %d: %s", method, test.header, test.value, rr.Code, test.want, rr.Body.String())
+				}
+				if test.want != http.StatusPreconditionFailed {
+					return
+				}
+				if events.events[events.key(1, "source")] == nil {
+					t.Error("source was unbound despite a failed precondition")
+				}
+				if events.events[events.key(2, "source")] != nil {
+					t.Error("destination was written despite a failed precondition")
+				}
+			})
+		}
+	}
+}
+
 func TestCalendarCollectionCopyMoveAdvertisedAndValidateHeaders(t *testing.T) {
 	calendars := &fakeCalendarRepo{accessible: []store.CalendarAccess{
 		{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}, Editor: true},

@@ -24,7 +24,7 @@ type contactBookBarrier struct {
 
 func (b *contactBookBarrier) GetByID(ctx context.Context, id int64) (*store.AddressBook, error) {
 	book, err := b.AddressBookRepository.GetByID(ctx, id)
-	if id == b.bookID && b.reads.Add(1) <= 2 {
+	if id == b.bookID && b.reads.Add(1) <= independentDAVWriters {
 		b.ready.Done()
 		<-b.release
 	}
@@ -47,8 +47,8 @@ func TestPostgresIndependentContactWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 			h := NewDavServer(Options{Store: db})
-			bodies := make([]string, 2)
-			etags := make([]string, 2)
+			bodies := make([]string, independentDAVWriters)
+			etags := make([]string, independentDAVWriters)
 			for i := range bodies {
 				bodies[i] = fmt.Sprintf("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c%d\r\nFN:Contact %d\r\nN:Contact;%d;;;\r\nEND:VCARD\r\n", i, i, i)
 				if method != "create" {
@@ -66,10 +66,10 @@ func TestPostgresIndependentContactWrites(t *testing.T) {
 			if method == "COPY" || method == "MOVE" {
 				barrier.bookID = dest.ID
 			}
-			barrier.ready.Add(2)
+			barrier.ready.Add(independentDAVWriters)
 			db.AddressBooks = barrier
-			results := make(chan *httptest.ResponseRecorder, 2)
-			for i := 0; i < 2; i++ {
+			results := make(chan *httptest.ResponseRecorder, independentDAVWriters)
+			for i := 0; i < independentDAVWriters; i++ {
 				go func(i int) {
 					verb := method
 					if method == "create" || method == "update" {
@@ -94,7 +94,7 @@ func TestPostgresIndependentContactWrites(t *testing.T) {
 			if method == "update" || method == "DELETE" {
 				want = http.StatusNoContent
 			}
-			for i := 0; i < 2; i++ {
+			for i := 0; i < independentDAVWriters; i++ {
 				rr := <-results
 				if rr.Code != want {
 					t.Errorf("independent %s = %d, want %d: %s", method, rr.Code, want, rr.Body.String())

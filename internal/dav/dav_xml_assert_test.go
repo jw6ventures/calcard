@@ -87,6 +87,9 @@ type davElement struct {
 // defect it is. RawToken does not check that an end tag matches its start tag
 // either, so this does.
 func parseElement(d *xml.Decoder, start xml.StartElement, inherited namespaceScope) (davElement, error) {
+	if err := checkAttributesAreUnique(start); err != nil {
+		return davElement{}, err
+	}
 	scope, err := inherited.extend(start.Attr)
 	if err != nil {
 		return davElement{}, err
@@ -97,6 +100,7 @@ func parseElement(d *xml.Decoder, start xml.StartElement, inherited namespaceSco
 	}
 
 	el := davElement{Name: name}
+	seenAttr := make(map[xml.Name]struct{}, len(start.Attr))
 	for _, a := range start.Attr {
 		// A namespace declaration is markup rather than an attribute of the
 		// element, and the scope now carries what it said.
@@ -107,6 +111,11 @@ func parseElement(d *xml.Decoder, start xml.StartElement, inherited namespaceSco
 		if err != nil {
 			return davElement{}, err
 		}
+		if _, repeated := seenAttr[resolved]; repeated {
+			return davElement{}, fmt.Errorf("<%s> carries the attribute %s twice under different prefixes (XML Namespaces §6.3)",
+				rawQName(start.Name), qnString(resolved))
+		}
+		seenAttr[resolved] = struct{}{}
 		el.Attr = append(el.Attr, xml.Attr{Name: resolved, Value: a.Value})
 	}
 
@@ -297,6 +306,16 @@ func (s namespaceScope) extend(attrs []xml.Attr) (namespaceScope, error) {
 		case prefix == "xml" && a.Value != xmlNamespaceURI:
 			return s, fmt.Errorf(`the "xml" prefix is bound to %s and cannot be rebound to %q (XML Namespaces §3)`,
 				xmlNamespaceURI, a.Value)
+		// XML Namespaces §3 reserves that namespace for the "xml" prefix alone:
+		// no other prefix may be bound to it and it may not be declared as the
+		// default namespace. Resolved names alone cannot tell xml:lang from
+		// another prefix bound to the same namespace, so without this a response
+		// spelling a property's language attribute the second way would satisfy
+		// every xml:lang assertion in the suite while a conformant parser
+		// rejected the declaration.
+		case prefix != "xml" && a.Value == xmlNamespaceURI:
+			return s, fmt.Errorf("%s binds %s, which is reserved for the \"xml\" prefix (XML Namespaces §3)",
+				declarationSpelling(prefix), xmlNamespaceURI)
 		case prefix != "" && a.Value == "":
 			return s, fmt.Errorf("xmlns:%s is empty; only the default namespace may be undeclared (XML Namespaces §2)", prefix)
 		case prefix == "":
@@ -309,6 +328,37 @@ func (s namespaceScope) extend(attrs []xml.Attr) (namespaceScope, error) {
 		extended.prefixes[prefix] = a.Value
 	}
 	return extended, nil
+}
+
+// declarationSpelling renders a namespace declaration as it was written, for
+// reporting the one that is at fault.
+func declarationSpelling(prefix string) string {
+	if prefix == "" {
+		return "xmlns"
+	}
+	return "xmlns:" + prefix
+}
+
+// checkAttributesAreUnique enforces the Unique Att Spec well-formedness
+// constraint (XML §3.1): no start tag may carry the same attribute name twice.
+// encoding/xml enforces nothing of the kind — RawToken hands back both copies
+// and Token silently keeps both — so a response that re-emitted a stored
+// namespaced property with its xmlns declaration written twice would decode
+// here as though it were conforming, while every libxml2- or expat-based DAV
+// client rejects the whole body with "Attribute xmlns redefined". The QName as
+// written is what must be unique, so this compares the spelling rather than the
+// resolved name; parseElement checks the resolved names separately.
+func checkAttributesAreUnique(start xml.StartElement) error {
+	seen := make(map[string]struct{}, len(start.Attr))
+	for _, a := range start.Attr {
+		written := rawQName(a.Name)
+		if _, repeated := seen[written]; repeated {
+			return fmt.Errorf("<%s> carries the attribute %q twice (XML §3.1 Unique Att Spec)",
+				rawQName(start.Name), written)
+		}
+		seen[written] = struct{}{}
+	}
+	return nil
 }
 
 // namespaceDeclaration reports whether a declares a namespace and, if so, which
@@ -1879,6 +1929,27 @@ func TestParseMultistatusRejectsMalformedDocuments(t *testing.T) {
 			body: msOpen + `<d:sync-token>1<d:displayname>hidden</d:displayname></d:sync-token>` + msClose,
 		},
 		{
+			// The shape a dead property re-emitted from storage takes when the
+			// encoder writes a declaration for the resolved namespace and also
+			// copies the xmlns attribute the decoder left behind.
+			name: "property child carrying xmlns twice",
+			body: msOpen + `<d:response>` + href +
+				`<d:propstat><d:prop><meta xmlns="urn:example:custom"><child xmlns="urn:example:custom" xmlns="urn:example:custom">v</child></meta></d:prop>` +
+				`<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>` + msClose,
+		},
+		{
+			name: "element carrying an ordinary attribute twice",
+			body: msOpen + `<d:response>` + href +
+				`<d:propstat><d:prop><cal:supported-calendar-component-set><cal:comp name="VEVENT" name="VTODO"/></cal:supported-calendar-component-set></d:prop>` +
+				`<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>` + msClose,
+		},
+		{
+			name: "element carrying one attribute under two prefixes for one namespace",
+			body: msOpen + `<d:response>` + href +
+				`<d:propstat><d:prop><meta xmlns="urn:example:custom" xmlns:a="urn:example:z" xmlns:b="urn:example:z" a:k="1" b:k="2"/></d:prop>` +
+				`<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>` + msClose,
+		},
+		{
 			name: "wrong root element",
 			body: `<d:propfind xmlns:d="DAV:"/>`,
 		},
@@ -2093,6 +2164,22 @@ func TestNamespaceBindingsAreScopedByPrefix(t *testing.T) {
 				response("/dav/calendars/1/", `<d:displayname>Work</d:displayname>`) +
 				`</d:multistatus>`,
 		},
+		{
+			// The resolved attribute name is the one xml:lang resolves to, so
+			// only the declaration itself distinguishes this from a conforming
+			// language attribute.
+			name: "binding another prefix to the reserved xml namespace",
+			body: `<d:multistatus xmlns:d="DAV:">` +
+				response("/dav/calendars/1/",
+					`<x:dead xmlns:x="`+tagNS+`" xmlns:ns1="`+xmlNamespaceURI+`" ns1:lang="en">a</x:dead>`) +
+				`</d:multistatus>`,
+		},
+		{
+			name: "declaring the reserved xml namespace as the default one",
+			body: `<d:multistatus xmlns:d="DAV:">` +
+				response("/dav/calendars/1/", `<x:dead xmlns:x="`+tagNS+`" xmlns="`+xmlNamespaceURI+`"><lang/></x:dead>`) +
+				`</d:multistatus>`,
+		},
 	}
 	for _, tt := range rejected {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2159,6 +2246,67 @@ func TestAttributeNamespacesFollowXMLNames(t *testing.T) {
 		return
 	}
 	t.Error("xml:lang is absent from the decoded attributes")
+}
+
+// TestDecoderBindsTheXMLPrefixItself pins the encoding/xml behavior the
+// PROPPATCH decoders and the dead-property fragment writer in xml_models.go both
+// read xml:lang through. Decoder.Token binds the "xml" prefix by specification
+// rather than from the document, so an attribute written xml:lang arrives with
+// the reserved namespace name resolved into Name.Space and never with the bare
+// prefix, and one comparison against that namespace is the whole test for it.
+//
+// Reading tokens with RawToken, as the assertion helpers above do, is what hands
+// back the prefix instead; a decode path built that way and compared against the
+// resolved namespace alone would treat every xml:lang as absent, dropping the
+// language of a property value on write and misplacing it on read.
+func TestDecoderBindsTheXMLPrefixItself(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+	}{
+		{"undeclared, as XML Namespaces §3 allows", `<meta xml:lang="en"/>`},
+		{"declared to the namespace it is reserved for", `<meta xmlns:xml="` + xmlNamespaceURI + `" xml:lang="en"/>`},
+		{"declared to another namespace, which §3 forbids", `<meta xmlns:xml="urn:not-the-xml-namespace" xml:lang="en"/>`},
+		{"on an element name rather than an attribute", `<xml:meta xml:lang="en"/>`},
+		{
+			// A stored dead property is re-parsed as a standalone fragment, so
+			// nothing the PROPPATCH request declared is in scope by then.
+			name: "in a fragment re-parsed on its own, as a stored dead property is",
+			doc:  `<stored-fragment><X:child xmlns:X="` + nsCalDAV + `" xml:lang="en">v</X:child></stored-fragment>`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var carrier xml.StartElement
+			decoder := xml.NewDecoder(strings.NewReader(tt.doc))
+			for carrier.Name.Local == "" {
+				token, err := decoder.Token()
+				if err != nil {
+					t.Fatalf("no element in %s carries a lang attribute: %v", tt.doc, err)
+				}
+				start, isStart := token.(xml.StartElement)
+				if !isStart {
+					continue
+				}
+				for _, a := range start.Attr {
+					if a.Name.Local == "lang" {
+						carrier = start
+					}
+				}
+			}
+			for _, a := range carrier.Attr {
+				if a.Name.Local != "lang" {
+					continue
+				}
+				if a.Name.Space != xmlNamespaceURI {
+					t.Errorf("xml:lang arrived in namespace %q, want %q", a.Name.Space, xmlNamespaceURI)
+				}
+			}
+			if got := inScopeLang(carrier, ""); got != "en" {
+				t.Errorf("inScopeLang = %q, want %q", got, "en")
+			}
+		})
+	}
 }
 
 // TestAttrRequiresUnqualifiedName pins that a namespaced attribute does not

@@ -91,118 +91,70 @@ CREATE TABLE IF NOT EXISTS digest_nonce_counts (
 CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
     ON digest_nonce_counts (expires_at);
 
--- v1.1.12: convert the two time-range expression indexes to the expressions
--- ListForCalendarFiltered now uses, replacing the v1.1.7 pair
---
---     COALESCE(recurrence_until, dtend, dtstart) >= range_start
---     COALESCE(recurrence_start, dtstart)        <= range_end
---
--- An infinity sentinel replaces the NULL each COALESCE could yield, and dtstart
--- leaves the upper-bound expression. Both changes keep a row the columns cannot
--- bound in the candidate set instead of dropping it before the RFC 4791 §9.9
--- test can judge it; the reasoning is on the predicates in
--- internal/store/postgres.go.
---
--- The indexes have to be recreated because an expression index only applies
--- when it matches the predicate verbatim.
 
+-- Operator note. Run this with the application stopped or during a maintenance
+-- window. The migration runner executes this whole file in one transaction, and
+-- every lock below is held until it commits. Every ALTER TABLE takes ACCESS
+-- EXCLUSIVE on its table, as does every DROP INDEX or DROP TRIGGER that finds
+-- its object; an IF EXISTS drop that finds nothing takes no lock. CREATE INDEX
+-- takes SHARE and CREATE TRIGGER SHARE ROW EXCLUSIVE, which block writes but not
+-- reads. In practice calendars, acl_entries and app_passwords are closed from
+-- their ALTER TABLE; events from the drop of idx_events_recurrence_start, which
+-- exists on every upgrade path; contacts from the first of its index or trigger
+-- drops that finds one. address_books and deleted_resources are closed to
+-- writes from their CREATE TRIGGER, and to reads as well when the file runs
+-- again and its DROP TRIGGER finds the trigger. A closed table makes a SELECT
+-- wait rather than fall back to another plan. A run that fails part way rolls
+-- back entirely and can simply be repeated; the statements are individually
+-- idempotent as well.
+--
+-- The duration is therefore what matters operationally. It is mostly the
+-- recurrence repair, plus the index builds and the birthday backfill, and the
+-- server does not open its listener until migrations finish, so on a container
+-- deployment it is startup time and has to fit the probe budget.
+--
+-- Check that budget against the table before upgrading. The repair measured
+-- about 30 seconds per hundred thousand events when two fifths are recurring and
+-- bodies are about 3 KB with a VTIMEZONE, and about 70 seconds with 10 KB
+-- bodies; it grows with both. The Helm chart's default startup budget is ten
+-- minutes
+-- (startupProbe.periodSeconds 10 x failureThreshold 60). A run that overruns it
+-- is killed rather than allowed to finish, and because the file is one
+-- transaction the kill rolls it back: the container then restarts and begins
+-- the same work again, so the deployment does not fail loudly, it never comes
+-- up. Above roughly half a million events, or a quarter of a million with large
+-- bodies, raise startupProbe.failureThreshold first, or apply the file by hand
+-- as below.
+--
+-- On a deployment that cannot take that pause, run the file's statements by hand
+-- outside a transaction, using DROP INDEX CONCURRENTLY and CREATE INDEX
+-- CONCURRENTLY for each index statement and checking pg_index.indisvalid
+-- afterwards -- concurrent builds can fail and leave an invalid index behind,
+-- which then has to be dropped by hand.
+
+-- Every events index that reads recurrence_start or recurrence_until is dropped
+-- ahead of the repair and built after it, so building each once over the
+-- repaired rows replaces maintaining it per repaired row. The repair's updates
+-- still fire trg_events_touch_last_modified, so they rewrite last_modified and
+-- maintain every index that remains.
+--
+-- The two time-range expression indexes are built on the expressions
+-- ListForCalendarFiltered filters on:
+--
+--     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz)   >= range_start
+--     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= range_end
+--
+-- The infinity sentinels keep a row the columns cannot bound in the candidate
+-- set, where the RFC 4791 §9.9 test can judge it; the reasoning is on the
+-- predicates in internal/store/postgres.go. An expression index only applies
+-- when it matches the predicate verbatim, so the v1.1.7 pair, built on other
+-- expressions, is replaced.
+--
+-- idx_events_calendar_keyset exists only on a database that ran a v1.2.0
+-- release candidate, which built it narrower than it is built below.
 DROP INDEX IF EXISTS idx_events_recurrence_start;
 DROP INDEX IF EXISTS idx_events_recurrence_until;
-
-CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
-    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
-
-CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
-    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
-
--- v1.2.0-rc7: index the keyset reads the DAV reports page a collection with.
---
--- Every report that scans a collection reads it as
---
---     WHERE <collection>=$1 AND id>$2 [AND <timestamp> > $3] ORDER BY id LIMIT $4
---
--- and no index ordered a single collection by id. The planner answered that
--- with the primary key, walking the whole table from afterID and discarding
--- every row belonging to another collection: for a collection whose rows sit in
--- one contiguous id range -- a bulk import, or any collection created after the
--- table had grown -- one 256-row page of a 220,000-row table discarded 200,000
--- rows and cost 21 ms. With these indexes the same page is an index scan of
--- about 0.09 ms.
-CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset
-    ON events (calendar_id, id);
-
-CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset
-    ON contacts (address_book_id, id);
-
-CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset
-    ON deleted_resources (resource_type, collection_id, id);
-
--- Both are leading-column prefixes of the keyset indexes above, so they no
--- longer serve a lookup the new indexes cannot.
-DROP INDEX IF EXISTS idx_events_calendar_id;
-DROP INDEX IF EXISTS idx_contacts_address_book_id;
-
--- v1.2.0-rc8: make the keyset indexes the plan the DAV paged reads actually get,
--- and let them filter on the index rather than on the heap.
---
--- v1.2.0-rc7 added (collection, id) indexes for the reads that page a
--- collection. They are the right indexes; they were not reliably chosen. With
--- the cursor spelled "collection=$1 AND id>$2 ORDER BY id" the primary key
--- answers the ORDER BY too, and the planner costs a pkey scan by assuming the
--- collection's rows are spread evenly through the id range. For a collection
--- holding a large fraction of the table -- a bulk import, or any collection
--- created after the table had grown -- that assumption is wrong in the
--- expensive direction. Measured on PostgreSQL 16.14 over 320,000 events with a
--- 100,000-row collection at the end of the id range, one 256-row first page was
--- an events_pkey scan discarding 220,300 rows: 36.17 ms filtered by a
--- time-range, 28.37 ms for an incremental sync one day back and 40.58 ms for one
--- ten years back. Extended statistics do not move it, and neither does naming
--- the collection in the ORDER BY: the planner folds an equality-constrained
--- column out of the sort key.
---
--- The reads now spell the cursor as a row comparison,
--- "(collection, id) > ($1, $2)", which the primary key cannot use as an index
--- bound at all. The same pages become 0.12 ms, 0.09 ms and 0.15 ms. The
--- collection equality stays beside it and is not redundant: the row comparison
--- alone also admits every row of every collection whose id is higher.
---
--- The trailing columns are the predicates those reads narrow on. Carried in the
--- index they are evaluated against the index tuple, so a page stops visiting
--- the heap for rows it will discard.
---
--- Two shapes pay for it, both a selective predicate losing the index that suited
--- it exactly: a narrow time-range can no longer reach
--- idx_events_recurrence_until, so 0.029 ms becomes 4.57 ms, and an incremental
--- sync whose token is near the present can no longer reach
--- idx_events_last_modified or idx_contacts_last_modified, so 0.08 ms becomes
--- 3.5-4.6 ms. The worst case over every shape falls from 40.58 ms to 4.57 ms.
--- Both costs are far inside any request budget, and trading them for a tail that
--- much shorter is the right way round for reads whose whole purpose is to be
--- bounded. An unfiltered first page was already reaching these indexes before
--- the change and is unaffected either way.
---
--- deleted_resources is deliberately unchanged: its lookup index leads on
--- deleted_at, which is the more selective bound for every sync that reads it,
--- and both shapes measured under a millisecond either way.
---
--- Operator note. Each rebuild below drops an index the DAV paged reads depend on
--- and builds it again, so run this with the application stopped or during a
--- maintenance window: a plain CREATE INDEX holds a SHARE lock that blocks writes
--- to the table for the build, and between the DROP and the CREATE those reads
--- fall back to the primary-key scans this migration exists to stop. The
--- statements are idempotent, so a run that fails part way can be repeated. On a
--- deployment that cannot take the write pause, replace each pair with
--- DROP INDEX CONCURRENTLY and CREATE INDEX CONCURRENTLY, outside a transaction
--- and checking pg_index.indisvalid afterwards -- concurrent builds can fail and
--- leave an invalid index behind, which then has to be dropped by hand.
 DROP INDEX IF EXISTS idx_events_calendar_keyset;
-CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset ON events (
-    calendar_id, id, last_modified,
-    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
-    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
-
-DROP INDEX IF EXISTS idx_contacts_book_keyset;
-CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified);
 
 -- Repair the recurrence bounds v1.1.7 did not backfill.
 --
@@ -215,38 +167,334 @@ CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id
 -- recurrence matcher can look at the other instances.
 --
 -- The repair lives here rather than in v1.1.7, which has shipped and is left
--- exactly as it ran. This covers every path into this release: a database at
--- v1.1.7 or later never executes that file again, because the runner applies a
--- migration only when its version is above the database's; and one still below
--- it runs that file first, since migrations are applied in ascending version
--- order, so this block repairs what it just missed.
+-- exactly as it ran. A database at v1.1.7 or later never executes that file
+-- again, and one below it runs that file first, since migrations are applied in
+-- ascending version order, so every path into this release reaches this
+-- statement after the columns exist.
 --
--- Scoped to rows that still have a NULL bound, so a precise value written by a
--- later PUT is never replaced by a sentinel, and the whole block can be run
--- again. The sentinels match ical.RecurrenceStartSentinel and
--- ical.RecurrenceUntilSentinel: deliberately open-ended, so a repaired row is a
--- candidate for every range and the in-memory RFC 4791 Section 9.9 pass makes
--- the decision. Unfold content lines before matching component and property names.
+-- Only NULL bounds are filled, so a precise value written by a later PUT is
+-- never replaced and the statement can be run again. The sentinels match
+-- ical.RecurrenceStartSentinel and ical.RecurrenceUntilSentinel: deliberately
+-- open-ended, so a repaired row is a candidate for every range and the in-memory
+-- RFC 4791 Section 9.9 pass makes the decision.
+--
+-- The body is unfolded before anything reads it, because RFC 5545 section 3.1
+-- lets a fold fall anywhere in a content line, including inside a component or
+-- property name. A line break is CRLF, bare LF or bare CR, as ical.UnfoldLines
+-- reads them. It is unfolded once, as a function scan whose column every test
+-- reads: PostgreSQL does not eliminate a repeated subexpression, so naming the
+-- unfold inside each test would unfold the whole body again per test.
+--
+-- The last branch of the CASE decides the row set. The non-greedy component
+-- match pairs each BEGIN with the END that closes it, and its cost grows faster
+-- than the body length, so two cheaper tests run ahead of it and each admits
+-- every row the one after it would. The first is a plain search for the property
+-- names. The second is a greedy, linear match from the first BEGIN of a
+-- component to the last END of one, which covers every character the non-greedy
+-- match could capture; it rejects the common shape the first cannot, a VTIMEZONE
+-- whose DST rules are RRULEs around a non-recurring event. A VTIMEZONE between
+-- two events lies inside that span, which is why the non-greedy match remains.
+-- Both filters test the property name unanchored, so each plainly admits
+-- everything the anchored test after it can accept.
+--
+-- CASE rather than AND'd conditions because it evaluates its branches in order;
+-- the planner costs the two regex subplans identically and would otherwise keep
+-- them only in the order they happen to be written.
+--
+-- The component bodies are matched with ".", which without the n flag matches
+-- every character, newlines included, under any collation. POSIX bracket
+-- classes follow the collation and under C admit ASCII only.
 UPDATE events
     SET recurrence_start = COALESCE(recurrence_start, '1900-01-01T00:00:00Z'),
         recurrence_until = COALESCE(recurrence_until, '9999-12-31T23:59:59Z')
     WHERE (recurrence_start IS NULL OR recurrence_until IS NULL)
-      AND (
-          EXISTS (
-              SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VEVENT([[:space:][:print:]]*?)END:VEVENT$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
-          )
-          OR EXISTS (
-              SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VTODO([[:space:][:print:]]*?)END:VTODO$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
-          )
-          OR EXISTS (
-              SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'\\r?\\n[ \t]', '', 'g'), $re$BEGIN:VJOURNAL([[:space:][:print:]]*?)END:VJOURNAL$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
-          )
+      AND EXISTS (
+          SELECT 1
+          FROM regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') AS unfolded(body)
+          WHERE CASE
+              WHEN unfolded.body !~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$ THEN FALSE
+              WHEN NOT (
+                  EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VEVENT(.*)END:VEVENT$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VTODO(.*)END:VTODO$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VJOURNAL(.*)END:VJOURNAL$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+              ) THEN FALSE
+              ELSE
+                  EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VEVENT(.*?)END:VEVENT$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VTODO(.*?)END:VTODO$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:VJOURNAL(.*?)END:VJOURNAL$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                  )
+          END
       );
+
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
+    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
+    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
+
+-- Keyset indexes for the reads the DAV reports page a collection with:
+--
+--     WHERE <collection>=$1 AND (<collection>, id) > ($1, $2) [AND <filter>]
+--     ORDER BY <collection>, id LIMIT $n
+--
+-- The cursor is a row comparison because the primary key cannot use one as an
+-- index bound. Spelled "id > $2 ORDER BY id", the primary key answers the
+-- ORDER BY too, and the planner prices that scan assuming the collection's rows
+-- are spread evenly through the id range; for a collection holding a large share
+-- of the table -- a bulk import, or any collection created after the table had
+-- grown -- it walks and discards most of the table per page. The collection
+-- equality stays beside the row comparison and is not redundant: the comparison
+-- alone also admits every row of every collection whose id is higher.
+--
+-- The trailing columns are the predicates those reads narrow on, so a page
+-- filters on the index tuple rather than visiting the heap for rows it discards.
+--
+-- deleted_resources keeps the plain id cursor: its lookup index leads on
+-- deleted_at, which is the more selective bound for every sync that reads it.
+CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset ON events (
+    calendar_id, id, last_modified,
+    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
+    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+
+-- A v1.2.0 release candidate built this as (address_book_id, id) only.
+DROP INDEX IF EXISTS idx_contacts_book_keyset;
+CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset
+    ON deleted_resources (resource_type, collection_id, id);
+
+-- Both are leading-column prefixes of the keyset indexes above and serve no
+-- lookup those cannot.
+DROP INDEX IF EXISTS idx_events_calendar_id;
+DROP INDEX IF EXISTS idx_contacts_address_book_id;
+
+-- Commit-ordered sync stamps.
+--
+-- A sync token is its collection's updated_at, and sync-collection reports a
+-- member whose last_modified, or a tombstone whose deleted_at, is later than the
+-- token. That only holds while the stamps order the way the writes commit.
+-- NOW() is the time the transaction started, so a writer that started before
+-- another but committed after it stamped its change behind a token the other's
+-- commit had already let a client take, and the change was never reported.
+--
+-- Every member write locks its collection's row before it writes, so a stamp
+-- read from clock_timestamp() inside the write, and kept above the collection's
+-- current updated_at, is later than every token handed out before the write
+-- can commit. The collection's own updated_at only moves forward, by at least a
+-- microsecond per change, so two changes never share a token.
+CREATE OR REPLACE FUNCTION touch_last_modified()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'events' THEN
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM calendars WHERE id = NEW.calendar_id) + interval '1 microsecond');
+    ELSE
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM address_books WHERE id = NEW.address_book_id) + interval '1 microsecond');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_events_touch_last_modified ON events;
+CREATE TRIGGER trg_events_touch_last_modified
+BEFORE INSERT OR UPDATE ON events
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+DROP TRIGGER IF EXISTS trg_contacts_touch_last_modified ON contacts;
+CREATE TRIGGER trg_contacts_touch_last_modified
+BEFORE INSERT OR UPDATE ON contacts
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+-- Any change to a collection row moves its sync token, whatever updated_at the
+-- statement itself wrote.
+CREATE OR REPLACE FUNCTION stamp_collection_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = GREATEST(clock_timestamp(), OLD.updated_at + interval '1 microsecond');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_calendars_stamp_updated_at ON calendars;
+CREATE TRIGGER trg_calendars_stamp_updated_at
+BEFORE UPDATE ON calendars
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+DROP TRIGGER IF EXISTS trg_address_books_stamp_updated_at ON address_books;
+CREATE TRIGGER trg_address_books_stamp_updated_at
+BEFORE UPDATE ON address_books
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+CREATE OR REPLACE FUNCTION increment_calendar_ctag()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('event', OLD.calendar_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION increment_address_book_ctag()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = OLD.address_book_id;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('contact', OLD.address_book_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = NEW.address_book_id;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A tombstone moves its collection's sync token and takes the new token as its
+-- own stamp: a client holding an older token is told of the removal, and one
+-- holding the new token already has a state without the resource. The
+-- collection may already be gone when its members are removed with it.
+CREATE OR REPLACE FUNCTION stamp_deleted_resource()
+RETURNS TRIGGER AS $$
+DECLARE
+    stamped TIMESTAMPTZ;
+BEGIN
+    IF NEW.resource_type = 'event' THEN
+        UPDATE calendars SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    ELSIF NEW.resource_type = 'contact' THEN
+        UPDATE address_books SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    END IF;
+    NEW.deleted_at = COALESCE(stamped, clock_timestamp());
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_deleted_resources_stamp ON deleted_resources;
+CREATE TRIGGER trg_deleted_resources_stamp
+BEFORE INSERT ON deleted_resources
+FOR EACH ROW EXECUTE FUNCTION stamp_deleted_resource();
+
+-- Re-derive the birthdays earlier releases stored in the wrong year.
+--
+-- A year-less BDAY (--MM-DD) was stored in year 1, which is not a leap year, so
+-- --02-29 became March 1. An Apple card, which cannot write a year-less date,
+-- writes a stand-in year and names it in X-APPLE-OMIT-YEAR, and that stand-in
+-- was stored as though it were the birth year. Both belong in year 4
+-- (store.NoYearBirthdayYear).
+--
+-- The birthday is read back from the card the way store.parseVCardFields reads
+-- it, so the row ends up as a write of the same card would leave it: content
+-- lines unfolded across CRLF, LF or CR breaks; the first BDAY line decides,
+-- whatever its group; a VALUE=text BDAY is no date; a date-time keeps its date;
+-- the date is one of YYYY-MM-DD, YYYYMMDD, --MM-DD or --MMDD and must exist,
+-- a year-less February 29 included; and a year equal to the first numeric
+-- X-APPLE-OMIT-YEAR value is no year. A card whose first BDAY does not parse
+-- keeps the birthday it has.
+--
+-- Only rows still in year 1, and rows whose year is the card's omitted year,
+-- are touched, and only when the derived date differs, so a birthday genuinely
+-- dated in year 1 and a row already moved stay as they are and the statement
+-- can run again. Each update fires the contacts triggers, which move the
+-- address book's CTag and sync token and stamp the contact after the old token,
+-- so clients pick up the corrected birthday.
+--
+-- Each card is unfolded, split and matched once, in LATERAL function scans, and
+-- only the first BDAY line is parsed further. OFFSET 0 keeps the derived steps
+-- from being flattened into the expressions that read them, which would
+-- evaluate each regex again for every reference.
+UPDATE contacts AS contact
+SET birthday = derived.birthday
+FROM (
+    SELECT candidate.id, parsed.birthday, bday.omitted_year
+    FROM contacts AS candidate
+    CROSS JOIN LATERAL regexp_replace(candidate.raw_vcard, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') AS unfolded(body)
+    CROSS JOIN LATERAL (
+        SELECT property.parts[1] AS params, btrim(property.parts[2], E' \t\013\f') AS value
+        FROM regexp_split_to_table(unfolded.body, E'\\r\\n?|\\n') WITH ORDINALITY AS line(text, position)
+        CROSS JOIN LATERAL regexp_match(line.text,
+            $re$^[ \t]*(?:[^;:"]*\.)?BDAY[ \t]*((?:;(?:[^";:]|"[^"]*")*)*):(.*)$re$, 'i') AS property(parts)
+        WHERE property.parts IS NOT NULL
+        ORDER BY line.position
+        LIMIT 1
+    ) AS first_bday
+    CROSS JOIN LATERAL regexp_match(first_bday.value,
+        $re$^(?:([0-9]{4})-([0-9]{2})-([0-9]{2})|([0-9]{4})([0-9]{2})([0-9]{2})|--([0-9]{2})-([0-9]{2})|--([0-9]{2})([0-9]{2}))(?:[Tt][0-9]{2}[0-9:.,Zz+-]*)?$$re$) AS date(parts)
+    CROSS JOIN LATERAL (
+        SELECT EXISTS (
+                   SELECT 1
+                   FROM regexp_matches(first_bday.params, $re$;[ \t]*VALUE[ \t]*=((?:[^";]|"[^"]*")*)$re$, 'gi') AS param(match)
+                   CROSS JOIN LATERAL regexp_split_to_table(param.match[1], ',') AS item(value)
+                   WHERE lower(btrim(btrim(item.value, E' \t'), '"')) = 'text'
+               ) AS is_text,
+               (
+                   SELECT btrim(btrim(item.value, E' \t'), '"')::numeric
+                   FROM regexp_matches(first_bday.params, $re$;[ \t]*X-APPLE-OMIT-YEAR[ \t]*=((?:[^";]|"[^"]*")*)$re$, 'gi') WITH ORDINALITY AS param(match, position)
+                   CROSS JOIN LATERAL regexp_split_to_table(param.match[1], ',') WITH ORDINALITY AS item(value, position)
+                   WHERE btrim(btrim(item.value, E' \t'), '"') ~ '^[0-9]+$'
+                   ORDER BY param.position, item.position
+                   LIMIT 1
+               ) AS omitted_year
+        OFFSET 0
+    ) AS bday
+    CROSS JOIN LATERAL (
+        SELECT COALESCE(date.parts[1], date.parts[4])::int AS year,
+               COALESCE(date.parts[2], date.parts[5], date.parts[7], date.parts[9])::int AS month,
+               COALESCE(date.parts[3], date.parts[6], date.parts[8], date.parts[10])::int AS day
+        OFFSET 0
+    ) AS fields
+    CROSS JOIN LATERAL (
+        SELECT CASE
+            WHEN date.parts IS NULL OR bday.is_text THEN NULL
+            WHEN fields.month NOT BETWEEN 1 AND 12 OR fields.day < 1 THEN NULL
+            -- Validated in its own year, or in a leap year when it has none
+            -- (year 0, which PostgreSQL cannot store, is one as well).
+            WHEN EXTRACT(MONTH FROM make_date(CASE WHEN COALESCE(fields.year, 0) = 0 THEN 2000 ELSE fields.year END, fields.month, 1)
+                                    + (fields.day - 1)) <> fields.month THEN NULL
+            WHEN fields.year IS NULL OR fields.year = bday.omitted_year THEN make_date(4, fields.month, fields.day)
+            WHEN fields.year = 0 THEN NULL
+            ELSE make_date(fields.year, fields.month, fields.day)
+        END AS birthday
+        OFFSET 0
+    ) AS parsed
+    WHERE candidate.birthday IS NOT NULL
+      AND ((candidate.birthday >= DATE '0001-01-01' AND candidate.birthday < DATE '0002-01-01')
+           OR unfolded.body ~* 'X-APPLE-OMIT-YEAR')
+) AS derived
+WHERE contact.id = derived.id
+  AND derived.birthday IS NOT NULL
+  AND derived.birthday <> contact.birthday
+  AND ((contact.birthday >= DATE '0001-01-01' AND contact.birthday < DATE '0002-01-01')
+       OR EXTRACT(YEAR FROM contact.birthday) = derived.omitted_year);
 
 UPDATE application SET value = 'v1.2.0' WHERE key = 'version';

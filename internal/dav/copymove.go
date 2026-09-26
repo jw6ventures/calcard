@@ -109,7 +109,7 @@ func (h *DavServer) prefetchCopyMoveLocks(r *http.Request, srcPath, destPath str
 	}
 	byPath := make(map[string][]store.Lock, len(locks))
 	for i := range locks {
-		key := normalizeDAVHref(locks[i].ResourcePath)
+		key := cleanDAVPath(locks[i].ResourcePath)
 		byPath[key] = append(byPath[key], locks[i])
 	}
 	return r.WithContext(withLockBatchIndex(r.Context(), &lockBatchIndex{byPath: byPath}))
@@ -191,8 +191,12 @@ func (h *DavServer) copyCalendarEvent(w http.ResponseWriter, r *http.Request, us
 }
 
 func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {
-	srcCal, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read")
+	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
+	if _, err := h.loadCalendarWithPrivilege(r.Context(), user, srcCalID, srcPath(r), "read"); err != nil {
 		_ = writePrivilegeRequirementError(w, requirePrivatePrivilegeAt(err, srcPath(r), "read"))
 		return
 	}
@@ -200,6 +204,10 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	src, err := h.store.Events.GetByResourceName(r.Context(), srcCalID, srcUID)
 	if err != nil || src == nil {
 		http.Error(w, "source event not found", http.StatusNotFound)
+		return
+	}
+	if !h.checkConditionalHeaders(r, src) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	}
 	destCalID, destResourceName, destMatched, err := h.parseCalendarResourcePath(r.Context(), user, destPath)
@@ -283,12 +291,11 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		SourceResourceName:      eventResourceName(*src),
 		ExpectedSourceETag:      src.ETag,
 		ExpectedSourceRaw:       src.RawICAL,
-		ExpectedSourceCTag:      &srcCal.CTag,
 		DestinationCalendarID:   destCalID,
 		DestinationResourceName: destResourceName,
 		ExpectedDestination:     calendarObjectTransferState(existing),
-		ExpectedDestinationCTag: &destCal.CTag,
 		Overwrite:               overwrite,
+		ExpectedACL:             aclGuard,
 		RawICAL:                 src.RawICAL,
 		ETag:                    etag,
 		Metadata:                &validated.Analysis.Metadata,
@@ -322,6 +329,11 @@ func (h *DavServer) copyContact(w http.ResponseWriter, r *http.Request, user *st
 }
 
 func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
+	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -417,11 +429,10 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 		replacedUID = existingByName.UID
 	}
 	expected := store.ContactTransferExpectation{
-		Source:                     store.ContactDAVResourceState(src),
-		Destination:                store.ContactDAVResourceState(existingByName),
-		SourceAddressBookCTag:      &srcBook.CTag,
-		DestinationAddressBookCTag: &destBook.CTag,
-		Overwrite:                  overwrite,
+		Source:      store.ContactDAVResourceState(src),
+		Destination: store.ContactDAVResourceState(existingByName),
+		ACL:         aclGuard,
+		Overwrite:   overwrite,
 	}
 	defer invalidateDAVRequestState(r.Context())
 	_, err = h.store.CopyContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, etag, fromStatePath, toStatePath, replacedUID,
@@ -540,6 +551,11 @@ func (h *DavServer) moveCalendarEvent(w http.ResponseWriter, r *http.Request, us
 }
 
 func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcCalID int64, srcUID, destPath string, overwrite bool, retries int) {
+	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
 	sourceParent := path.Dir(srcPath(r))
 	srcAccess, err := h.loadCalendarWithAnyPrivilege(r.Context(), user, srcCalID, path.Clean(r.URL.Path))
 	if err != nil {
@@ -561,6 +577,10 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if !h.requireLocks(w, r, "source is locked", path.Clean(r.URL.Path), sourceParent) {
+		return
+	}
+	if !h.checkConditionalHeaders(r, src) {
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	}
 
@@ -636,12 +656,11 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		SourceResourceName:      eventResourceName(*src),
 		ExpectedSourceETag:      src.ETag,
 		ExpectedSourceRaw:       src.RawICAL,
-		ExpectedSourceCTag:      &srcAccess.CTag,
 		DestinationCalendarID:   destCalID,
 		DestinationResourceName: destResourceName,
 		ExpectedDestination:     calendarObjectTransferState(existing),
-		ExpectedDestinationCTag: &destCal.CTag,
 		Overwrite:               overwrite,
+		ExpectedACL:             aclGuard,
 		RawICAL:                 src.RawICAL,
 		ETag:                    src.ETag,
 		Metadata:                &validated.Analysis.Metadata,
@@ -728,6 +747,11 @@ func (h *DavServer) moveContact(w http.ResponseWriter, r *http.Request, user *st
 }
 
 func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, srcBookID int64, srcUID, destPath string, overwrite bool, retries int) {
+	aclGuard, err := h.aclGuard(r.Context(), user, srcPath(r), destPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+		return
+	}
 	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
 	if err != nil || !destMatched {
 		http.Error(w, "invalid destination", http.StatusForbidden)
@@ -825,11 +849,10 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 		replacedUID = existingByName.UID
 	}
 	expected := store.ContactTransferExpectation{
-		Source:                     store.ContactDAVResourceState(src),
-		Destination:                store.ContactDAVResourceState(existingByName),
-		SourceAddressBookCTag:      &srcBook.CTag,
-		DestinationAddressBookCTag: &destBook.CTag,
-		Overwrite:                  overwrite,
+		Source:      store.ContactDAVResourceState(src),
+		Destination: store.ContactDAVResourceState(existingByName),
+		ACL:         aclGuard,
+		Overwrite:   overwrite,
 	}
 	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID,

@@ -115,7 +115,7 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 	canonicalSeen := make(map[string]struct{})
 	var canonicalPaths []string
 	addCanonical := func(resourcePath string) {
-		resourcePath = normalizeDAVHref(resourcePath)
+		resourcePath = cleanDAVPath(resourcePath)
 		if resourcePath == "" {
 			return
 		}
@@ -126,7 +126,7 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 		canonicalPaths = append(canonicalPaths, resourcePath)
 	}
 	for _, response := range responses {
-		resourcePath, err := h.canonicalDAVPath(ctx, user, response.Href)
+		resourcePath, err := h.canonicalDAVHref(ctx, user, response.Href)
 		if err != nil {
 			return err
 		}
@@ -153,7 +153,7 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 	}
 	byPath := make(map[string][]store.ACLEntry, len(queryPaths))
 	for _, entry := range entries {
-		key := normalizeDAVHref(entry.ResourcePath)
+		key := cleanDAVPath(entry.ResourcePath)
 		byPath[key] = append(byPath[key], entry)
 	}
 	cache := aclEntryCacheFromContext(ctx)
@@ -198,7 +198,8 @@ func (h *DavServer) deadPropertiesForResponses(ctx context.Context, user *store.
 		return nil, err
 	}
 	for _, property := range properties {
-		result[normalizeDAVHref(property.ResourcePath)] = append(result[normalizeDAVHref(property.ResourcePath)], property)
+		key := cleanDAVPath(property.ResourcePath)
+		result[key] = append(result[key], property)
 	}
 	return result, nil
 }
@@ -227,7 +228,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 			p.InheritedACLSet.Href = []string{ensureCollectionHref(inheritedACLPath)}
 		}
 	}
-	if strings.HasPrefix(normalizeDAVHref(resourcePath), "/dav/principals/") {
+	if strings.HasPrefix(cleanDAVPath(resourcePath), "/dav/principals/") {
 		p.AlternateURISet = &hrefListProp{}
 		p.GroupMembership = &hrefListProp{}
 	}
@@ -310,7 +311,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 }
 
 func inheritedACLSourcePath(resourcePath string) string {
-	cleanPath := normalizeDAVHref(resourcePath)
+	cleanPath := cleanDAVPath(resourcePath)
 	if strings.HasPrefix(cleanPath, calendarPrefix+"/") {
 		collectionPath := calendarCollectionPath(cleanPath)
 		if collectionPath != cleanPath {
@@ -327,7 +328,7 @@ func inheritedACLSourcePath(resourcePath string) string {
 }
 
 func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User, resourcePath string) (string, error) {
-	cleanPath := normalizeDAVHref(resourcePath)
+	cleanPath := cleanDAVPath(resourcePath)
 	if strings.HasPrefix(cleanPath, "/dav/principals/") {
 		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/"), "/")[0]
 		if id, err := strconv.ParseInt(segment, 10, 64); err == nil {
@@ -386,7 +387,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		return nil, nil
 	}
 
-	cleanPath := normalizeDAVHref(resourcePath)
+	cleanPath := cleanDAVPath(resourcePath)
 	if h.isResourceOwner(ctx, user, cleanPath) && isGenericDAVPrivilegePath(cleanPath) {
 		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames), nil
 	}
@@ -665,7 +666,7 @@ func (h *DavServer) prefetchLockBatchIndex(ctx context.Context, responses []resp
 	}
 	byPath := make(map[string][]store.Lock, len(locks))
 	for i := range locks {
-		key := normalizeDAVHref(locks[i].ResourcePath)
+		key := cleanDAVPath(locks[i].ResourcePath)
 		byPath[key] = append(byPath[key], locks[i])
 	}
 	return withLockBatchIndex(ctx, &lockBatchIndex{byPath: byPath}), nil

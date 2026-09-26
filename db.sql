@@ -255,7 +255,7 @@ CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS 
 -- primary key cannot answer as an index bound, so these are what serves them
 -- whatever fraction of the table one collection holds. The trailing columns are
 -- the predicates the paged reads narrow on: carried here they are evaluated on
--- the index tuple, so a page no longer visits the heap for a row it discards.
+-- the index tuple, so a page does not visit the heap for a row it discards.
 -- idx_events_calendar_keyset is created below, with the recurrence columns its
 -- trailing expressions read.
 CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);
@@ -440,3 +440,117 @@ CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
 -- applies.
 ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT;
 ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];
+
+-- Commit-ordered sync stamps.
+--
+-- A sync token is its collection's updated_at, and sync-collection reports a
+-- member whose last_modified, or a tombstone whose deleted_at, is later than the
+-- token. That only holds while the stamps order the way the writes commit.
+-- NOW() is the time the transaction started, so a writer that started before
+-- another but committed after it stamped its change behind a token the other's
+-- commit had already let a client take, and the change was never reported.
+--
+-- Every member write locks its collection's row before it writes, so a stamp
+-- read from clock_timestamp() inside the write, and kept above the collection's
+-- current updated_at, is later than every token handed out before the write
+-- can commit. The collection's own updated_at only moves forward, by at least a
+-- microsecond per change, so two changes never share a token.
+CREATE OR REPLACE FUNCTION touch_last_modified()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'events' THEN
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM calendars WHERE id = NEW.calendar_id) + interval '1 microsecond');
+    ELSE
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM address_books WHERE id = NEW.address_book_id) + interval '1 microsecond');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_events_touch_last_modified ON events;
+CREATE TRIGGER trg_events_touch_last_modified
+BEFORE INSERT OR UPDATE ON events
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+DROP TRIGGER IF EXISTS trg_contacts_touch_last_modified ON contacts;
+CREATE TRIGGER trg_contacts_touch_last_modified
+BEFORE INSERT OR UPDATE ON contacts
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+-- Any change to a collection row moves its sync token, whatever updated_at the
+-- statement itself wrote.
+CREATE OR REPLACE FUNCTION stamp_collection_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = GREATEST(clock_timestamp(), OLD.updated_at + interval '1 microsecond');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_calendars_stamp_updated_at ON calendars;
+CREATE TRIGGER trg_calendars_stamp_updated_at
+BEFORE UPDATE ON calendars
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+DROP TRIGGER IF EXISTS trg_address_books_stamp_updated_at ON address_books;
+CREATE TRIGGER trg_address_books_stamp_updated_at
+BEFORE UPDATE ON address_books
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+CREATE OR REPLACE FUNCTION increment_calendar_ctag()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('event', OLD.calendar_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION increment_address_book_ctag()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = OLD.address_book_id;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('contact', OLD.address_book_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = NEW.address_book_id;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A tombstone moves its collection's sync token and takes the new token as its
+-- own stamp: a client holding an older token is told of the removal, and one
+-- holding the new token already has a state without the resource. The
+-- collection may already be gone when its members are removed with it.
+CREATE OR REPLACE FUNCTION stamp_deleted_resource()
+RETURNS TRIGGER AS $$
+DECLARE
+    stamped TIMESTAMPTZ;
+BEGIN
+    IF NEW.resource_type = 'event' THEN
+        UPDATE calendars SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    ELSIF NEW.resource_type = 'contact' THEN
+        UPDATE address_books SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    END IF;
+    NEW.deleted_at = COALESCE(stamped, clock_timestamp());
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_deleted_resources_stamp ON deleted_resources;
+CREATE TRIGGER trg_deleted_resources_stamp
+BEFORE INSERT ON deleted_resources
+FOR EACH ROW EXECUTE FUNCTION stamp_deleted_resource();

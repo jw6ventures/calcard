@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	pathpkg "path"
 	"strconv"
 	"strings"
 	"time"
@@ -176,7 +177,7 @@ func Load() (*Config, error) {
 	cfg.OAuth.ClientSecret = os.Getenv("APP_OAUTH_CLIENT_SECRET")
 	cfg.OAuth.IssuerURL = os.Getenv("APP_OAUTH_ISSUER_URL")
 	cfg.OAuth.DiscoveryURL = os.Getenv("APP_OAUTH_DISCOVERY_URL")
-	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", "/auth/callback")
+	cfg.OAuth.RedirectPath = getenvDefault("APP_OAUTH_REDIRECT_PATH", DefaultOAuthRedirectPath)
 	cfg.Session.Secret = os.Getenv("APP_SESSION_SECRET")
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
 	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
@@ -239,6 +240,9 @@ func Load() (*Config, error) {
 	}
 	if len(cfg.Session.Secret) < 32 {
 		return nil, fmt.Errorf("APP_SESSION_SECRET must be at least 32 characters long (got %d)", len(cfg.Session.Secret))
+	}
+	if err := ValidateOAuthRedirectPath(cfg.OAuth.RedirectPath); err != nil {
+		return nil, err
 	}
 	if err := validateTrustedProxies(cfg.TrustedProxies); err != nil {
 		return nil, err
@@ -350,6 +354,41 @@ func getenvList(key string) []string {
 			}
 		}
 		return result
+	}
+	return nil
+}
+
+// DefaultOAuthRedirectPath is where the OAuth callback is served when
+// APP_OAUTH_REDIRECT_PATH is unset.
+const DefaultOAuthRedirectPath = "/auth/callback"
+
+// ownedRoutePrefixes are the top-level paths the router in internal/http
+// serves. A redirect path equal to or beneath one of them would collide with
+// that route; the router's tests check every registered route against this.
+var ownedRoutePrefixes = []string{
+	"/auth", "/dav", "/api", "/healthz", "/readyz", "/metrics", "/.well-known",
+	"/principals", "/calendar", "/calendars", "/addressbooks", "/app-passwords",
+	"/sessions", "/birthdays", "/help", "/onboarding",
+}
+
+// ValidateOAuthRedirectPath reports whether path can be served as the OAuth
+// callback: a clean absolute path, appended verbatim to APP_BASE_URL as the
+// redirect URI, that no other application route claims.
+func ValidateOAuthRedirectPath(path string) error {
+	if path == DefaultOAuthRedirectPath {
+		return nil
+	}
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") ||
+		strings.ContainsAny(path, "?#{}* \t\r\n\\") || pathpkg.Clean(path) != path {
+		return fmt.Errorf("APP_OAUTH_REDIRECT_PATH %q must be a clean absolute path such as %s", path, DefaultOAuthRedirectPath)
+	}
+	if path == "/" {
+		return fmt.Errorf("APP_OAUTH_REDIRECT_PATH %q collides with the dashboard route", path)
+	}
+	for _, owned := range ownedRoutePrefixes {
+		if path == owned || strings.HasPrefix(path, owned+"/") {
+			return fmt.Errorf("APP_OAUTH_REDIRECT_PATH %q collides with the application's %s routes", path, owned)
+		}
 	}
 	return nil
 }

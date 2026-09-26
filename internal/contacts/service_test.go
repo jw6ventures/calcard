@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
 
 // --- in-memory fakes -------------------------------------------------------
@@ -158,7 +162,15 @@ func (f *fakeContacts) CopyToAddressBook(context.Context, int64, int64, string, 
 	return nil, nil
 }
 
-type fakeACL struct{ entries []store.ACLEntry }
+// fakeACL models the repository's serialization guarantee: UpdateACL is one
+// locked read-modify-write, while a bare ListByResource leaves the caller
+// holding a snapshot another writer can invalidate. raceWrite is that other
+// writer, so it commits after ListByResource has taken its snapshot but before
+// UpdateACL takes its own.
+type fakeACL struct {
+	entries   []store.ACLEntry
+	raceWrite func()
+}
 
 func (f *fakeACL) SetACL(_ context.Context, resourcePath string, entries []store.ACLEntry) error {
 	kept := f.entries[:0:0]
@@ -178,13 +190,51 @@ func (f *fakeACL) SetACL(_ context.Context, resourcePath string, entries []store
 	return nil
 }
 func (f *fakeACL) ListByResource(_ context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	out := f.entriesFor(resourcePath)
+	if f.raceWrite != nil {
+		f.raceWrite()
+	}
+	return out, nil
+}
+
+func (f *fakeACL) entriesFor(resourcePath string) []store.ACLEntry {
 	var out []store.ACLEntry
 	for _, e := range f.entries {
 		if e.ResourcePath == resourcePath {
 			out = append(out, e)
 		}
 	}
-	return out, nil
+	return out
+}
+
+func (f *fakeACL) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	if f.raceWrite != nil {
+		f.raceWrite()
+	}
+	next, err := mutate(f.entriesFor(resourcePath))
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+func (f *fakeACL) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
 }
 func (f *fakeACL) ListByPrincipal(_ context.Context, principalHref string) ([]store.ACLEntry, error) {
 	var out []store.ACLEntry
@@ -489,6 +539,90 @@ func TestShareeCannotRemoveDenyToGainBroadGrant(t *testing.T) {
 	}
 }
 
+func TestUnshareRemovesResourceLevelGrants(t *testing.T) {
+	svc, aclRepo := newTestService()
+	ctx := context.Background()
+	if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, false); err != nil {
+		t.Fatalf("ShareAddressBook() error = %v", err)
+	}
+	// An ACL request grants the sharee read on one contact directly. Revoking the
+	// collection share must revoke this too, or the contact stays readable.
+	if err := aclRepo.SetACL(ctx, "/dav/addressbooks/1/c1", []store.ACLEntry{
+		{PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "read"},
+	}); err != nil {
+		t.Fatalf("SetACL() error = %v", err)
+	}
+	if _, err := svc.GetContact(ctx, sharee, 1, "c1"); err != nil {
+		t.Fatalf("GetContact() before unshare error = %v, want readable", err)
+	}
+
+	if err := svc.UnshareAddressBook(ctx, owner, 1, sharee.ID); err != nil {
+		t.Fatalf("UnshareAddressBook() error = %v", err)
+	}
+	if _, err := svc.GetContact(ctx, sharee, 1, "c1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetContact() after unshare error = %v, want ErrNotFound", err)
+	}
+	for _, entry := range aclRepo.entries {
+		if entry.PrincipalHref == sharePrincipalHref(sharee.ID) && entry.IsGrant {
+			t.Fatalf("UnshareAddressBook() left grant %#v", entry)
+		}
+	}
+}
+
+func TestUnshareKeepsResourceLevelDenies(t *testing.T) {
+	svc, aclRepo := newTestService()
+	ctx := context.Background()
+	if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, false); err != nil {
+		t.Fatalf("ShareAddressBook() error = %v", err)
+	}
+	if err := aclRepo.SetACL(ctx, "/dav/addressbooks/1/c1", []store.ACLEntry{
+		{PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: false, Privilege: "read"},
+	}); err != nil {
+		t.Fatalf("SetACL() error = %v", err)
+	}
+
+	if err := svc.UnshareAddressBook(ctx, owner, 1, sharee.ID); err != nil {
+		t.Fatalf("UnshareAddressBook() error = %v", err)
+	}
+	deny := 0
+	for _, entry := range aclRepo.entries {
+		if entry.ResourcePath == "/dav/addressbooks/1/c1" && !entry.IsGrant {
+			deny++
+		}
+	}
+	if deny != 1 {
+		t.Fatalf("UnshareAddressBook() removed a protective deny: %#v", aclRepo.entries)
+	}
+}
+
+func TestShareDoesNotClobberConcurrentGrant(t *testing.T) {
+	svc, aclRepo := newTestService()
+	ctx := context.Background()
+	// A competing grant commits while an unlocked reader is holding its snapshot,
+	// which is exactly the interleaving a lost update needs.
+	aclRepo.raceWrite = func() {
+		aclRepo.raceWrite = nil
+		aclRepo.entries = append(aclRepo.entries, store.ACLEntry{
+			ResourcePath:  addressBookACLCollectionPath(1),
+			PrincipalHref: sharePrincipalHref(stranger.ID),
+			IsGrant:       true,
+			Privilege:     "read",
+			Position:      9,
+		})
+	}
+
+	if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, false); err != nil {
+		t.Fatalf("ShareAddressBook() error = %v", err)
+	}
+	shares, err := svc.ListAddressBookShares(ctx, owner, 1)
+	if err != nil {
+		t.Fatalf("ListAddressBookShares() error = %v", err)
+	}
+	if len(shares) != 2 {
+		t.Fatalf("ListAddressBookShares() = %#v, want both the concurrent and the new share", shares)
+	}
+}
+
 func TestListAddressBookSharesHonorsOrderedDenies(t *testing.T) {
 	createdAt := time.Now().UTC()
 	svc := NewService(&store.Store{
@@ -523,23 +657,23 @@ func TestListAccessibleIncludesSharedBook(t *testing.T) {
 	}
 }
 
-func TestManagedShareAfterBroadReadGrant(t *testing.T) {
+func TestEffectiveShareAfterBroadReadGrant(t *testing.T) {
 	for _, principal := range []string{"DAV:all", "DAV:authenticated"} {
 		t.Run(principal, func(t *testing.T) {
 			entries := []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
 				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read", Position: 1},
 			}
-			if !hasEffectiveManagedShare(entries, 2) {
-				t.Fatal("broad read grant hid the user's managed share")
+			if !hasEffectiveShare(entries, 2) {
+				t.Fatal("broad read grant hid the user's share")
 			}
 			entries[0].IsGrant = false
-			if hasEffectiveManagedShare(entries, 2) {
+			if hasEffectiveShare(entries, 2) {
 				t.Fatal("earlier deny must still hide the share")
 			}
 			entries[0].IsGrant = true
-			if hasEffectiveManagedShare(entries[:1], 2) {
-				t.Fatal("broad grant alone is not a managed share")
+			if hasEffectiveShare(entries[:1], 2) {
+				t.Fatal("broad grant alone is not the user's share")
 			}
 		})
 	}
@@ -570,6 +704,251 @@ func TestDeleteContactConcurrentChange(t *testing.T) {
 			}
 			if len(base.items) != 1 {
 				t.Fatal("concurrent update was deleted")
+			}
+		})
+	}
+}
+
+// A structured contact is assembled into content lines, so a line break in any
+// of the single-line fields is not something the form can produce -- it only
+// arrives from a caller trying to add content lines to the stored card. Notes
+// come from a textarea, so a break there is a break in the note and is escaped
+// rather than refused.
+func TestBuildStructuredContactRejectsControlCharacters(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   StructuredInput
+		wantErr bool
+	}{
+		{name: "uid opens a property", input: StructuredInput{UID: "a\r\nEMAIL;TYPE=INTERNET:pwn@evil.test", DisplayName: "Bob"}, wantErr: true},
+		{name: "uid carries a bare CR", input: StructuredInput{UID: "a\rb", DisplayName: "Bob"}, wantErr: true},
+		{name: "display name opens a card", input: StructuredInput{DisplayName: "Bob\r\nEND:VCARD\r\nBEGIN:VCARD"}, wantErr: true},
+		{name: "given name carries CRLF", input: StructuredInput{DisplayName: "Bob", FirstName: "A\r\nX:1"}, wantErr: true},
+		{name: "family name carries CRLF", input: StructuredInput{DisplayName: "Bob", LastName: "A\r\nX:1"}, wantErr: true},
+		{name: "email carries CRLF", input: StructuredInput{DisplayName: "Bob", Email: "x@y.z\r\nX:1"}, wantErr: true},
+		{name: "phone carries CRLF", input: StructuredInput{DisplayName: "Bob", Phone: "+1\r\nX:1"}, wantErr: true},
+		{name: "birthday carries CRLF", input: StructuredInput{DisplayName: "Bob", Birthday: "--01-01\r\nX:1"}, wantErr: true},
+		{name: "company carries CRLF", input: StructuredInput{DisplayName: "Bob", Company: "Acme\r\nX:1"}, wantErr: true},
+		{name: "notes carry NUL", input: StructuredInput{DisplayName: "Bob", Notes: "a\x00b"}, wantErr: true},
+		{name: "display name carries an escape", input: StructuredInput{DisplayName: "a\x1b[0mb"}, wantErr: true},
+		{name: "notes carry a line break", input: StructuredInput{DisplayName: "Bob", Notes: "line one\nline two"}},
+		{name: "ordinary contact", input: StructuredInput{DisplayName: "Bob", Email: "bob@example.com", Phone: "+1 555 0100", Birthday: "1990-01-15"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := structuredPayload(&tt.input, "")
+			if tt.wantErr {
+				if !errors.Is(err, ErrBadRequest) {
+					t.Fatalf("error = %v, want ErrBadRequest\n%s", err, body)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildStructuredContact: %v", err)
+			}
+			var begins int
+			for _, line := range strings.Split(strings.TrimSuffix(body, "\r\n"), "\r\n") {
+				if line == "BEGIN:VCARD" {
+					begins++
+				}
+			}
+			if begins != 1 {
+				t.Errorf("card holds %d BEGIN:VCARD content lines, want 1:\n%s", begins, body)
+			}
+		})
+	}
+}
+
+// A birthday is stored as a vCard date, so a payload naming one the grammar
+// cannot carry is refused for the same reason a control character in it is: the
+// caller is told the contact was not stored as sent, rather than having the
+// birthday dropped from a card that is stored anyway. A payload naming no
+// birthday names a contact without one.
+func TestBuildStructuredContactRefusesABirthdayThatIsNotADate(t *testing.T) {
+	for _, birthday := range []string{"not-a-date", "--13-45", "1990-02-31", "1990-01-15 or so", "1990"} {
+		body, _, err := structuredPayload(&StructuredInput{DisplayName: "Bob", Birthday: birthday}, "")
+		if !errors.Is(err, ErrBadRequest) {
+			t.Errorf("birthday %q: error = %v, want ErrBadRequest\n%s", birthday, err, body)
+		}
+	}
+	for birthday, want := range map[string]string{"": "", "1990-01-15": "BDAY:1990-01-15", "--12-25": "BDAY:--12-25"} {
+		body, _, err := structuredPayload(&StructuredInput{DisplayName: "Bob", Birthday: birthday}, "")
+		if err != nil {
+			t.Fatalf("birthday %q: %v", birthday, err)
+		}
+		if want == "" {
+			if strings.Contains(body, "BDAY") {
+				t.Errorf("card holds a BDAY line for a contact with no birthday:\n%s", body)
+			}
+			continue
+		}
+		if !strings.Contains(body, want) {
+			t.Errorf("birthday %q: card missing %q:\n%s", birthday, want, body)
+		}
+	}
+}
+
+// A new contact's UID is chosen by the caller, and the TEXT delimiters an RFC
+// 2426 value would have escaped are refused there. Editing a contact keeps the
+// UID it already has, which another CardDAV client may have written with those
+// delimiters, so the edit must go through rather than leave it uneditable.
+func TestBuildStructuredContactChecksDelimitersOnlyInANewUID(t *testing.T) {
+	for _, uid := range []string{"a;b", "a,b", `a\b`} {
+		if _, _, err := structuredPayload(&StructuredInput{UID: uid, DisplayName: "Bob"}, ""); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("new contact with UID %q: error = %v, want ErrBadRequest", uid, err)
+		}
+		body, got, err := structuredPayload(&StructuredInput{DisplayName: "Bob"}, uid)
+		if err != nil {
+			t.Fatalf("editing the stored contact %q: %v", uid, err)
+		}
+		if got != uid || utils.ExtractVCardUID(body) != uid {
+			t.Fatalf("editing %q wrote UID %q, card UID %q", uid, got, utils.ExtractVCardUID(body))
+		}
+	}
+}
+
+// A principal the ACL method granted "all" is listed as a share, so removing
+// that share has to take the grant, or the principal is listed as removed while
+// keeping full access.
+func TestUnshareRevokesEveryShareVisibleGrant(t *testing.T) {
+	for _, privilege := range []string{"all", "write-content", "bind", "unbind", "write-properties", "write-acl", "read-acl", "read-current-user-privilege-set", "unlock"} {
+		t.Run(privilege, func(t *testing.T) {
+			svc, aclRepo := newTestService()
+			ctx := context.Background()
+			aclRepo.entries = []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "read", Position: 0},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: privilege, Position: 0},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: false, Privilege: "unbind", Position: 1},
+			}
+			if err := svc.UnshareAddressBook(ctx, owner, 1, sharee.ID); err != nil {
+				t.Fatalf("UnshareAddressBook() error = %v", err)
+			}
+			for _, entry := range aclRepo.entries {
+				if entry.IsGrant && entry.PrincipalHref == sharePrincipalHref(sharee.ID) {
+					t.Fatalf("unshare left grant %#v", entry)
+				}
+			}
+			if len(aclRepo.entries) != 1 || aclRepo.entries[0].IsGrant {
+				t.Fatalf("unshare must keep the deny entry, entries = %#v", aclRepo.entries)
+			}
+			if _, err := svc.GetAddressBook(ctx, sharee, 1); !errors.Is(err, ErrForbidden) && !errors.Is(err, ErrNotFound) {
+				t.Fatalf("GetAddressBook after unshare error = %v, want no access", err)
+			}
+		})
+	}
+}
+
+func TestUnshareRemovesAnAllGrantListedAsAShare(t *testing.T) {
+	svc, aclRepo := newTestService()
+	ctx := context.Background()
+	aclRepo.entries = []store.ACLEntry{
+		{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "all", Position: 0, CreatedAt: time.Now()},
+	}
+	shares, err := svc.ListAddressBookShares(ctx, owner, 1)
+	if err != nil || len(shares) != 1 || !shares[0].Editor {
+		t.Fatalf("ListAddressBookShares() = %#v, %v; want one editor share", shares, err)
+	}
+	if err := svc.UnshareAddressBook(ctx, owner, 1, sharee.ID); err != nil {
+		t.Fatalf("UnshareAddressBook() error = %v", err)
+	}
+	if shares, _ := svc.ListAddressBookShares(ctx, owner, 1); len(shares) != 0 {
+		t.Fatalf("after unshare shares = %#v, want none", shares)
+	}
+	if _, err := svc.GetAddressBook(ctx, sharee, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetAddressBook after unshare error = %v, want ErrNotFound", err)
+	}
+}
+
+// A sharee reached through an ACL-method grant can leave the book the same way
+// one reached through the sharing API can.
+func TestShareeCanLeaveABookSharedThroughAnAllGrant(t *testing.T) {
+	svc, aclRepo := newTestService()
+	ctx := context.Background()
+	aclRepo.entries = []store.ACLEntry{
+		{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "all", Position: 0},
+	}
+	if err := svc.UnshareAddressBook(ctx, sharee, 1, sharee.ID); err != nil {
+		t.Fatalf("UnshareAddressBook() by the sharee error = %v", err)
+	}
+	if _, err := svc.GetAddressBook(ctx, sharee, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetAddressBook after leaving error = %v, want ErrNotFound", err)
+	}
+}
+
+// Downgrading an editor to a viewer has to take every write grant, whichever
+// form it was written in, or the viewer keeps writing.
+func TestDowngradeToViewerRevokesEveryWriteGrant(t *testing.T) {
+	for _, privileges := range [][]string{{"write-content", "bind"}, {"all"}, {"write"}, {"unbind", "write-properties"}} {
+		t.Run(strings.Join(privileges, "+"), func(t *testing.T) {
+			svc, aclRepo := newTestService()
+			ctx := context.Background()
+			aclRepo.entries = []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "read", Position: 0},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(stranger.ID), IsGrant: true, Privilege: "write-content", Position: 2},
+			}
+			for _, privilege := range privileges {
+				aclRepo.entries = append(aclRepo.entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: privilege, Position: 1})
+			}
+			if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, false); err != nil {
+				t.Fatalf("ShareAddressBook() error = %v", err)
+			}
+			for _, entry := range aclRepo.entries {
+				if entry.PrincipalHref == sharePrincipalHref(sharee.ID) && entry.IsGrant && entry.Privilege != "read" {
+					t.Fatalf("downgrade left grant %#v", entry)
+				}
+			}
+			if granted, _, _ := svc.privilegeDecision(ctx, sharee, 1, "", "write-content"); granted {
+				t.Fatal("viewer can still write-content")
+			}
+			if granted, _, _ := svc.privilegeDecision(ctx, sharee, 1, "", "bind"); granted {
+				t.Fatal("viewer can still bind")
+			}
+			if granted, _, _ := svc.privilegeDecision(ctx, stranger, 1, "", "write-content"); !granted {
+				t.Fatal("downgrading one principal took another principal's grant")
+			}
+		})
+	}
+}
+
+// A contact's own grant is evaluated ahead of the book's, so a downgrade to
+// viewer has to take the principal's contact-level write grants too.
+func TestDowngradeToViewerRevokesContactLevelWriteGrants(t *testing.T) {
+	for _, privilege := range []string{"write", "write-content", "all"} {
+		t.Run(privilege, func(t *testing.T) {
+			svc, aclRepo := newTestService()
+			ctx := context.Background()
+			if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			aclRepo.entries = append(aclRepo.entries,
+				store.ACLEntry{ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: privilege},
+				store.ACLEntry{ResourcePath: "/dav/addressbooks/1/c1", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: false, Privilege: "unbind", Position: 1},
+				store.ACLEntry{ResourcePath: "/dav/addressbooks/1/c2", PrincipalHref: sharePrincipalHref(sharee.ID), IsGrant: true, Privilege: "read"},
+			)
+			if err := svc.ShareAddressBook(ctx, owner, 1, sharee.ID, false); err != nil {
+				t.Fatal(err)
+			}
+			if granted, _, _ := svc.privilegeDecision(ctx, sharee, 1, "c1", "write-content"); granted {
+				t.Fatalf("viewer can still write c1; entries = %#v", aclRepo.entries)
+			}
+			if _, err := svc.GetContact(ctx, sharee, 1, "c1"); err != nil {
+				t.Fatalf("viewer lost read on c1: %v", err)
+			}
+			denies, contactReads := 0, 0
+			for _, e := range aclRepo.entries {
+				if !e.IsGrant {
+					denies++
+				}
+				if e.IsGrant && e.ResourcePath == "/dav/addressbooks/1/c2" && e.Privilege == "read" {
+					contactReads++
+				}
+			}
+			if denies != 1 {
+				t.Fatalf("downgrade removed a deny: %#v", aclRepo.entries)
+			}
+			if contactReads != 1 {
+				t.Fatalf("downgrade removed the owner's contact-level read grant: %#v", aclRepo.entries)
 			}
 		})
 	}

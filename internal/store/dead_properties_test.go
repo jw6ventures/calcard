@@ -49,11 +49,12 @@ func TestDeadPropertyRepositoryAppliesMutationsInOrder(t *testing.T) {
 
 	resourcePath := "/dav/addressbooks/5/alice"
 	mock.ExpectBegin()
-	for _, lockPath := range sortedLockSerializationPaths(resourcePath) {
-		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-			WithArgs(lockPath).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                      false,
+		"/dav/addressbooks":         false,
+		"/dav/addressbooks/5":       true,
+		"/dav/addressbooks/5/alice": true,
+	})
 	mock.ExpectExec(`INSERT INTO dav_dead_properties`).
 		WithArgs(resourcePath, "urn:test", "note", "first").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -87,6 +88,11 @@ func TestPatchCalendarPropertiesRollsBackLiveChangeWhenDeadPropertyFails(t *test
 
 	st := New(db)
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+	})
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET name=$1, description=$2, description_lang=$3, timezone=$4, color=$5, updated_at=NOW() WHERE id=$6`)).
 		WithArgs("Renamed", nil, nil, nil, nil, int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -95,7 +101,7 @@ func TestPatchCalendarPropertiesRollsBackLiveChangeWhenDeadPropertyFails(t *test
 		WillReturnError(errors.New("dead property write failed"))
 	mock.ExpectRollback()
 
-	err = st.PatchCalendarProperties(context.Background(), 5, CalendarProperties{Name: "Renamed"}, "/dav/calendars/5", []DeadPropertyMutation{{NamespaceURI: "urn:test", LocalName: "note", InnerXML: "value"}}, nil)
+	err = st.PatchCalendarProperties(context.Background(), 5, CalendarProperties{Name: "Renamed"}, "/dav/calendars/5", []DeadPropertyMutation{{NamespaceURI: "urn:test", LocalName: "note", InnerXML: "value"}}, nil, nil)
 	if err == nil {
 		t.Fatal("PatchCalendarProperties() error = nil, want rollback error")
 	}
@@ -136,10 +142,18 @@ func TestEventRepositoryUsesPrecomputedWriteMetadata(t *testing.T) {
 	recurrenceUntil := dtend.Add(48 * time.Hour)
 	summary := "precomputed summary"
 	raw := "not reparsed because DAV already validated it"
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 7)
 	mock.ExpectQuery(`INSERT INTO events`).
 		WithArgs(int64(7), "event", "event", raw, "etag", summary, nil, nil, dtstart, dtend, false, dtstart, recurrenceUntil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(1), int64(7), "event", "event", raw, "etag", summary, nil, nil, dtstart, dtend, false, now))
+	mock.ExpectCommit()
 
 	created, err := (&eventRepo{pool: db}).Upsert(context.Background(), Event{
 		CalendarID:    7,
@@ -249,9 +263,17 @@ func TestStoreCopyContactAndStateCopiesDeadPropertiesAndClearsDestinationState(t
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/2": true,
+		"/dav/addressbooks/3": true,
+	})
 	for _, key := range []string{"contact-object:2:name:alice", "contact-object:2:uid:alice", "contact-object:3:name:copied", "contact-object:3:uid:alice"} {
 		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
+	expectCollectionRowLock(mock, "address_books", 2)
+	expectCollectionRowLock(mock, "address_books", 3)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(2), "alice").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(2), "alice", "alice", raw, "old-etag", "Alice", "alice@example.com", nil, now))
@@ -302,9 +324,17 @@ func TestStoreCopyContactAndStateRejectsLateDestinationUIDConflict(t *testing.T)
 	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/2": true,
+		"/dav/addressbooks/3": true,
+	})
 	for _, key := range []string{"contact-object:2:name:alice", "contact-object:2:uid:alice", "contact-object:3:name:copied", "contact-object:3:uid:alice"} {
 		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
+	expectCollectionRowLock(mock, "address_books", 2)
+	expectCollectionRowLock(mock, "address_books", 3)
 	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(2), "alice").
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(2), "alice", "alice", raw, "old-etag", "Alice", nil, nil, now))

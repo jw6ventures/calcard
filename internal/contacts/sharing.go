@@ -3,6 +3,7 @@ package contacts
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,9 +27,9 @@ type AddressBookAccess struct {
 	Editor bool // true when the current user may modify contacts
 }
 
-// shareManagedPrivileges are the grants the sharing UI/API own and replace when a
-// share is updated. Editor adds "write" (which subsumes the write-* / bind / unbind
-// privileges via the shared ACL matcher); read-only shares grant only "read".
+// sharePresetPrivileges are the grants a share of each role writes. Editor adds
+// "write" (which subsumes the write-* / bind / unbind privileges via the shared
+// ACL matcher); read-only shares grant only "read".
 func sharePresetPrivileges(editor bool) []string {
 	if editor {
 		return []string{"read", "write"}
@@ -36,13 +37,76 @@ func sharePresetPrivileges(editor bool) []string {
 	return []string{"read"}
 }
 
-func shareManagedPrivilege(privilege string) bool {
-	switch privilege {
-	case "read", "write":
-		return true
-	default:
-		return false
+// sharePrincipalPrivileges is every privilege a collection ACE can grant. A
+// share is the whole of a principal's grants on the book, however they were
+// written, so setting a role or removing a share replaces or revokes them all;
+// a grant left behind, such as "all" or "write-acl", would keep access the
+// share no longer shows.
+var sharePrincipalPrivileges = []string{
+	"all", "read", "read-free-busy", "read-acl", "read-current-user-privilege-set",
+	"write", "write-content", "write-properties", "write-acl", "bind", "unbind", "unlock",
+}
+
+// viewerRevokedPrivileges are the grants a viewer does not hold.
+var viewerRevokedPrivileges = []string{
+	"all", "write", "write-content", "write-properties", "write-acl", "bind", "unbind", "unlock",
+}
+
+// revokeContactWriteGrants takes the principal's write-type grants off every
+// contact in the book, each contact's ACL updated under its own lock. A grant
+// of "all" becomes a grant of "read" in the same position, so read access the
+// owner gave on a contact survives; other grants and every deny are kept.
+func (s *Service) revokeContactWriteGrants(ctx context.Context, bookID int64, principalHref string) error {
+	memberPrefix := addressBookACLCollectionPath(bookID) + "/"
+	seen := map[string]struct{}{}
+	for _, spelling := range []string{principalHref, strings.TrimSuffix(principalHref, "/")} {
+		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, spelling)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			path := entry.ResourcePath
+			if !entry.IsGrant || !strings.HasPrefix(path, memberPrefix) || !slices.Contains(viewerRevokedPrivileges, entry.Privilege) {
+				continue
+			}
+			if _, done := seen[path]; done {
+				continue
+			}
+			seen[path] = struct{}{}
+			if err := s.store.ACLEntries.UpdateACL(ctx, path, func(current []store.ACLEntry) ([]store.ACLEntry, error) {
+				return withoutWriteGrants(current, principalHref), nil
+			}); err != nil {
+				return err
+			}
+		}
 	}
+	return nil
+}
+
+func withoutWriteGrants(entries []store.ACLEntry, principalHref string) []store.ACLEntry {
+	kept := make([]store.ACLEntry, 0, len(entries))
+	readAt := map[int]bool{}
+	for _, entry := range entries {
+		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.Privilege == "read" {
+			readAt[entry.Position] = true
+		}
+	}
+	for _, entry := range entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != principalHref || !slices.Contains(viewerRevokedPrivileges, entry.Privilege) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.Privilege == "all" && !readAt[entry.Position] {
+			entry.Privilege = "read"
+			readAt[entry.Position] = true
+			kept = append(kept, entry)
+		}
+	}
+	return kept
+}
+
+func sharePrincipalPrivilege(privilege string) bool {
+	return slices.Contains(sharePrincipalPrivileges, privilege)
 }
 
 func shareVisiblePrivilege(privilege string) bool {
@@ -52,19 +116,6 @@ func shareVisiblePrivilege(privilege string) bool {
 	default:
 		return false
 	}
-}
-
-func shareEditorFromEntries(entries []store.ACLEntry) bool {
-	for _, entry := range entries {
-		if !entry.IsGrant {
-			continue
-		}
-		switch entry.Privilege {
-		case "write", "write-content", "write-properties", "bind", "unbind", "all":
-			return true
-		}
-	}
-	return false
 }
 
 func addressBookACLCollectionPath(bookID int64) string {
@@ -278,43 +329,57 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 	}
 
 	resourcePath := addressBookACLCollectionPath(bookID)
-	entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
-	if err != nil {
+	principalHref := sharePrincipalHref(targetUserID)
+	if !editor {
+		// A contact's own grant is evaluated ahead of the book's, so a viewer
+		// keeps no write grant on any contact. This runs before the role is
+		// written so that a failure part way leaves less access, never more.
+		if err := s.revokeContactWriteGrants(ctx, bookID, principalHref); err != nil {
+			return err
+		}
+	}
+	err = s.store.ACLEntries.UpdateACL(ctx, resourcePath, func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
+		filtered := make([]store.ACLEntry, 0, len(entries))
+		sharePosition := -1
+		maxPosition := -1
+		for _, entry := range entries {
+			if entry.Position > maxPosition {
+				maxPosition = entry.Position
+			}
+			if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && sharePrincipalPrivilege(entry.Privilege) {
+				if sharePosition == -1 || entry.Position < sharePosition {
+					sharePosition = entry.Position
+				}
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		if sharePosition == -1 {
+			sharePosition = maxPosition + 1
+		}
+		for _, privilege := range sharePresetPrivileges(editor) {
+			filtered = append(filtered, store.ACLEntry{
+				ResourcePath:  resourcePath,
+				PrincipalHref: principalHref,
+				IsGrant:       true,
+				Privilege:     privilege,
+				Position:      sharePosition,
+			})
+		}
+		return filtered, nil
+	})
+	if err != nil || editor {
 		return err
 	}
-	principalHref := sharePrincipalHref(targetUserID)
-	filtered := make([]store.ACLEntry, 0, len(entries))
-	sharePosition := -1
-	maxPosition := -1
-	for _, entry := range entries {
-		if entry.Position > maxPosition {
-			maxPosition = entry.Position
-		}
-		if entry.PrincipalHref == principalHref && entry.IsGrant && shareManagedPrivilege(entry.Privilege) {
-			if sharePosition == -1 || entry.Position < sharePosition {
-				sharePosition = entry.Position
-			}
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	if sharePosition == -1 {
-		sharePosition = maxPosition + 1
-	}
-	for _, privilege := range sharePresetPrivileges(editor) {
-		filtered = append(filtered, store.ACLEntry{
-			ResourcePath:  resourcePath,
-			PrincipalHref: principalHref,
-			IsGrant:       true,
-			Privilege:     privilege,
-			Position:      sharePosition,
-		})
-	}
-	return s.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
+	// A contact-level write grant committed while the role was being written
+	// would outlive the downgrade, so the contacts are swept once more.
+	return s.revokeContactWriteGrants(ctx, bookID, principalHref)
 }
 
 // UnshareAddressBook removes a share. The owner may remove any principal; a
-// sharee may remove only their own grant (i.e. leave the shared book).
+// sharee may remove only their own (leave the book). It revokes every grant the
+// principal holds on the book and its contacts, since a contact's own grant is
+// evaluated ahead of the book's; deny entries stay.
 func (s *Service) UnshareAddressBook(ctx context.Context, user *store.User, bookID, targetUserID int64) error {
 	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
 	if err != nil {
@@ -323,42 +388,36 @@ func (s *Service) UnshareAddressBook(ctx context.Context, user *store.User, book
 	if book == nil {
 		return ErrNotFound
 	}
-	isOwner := user != nil && book.UserID == user.ID
 	resourcePath := addressBookACLCollectionPath(bookID)
-	entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
-	if err != nil {
-		return err
-	}
-	acl.SortEntries(entries)
-	if !isOwner {
+	if user == nil || book.UserID != user.ID {
 		// A non-owner may only remove their own share, and only if they actually
 		// have one (otherwise the book stays hidden).
 		if user == nil || targetUserID != user.ID {
 			return ErrNotFound
 		}
-		if !hasEffectiveManagedShare(entries, user.ID) {
+		entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
+		if err != nil {
+			return err
+		}
+		acl.SortEntries(entries)
+		if !hasEffectiveShare(entries, user.ID) {
 			return ErrNotFound
 		}
 	}
-	principalHref := sharePrincipalHref(targetUserID)
-	filtered := make([]store.ACLEntry, 0, len(entries))
-	for _, entry := range entries {
-		if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && shareManagedPrivilege(entry.Privilege) {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	return s.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
+	return s.store.ACLEntries.RevokePrincipalGrants(ctx, resourcePath, sharePrincipalHref(targetUserID), sharePrincipalPrivileges)
 }
 
-func hasEffectiveManagedShare(entries []store.ACLEntry, userID int64) bool {
+// hasEffectiveShare reports whether the user reads the book through a grant
+// naming them, which is what ListAddressBookShares lists as a share. A grant to
+// a broader principal alone is not theirs to remove.
+func hasEffectiveShare(entries []store.ACLEntry, userID int64) bool {
 	principalHref := sharePrincipalHref(userID)
 	applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
 	if read, _ := acl.DecisionForPrivilege(entries, applicable, "read"); !read {
 		return false
 	}
 	for _, entry := range entries {
-		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && acl.PrivilegeMatches(entry.Privilege, "read") && shareManagedPrivilege(entry.Privilege) {
+		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && acl.PrivilegeMatches(entry.Privilege, "read") {
 			return true
 		}
 	}

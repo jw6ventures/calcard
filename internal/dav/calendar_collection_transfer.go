@@ -21,8 +21,17 @@ func (h *DavServer) moveCalendarCollection(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *DavServer) transferCalendarCollection(w http.ResponseWriter, r *http.Request, user *store.User, sourceSegment, sourcePath, destinationPath, depth string, overwrite bool, operation store.CalendarCollectionTransferOperation) {
-	if normalizeDAVHref(sourcePath) == normalizeDAVHref(destinationPath) {
+	h.transferCalendarCollectionWithRetry(w, r, user, sourceSegment, sourcePath, destinationPath, depth, overwrite, operation, maxResourceStateRetries)
+}
+
+func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, sourceSegment, sourcePath, destinationPath, depth string, overwrite bool, operation store.CalendarCollectionTransferOperation, retries int) {
+	if cleanDAVPath(sourcePath) == cleanDAVPath(destinationPath) {
 		writeDAVError(w, http.StatusForbidden, "cannot-copy-move-onto-itself")
+		return
+	}
+	aclGuard, err := h.aclGuard(r.Context(), user, sourcePath, destinationPath)
+	if err != nil {
+		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 		return
 	}
 	destinationSlug, status, err := h.calendarCollectionTransferDestination(r, user, destinationPath)
@@ -159,9 +168,17 @@ func (h *DavServer) transferCalendarCollection(w http.ResponseWriter, r *http.Re
 		DestinationLockPath:  destinationLockPath,
 		Members:              members,
 		LockPreconditions:    h.lockPreconditions(r, lockPaths...),
+		ExpectedACL:          aclGuard,
 	}
 	defer invalidateDAVRequestState(r.Context())
 	result, err := h.store.TransferCalendarCollection(r.Context(), transfer)
+	if errors.Is(err, store.ErrResourceStateChanged) && retries > 0 {
+		// The collection, its members or the ACL the request was authorized
+		// against changed; the next attempt re-reads all of them.
+		invalidateDAVRequestState(r.Context())
+		h.transferCalendarCollectionWithRetry(w, r, user, sourceSegment, sourcePath, destinationPath, depth, overwrite, operation, retries-1)
+		return
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrResourceStateChanged):

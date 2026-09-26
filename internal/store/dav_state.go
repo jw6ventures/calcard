@@ -1,12 +1,15 @@
 package store
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,57 +17,161 @@ import (
 )
 
 // DAVResourceState identifies the exact object state on which the HTTP layer
-// based its conditional and privilege checks.
+// based its conditional and privilege checks. It deliberately carries nothing
+// else collection-wide: the collection ctag counts every member write, so
+// requiring it to hold would fail an operation on one member whenever an
+// unrelated sibling was written. ACL, when set, pins the ACL entries the
+// privilege checks were decided on.
 type DAVResourceState struct {
-	Exists         bool
-	ID             int64
-	UID            string
-	ResourceName   string
-	ETag           string
-	RawData        string
-	CollectionCTag *int64
+	Exists       bool
+	ID           int64
+	UID          string
+	ResourceName string
+	ETag         string
+	RawData      string
+	ACL          *ACLGuard
 }
 
 type ContactTransferExpectation struct {
-	Source                     DAVResourceState
-	Destination                DAVResourceState
-	SourceAddressBookCTag      *int64
-	DestinationAddressBookCTag *int64
-	Overwrite                  bool
+	Source      DAVResourceState
+	Destination DAVResourceState
+	ACL         *ACLGuard
+	Overwrite   bool
 }
 
-type collectionCTagExpectation struct {
-	id   int64
-	ctag *int64
+// ACLGuard pins the ACL entries a request's privilege checks were decided on.
+// A write that carries one re-reads those entries under its locks and fails
+// with ErrResourceStateChanged if any changed, so an ACL change landing between
+// the handler's check and the write is not bypassed; the HTTP layer retries,
+// and the retry's check sees the new ACL. Every ACL write holds the DAV path
+// locks of the resource it changes and of that resource's collection, which a
+// member write holds as well, so the entries cannot change again before the
+// guarded write commits.
+type ACLGuard struct {
+	paths       []string
+	fingerprint [sha256.Size]byte
 }
 
-func validateCollectionCTagsTx(ctx context.Context, tx *sql.Tx, table string, expectations ...collectionCTagExpectation) error {
-	expectedByID := make(map[int64]int64, len(expectations))
-	for _, expectation := range expectations {
-		if expectation.id <= 0 || expectation.ctag == nil {
-			continue
-		}
-		if expected, ok := expectedByID[expectation.id]; ok && expected != *expectation.ctag {
-			return ErrResourceStateChanged
-		}
-		expectedByID[expectation.id] = *expectation.ctag
+// NewACLGuard pins entries as everything stored for resourcePaths.
+func NewACLGuard(resourcePaths []string, entries []ACLEntry) *ACLGuard {
+	return &ACLGuard{paths: slices.Clone(resourcePaths), fingerprint: aclFingerprint(entries)}
+}
+
+// aclFingerprint digests the parts of entries an ACL decision reads, in an
+// order independent of how they were fetched.
+func aclFingerprint(entries []ACLEntry) [sha256.Size]byte {
+	sorted := slices.Clone(entries)
+	slices.SortFunc(sorted, func(a, b ACLEntry) int {
+		return cmp.Or(
+			cmp.Compare(a.ResourcePath, b.ResourcePath),
+			cmp.Compare(a.Position, b.Position),
+			cmp.Compare(a.PrincipalHref, b.PrincipalHref),
+			cmp.Compare(a.Privilege, b.Privilege),
+			compareBool(a.IsGrant, b.IsGrant),
+		)
+	})
+	hash := sha256.New()
+	for _, entry := range sorted {
+		fmt.Fprintf(hash, "%q %d %q %q %t\n", entry.ResourcePath, entry.Position, entry.PrincipalHref, entry.Privilege, entry.IsGrant)
 	}
-	ids := make([]int64, 0, len(expectedByID))
-	for id := range expectedByID {
-		ids = append(ids, id)
+	var sum [sha256.Size]byte
+	hash.Sum(sum[:0])
+	return sum
+}
+
+func compareBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	default:
+		return -1
 	}
-	slices.Sort(ids)
-	query := `SELECT ctag FROM ` + table + ` WHERE id=$1 FOR UPDATE`
+}
+
+// validateACLGuardTx re-reads the guarded ACL inside tx. The caller must
+// already hold the DAV path locks that exclude ACL writes to those paths.
+func validateACLGuardTx(ctx context.Context, tx *sql.Tx, guard *ACLGuard) error {
+	if guard == nil {
+		return nil
+	}
+	const query = `SELECT resource_path, principal_href, is_grant, privilege, ace_order FROM acl_entries WHERE resource_path = ANY($1)`
+	rows, err := tx.QueryContext(ctx, query, pq.Array(guard.paths))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var current []ACLEntry
+	for rows.Next() {
+		var entry ACLEntry
+		if err := rows.Scan(&entry.ResourcePath, &entry.PrincipalHref, &entry.IsGrant, &entry.Privilege, &entry.Position); err != nil {
+			return err
+		}
+		current = append(current, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if aclFingerprint(current) != guard.fingerprint {
+		return ErrResourceStateChanged
+	}
+	return nil
+}
+
+// validateACLGuardFallback is validateACLGuardTx for a store without a
+// connection pool, which has no transaction to hold the check in place.
+func validateACLGuardFallback(ctx context.Context, acl ACLRepository, guard *ACLGuard) error {
+	if guard == nil || acl == nil {
+		return nil
+	}
+	current, err := acl.ListByResources(ctx, guard.paths)
+	if err != nil {
+		return err
+	}
+	if aclFingerprint(current) != guard.fingerprint {
+		return ErrResourceStateChanged
+	}
+	return nil
+}
+
+// calendarCollectionLockPath and addressBookCollectionLockPath are the
+// canonical DAV paths of a collection, which every write to one of its members
+// serializes on whatever spelling its request used.
+func calendarCollectionLockPath(calendarID int64) string {
+	return "/dav/calendars/" + strconv.FormatInt(calendarID, 10)
+}
+
+func addressBookCollectionLockPath(addressBookID int64) string {
+	return "/dav/addressbooks/" + strconv.FormatInt(addressBookID, 10)
+}
+
+// lockCollectionRowsTx takes the rows of the collections a member write
+// changes, in ascending id order. The sync-stamp triggers read and advance
+// those rows' updated_at, so the lock has to be held before the first member
+// row is written: a writer that stamped first and waited for the row after
+// could commit a stamp older than a token handed out while it waited. Taking
+// the rows in one order also keeps two writes reaching the same pair in
+// opposite orders, such as MOVEs in opposite directions, from deadlocking. FOR
+// NO KEY UPDATE is the lock the triggers' UPDATEs take; FOR UPDATE would also
+// block the foreign-key checks of member inserts. A collection that no longer
+// exists is ErrResourceStateChanged, the same answer the HTTP layer retries on.
+func lockCollectionRowsTx(ctx context.Context, tx *sql.Tx, table string, ids ...int64) error {
+	ordered := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		var current int64
-		if err := tx.QueryRowContext(ctx, query, id).Scan(&current); err != nil {
+		if id > 0 {
+			ordered = append(ordered, id)
+		}
+	}
+	slices.Sort(ordered)
+	query := `SELECT 1 FROM ` + table + ` WHERE id=$1 FOR NO KEY UPDATE`
+	for _, id := range slices.Compact(ordered) {
+		var present int
+		if err := tx.QueryRowContext(ctx, query, id).Scan(&present); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrResourceStateChanged
 			}
 			return err
-		}
-		if current != expectedByID[id] {
-			return ErrResourceStateChanged
 		}
 	}
 	return nil
@@ -143,18 +250,39 @@ func (s *Store) CreateCalendarAndState(ctx context.Context, cal Calendar, dead [
 	return created, nil
 }
 
-func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition) error {
-	if len(preconditions) == 0 {
+// validateLockPreconditionsTx serializes the transaction on the precondition
+// paths and then checks that the request may write under the locks on them.
+//
+// A precondition path that is an ancestor of another one is named so that a
+// depth-infinity lock there is honoured, not because the request targets it.
+// It is therefore not a target of its own, and davPathLocks decides how it is
+// held as the other path's ancestor: exclusively when it is the collection
+// directly containing that path, shared when it is further up. A member write
+// thereby excludes its siblings without also excluding every collection of its
+// kind, which the per-kind root it names as its collection's parent would do.
+//
+// alsoSerialize names paths a later step of the same transaction takes
+// exclusively in its own right. They join this acquisition so the transaction
+// settles its whole exclusive set in one ordered pass: a path taken shared here
+// as an ancestor and exclusively later would be an upgrade that two
+// transactions holding it shared can deadlock on. That later step writes them
+// whether or not the request carried any precondition, so they are acquired
+// even when there is nothing to validate.
+func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition, alsoSerialize ...string) error {
+	if len(preconditions) == 0 && len(alsoSerialize) == 0 {
 		return nil
 	}
-	var serializationTargets []string
+	serializationTargets := slices.Clone(alsoSerialize)
 	for _, precondition := range preconditions {
-		serializationTargets = append(serializationTargets, precondition.ResourcePath)
-	}
-	for _, resourcePath := range sortedLockSerializationPaths(serializationTargets...) {
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
-			return err
+		if !lockPreconditionObservesDescendant(precondition.ResourcePath, preconditions) {
+			serializationTargets = append(serializationTargets, precondition.ResourcePath)
 		}
+	}
+	if err := acquireDAVPathLocks(ctx, tx, serializationTargets...); err != nil {
+		return err
+	}
+	if len(preconditions) == 0 {
+		return nil
 	}
 
 	lookupSet := make(map[string]struct{})
@@ -200,6 +328,19 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	return nil
 }
 
+// lockPreconditionObservesDescendant reports whether resourcePath is a strict
+// ancestor of another precondition's path, which davPathLocks already covers
+// as that path's ancestor.
+func lockPreconditionObservesDescendant(resourcePath string, preconditions []LockPrecondition) bool {
+	prefix := strings.TrimSuffix(path.Clean(resourcePath), "/") + "/"
+	for _, other := range preconditions {
+		if strings.HasPrefix(path.Clean(other.ResourcePath), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateLockPreconditionsFallback(ctx context.Context, locks LockRepository, preconditions []LockPrecondition) error {
 	if len(preconditions) == 0 || locks == nil {
 		return nil
@@ -229,11 +370,15 @@ func validateLockPreconditionsFallback(ctx context.Context, locks LockRepository
 	return nil
 }
 
+// ACLResourceExpectation is the state an ACL request was authorized against:
+// the collection it is in, the member's state when it targets a member, and
+// the ACL entries the privilege check read. A write to a sibling member leaves
+// all of it untouched, so it cannot fail the request.
 type ACLResourceExpectation struct {
 	CollectionKind string
 	CollectionID   int64
-	CollectionCTag *int64
 	ResourceState  *DAVResourceState
+	ACL            *ACLGuard
 }
 
 func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries []ACLEntry, expected ACLResourceExpectation, lockPreconditions []LockPrecondition) error {
@@ -242,6 +387,9 @@ func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries
 	}
 	if s.pool == nil {
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
 			return err
 		}
 		if expected.ResourceState != nil {
@@ -277,43 +425,97 @@ func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, davStatePaths(resourcePath)...); err != nil {
 		return err
 	}
-	switch expected.CollectionKind {
-	case "calendar":
-		if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-			collectionCTagExpectation{id: expected.CollectionID, ctag: expected.CollectionCTag}); err != nil {
-			return err
-		}
-		if expected.ResourceState != nil {
-			current, err := selectEventTx(ctx, tx, `resource_name`, expected.CollectionID, expected.ResourceState.ResourceName)
-			if err != nil {
-				return err
-			}
-			if !eventDAVStateMatches(*expected.ResourceState, current) {
-				return ErrResourceStateChanged
-			}
-		}
-	case "addressbook":
-		if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-			collectionCTagExpectation{id: expected.CollectionID, ctag: expected.CollectionCTag}); err != nil {
-			return err
-		}
-		if expected.ResourceState != nil {
-			current, err := selectContactTx(ctx, tx, `resource_name`, expected.CollectionID, expected.ResourceState.ResourceName)
-			if err != nil {
-				return err
-			}
-			if !contactDAVStateMatches(*expected.ResourceState, current) {
-				return ErrResourceStateChanged
-			}
-		}
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
+		return err
+	}
+	if err := validateTargetStateTx(ctx, tx, expected.CollectionKind, expected.CollectionID, expected.ResourceState); err != nil {
+		return err
 	}
 	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// CreateLockAndState creates lock like LockRepository.Create and additionally
+// refuses it with ErrResourceStateChanged when the ACL entries acl pins have
+// changed since the request's privilege check. A store without a connection
+// pool checks acl and then delegates to its lock repository.
+func (s *Store) CreateLockAndState(ctx context.Context, lock Lock, acl *ACLGuard) (*Lock, error) {
+	if s == nil || s.Locks == nil {
+		return nil, ErrNotFound
+	}
+	if err := validateLockDepth(lock.Depth); err != nil {
+		return nil, err
+	}
+	if s.pool == nil {
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, acl); err != nil {
+			return nil, err
+		}
+		return s.Locks.Create(ctx, lock)
+	}
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	created, err := createLockTx(ctx, tx, lock, acl)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+// validateTargetStateTx checks, inside tx, that the collection named by kind
+// and collectionID still exists and, when state is given, that its member is
+// still in that state. The collection row is only share-locked against its
+// deletion: sibling writes update it for the ctag, and nothing here should wait
+// for or fail on them.
+func validateTargetStateTx(ctx context.Context, tx *sql.Tx, kind string, collectionID int64, state *DAVResourceState) error {
+	var table string
+	switch kind {
+	case "calendar":
+		table = "calendars"
+	case "addressbook":
+		table = "address_books"
+	default:
+		return nil
+	}
+	var present int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM `+table+` WHERE id=$1 FOR KEY SHARE`, collectionID).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrResourceStateChanged
+	}
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return nil
+	}
+	if kind == "calendar" {
+		current, err := selectEventTx(ctx, tx, `resource_name`, collectionID, state.ResourceName)
+		if err != nil {
+			return err
+		}
+		if !eventDAVStateMatches(*state, current) {
+			return ErrResourceStateChanged
+		}
+		return nil
+	}
+	current, err := selectContactTx(ctx, tx, `resource_name`, collectionID, state.ResourceName)
+	if err != nil {
+		return err
+	}
+	if !contactDAVStateMatches(*state, current) {
+		return ErrResourceStateChanged
+	}
+	return nil
 }
 
 // LockPreconditionsSatisfied applies the write-lock conditions captured by the
@@ -331,9 +533,15 @@ func LockPreconditionsSatisfied(preconditions []LockPrecondition, locks []Lock) 
 			tokens[token] = struct{}{}
 		}
 
+		// A lock recorded under any stored spelling of the target, such as the
+		// extension-suffixed one earlier releases wrote, is on the target itself
+		// and binds at any depth; one on an ancestor binds only at infinity.
+		targetSpellings := make(map[string]struct{})
+		for _, spelling := range davStatePaths(path.Clean(precondition.ResourcePath)) {
+			targetSpellings[path.Clean(spelling)] = struct{}{}
+		}
 		active := false
 		satisfied := false
-		resourcePath := path.Clean(precondition.ResourcePath)
 		for _, lock := range locks {
 			if !lock.ExpiresAt.IsZero() && lock.ExpiresAt.Before(now) {
 				continue
@@ -342,7 +550,7 @@ func LockPreconditionsSatisfied(preconditions []LockPrecondition, locks []Lock) 
 			if _, applies := lookupPaths[lockPath]; !applies {
 				continue
 			}
-			if lockPath != resourcePath && lock.Depth != "infinity" {
+			if _, onTarget := targetSpellings[lockPath]; !onTarget && lock.Depth != "infinity" {
 				continue
 			}
 			active = true
@@ -377,6 +585,9 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, expec
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
 			return err
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
+			return err
+		}
 		current, err := s.Events.GetByResourceName(ctx, calendarID, expected.ResourceName)
 		if err != nil {
 			return err
@@ -395,14 +606,16 @@ func (s *Store) DeleteEventAndState(ctx context.Context, calendarID int64, expec
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, calendarCollectionLockPath(calendarID)); err != nil {
 		return err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-		collectionCTagExpectation{id: calendarID, ctag: expected.CollectionCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
 		return err
 	}
 	if err := acquireDAVObjectIdentityLocks(ctx, tx, "calendar-object", calendarID, expected); err != nil {
+		return err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "calendars", calendarID); err != nil {
 		return err
 	}
 	current, err := selectEventTx(ctx, tx, `resource_name`, calendarID, expected.ResourceName)
@@ -429,6 +642,9 @@ func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, 
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
 			return err
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
+			return err
+		}
 		current, err := s.Contacts.GetByResourceName(ctx, addressBookID, expected.ResourceName)
 		if err != nil {
 			return err
@@ -447,14 +663,16 @@ func (s *Store) DeleteContactAndState(ctx context.Context, addressBookID int64, 
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, addressBookCollectionLockPath(addressBookID)); err != nil {
 		return err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-		collectionCTagExpectation{id: addressBookID, ctag: expected.CollectionCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
 		return err
 	}
 	if err := acquireDAVObjectIdentityLocks(ctx, tx, "contact-object", addressBookID, expected); err != nil {
+		return err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "address_books", addressBookID); err != nil {
 		return err
 	}
 	current, err := selectContactTx(ctx, tx, `resource_name`, addressBookID, expected.ResourceName)
@@ -661,6 +879,12 @@ func (s *Store) MoveEventAndState(ctx context.Context, fromCalendarID, toCalenda
 	}
 	defer tx.Rollback()
 
+	if destResourceName == "" {
+		destResourceName = uid
+	}
+	if err := lockEventMoveTx(ctx, tx, fromCalendarID, toCalendarID, uid, "", destResourceName, fromStatePath, toStatePath); err != nil {
+		return err
+	}
 	if err := moveEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName); err != nil {
 		return err
 	}
@@ -719,6 +943,9 @@ func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID i
 	}
 	defer tx.Rollback()
 
+	if err := lockEventMoveTx(ctx, tx, fromCalendarID, event.CalendarID, event.UID, event.ResourceName, event.ResourceName, fromStatePath, toStatePath); err != nil {
+		return err
+	}
 	const updateQuery = `UPDATE events SET
 calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
 summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
@@ -773,6 +1000,42 @@ WHERE calendar_id=$13 AND uid=$14`
 	return tx.Commit()
 }
 
+// lockEventMoveTx takes what a DAV MOVE or COPY of the same event takes, in
+// the same order: the DAV path locks of both resources and both collections,
+// the object identity locks, and the two collection rows by ascending id. A
+// move skipping
+// any of them could reach the collection rows in the opposite order from a DAV
+// MOVE going the other way and deadlock against it, and a copy stamping its
+// new member before it waited for the destination could commit behind a sync
+// token handed out meanwhile. sourceResourceName and destResourceName may be
+// empty when the caller has not resolved them yet; the UID keys still
+// serialize the transfer against every other write to the event.
+func lockEventMoveTx(ctx context.Context, tx *sql.Tx, fromCalendarID, toCalendarID int64, uid, sourceResourceName, destResourceName, fromStatePath, toStatePath string) error {
+	lockPaths := []string{calendarCollectionLockPath(fromCalendarID), calendarCollectionLockPath(toCalendarID)}
+	lockPaths = append(lockPaths, davStatePaths(fromStatePath)...)
+	lockPaths = append(lockPaths, davStatePaths(toStatePath)...)
+	if err := acquireDAVPathLocks(ctx, tx, lockPaths...); err != nil {
+		return err
+	}
+	keys := []string{
+		fmt.Sprintf("calendar-object:%d:uid:%s", fromCalendarID, uid),
+		fmt.Sprintf("calendar-object:%d:uid:%s", toCalendarID, uid),
+	}
+	if destResourceName != "" {
+		keys = append(keys, fmt.Sprintf("calendar-object:%d:name:%s", toCalendarID, destResourceName))
+	}
+	if sourceResourceName != "" {
+		keys = append(keys, fmt.Sprintf("calendar-object:%d:name:%s", fromCalendarID, sourceResourceName))
+	}
+	slices.Sort(keys)
+	for _, key := range slices.Compact(keys) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, key); err != nil {
+			return err
+		}
+	}
+	return lockCollectionRowsTx(ctx, tx, "calendars", fromCalendarID, toCalendarID)
+}
+
 // MoveContactAndState is the contact counterpart of MoveEventAndState.
 func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, fromStatePath, toStatePath, replacedUID string, expected ContactTransferExpectation, lockPreconditions []LockPrecondition) error {
 	if s == nil || s.Contacts == nil {
@@ -780,6 +1043,9 @@ func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAd
 	}
 	if s.pool == nil {
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
 			return err
 		}
 		if err := validateContactTransferViaRepository(ctx, s.Contacts, fromAddressBookID, toAddressBookID, destResourceName, expected); err != nil {
@@ -796,15 +1062,17 @@ func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAd
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions,
+		addressBookCollectionLockPath(fromAddressBookID), addressBookCollectionLockPath(toAddressBookID)); err != nil {
 		return err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-		collectionCTagExpectation{id: fromAddressBookID, ctag: expected.SourceAddressBookCTag},
-		collectionCTagExpectation{id: toAddressBookID, ctag: expected.DestinationAddressBookCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
 		return err
 	}
 	if err := acquireContactTransferIdentityLocks(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName, expected); err != nil {
+		return err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "address_books", fromAddressBookID, toAddressBookID); err != nil {
 		return err
 	}
 	if _, _, err := transferContactTx(ctx, tx, contactTransferMove, fromAddressBookID, toAddressBookID, uid, destResourceName, "", expected); err != nil {
@@ -968,6 +1236,9 @@ func (s *Store) CopyEventAndState(ctx context.Context, fromCalendarID, toCalenda
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := lockEventMoveTx(ctx, tx, fromCalendarID, toCalendarID, uid, "", destResourceName, fromStatePath, toStatePath); err != nil {
+		return nil, err
+	}
 	event, err := copyEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName, newETag)
 	if err != nil {
 		return nil, err
@@ -992,6 +1263,9 @@ func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAd
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
 			return nil, err
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
+			return nil, err
+		}
 		if err := validateContactTransferViaRepository(ctx, s.Contacts, fromAddressBookID, toAddressBookID, destResourceName, expected); err != nil {
 			return nil, err
 		}
@@ -1010,15 +1284,17 @@ func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAd
 		return nil, err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions,
+		addressBookCollectionLockPath(fromAddressBookID), addressBookCollectionLockPath(toAddressBookID)); err != nil {
 		return nil, err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-		collectionCTagExpectation{id: fromAddressBookID, ctag: expected.SourceAddressBookCTag},
-		collectionCTagExpectation{id: toAddressBookID, ctag: expected.DestinationAddressBookCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
 		return nil, err
 	}
 	if err := acquireContactTransferIdentityLocks(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName, expected); err != nil {
+		return nil, err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "address_books", fromAddressBookID, toAddressBookID); err != nil {
 		return nil, err
 	}
 	contact, _, err := transferContactTx(ctx, tx, contactTransferCopy, fromAddressBookID, toAddressBookID, uid, destResourceName, newETag, expected)

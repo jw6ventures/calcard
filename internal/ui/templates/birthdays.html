@@ -287,6 +287,9 @@
 </div>
 
 <script>
+{{template "safe_html_js"}}
+</script>
+<script>
 (function() {
     // Birthday data from server
     var birthdays = ({{toJSON .BirthdayEvents}} || []).map(function(raw) {
@@ -295,7 +298,7 @@
             displayName: raw.DisplayName,
             month: raw.Month,
             day: raw.Day,
-            age: raw.Age === undefined ? null : raw.Age
+            birthYear: raw.BirthYear === undefined ? null : raw.BirthYear
         };
     });
     
@@ -328,19 +331,62 @@
         return name.split(' ').slice(0, 2).map(function(n) { return n.charAt(0); }).join('').toUpperCase();
     }
     
+    // observedBirthdayDay is the day of the month a birthday falls on in a
+    // given year. 29 February is kept on 28 February in a year without one,
+    // so it neither drops off the calendar nor moves into March.
+    function observedBirthdayDay(month, day, year) {
+        var leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+        return month === 2 && day === 29 && !leap ? 28 : day;
+    }
+
+    function birthdayDate(birthday, year) {
+        return new Date(year, birthday.month - 1, observedBirthdayDay(birthday.month, birthday.day, year));
+    }
+
+    // nextBirthday is the local midnight of the first occurrence on or after
+    // today's date, so a birthday today is still today's.
+    function nextBirthday(birthday, today) {
+        var start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+        var next = birthdayDate(birthday, start.getFullYear());
+        if (next < start) {
+            next = birthdayDate(birthday, start.getFullYear() + 1);
+        }
+        return next;
+    }
+
+    function daysUntil(birthday, today) {
+        var start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+        // Rounded, because a day across a DST change is not 24 hours long.
+        return Math.round((nextBirthday(birthday, today) - start) / (1000 * 60 * 60 * 24));
+    }
+
+    function birthdaysOn(list, date) {
+        return list.filter(function(b) {
+            return b.month === date.getMonth() + 1 &&
+                observedBirthdayDay(b.month, b.day, date.getFullYear()) === date.getDate();
+        });
+    }
+
+    // birthdayDateLabel names the day a birthday is marked in that year, and
+    // the day it really is when the two differ.
+    function birthdayDateLabel(birthday, year) {
+        var label = birthdayDate(birthday, year).toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+        if (observedBirthdayDay(birthday.month, birthday.day, year) !== birthday.day) {
+            // 2000 is a leap year, so every birthday exists in it.
+            label += ' (born ' + new Date(2000, birthday.month - 1, birthday.day)
+                .toLocaleDateString(undefined, { month: 'long', day: 'numeric' }) + ')';
+        }
+        return label;
+    }
+
     function showBirthdayModal(birthday, year) {
-        var date = new Date(year, birthday.month - 1, birthday.day);
-        var dateStr = date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+        var dateStr = escapeHtml(birthdayDateLabel(birthday, year));
         
         var body = '<div class="birthday-icon">🎂</div>';
         body += '<p><strong>' + escapeHtml(birthday.displayName) + '</strong></p>';
         body += '<p>Birthday: ' + dateStr + '</p>';
-        if (birthday.age !== null) {
-            var ageThisYear = birthday.age;
-            if (year !== new Date().getFullYear()) {
-                ageThisYear = birthday.age + (year - new Date().getFullYear());
-            }
-            body += '<p>Turns ' + ageThisYear + ' years old</p>';
+        if (birthday.birthYear !== null) {
+            body += '<p>Turns ' + (year - birthday.birthYear) + ' years old</p>';
         }
         
         document.getElementById('modal-title').textContent = 'Birthday';
@@ -348,19 +394,6 @@
         modal.classList.add('show');
     }
     
-    // Escapes the quotes as well as the markup delimiters, so a value stays
-    // inert wherever it is interpolated: a textContent round trip through the
-    // DOM escapes only & < >, which leaves a value free to close a
-    // double-quoted attribute and open an event handler. The ampersand is
-    // rewritten first so the entities introduced below are not escaped twice.
-    function escapeHtml(str) {
-        return (str === null ? '' : String(str))
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
     
     function renderCalendar() {
         var year = currentDate.getFullYear();
@@ -417,15 +450,10 @@
         if (otherMonth) cell.className += ' other-month';
         if (isToday) cell.className += ' today';
         
-        // Normalize month for comparison
-        var displayMonth = month + 1;
-        if (displayMonth < 1) displayMonth = 12;
-        if (displayMonth > 12) displayMonth = 1;
-        
-        // Find birthdays for this day
-        var dayBirthdays = birthdays.filter(function(b) {
-            return b.month === displayMonth && b.day === day;
-        });
+        // The padding cells pass the neighbouring month, which Date carries
+        // into the right year.
+        var cellDate = new Date(year, month, day);
+        var dayBirthdays = birthdaysOn(birthdays, cellDate);
         
         var numEl = document.createElement('div');
         numEl.className = 'day-number';
@@ -443,7 +471,7 @@
             evEl.textContent = '🎂 ' + b.displayName;
             evEl.addEventListener('click', function(e) {
                 e.stopPropagation();
-                showBirthdayModal(b, year);
+                showBirthdayModal(b, cellDate.getFullYear());
             });
             eventsEl.appendChild(evEl);
         });
@@ -462,15 +490,10 @@
     function renderUpcoming() {
         var list = document.getElementById('upcoming-list');
         var today = new Date();
-        var currentMonth = today.getMonth() + 1;
-        var currentDay = today.getDate();
         
         // Sort birthdays by upcoming date
         var sorted = birthdays.slice().sort(function(a, b) {
-            // Calculate days until birthday
-            var aDays = daysUntil(a.month, a.day, currentMonth, currentDay);
-            var bDays = daysUntil(b.month, b.day, currentMonth, currentDay);
-            return aDays - bDays;
+            return daysUntil(a, today) - daysUntil(b, today);
         });
         
         // Show next 5 birthdays
@@ -501,11 +524,8 @@
             
             var dateEl = document.createElement('div');
             dateEl.className = 'birthday-date';
-            var bdayDate = new Date(today.getFullYear(), b.month - 1, b.day);
-            if (bdayDate < today) {
-                bdayDate.setFullYear(bdayDate.getFullYear() + 1);
-            }
-            var daysAway = daysUntil(b.month, b.day, currentMonth, currentDay);
+            var bdayDate = nextBirthday(b, today);
+            var daysAway = daysUntil(b, today);
             if (daysAway === 0) {
                 dateEl.textContent = 'Today!';
             } else if (daysAway === 1) {
@@ -517,15 +537,10 @@
             
             item.appendChild(details);
             
-            if (b.age !== null) {
+            if (b.birthYear !== null) {
                 var age = document.createElement('div');
                 age.className = 'birthday-age';
-                var nextAge = b.age;
-                if (bdayDate.getFullYear() > today.getFullYear() || 
-                    (bdayDate.getFullYear() === today.getFullYear() && (b.month > currentMonth || (b.month === currentMonth && b.day > currentDay)))) {
-                    nextAge = b.age + 1;
-                }
-                age.textContent = 'Turning ' + nextAge;
+                age.textContent = 'Turning ' + (bdayDate.getFullYear() - b.birthYear);
                 item.appendChild(age);
             }
             
@@ -537,15 +552,6 @@
         });
     }
     
-    function daysUntil(targetMonth, targetDay, currentMonth, currentDay) {
-        var today = new Date();
-        var target = new Date(today.getFullYear(), targetMonth - 1, targetDay);
-        if (target < today) {
-            target.setFullYear(target.getFullYear() + 1);
-        }
-        var diff = target - today;
-        return Math.floor(diff / (1000 * 60 * 60 * 24));
-    }
     
     // Initial render
     renderCalendar();

@@ -39,6 +39,11 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
+		aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
+		if err != nil {
+			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			return
+		}
 		privilegePath := path.Dir(cleanPath)
 		source, accessErr := h.loadCalendarWithAnyPrivilege(r.Context(), user, calendarID, cleanPath)
 		if accessErr != nil {
@@ -77,7 +82,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		}
 		defer invalidateDAVRequestState(r.Context())
 		expected := store.EventDAVResourceState(existing)
-		expected.CollectionCTag = &source.CTag
+		expected.ACL = aclGuard
 		if err := h.store.DeleteEventAndState(r.Context(), calendarID, expected, canonicalPath, h.lockPreconditions(r, lockPaths...)); err != nil {
 			if errors.Is(err, store.ErrLockConflict) {
 				http.Error(w, "resource is locked", http.StatusLocked)
@@ -112,6 +117,11 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		http.Error(w, "failed to load address book", http.StatusInternalServerError)
 		return
 	} else if matched {
+		aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
+		if err != nil {
+			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
+			return
+		}
 		book, err := h.getAddressBook(r.Context(), addressBookID)
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -158,7 +168,7 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 		}
 		defer invalidateDAVRequestState(r.Context())
 		expected := store.ContactDAVResourceState(existing)
-		expected.CollectionCTag = &book.CTag
+		expected.ACL = aclGuard
 		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, expected, canonicalPath, h.lockPreconditions(r, lockPaths...)); err != nil {
 			if errors.Is(err, store.ErrLockConflict) {
 				http.Error(w, "resource is locked", http.StatusLocked)

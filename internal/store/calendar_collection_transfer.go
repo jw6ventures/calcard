@@ -72,6 +72,10 @@ type CalendarCollectionTransfer struct {
 
 	Members           []CalendarCollectionMember
 	LockPreconditions []LockPrecondition
+
+	// ExpectedACL pins the ACL entries the source and destination privilege
+	// checks read.
+	ExpectedACL *ACLGuard
 }
 
 // CalendarCollectionTransferResult reports the resulting collection, if the
@@ -104,6 +108,9 @@ func (s *Store) TransferCalendarCollection(ctx context.Context, transfer Calenda
 		if s.CalendarCollections == nil {
 			return nil, ErrAtomicStateUnsupported
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, transfer.ExpectedACL); err != nil {
+			return nil, err
+		}
 		return s.CalendarCollections.TransferCalendarCollection(ctx, transfer)
 	}
 
@@ -112,7 +119,13 @@ func (s *Store) TransferCalendarCollection(ctx context.Context, transfer Calenda
 		return nil, err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions); err != nil {
+	// The source is held even by a COPY, which leaves it in place: the member
+	// set and the ACL the request was checked against must not change before
+	// the copy commits.
+	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions, calendarCollectionLockPath(transfer.SourceID)); err != nil {
+		return nil, err
+	}
+	if err := validateACLGuardTx(ctx, tx, transfer.ExpectedACL); err != nil {
 		return nil, err
 	}
 	for _, key := range calendarCollectionTransferLockKeys(transfer) {

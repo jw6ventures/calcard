@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -979,6 +981,39 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 	return result, nil
 }
 
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+// RevokePrincipalGrants mirrors the repository contract: take back the named
+// collection privileges plus every grant beneath the collection, keeping denies.
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
+}
+
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
 	f.listByPrincipalCalls++
 	var result []store.ACLEntry
@@ -1056,5 +1091,30 @@ func TestDeleteEventConcurrentChange(t *testing.T) {
 				t.Fatal("concurrent update was deleted")
 			}
 		})
+	}
+}
+
+// The UID names the event's resource, and both are unique index keys whose
+// entries PostgreSQL bounds in size, so one past the limit is the caller's
+// error rather than a failed write.
+func TestCreateEventBoundsTheUID(t *testing.T) {
+	user := &store.User{ID: 1}
+	repo := &fakeEventRepo{events: map[string]store.Event{}}
+	svc := newServiceWithRepos(true, repo)
+	_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		RawICS:      validICS(strings.Repeat("u", store.MaxIdentifierOctets+1)),
+		ContentType: "text/calendar",
+	})
+	if !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("CreateEvent() error = %v, want ErrBadRequest", err)
+	}
+	if len(repo.events) != 0 {
+		t.Fatal("the event was stored")
+	}
+	if _, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		RawICS:      validICS(strings.Repeat("u", store.MaxIdentifierOctets)),
+		ContentType: "text/calendar",
+	}); err != nil || !created {
+		t.Fatalf("UID at the limit: created=%v err=%v", created, err)
 	}
 }

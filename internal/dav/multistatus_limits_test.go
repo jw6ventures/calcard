@@ -15,7 +15,6 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
-	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -286,6 +285,12 @@ func TestExpandOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	}
 }
 
+// A year of a secondly rule is thirty million occurrences, which no response
+// carries. The report is refused rather than answered from a prefix -- a
+// published prefix would leave the rest of the range looking free -- and the
+// refusal carries the RFC 4791 §7.8 postcondition §7.10 gives this report,
+// which says the request exceeded a server limit rather than that the server
+// broke.
 func TestFreeBusyOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	h := hostileRecurrenceServer()
 	body := `<?xml version="1.0" encoding="utf-8"?>
@@ -299,11 +304,14 @@ func TestFreeBusyOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", rr.Code, rr.Body.String())
 	}
-	if periods := strings.Count(rr.Body.String(), "FREEBUSY"); periods > ical.MaxRecurrenceInstances {
-		t.Fatalf("free-busy periods = %d, want at most %d", periods, ical.MaxRecurrenceInstances)
+	if !strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
+		t.Fatalf("refusal carries no DAV:number-of-matches-within-limits postcondition: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "FREEBUSY") {
+		t.Fatalf("a refused report published busy time: %s", rr.Body.String())
 	}
 }
 
@@ -975,7 +983,7 @@ func TestBirthdayMultiGetOverTheCandidateRowLimitReturns507(t *testing.T) {
 	rr := limitsBirthdayReport(t, h, `<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:prop><D:getetag/></D:prop>
-  <D:href>`+birthdayCalendarHref()+`birthday-contact-1@calcard.ics</D:href>
+  <D:href>`+calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(1, "contact-1"))+`</D:href>
 </C:calendar-multiget>`)
 
 	if rr.Code != http.StatusInsufficientStorage {
@@ -1076,7 +1084,7 @@ func TestBirthdayObjectGetOverTheCandidateRowLimitReturns507(t *testing.T) {
 	cfg.DAV.MaxReportCandidateRows = 100
 	h := limitsBirthdayServer(cfg, 400)
 
-	req := httptest.NewRequest("GET", birthdayCalendarHref()+"birthday-contact-1@calcard.ics", nil)
+	req := httptest.NewRequest("GET", calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(1, "contact-1")), nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Get(rr, req)
@@ -1372,5 +1380,58 @@ func TestBirthdayCollectionRepositoryFailureCarriesNoStorageDetail(t *testing.T)
 	}
 	if strings.Contains(rr.Body.String(), "contacts unavailable") {
 		t.Fatalf("report leaked the repository error: %s", rr.Body.String())
+	}
+}
+
+// A time-range asks only whether some instance of the resource intersects it,
+// and every instance the expansion generates already does. Running out of
+// budget before the end of the set therefore leaves the question unsettled for
+// that one resource, which the filter walk already answers conservatively by
+// keeping it -- the same answer it gives for a frequency it cannot expand.
+// Failing the whole REPORT instead loses every other resource in the
+// collection, and 500 is no RFC 4791 §7.8 postcondition either.
+func TestCalendarQueryTimeRangeSurvivesAResourceItCannotFullyExpand(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{
+		"1:forever": {
+			ID: 1, CalendarID: 1, UID: "forever", ResourceName: "forever", ETag: "e1",
+			RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:forever\r\n" +
+				"DTSTART:20240101T000000Z\r\nDTEND:20240101T000001Z\r\nRRULE:FREQ=SECONDLY\r\n" +
+				"END:VEVENT\r\nEND:VCALENDAR\r\n",
+		},
+		"1:oneoff": {
+			ID: 2, CalendarID: 1, UID: "oneoff", ResourceName: "oneoff", ETag: "e2",
+			RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:oneoff\r\n" +
+				"DTSTART:20240304T140000Z\r\nDTEND:20240304T150000Z\r\n" +
+				"END:VEVENT\r\nEND:VCALENDAR\r\n",
+		},
+	}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range start="20240101T000000Z" end="20250101T000000Z"/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
+	}
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/calendars/1/forever.ics", "/dav/calendars/1/oneoff.ics")
+	for href, etag := range map[string]string{"/dav/calendars/1/forever.ics": `"e1"`, "/dav/calendars/1/oneoff.ics": `"e2"`} {
+		ms.responseForHref(t, href).assertPropValue(t, davQN("getetag"), http.StatusOK, etag)
 	}
 }

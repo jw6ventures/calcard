@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -42,6 +44,35 @@ func (f *fakeACLRepo) ListByResource(_ context.Context, resourcePath string) ([]
 		}
 	}
 	return out, nil
+}
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
 }
 func (f *fakeACLRepo) ListByPrincipal(_ context.Context, principalHref string) ([]store.ACLEntry, error) {
 	var out []store.ACLEntry
@@ -140,6 +171,56 @@ func TestAPIShareLifecycle(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &shares)
 	if len(shares) != 0 {
 		t.Fatalf("after unshare shares=%+v, want none", shares)
+	}
+}
+
+// A grant on one contact is evaluated ahead of the book's, so unsharing the
+// book must revoke it too or that contact stays readable.
+func TestAPIUnshareRevokesResourceLevelGrant(t *testing.T) {
+	h, aclRepo := newSharingHandler()
+	h.store.Contacts.(*fakeContactRepo).contacts[contactKey(1, "secret")] = store.Contact{
+		AddressBookID: 1, UID: "secret", ResourceName: "secret", ETag: "e1",
+		RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:secret\r\nFN:Secret\r\nEND:VCARD\r\n",
+	}
+
+	body := strings.NewReader(`{"userId":2,"role":"viewer"}`)
+	req := routeReq(httptest.NewRequest(http.MethodPost, "/api/addressbooks/1/shares", body), map[string]string{"id": "1"})
+	rec := httptest.NewRecorder()
+	h.ShareAddressBook(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("share status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	aclRepo.entries = append(aclRepo.entries, store.ACLEntry{
+		ResourcePath:  "/dav/addressbooks/1/secret",
+		PrincipalHref: "/dav/principals/2/",
+		IsGrant:       true,
+		Privilege:     "read",
+	})
+
+	getSecret := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/addressbooks/1/contacts/secret", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "sharee@example.com"}))
+		rc := chi.NewRouteContext()
+		rc.URLParams.Add("id", "1")
+		rc.URLParams.Add("uid", "secret")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+		rec := httptest.NewRecorder()
+		h.GetContact(rec, req)
+		return rec
+	}
+	if rec := getSecret(); rec.Code != http.StatusOK {
+		t.Fatalf("sharee GetContact before unshare status=%d, want 200", rec.Code)
+	}
+
+	req = routeReq(httptest.NewRequest(http.MethodDelete, "/api/addressbooks/1/shares/2", nil), map[string]string{"id": "1", "userId": "2"})
+	rec = httptest.NewRecorder()
+	h.UnshareAddressBook(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("unshare status=%d", rec.Code)
+	}
+
+	if rec := getSecret(); rec.Code != http.StatusNotFound && rec.Code != http.StatusForbidden {
+		t.Fatalf("sharee GetContact after unshare status=%d, want 404 or 403", rec.Code)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/http/clientip"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
@@ -35,9 +35,12 @@ type Service struct {
 	authMu    sync.Mutex
 	authCache map[string]authCacheEntry
 
-	digestMu  sync.Mutex
-	digestKey []byte
-	digestNow func() time.Time
+	digestMu             sync.Mutex
+	digestKey            []byte
+	digestNow            func() time.Time
+	digestUnreadableOnce sync.Once
+
+	log *logging.Logger
 
 	trustedProxiesOnce sync.Once
 	trustedProxies     clientip.TrustedProxies
@@ -74,6 +77,19 @@ func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (
 		Endpoint:     provider.Endpoint(),
 		Scopes:       []string{"openid", "email", "profile"},
 	}}, nil
+}
+
+// SetLogger installs the sink the service reports through. Call it before the
+// service handles traffic; until then, and with a nil sink, nothing is logged.
+func (s *Service) SetLogger(sink logging.Sink) {
+	s.log = logging.New(sink, "Auth")
+}
+
+func (s *Service) logger() *logging.Logger {
+	if s == nil {
+		return nil
+	}
+	return s.log
 }
 
 func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +141,7 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.store.Users.UpsertOAuthUser(ctx, identity.Subject, identity.Email, identity.FullName, identity.FirstName)
 	if err != nil {
-		log.Printf("failed to persist user for subject %q: %v", identity.Subject, err)
+		s.logger().Error("oauth_callback", "failed to persist user for subject %q: %v", identity.Subject, err)
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
 		return
 	}
@@ -168,10 +184,8 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 		return "", nil, err
 	}
 
-	// An HA1 authenticates its holder without the password, so it is sealed
-	// under a key derived from the session secret rather than stored as the
-	// bare hash Digest computes. Without a configured secret there is no key,
-	// and the app password is created usable over Basic alone.
+	// Both nil unless Digest is enabled and a session secret is configured,
+	// leaving the new app password Basic-only.
 	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, plaintext)
 	if err != nil {
 		return "", nil, err
@@ -231,21 +245,32 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 	return nil, errors.New("invalid app password")
 }
 
-// backfillDigestCredentials attaches Digest HA1s to an app password issued
-// without them. An HA1 cannot be derived from the stored bcrypt hash, so a
-// successful Basic authentication is the only moment the server can produce
-// one for an existing credential; every app password predating Digest depends
-// on this to become able to answer a Digest challenge.
+// backfillDigestCredentials brings an app password's stored HA1s in line with
+// the Digest setting after a successful Basic authentication, the only moment
+// the server holds the plaintext password. With Digest on, a password that has
+// no HA1 this server can open -- one issued while Digest was off, or one sealed
+// under a since-rotated session secret -- is sealed afresh. With Digest off,
+// any HA1 the row still holds is cleared, backing up the periodic purge.
+//
+// Every write is a compare-and-swap against the row as it was read, so a
+// request acting on a stale read loses rather than overwriting what a
+// concurrent request stored.
 //
 // Every failure here is logged and swallowed. The password has already been
 // verified, and refusing the request because a convenience write did not land
-// would turn a working credential into a broken one -- the exact outcome this
-// exists to prevent.
+// would turn a working credential into a broken one.
 func (s *Service) backfillDigestCredentials(ctx context.Context, user *store.User, token store.AppPassword, password string) {
-	if token.DigestMD5HA1 != nil || token.DigestSHA256HA1 != nil {
+	if user == nil || user.PrimaryEmail == "" || s.store == nil || s.store.AppPasswords == nil {
 		return
 	}
-	if user == nil || user.PrimaryEmail == "" || s.store == nil || s.store.AppPasswords == nil {
+	stored := token.DigestMD5HA1 != nil || token.DigestSHA256HA1 != nil
+	if !s.digestEnabled() {
+		if stored && s.replaceDigestCredentials(ctx, token, nil, nil) {
+			s.logger().Info("dav_digest", "cleared the stored credentials on app password %d because APP_DAV_DIGEST_ENABLED is off", token.ID)
+		}
+		return
+	}
+	if stored && DigestReady(s.cfg, token) {
 		return
 	}
 	// Hashed over the account's own address rather than the spelling the
@@ -253,17 +278,32 @@ func (s *Service) backfillDigestCredentials(ctx context.Context, user *store.Use
 	// have produced and what the Digest lookup resolves the username to.
 	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, password)
 	if err != nil {
-		log.Printf("dav digest: could not seal credentials for app password %d: %v", token.ID, err)
+		s.logger().Error("dav_digest", "could not seal credentials for app password %d: %v", token.ID, err)
 		return
 	}
 	if md5HA1 == nil || sha256HA1 == nil {
-		// No session secret, so there is no key and no HA1 to store. The app
-		// password stays Basic-only, which is the state it was already in.
+		// No session secret, so no key: the app password stays Basic-only.
 		return
 	}
-	if err := s.store.AppPasswords.SetDigestCredentials(ctx, token.ID, *md5HA1, *sha256HA1); err != nil {
-		log.Printf("dav digest: could not store credentials for app password %d: %v", token.ID, err)
+	if s.replaceDigestCredentials(ctx, token, md5HA1, sha256HA1) && stored {
+		s.logger().Info("dav_digest", "re-sealed the unreadable credentials on app password %d", token.ID)
 	}
+}
+
+// replaceDigestCredentials swaps the row's HA1s from what token holds to the
+// given values and reports whether the swap landed.
+func (s *Service) replaceDigestCredentials(ctx context.Context, token store.AppPassword, md5HA1, sha256HA1 *string) bool {
+	replaced, err := s.store.AppPasswords.ReplaceDigestCredentials(ctx, token.ID, md5HA1, sha256HA1, token.DigestMD5HA1, token.DigestSHA256HA1)
+	if err != nil {
+		s.logger().Error("dav_digest", "could not store credentials for app password %d: %v", token.ID, err)
+		return false
+	}
+	if !replaced {
+		// Another request changed the row after this one read it; its value
+		// stands, and this request's credential check is unaffected.
+		s.logger().Debug("dav_digest", "credentials for app password %d changed concurrently; left them as they are", token.ID)
+	}
+	return replaced
 }
 
 func (s *Service) RequireSession(next http.Handler) http.Handler {

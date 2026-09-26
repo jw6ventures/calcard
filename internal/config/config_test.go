@@ -477,3 +477,58 @@ func TestGetenvHelpers(t *testing.T) {
 		t.Fatalf("getenvList() = %#v, want nil", got)
 	}
 }
+
+// The auth service sends the identity provider to APP_BASE_URL plus this path
+// and the router serves the callback there, so the value has to be a plain
+// absolute path that no route the application already serves claims.
+func TestLoadValidatesOAuthRedirectPath(t *testing.T) {
+	setRequired := func(t *testing.T, redirectPath string) {
+		t.Helper()
+		t.Setenv("APP_DB_DSN", "postgres://dsn")
+		t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+		t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+		t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+		t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+		t.Setenv("APP_TRUSTED_PROXIES", "")
+		t.Setenv("APP_OAUTH_REDIRECT_PATH", redirectPath)
+	}
+
+	for _, tc := range []struct{ value, want string }{
+		{"", "/auth/callback"},
+		{"/auth/callback", "/auth/callback"},
+		{"/oidc/return", "/oidc/return"},
+		{"/sso-callback", "/sso-callback"},
+		{"/calendars-sso", "/calendars-sso"},
+	} {
+		t.Run("accepts "+tc.value, func(t *testing.T) {
+			setRequired(t, tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.OAuth.RedirectPath != tc.want {
+				t.Fatalf("OAuth.RedirectPath = %q, want %q", cfg.OAuth.RedirectPath, tc.want)
+			}
+		})
+	}
+
+	for _, value := range []string{
+		// Not a plain absolute path.
+		"auth/callback", "https://idp.example/cb", "//idp.example/cb",
+		"/cb?x=1", "/cb#frag", "/cb/{id}", "/cb/*", "/cb/../auth/login", "/cb/./x", "/cb//x", "/cb with space",
+		// Collides with a route the application serves.
+		"/", "/auth", "/auth/login", "/auth/logout", "/auth/oidc",
+		"/dav", "/dav/cb", "/api/cb", "/healthz", "/readyz", "/metrics",
+		"/.well-known/caldav", "/.well-known/openid", "/principals/cb", "/calendar/cb",
+		"/calendars", "/calendars/cb", "/addressbooks", "/app-passwords", "/sessions",
+		"/birthdays", "/help", "/onboarding/cb",
+	} {
+		t.Run("refuses "+value, func(t *testing.T) {
+			setRequired(t, value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "APP_OAUTH_REDIRECT_PATH") {
+				t.Fatalf("Load() error = %v, want an APP_OAUTH_REDIRECT_PATH error", err)
+			}
+		})
+	}
+}

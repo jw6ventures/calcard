@@ -5,12 +5,15 @@ import (
 	"database/sql"
 )
 
-func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, props CalendarProperties, resourcePath string, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition) error {
+func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, props CalendarProperties, resourcePath string, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition, acl *ACLGuard) error {
 	if s == nil || s.Calendars == nil {
 		return ErrNotFound
 	}
 	if s.pool == nil {
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, acl); err != nil {
 			return err
 		}
 		if err := s.Calendars.UpdateProperties(ctx, calendarID, props); err != nil {
@@ -27,7 +30,10 @@ func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, p
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, resourcePath); err != nil {
+		return err
+	}
+	if err := validateACLGuardTx(ctx, tx, acl); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE calendars SET name=$1, description=$2, description_lang=$3, timezone=$4, color=$5, updated_at=NOW() WHERE id=$6`, props.Name, props.Description, props.DescriptionLang, props.Timezone, props.Color, calendarID)
@@ -43,12 +49,15 @@ func (s *Store) PatchCalendarProperties(ctx context.Context, calendarID int64, p
 	return tx.Commit()
 }
 
-func (s *Store) PatchAddressBookProperties(ctx context.Context, addressBookID int64, name string, description *string, resourcePath string, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition) error {
+func (s *Store) PatchAddressBookProperties(ctx context.Context, addressBookID int64, name string, description *string, resourcePath string, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition, acl *ACLGuard) error {
 	if s == nil || s.AddressBooks == nil {
 		return ErrNotFound
 	}
 	if s.pool == nil {
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, acl); err != nil {
 			return err
 		}
 		if err := s.AddressBooks.UpdateProperties(ctx, addressBookID, name, description); err != nil {
@@ -65,7 +74,10 @@ func (s *Store) PatchAddressBookProperties(ctx context.Context, addressBookID in
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, resourcePath); err != nil {
+		return err
+	}
+	if err := validateACLGuardTx(ctx, tx, acl); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE address_books SET name=$1, description=$2, updated_at=NOW() WHERE id=$3`, name, description, addressBookID)
@@ -93,6 +105,9 @@ func (s *Store) PatchObjectDeadProperties(ctx context.Context, kind string, coll
 	}
 	if s.pool == nil {
 		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
 			return err
 		}
 		switch kind {
@@ -128,15 +143,14 @@ func (s *Store) PatchObjectDeadProperties(ctx context.Context, kind string, coll
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, resourcePath); err != nil {
+		return err
+	}
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
 		return err
 	}
 	switch kind {
 	case "calendar":
-		if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-			collectionCTagExpectation{id: collectionID, ctag: expected.CollectionCTag}); err != nil {
-			return err
-		}
 		current, err := selectEventTx(ctx, tx, `resource_name`, collectionID, expected.ResourceName)
 		if err != nil {
 			return err
@@ -145,10 +159,6 @@ func (s *Store) PatchObjectDeadProperties(ctx context.Context, kind string, coll
 			return ErrResourceStateChanged
 		}
 	case "addressbook":
-		if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-			collectionCTagExpectation{id: collectionID, ctag: expected.CollectionCTag}); err != nil {
-			return err
-		}
 		current, err := selectContactTx(ctx, tx, `resource_name`, collectionID, expected.ResourceName)
 		if err != nil {
 			return err

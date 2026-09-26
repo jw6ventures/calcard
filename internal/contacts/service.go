@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
+	"github.com/jw6ventures/calcard/internal/vcard"
 )
 
 // MaxBodyBytes bounds the size of a contact write payload.
@@ -29,6 +31,27 @@ var (
 	ErrConflict           = errors.New("conflict")
 	ErrPreconditionFailed = errors.New("precondition failed")
 )
+
+// FieldError is a refused structured payload field. Field is the
+// StructuredInput JSON name; it unwraps to ErrBadRequest.
+type FieldError struct {
+	Field  string
+	Reason string
+}
+
+// FieldError reasons.
+const (
+	ReasonRequired          = "is required"
+	ReasonControlCharacters = "must not contain control characters"
+	ReasonUIDCharacters     = "may contain only letters, digits and - . _ ~ @ : + ="
+	ReasonUIDTooLong        = "must be at most 1024 characters long"
+)
+
+func (e *FieldError) Error() string {
+	return ErrBadRequest.Error() + ": " + e.Field + " " + e.Reason
+}
+
+func (e *FieldError) Unwrap() error { return ErrBadRequest }
 
 // Service exposes address book and contact operations for API callers.
 type Service struct {
@@ -163,57 +186,171 @@ func (s *Service) GetContact(ctx context.Context, user *store.User, bookID int64
 
 // CreateContact creates a new contact. It fails with ErrConflict if one with the
 // same UID already exists.
+// The write is conditional on no contact existing under its UID or resource
+// name, so a contact another client creates concurrently is not overwritten.
+// A write that loses to a concurrent change of the contact or of the ACL is
+// decided again, which reports that contact as a conflict and a withdrawn
+// grant as forbidden.
 func (s *Service) CreateContact(ctx context.Context, user *store.User, bookID int64, input UpsertInput) (*store.Contact, bool, error) {
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "bind"); err != nil {
-		return nil, false, err
-	}
-	body, uid, err := normalizeVCardPayload(input, "")
+	body, uid, err := normalizeVCardPayload(input, "", "")
 	if err != nil {
+		if _, accessErr := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "bind"); accessErr != nil {
+			return nil, false, accessErr
+		}
 		return nil, false, err
 	}
-	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
-	if err != nil {
-		return nil, false, err
+	conditional := input.IfMatch != "" || input.IfNoneMatch != ""
+	for attempt := 1; ; attempt++ {
+		c, err := s.createContactOnce(ctx, user, bookID, uid, body, input)
+		if !errors.Is(err, store.ErrResourceStateChanged) {
+			return c, err == nil, err
+		}
+		if conditional {
+			return nil, false, ErrPreconditionFailed
+		}
+		if attempt == maxUpdateAttempts {
+			return nil, false, ErrConflict
+		}
 	}
-	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
-	}
-	if existing != nil {
-		return nil, false, ErrConflict
-	}
-	return s.saveContact(ctx, bookID, uid, uid, body, input.IfMatch, input.IfNoneMatch)
 }
 
-// UpdateContact replaces an existing contact identified by uid.
-func (s *Service) UpdateContact(ctx context.Context, user *store.User, bookID int64, uid string, input UpsertInput) (*store.Contact, bool, error) {
+func (s *Service) createContactOnce(ctx context.Context, user *store.User, bookID int64, uid, body string, input UpsertInput) (*store.Contact, error) {
+	resourceName := newContactResourceName(uid)
+	guard, err := s.writeGuard(ctx, user, bookID, resourceName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "bind"); err != nil {
+		return nil, err
+	}
 	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
 	if err != nil {
-		return nil, false, err
+		return nil, err
+	}
+	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
+		return nil, ErrPreconditionFailed
+	}
+	if existing != nil {
+		return nil, ErrConflict
+	}
+	result, err := s.store.PutContactObject(ctx, store.ContactObjectWrite{
+		AddressBookID: bookID,
+		UID:           uid,
+		ResourceName:  resourceName,
+		RawVCard:      body,
+		ETag:          utils.GenerateETag(body),
+		ExpectedState: store.DAVResourceState{ACL: guard},
+		StatePath:     addressBookACLResourcePaths(bookID, resourceName)[0],
+	})
+	switch {
+	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
+		return nil, ErrConflict
+	case errors.Is(err, store.ErrPreconditionFailed):
+		return nil, ErrPreconditionFailed
+	case err != nil:
+		return nil, err
+	}
+	return result.Contact, nil
+}
+
+// writeGuard pins the ACL entries a non-owner's write to one contact is
+// decided on: the book's and the contact's own. The store refuses the write if
+// they change before it commits, and the caller re-decides. An owner's access
+// does not come from the ACL, so it writes unguarded.
+func (s *Service) writeGuard(ctx context.Context, user *store.User, bookID int64, resourceName string) (*store.ACLGuard, error) {
+	if s.store.ACLEntries == nil || s.store.AddressBooks == nil {
+		return nil, nil
+	}
+	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil || (user != nil && book.UserID == user.ID) {
+		return nil, nil
+	}
+	paths := append([]string{addressBookACLCollectionPath(bookID)}, addressBookACLResourcePaths(bookID, resourceName)...)
+	entries, err := s.store.ACLEntries.ListByResources(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+	return store.NewACLGuard(paths, entries), nil
+}
+
+// maxUpdateAttempts bounds how often an update is re-read and re-applied
+// when another writer changes the contact between the read and the write.
+const maxUpdateAttempts = 3
+
+// UpdateContact replaces an existing contact identified by uid. The write is
+// conditional on the version it was built from: a structured edit is merged
+// into that version, so a concurrent write is re-read and the edit re-applied
+// rather than overwritten. A caller's own If-Match or If-None-Match is honoured
+// instead of retrying.
+func (s *Service) UpdateContact(ctx context.Context, user *store.User, bookID int64, uid string, input UpsertInput) (*store.Contact, bool, error) {
+	conditional := input.IfMatch != "" || input.IfNoneMatch != ""
+	for attempt := 1; ; attempt++ {
+		c, err := s.updateContactOnce(ctx, user, bookID, uid, input)
+		if !errors.Is(err, store.ErrResourceStateChanged) {
+			return c, false, err
+		}
+		if conditional {
+			return nil, false, ErrPreconditionFailed
+		}
+		if attempt == maxUpdateAttempts {
+			return nil, false, ErrConflict
+		}
+	}
+}
+
+func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookID int64, uid string, input UpsertInput) (*store.Contact, error) {
+	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
+	if err != nil {
+		return nil, err
 	}
 	if existing == nil {
 		if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "write-content"); err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		return nil, false, ErrNotFound
+		return nil, ErrNotFound
 	}
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, contactResourceName(*existing), "write-content"); err != nil {
-		return nil, false, err
+	resourceName := contactResourceName(*existing)
+	guard, err := s.writeGuard(ctx, user, bookID, resourceName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, resourceName, "write-content"); err != nil {
+		return nil, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
+		return nil, ErrPreconditionFailed
 	}
-	body, normalizedUID, err := normalizeVCardPayload(input, uid)
+	body, normalizedUID, err := normalizeVCardPayload(input, uid, existing.RawVCard)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if normalizedUID != uid {
-		return nil, false, fmt.Errorf("%w: uid mismatch", ErrBadRequest)
+		return nil, fmt.Errorf("%w: uid mismatch", ErrBadRequest)
 	}
-	resourceName := existing.ResourceName
-	if resourceName == "" {
-		resourceName = uid
+	expected := store.ContactDAVResourceState(existing)
+	expected.ACL = guard
+	statePaths := addressBookACLResourcePaths(bookID, resourceName)
+	result, err := s.store.PutContactObject(ctx, store.ContactObjectWrite{
+		AddressBookID: bookID,
+		UID:           uid,
+		ResourceName:  resourceName,
+		RawVCard:      body,
+		ETag:          utils.GenerateETag(body),
+		ExpectedState: expected,
+		StatePath:     statePaths[0],
+	})
+	switch {
+	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
+		return nil, ErrConflict
+	case errors.Is(err, store.ErrPreconditionFailed):
+		return nil, ErrPreconditionFailed
+	case err != nil:
+		return nil, err
 	}
-	return s.saveContact(ctx, bookID, uid, resourceName, body, input.IfMatch, input.IfNoneMatch)
+	return result.Contact, nil
 }
 
 // DeleteContact removes a contact, honoring If-Match/If-None-Match preconditions.
@@ -356,51 +493,28 @@ func addressBookIDFromCollectionPath(resourcePath string) (int64, bool) {
 	return id, true
 }
 
-func (s *Service) saveContact(ctx context.Context, bookID int64, uid, resourceName, body, ifMatch, ifNoneMatch string) (*store.Contact, bool, error) {
-	existingByResource, err := s.store.Contacts.GetByResourceName(ctx, bookID, resourceName)
-	if err != nil {
-		return nil, false, err
-	}
-	if existingByResource != nil && existingByResource.UID != uid {
-		return nil, false, ErrConflict
-	}
-
-	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
-	if err != nil {
-		return nil, false, err
-	}
-	if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
-		return nil, false, ErrConflict
-	}
-	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
-	}
-
-	etag := utils.GenerateETag(body)
-	created := existing == nil
-	c, err := s.store.Contacts.Upsert(ctx, store.Contact{
-		AddressBookID: bookID,
-		UID:           uid,
-		ResourceName:  resourceName,
-		RawVCard:      body,
-		ETag:          etag,
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			return nil, false, ErrConflict
-		}
-		return nil, false, err
-	}
-	return c, created, nil
-}
-
-func normalizeVCardPayload(input UpsertInput, expectedUID string) (string, string, error) {
+// normalizeVCardPayload turns a write payload into the card to store. A
+// structured edit is merged into stored, the card it replaces, when there is
+// one.
+func normalizeVCardPayload(input UpsertInput, expectedUID, stored string) (string, string, error) {
 	if strings.TrimSpace(input.RawVCard) != "" {
 		body := ensureCRLF(strings.TrimSpace(input.RawVCard))
-		if err := validateVCard(body); err != nil {
-			return "", "", err
+		if err := vcard.CheckOctets(body); err != nil {
+			return "", "", fmt.Errorf("%w: %w", ErrBadRequest, err)
 		}
-		uid := utils.ExtractVCardUID(body)
+		structure, err := vcard.Inspect(body, false)
+		if err != nil && vcard.Version(body) == "2.1" {
+			converted, convertErr := vcard.Convert21To30(body)
+			if convertErr != nil {
+				return "", "", fmt.Errorf("%w: vCard 2.1: %w", ErrBadRequest, convertErr)
+			}
+			body = converted
+			structure, err = vcard.Inspect(body, false)
+		}
+		if err != nil {
+			return "", "", fmt.Errorf("%w: %w", ErrBadRequest, err)
+		}
+		uid := structure.UID
 		if uid == "" {
 			uid = expectedUID
 			if uid == "" {
@@ -417,16 +531,97 @@ func normalizeVCardPayload(input UpsertInput, expectedUID string) (string, strin
 	if input.Structured == nil {
 		return "", "", fmt.Errorf("%w: missing contact body", ErrBadRequest)
 	}
-	return buildStructuredContact(input.Structured, expectedUID)
+	return structuredContactBody(input.Structured, expectedUID, stored)
 }
 
-func buildStructuredContact(input *StructuredInput, expectedUID string) (string, string, error) {
-	displayName := strings.TrimSpace(input.DisplayName)
-	if displayName == "" {
-		return "", "", fmt.Errorf("%w: displayName is required", ErrBadRequest)
+// validateStructuredFields refuses control characters in a contact payload,
+// since a CR or LF would end the content line the value is written into. Notes
+// come from a textarea, so line breaks there are escaped instead.
+func validateStructuredFields(input *StructuredInput) error {
+	fields := []struct {
+		name      string
+		value     string
+		multiline bool
+	}{
+		{name: "uid", value: input.UID},
+		{name: "displayName", value: input.DisplayName},
+		{name: "firstName", value: input.FirstName},
+		{name: "lastName", value: input.LastName},
+		{name: "email", value: input.Email},
+		{name: "phone", value: input.Phone},
+		{name: "birthday", value: input.Birthday},
+		{name: "company", value: input.Company},
+		{name: "notes", value: input.Notes, multiline: true},
+	}
+	for _, field := range fields {
+		for _, c := range []byte(field.value) {
+			if (c == '\r' || c == '\n') && field.multiline {
+				continue
+			}
+			if vcard.IsControlOctet(c) {
+				return &FieldError{Field: field.name, Reason: ReasonControlCharacters}
+			}
+		}
+	}
+	return nil
+}
+
+// safeResourceSegment reports whether a UID can name a new contact's resource
+// as a single path segment without escaping.
+func safeResourceSegment(uid string) bool {
+	if uid == "" || uid == "." || uid == ".." {
+		return false
+	}
+	for i := 0; i < len(uid); i++ {
+		c := uid[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		case strings.IndexByte("-._~@:+=", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// newContactResourceName names a new contact's resource after its UID when the
+// UID is a safe path segment. A raw card keeps whatever UID its author wrote,
+// so an unsafe one gets a generated resource name instead.
+func newContactResourceName(uid string) string {
+	if safeResourceSegment(uid) {
+		return uid
+	}
+	return utils.GenerateUID()
+}
+
+func structuredContactBody(input *StructuredInput, expectedUID, stored string) (string, string, error) {
+	if err := validateStructuredFields(input); err != nil {
+		return "", "", err
+	}
+
+	form := contactForm{
+		displayName: strings.TrimSpace(input.DisplayName),
+		firstName:   strings.TrimSpace(input.FirstName),
+		lastName:    strings.TrimSpace(input.LastName),
+		email:       strings.TrimSpace(input.Email),
+		phone:       strings.TrimSpace(input.Phone),
+		birthday:    strings.TrimSpace(input.Birthday),
+		notes:       strings.TrimSpace(input.Notes),
+		company:     strings.TrimSpace(input.Company),
+	}
+	if form.displayName == "" {
+		return "", "", &FieldError{Field: "displayName", Reason: ReasonRequired}
 	}
 
 	uid := strings.TrimSpace(input.UID)
+	// An edit keeps the UID the contact already has, which another client may
+	// have written with any characters, so only a new UID is restricted.
+	if expectedUID == "" && uid != "" && !safeResourceSegment(uid) {
+		return "", "", &FieldError{Field: "uid", Reason: ReasonUIDCharacters}
+	}
+	if expectedUID == "" && len(uid) > vcard.MaxUIDOctets {
+		return "", "", &FieldError{Field: "uid", Reason: ReasonUIDTooLong}
+	}
 	if expectedUID != "" {
 		if uid != "" && uid != expectedUID {
 			return "", "", fmt.Errorf("%w: path uid does not match payload uid", ErrBadRequest)
@@ -437,26 +632,16 @@ func buildStructuredContact(input *StructuredInput, expectedUID string) (string,
 		uid = utils.GenerateUID()
 	}
 
-	body := utils.BuildVCard(
-		uid,
-		displayName,
-		strings.TrimSpace(input.FirstName),
-		strings.TrimSpace(input.LastName),
-		strings.TrimSpace(input.Email),
-		strings.TrimSpace(input.Phone),
-		strings.TrimSpace(input.Birthday),
-		strings.TrimSpace(input.Notes),
-		strings.TrimSpace(input.Company),
-	)
-	return body, uid, nil
-}
-
-func validateVCard(body string) error {
-	upper := strings.ToUpper(body)
-	if !strings.HasPrefix(upper, "BEGIN:VCARD") || !strings.Contains(upper, "END:VCARD") {
-		return fmt.Errorf("%w: invalid vCard data", ErrBadRequest)
+	if stored != "" {
+		body, err := mergeStructuredContact(stored, uid, form, time.Now())
+		return body, uid, err
 	}
-	return nil
+
+	body, err := utils.BuildVCard(uid, form.displayName, form.firstName, form.lastName, form.email, form.phone, form.birthday, form.notes, form.company)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %w", ErrBadRequest, err)
+	}
+	return body, uid, nil
 }
 
 // injectVCardUID inserts a UID line immediately after the BEGIN:VCARD line.

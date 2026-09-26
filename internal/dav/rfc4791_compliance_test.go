@@ -4732,7 +4732,7 @@ func TestRFC4791_SupportedCollationSetAdvertisedOnCalendarObjectResources(t *tes
 		rr := httptest.NewRecorder()
 		h.Propfind(rr, req)
 
-		assertAdvertised(t, rr, fmt.Sprintf("/dav/calendars/%d/birthday-alice@calcard.ics", birthdayCalendarID))
+		assertAdvertised(t, rr, calendarObjectHref(birthdayCalendarHref(), birthdayEventUID(5, "alice")))
 	})
 }
 

@@ -266,7 +266,28 @@ type AddressBook struct {
 	UpdatedAt   time.Time
 }
 
-// Contact stores raw vCard payload and metadata.
+// MaxIdentifierOctets bounds a UID or resource name. Both are keys of unique
+// btree indexes, and PostgreSQL refuses an index entry larger than about a
+// third of an 8 KB page (2704 octets) after compression; 1 KB leaves room for
+// the collection id and the derived ACL path beside it, and is far longer
+// than any identifier a client generates.
+const MaxIdentifierOctets = 1024
+
+// maxDisplayNameOctets bounds the indexed display_name column. It is derived
+// from FN for sorting and search, so a longer FN is kept whole in the card
+// and only the column is cut.
+const maxDisplayNameOctets = 1024
+
+// NoYearBirthdayYear is the year a birthday written without one (--MM-DD) is
+// stored under. It is a leap year, so February 29 survives the round trip.
+const NoYearBirthdayYear = 4
+
+// legacyNoYearBirthdayYear marks a year-less birthday in rows the v1.2.0
+// migration has not rewritten; scanContact reads it as NoYearBirthdayYear.
+const legacyNoYearBirthdayYear = 1
+
+// Contact stores raw vCard payload and metadata. A Birthday in
+// NoYearBirthdayYear has no year of its own.
 type Contact struct {
 	ID            int64
 	AddressBookID int64
@@ -347,11 +368,10 @@ type Lock struct {
 
 	// These transient fields bind lock creation to the state authorized by the
 	// DAV layer. They are not persisted in the locks table.
-	ExpectedTargetExists   *bool
-	ExpectedCollection     string
-	ExpectedCollectionID   int64
-	ExpectedCollectionCTag *int64
-	ExpectedResourceState  *DAVResourceState
+	ExpectedTargetExists  *bool
+	ExpectedCollection    string
+	ExpectedCollectionID  int64
+	ExpectedResourceState *DAVResourceState
 }
 
 // LockPrecondition captures one write target whose active locks must be

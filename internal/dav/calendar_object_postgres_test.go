@@ -59,8 +59,16 @@ func newDAVPostgresStore(t *testing.T) *store.Store {
 	if _, err := pool.Exec(string(schemaSQL)); err != nil {
 		t.Fatalf("apply db.sql: %v", err)
 	}
+	// Test packages share one server and run concurrently, and the widest
+	// concurrency test here starts 40 writers. Writers beyond the cap wait for a
+	// connection instead of for the collection lock they would queue on anyway.
+	pool.SetMaxOpenConns(davPostgresMaxConnections)
 	return store.New(pool)
 }
+
+// davPostgresMaxConnections keeps one test's pool well under PostgreSQL's
+// default max_connections of 100.
+const davPostgresMaxConnections = 20
 
 func davPostgresSearchPath(t *testing.T, dsn, schema string) string {
 	t.Helper()

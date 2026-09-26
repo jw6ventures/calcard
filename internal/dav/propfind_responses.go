@@ -241,7 +241,7 @@ func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.Us
 		if !allowed {
 			return nil, nil
 		}
-		result := resourceResponse(publicPath, statusOKProp(path.Base(publicPath), resourceType{}))
+		result := resourceResponse(escapeDAVPath(publicPath), statusOKProp(path.Base(publicPath), resourceType{}))
 		return &result, nil
 	}
 	return nil, nil
@@ -251,7 +251,7 @@ func (h *DavServer) appendLockNullMembers(ctx context.Context, user *store.User,
 	if !depthIncludesChildren(depth) || h == nil || h.store == nil || h.store.Locks == nil || user == nil {
 		return responses, nil
 	}
-	parentPath := normalizeDAVHref(cleanPath)
+	parentPath := cleanDAVPath(cleanPath)
 	locks, err := h.store.Locks.ListByResourcePrefix(ctx, strings.TrimSuffix(parentPath, "/")+"/")
 	if err != nil {
 		return nil, err
@@ -270,7 +270,7 @@ func (h *DavServer) appendLockNullMembers(ctx context.Context, user *store.User,
 			continue
 		}
 		publicPath := publicDAVLockRoot(lock.ResourcePath)
-		candidatePath := normalizeDAVHref(publicPath)
+		candidatePath := cleanDAVPath(publicPath)
 		if depth == "1" {
 			if path.Dir(candidatePath) != parentPath {
 				continue
@@ -296,7 +296,7 @@ func (h *DavServer) appendLockNullMembers(ctx context.Context, user *store.User,
 			continue
 		}
 		responses = h.appendMultistatusResponses(responses, []response{
-			resourceResponse(publicPath, statusOKProp(path.Base(publicPath), resourceType{})),
+			resourceResponse(escapeDAVPath(publicPath), statusOKProp(path.Base(publicPath), resourceType{})),
 		})
 		seen[candidatePath] = struct{}{}
 	}

@@ -22,7 +22,7 @@ const (
 // (e.g. "/dav/calendars/12/foo.ics" -> "/dav/calendars/12"). Paths outside the
 // prefix are returned normalized but otherwise unchanged.
 func collectionPathForPrefix(cleanPath, prefix string) string {
-	cleanPath = normalizeDAVHref(cleanPath)
+	cleanPath = cleanDAVPath(cleanPath)
 	if !strings.HasPrefix(cleanPath, prefix+"/") {
 		return cleanPath
 	}

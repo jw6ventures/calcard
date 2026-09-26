@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -219,6 +221,40 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+// RevokePrincipalGrants mirrors the repository contract: drop the
+// principal's grants on the collection and every resource beneath it, keeping
+// denies.
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
 }
 
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {

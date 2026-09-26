@@ -174,12 +174,10 @@ func primaryEventMetadata(components []calendarTopLevelComponent) store.EventWri
 }
 
 func splitICalendarProperty(line string) (name, keyPart, value string, ok bool) {
-	colon := strings.IndexByte(line, ':')
-	if colon < 0 {
+	keyPart, value, ok = ical.SplitContentLine(line)
+	if !ok {
 		return "", "", "", false
 	}
-	keyPart = line[:colon]
-	value = line[colon+1:]
 	name = keyPart
 	if semicolon := strings.IndexByte(name, ';'); semicolon >= 0 {
 		name = name[:semicolon]

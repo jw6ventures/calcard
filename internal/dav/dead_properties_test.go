@@ -2,8 +2,12 @@ package dav
 
 import (
 	"context"
+	"encoding/xml"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -263,21 +267,307 @@ func TestProppatchPersistsNamespacedDeadPropertyAndPropfindReturnsIt(t *testing.
 	if findResponse.Code != http.StatusMultiStatus {
 		t.Fatalf("PROPFIND status = %d: %s", findResponse.Code, findResponse.Body.String())
 	}
-	responseBody := findResponse.Body.String()
-	for _, want := range []string{"urn:example:custom", "meta", "child", "value", "200 OK"} {
-		if !strings.Contains(responseBody, want) {
-			t.Fatalf("PROPFIND response missing %q: %s", want, responseBody)
-		}
+	// Asserted as a resolved tree: a child carrying xmlns twice contains every
+	// expected substring yet is rejected by libxml2- and expat-based clients.
+	wantMeta := davElement{
+		Name:     qn("urn:example:custom", "meta"),
+		Children: []davElement{{Name: qn("urn:example:custom", "child"), Text: "value"}},
 	}
+	find := decodeMultistatus(t, findResponse).responseForHref(t, "/dav/calendars/1/")
+	assertDeadPropertyTree(t, find.assertPropStatus(t, wantMeta.Name, http.StatusOK), wantMeta)
 
 	allpropRequest := httptest.NewRequest("PROPFIND", "/dav/calendars/1", strings.NewReader(`<D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>`))
 	allpropRequest.Header.Set("Depth", "0")
 	allpropRequest = allpropRequest.WithContext(auth.WithUser(allpropRequest.Context(), user))
 	allpropResponse := httptest.NewRecorder()
 	h.ServeHTTP(allpropResponse, allpropRequest)
-	if allpropResponse.Code != http.StatusMultiStatus || !strings.Contains(allpropResponse.Body.String(), "<meta") || !strings.Contains(allpropResponse.Body.String(), "value") {
-		t.Fatalf("PROPFIND allprop omitted dead property: %d: %s", allpropResponse.Code, allpropResponse.Body.String())
+	allprop := decodeMultistatus(t, allpropResponse).responseForHref(t, "/dav/calendars/1/")
+	assertDeadPropertyTree(t, allprop.assertPropStatus(t, wantMeta.Name, http.StatusOK), wantMeta)
+}
+
+// TestDeadPropertyRoundTripPreservesXMLStructure drives PROPPATCH then
+// PROPFIND for property values whose structure is what the round trip has to
+// carry: nesting, a child in a namespace other than its property's, a default
+// declaration the fragment supplies itself, a child in no namespace at all, and
+// attributes both plain and qualified.
+//
+// Every assertion here is on resolved names, so it is indifferent to which
+// prefixes or declarations the server picks, and rejects any spelling no
+// conformant parser accepts. The fragment as persisted is checked too: it is
+// stored as a standalone fragment and re-parsed on every read, so a declaration
+// written twice at rest is a defect even when the lenient decoder reading it
+// back happens to recover.
+func TestDeadPropertyRoundTripPreservesXMLStructure(t *testing.T) {
+	const (
+		propertyNS  = "urn:example:custom"
+		otherNS     = "urn:example:other"
+		defaultNS   = "urn:example:default"
+		qualifierNS = "urn:example:qualifier"
+
+		declarations = `xmlns:D="DAV:" xmlns:X="` + propertyNS + `" xmlns:Y="` + otherNS + `" xmlns:Z="` + qualifierNS + `"`
+	)
+
+	tests := []struct {
+		name     string
+		property string
+		// requested is the element the PROPFIND body names, defaulting to the
+		// prefixed X:meta the other cases patch.
+		requested string
+		want      davElement
+	}{
+		{
+			name:     "child in the property namespace",
+			property: `<X:meta><X:child>value</X:child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(propertyNS, "child"), Text: "value"},
+			}},
+		},
+		{
+			name:     "multi-level nesting with attributes on nested children",
+			property: `<X:meta><X:outer k="1"><X:middle k="2" j="3"><X:inner>deep</X:inner></X:middle></X:outer></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(propertyNS, "outer"), Attr: []xml.Attr{{Name: qn("", "k"), Value: "1"}}, Children: []davElement{
+					{
+						Name: qn(propertyNS, "middle"),
+						Attr: []xml.Attr{{Name: qn("", "j"), Value: "3"}, {Name: qn("", "k"), Value: "2"}},
+						Children: []davElement{
+							{Name: qn(propertyNS, "inner"), Text: "deep"},
+						},
+					},
+				}},
+			}},
+		},
+		{
+			name:     "child in a namespace other than the property's",
+			property: `<X:meta><Y:child a="1">other</Y:child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(otherNS, "child"), Attr: []xml.Attr{{Name: qn("", "a"), Value: "1"}}, Text: "other"},
+			}},
+		},
+		{
+			name:     "namespaces alternating down the tree",
+			property: `<X:meta><Y:outer><X:inner><Y:leaf>back</Y:leaf></X:inner></Y:outer></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(otherNS, "outer"), Children: []davElement{
+					{Name: qn(propertyNS, "inner"), Children: []davElement{
+						{Name: qn(otherNS, "leaf"), Text: "back"},
+					}},
+				}},
+			}},
+		},
+		{
+			name:     "fragment supplying its own default namespace",
+			property: `<X:meta xmlns="urn:example:default"><child><grand k="1">v</grand></child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(defaultNS, "child"), Children: []davElement{
+					{Name: qn(defaultNS, "grand"), Attr: []xml.Attr{{Name: qn("", "k"), Value: "1"}}, Text: "v"},
+				}},
+			}},
+		},
+		{
+			name:     "child in no namespace under a namespaced property",
+			property: `<X:meta><child><X:qualified>q</X:qualified></child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn("", "child"), Children: []davElement{
+					{Name: qn(propertyNS, "qualified"), Text: "q"},
+				}},
+			}},
+		},
+		{
+			name:     "child redeclaring the default namespace itself",
+			property: `<X:meta><child xmlns="urn:example:other"/></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(otherNS, "child")},
+			}},
+		},
+		{
+			name:     "qualified attribute on a nested child",
+			property: `<X:meta><X:child Z:k="1" plain="2">v</X:child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{
+					Name: qn(propertyNS, "child"),
+					Attr: []xml.Attr{{Name: qn("", "plain"), Value: "2"}, {Name: qn(qualifierNS, "k"), Value: "1"}},
+					Text: "v",
+				},
+			}},
+		},
+		{
+			name:     "two qualified attributes sharing a namespace",
+			property: `<X:meta><X:child Z:k="1" Z:j="2"/></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{Name: qn(propertyNS, "child"), Attr: []xml.Attr{
+					{Name: qn(qualifierNS, "j"), Value: "2"},
+					{Name: qn(qualifierNS, "k"), Value: "1"},
+				}},
+			}},
+		},
+		{
+			name:      "property in no namespace carrying namespaced children",
+			property:  `<meta><X:child>value</X:child><plain/></meta>`,
+			requested: `<meta/>`,
+			want: davElement{Name: qn("", "meta"), Children: []davElement{
+				{Name: qn(propertyNS, "child"), Text: "value"},
+				{Name: qn("", "plain")},
+			}},
+		},
+		{
+			name:     "xml:lang on a nested child",
+			property: `<X:meta><X:child xml:lang="de">wert</X:child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{
+					Name: qn(propertyNS, "child"),
+					Attr: []xml.Attr{{Name: qn(xmlNamespaceURI, "lang"), Value: "de"}},
+					Text: "wert",
+				},
+			}},
+		},
+		{
+			// The reserved namespace is the one namespace no declaration may
+			// bind, so the two attributes have to be written different ways:
+			// xml:lang by its reserved prefix and Z:k through a declaration the
+			// re-emitted element carries itself.
+			name:     "xml:lang beside an attribute needing a declared prefix",
+			property: `<X:meta><X:child xml:lang="de" Z:k="1">wert</X:child></X:meta>`,
+			want: davElement{Name: qn(propertyNS, "meta"), Children: []davElement{
+				{
+					Name: qn(propertyNS, "child"),
+					Attr: []xml.Attr{
+						{Name: qn(xmlNamespaceURI, "lang"), Value: "de"},
+						{Name: qn(qualifierNS, "k"), Value: "1"},
+					},
+					Text: "wert",
+				},
+			}},
+		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dead := &fakeDeadPropertyRepo{}
+			h := NewDavServer(Options{Store: &store.Store{
+				Calendars:      &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 1, Name: "Work"}}},
+				Events:         &fakeEventRepo{events: map[string]*store.Event{}},
+				DeadProperties: dead,
+			}})
+			user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+
+			patchBody := `<D:propertyupdate ` + declarations + `><D:set><D:prop>` + tt.property + `</D:prop></D:set></D:propertyupdate>`
+			patchRequest := httptest.NewRequest("PROPPATCH", "/dav/calendars/1", strings.NewReader(patchBody))
+			patchRequest = patchRequest.WithContext(auth.WithUser(patchRequest.Context(), user))
+			patchResponse := httptest.NewRecorder()
+			h.ServeHTTP(patchResponse, patchRequest)
+			patched := decodeMultistatus(t, patchResponse).responseForHref(t, "/dav/calendars/1")
+			patched.assertPropStatus(t, tt.want.Name, http.StatusOK)
+
+			assertStoredDeadPropertyTree(t, dead, "/dav/calendars/1", tt.want)
+
+			requested := tt.requested
+			if requested == "" {
+				requested = `<X:meta/>`
+			}
+			findBody := `<D:propfind ` + declarations + `><D:prop>` + requested + `</D:prop></D:propfind>`
+			findRequest := httptest.NewRequest("PROPFIND", "/dav/calendars/1", strings.NewReader(findBody))
+			findRequest.Header.Set("Depth", "0")
+			findRequest = findRequest.WithContext(auth.WithUser(findRequest.Context(), user))
+			findResponse := httptest.NewRecorder()
+			h.ServeHTTP(findResponse, findRequest)
+			found := decodeMultistatus(t, findResponse).responseForHref(t, "/dav/calendars/1/")
+			assertDeadPropertyTree(t, found.assertPropStatus(t, tt.want.Name, http.StatusOK), tt.want)
+		})
+	}
+}
+
+// A stored fragment can carry a declaration twice, which the lenient decoder
+// resolves; the read path writes it once rather than copying the spelling.
+func TestPropfindRepairsDeadPropertyStoredWithDuplicateDeclarations(t *testing.T) {
+	dead := &fakeDeadPropertyRepo{properties: map[string]map[string]store.DeadProperty{
+		"/dav/calendars/1": {
+			"urn:example:custom\x00meta": {
+				ResourcePath: "/dav/calendars/1",
+				NamespaceURI: "urn:example:custom",
+				LocalName:    "meta",
+				InnerXML:     `<child xmlns="urn:example:other" xmlns="urn:example:other">value</child>`,
+			},
+		},
+	}}
+	h := NewDavServer(Options{Store: &store.Store{
+		Calendars:      &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 1, Name: "Work"}}},
+		Events:         &fakeEventRepo{events: map[string]*store.Event{}},
+		DeadProperties: dead,
+	}})
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+
+	findBody := `<D:propfind xmlns:D="DAV:" xmlns:X="urn:example:custom"><D:prop><X:meta/></D:prop></D:propfind>`
+	request := httptest.NewRequest("PROPFIND", "/dav/calendars/1", strings.NewReader(findBody))
+	request.Header.Set("Depth", "0")
+	request = request.WithContext(auth.WithUser(request.Context(), user))
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+
+	want := davElement{
+		Name:     qn("urn:example:custom", "meta"),
+		Children: []davElement{{Name: qn("urn:example:other", "child"), Text: "value"}},
+	}
+	found := decodeMultistatus(t, response).responseForHref(t, "/dav/calendars/1/")
+	assertDeadPropertyTree(t, found.assertPropStatus(t, want.Name, http.StatusOK), want)
+}
+
+// assertStoredDeadPropertyTree checks the fragment persisted for want's name.
+// The fragment is parsed on its own, as the read path parses it, so it must
+// carry every declaration its elements need and carry none of them twice.
+func assertStoredDeadPropertyTree(t *testing.T, dead *fakeDeadPropertyRepo, resourcePath string, want davElement) {
+	t.Helper()
+	stored, ok := dead.properties[resourcePath][want.Name.Space+"\x00"+want.Name.Local]
+	if !ok {
+		t.Fatalf("PROPPATCH stored no %s for %s: %#v", qnString(want.Name), resourcePath, dead.properties)
+	}
+	// The property element is not part of the stored fragment, so the children
+	// are re-parsed under a wrapper in no namespace, which declares nothing and
+	// leaves each of them to say what namespace it is in.
+	root, err := parseDAVDocument([]byte("<stored-fragment>" + stored.InnerXML + "</stored-fragment>"))
+	if err != nil {
+		t.Fatalf("stored fragment for %s is not well-formed: %v; fragment: %s", qnString(want.Name), err, stored.InnerXML)
+	}
+	got := davElement{Name: want.Name, Text: root.Text, Children: root.Children}
+	assertDeadPropertyTree(t, got, want)
+}
+
+// assertDeadPropertyTree compares a property value's resolved element tree
+// against want, ignoring whitespace-only text and attribute order.
+func assertDeadPropertyTree(t *testing.T, got, want davElement) {
+	t.Helper()
+	if gotText, wantText := renderDeadPropertyTree(got), renderDeadPropertyTree(want); gotText != wantText {
+		t.Errorf("property tree =\n  %s\nwant\n  %s", gotText, wantText)
+	}
+}
+
+// renderDeadPropertyTree renders a resolved subtree in a canonical form:
+// attributes sorted by resolved name and whitespace-only text dropped, so the
+// comparison turns on structure and namespaces rather than serialization.
+func renderDeadPropertyTree(el davElement) string {
+	var out strings.Builder
+	out.WriteString(qnString(el.Name))
+	attrs := append([]xml.Attr(nil), el.Attr...)
+	sort.Slice(attrs, func(i, j int) bool {
+		return qnString(attrs[i].Name) < qnString(attrs[j].Name)
+	})
+	for _, a := range attrs {
+		out.WriteString(" " + qnString(a.Name) + "=" + strconv.Quote(a.Value))
+	}
+	if text := strings.TrimSpace(el.Text); text != "" {
+		out.WriteString(" " + strconv.Quote(text))
+	}
+	if len(el.Children) > 0 {
+		out.WriteString("(")
+		for i, child := range el.Children {
+			if i > 0 {
+				out.WriteString(", ")
+			}
+			out.WriteString(renderDeadPropertyTree(child))
+		}
+		out.WriteString(")")
+	}
+	return out.String()
 }
 
 func TestCalendarReportsResolveDeadPropertiesLikePropfind(t *testing.T) {
@@ -560,6 +850,14 @@ func TestProppatchRejectsInvalidRootAndEmptyPropertyList(t *testing.T) {
 			name: "empty prop",
 			body: `<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop/></D:set></D:propertyupdate>`,
 		},
+		{
+			name: "attribute prefix never declared",
+			body: `<D:propertyupdate xmlns:D="DAV:" xmlns:X="urn:test"><D:set><D:prop><X:meta><X:child q:attr="1"/></X:meta></D:prop></D:set></D:propertyupdate>`,
+		},
+		{
+			name: "element prefix never declared",
+			body: `<D:propertyupdate xmlns:D="DAV:" xmlns:X="urn:test"><D:set><D:prop><X:meta><q:child/></X:meta></D:prop></D:set></D:propertyupdate>`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -833,5 +1131,97 @@ func TestValidCalendarTimezoneRequiresWrappedSingleVTimezone(t *testing.T) {
 				t.Fatalf("validCalendarTimezone() = %v, want %v for %s", got, test.want, test.value)
 			}
 		})
+	}
+}
+
+// RFC 4918 Section 4.3: a server SHOULD preserve prefixes, because vocabularies
+// such as XPath and XML Schema name things with QNames in content. The prefix
+// an element was written with, and the declaration its QName content relies
+// on, come back as they were sent -- including one declared on an ancestor
+// outside the property value.
+func TestDeadPropertyRoundTripPreservesPrefixes(t *testing.T) {
+	dead := &fakeDeadPropertyRepo{}
+	h := NewDavServer(Options{Store: &store.Store{
+		Calendars:      &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 1, Name: "Work"}}},
+		Events:         &fakeEventRepo{events: map[string]*store.Event{}},
+		DeadProperties: dead,
+	}})
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+
+	patchBody := `<D:propertyupdate xmlns:D="DAV:" xmlns:X="urn:example:custom" xmlns:xs="http://www.w3.org/2001/XMLSchema">` +
+		`<D:set><D:prop><X:meta><X:type xmlns:t="urn:example:types" t:kind="k">xs:dateTime</X:type><t2:ref xmlns:t2="urn:example:types">t2:name</t2:ref></X:meta></D:prop></D:set></D:propertyupdate>`
+	patchRequest := httptest.NewRequest("PROPPATCH", "/dav/calendars/1", strings.NewReader(patchBody))
+	patchRequest = patchRequest.WithContext(auth.WithUser(patchRequest.Context(), user))
+	patchResponse := httptest.NewRecorder()
+	h.ServeHTTP(patchResponse, patchRequest)
+	if patchResponse.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPPATCH status = %d: %s", patchResponse.Code, patchResponse.Body.String())
+	}
+
+	stored := dead.properties["/dav/calendars/1"]["urn:example:custom\x00meta"].InnerXML
+	findBody := `<D:propfind xmlns:D="DAV:" xmlns:X="urn:example:custom"><D:prop><X:meta/></D:prop></D:propfind>`
+	findRequest := httptest.NewRequest("PROPFIND", "/dav/calendars/1", strings.NewReader(findBody))
+	findRequest.Header.Set("Depth", "0")
+	findRequest = findRequest.WithContext(auth.WithUser(findRequest.Context(), user))
+	findResponse := httptest.NewRecorder()
+	h.ServeHTTP(findResponse, findRequest)
+
+	for name, document := range map[string]string{"stored fragment": "<stored>" + stored + "</stored>", "PROPFIND response": findResponse.Body.String()} {
+		elements := rawPrefixedElements(t, document)
+		typeElement, ok := elements["X:type"]
+		if !ok {
+			t.Fatalf("%s lost the X prefix on X:type: %s", name, document)
+		}
+		if typeElement["xs"] != "http://www.w3.org/2001/XMLSchema" {
+			t.Errorf("%s: QName content xs:dateTime has xs bound to %q: %s", name, typeElement["xs"], document)
+		}
+		if typeElement["t"] != "urn:example:types" {
+			t.Errorf("%s: attribute prefix t bound to %q: %s", name, typeElement["t"], document)
+		}
+		ref, ok := elements["t2:ref"]
+		if !ok || ref["t2"] != "urn:example:types" {
+			t.Errorf("%s lost the t2 prefix or its binding: %s", name, document)
+		}
+		if strings.Contains(document, `"q"`) || strings.Contains(document, "xmlns:ns1") {
+			t.Errorf("%s invented a prefix: %s", name, document)
+		}
+	}
+}
+
+// rawPrefixedElements maps each element's name, spelled as written, to the
+// prefix bindings in scope at it.
+func rawPrefixedElements(t *testing.T, document string) map[string]map[string]string {
+	t.Helper()
+	dec := xml.NewDecoder(strings.NewReader(document))
+	result := map[string]map[string]string{}
+	stack := []map[string]string{{}}
+	for {
+		token, err := dec.RawToken()
+		if err == io.EOF {
+			return result
+		}
+		if err != nil {
+			t.Fatalf("document is not well-formed: %v\n%s", err, document)
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			scope := map[string]string{}
+			for prefix, uri := range stack[len(stack)-1] {
+				scope[prefix] = uri
+			}
+			for _, attr := range token.Attr {
+				if attr.Name.Space == "xmlns" {
+					scope[attr.Name.Local] = attr.Value
+				}
+			}
+			stack = append(stack, scope)
+			name := token.Name.Local
+			if token.Name.Space != "" {
+				name = token.Name.Space + ":" + name
+			}
+			result[name] = scope
+		case xml.EndElement:
+			stack = stack[:len(stack)-1]
+		}
 	}
 }

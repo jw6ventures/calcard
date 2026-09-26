@@ -1,18 +1,21 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
+	"hash/fnv"
 	"path"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	icalpkg "github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/util"
+	"github.com/jw6ventures/calcard/internal/vcard"
 	"github.com/lib/pq"
 )
 
@@ -455,6 +458,33 @@ type eventRepo struct {
 	pool *sql.DB
 }
 
+// lockRepositoryCollectionsTx holds the collections a member write that does
+// not come through DAV changes, the way a DAV write holds them: each
+// collection's DAV path, then its row. The sync-stamp triggers read the
+// collection when a member row is written, so the write has to wait out every
+// other writer to the collection before it writes anything. A collection that
+// does not exist is ErrNotFound.
+func lockRepositoryCollectionsTx(ctx context.Context, tx *sql.Tx, table string, ids ...int64) error {
+	lockPath := calendarCollectionLockPath
+	if table == "address_books" {
+		lockPath = addressBookCollectionLockPath
+	}
+	paths := make([]string, 0, len(ids))
+	for _, id := range ids {
+		paths = append(paths, lockPath(id))
+	}
+	if err := acquireDAVPathLocks(ctx, tx, paths...); err != nil {
+		return err
+	}
+	if err := lockCollectionRowsTx(ctx, tx, table, ids...); err != nil {
+		if errors.Is(err, ErrResourceStateChanged) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return nil
+}
+
 func (r *eventRepo) Upsert(ctx context.Context, event Event) (*Event, error) {
 	var metadata EventWriteMetadata
 	if event.WriteMetadata != nil {
@@ -486,12 +516,23 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `
 	defer observeDB(ctx, "events.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay, metadata.RecurrenceStart, metadata.RecurrenceUntil)
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", event.CalendarID); err != nil {
+		return nil, err
+	}
+	row := tx.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay, metadata.RecurrenceStart, metadata.RecurrenceUntil)
 	ev, err := scanEvent(row.Scan)
 	if err != nil {
 		if isEventResourceNameConflict(err) {
 			return nil, ErrConflict
 		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &ev, nil
@@ -500,8 +541,18 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, descript
 func (r *eventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid string) error {
 	const q = `DELETE FROM events WHERE calendar_id=$1 AND uid=$2`
 	defer observeDB(ctx, "events.delete_by_uid")()
-	_, err := r.pool.ExecContext(ctx, q, calendarID, uid)
-	return err
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", calendarID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, q, calendarID, uid); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *eventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error) {
@@ -887,6 +938,9 @@ func (r *eventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalend
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", fromCalendarID, toCalendarID); err != nil {
+		return err
+	}
 
 	if err := moveEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName); err != nil {
 		return err
@@ -976,6 +1030,9 @@ func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalend
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", fromCalendarID, toCalendarID); err != nil {
+		return nil, err
+	}
 
 	const selectQ = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
 	row := tx.QueryRowContext(ctx, selectQ, fromCalendarID, uid)
@@ -1052,6 +1109,21 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, descript
 // addressBookRepo implements AddressBookRepository.
 type addressBookRepo struct {
 	pool *sql.DB
+}
+
+// IsDataError reports whether err is PostgreSQL refusing a value it cannot
+// store (SQLSTATE class 22) or one past a limit such as the index entry size
+// (class 54), as opposed to the database being unavailable.
+func IsDataError(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && (pqErr.Code.Class() == "22" || pqErr.Code.Class() == "54")
+}
+
+// isMissingCollection reports whether err is a member insert failing the
+// named foreign key to its collection, which means the collection was removed.
+func isMissingCollection(err error, constraint string) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23503" && pqErr.Constraint == constraint
 }
 
 func isAddressBookNameConflict(err error) bool {
@@ -1282,12 +1354,23 @@ ON CONFLICT (address_book_id, uid) DO UPDATE SET
 RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified
 `
 	defer observeDB(ctx, "contacts.upsert")()
-	row := r.pool.QueryRowContext(ctx, q, contact.AddressBookID, contact.UID, contact.ResourceName, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "address_books", contact.AddressBookID); err != nil {
+		return nil, err
+	}
+	row := tx.QueryRowContext(ctx, q, contact.AddressBookID, contact.UID, contact.ResourceName, contact.RawVCard, contact.ETag, displayName, primaryEmail, birthday)
 	c, err := scanContact(row.Scan)
 	if err != nil {
 		if isContactResourceNameConflict(err) {
 			return nil, ErrConflict
 		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -1296,8 +1379,18 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 func (r *contactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
 	const q = `DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	defer observeDB(ctx, "contacts.delete_by_uid")()
-	_, err := r.pool.ExecContext(ctx, q, addressBookID, uid)
-	return err
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "address_books", addressBookID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, q, addressBookID, uid); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
@@ -1308,6 +1401,9 @@ func (r *contactRepo) MoveToAddressBook(ctx context.Context, fromAddressBookID, 
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "address_books", fromAddressBookID, toAddressBookID); err != nil {
+		return err
+	}
 
 	if err := moveContactTx(ctx, tx, fromAddressBookID, toAddressBookID, uid, destResourceName); err != nil {
 		return err
@@ -1711,6 +1807,9 @@ func (r *contactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, 
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := lockRepositoryCollectionsTx(ctx, tx, "address_books", fromAddressBookID, toAddressBookID); err != nil {
+		return nil, err
+	}
 
 	const selectQ = `SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`
 	row := tx.QueryRowContext(ctx, selectQ, fromAddressBookID, uid)
@@ -1868,12 +1967,15 @@ func (r *appPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
 	return err
 }
 
-func (r *appPasswordRepo) SetDigestCredentials(ctx context.Context, id int64, md5HA1, sha256HA1 string) error {
-	const q = `UPDATE app_passwords SET digest_md5_ha1=$2, digest_sha256_ha1=$3
-        WHERE id=$1 AND digest_md5_ha1 IS NULL AND digest_sha256_ha1 IS NULL`
-	defer observeDB(ctx, "app_passwords.set_digest_credentials")()
-	_, err := r.pool.ExecContext(ctx, q, id, md5HA1, sha256HA1)
-	return err
+func (r *appPasswordRepo) PurgeDigestCredentials(ctx context.Context) (int64, error) {
+	const q = `UPDATE app_passwords SET digest_md5_ha1=NULL, digest_sha256_ha1=NULL
+        WHERE digest_md5_ha1 IS NOT NULL OR digest_sha256_ha1 IS NOT NULL`
+	defer observeDB(ctx, "app_passwords.purge_digest_credentials")()
+	result, err := r.pool.ExecContext(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (r *appPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error {
@@ -2086,19 +2188,29 @@ func (r *lockRepo) Create(ctx context.Context, lock Lock) (*Lock, error) {
 	if err := validateLockDepth(lock.Depth); err != nil {
 		return nil, err
 	}
-
 	tx, err := r.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	created, err := createLockTx(ctx, tx, lock, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return created, nil
+}
 
+// createLockTx records lock after checking, under the DAV path locks of its
+// resource, that the target is still in the state the request was authorized
+// against and that no existing lock conflicts with it.
+func createLockTx(ctx context.Context, tx *sql.Tx, lock Lock, acl *ACLGuard) (*Lock, error) {
 	// Serialize concurrent lock creation for the resource and its parent path so
 	// parent/child lock requests observe each other before conflict checks run.
-	for _, resourcePath := range sortedLockSerializationPaths(lock.ResourcePath) {
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, resourcePath); err != nil {
-			return nil, err
-		}
+	if err := acquireDAVPathLocks(ctx, tx, lock.ResourcePath); err != nil {
+		return nil, err
 	}
 	originalResourcePath := lock.ResourcePath
 	if err := canonicalizePendingCalendarLockTx(ctx, tx, &lock); err != nil {
@@ -2107,34 +2219,12 @@ func (r *lockRepo) Create(ctx context.Context, lock Lock) (*Lock, error) {
 	if lock.ExpectedTargetExists != nil && !*lock.ExpectedTargetExists && lock.ResourcePath != originalResourcePath {
 		return nil, ErrResourceStateChanged
 	}
-	switch lock.ExpectedCollection {
-	case "calendar":
-		if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-			collectionCTagExpectation{id: lock.ExpectedCollectionID, ctag: lock.ExpectedCollectionCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, acl); err != nil {
+		return nil, err
+	}
+	if lock.ExpectedCollection != "" {
+		if err := validateTargetStateTx(ctx, tx, lock.ExpectedCollection, lock.ExpectedCollectionID, lock.ExpectedResourceState); err != nil {
 			return nil, err
-		}
-		if lock.ExpectedResourceState != nil {
-			current, err := selectEventTx(ctx, tx, `resource_name`, lock.ExpectedCollectionID, lock.ExpectedResourceState.ResourceName)
-			if err != nil {
-				return nil, err
-			}
-			if !eventDAVStateMatches(*lock.ExpectedResourceState, current) {
-				return nil, ErrResourceStateChanged
-			}
-		}
-	case "addressbook":
-		if err := validateCollectionCTagsTx(ctx, tx, "address_books",
-			collectionCTagExpectation{id: lock.ExpectedCollectionID, ctag: lock.ExpectedCollectionCTag}); err != nil {
-			return nil, err
-		}
-		if lock.ExpectedResourceState != nil {
-			current, err := selectContactTx(ctx, tx, `resource_name`, lock.ExpectedCollectionID, lock.ExpectedResourceState.ResourceName)
-			if err != nil {
-				return nil, err
-			}
-			if !contactDAVStateMatches(*lock.ExpectedResourceState, current) {
-				return nil, ErrResourceStateChanged
-			}
 		}
 	}
 
@@ -2219,10 +2309,6 @@ RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner
 	if err := row.Scan(&l.ID, &l.Token, &l.ResourcePath, &l.UserID, &l.LockScope, &l.LockType, &l.Depth, &l.OwnerInfo, &l.TimeoutSeconds, &l.CreatedAt, &l.ExpiresAt); err != nil {
 		return nil, err
 	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return &l, nil
 }
 
@@ -2263,27 +2349,114 @@ func pendingCalendarLockIdentity(resourcePath string) (int64, string, bool) {
 	return userID, parts[1], true
 }
 
-func lockSerializationPaths(resourcePath string) []string {
-	cleanPath := path.Clean(resourcePath)
-	paths := []string{cleanPath}
-	paths = append(paths, lockAncestorPaths(cleanPath)...)
-	return paths
+// davPathLock is one advisory lock a transaction takes on a DAV resource path.
+// key is what PostgreSQL actually locks; path is kept for diagnostics.
+type davPathLock struct {
+	key       int64
+	path      string
+	exclusive bool
 }
 
-func sortedLockSerializationPaths(resourcePaths ...string) []string {
-	seen := make(map[string]struct{})
-	var result []string
+// davPathLockQuery takes a whole davPathLocks set in one round trip. unnest
+// scans the arrays in the order they were built and the lock call in the target
+// list runs as each row is produced, so the set is still acquired in the key
+// order that keeps overlapping callers deadlock-free. Splitting the two modes
+// into separate statements would acquire them in two disjoint orders instead,
+// and an ORDER BY here would not help: the planner is free to evaluate the
+// target list below the sort.
+const davPathLockQuery = `
+SELECT CASE WHEN l.exclusive THEN pg_advisory_xact_lock(l.key)
+            ELSE pg_advisory_xact_lock_shared(l.key) END
+FROM unnest($1::bigint[], $2::boolean[]) AS l(key, exclusive)`
+
+// davPathLockKey maps a DAV path to its advisory lock key. It uses the whole
+// 64-bit key space so that two paths sharing a key, which would silently merge
+// their locks, stays practically impossible.
+func davPathLockKey(resourcePath string) int64 {
+	hash := fnv.New64a()
+	hash.Write([]byte(resourcePath))
+	return int64(hash.Sum64())
+}
+
+// davPathLocks orders the advisory locks a transaction must hold to serialize
+// DAV writes to resourcePaths against the operations that can conflict with
+// them under RFC 4918.
+//
+// Each requested path is the caller's own target and is taken exclusively, and
+// so is the collection directly containing a target. A member write changes its
+// collection's CTag and sync token, and sync-collection reports the changes
+// since a token as the rows stamped later than it. Those stamps are taken
+// before the write commits, so they only order the way the commits do while
+// writers to one collection exclude each other; two sibling writes left to run
+// together could commit a stamp older than a token already handed out, and
+// that change would never be reported.
+//
+// Every farther ancestor is only observed and is taken shared, so writes to
+// different collections do not wait on each other, while a depth-infinity
+// operation, which names the collection itself as a target, still excludes its
+// members. The DAV root and the per-kind roots ("/dav", "/dav/calendars") are
+// never taken exclusively on a child's behalf: every collection sits directly
+// beneath one, and doing so would serialize the whole server.
+//
+// A path that is both exclusive and shared within the set is taken once,
+// exclusively: taking it shared first and upgrading later would let two
+// transactions that both hold it shared deadlock on the upgrade. The set is
+// sorted by lock key, the value PostgreSQL actually orders waiters on, so every
+// transaction walks one total order and overlapping sets cannot deadlock
+// against each other. Paths that share a key merge into one entry for the same
+// reason.
+func davPathLocks(resourcePaths ...string) []davPathLock {
+	byKey := make(map[int64]davPathLock, len(resourcePaths)*3)
+	add := func(lockPath string, exclusive bool) {
+		key := davPathLockKey(lockPath)
+		current, seen := byKey[key]
+		if seen && (current.exclusive || !exclusive) {
+			return
+		}
+		if seen {
+			lockPath = current.path
+		}
+		byKey[key] = davPathLock{key: key, path: lockPath, exclusive: exclusive}
+	}
 	for _, resourcePath := range resourcePaths {
-		for _, candidate := range lockSerializationPaths(resourcePath) {
-			if _, exists := seen[candidate]; exists {
-				continue
-			}
-			seen[candidate] = struct{}{}
-			result = append(result, candidate)
+		target := path.Clean(resourcePath)
+		add(target, true)
+		for i, ancestor := range lockAncestorPaths(target) {
+			add(ancestor, i == 0 && !isDAVRootPath(ancestor))
 		}
 	}
-	slices.Sort(result)
-	return result
+
+	locks := make([]davPathLock, 0, len(byKey))
+	for _, lock := range byKey {
+		locks = append(locks, lock)
+	}
+	slices.SortFunc(locks, func(a, b davPathLock) int { return cmp.Compare(a.key, b.key) })
+	return locks
+}
+
+// isDAVRootPath reports whether p is "/dav" or one of the per-kind roots
+// directly beneath it, none of which is a collection a member write changes.
+func isDAVRootPath(p string) bool {
+	return strings.Count(p, "/") <= 2
+}
+
+// acquireDAVPathLocks takes the advisory locks davPathLocks assigns to
+// resourcePaths. Callers that need more than one lock set in a single
+// transaction must pass every target to one call: two calls decide the
+// exclusive set independently and can order or upgrade them against each other.
+func acquireDAVPathLocks(ctx context.Context, tx execContext, resourcePaths ...string) error {
+	locks := davPathLocks(resourcePaths...)
+	if len(locks) == 0 {
+		return nil
+	}
+	keys := make([]int64, len(locks))
+	modes := make([]bool, len(locks))
+	for i, lock := range locks {
+		keys[i] = lock.key
+		modes[i] = lock.exclusive
+	}
+	_, err := tx.ExecContext(ctx, davPathLockQuery, pq.Array(keys), pq.Array(modes))
+	return err
 }
 
 // lockAncestorPaths returns all parent paths of p, excluding p itself.
@@ -2461,19 +2634,147 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockACLPathsTx(ctx, tx, davStatePaths(resourcePath)...); err != nil {
+		return err
+	}
 	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []ACLEntry) error {
-	statePaths := davStatePaths(resourcePath)
-	for _, lockPath := range sortedLockSerializationPaths(statePaths...) {
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockPath); err != nil {
+// UpdateACL derives the resource's new ACL from its current one without the
+// read and the write being able to interleave with another writer's.
+func (r *aclRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]ACLEntry) ([]ACLEntry, error)) error {
+	defer observeDB(ctx, "acl.update_acl")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Locking before the snapshot read is the whole point: mutate derives the new
+	// ACL from that read, so a hold that only starts at the write lets a caller
+	// write back a stale ACL.
+	if err := lockACLPathsTx(ctx, tx, davStatePaths(resourcePath)...); err != nil {
+		return err
+	}
+
+	// setACLTx replaces every stored spelling of the resource, so mutate has to
+	// see the entries of all of them: one it was not shown would be dropped.
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`
+	rows, err := tx.QueryContext(ctx, q, pq.Array(davStatePaths(resourcePath)))
+	if err != nil {
+		return err
+	}
+	current, err := scanACLEntries(rows)
+	rows.Close()
+	if err != nil {
+		return err
+	}
+
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	if err := setACLTx(ctx, tx, resourcePath, next); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RevokePrincipalGrants revokes a share across the whole collection. Member
+// grants are evaluated before the collection's, so one left behind would keep
+// that resource readable after a collection-only revocation. They carry no
+// origin, so every member grant the principal holds goes, including any the
+// owner set on a resource directly.
+func (r *aclRepo) RevokePrincipalGrants(ctx context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	defer observeDB(ctx, "acl.revoke_principal_grants")()
+
+	tx, err := r.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Holding the collection exclusively excludes every ACL write and member
+	// write beneath it too: each of those holds its collection exclusively.
+	if err := lockACLPathsTx(ctx, tx, collectionPath); err != nil {
+		return err
+	}
+
+	memberPattern := likeEscape(collectionPath) + "/%"
+	principals := pq.Array(principalHrefSpellings(principalHref))
+	privileges := pq.Array(collectionPrivileges)
+
+	const scope = `is_grant AND principal_href = ANY($1) AND ((resource_path=$2 AND privilege = ANY($4)) OR resource_path LIKE $3 ESCAPE '\')`
+	const listQ = `SELECT DISTINCT resource_path FROM acl_entries WHERE ` + scope + ` ORDER BY resource_path`
+	rows, err := tx.QueryContext(ctx, listQ, principals, collectionPath, memberPattern, privileges)
+	if err != nil {
+		return err
+	}
+	var affected []string
+	for rows.Next() {
+		var resourcePath string
+		if err := rows.Scan(&resourcePath); err != nil {
+			rows.Close()
 			return err
 		}
+		affected = append(affected, resourcePath)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(affected) == 0 {
+		return tx.Commit()
+	}
+
+	const deleteQ = `DELETE FROM acl_entries WHERE ` + scope
+	if _, err := tx.ExecContext(ctx, deleteQ, principals, collectionPath, memberPattern, privileges); err != nil {
+		return err
+	}
+
+	if err := touchACLDependentStates(ctx, tx, affected); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// principalHrefSpellings returns the stored forms of a principal href that the
+// ACL evaluator folds together, so a SQL predicate matches the same rows the
+// in-memory comparison does. Only the trailing slash varies in practice: every
+// writer canonicalizes the rest before storing it.
+func principalHrefSpellings(principalHref string) []string {
+	trimmed := strings.TrimSuffix(principalHref, "/")
+	if trimmed == "" {
+		return []string{principalHref}
+	}
+	if trimmed == principalHref {
+		return []string{principalHref, principalHref + "/"}
+	}
+	return []string{principalHref, trimmed}
+}
+
+// lockACLPathsTx serializes an ACL transaction against the DAV path space. The
+// paths are targets, and so is the collection directly containing a member:
+// changing a member's ACL bumps that collection's CTag and sync token, and a
+// write guarded against the member's ACL holds the collection as well.
+func lockACLPathsTx(ctx context.Context, tx *sql.Tx, resourcePaths ...string) error {
+	return acquireDAVPathLocks(ctx, tx, resourcePaths...)
+}
+
+// setACLTx replaces the ACL of every stored spelling of one resource identity.
+// The caller holds the DAV path locks for those paths already: they are part of
+// the transaction's exclusive set, which one ordered pass has to settle, and
+// anything the caller read to derive these entries needs the hold to have
+// started before the read.
+func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []ACLEntry) error {
+	statePaths := davStatePaths(resourcePath)
 
 	type aclIdentity struct {
 		principalHref string
@@ -2547,48 +2848,69 @@ func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []AC
 }
 
 func touchACLDependentState(ctx context.Context, tx *sql.Tx, resourcePath string) error {
-	collectionType, collectionID, resourceName, collectionPath, ok := aclResourceIdentity(resourcePath)
-	if !ok {
-		return nil
+	return touchACLDependentStates(ctx, tx, []string{resourcePath})
+}
+
+// touchACLDependentStates marks every resource whose ACL changed as modified,
+// so CTag and sync-collection clients re-read what they may access. It issues
+// one CTag bump and one member update per collection however many of its
+// resources changed; a change on the collection itself touches every member.
+func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []string) error {
+	type collectionKey struct {
+		kind string
+		id   int64
+	}
+	type touched struct {
+		whole bool
+		names []string
+	}
+	var order []collectionKey
+	byCollection := make(map[collectionKey]*touched)
+	for _, resourcePath := range resourcePaths {
+		kind, id, resourceName, isCollection, ok := aclResourceIdentity(resourcePath)
+		if !ok {
+			continue
+		}
+		key := collectionKey{kind: kind, id: id}
+		entry, seen := byCollection[key]
+		if !seen {
+			entry = &touched{}
+			byCollection[key] = entry
+			order = append(order, key)
+		}
+		if isCollection {
+			entry.whole = true
+			continue
+		}
+		ext := ".ics"
+		if kind == "addressbook" {
+			ext = ".vcf"
+		}
+		canonical, alternate := aclResourceNameCandidates(resourceName, ext)
+		entry.names = append(entry.names, canonical, alternate)
 	}
 
-	switch collectionType {
-	case "calendar":
-		const touchCalendarQ = `UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
-		if _, err := tx.ExecContext(ctx, touchCalendarQ, collectionID); err != nil {
+	for _, key := range order {
+		entry := byCollection[key]
+		collectionTable, memberTable, memberCollection := "calendars", "events", "calendar_id"
+		if key.kind == "addressbook" {
+			collectionTable, memberTable, memberCollection = "address_books", "contacts", "address_book_id"
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE `+collectionTable+` SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`, key.id); err != nil {
 			return err
 		}
-		if collectionPath {
-			const touchEventsQ = `UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`
-			if _, err := tx.ExecContext(ctx, touchEventsQ, collectionID); err != nil {
+		if entry.whole {
+			if _, err := tx.ExecContext(ctx, `UPDATE `+memberTable+` SET last_modified = NOW() WHERE `+memberCollection+` = $1`, key.id); err != nil {
 				return err
 			}
-		} else {
-			canonical, alternate := aclResourceNameCandidates(resourceName, ".ics")
-			const touchEventQ = `UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`
-			if _, err := tx.ExecContext(ctx, touchEventQ, collectionID, canonical, alternate); err != nil {
-				return err
-			}
+			continue
 		}
-	case "addressbook":
-		const touchBookQ = `UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
-		if _, err := tx.ExecContext(ctx, touchBookQ, collectionID); err != nil {
+		slices.Sort(entry.names)
+		names := slices.Compact(entry.names)
+		if _, err := tx.ExecContext(ctx, `UPDATE `+memberTable+` SET last_modified = NOW() WHERE `+memberCollection+` = $1 AND resource_name = ANY($2)`, key.id, pq.Array(names)); err != nil {
 			return err
-		}
-		if collectionPath {
-			const touchContactsQ = `UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1`
-			if _, err := tx.ExecContext(ctx, touchContactsQ, collectionID); err != nil {
-				return err
-			}
-		} else {
-			canonical, alternate := aclResourceNameCandidates(resourceName, ".vcf")
-			const touchContactQ = `UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1 AND resource_name IN ($2, $3)`
-			if _, err := tx.ExecContext(ctx, touchContactQ, collectionID, canonical, alternate); err != nil {
-				return err
-			}
 		}
 	}
-
 	return nil
 }
 
@@ -2895,6 +3217,10 @@ func scanContact(scan rowScanner) (Contact, error) {
 	c.DisplayName = nullableString(displayName)
 	c.PrimaryEmail = nullableString(primaryEmail)
 	c.Birthday = nullableTime(birthday)
+	if c.Birthday != nil && c.Birthday.Year() == legacyNoYearBirthdayYear {
+		normalized := time.Date(NoYearBirthdayYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
+		c.Birthday = &normalized
+	}
 	return c, nil
 }
 
@@ -2991,38 +3317,32 @@ func unescapeICalValue(s string) string {
 	return s
 }
 
-// parseVCardFields extracts display_name, primary_email, and birthday from raw vCard data.
-func parseVCardFields(vcard string) (*string, *string, *time.Time) {
+// parseVCardFields extracts display_name, primary_email, and birthday from raw
+// vCard data. Each comes from the first FN, EMAIL and BDAY, which is what the
+// contact form shows and a structured edit rewrites.
+func parseVCardFields(raw string) (*string, *string, *time.Time) {
 	var displayName, primaryEmail *string
 	var birthday *time.Time
+	seenBirthday := false
 
-	lines := unfoldVCardLines(vcard)
-	for _, line := range lines {
-		colonIdx := strings.Index(line, ":")
-		if colonIdx == -1 {
+	for _, contentLine := range vcard.ContentLines(raw) {
+		line, ok := vcard.ParseLine(contentLine)
+		if !ok {
 			continue
 		}
-
-		keyPart := line[:colonIdx]
-		value := line[colonIdx+1:]
-
-		// Remove parameters
-		key := keyPart
-		if semiIdx := strings.Index(keyPart, ";"); semiIdx != -1 {
-			key = keyPart[:semiIdx]
-		}
-		key = strings.ToUpper(key)
-
-		switch key {
+		switch strings.ToUpper(line.Name) {
 		case "FN":
-			displayName = util.StrPtr(unescapeVCardValue(value))
+			if displayName == nil {
+				displayName = util.StrPtr(truncateUTF8(vcard.UnescapeText(line.Value), maxDisplayNameOctets))
+			}
 		case "EMAIL":
 			if primaryEmail == nil {
-				primaryEmail = util.StrPtr(strings.TrimSpace(value))
+				primaryEmail = util.StrPtr(strings.TrimSpace(line.Value))
 			}
 		case "BDAY":
-			if bd := parseVCardBirthday(value); bd != nil {
-				birthday = bd
+			if !seenBirthday {
+				seenBirthday = true
+				birthday = parseVCardBirthday(line)
 			}
 		}
 	}
@@ -3030,54 +3350,28 @@ func parseVCardFields(vcard string) (*string, *string, *time.Time) {
 	return displayName, primaryEmail, birthday
 }
 
-// parseVCardBirthday parses birthday from various vCard formats.
-func parseVCardBirthday(value string) *time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
+// truncateUTF8 cuts s to at most n octets without splitting a character.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// parseVCardBirthday reads a BDAY line as vcard.ParseDateProperty does. A
+// birthday without a year is stored in NoYearBirthdayYear.
+func parseVCardBirthday(line vcard.Line) *time.Time {
+	date, ok := vcard.ParseDateProperty(line)
+	if !ok {
 		return nil
 	}
-
-	// Try YYYY-MM-DD format
-	if t, err := time.Parse("2006-01-02", value); err == nil {
-		return &t
+	year := date.Year
+	if !date.HasYear {
+		year = NoYearBirthdayYear
 	}
-
-	// Try YYYYMMDD format
-	if t, err := time.Parse("20060102", value); err == nil {
-		return &t
-	}
-
-	// Try --MM-DD format (no year)
-	if strings.HasPrefix(value, "--") && len(value) >= 7 {
-		mmdd := strings.TrimPrefix(value, "--")
-		// Use year 1 as placeholder for no-year birthdays
-		if t, err := time.Parse("01-02", mmdd); err == nil {
-			bd := time.Date(1, t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
-			return &bd
-		}
-		if t, err := time.Parse("0102", mmdd); err == nil {
-			bd := time.Date(1, t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
-			return &bd
-		}
-	}
-
-	return nil
-}
-
-func unfoldVCardLines(vcard string) []string {
-	// Unfold continuation lines
-	unfolded := regexp.MustCompile(`\r?\n[ \t]`).ReplaceAllString(vcard, "")
-	// Normalize line endings and split
-	unfolded = strings.ReplaceAll(unfolded, "\r\n", "\n")
-	unfolded = strings.ReplaceAll(unfolded, "\r", "\n")
-	return strings.Split(unfolded, "\n")
-}
-
-func unescapeVCardValue(s string) string {
-	s = strings.ReplaceAll(s, "\\n", "\n")
-	s = strings.ReplaceAll(s, "\\N", "\n")
-	s = strings.ReplaceAll(s, "\\,", ",")
-	s = strings.ReplaceAll(s, "\\;", ";")
-	s = strings.ReplaceAll(s, "\\\\", "\\")
-	return s
+	birthday := time.Date(year, date.Month, date.Day, 0, 0, 0, 0, time.UTC)
+	return &birthday
 }

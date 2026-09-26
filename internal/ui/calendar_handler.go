@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -262,7 +264,7 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 
 	if calAccess.UserID == user.ID {
 		// Owner removing a share
-		if err := h.removeCalendarShare(r.Context(), calendarID, targetID, false); err != nil {
+		if err := h.removeCalendarShare(r.Context(), calendarID, targetID); err != nil {
 			h.redirect(w, r, "/calendars", map[string]string{"error": "failed to unshare"})
 			return
 		}
@@ -272,7 +274,7 @@ func (h *Handler) UnshareCalendar(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if err := h.removeCalendarShare(r.Context(), calendarID, user.ID, true); err != nil {
+		if err := h.removeCalendarShare(r.Context(), calendarID, user.ID); err != nil {
 			h.redirect(w, r, "/calendars", map[string]string{"error": "failed to leave"})
 			return
 		}
@@ -330,13 +332,12 @@ func calendarEventResourceName(uid string, existing *store.Event) string {
 	return utils.ResourceNameForUID(uid)
 }
 
+// calendarShareManagedPrivileges are the collection grants the sharing UI owns,
+// and so the only ones it takes back when a share is revoked.
+var calendarShareManagedPrivileges = []string{"read", "read-free-busy", "write"}
+
 func calendarShareManagedPrivilege(privilege string) bool {
-	switch privilege {
-	case "read", "read-free-busy", "write":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(calendarShareManagedPrivileges, privilege)
 }
 
 func calendarShareVisiblePrivilege(privilege string) bool {
@@ -629,66 +630,40 @@ func effectiveCalendarShareAccess(entries []store.ACLEntry, userID int64) (bool,
 
 func (h *Handler) setCalendarShare(ctx context.Context, calendarID, userID int64, editor bool) error {
 	resourcePath := calendarACLResourcePath(calendarID)
-	entries, err := h.store.ACLEntries.ListByResource(ctx, resourcePath)
-	if err != nil {
-		return err
-	}
 	principalHref := calendarSharePrincipalHref(userID)
-	filtered := make([]store.ACLEntry, 0, len(entries))
-	sharePosition := -1
-	maxPosition := -1
-	for _, entry := range entries {
-		if entry.Position > maxPosition {
-			maxPosition = entry.Position
-		}
-		if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && calendarShareManagedPrivilege(entry.Privilege) {
-			if sharePosition == -1 || entry.Position < sharePosition {
-				sharePosition = entry.Position
+	return h.store.ACLEntries.UpdateACL(ctx, resourcePath, func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
+		filtered := make([]store.ACLEntry, 0, len(entries))
+		sharePosition := -1
+		maxPosition := -1
+		for _, entry := range entries {
+			if entry.Position > maxPosition {
+				maxPosition = entry.Position
 			}
-			continue
+			if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && calendarShareManagedPrivilege(entry.Privilege) {
+				if sharePosition == -1 || entry.Position < sharePosition {
+					sharePosition = entry.Position
+				}
+				continue
+			}
+			filtered = append(filtered, entry)
 		}
-		filtered = append(filtered, entry)
-	}
-	if sharePosition == -1 {
-		sharePosition = maxPosition + 1
-	}
-	filtered = append(filtered, calendarSharePresetEntries(calendarID, userID, editor, sharePosition)...)
-	return h.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
+		if sharePosition == -1 {
+			sharePosition = maxPosition + 1
+		}
+		return append(filtered, calendarSharePresetEntries(calendarID, userID, editor, sharePosition)...), nil
+	})
 }
 
-func (h *Handler) removeCalendarShare(ctx context.Context, calendarID, userID int64, requireEffectiveShare bool) error {
-	resourcePath := calendarACLResourcePath(calendarID)
-	entries, err := h.store.ACLEntries.ListByResource(ctx, resourcePath)
-	if err != nil {
-		return err
-	}
-	acl.SortEntries(entries)
-	if requireEffectiveShare && !hasEffectiveManagedCalendarShare(entries, userID) {
-		return store.ErrNotFound
-	}
-	principalHref := calendarSharePrincipalHref(userID)
-	filtered := make([]store.ACLEntry, 0, len(entries))
-	for _, entry := range entries {
-		if acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && entry.IsGrant && calendarShareManagedPrivilege(entry.Privilege) {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	return h.store.ACLEntries.SetACL(ctx, resourcePath, filtered)
-}
-
-func hasEffectiveManagedCalendarShare(entries []store.ACLEntry, userID int64) bool {
-	principalHref := calendarSharePrincipalHref(userID)
-	applicable := acl.ApplicablePrincipals(&store.User{ID: userID})
-	if read, _ := acl.DecisionForPrivilege(entries, applicable, "read"); !read {
-		return false
-	}
-	for _, entry := range entries {
-		if entry.IsGrant && acl.NormalizePrincipalHref(entry.PrincipalHref) == principalHref && acl.PrivilegeMatches(entry.Privilege, "read") && calendarShareManagedPrivilege(entry.Privilege) {
-			return true
-		}
-	}
-	return false
+// removeCalendarShare revokes a principal's share of one calendar. It reaches
+// further than the collection grants it writes: a grant on one event is
+// evaluated ahead of the calendar's, so one left in place would keep that event
+// readable to a principal the calendar no longer names, and a member grant
+// records no origin to tell a share's leftovers from one the owner set through
+// the ACL method on that event. Every grant the principal holds anywhere in the
+// calendar therefore goes. Only grants are removed, so this never widens
+// access and needs no precondition, whoever asks for it.
+func (h *Handler) removeCalendarShare(ctx context.Context, calendarID, userID int64) error {
+	return h.store.ACLEntries.RevokePrincipalGrants(ctx, calendarACLResourcePath(calendarID), calendarSharePrincipalHref(userID), calendarShareManagedPrivileges)
 }
 
 // ViewCalendar displays a calendar and its events.
@@ -2159,13 +2134,10 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 }
 
 func parseICalProperty(line string) (string, map[string]string, string, bool) {
-	colonIdx := strings.Index(line, ":")
-	if colonIdx == -1 {
+	keyPart, value, ok := ical.SplitContentLine(line)
+	if !ok {
 		return "", nil, "", false
 	}
-
-	keyPart := line[:colonIdx]
-	value := line[colonIdx+1:]
 	keyParts := splitICalParameterParts(keyPart)
 	key := strings.ToUpper(strings.TrimSpace(keyParts[0]))
 	params := make(map[string]string)

@@ -27,15 +27,23 @@ function element() {
     get innerHTML() { return this._text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); },
   };
 }
-const context = { document: { createElement: element }, URL, window: { location: { origin: 'https://calcard.example' } } };
+const context = { document: { createElement: element }, URL, window: {} };
 const hasSafeHref = source.includes('function safeHref(');
+const hasSafeUrl = source.includes('function safeUrl(');
 vm.runInNewContext(
-  extract('escapeHtml') + '\n' + extract('safeHref', true) +
-    '\nglobalThis._escapeHtml = escapeHtml;' + (hasSafeHref ? ' globalThis._safeHref = safeHref;' : ''),
+  [
+    extract('escapeHtml'),
+    extract('safeUrl', true),
+    extract('safeHref', true),
+    'globalThis._escapeHtml = escapeHtml;',
+    hasSafeUrl ? 'globalThis._safeUrl = safeUrl;' : '',
+    hasSafeHref ? 'globalThis._safeHref = safeHref;' : '',
+  ].join('\n'),
   context,
 );
 const escapeHtml = context._escapeHtml;
 const safeHref = context._safeHref;
+const safeUrl = context._safeUrl;
 
 // Every escapeHtml result in these templates is interpolated into markup that
 // is then assigned to innerHTML, and several land inside a double-quoted
@@ -53,6 +61,45 @@ assert.equal(escapeHtml('a & b'), 'a &amp; b');
 // & must be rewritten before the other replacements, or the entities they
 // introduce get their ampersand escaped a second time.
 assert.equal(escapeHtml('&lt;'), '&amp;lt;');
+
+// safeUrl is the scheme gate for a value that is set as a property or an
+// attribute rather than concatenated into markup, so it returns the parsed URL
+// rather than an escaped one. Deciding the scheme by inspecting the caller's
+// text -- trim, then startsWith('javascript:') -- misses every spelling the URL
+// parser normalizes away, and the browser navigates by the parsed URL.
+if (hasSafeUrl) {
+  for (const blocked of [
+    'javascript:alert(1)',
+    'JaVaScRiPt:alert(1)',
+    '  javascript:alert(1)',
+    'java\tscript:alert(1)',
+    'java\nscript:alert(1)',
+    'java\rscript:alert(1)',
+    '\u0001javascript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'vbscript:alert(1)',
+  ]) {
+    assert.equal(safeUrl(blocked), '', `safeUrl admitted ${JSON.stringify(blocked)}`);
+  }
+  // A relative URL resolves against this site, so a stored value could put a
+  // link to one of the site's own pages, under text of its choosing, into a
+  // modal. Only absolute URLs are links here.
+  for (const relative of [
+    '/calendars?error=Your+session+expired.+Sign+in+again',
+    'calendars',
+    '//evil.test/login',
+    '?error=x',
+    '#top',
+  ]) {
+    assert.equal(safeUrl(relative), '', `safeUrl admitted the relative URL ${JSON.stringify(relative)}`);
+  }
+  assert.ok(safeUrl('https://example.com/a?b=1').startsWith('https://example.com/a'), 'safeUrl dropped a valid https URL');
+  assert.equal(safeUrl('tel:+15551234567'), 'tel:+15551234567', 'safeUrl dropped a telephone link');
+  assert.ok(safeUrl('mailto:someone@example.com').startsWith('mailto:'), 'safeUrl dropped a valid mailto URL');
+  // Unescaped on purpose: this value is assigned, not interpolated. The URL
+  // parser is what keeps a quote out of it.
+  assert.ok(!safeUrl('https://example.com/"x').includes('"'), 'safeUrl left a bare quote in a parsed URL');
+}
 
 if (!hasSafeHref) {
   process.exit(0);

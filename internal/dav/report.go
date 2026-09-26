@@ -351,13 +351,13 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			// for a floating value.
 			candidates, err = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
 			if err != nil {
-				h.writeReportFailure(w, r, report.XMLName.Local, err)
+				h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
 				return
 			}
 		}
 		freeBusyData, err := h.generateFreeBusy(candidates, report.TimeRange)
 		if err != nil {
-			h.writeReportFailure(w, r, report.XMLName.Local, err)
+			h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
 			return
 		}
 		w.Header().Set("Content-Type", "text/calendar")

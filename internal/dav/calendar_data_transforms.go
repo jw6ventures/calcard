@@ -1,6 +1,8 @@
 package dav
 
 import (
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,7 +53,7 @@ var utcDateProperties = nameSet("DTSTART", "DTEND", "DUE", "COMPLETED", "CREATED
 // a resource carrying several masters cannot multiply the limit by how many it
 // carries.
 func expandCalendarData(m calendarTimeRangeMatcher, root *icalNode, r calendarRange) *icalNode {
-	expanded := &icalNode{name: root.name, properties: expandedProperties(m, root.properties, 0)}
+	expanded := &icalNode{name: root.name, properties: expandedProperties(m, root.properties, noShift)}
 	for _, child := range root.children {
 		// §9.6.5 forbids the output referring to a VTIMEZONE, and every value
 		// that referred to one has been rewritten as UTC by now.
@@ -83,7 +85,7 @@ func expandComponent(m calendarTimeRangeMatcher, root, node *icalNode, r calenda
 		// §9.6.5 does not admit: each component defines exactly one instance.
 		// Without a master there is no expansion to carry it, and §4.1 permits a
 		// resource made only of overridden instances, so it stands for its own.
-		if thisAndFutureOverride(node) && recurrenceSetMaster(root, node) != nil {
+		if thisAndFutureOverride(node) && m.recurrenceSetMaster(root, node) != nil {
 			return nil
 		}
 		// An ordinary overridden instance already defines exactly one instance
@@ -117,7 +119,7 @@ func expandComponent(m calendarTimeRangeMatcher, root, node *icalNode, r calenda
 	var expanded []*icalNode
 	for _, instance := range instances {
 		occurrence := expandedInstance(m, root, node, instance)
-		if !m.componentInTimeRange(occurrence, root, r.Start, r.End, 0) {
+		if !m.componentInTimeRange(occurrence, root, r.Start, r.End, noShift) {
 			continue
 		}
 		if len(expanded) >= budget {
@@ -138,10 +140,10 @@ func expandComponent(m calendarTimeRangeMatcher, root, node *icalNode, r calenda
 // non-standard component stored by PUT to be preserved, and discarding one on
 // the strength of a test that never ran would lose it.
 func expandedSingleton(m calendarTimeRangeMatcher, root, node *icalNode, r calendarRange) []*icalNode {
-	if calendarTimeRangeComponents.contains(node.name) && !m.componentInTimeRange(node, root, r.Start, r.End, 0) {
+	if calendarTimeRangeComponents.contains(node.name) && !m.componentInTimeRange(node, root, r.Start, r.End, noShift) {
 		return nil
 	}
-	expanded := utcComponent(m, node, 0)
+	expanded := utcComponent(m, node, noShift)
 	expanded.properties = dropRecurrenceRange(expanded.properties)
 	return []*icalNode{expanded}
 }
@@ -181,14 +183,14 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 	}
 
 	expanded := utcComponent(m, content, contentShift)
-	if start, ok := m.dateValue(content, "DTSTART", 0); ok {
+	if start, ok := m.dateValue(content, "DTSTART", noShift); ok {
 		delta := instance.duration - m.occurrenceWindow(content, start)
 		if delta != 0 {
 			adjusted := false
 			for i, property := range expanded.properties {
 				switch property.name {
 				case "DTEND", "DUE":
-					if end, ok := utcProperty(m, property, delta); ok {
+					if end, ok := utcProperty(m, property, durationShift(delta)); ok {
 						expanded.properties[i] = end
 						adjusted = true
 					}
@@ -199,7 +201,7 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 			}
 			if !adjusted && (master.name == "VEVENT" || master.name == "VTODO") {
 				property, _ := firstICalProperty(content, "DTSTART")
-				end, ok := utcProperty(m, property, contentShift+instance.duration)
+				end, ok := utcProperty(m, property, contentShift.plus(durationShift(instance.duration)))
 				if ok {
 					end.name = "DTEND"
 					if master.name == "VTODO" {
@@ -221,16 +223,16 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 // instanceShiftFrom re-expresses an occurrence offset so it moves the override's
 // own dates rather than the master's. The override describes the slot it names;
 // a later slot is that description moved by the distance between the two.
-func instanceShiftFrom(m calendarTimeRangeMatcher, master, override *icalNode, shift time.Duration) time.Duration {
+func instanceShiftFrom(m calendarTimeRangeMatcher, master, override *icalNode, shift instantShift) instantShift {
 	masterStart, ok := m.dateValue(master, "DTSTART", shift)
 	if !ok {
-		return 0
+		return noShift
 	}
-	overrideStart, ok := m.dateValue(override, "DTSTART", 0)
+	overrideStart, ok := m.dateValue(override, "DTSTART", noShift)
 	if !ok {
-		return 0
+		return noShift
 	}
-	return masterStart.instant.Sub(overrideStart.instant)
+	return shiftBetween(overrideStart.instant, masterStart.instant)
 }
 
 // recurrenceIDProperty is the master's DTSTART moved to the slot and renamed,
@@ -238,7 +240,7 @@ func instanceShiftFrom(m calendarTimeRangeMatcher, master, override *icalNode, s
 // of a slot in the master's pattern, not the time the occurrence was moved to.
 // Deriving it from the master's own property also keeps its DATE, floating or
 // UTC spelling, whatever the instance's dates ended up written as.
-func recurrenceIDProperty(m calendarTimeRangeMatcher, master *icalNode, slotShift time.Duration) (icalProperty, bool) {
+func recurrenceIDProperty(m calendarTimeRangeMatcher, master *icalNode, slotShift instantShift) (icalProperty, bool) {
 	dtstart, ok := firstICalProperty(master, "DTSTART")
 	if !ok {
 		// Nothing to expand around, so there is one instance and no identifier
@@ -258,26 +260,106 @@ func recurrenceIDProperty(m calendarTimeRangeMatcher, master *icalNode, slotShif
 // slotShift: the latest one whose RECURRENCE-ID is at or before it. RFC 5545
 // §3.8.4.4 makes a RANGE=THISANDFUTURE override apply to the instance it names
 // and every later one, so the nearest preceding override wins.
-func governingThisAndFutureOverride(m calendarTimeRangeMatcher, root, master *icalNode, slotShift time.Duration) *icalNode {
+func governingThisAndFutureOverride(m calendarTimeRangeMatcher, root, master *icalNode, slotShift instantShift) *icalNode {
 	slot, ok := m.dateValue(master, "DTSTART", slotShift)
 	if !ok {
 		return nil
 	}
-	var governing *icalNode
-	var governingID time.Time
+	return m.overrideIndex(root, master).governing(slot.instant)
+}
+
+// recurrenceOverride links a recurrence slot to the component overriding it.
+type recurrenceOverride struct {
+	recurrenceID time.Time
+	node         *icalNode
+}
+
+// recurrenceOverrideIndex finds the component describing a slot of a master's
+// recurrence set. It is consulted once per expanded instance by free-busy, by
+// §9.6.5 expansion and by every §9.9 test that visits instances, and RFC 5545
+// §3.8.4.4 bounds neither how many overrides a resource may carry, so both of
+// its questions are lookups rather than walks over the resource's components.
+type recurrenceOverrideIndex struct {
+	// exact holds, per slot, the first override naming it.
+	exact map[time.Time]*icalNode
+	// thisAndFuture is ordered by RECURRENCE-ID; among overrides naming the same
+	// slot the first in the resource comes first, and is the one that governs.
+	thisAndFuture []recurrenceOverride
+}
+
+type recurrenceOverrideIndexKey struct {
+	root, master *icalNode
+}
+
+// overrideIndex is the override index of master's recurrence set within root,
+// built once per matcher and shared by every copy of it.
+func (m calendarTimeRangeMatcher) overrideIndex(root, master *icalNode) recurrenceOverrideIndex {
+	key := recurrenceOverrideIndexKey{root: root, master: master}
+	if m.indexes == nil {
+		return newRecurrenceOverrideIndex(m, root, master)
+	}
+	if index, ok := m.indexes.overrides[key]; ok {
+		return index
+	}
+	index := newRecurrenceOverrideIndex(m, root, master)
+	if m.indexes.overrides == nil {
+		m.indexes.overrides = make(map[recurrenceOverrideIndexKey]recurrenceOverrideIndex)
+	}
+	m.indexes.overrides[key] = index
+	return index
+}
+
+func newRecurrenceOverrideIndex(m calendarTimeRangeMatcher, root, master *icalNode) recurrenceOverrideIndex {
+	index := recurrenceOverrideIndex{exact: make(map[time.Time]*icalNode)}
 	for _, child := range root.children {
-		if child.name != master.name || !thisAndFutureOverride(child) {
+		if child.name != master.name || child.count("RECURRENCE-ID") == 0 {
 			continue
 		}
-		recurrenceID, ok := m.dateValue(child, "RECURRENCE-ID", 0)
-		if !ok || recurrenceID.instant.After(slot.instant) {
+		recurrenceID, ok := m.dateValue(child, "RECURRENCE-ID", noShift)
+		if !ok {
 			continue
 		}
-		if governing == nil || recurrenceID.instant.After(governingID) {
-			governing, governingID = child, recurrenceID.instant
+		slot := recurrenceID.instant.UTC()
+		if _, seen := index.exact[slot]; !seen {
+			index.exact[slot] = child
+		}
+		if thisAndFutureOverride(child) {
+			index.thisAndFuture = append(index.thisAndFuture, recurrenceOverride{recurrenceID: slot, node: child})
 		}
 	}
-	return governing
+	slices.SortStableFunc(index.thisAndFuture, func(a, b recurrenceOverride) int {
+		return a.recurrenceID.Compare(b.recurrenceID)
+	})
+	return index
+}
+
+// governing is the RANGE=THISANDFUTURE override with the latest RECURRENCE-ID
+// at or before slot, or nil.
+func (index recurrenceOverrideIndex) governing(slot time.Time) *icalNode {
+	overrides := index.thisAndFuture
+	after := sort.Search(len(overrides), func(i int) bool {
+		return overrides[i].recurrenceID.After(slot)
+	})
+	if after == 0 {
+		return nil
+	}
+	latest := overrides[after-1].recurrenceID
+	first := sort.Search(after, func(i int) bool {
+		return !overrides[i].recurrenceID.Before(latest)
+	})
+	return overrides[first].node
+}
+
+// describing is the component that describes the slot: its exact override,
+// else the governing RANGE=THISANDFUTURE override, else the master.
+func (index recurrenceOverrideIndex) describing(master *icalNode, slot time.Time) *icalNode {
+	if node, ok := index.exact[slot.UTC()]; ok {
+		return node
+	}
+	if node := index.governing(slot); node != nil {
+		return node
+	}
+	return master
 }
 
 // thisAndFutureOverride reports whether the component overrides the instance it
@@ -290,17 +372,17 @@ func thisAndFutureOverride(node *icalNode) bool {
 // utcComponent is one component with the recurrence properties §9.6.5 forbids
 // removed and every date-valued property rewritten so it refers to no
 // VTIMEZONE. Sub-components come along, since a VALARM is part of the instance.
-func utcComponent(m calendarTimeRangeMatcher, node *icalNode, shift time.Duration) *icalNode {
+func utcComponent(m calendarTimeRangeMatcher, node *icalNode, shift instantShift) *icalNode {
 	projected := &icalNode{name: node.name, properties: expandedProperties(m, node.properties, shift)}
 	for _, child := range node.children {
 		// A sub-component defines no recurrence set of its own, so its dates
 		// are read as written rather than moved onto the instance.
-		projected.children = append(projected.children, utcComponent(m, child, 0))
+		projected.children = append(projected.children, utcComponent(m, child, noShift))
 	}
 	return projected
 }
 
-func expandedProperties(m calendarTimeRangeMatcher, properties []icalProperty, shift time.Duration) []icalProperty {
+func expandedProperties(m calendarTimeRangeMatcher, properties []icalProperty, shift instantShift) []icalProperty {
 	projected := make([]icalProperty, 0, len(properties))
 	for _, property := range properties {
 		if recurrencePropertyNames.contains(property.name) {
@@ -318,12 +400,12 @@ func expandedProperties(m calendarTimeRangeMatcher, properties []icalProperty, s
 // keyed on the TZID parameter rather than on the date-valued names, because
 // RFC 5545 §3.2.19 admits one on any DATE-TIME value -- an alarm's absolute
 // TRIGGER and an X- property among them.
-func expandedProperty(m calendarTimeRangeMatcher, property icalProperty, shift time.Duration) icalProperty {
+func expandedProperty(m calendarTimeRangeMatcher, property icalProperty, shift instantShift) icalProperty {
 	zoned := strings.TrimSpace(property.parameters["TZID"]) != ""
 	if !zoned && !utcDateProperties.contains(property.name) {
 		return property
 	}
-	propertyShift := time.Duration(0)
+	propertyShift := noShift
 	if shiftedDateProperties.contains(property.name) {
 		propertyShift = shift
 	}
@@ -346,7 +428,7 @@ func expandedProperty(m calendarTimeRangeMatcher, property icalProperty, shift t
 // local time carrying a time zone reference, and rewriting an all-day value as
 // an instant would destroy the fact that it is all-day. ok is false for a value
 // no zone resolves, which is left exactly as it was written.
-func utcProperty(m calendarTimeRangeMatcher, property icalProperty, shift time.Duration) (icalProperty, bool) {
+func utcProperty(m calendarTimeRangeMatcher, property icalProperty, shift instantShift) (icalProperty, bool) {
 	value := strings.TrimSpace(property.value)
 	form, ok := parseICalDateForm(value)
 	if !ok {
@@ -356,7 +438,7 @@ func utcProperty(m calendarTimeRangeMatcher, property icalProperty, shift time.D
 	if !ok {
 		return icalProperty{}, false
 	}
-	instant = instant.Add(shift)
+	instant = shift.apply(instant)
 
 	rewritten := property
 	switch {
@@ -428,35 +510,73 @@ func dropProperties(properties []icalProperty, names icalNameSet) []icalProperty
 // element narrows the set, it does not expand it.
 func limitCalendarRecurrenceSet(m calendarTimeRangeMatcher, root *icalNode, r calendarRange) *icalNode {
 	limited := &icalNode{name: root.name, properties: root.properties}
+	slots := newRangeSlots(m, r)
 	for _, child := range root.children {
-		if child.count("RECURRENCE-ID") == 0 || overrideImpactsRange(m, root, child, r) {
+		if child.count("RECURRENCE-ID") == 0 || overrideImpactsRange(m, root, child, r, slots) {
 			limited.children = append(limited.children, child)
 		}
 	}
 	return limited
 }
 
-func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, r calendarRange) bool {
+// rangeSlots expands a master's recurrence slots over one range at most once.
+// Every RANGE=THISANDFUTURE override of the master asks the same question of
+// them, and a resource may carry any number of overrides.
+type rangeSlots struct {
+	m      calendarTimeRangeMatcher
+	r      calendarRange
+	byNode map[*icalNode][]ical.RecurrenceSlot
+}
+
+func newRangeSlots(m calendarTimeRangeMatcher, r calendarRange) *rangeSlots {
+	return &rangeSlots{m: m, r: r, byNode: make(map[*icalNode][]ical.RecurrenceSlot)}
+}
+
+// of returns the slots of master's recurrence set touching the range. An
+// expansion failure is recorded on the matcher, which ends the transform.
+func (s *rangeSlots) of(master *icalNode) ([]ical.RecurrenceSlot, bool) {
+	if slots, ok := s.byNode[master]; ok {
+		return slots, true
+	}
+	if *s.m.expansionError != nil {
+		return nil, false
+	}
+	dtstart, ok := s.m.dateValue(master, "DTSTART", noShift)
+	if !ok {
+		return nil, false
+	}
+	window := s.m.occurrenceWindow(master, dtstart)
+	slots, err := ical.RecurrenceSlots(s.m.raw, master.name, dtstart.instant, window,
+		s.r.Start, s.r.End, ical.MaxRecurrenceInstances, s.m.resolveContentLine)
+	if err != nil {
+		*s.m.expansionError = err
+		return nil, false
+	}
+	s.byNode[master] = slots
+	return slots, true
+}
+
+func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, r calendarRange, rangeSlots *rangeSlots) bool {
 	// The current scheduled time: the override's own dates, judged by the same
 	// §9.9 table the filter uses.
-	if m.componentInTimeRange(override, root, r.Start, r.End, 0) {
+	if m.componentInTimeRange(override, root, r.Start, r.End, noShift) {
 		return true
 	}
 	property, ok := firstICalProperty(override, "RECURRENCE-ID")
 	if !ok {
 		return false
 	}
-	original, ok := m.dateValue(override, "RECURRENCE-ID", 0)
+	original, ok := m.dateValue(override, "RECURRENCE-ID", noShift)
 	if !ok {
 		return false
 	}
 	// The original scheduled time occupies one occurrence of the master's
 	// window. A masterless override still names an instant, which is enough to
 	// retain it when that instant falls strictly inside the requested range.
-	master := recurrenceSetMaster(root, override)
+	master := m.recurrenceSetMaster(root, override)
 	window := time.Duration(0)
 	if master != nil {
-		if dtstart, ok := m.dateValue(master, "DTSTART", 0); ok {
+		if dtstart, ok := m.dateValue(master, "DTSTART", noShift); ok {
 			window = m.occurrenceWindow(master, dtstart)
 		}
 	}
@@ -467,15 +587,8 @@ func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, 
 		if master == nil {
 			return false
 		}
-		dtstart, ok := m.dateValue(master, "DTSTART", 0)
+		slots, ok := rangeSlots.of(master)
 		if !ok {
-			return false
-		}
-		window := m.occurrenceWindow(master, dtstart)
-		slots, err := ical.RecurrenceSlots(m.raw, master.name, dtstart.instant, window,
-			r.Start, r.End, ical.MaxRecurrenceInstances, m.resolveContentLine)
-		if err != nil {
-			*m.expansionError = err
 			return false
 		}
 		for _, slot := range slots {
@@ -496,16 +609,34 @@ func recurrencePeriodIntersects(period ical.BusyPeriod, start, end time.Time) bo
 	return period.Start.Before(end) && period.End.After(start)
 }
 
-// recurrenceSetMaster is the component an override belongs to: the sibling of
-// the same type carrying no RECURRENCE-ID. A resource made only of overridden
-// instances has none, which RFC 4791 §4.1 permits.
-func recurrenceSetMaster(root, override *icalNode) *icalNode {
-	for _, child := range root.children {
-		if child.name == override.name && child.count("RECURRENCE-ID") == 0 {
-			return child
+// recurrenceSetMaster is the component an override belongs to: the first
+// sibling of the same type carrying no RECURRENCE-ID. A resource made only of
+// overridden instances has none, which RFC 4791 §4.1 permits.
+//
+// It is asked once per override, and a master may follow every one of its
+// overrides, so the masters of root are found in one walk and kept with the
+// matcher's other per-resource indexes.
+func (m calendarTimeRangeMatcher) recurrenceSetMaster(root, override *icalNode) *icalNode {
+	var masters map[string]*icalNode
+	ok := false
+	if m.indexes != nil {
+		masters, ok = m.indexes.masters[root]
+	}
+	if !ok {
+		masters = make(map[string]*icalNode)
+		for _, child := range root.children {
+			if _, seen := masters[child.name]; !seen && child.count("RECURRENCE-ID") == 0 {
+				masters[child.name] = child
+			}
+		}
+		if m.indexes != nil {
+			if m.indexes.masters == nil {
+				m.indexes.masters = make(map[*icalNode]map[string]*icalNode)
+			}
+			m.indexes.masters[root] = masters
 		}
 	}
-	return nil
+	return masters[override.name]
 }
 
 // limitCalendarFreeBusySet drops the FREEBUSY period values that do not

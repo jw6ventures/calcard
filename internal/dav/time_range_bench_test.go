@@ -87,8 +87,11 @@ func BenchmarkFreeBusyPeriods(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
+		budget := newFreeBusyBudget()
 		for _, candidate := range freeBusyCandidates(events, floatingZone{}) {
-			freeBusyIntervals(candidate, rangeStart, rangeEnd)
+			if _, err := freeBusyIntervals(candidate, rangeStart, rangeEnd, budget); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 }

@@ -838,3 +838,30 @@ func TestSameRecurrenceID(t *testing.T) {
 		}
 	}
 }
+
+// RFC 5545 Section 3.1 lets a quoted parameter value hold a colon; Exchange
+// writes TZIDs such as "(UTC-05:00) Eastern". The value starts at the first
+// colon outside quotes.
+func TestContentLineReadersHonourQuotedColons(t *testing.T) {
+	const quoted = `RECURRENCE-ID;TZID="(UTC-05:00) Eastern":20250724T090000`
+	if got := RecurrenceIDValue([]string{"UID:x", quoted}); got != "20250724T090000" {
+		t.Errorf("RecurrenceIDValue() = %q, want 20250724T090000", got)
+	}
+	exdate := `EXDATE;TZID="(UTC-05:00) Eastern":20250724T090000`
+	if !HasPropertyValue([]string{exdate}, "EXDATE", "20250724T090000") {
+		t.Errorf("HasPropertyValue missed %q", exdate)
+	}
+	left := `RECURRENCE-ID;X-NOTE="a:b";TZID=America/New_York:20250724T090000`
+	if !SameRecurrenceID([]string{left}, []string{"RECURRENCE-ID:20250724T130000Z"}) {
+		t.Errorf("SameRecurrenceID did not resolve %q", left)
+	}
+}
+
+func TestContentLineReadersMatchWholePropertyNames(t *testing.T) {
+	if got := RecurrenceIDValue([]string{"RECURRENCE-IDX:1", "X-FOO:2"}); got != "" {
+		t.Errorf("RecurrenceIDValue() = %q from another property", got)
+	}
+	if HasPropertyValue([]string{"EXDATEX:1"}, "EXDATE", "1") {
+		t.Error("HasPropertyValue matched another property")
+	}
+}

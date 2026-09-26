@@ -199,19 +199,22 @@ func (h *DavServer) aclResourceExpectation(ctx context.Context, user *store.User
 		if !ok || calendarID == birthdayCalendarID {
 			return store.ACLResourceExpectation{}, store.ErrNotFound
 		}
-		cal, err := h.getCalendar(ctx, calendarID)
+		_, err = h.getCalendar(ctx, calendarID)
 		if errors.Is(err, store.ErrNotFound) && h.store != nil && h.store.Calendars != nil && user != nil {
 			if access, accessErr := h.store.Calendars.GetAccessible(ctx, calendarID, user.ID); accessErr != nil {
 				return store.ACLResourceExpectation{}, accessErr
 			} else if access != nil {
-				cal = &access.Calendar
 				err = nil
 			}
 		}
 		if err != nil {
 			return store.ACLResourceExpectation{}, err
 		}
-		expected := store.ACLResourceExpectation{CollectionKind: "calendar", CollectionID: calendarID, CollectionCTag: &cal.CTag}
+		guard, err := h.aclGuard(ctx, user, cleanPath)
+		if err != nil {
+			return store.ACLResourceExpectation{}, err
+		}
+		expected := store.ACLResourceExpectation{CollectionKind: "calendar", CollectionID: calendarID, ACL: guard}
 		if target.Resource {
 			event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
 			if err != nil {
@@ -232,11 +235,14 @@ func (h *DavServer) aclResourceExpectation(ctx context.Context, user *store.User
 		if !ok {
 			return store.ACLResourceExpectation{}, store.ErrNotFound
 		}
-		book, err := h.getAddressBook(ctx, addressBookID)
+		if _, err := h.getAddressBook(ctx, addressBookID); err != nil {
+			return store.ACLResourceExpectation{}, err
+		}
+		guard, err := h.aclGuard(ctx, user, cleanPath)
 		if err != nil {
 			return store.ACLResourceExpectation{}, err
 		}
-		expected := store.ACLResourceExpectation{CollectionKind: "addressbook", CollectionID: addressBookID, CollectionCTag: &book.CTag}
+		expected := store.ACLResourceExpectation{CollectionKind: "addressbook", CollectionID: addressBookID, ACL: guard}
 		if target.Resource {
 			contact, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, target.ResourceName)
 			if err != nil {
@@ -572,7 +578,7 @@ func (h *DavServer) applicablePrincipalsForPath(ctx context.Context, user *store
 // which is what DAV:self resolves to there, and an empty string for every other
 // resource.
 func principalResourceHref(resourcePath string) string {
-	cleanPath := normalizeDAVHref(resourcePath)
+	cleanPath := cleanDAVPath(resourcePath)
 	if !strings.HasPrefix(cleanPath, "/dav/principals/") {
 		return ""
 	}
@@ -589,7 +595,8 @@ func principalResourceHref(resourcePath string) string {
 
 func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
 	resourcePath = normalizeDAVResourceIdentity(resourcePath)
-	if isProtectedVirtualDAVRoot(resourcePath) {
+	candidates := aclEntryPaths(resourcePath)
+	if len(candidates) == 0 {
 		return nil, nil
 	}
 
@@ -602,17 +609,8 @@ func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath stri
 		}
 	}
 
-	candidates := append([]string{resourcePath}, legacyDAVResourcePaths(resourcePath)...)
-	seen := make(map[string]struct{}, len(candidates))
 	var result []store.ACLEntry
 	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
 		entries, err := h.store.ACLEntries.ListByResource(ctx, candidate)
 		if err != nil {
 			return nil, err
@@ -627,8 +625,103 @@ func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath stri
 	return result, nil
 }
 
+// aclEntryPaths lists the stored spellings whose entries make up the ACL of
+// resourcePath, which must already be normalized.
+func aclEntryPaths(resourcePath string) []string {
+	if isProtectedVirtualDAVRoot(resourcePath) {
+		return nil
+	}
+	candidates := append([]string{resourcePath}, legacyDAVResourcePaths(resourcePath)...)
+	seen := make(map[string]struct{}, len(candidates))
+	paths := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		paths = append(paths, candidate)
+	}
+	return paths
+}
+
+// aclDecisionPaths lists the resources whose ACLs checkACLPrivilege consults
+// for resourcePath: the resource itself and, for a member, its collection.
+func aclDecisionPaths(resourcePath string) []string {
+	var collectionPath string
+	switch {
+	case strings.HasPrefix(resourcePath, "/dav/calendars/"):
+		collectionPath = calendarCollectionPath(resourcePath)
+	case strings.HasPrefix(resourcePath, "/dav/addressbooks/"):
+		collectionPath = addressBookCollectionPath(resourcePath)
+	}
+	if collectionPath == "" || collectionPath == resourcePath {
+		return []string{resourcePath}
+	}
+	return []string{resourcePath, collectionPath}
+}
+
+// aclGuard pins the ACL entries that decide user's privileges on resourcePaths,
+// for the store to re-check under the write's locks: an ACL change landing
+// between the privilege check and the write then fails the write, and the
+// retry is authorized against the new ACL. It reads through the request's ACL
+// cache, so it pins the very entries the privilege checks use; call it before
+// those checks all the same, so that it cannot pin entries newer than theirs
+// when no cache is present. It is nil when user owns every path, since an
+// owner's privileges do not come from the ACL.
+func (h *DavServer) aclGuard(ctx context.Context, user *store.User, resourcePaths ...string) (*store.ACLGuard, error) {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return nil, nil
+	}
+	canonicalPaths := make([]string, 0, len(resourcePaths))
+	ownsAll := true
+	for _, resourcePath := range resourcePaths {
+		canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
+			// The request fails resolving this path on its own; there is no ACL
+			// decision on it to pin.
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if canonicalPath == "" {
+			canonicalPath = resourcePath
+		}
+		canonicalPaths = append(canonicalPaths, canonicalPath)
+		if !h.isResourceOwner(ctx, user, canonicalPath) {
+			ownsAll = false
+		}
+	}
+	if ownsAll {
+		return nil, nil
+	}
+
+	var guardedPaths []string
+	var entries []store.ACLEntry
+	seen := make(map[string]struct{})
+	for _, canonicalPath := range canonicalPaths {
+		for _, decisionPath := range aclDecisionPaths(canonicalPath) {
+			decisionPath = normalizeDAVResourceIdentity(decisionPath)
+			if _, ok := seen[decisionPath]; ok {
+				continue
+			}
+			seen[decisionPath] = struct{}{}
+			decisionEntries, err := h.aclEntriesForResource(ctx, decisionPath)
+			if err != nil {
+				return nil, err
+			}
+			guardedPaths = append(guardedPaths, aclEntryPaths(decisionPath)...)
+			entries = append(entries, decisionEntries...)
+		}
+	}
+	return store.NewACLGuard(guardedPaths, entries), nil
+}
+
 func isProtectedVirtualDAVRoot(resourcePath string) bool {
-	switch normalizeDAVHref(resourcePath) {
+	switch cleanDAVPath(resourcePath) {
 	case "/dav", "/dav/calendars", "/dav/addressbooks", "/dav/principals":
 		return true
 	default:

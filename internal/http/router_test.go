@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
@@ -468,4 +469,85 @@ func TestRateLimiterBucketsByTheClientNotAForwardedHeader(t *testing.T) {
 		}
 	}
 	t.Fatal("rotating the leftmost X-Forwarded-For entry kept the client out of its own bucket for 50 requests")
+}
+
+// The auth service sends the identity provider to BaseURL+RedirectPath, so the
+// router has to serve the callback at that same path. A handler reached without
+// the state cookie answers 400 "invalid oauth state", which is what proves the
+// request got to the callback rather than a 404 or the session redirect.
+func TestNewRouterServesTheOAuthCallbackAtTheConfiguredPath(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	for _, tc := range []struct {
+		name         string
+		redirectPath string
+		served       string
+		notServed    string
+	}{
+		{name: "default", redirectPath: "", served: "/auth/callback"},
+		{name: "explicit default", redirectPath: "/auth/callback", served: "/auth/callback"},
+		{name: "custom outside /auth", redirectPath: "/oidc/return", served: "/oidc/return", notServed: "/auth/callback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{BaseURL: "http://localhost:8080"}
+			cfg.OAuth.RedirectPath = tc.redirectPath
+			r := NewRouter(cfg, store.New(db), &auth.Service{})
+
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.served+"?state=x&code=y", nil))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid oauth state") {
+				t.Fatalf("GET %s = %d %q, want the OAuth callback's 400", tc.served, rec.Code, rec.Body.String())
+			}
+
+			if tc.notServed != "" {
+				rec = httptest.NewRecorder()
+				r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.notServed+"?state=x&code=y", nil))
+				if strings.Contains(rec.Body.String(), "invalid oauth state") {
+					t.Fatalf("GET %s reached the OAuth callback although RedirectPath is %q", tc.notServed, tc.redirectPath)
+				}
+			}
+		})
+	}
+}
+
+// config.ValidateOAuthRedirectPath refuses a redirect path that collides with
+// a route the application serves, from a list of owned prefixes kept beside it.
+// Walking the real router is what keeps that list from falling behind: every
+// registered route other than the callback itself must be refused.
+func TestOAuthRedirectPathValidationCoversEveryRoute(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	cfg := &config.Config{BaseURL: "http://localhost:8080", PrometheusEnabled: true}
+	routes, ok := NewRouter(cfg, store.New(db), &auth.Service{}).(chi.Routes)
+	if !ok {
+		t.Fatal("NewRouter no longer returns chi.Routes; walk its routes another way")
+	}
+	walked := 0
+	err = chi.Walk(routes, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		walked++
+		if route == config.DefaultOAuthRedirectPath {
+			return nil
+		}
+		// A pattern such as /dav/* or /calendars/{id} is checked through a
+		// concrete path beneath it.
+		concrete := strings.NewReplacer("/*", "/x", "{", "", "}", "").Replace(route)
+		if config.ValidateOAuthRedirectPath(concrete) == nil {
+			t.Errorf("%s %s is served by the router, but APP_OAUTH_REDIRECT_PATH=%s is accepted", method, route, concrete)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("chi.Walk: %v", err)
+	}
+	if walked == 0 {
+		t.Fatal("walked no routes")
+	}
 }

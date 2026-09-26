@@ -12,9 +12,14 @@ import (
 
 const pendingCollectionSegment = ".pending"
 
-func (h *DavServer) canonicalDAVPath(ctx context.Context, user *store.User, rawPath string) (string, error) {
-	cleanPath := normalizeDAVHref(rawPath)
-	return h.resolveCanonicalDAVPath(ctx, user, cleanPath)
+// canonicalDAVPath resolves an already-decoded path; canonicalDAVHref resolves
+// a percent-encoded href.
+func (h *DavServer) canonicalDAVPath(ctx context.Context, user *store.User, decodedPath string) (string, error) {
+	return h.resolveCanonicalDAVPath(ctx, user, cleanDAVPath(decodedPath))
+}
+
+func (h *DavServer) canonicalDAVHref(ctx context.Context, user *store.User, href string) (string, error) {
+	return h.resolveCanonicalDAVPath(ctx, user, normalizeDAVHref(href))
 }
 
 func (h *DavServer) resolveCanonicalDAVPath(ctx context.Context, user *store.User, cleanPath string) (string, error) {
@@ -81,7 +86,7 @@ func pendingCollectionPath(prefix string, userID int64, segment string) string {
 }
 
 func publicPendingCollectionPath(canonicalPath string) (string, bool) {
-	cleanPath := normalizeDAVHref(canonicalPath)
+	cleanPath := cleanDAVPath(canonicalPath)
 	for _, prefix := range []string{"/dav/addressbooks", "/dav/calendars"} {
 		if !strings.HasPrefix(cleanPath, prefix+"/"+pendingCollectionSegment+"/") {
 			continue
@@ -97,7 +102,7 @@ func publicPendingCollectionPath(canonicalPath string) (string, bool) {
 }
 
 func normalizeDAVResourceIdentity(rawPath string) string {
-	cleanPath := normalizeDAVHref(rawPath)
+	cleanPath := cleanDAVPath(rawPath)
 	if segment, resource, ok := parseCalendarResourceSegments(cleanPath); ok {
 		resourcePart := path.Base(cleanPath)
 		if strings.EqualFold(path.Ext(resourcePart), ".ics") {
@@ -130,7 +135,7 @@ func legacyDAVResourcePaths(canonicalPath string) []string {
 }
 
 func davStatePaths(resourcePath string) []string {
-	resourcePath = normalizeDAVHref(resourcePath)
+	resourcePath = cleanDAVPath(resourcePath)
 	if resourcePath == "" {
 		return nil
 	}
@@ -138,7 +143,7 @@ func davStatePaths(resourcePath string) []string {
 	seen := map[string]struct{}{}
 	var paths []string
 	addPath := func(p string) {
-		p = normalizeDAVHref(p)
+		p = cleanDAVPath(p)
 		if p == "" {
 			return
 		}

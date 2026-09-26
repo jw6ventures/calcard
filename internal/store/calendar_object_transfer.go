@@ -42,13 +42,15 @@ type CalendarObjectTransfer struct {
 	SourceResourceName string
 	ExpectedSourceETag string
 	ExpectedSourceRaw  string
-	ExpectedSourceCTag *int64
 
 	DestinationCalendarID   int64
 	DestinationResourceName string
 	ExpectedDestination     CalendarObjectTransferState
-	ExpectedDestinationCTag *int64
 	Overwrite               bool
+
+	// ExpectedACL pins the ACL entries the source and destination privilege
+	// checks read.
+	ExpectedACL *ACLGuard
 
 	RawICAL  string
 	ETag     string
@@ -76,9 +78,9 @@ type CalendarObjectTransferBackend interface {
 }
 
 // TransferCalendarObject performs one COPY or MOVE of a calendar object inside
-// a single transaction: lock preconditions, collection ctags, the source and
-// destination rows, the UID uniqueness rule, the DAV dead-property state and
-// the sync tombstones all move together or not at all.
+// a single transaction: lock preconditions, the source and destination rows,
+// the UID uniqueness rule, the DAV dead-property state and the sync tombstones
+// all move together or not at all.
 func (s *Store) TransferCalendarObject(ctx context.Context, transfer CalendarObjectTransfer) (*CalendarObjectTransferResult, error) {
 	if s == nil || s.Events == nil {
 		return nil, ErrNotFound
@@ -96,6 +98,9 @@ func (s *Store) TransferCalendarObject(ctx context.Context, transfer CalendarObj
 		if s.CalendarTransfers == nil {
 			return nil, ErrAtomicStateUnsupported
 		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, transfer.ExpectedACL); err != nil {
+			return nil, err
+		}
 		return s.CalendarTransfers.TransferCalendarObject(ctx, transfer)
 	}
 
@@ -105,18 +110,20 @@ func (s *Store) TransferCalendarObject(ctx context.Context, transfer CalendarObj
 	}
 	defer tx.Rollback()
 
-	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions,
+		calendarCollectionLockPath(transfer.SourceCalendarID), calendarCollectionLockPath(transfer.DestinationCalendarID)); err != nil {
 		return nil, err
 	}
-	if err := validateCollectionCTagsTx(ctx, tx, "calendars",
-		collectionCTagExpectation{id: transfer.SourceCalendarID, ctag: transfer.ExpectedSourceCTag},
-		collectionCTagExpectation{id: transfer.DestinationCalendarID, ctag: transfer.ExpectedDestinationCTag}); err != nil {
+	if err := validateACLGuardTx(ctx, tx, transfer.ExpectedACL); err != nil {
 		return nil, err
 	}
 	for _, key := range calendarObjectTransferLockKeys(transfer) {
 		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, key); err != nil {
 			return nil, err
 		}
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "calendars", transfer.SourceCalendarID, transfer.DestinationCalendarID); err != nil {
+		return nil, err
 	}
 
 	result, err := transferCalendarObjectTx(ctx, tx, transfer)

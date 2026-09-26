@@ -156,15 +156,65 @@ type icalTimeValue struct {
 // refuses those names too, but this evaluator answers independently rather than
 // trusting that, since it also runs over stored data the grammar never saw.
 type calendarTimeRangeMatcher struct {
-	// Copies made during the component walk share expansion failures.
+	// Copies made during the component walk share expansion failures and the
+	// per-resource indexes, which are built only when a recurrence set is.
 	expansionError *error
+	indexes        *matcherIndexes
 	raw            string
 	root           *icalNode
 	zone           floatingZone
 }
 
+// matcherIndexes holds what a matcher derives from its resource once and
+// consults per instance. Each map is allocated on first use, so a resource that
+// recurs through no override pays for neither.
+type matcherIndexes struct {
+	overrides map[recurrenceOverrideIndexKey]recurrenceOverrideIndex
+	masters   map[*icalNode]map[string]*icalNode
+}
+
 func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) calendarTimeRangeMatcher {
-	return calendarTimeRangeMatcher{raw: raw, root: root, zone: zone, expansionError: new(error)}
+	return calendarTimeRangeMatcher{
+		raw: raw, root: root, zone: zone,
+		expansionError: new(error),
+		indexes:        &matcherIndexes{},
+	}
+}
+
+// instantShift is the distance between two instants, carried as whole seconds
+// and nanoseconds rather than as a time.Duration. RFC 5545 §3.3.4 admits any
+// four-digit year, so a recurrence instance can lie further from its DTSTART
+// than a time.Duration's ~292 years can measure, and a saturated shift would
+// place the instance centuries from where it falls.
+type instantShift struct {
+	seconds     int64
+	nanoseconds int64
+}
+
+// noShift reads a component at the dates it was written with.
+var noShift = instantShift{}
+
+// shiftBetween is the shift that moves from onto to.
+func shiftBetween(from, to time.Time) instantShift {
+	return instantShift{seconds: to.Unix() - from.Unix(), nanoseconds: int64(to.Nanosecond() - from.Nanosecond())}
+}
+
+// durationShift is a shift no longer than a time.Duration, such as the length
+// of one occurrence.
+func durationShift(d time.Duration) instantShift {
+	return instantShift{seconds: int64(d / time.Second), nanoseconds: int64(d % time.Second)}
+}
+
+// apply moves t by the shift, keeping t's location.
+func (s instantShift) apply(t time.Time) time.Time {
+	if s == noShift {
+		return t
+	}
+	return time.Unix(t.Unix()+s.seconds, int64(t.Nanosecond())+s.nanoseconds).In(t.Location())
+}
+
+func (s instantShift) plus(other instantShift) instantShift {
+	return instantShift{seconds: s.seconds + other.seconds, nanoseconds: s.nanoseconds + other.nanoseconds}
 }
 
 // dateValue resolves one date-valued property of node, shifting it by shift so
@@ -172,7 +222,7 @@ func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) 
 // set. §9.9 requires the effective DTSTART, DTEND, DURATION and DUE of an
 // instance to be inferred; the other date properties are metadata of the
 // component as a whole and are read unshifted.
-func (m calendarTimeRangeMatcher) dateValue(node *icalNode, name string, shift time.Duration) (icalTimeValue, bool) {
+func (m calendarTimeRangeMatcher) dateValue(node *icalNode, name string, shift instantShift) (icalTimeValue, bool) {
 	property, ok := firstICalProperty(node, name)
 	if !ok {
 		return icalTimeValue{}, false
@@ -186,7 +236,7 @@ func (m calendarTimeRangeMatcher) dateValue(node *icalNode, name string, shift t
 	if !ok {
 		return icalTimeValue{}, false
 	}
-	return icalTimeValue{instant: instant.Add(shift), isDate: form == icalDateOnly}, true
+	return icalTimeValue{instant: shift.apply(instant), isDate: form == icalDateOnly}, true
 }
 
 func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDateForm) (time.Time, bool) {
@@ -242,7 +292,7 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 		// fires once however often the enclosing component recurs. Every
 		// instance would answer identically, and an instance scan that reaches
 		// none of them must not suppress a trigger that does fall in the range.
-		return m.alarmInTimeRange(node, parent, start, end, 0)
+		return m.alarmInTimeRange(node, parent, start, end, noShift)
 	}
 	master := m.recurrenceMaster(node, parent)
 	instances, expandable, settled := m.recurrenceInstances(node, master, start, end)
@@ -262,14 +312,14 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 			} else {
 				enclosing = occurrence
 			}
-			shift = 0
+			shift = noShift
 		}
 		if m.componentInTimeRange(content, enclosing, start, end, shift) {
 			return true
 		}
 	}
-	// No instance of the prefix matched, which settles the question only when the
-	// prefix was the whole set. Otherwise the resource is kept on the same ground
+	// No instance returned matched, which settles the question only when they
+	// were the whole set. Otherwise the resource is kept on the same ground
 	// an inexpressible frequency is.
 	return !settled
 }
@@ -294,8 +344,8 @@ func (m calendarTimeRangeMatcher) recurrenceMaster(node, parent *icalNode) *ical
 // and a caller writing a RECURRENCE-ID out needs the slot rather than the
 // occurrence (RFC 5545 §3.8.4.4).
 type recurrenceInstance struct {
-	shift     time.Duration
-	slotShift time.Duration
+	shift     instantShift
+	slotShift instantShift
 	duration  time.Duration
 }
 
@@ -312,8 +362,8 @@ func openTimeRangeEnd(end time.Time) bool {
 
 // recurrenceInstances retains the effective duration and original identity of
 // each occurrence. expandable is false when nothing here can be enumerated at
-// all. settled is false when the instances returned are a prefix of the set and
-// that prefix does not answer the question asked of it, which a caller deciding
+// all. settled is false when the instances returned are only part of the set
+// and that part does not answer the question asked of it, which a caller deciding
 // a §9.9 match has to read as "no answer" rather than "no match".
 func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) (_ []recurrenceInstance, expandable, settled bool) {
 	if master == nil {
@@ -322,7 +372,7 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
 		return nil, false, false
 	}
-	dtstart, ok := m.dateValue(master, "DTSTART", 0)
+	dtstart, ok := m.dateValue(master, "DTSTART", noShift)
 	if !ok {
 		return []recurrenceInstance{{}}, true, true
 	}
@@ -335,32 +385,31 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	// component-specific test excludes. The output budget is checked after that test.
 	generated, err := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
 		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine)
-	// Exhausting the budget against an open end is not a failure. No budget
-	// covers an infinity, so refusing would fail every report a client scopes
-	// that way rather than the one resource -- and the prefix settles the match
-	// without the rest of the set, since an instance had to reach the range to
-	// be generated at all. A spelled end asks a finite question the server
-	// undertook to answer exactly, so there the budget still refuses.
+	// Exhausting the budget is not a failure of the report. The partial set
+	// settles a match on its own, since an instance had to reach the range to be generated
+	// at all, and its silence about the rest of the set is reported as unsettled
+	// rather than as an error: the callers answer that the way they answer a
+	// frequency this server cannot expand, by keeping the resource. Refusing
+	// instead would lose every other resource of the collection over one
+	// "repeats daily, no end date" event, and a range holding more instances
+	// than one resource may store is an ordinary request, not a malformed one.
 	truncated := errors.Is(err, ical.ErrRecurrenceExpansionLimit)
 	if err != nil && !truncated {
-		*m.expansionError = err
-		return nil, false, false
-	}
-	if truncated && !openTimeRangeEnd(end) {
 		*m.expansionError = err
 		return nil, false, false
 	}
 	instances := make([]recurrenceInstance, 0, len(generated))
 	for _, instance := range generated {
 		instances = append(instances, recurrenceInstance{
-			shift:     instance.Start.Sub(dtstart.instant),
-			slotShift: instance.RecurrenceID.Sub(dtstart.instant),
+			shift:     shiftBetween(dtstart.instant, instance.Start),
+			slotShift: shiftBetween(dtstart.instant, instance.RecurrenceID),
 			duration:  instance.End.Sub(instance.Start),
 		})
 	}
-	// A truncated prefix reaching here came from an open end, so it settles a
-	// match it contains. Whether it settles the absence of one is the caller's
-	// question, and truncated is what tells it apart.
+	// A truncated set settles a match it contains. Whether it settles the
+	// absence of one is the caller's question, and truncated is what tells it
+	// apart: §9.9 needs only one instance, while the §9.6.5 expansion owes the
+	// whole set and refuses the resource on the same signal.
 	return instances, true, !truncated
 }
 
@@ -423,13 +472,13 @@ func (m calendarTimeRangeMatcher) hasRecurrenceSet(node *icalNode) bool {
 func (m calendarTimeRangeMatcher) occurrenceWindow(node *icalNode, dtstart icalTimeValue) time.Duration {
 	switch node.name {
 	case "VEVENT":
-		if dtend, ok := m.dateValue(node, "DTEND", 0); ok {
+		if dtend, ok := m.dateValue(node, "DTEND", noShift); ok {
 			if d := dtend.instant.Sub(dtstart.instant); d > 0 {
 				return d
 			}
 		}
 	case "VTODO":
-		if due, ok := m.dateValue(node, "DUE", 0); ok {
+		if due, ok := m.dateValue(node, "DUE", noShift); ok {
 			if d := due.instant.Sub(dtstart.instant); d > 0 {
 				return d
 			}
@@ -444,7 +493,7 @@ func (m calendarTimeRangeMatcher) occurrenceWindow(node *icalNode, dtstart icalT
 	return 0
 }
 
-func (m calendarTimeRangeMatcher) componentInTimeRange(node, parent *icalNode, start, end time.Time, shift time.Duration) bool {
+func (m calendarTimeRangeMatcher) componentInTimeRange(node, parent *icalNode, start, end time.Time, shift instantShift) bool {
 	switch node.name {
 	case "VEVENT":
 		return m.eventInTimeRange(node, start, end, shift)
@@ -463,7 +512,7 @@ func (m calendarTimeRangeMatcher) componentInTimeRange(node, parent *icalNode, s
 
 // eventInTimeRange implements the §9.9 VEVENT table. RFC 5545 makes DTSTART
 // required, so a VEVENT without one cannot be placed on a timeline at all.
-func (m calendarTimeRangeMatcher) eventInTimeRange(node *icalNode, start, end time.Time, shift time.Duration) bool {
+func (m calendarTimeRangeMatcher) eventInTimeRange(node *icalNode, start, end time.Time, shift instantShift) bool {
 	dtstart, ok := m.dateValue(node, "DTSTART", shift)
 	if !ok {
 		return false
@@ -485,7 +534,7 @@ func (m calendarTimeRangeMatcher) eventInTimeRange(node *icalNode, start, end ti
 
 // todoInTimeRange implements the eight-row §9.9 VTODO table, whose last row
 // makes a VTODO carrying none of the five properties match every range.
-func (m calendarTimeRangeMatcher) todoInTimeRange(node *icalNode, start, end time.Time, shift time.Duration) bool {
+func (m calendarTimeRangeMatcher) todoInTimeRange(node *icalNode, start, end time.Time, shift instantShift) bool {
 	dtstart, hasStart := m.dateValue(node, "DTSTART", shift)
 	duration, hasDuration := componentDuration(node, "DURATION")
 	due, hasDue := m.dateValue(node, "DUE", shift)
@@ -505,8 +554,8 @@ func (m calendarTimeRangeMatcher) todoInTimeRange(node *icalNode, start, end tim
 		return start.Before(due.instant) && !end.Before(due.instant)
 	}
 
-	completed, hasCompleted := m.dateValue(node, "COMPLETED", 0)
-	created, hasCreated := m.dateValue(node, "CREATED", 0)
+	completed, hasCompleted := m.dateValue(node, "COMPLETED", noShift)
+	created, hasCreated := m.dateValue(node, "CREATED", noShift)
 	switch {
 	case hasCompleted && hasCreated:
 		return (!start.After(created.instant) || !start.After(completed.instant)) &&
@@ -521,7 +570,7 @@ func (m calendarTimeRangeMatcher) todoInTimeRange(node *icalNode, start, end tim
 }
 
 // journalInTimeRange implements the three-row §9.9 VJOURNAL table.
-func (m calendarTimeRangeMatcher) journalInTimeRange(node *icalNode, start, end time.Time, shift time.Duration) bool {
+func (m calendarTimeRangeMatcher) journalInTimeRange(node *icalNode, start, end time.Time, shift instantShift) bool {
 	dtstart, ok := m.dateValue(node, "DTSTART", shift)
 	if !ok {
 		return false
@@ -536,8 +585,8 @@ func (m calendarTimeRangeMatcher) journalInTimeRange(node *icalNode, start, end 
 // is ignored here, as §9.9 says outright, because it carries a different meaning
 // inside a VFREEBUSY.
 func (m calendarTimeRangeMatcher) freeBusyInTimeRange(node *icalNode, start, end time.Time) bool {
-	dtstart, hasStart := m.dateValue(node, "DTSTART", 0)
-	dtend, hasEnd := m.dateValue(node, "DTEND", 0)
+	dtstart, hasStart := m.dateValue(node, "DTSTART", noShift)
+	dtend, hasEnd := m.dateValue(node, "DTEND", noShift)
 	if hasStart && hasEnd {
 		return !start.After(dtend.instant) && end.After(dtstart.instant)
 	}
@@ -594,7 +643,7 @@ func (m calendarTimeRangeMatcher) freeBusyPeriod(property icalProperty, value st
 
 // alarmInTimeRange applies the §9.9 VALARM condition to every trigger the alarm
 // fires, which is the initial one plus each REPEAT.
-func (m calendarTimeRangeMatcher) alarmInTimeRange(node, parent *icalNode, start, end time.Time, shift time.Duration) bool {
+func (m calendarTimeRangeMatcher) alarmInTimeRange(node, parent *icalNode, start, end time.Time, shift instantShift) bool {
 	trigger, ok := m.alarmTriggerTime(node, parent, shift)
 	if !ok {
 		return false
@@ -658,7 +707,7 @@ func hasAbsoluteAlarmTrigger(node *icalNode) bool {
 // alarmTriggerTime resolves TRIGGER in both RFC 5545 §3.8.6.3 forms: an
 // absolute DATE-TIME, or a duration relative to the enclosing component's start
 // or end. RELATED defaults to START.
-func (m calendarTimeRangeMatcher) alarmTriggerTime(node, parent *icalNode, shift time.Duration) (time.Time, bool) {
+func (m calendarTimeRangeMatcher) alarmTriggerTime(node, parent *icalNode, shift instantShift) (time.Time, bool) {
 	property, ok := firstICalProperty(node, "TRIGGER")
 	if !ok {
 		return time.Time{}, false
@@ -681,7 +730,7 @@ func (m calendarTimeRangeMatcher) alarmTriggerTime(node, parent *icalNode, shift
 	return m.resolveInstant(property.parameters["TZID"], value, form)
 }
 
-func (m calendarTimeRangeMatcher) alarmAnchor(parent *icalNode, trigger icalProperty, shift time.Duration) (time.Time, bool) {
+func (m calendarTimeRangeMatcher) alarmAnchor(parent *icalNode, trigger icalProperty, shift instantShift) (time.Time, bool) {
 	if !strings.EqualFold(strings.TrimSpace(trigger.parameters["RELATED"]), "END") {
 		dtstart, ok := m.dateValue(parent, "DTSTART", shift)
 		return dtstart.instant, ok
@@ -748,7 +797,7 @@ func (m calendarTimeRangeMatcher) inferredPropertyInTimeRange(name string, node,
 	if inferredTimeRangeProperties[node.name] != strings.ToUpper(name) {
 		return false
 	}
-	dtstart, ok := m.dateValue(node, "DTSTART", 0)
+	dtstart, ok := m.dateValue(node, "DTSTART", noShift)
 	if !ok {
 		return false
 	}
@@ -769,13 +818,13 @@ func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, n
 		return true
 	}
 	for _, instance := range instances {
-		effective := instant.Add(instance.shift)
+		effective := instance.shift.apply(instant)
 		if master == node {
 			occurrence := expandedInstance(m, m.root, master, instance)
-			if value, ok := m.dateValue(occurrence, name, 0); ok {
+			if value, ok := m.dateValue(occurrence, name, noShift); ok {
 				effective = value.instant
 			} else if name == "DTEND" || name == "DUE" {
-				if start, ok := m.dateValue(occurrence, "DTSTART", 0); ok {
+				if start, ok := m.dateValue(occurrence, "DTSTART", noShift); ok {
 					effective = start.instant.Add(instance.duration)
 				}
 			}

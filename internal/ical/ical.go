@@ -165,13 +165,37 @@ func UnfoldLines(raw string) []string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = strings.ReplaceAll(raw, "\r", "\n")
 	rawLines := strings.Split(raw, "\n")
-	var lines []string
-	for _, line := range rawLines {
-		if len(lines) > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
-			lines[len(lines)-1] += line[1:]
-			continue
+	lines := make([]string, 0, len(rawLines))
+	for i := 0; i < len(rawLines); {
+		line := rawLines[i]
+		end := i + 1
+		for end < len(rawLines) && isContinuation(rawLines[end]) {
+			end++
+		}
+		if end > i+1 {
+			// Joined once, so a line folded many times unfolds in linear time.
+			var b strings.Builder
+			b.Grow(foldedLength(rawLines[i:end]))
+			b.WriteString(line)
+			for _, continuation := range rawLines[i+1 : end] {
+				b.WriteString(continuation[1:])
+			}
+			line = b.String()
 		}
 		lines = append(lines, line)
+		i = end
 	}
 	return lines
+}
+
+func isContinuation(line string) bool {
+	return strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+}
+
+func foldedLength(lines []string) int {
+	n := 0
+	for _, line := range lines {
+		n += len(line)
+	}
+	return n
 }

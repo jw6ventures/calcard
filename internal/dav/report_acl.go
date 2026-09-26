@@ -352,7 +352,7 @@ func (h *DavServer) reportPrincipalMatch(w http.ResponseWriter, r *http.Request,
 		}
 		return
 	}
-	requestHref := ensureCollectionHref(normalizeDAVHref(cleanPath))
+	requestHref := ensureCollectionHref(cleanDAVPath(cleanPath))
 	currentPrincipal := ensureCollectionHref(h.principalURL(user))
 	responses := make([]response, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -415,7 +415,7 @@ func (h *DavServer) reportPrincipalPropertySearch(w http.ResponseWriter, r *http
 	// redirects it to the principal collections. CalCard exposes exactly one
 	// principal collection, so any other Request-URI has no member set to
 	// search.
-	if request.ApplyToPrincipalCollectionSet == nil && normalizeDAVHref(cleanPath) != "/dav/principals" {
+	if request.ApplyToPrincipalCollectionSet == nil && cleanDAVPath(cleanPath) != "/dav/principals" {
 		http.Error(w, "principal-property-search target must be a principal collection", http.StatusBadRequest)
 		return
 	}
@@ -493,7 +493,7 @@ func principalMatchesSearches(principal *store.User, searches []principalPropert
 // empty element, so any content makes it malformed.
 func (h *DavServer) reportPrincipalSearchPropertySet(w http.ResponseWriter, cleanPath string, body []byte) {
 	children, err := directXMLChildNames(body)
-	if err != nil || len(children) != 0 || normalizeDAVHref(cleanPath) != "/dav/principals" {
+	if err != nil || len(children) != 0 || cleanDAVPath(cleanPath) != "/dav/principals" {
 		http.Error(w, "invalid principal-search-property-set request", http.StatusBadRequest)
 		return
 	}
@@ -519,7 +519,7 @@ func (h *DavServer) selectACLReportProperties(r *http.Request, user *store.User,
 }
 
 func (h *DavServer) isDAVCollection(ctx context.Context, user *store.User, cleanPath string) bool {
-	cleanPath = normalizeDAVHref(cleanPath)
+	cleanPath = cleanDAVPath(cleanPath)
 	if cleanPath == "/dav" || cleanPath == "/dav/calendars" || cleanPath == "/dav/addressbooks" || cleanPath == "/dav/principals" {
 		return true
 	}

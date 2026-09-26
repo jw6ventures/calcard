@@ -16,7 +16,7 @@ image:
 nameOverride: "" # Overrides the chart name used for resource names/labels.
 fullnameOverride: "" # Overrides the full resource name (takes precedence over nameOverride).
 
-replicaCount: 1 # HA is theoretically possible, but untested at this point. Recommend 1 until the release notes say otherwise.
+replicaCount: 1 # Number of app pods. Must be 1 (or 0 to stop the app without deleting the release); the chart refuses anything higher. Every pod runs the schema migration on startup and the migration runner takes no lock, so a second replica applies the same migrations to the same database at the same time. HA needs that solved first; the release notes will say when. Only helm is held to this: kubectl scale or an HPA targeting the Deployment bypasses it, so do neither.
 
 # Application configuration. These map directly to the APP_* environment
 # variables the container reads.
@@ -73,7 +73,7 @@ app:
   # turns that limit off entirely.
   dav: {}
     # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
-    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default: an app password issued before Digest existed carries no HA1 and cannot answer a Digest challenge, so enabling this before those credentials have caught up breaks existing clients. A password gains its HA1 when it is issued, or the first time it authenticates over Basic; the App Passwords page shows which are ready.
+    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default because Digest needs a stored, password-equivalent HA1 (see README). While off, no HA1 is written and any already stored is cleared. When on, each app password gains its HA1 when issued or on its next Basic authentication over HTTPS; the App Passwords page shows which are ready.
     # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
     # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
     # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.
@@ -126,3 +126,4 @@ resources: {} # CPU/memory requests and limits for the app container.
 nodeSelector: {} # Constrain app pods to nodes with matching labels.
 tolerations: [] # Tolerations allowing app pods to schedule onto tainted nodes.
 affinity: {} # Affinity/anti-affinity rules for app pod scheduling.
+priorityClassName: "" # PriorityClass to schedule app pods with (e.g. system-cluster-critical). Raises their scheduling priority and makes them a later candidate for eviction when a node runs out of resources. The class must already exist in the cluster. Leave empty to use the cluster default priority.

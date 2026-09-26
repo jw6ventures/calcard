@@ -388,7 +388,7 @@
                         <option value="12">December</option>
                     </select>
                     <select id="create-birthday-day" style="width: 70px;"></select>
-                    <input type="number" id="create-birthday-year" placeholder="Year" min="1900" max="2100" style="width: 90px;">
+                    <input type="number" id="create-birthday-year" placeholder="Year" min="1" max="9999" style="width: 90px;">
                 </div>
                 <input type="hidden" id="create-birthday" name="birthday">
             </div>
@@ -437,6 +437,7 @@
         </div>
         <form id="edit-contact-form" method="POST">
             <input type="hidden" name="_method" value="PUT">
+            <input type="hidden" id="edit-etag" name="etag">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
             <div class="form-group">
                 <label for="edit-display-name">Display Name *</label>
@@ -483,7 +484,7 @@
                         <option value="12">December</option>
                     </select>
                     <select id="edit-birthday-day" style="width: 70px;"></select>
-                    <input type="number" id="edit-birthday-year" placeholder="Year" min="1900" max="2100" style="width: 90px;">
+                    <input type="number" id="edit-birthday-year" placeholder="Year" min="1" max="9999" style="width: 90px;">
                 </div>
                 <input type="hidden" id="edit-birthday" name="birthday">
             </div>
@@ -542,6 +543,9 @@
     window.canEditAddressBook = {{if .CanEdit}}true{{else}}false{{end}};
 </script>
 <script>
+{{template "safe_html_js"}}
+</script>
+<script>
 (function() {
     // Raw contact data from server
     var rawContacts = {{toJSON .Contacts}} || [];
@@ -561,10 +565,14 @@
         
         // First pass: collect grouped labels (item1.X-ABLABEL, etc.)
         var groupLabels = {};
+        // The structured edit writes into the first occurrence of each of
+        // these, so a duplicate later in the card is not the one the form shows.
+        var firstOnly = ['FN', 'N', 'ORG', 'NOTE', 'BDAY'];
+        var seen = {};
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
             if (!line) continue;
-            var colonIdx = line.indexOf(':');
+            var colonIdx = indexOutsideQuotes(line, ':');
             if (colonIdx === -1) continue;
             var keyPart = line.substring(0, colonIdx).toUpperCase();
             var valuePart = line.substring(colonIdx + 1);
@@ -580,7 +588,7 @@
             var line = lines[i];
             if (!line || line === 'BEGIN:VCARD' || line === 'END:VCARD') continue;
             
-            var colonIdx = line.indexOf(':');
+            var colonIdx = indexOutsideQuotes(line, ':');
             if (colonIdx === -1) continue;
             
             var key = line.substring(0, colonIdx);
@@ -592,10 +600,10 @@
             if (semicolonIdx !== -1) {
                 var paramStr = key.substring(semicolonIdx + 1);
                 key = key.substring(0, semicolonIdx);
-                paramStr.split(';').forEach(function(p) {
+                splitOutsideQuotes(paramStr, ';').forEach(function(p) {
                     var eq = p.indexOf('=');
                     if (eq !== -1) {
-                        params[p.substring(0, eq).toUpperCase()] = p.substring(eq + 1);
+                        params[p.substring(0, eq).toUpperCase()] = unquoteParam(p.substring(eq + 1));
                     } else {
                         // Handle type without explicit TYPE= prefix
                         params.TYPE = (params.TYPE || '') + (params.TYPE ? ',' : '') + p;
@@ -616,30 +624,35 @@
                     params['X-ABLABEL'] = groupLabels[itemPrefix];
                 }
             }
+
+            if (firstOnly.indexOf(key) !== -1) {
+                if (seen[key]) continue;
+                seen[key] = true;
+            }
             
             switch (key) {
                 case 'FN':
-                    contact.fn = unescapeVCard(value);
+                    contact.fn = unescapeText(value);
                     break;
                 case 'N':
                     // N:Last;First;Middle;Prefix;Suffix
-                    var parts = value.split(';');
+                    var parts = splitUnescaped(value, ';');
                     contact.n = {
-                        last: unescapeVCard(parts[0] || ''),
-                        first: unescapeVCard(parts[1] || ''),
-                        middle: unescapeVCard(parts[2] || ''),
-                        prefix: unescapeVCard(parts[3] || ''),
-                        suffix: unescapeVCard(parts[4] || '')
+                        last: unescapeText(parts[0] || ''),
+                        first: unescapeText(parts[1] || ''),
+                        middle: unescapeText(parts[2] || ''),
+                        prefix: unescapeText(parts[3] || ''),
+                        suffix: unescapeText(parts[4] || '')
                     };
                     break;
                 case 'NICKNAME':
-                    contact.nickname = unescapeVCard(value);
+                    contact.nickname = unescapeText(value);
                     break;
                 case 'ORG':
-                    contact.org = unescapeVCard(value.split(';')[0]);
+                    contact.org = unescapeText(splitUnescaped(value, ';')[0]);
                     break;
                 case 'TITLE':
-                    contact.title = unescapeVCard(value);
+                    contact.title = unescapeText(value);
                     break;
                 case 'TEL':
                     contact.phones.push({
@@ -655,14 +668,14 @@
                     break;
                 case 'ADR':
                     // ADR:;;Street;City;State;ZIP;Country
-                    var adrParts = value.split(';');
+                    var adrParts = splitUnescaped(value, ';');
                     contact.addresses.push({
                         type: getType(params),
-                        street: unescapeVCard(adrParts[2] || ''),
-                        city: unescapeVCard(adrParts[3] || ''),
-                        state: unescapeVCard(adrParts[4] || ''),
-                        zip: unescapeVCard(adrParts[5] || ''),
-                        country: unescapeVCard(adrParts[6] || '')
+                        street: unescapeText(adrParts[2] || ''),
+                        city: unescapeText(adrParts[3] || ''),
+                        state: unescapeText(adrParts[4] || ''),
+                        zip: unescapeText(adrParts[5] || ''),
+                        country: unescapeText(adrParts[6] || '')
                     });
                     break;
                 case 'URL':
@@ -672,22 +685,27 @@
                     });
                     break;
                 case 'BDAY':
-                    contact.bday = parseVCardDate(value);
+                    contact.bday = parseVCardDateProperty(value, params);
                     break;
                 case 'NOTE':
-                    contact.note = unescapeVCard(value);
+                    contact.note = unescapeText(value);
                     break;
                 case 'PHOTO':
-                    if (params.ENCODING === 'b' || params.ENCODING === 'BASE64') {
-                        var mediaType = params.TYPE || params.MEDIATYPE || 'image/jpeg';
-                        contact.photo = 'data:' + mediaType.toLowerCase() + ';base64,' + value;
-                    } else if (value.indexOf('http') === 0) {
+                    var encoding = (params.ENCODING || '').toUpperCase();
+                    if (encoding === 'B' || encoding === 'BASE64') {
+                        // vCard 3 names the format alone (TYPE=JPEG).
+                        var mediaType = (params.MEDIATYPE || params.TYPE || 'jpeg').split(',')[0].replace(/"/g, '').toLowerCase();
+                        if (mediaType.indexOf('/') === -1) {
+                            mediaType = 'image/' + mediaType;
+                        }
+                        contact.photo = 'data:' + mediaType + ';base64,' + value.replace(/\s+/g, '');
+                    } else if (/^(https?|data):/i.test(value)) {
                         contact.photo = value;
                     }
                     break;
                 case 'ANNIVERSARY':
                 case 'X-ANNIVERSARY':
-                    contact.anniversary = parseVCardDate(value);
+                    contact.anniversary = parseVCardDateProperty(value, params);
                     break;
                 case 'X-ABDATE':
                     // Custom date field (Apple/Thunderbird format)
@@ -695,11 +713,11 @@
                     dateLabel = dateLabel.replace(/_\$!<|>!\$_/g, '');
                     // Check if this is actually an anniversary
                     if (dateLabel.toLowerCase() === 'anniversary' || dateLabel.toLowerCase() === '_$!<anniversary>!$_') {
-                        contact.anniversary = parseVCardDate(value);
+                        contact.anniversary = parseVCardDateProperty(value, params);
                     } else {
                         contact.dates.push({
                             type: dateLabel,
-                            value: parseVCardDate(value)
+                            value: parseVCardDateProperty(value, params)
                         });
                     }
                     break;
@@ -707,25 +725,25 @@
                     // vCard 4.0 relationships
                     contact.relations.push({
                         type: getType(params) || 'Related',
-                        value: unescapeVCard(value)
+                        value: unescapeText(value)
                     });
                     break;
                 case 'X-SPOUSE':
                     contact.relations.push({
                         type: 'Spouse',
-                        value: unescapeVCard(value)
+                        value: unescapeText(value)
                     });
                     break;
                 case 'X-MANAGER':
                     contact.relations.push({
                         type: 'Manager',
-                        value: unescapeVCard(value)
+                        value: unescapeText(value)
                     });
                     break;
                 case 'X-ASSISTANT':
                     contact.relations.push({
                         type: 'Assistant',
-                        value: unescapeVCard(value)
+                        value: unescapeText(value)
                     });
                     break;
                 case 'X-ABRELATEDNAMES':
@@ -736,7 +754,7 @@
                     relLabel = relLabel.charAt(0).toUpperCase() + relLabel.slice(1).toLowerCase();
                     contact.relations.push({
                         type: relLabel,
-                        value: unescapeVCard(value)
+                        value: unescapeText(value)
                     });
                     break;
                 case 'X-CUSTOM1':
@@ -749,7 +767,7 @@
                         customLabel = customLabel.replace(/_\$!<|>!\$_/g, '');
                         contact.dates.push({
                             type: customLabel,
-                            value: parseVCardDate(value) || unescapeVCard(value)
+                            value: parseVCardDateProperty(value, params) || unescapeText(value)
                         });
                     }
                     break;
@@ -776,10 +794,10 @@
                     });
                     break;
                 case 'ROLE':
-                    contact.role = unescapeVCard(value);
+                    contact.role = unescapeText(value);
                     break;
                 case 'CATEGORIES':
-                    contact.categories = value.split(',').map(function(c) { return unescapeVCard(c.trim()); });
+                    contact.categories = splitUnescaped(value, ',').map(function(c) { return unescapeText(c.trim()); });
                     break;
             }
         }
@@ -793,16 +811,42 @@
         return contact;
     }
     
+    // A quoted parameter value may hold ':' and ';' (RFC 6350 section 3.3),
+    // so the delimiters that end a property name, a parameter or the key part
+    // are only those outside double quotes.
+    function indexOutsideQuotes(text, delimiter) {
+        var quoted = false;
+        for (var i = 0; i < text.length; i++) {
+            var c = text.charAt(i);
+            if (c === '"') {
+                quoted = !quoted;
+            } else if (c === delimiter && !quoted) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function splitOutsideQuotes(text, delimiter) {
+        var parts = [];
+        var at = indexOutsideQuotes(text, delimiter);
+        while (at !== -1) {
+            parts.push(text.substring(0, at));
+            text = text.substring(at + 1);
+            at = indexOutsideQuotes(text, delimiter);
+        }
+        parts.push(text);
+        return parts;
+    }
+
+    function unquoteParam(value) {
+        return value.length >= 2 && value.charAt(0) === '"' && value.charAt(value.length - 1) === '"'
+            ? value.substring(1, value.length - 1)
+            : value;
+    }
+
     function unfoldLines(vcard) {
         return vcard.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
-    }
-    
-    function unescapeVCard(str) {
-        return str
-            .replace(/\\n/gi, '\n')
-            .replace(/\\,/g, ',')
-            .replace(/\\;/g, ';')
-            .replace(/\\\\/g, '\\');
     }
     
     function getType(params) {
@@ -810,51 +854,120 @@
         return type.split(',')[0].replace(/"/g, '').toLowerCase() || 'other';
     }
     
+    // Splits a structured value on the separators that are not escaped, so
+    // "Acme\; Inc;Research" is one organization name followed by one unit.
+    // The parts keep their escapes for unescapeText to undo.
+    function splitUnescaped(value, separator) {
+        var parts = [];
+        var current = '';
+        for (var i = 0; i < value.length; i++) {
+            var c = value.charAt(i);
+            if (c === '\\' && i + 1 < value.length) {
+                current += c + value.charAt(i + 1);
+                i++;
+            } else if (c === separator) {
+                parts.push(current);
+                current = '';
+            } else {
+                current += c;
+            }
+        }
+        parts.push(current);
+        return parts;
+    }
+
+    // A vCard date as {year, month, day}, with year null for a year-less
+    // --MM-DD, or null when the value is not a whole date. It never goes
+    // through Date: a Date needs a year, so a year-less 29 February has no
+    // honest one, and a date-time would be moved by the reader's time zone
+    // off the day its writer meant. A date-time contributes its date as
+    // written.
     function parseVCardDate(str) {
         if (!str) return null;
-        str = str.trim();
-        
-        // Handle ISO format: YYYY-MM-DD
-        if (str.match(/^\d{4}-\d{2}-\d{2}$/)) {
-            var parts = str.split('-');
-            return new Date(
-                parseInt(parts[0], 10),
-                parseInt(parts[1], 10) - 1,
-                parseInt(parts[2], 10)
-            );
+        var value = String(str).trim();
+        var year = null;
+        var month;
+        var day;
+        var match = /^--(\d{2})-?(\d{2})([Tt]\d{2}[0-9:.,Zz+\-]*)?$/.exec(value);
+        if (match) {
+            month = parseInt(match[1], 10);
+            day = parseInt(match[2], 10);
+        } else {
+            // A date-time's time part must look like one, as the server
+            // requires before it reads the date.
+            match = /^(\d{4})(-?)(\d{2})\2(\d{2})([Tt]\d{2}[0-9:.,Zz+\-]*)?$/.exec(value);
+            if (!match) return null;
+            // Year 0000 is a client's stand-in for "no year", as the
+            // birthdays page also reads it.
+            year = parseInt(match[1], 10) || null;
+            month = parseInt(match[3], 10);
+            day = parseInt(match[4], 10);
         }
-        
-        // Handle YYYYMMDD format
-        if (str.match(/^\d{8}$/)) {
-            return new Date(
-                parseInt(str.substring(0, 4), 10),
-                parseInt(str.substring(4, 6), 10) - 1,
-                parseInt(str.substring(6, 8), 10)
-            );
+        if (month < 1 || month > 12 || day < 1 || day > birthdayDaysInMonth(String(month), year === null ? '' : String(year))) {
+            return null;
         }
-        
-        // Handle --MM-DD format (no year)
-        if (str.match(/^--\d{2}-\d{2}$/)) {
-            return new Date(
-                1900, // Use 1900 as placeholder year
-                parseInt(str.substring(2, 4), 10) - 1,
-                parseInt(str.substring(5, 7), 10)
-            );
-        }
-        
-        // Try parsing as generic date string
-        var d = new Date(str);
-        if (!isNaN(d.getTime())) {
-            return d;
-        }
-        
-        return null;
+        return { year: year, month: month, day: day };
     }
-    
+
+    // parseVCardDate for a property, honouring the stand-in year Apple
+    // clients write in place of a year-less date and name in
+    // X-APPLE-OMIT-YEAR.
+    function parseVCardDateProperty(value, params) {
+        if (String(params.VALUE || '').replace(/"/g, '').toLowerCase() === 'text') {
+            return null;
+        }
+        var date = parseVCardDate(value);
+        var omitted = String(params['X-APPLE-OMIT-YEAR'] || '').replace(/"/g, '');
+        if (date && omitted && parseInt(omitted, 10) === date.year) {
+            date.year = null;
+        }
+        return date;
+    }
+
+    // The long form of a parseVCardDate result, with a year only when the
+    // card names one. It is formatted in UTC so no zone moves the day.
+    function formatVCardDate(date) {
+        var at = new Date(0);
+        // A leap year stands in for a year-less date so 29 February exists;
+        // it is not shown.
+        at.setUTCFullYear(date.year === null ? 2000 : date.year, date.month - 1, date.day);
+        var options = { month: 'long', day: 'numeric', timeZone: 'UTC' };
+        if (date.year !== null) {
+            options.year = 'numeric';
+        }
+        return at.toLocaleDateString(undefined, options);
+    }
+
+    // The link for a contact's website. Phone clients often store a bare host
+    // such as www.example.com; one that reads as a hostname, with an optional
+    // path, is linked as https:// rather than lost. Anything else safeUrl
+    // refuses -- a relative path, an unknown scheme -- has no link and is shown
+    // as text.
+    function websiteHref(value) {
+        var href = safeUrl(value);
+        if (href) return href;
+        var text = String(value || '').trim();
+        if (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,63}(:\d{1,5})?([\/?#][^\s]*)?$/i.test(text)) {
+            return safeUrl('https://' + text);
+        }
+        return '';
+    }
+
+    // The source an avatar <img> may load: an http(s) URL, or an embedded
+    // raster image. Anything else yields '' and the initials are shown.
+    function contactPhotoSrc(photo) {
+        if (/^data:image\/(png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+\/]+={0,2}$/i.test(photo || '')) {
+            return photo;
+        }
+        var url = safeUrl(photo);
+        return /^https?:/i.test(url) ? url : '';
+    }
+
     // Parse all contacts
     var contacts = rawContacts.map(function(raw) {
         var parsed = parseVCard(raw.RawVCard);
         parsed.uid = raw.UID;
+        parsed.etag = raw.ETag;
         parsed.lastMod = raw.LastModified;
         return parsed;
     }).filter(function(c) { return c.fn; });
@@ -879,35 +992,6 @@
         if (e.target === modal) modal.classList.remove('show');
     });
     
-    // Photo, telephone and email values reach a double-quoted attribute here,
-    // so the quotes are escaped as well as the markup delimiters: a textContent
-    // round trip through the DOM escapes only & < >, which leaves a vCard field
-    // free to close the attribute it sits in and open an event handler. The
-    // ampersand is rewritten first so the entities introduced below are not
-    // escaped twice.
-    function escapeHtml(str) {
-        return (str === null ? '' : String(str))
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
-
-    function safeUrl(raw) {
-        if (!raw) return '';
-        try {
-            var url = new URL(raw, window.location.origin);
-            var protocol = (url.protocol || '').toLowerCase();
-            if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:') {
-                return url.href;
-            }
-        } catch (e) {
-            return '';
-        }
-        return '';
-    }
-    
     function getInitials(name) {
         return name.split(' ').slice(0, 2).map(function(n) { return n.charAt(0); }).join('').toUpperCase();
     }
@@ -921,14 +1005,12 @@
         var body = '';
         
         // Avatar
-        body += '<div class="modal-avatar' + (contact.photo ? ' has-photo' : '') + '">';
-        if (contact.photo) {
-            var photoUrl = safeUrl(contact.photo);
-            if (photoUrl) {
-                body += '<img src="' + escapeHtml(photoUrl) + '" alt="">';
-            }
+        var photoSrc = contactPhotoSrc(contact.photo);
+        body += '<div class="modal-avatar' + (photoSrc ? ' has-photo' : '') + '">';
+        if (photoSrc) {
+            body += '<img src="' + escapeHtml(photoSrc) + '" alt="">';
         } else {
-            body += getInitials(contact.fn);
+            body += escapeHtml(getInitials(contact.fn));
         }
         body += '</div>';
         
@@ -983,11 +1065,14 @@
         if (contact.urls.length) {
             body += '<div class="modal-section"><div class="modal-section-title">Website</div>';
             contact.urls.forEach(function(u) {
-                var href = safeUrl(u.value);
-                if (!href) return;
+                var href = websiteHref(u.value);
                 body += '<div class="modal-item">';
                 body += '<span class="modal-item-label">' + escapeHtml(u.type) + '</span>';
-                body += '<span class="modal-item-value"><a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(u.value) + '</a></span>';
+                if (href) {
+                    body += '<span class="modal-item-value"><a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(u.value) + '</a></span>';
+                } else {
+                    body += '<span class="modal-item-value">' + escapeHtml(u.value) + '</span>';
+                }
                 body += '</div>';
             });
             body += '</div>';
@@ -1000,24 +1085,19 @@
             if (contact.bday) {
                 body += '<div class="modal-item">';
                 body += '<span class="modal-item-label">Birthday</span>';
-                body += '<span class="modal-item-value">' + 
-                    contact.bday.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
-                    '</span></div>';
+                body += '<span class="modal-item-value">' + escapeHtml(formatVCardDate(contact.bday)) + '</span></div>';
             }
             if (contact.anniversary) {
                 body += '<div class="modal-item">';
                 body += '<span class="modal-item-label">Anniversary</span>';
-                body += '<span class="modal-item-value">' + 
-                    contact.anniversary.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
-                    '</span></div>';
+                body += '<span class="modal-item-value">' + escapeHtml(formatVCardDate(contact.anniversary)) + '</span></div>';
             }
             contact.dates.forEach(function(d) {
                 if (d.value) {
                     body += '<div class="modal-item">';
                     body += '<span class="modal-item-label">' + escapeHtml(d.type) + '</span>';
-                    body += '<span class="modal-item-value">' + 
-                        d.value.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) + 
-                        '</span></div>';
+                    var shown = typeof d.value === 'string' ? d.value : formatVCardDate(d.value);
+                    body += '<span class="modal-item-value">' + escapeHtml(shown) + '</span></div>';
                 }
             });
             body += '</div>';
@@ -1060,14 +1140,30 @@
             body += '<div style="white-space:pre-wrap;color:#4a5568">' + escapeHtml(contact.note) + '</div></div>';
         }
         
-        // Add edit button (only when the user may modify this address book)
+        var modalBody = document.getElementById('modal-body');
+        modalBody.innerHTML = body;
+
+        // Add edit button (only when the user may modify this address book).
+        // The contact is carried by the closure rather than written into an
+        // onclick attribute: an attribute value is decoded before the
+        // JavaScript in it is compiled, so escapeHtml output is not inert
+        // there -- &#39; arrives at the engine as an apostrophe and closes the
+        // string literal it was meant to stay inside.
         if (window.canEditAddressBook) {
-            body += '<div class="modal-contact-actions">';
-            body += '<button class="btn btn-primary" onclick="document.getElementById(\'contact-modal\').classList.remove(\'show\'); showEditContactModal(window.contacts.find(function(c) { return c.uid === \'' + escapeHtml(contact.uid) + '\'; }));">Edit Contact</button>';
-            body += '</div>';
+            var actions = document.createElement('div');
+            actions.className = 'modal-contact-actions';
+            var editButton = document.createElement('button');
+            editButton.type = 'button';
+            editButton.className = 'btn btn-primary';
+            editButton.textContent = 'Edit Contact';
+            editButton.addEventListener('click', function() {
+                modal.classList.remove('show');
+                showEditContactModal(contact);
+            });
+            actions.appendChild(editButton);
+            modalBody.appendChild(actions);
         }
-        
-        document.getElementById('modal-body').innerHTML = body;
+
         modal.classList.add('show');
     }
     
@@ -1107,16 +1203,12 @@
             card.addEventListener('click', function() { showContactModal(contact); });
             
             var html = '<div class="contact-header">';
-            html += '<div class="contact-avatar' + (contact.photo ? ' has-photo' : '') + '">';
-            if (contact.photo) {
-                var photoUrl = safeUrl(contact.photo);
-                if (photoUrl) {
-                    html += '<img src="' + escapeHtml(photoUrl) + '" alt="">';
-                } else {
-                    html += getInitials(contact.fn);
-                }
+            var photoSrc = contactPhotoSrc(contact.photo);
+            html += '<div class="contact-avatar' + (photoSrc ? ' has-photo' : '') + '">';
+            if (photoSrc) {
+                html += '<img src="' + escapeHtml(photoSrc) + '" alt="">';
             } else {
-                html += getInitials(contact.fn);
+                html += escapeHtml(getInitials(contact.fn));
             }
             html += '</div>';
             html += '<div>';
@@ -1165,61 +1257,121 @@
 // Birthday input handling
 function initBirthdaySelects() {
     ['create', 'edit'].forEach(function(prefix) {
-        var daySelect = document.getElementById(prefix + '-birthday-day');
-        daySelect.innerHTML = '<option value="">Day</option>';
-        for (var i = 1; i <= 31; i++) {
-            daySelect.innerHTML += '<option value="' + String(i).padStart(2, '0') + '">' + i + '</option>';
-        }
-        
-        // Update hidden field when inputs change
+        syncBirthdayDayOptions(prefix);
+
+        // The month and the year decide how long the day list is, so they
+        // rebuild it before the hidden field is read back.
         ['-month', '-day', '-year'].forEach(function(suffix) {
             var el = document.getElementById(prefix + '-birthday' + suffix);
             el.addEventListener('change', function() {
+                if (suffix !== '-day') {
+                    syncBirthdayDayOptions(prefix);
+                }
                 updateBirthdayHidden(prefix);
             });
+        });
+
+        // An empty birthday field asks the server to remove the birthday, so a
+        // half-chosen date must stop the submit rather than go out empty. The
+        // controls are re-read here because a year typed and submitted with
+        // Enter need not have fired change first.
+        document.getElementById(prefix + '-birthday').form.addEventListener('submit', function(event) {
+            syncBirthdayDayOptions(prefix);
+            var invalid = updateBirthdayHidden(prefix);
+            if (invalid) {
+                event.preventDefault();
+                invalid.reportValidity();
+            }
         });
     });
 }
 
-function updateBirthdayHidden(prefix) {
-    var month = document.getElementById(prefix + '-birthday-month').value;
-    var day = document.getElementById(prefix + '-birthday-day').value;
-    var year = document.getElementById(prefix + '-birthday-year').value;
-    var hidden = document.getElementById(prefix + '-birthday');
-    
-    if (!month || !day) {
-        hidden.value = '';
-        return;
+// birthdayDaysInMonth is how many days the chosen month holds. With no year
+// chosen the birthday is stored as --MM-DD, which names a day in every year, so
+// 29 February stays choosable until a year rules it out.
+function birthdayDaysInMonth(month, year) {
+    var monthNumber = parseInt(month, 10);
+    if (!monthNumber) {
+        return 31;
     }
-    
-    if (year) {
-        hidden.value = year + '-' + month + '-' + day;
-    } else {
-        // Format without year for server to parse as --MM-DD
-        hidden.value = '--' + month + '-' + day;
+    if (monthNumber === 2) {
+        var yearNumber = parseInt(year, 10);
+        if (isNaN(yearNumber)) {
+            return 29;
+        }
+        var leap = (yearNumber % 4 === 0 && yearNumber % 100 !== 0) || yearNumber % 400 === 0;
+        return leap ? 29 : 28;
+    }
+    return [4, 6, 9, 11].indexOf(monthNumber) === -1 ? 31 : 30;
+}
+
+// syncBirthdayDayOptions holds the day list to the days the chosen month and
+// year actually have. The day already picked survives only while the month
+// still has it; otherwise it returns to the placeholder, which
+// updateBirthdayHidden then flags so the form cannot submit without a day.
+function syncBirthdayDayOptions(prefix) {
+    var monthEl = document.getElementById(prefix + '-birthday-month');
+    var dayEl = document.getElementById(prefix + '-birthday-day');
+    var yearEl = document.getElementById(prefix + '-birthday-year');
+    var days = birthdayDaysInMonth(monthEl.value, yearEl.value);
+    var selected = dayEl.value;
+
+    var options = ['<option value="">Day</option>'];
+    for (var i = 1; i <= days; i++) {
+        options.push('<option value="' + String(i).padStart(2, '0') + '">' + i + '</option>');
+    }
+    dayEl.innerHTML = options.join('');
+    if (selected && parseInt(selected, 10) <= days) {
+        dayEl.value = selected;
     }
 }
 
+// updateBirthdayHidden spells the chosen birthday into the submitted field and
+// returns the control that keeps it from being a whole date, or null. The
+// submitted field is empty both for a birthday being removed and for one only
+// partly chosen, so only the first -- every control empty -- is left valid.
+function updateBirthdayHidden(prefix) {
+    var monthEl = document.getElementById(prefix + '-birthday-month');
+    var dayEl = document.getElementById(prefix + '-birthday-day');
+    var yearEl = document.getElementById(prefix + '-birthday-year');
+    var hidden = document.getElementById(prefix + '-birthday');
+    var month = monthEl.value;
+    var day = dayEl.value;
+    var year = String(yearEl.value).trim();
+
+    var invalid = null;
+    if (!month && (day || year)) {
+        invalid = monthEl;
+    } else if (month && !day) {
+        invalid = dayEl;
+    }
+    monthEl.setCustomValidity(invalid === monthEl ? 'Choose a month, or clear the birthday to remove it.' : '');
+    dayEl.setCustomValidity(invalid === dayEl ? 'Choose a day, or clear the birthday to remove it.' : '');
+
+    if (invalid || !month) {
+        hidden.value = '';
+    } else if (year) {
+        hidden.value = String(parseInt(year, 10)).padStart(4, '0') + '-' + month + '-' + day;
+    } else {
+        hidden.value = '--' + month + '-' + day;
+    }
+    return invalid;
+}
+
+// setBirthdayFields fills the controls from a parseVCardDate result, or
+// clears them for null.
 function setBirthdayFields(prefix, bday) {
     var monthEl = document.getElementById(prefix + '-birthday-month');
     var dayEl = document.getElementById(prefix + '-birthday-day');
     var yearEl = document.getElementById(prefix + '-birthday-year');
-    
-    if (!bday) {
-        monthEl.value = '';
-        dayEl.value = '';
-        yearEl.value = '';
-        return;
-    }
-    
-    monthEl.value = String(bday.getMonth() + 1).padStart(2, '0');
-    dayEl.value = String(bday.getDate()).padStart(2, '0');
-    // Only set year if it's not the placeholder year (1 or 1900)
-    if (bday.getFullYear() > 1900) {
-        yearEl.value = bday.getFullYear();
-    } else {
-        yearEl.value = '';
-    }
+
+    monthEl.value = bday ? String(bday.month).padStart(2, '0') : '';
+    yearEl.value = bday && bday.year !== null ? String(bday.year) : '';
+    // The day list is rebuilt for that month and year before the stored day is
+    // selected: a 29 February birthday has no option to select until February
+    // is the month in force.
+    syncBirthdayDayOptions(prefix);
+    dayEl.value = bday ? String(bday.day).padStart(2, '0') : '';
     updateBirthdayHidden(prefix);
 }
 
@@ -1240,10 +1392,7 @@ function closeCreateContactModal() {
     document.getElementById('create-company').value = '';
     document.getElementById('create-email').value = '';
     document.getElementById('create-phone').value = '';
-    document.getElementById('create-birthday-month').value = '';
-    document.getElementById('create-birthday-day').value = '';
-    document.getElementById('create-birthday-year').value = '';
-    document.getElementById('create-birthday').value = '';
+    setBirthdayFields('create', null);
     document.getElementById('create-notes').value = '';
 }
 
@@ -1253,6 +1402,7 @@ function showEditContactModal(contact) {
     var bookId = {{.AddressBook.ID}};
     document.getElementById('edit-contact-form').action = '/addressbooks/' + bookId + '/contacts/' + encodeURIComponent(contact.uid);
     document.getElementById('delete-contact-form').action = '/addressbooks/' + bookId + '/contacts/' + encodeURIComponent(contact.uid) + '/delete';
+    document.getElementById('edit-etag').value = contact.etag || '';
     
     document.getElementById('edit-display-name').value = contact.fn || '';
     
@@ -1347,12 +1497,6 @@ function confirmMoveContact() {
     form.submit();
 }
 
-function formatDateForInput(date) {
-    var year = date.getFullYear();
-    var month = String(date.getMonth() + 1).padStart(2, '0');
-    var day = String(date.getDate()).padStart(2, '0');
-    return year + '-' + month + '-' + day;
-}
 
 // Import modal
 function showImportModal() {

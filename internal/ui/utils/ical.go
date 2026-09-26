@@ -584,13 +584,24 @@ func UnfoldLines(ical string) []string {
 	ical = strings.ReplaceAll(ical, "\r\n", "\n")
 	ical = strings.ReplaceAll(ical, "\r", "\n")
 	rawLines := strings.Split(ical, "\n")
-	var lines []string
-	for _, line := range rawLines {
-		if len(lines) > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
-			lines[len(lines)-1] += strings.TrimLeft(line, " \t")
-			continue
+	lines := make([]string, 0, len(rawLines))
+	for i := 0; i < len(rawLines); {
+		end := i + 1
+		for end < len(rawLines) && (strings.HasPrefix(rawLines[end], " ") || strings.HasPrefix(rawLines[end], "\t")) {
+			end++
 		}
-		lines = append(lines, line)
+		if end == i+1 {
+			lines = append(lines, rawLines[i])
+		} else {
+			// Joined once, so a line folded many times unfolds in linear time.
+			var b strings.Builder
+			b.WriteString(rawLines[i])
+			for _, continuation := range rawLines[i+1 : end] {
+				b.WriteString(strings.TrimLeft(continuation, " \t"))
+			}
+			lines = append(lines, b.String())
+		}
+		i = end
 	}
 	return lines
 }
@@ -667,14 +678,21 @@ func writeICalLine(sb *strings.Builder, line string) {
 	sb.WriteString("\r\n")
 }
 
+// propertyLine splits an unfolded content line when it is the named property.
+// A quoted parameter value may hold a colon, so the split honours quoting.
+func propertyLine(line, name string) (keyPart, value string, ok bool) {
+	keyPart, value, ok = ical.SplitContentLine(line)
+	if !ok || !strings.EqualFold(ical.PropertyName(keyPart), name) {
+		return "", "", false
+	}
+	return keyPart, value, true
+}
+
 // RecurrenceIDValue extracts the RECURRENCE-ID value from event lines.
 func RecurrenceIDValue(lines []string) string {
 	for _, line := range lines {
-		if strings.HasPrefix(line, "RECURRENCE-ID") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return parts[1]
-			}
+		if _, value, ok := propertyLine(line, "RECURRENCE-ID"); ok {
+			return value
 		}
 	}
 	return ""
@@ -684,8 +702,7 @@ func RecurrenceIDValue(lines []string) string {
 func SameRecurrenceID(left, right []string) bool {
 	read := func(lines []string) (string, string) {
 		for _, line := range lines {
-			key, value, ok := strings.Cut(line, ":")
-			if ok && (key == "RECURRENCE-ID" || strings.HasPrefix(key, "RECURRENCE-ID;")) {
+			if key, value, ok := propertyLine(line, "RECURRENCE-ID"); ok {
 				return key, value
 			}
 		}
@@ -711,11 +728,8 @@ func SameRecurrenceID(left, right []string) bool {
 // HasPropertyValue checks if a property has a specific value.
 func HasPropertyValue(lines []string, prop, value string) bool {
 	for _, line := range lines {
-		if strings.HasPrefix(line, prop) {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 && parts[1] == value {
-				return true
-			}
+		if _, got, ok := propertyLine(line, prop); ok && got == value {
+			return true
 		}
 	}
 	return false

@@ -5,6 +5,7 @@ package ical
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,7 +92,17 @@ type recurrenceExpansion struct {
 // busy periods that overlap [rangeStart, rangeEnd). dtstart and duration are
 // the event's resolved start and occurrence length; maxInstances caps the
 // expansion and resolve reads the recurrence dates, per PropertyTimeResolver.
-// It returns ErrRecurrenceExpansionLimit if the work budget is exhausted.
+//
+// Exhausting maxInstances returns ErrRecurrenceExpansionLimit, and exhausting
+// the rule's scan work returns ErrRecurrenceScanLimit, which wraps it. Either
+// comes with the periods collected before the budget ran out. Each of those
+// reaches the requested range, but together they are neither a prefix of the
+// set nor in any particular order: rule-generated instances are collected
+// before RDATEs and overrides, so an interrupted rule leaves those out
+// entirely, and a RANGE=THISANDFUTURE override can move an instance past a
+// later one. A caller that owes the complete set -- free-busy does, since a
+// dropped period publishes an hour as free that is not -- has to treat the
+// error as fatal rather than publish them.
 func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]BusyPeriod, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    "VEVENT",
@@ -102,7 +113,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 			return !suppressed && periodOverlaps(effective.Start, effective.End, rangeStart, rangeEnd)
 		},
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrRecurrenceExpansionLimit) {
 		return nil, err
 	}
 	periods := make([]BusyPeriod, 0, len(occurrences))
@@ -111,7 +122,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 		period.RecurrenceID = occurrence.recurrenceID
 		periods = append(periods, period)
 	}
-	return periods, nil
+	return periods, err
 }
 
 // RecurrenceInstances expands the recurrence set of the named component and
@@ -124,10 +135,13 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 // exclusive bound here would drop an occurrence that starts precisely at the end
 // of the range.
 //
-// Work budget exhaustion returns ErrRecurrenceExpansionLimit alongside the
-// instances generated before the budget ran out. Each of those does reach the
-// range, so a caller asking only whether the set reaches it can answer from
-// them; one that owes the complete set has to treat the error as fatal.
+// Work budget exhaustion returns ErrRecurrenceExpansionLimit (or the
+// ErrRecurrenceScanLimit wrapping it) alongside the instances collected before
+// the budget ran out. Those are not a prefix of the set in ascending order --
+// RDATE instances are collected after the rule's, and a RANGE=THISANDFUTURE
+// override can reorder placements -- but each of them does reach the range, so
+// a caller asking only whether the set reaches it can answer from them; one
+// that owes the complete set has to treat the error as fatal.
 func RecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]RecurrenceInstance, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    componentName,
@@ -193,6 +207,7 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 	component := primaryOf(components)
 	exdates := eventExDates(component, expansion.resolve)
 	overrides := componentRecurrenceOverrides(components, duration, expansion.resolve)
+	overrideIndex := newRecurrenceOverrideIndex(overrides)
 	rdates := componentRDatePeriods(component, expansion.resolve)
 	periodEnds := make(map[time.Time]time.Time)
 	for _, rdate := range rdates {
@@ -210,7 +225,7 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		if limitErr != nil {
 			return
 		}
-		if applyExDates && isExcludedDate(recurrenceID, exdates) {
+		if applyExDates && exdates.contains(recurrenceID) {
 			return
 		}
 		if generated {
@@ -223,8 +238,8 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		exactOverride := false
 		var governing time.Time
 		if generated {
-			effective, suppressed, governing = applyThisAndFutureOverrides(original, overrides)
-			exactOverride = isOverrideRecurrenceID(recurrenceID, overrides)
+			effective, suppressed, governing = overrideIndex.applyThisAndFuture(original)
+			exactOverride = overrideIndex.replaces(recurrenceID)
 			suppressed = suppressed || exactOverride
 		}
 		if suppressed && !expansion.includeSuppressed {
@@ -254,10 +269,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 
 	if rrule := componentPropertyValue(component, "RRULE"); rrule != "" {
 		scanStart, scanEnd := rangeStart, rangeEnd
-		if hasThisAndFutureOverrides(overrides) {
-			if shift := maxThisAndFutureShift(overrides); shift > 0 {
-				scanStart = scanStart.Add(-shift)
-				scanEnd = scanEnd.Add(shift)
+		if overrideIndex.hasThisAndFuture() {
+			if shift := overrideIndex.maxThisAndFutureShiftSeconds(); shift > 0 {
+				scanStart = addSeconds(scanStart, -shift)
+				scanEnd = addSeconds(scanEnd, shift)
 			}
 		}
 		scanExpansion := expansion
@@ -269,7 +284,12 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			return limitErr != nil
 		})
 		if err != nil {
-			return nil, err
+			// The occurrences already collected are kept for the same reason the
+			// output budget keeps them: each one reaches the range, so a caller
+			// asking whether the set reaches it can still answer. The RDATEs and
+			// overrides below are never collected, which is why what is returned
+			// is not a prefix of the set.
+			return periods, err
 		}
 		if !ok {
 			addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
@@ -296,9 +316,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 	}
 
 	// The periods collected before the budget ran out are returned with the
-	// error rather than dropped. Every one of them reaches the range, so a
-	// caller testing whether the set reaches it at all can answer from them; the
-	// callers that owe a complete set discard them by refusing on the error.
+	// error rather than dropped. They are an arbitrary subset of the set rather
+	// than a prefix, but every one of them reaches the range, so a caller testing
+	// whether the set reaches it at all can answer from them; the callers that
+	// owe a complete set discard them by refusing on the error.
 	return periods, limitErr
 }
 
@@ -338,6 +359,13 @@ func ValidRecurrenceRule(value string) bool {
 	return ok
 }
 
+// maxRecurrenceOverrideComponents bounds the RECURRENCE-ID components one
+// resource may carry. A cancelled override adds no instance to the set, so
+// CALDAV:max-instances does not bound them, yet every expansion of the resource
+// reads each one; ten times the instance limit leaves room for a long-running
+// series with many modified or cancelled occurrences.
+const maxRecurrenceOverrideComponents = 10 * MaxRecurrenceInstances
+
 // RecurrenceSetExceedsLimit counts the instance identities in the recurring
 // VEVENT, VTODO, or VJOURNAL set carried by raw. The second result is false
 // when a recurrence value cannot be parsed.
@@ -355,7 +383,13 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	}
 
 	var master *Component
+	// overrides maps each overridden slot to whether its override is
+	// STATUS:CANCELLED. A cancelled override replaces the instance it names
+	// rather than adding one -- only EXDATE removes an instance (RFC 5545
+	// §3.8.5.1) -- so it is counted as the generated slot it names, and one
+	// naming no generated slot adds nothing.
 	overrides := make(map[string]bool)
+	overrideComponents := 0
 	instances := make(map[string]struct{})
 	for i := range components {
 		component := &components[i]
@@ -370,12 +404,18 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 		if !ok {
 			return false, false
 		}
+		overrideComponents++
 		key := recurrenceInstantKey(parsed)
 		cancelled := strings.EqualFold(componentPropertyValue(component, "STATUS"), "CANCELLED")
-		overrides[key] = cancelled
+		if previous, seen := overrides[key]; !seen || previous {
+			overrides[key] = cancelled
+		}
 		if !cancelled {
 			instances["override:"+key] = struct{}{}
 		}
+	}
+	if overrideComponents > maxRecurrenceOverrideComponents {
+		return true, true
 	}
 	if master == nil {
 		return len(instances) > limit, true
@@ -396,7 +436,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 		if _, skip := excluded[key]; skip {
 			return false
 		}
-		if _, replaced := overrides[key]; replaced {
+		if cancelled, replaced := overrides[key]; replaced && !cancelled {
 			return false
 		}
 		instances["generated:"+key] = struct{}{}
@@ -451,6 +491,19 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return len(instances) > limit, true
 	}
+	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule)
+	if overBudget {
+		return true, true
+	}
+	// countLimit is how many instances the rule itself contributes toward
+	// COUNT once the DTSTART, counted above, has taken its place.
+	countLimit := rule.Count
+	if !generatesStart && rule.Count > 0 {
+		if rule.Count == 1 {
+			return len(instances) > limit, true
+		}
+		countLimit--
+	}
 
 	// A rule with neither COUNT nor UNTIL never stops, so the limit cannot be a
 	// count of the whole set without refusing every "repeats weekly, no end
@@ -478,7 +531,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 				return true
 			}
 			occurrences++
-			if rule.Count > 0 && occurrences > rule.Count {
+			if countLimit > 0 && occurrences > countLimit {
 				bounded = true
 				return true
 			}
@@ -510,20 +563,16 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	}
 	mayProduceCandidate := occurrences > 0 || recurrenceRuleMayProduceCandidate(dtstart, rule)
 	if rule.Count > 0 && mayProduceCandidate {
-		maxSuppressed := len(excluded)
-		for _, cancelled := range overrides {
-			if cancelled {
-				maxSuppressed++
-			}
-		}
-		if rule.Count-maxSuppressed > limit {
+		if rule.Count-len(excluded) > limit {
 			return true, true
 		}
 	}
 	if !mayProduceCandidate {
 		return len(instances) > limit, true
 	}
-	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, rule, &occurrences, add); handled {
+	countedRule := rule
+	countedRule.Count = countLimit
+	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, &occurrences, add); handled {
 		return exceeds, true
 	}
 	// The scan guard ran out before the horizon above was reached, so how many
@@ -655,26 +704,14 @@ func positiveRemainder(value, divisor int64) int64 {
 	return result
 }
 
+// recurrenceBySetPosMaySelect reports whether the rule can select anything at
+// all. RFC 5545 §3.3.10 numbers BYSETPOS within one period, so an ordinal
+// larger than any period of the rule can ever offer selects nothing however
+// many periods are generated -- and generating them to find that out costs
+// seconds of CPU for a two-hundred byte object, on the validation gate and
+// again on every expansion of the stored resource.
 func recurrenceBySetPosMaySelect(dtstart time.Time, rule recurrenceRule) bool {
-	clockCandidates := len(defaultedInts(rule.ByHour, dtstart.Hour())) *
-		len(defaultedInts(rule.ByMinute, dtstart.Minute())) *
-		validSecondCandidateCount(rule.BySecond)
-	maxCandidates := clockCandidates
-	switch rule.Freq {
-	case "SECONDLY":
-		maxCandidates = 1
-	case "MINUTELY":
-		maxCandidates = validSecondCandidateCount(rule.BySecond)
-	case "HOURLY":
-		maxCandidates = len(defaultedInts(rule.ByMinute, dtstart.Minute())) *
-			validSecondCandidateCount(rule.BySecond)
-	case "WEEKLY":
-		maxCandidates *= 7
-	case "MONTHLY":
-		maxCandidates *= 31
-	case "YEARLY":
-		maxCandidates *= 366
-	}
+	maxCandidates := recurrenceMaxCandidatesPerPeriod(dtstart, rule)
 	if maxCandidates == 0 {
 		return false
 	}
@@ -687,6 +724,146 @@ func recurrenceBySetPosMaySelect(dtstart time.Time, rule recurrenceRule) bool {
 		}
 	}
 	return false
+}
+
+// recurrenceCandidateBoundCeiling saturates the candidate-count arithmetic
+// below. Every BYSETPOS value parses within ±366, so any bound at or above that
+// answers identically and the exact figure past it carries no information.
+const recurrenceCandidateBoundCeiling = 1 << 20
+
+// recurrenceMaxCandidatesPerPeriod is an upper bound on the candidate starts
+// one period of the rule offers, derived from the rule rather than by
+// generating a period. It mirrors visitRecurrenceCandidates: the days the
+// frequency's day list can hold, times the clock values each of those days
+// expands to. Over-estimating only makes the BYSETPOS guard weaker, so each
+// part is the widest count its generator can produce.
+func recurrenceMaxCandidatesPerPeriod(dtstart time.Time, rule recurrenceRule) int {
+	seconds := validSecondCandidateCount(rule.BySecond)
+	minutes := len(defaultedInts(rule.ByMinute, dtstart.Minute()))
+	switch rule.Freq {
+	case "SECONDLY":
+		// A second is one instant, so the period offers itself or nothing.
+		return 1
+	case "MINUTELY":
+		return seconds
+	case "HOURLY":
+		return saturatingProduct(minutes, seconds)
+	}
+	hours := len(defaultedInts(rule.ByHour, dtstart.Hour()))
+	perDay := saturatingProduct(saturatingProduct(hours, minutes), seconds)
+	return saturatingProduct(recurrenceMaxDaysPerPeriod(dtstart, rule), perDay)
+}
+
+// recurrenceMaxDaysPerPeriod is an upper bound on the entries the day list of
+// one period can hold, after the deduplication by calendar date that
+// visitRecurrenceCandidates applies to it.
+func recurrenceMaxDaysPerPeriod(dtstart time.Time, rule recurrenceRule) int {
+	switch rule.Freq {
+	case "DAILY":
+		return 1
+	case "WEEKLY":
+		if len(rule.ByDay) == 0 {
+			return 1
+		}
+		return weekdayDayCountBound(rule.ByDay, 7)
+	case "MONTHLY":
+		return monthlyDayCountBound(rule.ByMonthDay, rule.ByDay)
+	case "YEARLY":
+		return yearlyDayCountBound(rule)
+	default:
+		return 1
+	}
+}
+
+// monthlyDayCountBound bounds monthlyDays. Each BYMONTHDAY value names at most
+// one date of a month, and a BYDAY list is bounded over the longest month.
+func monthlyDayCountBound(byMonthDay []int, byDay []weekdaySpecifier) int {
+	if len(byMonthDay) > 0 {
+		return len(byMonthDay)
+	}
+	if len(byDay) > 0 {
+		return weekdayDayCountBound(byDay, 31)
+	}
+	return 1
+}
+
+// yearlyDayCountBound bounds yearlyDays, following the same branches it takes.
+func yearlyDayCountBound(rule recurrenceRule) int {
+	if len(rule.ByWeekNo) > 0 {
+		perWeek := 7
+		// A whole-week list is narrowed afterwards by an unnumbered BYDAY, which
+		// selects the same weekdays out of every one of those weeks.
+		if len(rule.ByDay) > 0 && !hasOrdinalWeekday(rule.ByDay) {
+			perWeek = weekdayDayCountBound(rule.ByDay, 7)
+		}
+		return saturatingProduct(len(rule.ByWeekNo), perWeek)
+	}
+	if len(rule.ByYearDay) > 0 {
+		return len(rule.ByYearDay)
+	}
+	if len(rule.ByMonth) == 0 && len(rule.ByDay) > 0 && len(rule.ByMonthDay) == 0 {
+		// The whole year is searched, whether the days are taken from it
+		// directly or month by month.
+		return weekdayDayCountBound(rule.ByDay, 366)
+	}
+	months := len(rule.ByMonth)
+	if months == 0 {
+		if len(rule.ByMonthDay) > 0 {
+			months = 12
+		} else {
+			months = 1
+		}
+	}
+	return saturatingProduct(months, monthlyDayCountBound(rule.ByMonthDay, rule.ByDay))
+}
+
+// weekdayDayCountBound bounds the dates a BYDAY list names inside a period
+// spanning at most periodDays days. A numbered specifier names one date.
+//
+// The unnumbered ones are counted together rather than one at a time, because
+// they share the period's days: a stretch of periodDays holds exactly
+// periodDays/7 complete weeks, so each named weekday occurs that often, and
+// only the periodDays%7 days left over can add one more apiece. Summing a
+// per-weekday maximum instead would claim 25 weekdays in a 31-day month, which
+// no month has, and hand a BYSETPOS the scan then has to disprove by
+// generating every period of the rule.
+func weekdayDayCountBound(specifiers []weekdaySpecifier, periodDays int) int {
+	numbered := 0
+	var unnumbered [7]bool
+	distinct := 0
+	for _, spec := range specifiers {
+		if spec.Ordinal != 0 {
+			numbered++
+			continue
+		}
+		if unnumbered[spec.Day] {
+			continue
+		}
+		unnumbered[spec.Day] = true
+		distinct++
+	}
+	total := numbered
+	if distinct > 0 {
+		total = saturatingSum(total, distinct*(periodDays/7)+min(distinct, periodDays%7))
+	}
+	return total
+}
+
+func saturatingProduct(a, b int) int {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > recurrenceCandidateBoundCeiling/b {
+		return recurrenceCandidateBoundCeiling
+	}
+	return a * b
+}
+
+func saturatingSum(a, b int) int {
+	if a > recurrenceCandidateBoundCeiling-b {
+		return recurrenceCandidateBoundCeiling
+	}
+	return a + b
 }
 
 func validSecondCandidateCount(values []int) int {
@@ -708,6 +885,14 @@ func validSecondCandidateCount(values []int) int {
 // ErrRecurrenceExpansionLimit means a recurrence could not be fully evaluated
 // within the work budget.
 var ErrRecurrenceExpansionLimit = errors.New("recurrence expansion work limit exceeded")
+
+// ErrRecurrenceScanLimit is the ErrRecurrenceExpansionLimit raised when a rule
+// needs more candidate generation than the scan budgets allow, as opposed to
+// generating more instances than the caller's output budget holds. It is a
+// property of the stored rule over the range rather than of how many instances
+// the range contains, and wraps ErrRecurrenceExpansionLimit so a caller that
+// treats every incomplete expansion alike need not tell the two apart.
+var ErrRecurrenceScanLimit = fmt.Errorf("%w: recurrence rule scan work exhausted", ErrRecurrenceExpansionLimit)
 
 // Sparse rules are evaluated exactly while work remains. Validation fails
 // closed on max-instances; reads return ErrRecurrenceExpansionLimit.
@@ -906,9 +1091,10 @@ func recurrenceInstantKey(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
 }
 
-// LatestRecurrenceOnOrBefore returns the latest generated recurrence start at
-// or before the supplied wall-clock value. It is used to apply the observance
-// rules in a submitted VTIMEZONE definition.
+// LatestRecurrenceOnOrBefore returns the latest occurrence of the recurrence
+// set -- the DTSTART or a start the rule generates -- at or before the supplied
+// wall-clock value. It is used to apply the observance rules in a submitted
+// VTIMEZONE definition.
 //
 // found reports that such a start exists. complete reports that the search
 // reached the end of what the rule describes; it is false when a period was too
@@ -923,25 +1109,42 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 	if !ok || before.Before(dtstart) {
 		return time.Time{}, false, true
 	}
+	// RFC 5545 §3.8.5.3 makes the DTSTART the first occurrence whether or not
+	// the rule generates it, and whether or not it falls past UNTIL; a
+	// VTIMEZONE observance's DTSTART is its first onset (§3.6.5). A rule that
+	// selects nothing leaves it the only one.
+	if !recurrenceBySetPosMaySelect(dtstart, rule) {
+		return dtstart, true, true
+	}
+	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule)
+	if overBudget {
+		return dtstart, true, false
+	}
+	pastUntil := func(candidate time.Time) bool {
+		return rule.Until != nil && candidate.After(*rule.Until) && !candidate.Equal(dtstart)
+	}
 	threshold := before
 	if rule.Until != nil && rule.Until.Before(threshold) {
 		threshold = *rule.Until
 	}
-	periodStart := recurrencePeriodStart(dtstart, rule)
-	if rule.Count == 0 {
-		periodStart = fastForwardRecurrencePeriod(periodStart, threshold, rule)
-	}
 
-	occurrences := 0
 	if rule.Count > 0 {
-		periodStart = recurrencePeriodStart(dtstart, rule)
+		occurrences := 0
+		if !generatesStart {
+			latest = dtstart
+			occurrences = 1
+		}
+		periodStart := recurrencePeriodStart(dtstart, rule)
 		for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-			done := false
+			done := occurrences >= rule.Count
+			if done {
+				return latest, true, true
+			}
 			_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
 				if candidate.Before(dtstart) {
 					return false
 				}
-				if rule.Until != nil && candidate.After(*rule.Until) {
+				if pastUntil(candidate) {
 					done = true
 					return true
 				}
@@ -966,16 +1169,22 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		return latest, !latest.IsZero(), false
 	}
 
+	// The DTSTART answers only when no generated occurrence does, since every
+	// generated one is at or after it.
+	fallback := func() (time.Time, bool) {
+		if generatesStart {
+			return time.Time{}, false
+		}
+		return dtstart, true
+	}
+	periodStart := fastForwardRecurrencePeriod(recurrencePeriodStart(dtstart, rule), threshold, rule)
 	for scanned := 0; scanned < 1000; scanned++ {
 		// The whole period is wanted here, so a period too large to generate
 		// leaves no usable answer: without BYSETPOS the maximum reached is only
 		// the maximum of the days that were generated, and with it nothing is
 		// selected at all, because BYSETPOS resolves only once the period ends.
 		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
-			if candidate.Before(dtstart) || candidate.After(before) {
-				return false
-			}
-			if rule.Until != nil && candidate.After(*rule.Until) {
+			if candidate.Before(dtstart) || candidate.After(before) || pastUntil(candidate) {
 				return false
 			}
 			if latest.IsZero() || candidate.After(latest) {
@@ -991,7 +1200,8 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		}
 		previous := retreatRecurrencePeriod(periodStart, rule)
 		if !previous.Before(periodStart) || previous.Before(dtstart) {
-			return time.Time{}, false, true
+			start, found := fallback()
+			return start, found, true
 		}
 		periodStart = previous
 	}
@@ -1028,32 +1238,14 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // than 24 hours.
 const recurrenceCivilScanPad = 24 * time.Hour
 
-func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates []time.Time, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod) bool) (bool, error) {
+func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates recurrenceInstantSet, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod) bool) (bool, error) {
 	recurrenceStart, resolveCandidate, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
 	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), expansion.resolve)
 	if !ok {
 		return false, nil
 	}
 
-	scanStart, scanEnd := rangeStart, rangeEnd
-	if civil {
-		// A valid UTC offset is strictly less than 24 hours. Padding the absolute
-		// request bounds by that amount produces a safe civil-time scan window;
-		// every candidate is still resolved and checked against the exact bounds.
-		scanStart = scanStart.Add(-recurrenceCivilScanPad)
-		scanEnd = scanEnd.Add(recurrenceCivilScanPad)
-	}
-	periodStart := recurrencePeriodStart(recurrenceStart, rule)
 	occurrences := 0
-	if rule.Count == 0 {
-		periodStart = fastForwardRecurrencePeriod(periodStart, scanStart.Add(-duration), rule)
-	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
-		if skipped >= rule.Count {
-			return true, nil
-		}
-		periodStart = fastForwardedStart
-		occurrences = skipped
-	}
 	done := false
 	visit := func(current time.Time) bool {
 		if current.Before(recurrenceStart) {
@@ -1063,7 +1255,8 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		if !resolved {
 			return false
 		}
-		if rule.Until != nil && resolvedCurrent.After(*rule.Until) {
+		// The DTSTART is an instance even past UNTIL (RFC 5545 §3.8.5.3).
+		if rule.Until != nil && resolvedCurrent.After(*rule.Until) && !current.Equal(recurrenceStart) {
 			done = true
 			return true
 		}
@@ -1075,7 +1268,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		period := BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
 		// resolvedCurrent is the slot the rule generated; the shared
 		// expansion applies any RANGE=THISANDFUTURE transform afterwards.
-		if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !isExcludedDate(resolvedCurrent, exdates) {
+		if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !exdates.contains(resolvedCurrent) {
 			if add(resolvedCurrent, period) {
 				done = true
 				return true
@@ -1083,17 +1276,65 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		}
 		return false
 	}
+
+	// RFC 5545 §3.8.5.3 makes the DTSTART the first instance of the set, and
+	// the first toward COUNT, whether or not the rule generates it. A rule that
+	// does generate it visits it below like any other candidate.
+	selects := recurrenceBySetPosMaySelect(recurrenceStart, rule)
+	generatesStart := false
+	if selects {
+		var overBudget bool
+		generatesStart, overBudget = recurrenceRuleGeneratesStart(recurrenceStart, rule)
+		if overBudget {
+			// Whether or not the rule generates it, the DTSTART is an
+			// instance, so it is collected with whatever else is returned.
+			visit(recurrenceStart)
+			return false, ErrRecurrenceScanLimit
+		}
+	}
+	if !generatesStart {
+		visit(recurrenceStart)
+		if done {
+			return true, nil
+		}
+	}
+	// A rule whose BYSETPOS names an ordinal no period of it can reach generates
+	// nothing past the DTSTART. That is an answer, and one the rule gives on its
+	// own: scanning for it would burn the whole work budget on every report the
+	// resource appears in and still end with nothing to return.
+	if !selects {
+		return true, nil
+	}
+
+	scanStart, scanEnd := rangeStart, rangeEnd
+	if civil {
+		// A valid UTC offset is strictly less than 24 hours. Padding the absolute
+		// request bounds by that amount produces a safe civil-time scan window;
+		// every candidate is still resolved and checked against the exact bounds.
+		scanStart = scanStart.Add(-recurrenceCivilScanPad)
+		scanEnd = scanEnd.Add(recurrenceCivilScanPad)
+	}
+	periodStart := recurrencePeriodStart(recurrenceStart, rule)
+	if rule.Count == 0 {
+		periodStart = fastForwardRecurrencePeriod(periodStart, scanStart.Add(-duration), rule)
+	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
+		if occurrences+skipped >= rule.Count {
+			return true, nil
+		}
+		periodStart = fastForwardedStart
+		occurrences += skipped
+	}
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
 		_, overBudget := visitRecurrenceCandidates(periodStart, recurrenceStart, rule, visit)
 		if overBudget {
-			return false, ErrRecurrenceExpansionLimit
+			return false, ErrRecurrenceScanLimit
 		}
 		if done {
 			return true, nil
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
 		if !next.After(periodStart) {
-			return false, ErrRecurrenceExpansionLimit
+			return false, ErrRecurrenceScanLimit
 		}
 		periodStart = next
 		if periodStart.After(scanEnd) || (rule.Count > 0 && occurrences >= rule.Count) {
@@ -1107,7 +1348,25 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 			return true, nil
 		}
 	}
-	return false, ErrRecurrenceExpansionLimit
+	return false, ErrRecurrenceScanLimit
+}
+
+// recurrenceRuleGeneratesStart reports whether rule itself generates dtstart,
+// which only the period containing it can. overBudget reports that the period
+// was too large to decide within recurrencePeriodWorkLimit.
+func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule) (generates, overBudget bool) {
+	// A rule with no BY part derives every candidate from the DTSTART itself.
+	if !recurrenceRuleHasOtherByPart(rule) && len(rule.BySetPos) == 0 {
+		return true, false
+	}
+	_, overBudget = visitRecurrenceCandidates(recurrencePeriodStart(dtstart, rule), dtstart, rule, func(candidate time.Time) bool {
+		if candidate.Before(dtstart) {
+			return false
+		}
+		generates = candidate.Equal(dtstart)
+		return true
+	})
+	return generates && !overBudget, overBudget
 }
 
 func recurrenceGenerationStart(component *Component, fallback time.Time, resolve PropertyTimeResolver) (time.Time, func(time.Time) (time.Time, bool), bool) {
@@ -1130,18 +1389,24 @@ func recurrenceGenerationStart(component *Component, fallback time.Time, resolve
 }
 
 func fastForwardCountedSubDailyRecurrence(periodStart, threshold time.Time, rule recurrenceRule) (time.Time, int, bool) {
-	step, ok := subDailyRecurrenceStep(rule)
+	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
 	if !ok || !fixedStepSubDailyRecurrence(rule) {
 		return periodStart, 0, false
 	}
 	if !threshold.After(periodStart) {
 		return periodStart, 0, true
 	}
-	steps := int(threshold.Sub(periodStart) / step)
+	// Whole seconds rather than a time.Duration, which saturates at about 292
+	// years and would stop the fast-forward short for an early DTSTART.
+	elapsed := threshold.Unix() - periodStart.Unix()
+	if threshold.Nanosecond() < periodStart.Nanosecond() {
+		elapsed--
+	}
+	steps := elapsed / stepSeconds
 	if steps <= 0 {
 		return periodStart, 0, true
 	}
-	return periodStart.Add(time.Duration(steps) * step), steps, true
+	return addSeconds(periodStart, steps*stepSeconds), int(steps), true
 }
 
 func fixedStepSubDailyRecurrence(rule recurrenceRule) bool {
@@ -1178,13 +1443,28 @@ func periodTouches(start, end, rangeStart, rangeEnd time.Time) bool {
 	return !start.After(rangeEnd) && !end.Before(rangeStart)
 }
 
-func isExcludedDate(start time.Time, exdates []time.Time) bool {
-	for _, exdate := range exdates {
-		if start.Equal(exdate) {
-			return true
-		}
-	}
-	return false
+// recurrenceInstant is a comparable form of an absolute instant, so a set of
+// them can be looked up rather than scanned. Seconds and nanoseconds are held
+// apart rather than combined: RFC 5545 §3.3.5 admits a DATE-TIME centuries
+// before 1678, which a nanosecond count cannot represent.
+type recurrenceInstant struct {
+	seconds     int64
+	nanoseconds int
+}
+
+// recurrenceInstantSet answers the exclusion test the expansion applies once
+// per generated instance. RFC 5545 §3.8.5.1 puts no bound on how many EXDATEs a
+// component may carry, so scanning them would make one expansion cost the
+// product of the two counts.
+type recurrenceInstantSet map[recurrenceInstant]struct{}
+
+func (s recurrenceInstantSet) add(value time.Time) {
+	s[recurrenceInstant{seconds: value.Unix(), nanoseconds: value.Nanosecond()}] = struct{}{}
+}
+
+func (s recurrenceInstantSet) contains(value time.Time) bool {
+	_, ok := s[recurrenceInstant{seconds: value.Unix(), nanoseconds: value.Nanosecond()}]
+	return ok
 }
 
 func componentRDatePeriods(component *Component, resolve PropertyTimeResolver) []rdatePeriod {
@@ -1223,12 +1503,12 @@ func componentRDatePeriods(component *Component, resolve PropertyTimeResolver) [
 	return periods
 }
 
-func eventExDates(component *Component, resolve PropertyTimeResolver) []time.Time {
-	var dates []time.Time
+func eventExDates(component *Component, resolve PropertyTimeResolver) recurrenceInstantSet {
+	dates := make(recurrenceInstantSet)
 	for _, prop := range componentProperties(component, "EXDATE") {
 		for _, value := range strings.Split(prop.Value, ",") {
 			if parsed, ok := resolve.or(prop.KeyPart, strings.TrimSpace(value)); ok {
-				dates = append(dates, parsed)
+				dates.add(parsed)
 			}
 		}
 	}
@@ -1287,66 +1567,108 @@ func componentRecurrenceOverrides(components []Component, fallbackDuration time.
 	return overrides
 }
 
-func applyThisAndFutureOverrides(period BusyPeriod, overrides []recurrenceOverride) (BusyPeriod, bool, time.Time) {
-	var selected *recurrenceOverride
-	for i := range overrides {
-		override := &overrides[i]
-		if !override.rangeThisAndFuture || period.Start.Before(override.recurrenceID) {
+// recurrenceOverrideIndex answers the two override questions the expansion
+// asks of every generated instance: whether an ordinary override replaces its
+// slot, and which RANGE=THISANDFUTURE override governs it. RFC 5545 §3.8.4.4
+// bounds neither how many overrides a resource may carry, so both are lookups
+// rather than scans; otherwise one expansion would cost the product of the
+// instance and override counts.
+type recurrenceOverrideIndex struct {
+	exact recurrenceInstantSet
+	// thisAndFuture is ordered by RECURRENCE-ID. Among overrides naming the same
+	// slot the first in the resource comes first, and is the one that governs.
+	thisAndFuture []recurrenceOverride
+}
+
+func newRecurrenceOverrideIndex(overrides []recurrenceOverride) recurrenceOverrideIndex {
+	index := recurrenceOverrideIndex{exact: make(recurrenceInstantSet)}
+	for _, override := range overrides {
+		if override.rangeThisAndFuture {
+			index.thisAndFuture = append(index.thisAndFuture, override)
 			continue
 		}
-		if selected == nil || override.recurrenceID.After(selected.recurrenceID) {
-			selected = override
+		index.exact.add(override.recurrenceID)
+	}
+	sort.SliceStable(index.thisAndFuture, func(i, j int) bool {
+		return index.thisAndFuture[i].recurrenceID.Before(index.thisAndFuture[j].recurrenceID)
+	})
+	return index
+}
+
+// replaces reports whether an ordinary override names the slot.
+func (index recurrenceOverrideIndex) replaces(recurrenceID time.Time) bool {
+	return index.exact.contains(recurrenceID)
+}
+
+// governing returns the RANGE=THISANDFUTURE override with the latest
+// RECURRENCE-ID at or before start.
+func (index recurrenceOverrideIndex) governing(start time.Time) (recurrenceOverride, bool) {
+	overrides := index.thisAndFuture
+	after := sort.Search(len(overrides), func(i int) bool {
+		return overrides[i].recurrenceID.After(start)
+	})
+	if after == 0 {
+		return recurrenceOverride{}, false
+	}
+	latest := overrides[after-1].recurrenceID
+	first := sort.Search(after, func(i int) bool {
+		return !overrides[i].recurrenceID.Before(latest)
+	})
+	return overrides[first], true
+}
+
+func (index recurrenceOverrideIndex) hasThisAndFuture() bool {
+	return len(index.thisAndFuture) > 0
+}
+
+// maxThisAndFutureShiftSeconds is the furthest any RANGE=THISANDFUTURE
+// override moves its instances, in whole seconds rounded up. It is counted in
+// seconds rather than as a time.Duration because the distance can exceed the
+// ~292 years a Duration holds.
+func (index recurrenceOverrideIndex) maxThisAndFutureShiftSeconds() int64 {
+	var max int64
+	for _, override := range index.thisAndFuture {
+		if override.cancelled {
+			continue
+		}
+		shift := override.period.Start.Unix() - override.recurrenceID.Unix()
+		if shift < 0 {
+			shift = -shift
+		}
+		if shift+1 > max {
+			max = shift + 1
 		}
 	}
-	if selected == nil {
+	return max
+}
+
+// addSeconds moves t by seconds, which may exceed what a time.Duration holds.
+func addSeconds(t time.Time, seconds int64) time.Time {
+	return time.Unix(t.Unix()+seconds, int64(t.Nanosecond())).In(t.Location())
+}
+
+// moveInstant moves t by the distance from from to to, which may exceed what
+// a time.Duration holds.
+func moveInstant(t, from, to time.Time) time.Time {
+	return time.Unix(t.Unix()+(to.Unix()-from.Unix()),
+		int64(t.Nanosecond())+int64(to.Nanosecond()-from.Nanosecond())).In(t.Location())
+}
+
+func (index recurrenceOverrideIndex) applyThisAndFuture(period BusyPeriod) (BusyPeriod, bool, time.Time) {
+	selected, ok := index.governing(period.Start)
+	if !ok {
 		return period, false, time.Time{}
 	}
 	if selected.cancelled {
 		return period, true, selected.recurrenceID
 	}
 
-	delta := selected.period.Start.Sub(selected.recurrenceID)
-	shiftedStart := period.Start.Add(delta)
+	shiftedStart := moveInstant(period.Start, selected.recurrenceID, selected.period.Start)
 	duration := selected.period.End.Sub(selected.period.Start)
 	if duration <= 0 {
 		duration = period.End.Sub(period.Start)
 	}
 	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, false, selected.recurrenceID
-}
-
-func maxThisAndFutureShift(overrides []recurrenceOverride) time.Duration {
-	var max time.Duration
-	for _, override := range overrides {
-		if !override.rangeThisAndFuture || override.cancelled {
-			continue
-		}
-		shift := override.period.Start.Sub(override.recurrenceID)
-		if shift < 0 {
-			shift = -shift
-		}
-		if shift > max {
-			max = shift
-		}
-	}
-	return max
-}
-
-func hasThisAndFutureOverrides(overrides []recurrenceOverride) bool {
-	for _, override := range overrides {
-		if override.rangeThisAndFuture {
-			return true
-		}
-	}
-	return false
-}
-
-func isOverrideRecurrenceID(start time.Time, overrides []recurrenceOverride) bool {
-	for _, override := range overrides {
-		if !override.rangeThisAndFuture && start.Equal(override.recurrenceID) {
-			return true
-		}
-	}
-	return false
 }
 
 // Component is one component block's parsed content lines, of whatever type the
@@ -1437,15 +1759,12 @@ func topLevelComponentsFromLines(lines []string, accept func(string) bool) []Com
 		if current == nil || componentDepth != depth {
 			continue
 		}
-		colonIdx := strings.IndexByte(rawLine, ':')
-		if colonIdx < 0 {
+		keyPart, value, ok := SplitContentLine(rawLine)
+		if !ok {
 			current.malformedProperties = append(current.malformedProperties, rawLine)
 			continue
 		}
-		current.properties = append(current.properties, PropertyValue{
-			KeyPart: rawLine[:colonIdx],
-			Value:   rawLine[colonIdx+1:],
-		})
+		current.properties = append(current.properties, PropertyValue{KeyPart: keyPart, Value: value})
 	}
 	return components
 }
@@ -1487,21 +1806,80 @@ func componentHasProperty(component *Component, name string) bool {
 
 // PropertyParam returns the value of the named parameter on a content line's
 // key part, and whether the line carries it at all.
+//
+// RFC 5545 §3.2 makes a parameter value a quoted string whenever it contains a
+// colon, a semicolon or a comma, and some clients quote unconditionally --
+// Exchange writes every TZID that way. The quotes delimit the value rather than
+// belonging to it, so a separator inside them does not start another parameter
+// and they are stripped from what is returned: a caller handed
+// `"America/New_York"` resolves no zone at all and silently places every value
+// it reads a whole UTC offset away from where the property named.
 func PropertyParam(keyPart, param string) (string, bool) {
-	parts := strings.Split(keyPart, ";")
-	if len(parts) < 2 {
-		return "", false
-	}
-	for _, part := range parts[1:] {
-		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-		if len(kv) != 2 {
+	for _, part := range propertyParameterParts(keyPart) {
+		name, value, found := strings.Cut(part, "=")
+		if !found {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(kv[0]), param) {
-			return strings.TrimSpace(kv[1]), true
+		if strings.EqualFold(strings.TrimSpace(name), param) {
+			return unquotePropertyParam(strings.TrimSpace(value)), true
 		}
 	}
 	return "", false
+}
+
+// SplitContentLine splits an unfolded content line into its key part (name and
+// parameters) and its value. RFC 5545 §3.1 lets a quoted parameter value hold a
+// colon, so the value starts at the first colon outside double quotes: Exchange
+// writes zone names such as "(UTC-05:00) Eastern Time (US & Canada)" as TZIDs.
+func SplitContentLine(line string) (keyPart, value string, ok bool) {
+	colon := IndexOutsideQuotes(line, ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return line[:colon], line[colon+1:], true
+}
+
+// IndexOutsideQuotes returns the index of the first delimiter in a content line
+// or key part that is not inside a double-quoted parameter value, or -1.
+func IndexOutsideQuotes(s string, delimiter byte) int {
+	quoted := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			quoted = !quoted
+		case delimiter:
+			if !quoted {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// propertyParameterParts splits a content line's key part into its parameters,
+// leaving out the property name that precedes the first separator.
+func propertyParameterParts(keyPart string) []string {
+	separator := IndexOutsideQuotes(keyPart, ';')
+	if separator < 0 {
+		return nil
+	}
+	var parts []string
+	rest := keyPart[separator+1:]
+	for {
+		next := IndexOutsideQuotes(rest, ';')
+		if next < 0 {
+			return append(parts, rest)
+		}
+		parts = append(parts, rest[:next])
+		rest = rest[next+1:]
+	}
+}
+
+func unquotePropertyParam(value string) string {
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func PropertyParamEquals(keyPart, param, value string) bool {
@@ -1531,15 +1909,11 @@ func ParsePropertyDateTimeLocal(keyPart, value string) (time.Time, bool) {
 	if value == "" {
 		return time.Time{}, false
 	}
-	for _, param := range strings.Split(keyPart, ";")[1:] {
-		if strings.HasPrefix(strings.ToUpper(param), "TZID=") {
-			tzid := strings.TrimSpace(param[len("TZID="):])
-			if loc, err := time.LoadLocation(tzid); err == nil {
-				if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
-					return parsed, true
-				}
+	if tzid, ok := PropertyParam(keyPart, "TZID"); ok {
+		if loc, err := time.LoadLocation(tzid); err == nil {
+			if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
+				return parsed, true
 			}
-			break
 		}
 	}
 	parsed, err := ParseDateTime(value)

@@ -260,19 +260,15 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 			status = "expired"
 		}
 		view = append(view, map[string]any{
-			"id":         p.ID,
-			"label":      p.Label,
-			"created_at": p.CreatedAt,
-			"expires_at": p.ExpiresAt,
-			"last_used":  p.LastUsedAt,
-			"status":     status,
-			"revoked":    revoked,
-			"expired":    expired,
-			// Whether this credential can answer a Digest challenge. One issued
-			// before Digest existed cannot until it has authenticated over
-			// Basic once, and a deployment should not turn Digest on before its
-			// credentials have caught up.
-			"digest_ready": p.DigestMD5HA1 != nil && p.DigestSHA256HA1 != nil,
+			"id":           p.ID,
+			"label":        p.Label,
+			"created_at":   p.CreatedAt,
+			"expires_at":   p.ExpiresAt,
+			"last_used":    p.LastUsedAt,
+			"status":       status,
+			"revoked":      revoked,
+			"expired":      expired,
+			"digest_ready": auth.DigestReady(h.cfg, p),
 		})
 	}
 	data := h.withFlash(r, map[string]any{
@@ -280,6 +276,9 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		"User":         user,
 		"AppPasswords": view,
 		"DAVEndpoint":  h.davEndpoint(),
+		// With Digest off no app password holds an HA1 and none can, so the
+		// readiness badge would label every row alike and say nothing.
+		"DigestEnabled": auth.DigestEnabled(h.cfg),
 	})
 	if plaintext != "" {
 		data["PlainToken"] = plaintext

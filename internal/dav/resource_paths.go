@@ -30,8 +30,10 @@ type davTarget struct {
 	Valid             bool
 }
 
+// parseDAVTarget and parsedDAVTarget take a decoded path, such as
+// r.URL.Path; a DAV:href from a body goes through normalizeDAVHref first.
 func parseDAVTarget(rawPath string) davTarget {
-	cleanPath := normalizeDAVHref(rawPath)
+	cleanPath := cleanDAVPath(rawPath)
 	target := davTarget{CleanPath: cleanPath}
 	for _, candidate := range []struct {
 		prefix string
@@ -73,7 +75,7 @@ func parseDAVTarget(rawPath string) davTarget {
 }
 
 func parsedDAVTarget(ctx context.Context, rawPath string) davTarget {
-	cleanPath := normalizeDAVHref(rawPath)
+	cleanPath := cleanDAVPath(rawPath)
 	if state := davRequestStateFromContext(ctx); state != nil {
 		if target, ok := state.primaryDAVTarget(cleanPath); ok {
 			return target
@@ -208,10 +210,11 @@ func (h *DavServer) parseAddressBookResourcePath(ctx context.Context, user *stor
 	return id, target.ResourceName, true, nil
 }
 
-// parseResourcePath extracts the numeric collection ID and resource name from a DAV resource path.
-// The returned boolean indicates whether the path matched the expected prefix and contained both parts.
-func parseResourcePath(rawPath, prefix string) (int64, string, bool) {
-	target := parseDAVTarget(rawPath)
+// parseResourcePath extracts the numeric collection ID and resource name from a
+// percent-encoded DAV:href, absolute or not. The boolean reports whether the
+// href matched the expected prefix and named both parts.
+func parseResourcePath(href, prefix string) (int64, string, bool) {
+	target := parseDAVTarget(normalizeDAVHref(href))
 	wantedDomain := davPathUnknown
 	switch prefix {
 	case calendarPrefix:
@@ -229,6 +232,9 @@ func parseResourcePath(rawPath, prefix string) (int64, string, bool) {
 	return id, target.ResourceName, true
 }
 
+// normalizeDAVHref turns a percent-encoded href into the decoded, cleaned path
+// it names. It must not be given a path that is already decoded: a resource
+// name containing "%" would be decoded a second time.
 func normalizeDAVHref(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -247,6 +253,31 @@ func normalizeDAVHref(raw string) string {
 		cleaned = "/" + strings.TrimPrefix(cleaned, "/")
 	}
 	return cleaned
+}
+
+// cleanDAVPath cleans an already-decoded path without decoding it again.
+func cleanDAVPath(decoded string) string {
+	if strings.TrimSpace(decoded) == "" {
+		return ""
+	}
+	cleaned := path.Clean(decoded)
+	if cleaned == "." {
+		cleaned = "/"
+	}
+	if !strings.HasPrefix(cleaned, "/") {
+		cleaned = "/" + cleaned
+	}
+	return cleaned
+}
+
+// escapeDAVPath percent-encodes each segment of a decoded path, as hrefs for
+// object resources are written.
+func escapeDAVPath(decoded string) string {
+	segments := strings.Split(decoded, "/")
+	for i := range segments {
+		segments[i] = url.PathEscape(segments[i])
+	}
+	return strings.Join(segments, "/")
 }
 
 // requestScheme is the scheme the client used to reach this server, which an
@@ -335,13 +366,15 @@ func (h *DavServer) resolveDAVHrefReference(rawHref, basePath string, r *http.Re
 // in "/", so a collection Request-URI written without its trailing slash needs
 // the slash restored or a relative href would resolve above the collection
 // holding the resource it names. A Request-URI naming an object resource wants
-// that same discard and is left alone.
+// that same discard and is left alone. requestPath is decoded; the base is
+// returned percent-encoded, as url.Parse expects it.
 func davHrefReferenceBase(requestPath string) string {
-	cleanPath := normalizeDAVHref(requestPath)
+	cleanPath := cleanDAVPath(requestPath)
+	base := escapeDAVPath(cleanPath)
 	if target := parseDAVTarget(cleanPath); target.Valid && target.Resource {
-		return cleanPath
+		return base
 	}
-	return ensureCollectionHref(cleanPath)
+	return ensureCollectionHref(base)
 }
 
 // resolvedObjectHref is one DAV:href from a request body resolved against the

@@ -85,15 +85,27 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 
 	var responses []response
 	lockPreconditions := h.lockPreconditions(r, cleanPath)
-	switch target.Domain {
-	case davPathCalendar:
-		responses, err = h.proppatchCalendar(r.Context(), user, cleanPath, target, &request, lockPreconditions)
-	case davPathAddressBook:
-		responses, err = h.proppatchAddressBook(r.Context(), user, cleanPath, target, &request, lockPreconditions)
+	for attempt := 0; ; attempt++ {
+		switch target.Domain {
+		case davPathCalendar:
+			responses, err = h.proppatchCalendar(r.Context(), user, cleanPath, target, &request, lockPreconditions)
+		case davPathAddressBook:
+			responses, err = h.proppatchAddressBook(r.Context(), user, cleanPath, target, &request, lockPreconditions)
+		}
+		if !errors.Is(err, store.ErrResourceStateChanged) || attempt == maxResourceStateRetries {
+			break
+		}
+		// The member or its ACL changed after this attempt read them; the next
+		// one re-reads both instead of the request's cached copies.
+		invalidateDAVRequestState(r.Context())
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is locked", http.StatusLocked)
+			return
+		}
+		if errors.Is(err, store.ErrResourceStateChanged) {
+			http.Error(w, "resource changed while writing; retry the request", http.StatusConflict)
 			return
 		}
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
@@ -182,6 +194,10 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 	if err != nil {
 		return nil, err
 	}
+	aclGuard, err := h.aclGuard(ctx, user, canonicalPath)
+	if err != nil {
+		return nil, err
+	}
 	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, canonicalPath, "write-properties")
 	if err != nil {
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
@@ -207,10 +223,10 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 	}
 	if target.Resource {
 		expected := store.EventDAVResourceState(event)
-		expected.CollectionCTag = &cal.CTag
+		expected.ACL = aclGuard
 		err = h.store.PatchObjectDeadProperties(ctx, "calendar", calendarID, expected, canonicalPath, preflight.dead, lockPreconditions)
 	} else {
-		err = h.store.PatchCalendarProperties(ctx, calendarID, state.properties(), canonicalPath, preflight.dead, lockPreconditions)
+		err = h.store.PatchCalendarProperties(ctx, calendarID, state.properties(), canonicalPath, preflight.dead, lockPreconditions, aclGuard)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -459,6 +475,10 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 	if err != nil {
 		return nil, err
 	}
+	aclGuard, err := h.aclGuard(ctx, user, canonicalPath)
+	if err != nil {
+		return nil, err
+	}
 	book, err := h.getAddressBook(ctx, bookID)
 	if err != nil {
 		return nil, err
@@ -487,10 +507,10 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 	}
 	if target.Resource {
 		expected := store.ContactDAVResourceState(contact)
-		expected.CollectionCTag = &book.CTag
+		expected.ACL = aclGuard
 		err = h.store.PatchObjectDeadProperties(ctx, "addressbook", bookID, expected, canonicalPath, preflight.dead, lockPreconditions)
 	} else {
-		err = h.store.PatchAddressBookProperties(ctx, bookID, state.name, state.description, canonicalPath, preflight.dead, lockPreconditions)
+		err = h.store.PatchAddressBookProperties(ctx, bookID, state.name, state.description, canonicalPath, preflight.dead, lockPreconditions, aclGuard)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {

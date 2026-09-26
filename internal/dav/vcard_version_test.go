@@ -594,3 +594,64 @@ func TestConvertVCardVersionPreservesVersionSpecificProperties(t *testing.T) {
 		})
 	}
 }
+
+// BEGIN:VCARD and END:VCARD are content lines, not text. A display name or note
+// that merely spells one out is escaped into a value by every writer here, so
+// counting the octets rather than the lines refuses a perfectly ordinary card
+// -- and refuses it for good, since the client can never PUT an edit back.
+func TestVCardEnvelopeCountsContentLinesNotSubstrings(t *testing.T) {
+	tests := []struct {
+		name    string
+		card    string
+		wantErr bool
+	}{
+		{
+			name: "a value spells out the delimiters",
+			card: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:END:VCARD BEGIN:VCARD\r\nN:;;;;\r\nEND:VCARD\r\n",
+		},
+		{
+			name: "an escaped note spells out a whole card",
+			card: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:Bob\r\nNOTE:BEGIN:VCARD\\nVERSION:3.0\\nEND:VCARD\r\nEND:VCARD\r\n",
+		},
+		{
+			name: "a folded value spells out the delimiters",
+			card: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:BEGIN\r\n :VCARD\r\nEND:VCARD\r\n",
+		},
+		{
+			name:    "two cards in one resource",
+			card:    "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:Bob\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:3.0\r\nUID:u2\r\nFN:Eve\r\nEND:VCARD\r\n",
+			wantErr: true,
+		},
+		{
+			name:    "an unclosed card",
+			card:    "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:Bob\r\nBEGIN:VCARD\r\nEND:VCARD\r\n",
+			wantErr: true,
+		},
+		{
+			name:    "content lines after the card closes",
+			card:    "BEGIN:VCARD\r\nVERSION:3.0\r\nEND:VCARD\r\nUID:u1\r\nFN:x\r\nX-A:END:VCARD",
+			wantErr: true,
+		},
+		{
+			name:    "content lines before the card opens",
+			card:    "UID:u1\r\nBEGIN:VCARD\r\nVERSION:3.0\r\nFN:x\r\nEND:VCARD\r\n",
+			wantErr: true,
+		},
+		{
+			name: "delimiters in any letter case",
+			card: "begin:vcard\r\nVERSION:3.0\r\nUID:u1\r\nFN:x\r\nend:VCard\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateVCardEnvelope(tt.card)
+			if tt.wantErr && err == nil {
+				t.Fatalf("validateVCardEnvelope accepted:\n%s", tt.card)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateVCardEnvelope rejected an ordinary card: %v\n%s", err, tt.card)
+			}
+		})
+	}
+}
