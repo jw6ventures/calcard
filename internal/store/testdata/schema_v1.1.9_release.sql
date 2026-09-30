@@ -1,13 +1,12 @@
--- Historical snapshot: db.sql exactly as it stood at the v1.1.9 baseline
--- (commit af41c05, the commit that set application.version to v1.1.9). It is the
--- schema migrations/v1.2.0.sql actually meets on an upgrading installation, so the
--- migration tests seed from it rather than from the current db.sql.
+-- Historical snapshot: db.sql exactly as the v1.1.6, v1.1.7 and v1.1.9 release
+-- tags ship it (`git show v1.1.9:db.sql`; the three are identical). Those
+-- releases carry migrations only through v1.1.4.sql, and the runner stamps the
+-- database with the release's own version, so an installation of any of them
+-- holds this schema while reporting v1.1.6, v1.1.7 or v1.1.9.
 --
--- Never edit this file. It records what a released version shipped; changing it
--- would make the upgrade tests assert against a database that never existed.
---
--- The v1.1.x *tags* in this repository point at unrelated history and must not be
--- used to reconstruct a baseline.
+-- Never edit below this header. It records what a released version shipped;
+-- changing it would make the upgrade tests assert against a database that never
+-- existed.
 
 -- CalCard baseline schema (flattened migrations)
 
@@ -17,7 +16,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.1.9')
+VALUES ('version', 'v1.0.13')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -25,8 +24,6 @@ CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     oauth_subject TEXT NOT NULL UNIQUE,
     primary_email TEXT NOT NULL,
-    full_name TEXT NOT NULL DEFAULT '',
-    first_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     onboarding_completed_at TIMESTAMPTZ NULL
@@ -344,60 +341,3 @@ DROP TRIGGER IF EXISTS trg_contacts_increment_ctag ON contacts;
 CREATE TRIGGER trg_contacts_increment_ctag
 AFTER INSERT OR UPDATE OR DELETE ON contacts
 FOR EACH ROW EXECUTE FUNCTION increment_address_book_ctag();
-
--- Normalized ACL join keys for object-level access checks. resource_path_norm
--- and object_acl_path both drop the trailing .ics/.vcf extension so a grant
--- stored with or without it lines up. Maintained as STORED generated columns so
--- the normalization is always correct on write and can be indexed.
-ALTER TABLE acl_entries
-    ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
-    GENERATED ALWAYS AS (regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i')) STORED;
-
-ALTER TABLE events
-    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || regexp_replace(resource_name, '\.ics$', '', 'i')) STORED;
-
-CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
-    ON acl_entries (principal_href, is_grant, resource_path_norm);
-
-CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
-    ON events (object_acl_path);
-
--- recurrence_start/recurrence_until make calendar-query time-range bounds
--- indexable for recurring events. They hold a recurring event's earliest
--- instance start and last instance end (sentinels when not precisely bounded)
--- and are NULL for non-recurring events, so COALESCE falls back to the
--- single-instance dtstart/dtend window. The application recomputes them on every
--- write.
-ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
-
-CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
-    ON events (calendar_id, COALESCE(recurrence_start, dtstart));
-
-CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
-    ON events (calendar_id, COALESCE(recurrence_until, dtend, dtstart));
-
--- Persistent WebDAV dead properties and batched ACL lookup support.
-CREATE TABLE IF NOT EXISTS dav_dead_properties (
-    resource_path TEXT NOT NULL,
-    namespace_uri TEXT NOT NULL,
-    local_name TEXT NOT NULL,
-    inner_xml TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (resource_path, namespace_uri, local_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
-    ON dav_dead_properties (resource_path);
-
-CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
-    ON acl_entries (resource_path, principal_href);
-
-ALTER TABLE contacts
-    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;
-
-CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
-    ON contacts (object_acl_path);

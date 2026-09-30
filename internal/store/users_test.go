@@ -111,7 +111,7 @@ func TestUserRepoUpsertOAuthUserClearsMissingProfileNames(t *testing.T) {
 }
 
 func TestOAuthProfileNamesMigration(t *testing.T) {
-	contents, err := os.ReadFile("../../migrations/v1.1.9.sql")
+	contents, err := os.ReadFile("../../migrations/v1.2.0.sql")
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
@@ -119,7 +119,7 @@ func TestOAuthProfileNamesMigration(t *testing.T) {
 	for _, expected := range []string{
 		"ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''",
-		"UPDATE application SET value = 'v1.1.9'",
+		"UPDATE application SET value = 'v1.2.0'",
 	} {
 		if !strings.Contains(sql, expected) {
 			t.Errorf("migration missing %q", expected)

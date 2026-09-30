@@ -1,5 +1,72 @@
--- v1.2.0: consolidated upgrade from v1.1.9.
+-- v1.2.0: consolidated upgrade from every v1.1.x release.
 -- Apply with the application stopped or during a maintenance window.
+--
+-- The v1.1.6, v1.1.7 and v1.1.9 releases ship migrations only through
+-- v1.1.4.sql yet stamp the database with their own version, and the runner
+-- applies only the files above that stamp. The stamp therefore does not say
+-- which of the v1.1.6-v1.1.9 schema changes an installation holds, so this file
+-- makes every one of them, each idempotently, before anything that reads them.
+
+-- The indexes this upgrade retires go first, so the rewrites below do not
+-- rebuild them and the backfills do not maintain them row by row.
+-- idx_acl_unique gives way to idx_acl_resource_order, and idx_events_calendar_id
+-- and idx_contacts_address_book_id are leading-column prefixes of the keyset
+-- indexes built below and serve no lookup those cannot.
+DROP INDEX IF EXISTS idx_acl_unique;
+DROP INDEX IF EXISTS idx_events_calendar_id;
+DROP INDEX IF EXISTS idx_contacts_address_book_id;
+
+-- v1.1.6: normalized, indexable join keys for the object-level ACL checks.
+-- resource_path_norm and object_acl_path drop the trailing .ics/.vcf extension
+-- so a grant stored with or without it lines up by plain equality. They are
+-- STORED generated columns: adding one rewrites its table to fill the existing
+-- rows, and every later write keeps it correct with no application changes.
+-- idx_events_object_acl_path is built after the recurrence repair below, and
+-- idx_acl_principal_grant_norm after the ace_order backfill.
+
+ALTER TABLE acl_entries
+    ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
+    GENERATED ALWAYS AS (regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i')) STORED;
+
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || regexp_replace(resource_name, '\.ics$', '', 'i')) STORED;
+
+-- v1.1.7: recurrence_start and recurrence_until bound a recurring resource's
+-- instances so calendar-query time ranges can use an index; both are NULL for a
+-- resource that does not recur. The recurrence repair below fills them for the
+-- stored rows, and their indexes are built after it.
+
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
+
+-- v1.1.8: persistent DAV dead properties and scoped ACL lookup indexes.
+-- idx_acl_resource_principal is built after the ace_order backfill below.
+
+CREATE TABLE IF NOT EXISTS dav_dead_properties (
+    resource_path TEXT NOT NULL,
+    namespace_uri TEXT NOT NULL,
+    local_name TEXT NOT NULL,
+    inner_xml TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (resource_path, namespace_uri, local_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
+    ON dav_dead_properties (resource_path);
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
+    ON contacts (object_acl_path);
+
+-- v1.1.9: display names from the OAuth profile.
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT '';
 
 -- v1.1.10: persist the CALDAV:calendar-description language and the
 -- per-collection CALDAV:supported-calendar-component-set.
@@ -66,7 +133,12 @@ BEGIN
     END IF;
 END $$;
 
-DROP INDEX IF EXISTS idx_acl_unique;
+CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
+    ON acl_entries (principal_href, is_grant, resource_path_norm);
+
+CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
+    ON acl_entries (resource_path, principal_href);
+
 CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
 
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT;
@@ -98,26 +170,29 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- EXCLUSIVE on its table, as does every DROP INDEX or DROP TRIGGER that finds
 -- its object; an IF EXISTS drop that finds nothing takes no lock. CREATE INDEX
 -- takes SHARE and CREATE TRIGGER SHARE ROW EXCLUSIVE, which block writes but not
--- reads. In practice calendars, acl_entries and app_passwords are closed from
--- their ALTER TABLE; events from the drop of idx_events_recurrence_start, which
--- exists on every upgrade path; contacts from the first of its index or trigger
--- drops that finds one. address_books and deleted_resources are closed to
--- writes from their CREATE TRIGGER, and to reads as well when the file runs
--- again and its DROP TRIGGER finds the trigger. A closed table makes a SELECT
--- wait rather than fall back to another plan. A run that fails part way rolls
--- back entirely and can simply be repeated; the statements are individually
--- idempotent as well.
+-- reads. In practice acl_entries, events, contacts, users, calendars and
+-- app_passwords are closed from their first ALTER TABLE, which runs on every
+-- upgrade path whether or not it finds anything to add. address_books and
+-- deleted_resources are closed to writes from their CREATE TRIGGER, and to
+-- reads as well when the file runs again and its DROP TRIGGER finds the
+-- trigger. A closed table makes a SELECT wait rather than fall back to another
+-- plan. A run that fails part way rolls back entirely and can simply be
+-- repeated; the statements are individually idempotent as well.
 --
 -- The duration is therefore what matters operationally. It is mostly the
--- recurrence repair, plus the index builds and the birthday backfill, and the
--- server does not open its listener until migrations finish, so on a container
--- deployment it is startup time and has to fit the probe budget.
+-- recurrence repair, plus the index builds and the birthday backfill, and on an
+-- installation that lacks the generated ACL join keys, the rewrite of
+-- acl_entries, events and contacts that adding them costs. The server does not
+-- open its listener until migrations finish, so on a container deployment it
+-- is startup time and has to fit the probe budget.
 --
 -- Check that budget against the table before upgrading. The repair measured
 -- about 30 seconds per hundred thousand events when two fifths are recurring and
 -- bodies are about 3 KB with a VTIMEZONE, and about 70 seconds with 10 KB
--- bodies; it grows with both. The Helm chart's default startup budget is ten
--- minutes
+-- bodies; it grows with both. The whole file, run from a v1.1.9 release
+-- install, where it also adds the generated columns, measured about 40 seconds
+-- per hundred thousand of those 3 KB events. The Helm chart's default startup
+-- budget is ten minutes
 -- (startupProbe.periodSeconds 10 x failureThreshold 60). A run that overruns it
 -- is killed rather than allowed to finish, and because the file is one
 -- transaction the kill rolls it back: the container then restarts and begins
@@ -134,9 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 
 -- Every events index that reads recurrence_start or recurrence_until is dropped
 -- ahead of the repair and built after it, so building each once over the
--- repaired rows replaces maintaining it per repaired row. The repair's updates
--- still fire trg_events_touch_last_modified, so they rewrite last_modified and
--- maintain every index that remains.
+-- repaired rows replaces maintaining it per repaired row. idx_events_object_acl_path
+-- is built after the repair for the same reason where the upgrade is what adds
+-- it. The repair's updates still fire trg_events_touch_last_modified, so they
+-- rewrite last_modified and maintain every index that remains.
 --
 -- The two time-range expression indexes are built on the expressions
 -- ListForCalendarFiltered filters on:
@@ -156,21 +232,17 @@ DROP INDEX IF EXISTS idx_events_recurrence_start;
 DROP INDEX IF EXISTS idx_events_recurrence_until;
 DROP INDEX IF EXISTS idx_events_calendar_keyset;
 
--- Repair the recurrence bounds v1.1.7 did not backfill.
+-- Fill the recurrence bounds of every stored resource that recurs and has none.
 --
--- That backfill recognised RRULE and RDATE only, but a resource made solely of
--- detached instances -- RECURRENCE-ID components with neither property anywhere
--- -- is recurring too: ical.ConservativeRecurrenceBounds counts a
--- RECURRENCE-ID, so every write since has stored bounds for one. The rows the
--- backfill skipped kept NULL bounds, and the candidate filter then COALESCEs to
--- the first component's dtstart/dtend and drops the resource before the
--- recurrence matcher can look at the other instances.
---
--- The repair lives here rather than in v1.1.7, which has shipped and is left
--- exactly as it ran. A database at v1.1.7 or later never executes that file
--- again, and one below it runs that file first, since migrations are applied in
--- ascending version order, so every path into this release reaches this
--- statement after the columns exist.
+-- A resource recurs when a VEVENT, VTODO or VJOURNAL in it carries an RRULE,
+-- an RDATE or a RECURRENCE-ID. A resource made solely of detached instances --
+-- RECURRENCE-ID components with neither property anywhere -- is recurring too:
+-- ical.ConservativeRecurrenceBounds counts a RECURRENCE-ID, so every write
+-- stores bounds for one. A row left with NULL bounds -- written before the
+-- columns existed, or a detached-only resource that an RRULE/RDATE-only
+-- backfill passed over -- would have the candidate filter COALESCE to its first
+-- component's dtstart/dtend and drop the resource before the recurrence matcher
+-- can look at the other instances.
 --
 -- Only NULL bounds are filled, so a precise value written by a later PUT is
 -- never replaced and the statement can be run again. The sentinels match
@@ -255,6 +327,9 @@ CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
     ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
 
+CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
+    ON events (object_acl_path);
+
 -- Keyset indexes for the reads the DAV reports page a collection with:
 --
 --     WHERE <collection>=$1 AND (<collection>, id) > ($1, $2) [AND <filter>]
@@ -285,11 +360,6 @@ CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id
 
 CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset
     ON deleted_resources (resource_type, collection_id, id);
-
--- Both are leading-column prefixes of the keyset indexes above and serve no
--- lookup those cannot.
-DROP INDEX IF EXISTS idx_events_calendar_id;
-DROP INDEX IF EXISTS idx_contacts_address_book_id;
 
 -- Commit-ordered sync stamps.
 --

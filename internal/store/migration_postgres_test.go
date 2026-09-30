@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/jw6-go-utils/database/migration"
+
 	icalpkg "github.com/jw6ventures/calcard/internal/ical"
 )
 
@@ -47,13 +49,155 @@ func applyV120Migration(t *testing.T, pool *sql.DB) {
 	}
 }
 
-// newV119Pool builds the database an installation running v1.1.9 actually has:
-// the baseline that release shipped, with none of the objects later versions add.
-// Seeding from the current db.sql instead would hand the migration every column
-// it needs for reasons the upgrade path does not supply.
-func newV119Pool(t *testing.T) *sql.DB {
+// migrateWithRunner migrates pool the way the server does at startup:
+// MigrateDatabase applies, in version order and each in its own transaction,
+// the files in migrationsDir above the database's stamped version and up to
+// appVersion, then stamps appVersion.
+func migrateWithRunner(t *testing.T, pool *sql.DB, migrationsDir, appVersion string) {
 	t.Helper()
-	return newPostgresSchemaPool(t, filepath.Join("testdata", "schema_v1.1.9.sql"))
+	runner := migration.NewManager(pool, migrationsDir, appVersion)
+	if err := runner.Initialize(); err != nil {
+		t.Fatalf("initialize migrations for %s: %v", appVersion, err)
+	}
+	if err := runner.MigrateDatabase(); err != nil {
+		t.Fatalf("migrate to %s: %v", appVersion, err)
+	}
+}
+
+// newReleaseInstallPool installs a release the way its server did on first
+// start: its baseline schema, then the migrations it shipped, through the
+// runner, which stamps the release's own version whatever those files reached.
+// Every release up to v1.1.9 ships migrations only through v1.1.4.sql.
+func newReleaseInstallPool(t *testing.T, schemaPath, releaseVersion string) *sql.DB {
+	t.Helper()
+	pool := newPostgresSchemaPool(t, schemaPath)
+	shipped := t.TempDir()
+	for _, name := range []string{"v1.0.11.sql", "v1.0.12.sql", "v1.1.3.sql", "v1.1.4.sql"} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", "migrations", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(shipped, name), contents, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	migrateWithRunner(t, pool, shipped, releaseVersion)
+	return pool
+}
+
+// newV119ReleasePool builds the database an installation of the v1.1.9 release
+// has: stamped v1.1.9 over a schema that stops at v1.1.4.sql.
+func newV119ReleasePool(t *testing.T) *sql.DB {
+	t.Helper()
+	return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.1.9_release.sql"), "v1.1.9")
+}
+
+// schemaCatalog lists every table, column, constraint, index, trigger and
+// function in the pool's schema, one whitespace-normalized definition each with
+// the schema qualifier removed, so an upgraded database and a fresh install
+// compare directly. Column position is left out: an upgrade appends a column
+// that a fresh install declares in place.
+func schemaCatalog(t *testing.T, pool *sql.DB) map[string]bool {
+	t.Helper()
+	var schema string
+	if err := pool.QueryRow(`SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	rows, err := pool.Query(`
+SELECT 'table ' || c.relname
+FROM pg_class c
+WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind = 'r'
+UNION ALL
+SELECT 'column ' || c.relname || '.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+       || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END
+       || COALESCE(CASE WHEN a.attgenerated = 's' THEN ' GENERATED ' ELSE ' DEFAULT ' END
+                   || pg_get_expr(d.adbin, d.adrelid), '')
+FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind = 'r'
+  AND a.attnum > 0 AND NOT a.attisdropped
+UNION ALL
+SELECT 'constraint ' || c.relname || '.' || con.conname || ' ' || pg_get_constraintdef(con.oid)
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+WHERE con.connamespace = current_schema()::regnamespace
+UNION ALL
+SELECT 'index ' || pg_get_indexdef(i.indexrelid)
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relnamespace = current_schema()::regnamespace
+UNION ALL
+SELECT 'trigger ' || pg_get_triggerdef(t.oid)
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+WHERE c.relnamespace = current_schema()::regnamespace AND NOT t.tgisinternal
+UNION ALL
+SELECT 'function ' || pg_get_functiondef(p.oid)
+FROM pg_proc p
+WHERE p.pronamespace = current_schema()::regnamespace`)
+	if err != nil {
+		t.Fatalf("read schema catalog: %v", err)
+	}
+	defer rows.Close()
+	catalog := make(map[string]bool)
+	for rows.Next() {
+		var definition string
+		if err := rows.Scan(&definition); err != nil {
+			t.Fatalf("scan schema catalog: %v", err)
+		}
+		definition = strings.ReplaceAll(definition, schema+".", "")
+		catalog[strings.Join(strings.Fields(definition), " ")] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read schema catalog: %v", err)
+	}
+	return catalog
+}
+
+// Every installation a release can have left behind has to reach, through the
+// runner the server starts with, the schema a fresh install creates. The runner
+// applies only the files above the stamped version, and the stamp does not say
+// which files a release carried: v1.1.6, v1.1.7 and v1.1.9 stamp their own
+// version over a schema that stops at v1.1.4.sql.
+func TestPostgres_UpgradeThroughRunnerMatchesFreshInstall(t *testing.T) {
+	const migrationsDir = "../../migrations"
+	fresh := newPostgresPool(t)
+	migrateWithRunner(t, fresh, migrationsDir, "v1.2.0")
+	want := schemaCatalog(t, fresh)
+
+	for _, test := range []struct {
+		name    string
+		install func(*testing.T) *sql.DB
+	}{
+		{name: "v1.1.5", install: func(t *testing.T) *sql.DB {
+			return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.0.13.sql"), "v1.1.5")
+		}},
+		{name: "v1.1.6", install: func(t *testing.T) *sql.DB {
+			return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.1.9_release.sql"), "v1.1.6")
+		}},
+		{name: "v1.1.7", install: func(t *testing.T) *sql.DB {
+			return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.1.9_release.sql"), "v1.1.7")
+		}},
+		{name: "v1.1.9", install: newV119ReleasePool},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := test.install(t)
+			migrateWithRunner(t, pool, migrationsDir, "v1.2.0")
+
+			got := schemaCatalog(t, pool)
+			for definition := range want {
+				if !got[definition] {
+					t.Errorf("the upgrade lacks %s", definition)
+				}
+			}
+			for definition := range got {
+				if !want[definition] {
+					t.Errorf("the upgrade leaves %s, which a fresh install does not have", definition)
+				}
+			}
+		})
+	}
 }
 
 // Before ace_order existed a denial suppressed every grant on the resource, no
@@ -63,7 +207,7 @@ func newV119Pool(t *testing.T) *sql.DB {
 // starts answering first, turning a principal the installation had denied into
 // one it admits.
 func TestPostgres_V120MigrationPreservesExistingDenials(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 
 	const (
 		resourcePath = "/dav/calendars/1"
@@ -103,7 +247,7 @@ LIMIT 1`
 // the .ics suffix and one stored without it are one ordered group at evaluation
 // time. The backfill has to order them against each other for the same reason.
 func TestPostgres_V120MigrationPreservesDenialsAcrossPathSpellings(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 
 	const principal = "/dav/principals/2/"
 	if _, err := pool.Exec(`
@@ -170,7 +314,7 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace
 // The upgrade has to be repeatable: the runner execs the whole file again if a
 // run failed part way, and an operator may run it by hand.
 func TestPostgres_V120MigrationIsRepeatable(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 
 	const resourcePath = "/dav/calendars/1"
 	if _, err := pool.Exec(`
@@ -218,13 +362,12 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 
 // A resource made only of detached instances -- RECURRENCE-ID components with
 // no RRULE or RDATE anywhere -- is recurring as far as the recurrence matcher is
-// concerned (ical.ConservativeRecurrenceBounds counts a RECURRENCE-ID), but the
-// v1.1.7 backfill recognised only RRULE and RDATE and left its bounds NULL. The
-// candidate filter then COALESCEs to the first component's dtstart/dtend and
-// drops the row before the matcher ever sees the other instances, so an
-// installation that upgraded through v1.1.7 has June instances it cannot find.
+// concerned (ical.ConservativeRecurrenceBounds counts a RECURRENCE-ID). Left
+// with NULL bounds, the candidate filter COALESCEs to the first component's
+// dtstart/dtend and drops the row before the matcher ever sees the other
+// instances, so the upgrade has to bound it or its June instance is lost.
 func TestPostgres_V120MigrationRepairsDetachedRecurrenceBounds(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	ctx := context.Background()
 	store := New(pool)
 
@@ -242,16 +385,16 @@ INSERT INTO calendars (user_id, name) SELECT id, 'Detached' FROM seeded_user RET
 		t.Fatalf("seed user and calendar: %v", err)
 	}
 
-	// Written the way the v1.1.7 backfill left it: the columns exist, the first
-	// component's dates are stored, and both bounds are NULL.
+	// Stored the way v1.1.9 stores it: the first component's dates, and no
+	// recurrence bounds, because v1.1.9 has no columns for them.
 	const detached = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
 		"BEGIN:VEVENT\r\nUID:detached\r\nRECURRENCE-ID:20260115T100000Z\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nSUMMARY:January\r\nEND:VEVENT\r\n" +
 		"BEGIN:VEVENT\r\nUID:detached\r\nRECURRENCE-ID:20260615T100000Z\r\nDTSTART:20260615T100000Z\r\nDTEND:20260615T110000Z\r\nSUMMARY:June\r\nEND:VEVENT\r\n" +
 		"END:VCALENDAR\r\n"
 	if _, err := pool.Exec(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, dtstart, dtend, all_day, last_modified)
 VALUES ($1, 'detached', 'detached.ics', $2, 'etag', 'January',
-        '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NULL, NULL, NOW())`,
+        '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NOW())`,
 		calendarID, detached); err != nil {
 		t.Fatalf("seed detached resource: %v", err)
 	}
@@ -300,80 +443,110 @@ VALUES ($1, 'detached', 'detached.ics', $2, 'etag', 'January',
 	}
 }
 
-// An installation still below v1.1.7 upgrades through the shipped file and then
-// this release, in that order. v1.1.7 has shipped and is left exactly as it ran,
-// so it still skips the detached-only resource; what matters is that the repair
-// in v1.2.0 catches what it missed, which is the path this covers by applying
-// both files the way the runner does.
-func TestPostgres_UpgradeFromBeforeV117RepairsDetachedRecurrenceBounds(t *testing.T) {
-	pool := newV119Pool(t)
+// An installation of the v1.1.9 release has neither the recurrence columns nor
+// the ACL join key, so the upgrade adds both and fills what they hold: every
+// resource that recurs -- through RRULE, RDATE, or detached instances alone --
+// gets the open-ended bounds while a one-off stays NULL, and the stored ACL is
+// ordered deny-first across its path spellings. The first release carrying
+// display names is this one too, so the columns an OAuth login writes exist.
+func TestPostgres_UpgradeFromV119ReleaseFillsTheColumnsItAdds(t *testing.T) {
+	pool := newV119ReleasePool(t)
 
 	var calendarID int64
 	if err := pool.QueryRow(`
 WITH seeded_user AS (
-    INSERT INTO users (oauth_subject, primary_email) VALUES ('subject-v117', 'v117@example.test')
+    INSERT INTO users (oauth_subject, primary_email) VALUES ('subject-v119', 'v119@example.test')
     RETURNING id
 )
-INSERT INTO calendars (user_id, name) SELECT id, 'Detached' FROM seeded_user RETURNING id`).
+INSERT INTO calendars (user_id, name) SELECT id, 'Release' FROM seeded_user RETURNING id`).
 		Scan(&calendarID); err != nil {
 		t.Fatalf("seed user and calendar: %v", err)
 	}
 
-	seed := func(uid, raw string) {
+	seed := func(uid, component string) {
 		t.Helper()
+		raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + component + "END:VCALENDAR\r\n"
 		if _, err := pool.Exec(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
-VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NULL, NULL, NOW())`,
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NOW())`,
 			calendarID, uid, raw); err != nil {
 			t.Fatalf("seed %s: %v", uid, err)
 		}
 	}
-	seed("detached", "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"+
+	seed("rrule", "BEGIN:VEVENT\r\nUID:rrule\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nRRULE:FREQ=MONTHLY\r\nEND:VEVENT\r\n")
+	seed("rdate", "BEGIN:VTODO\r\nUID:rdate\r\nDTSTART:20260115T100000Z\r\nRDATE:20260615T100000Z\r\nEND:VTODO\r\n")
+	seed("detached",
 		"BEGIN:VEVENT\r\nUID:detached\r\nRECURRENCE-ID:20260115T100000Z\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nEND:VEVENT\r\n"+
-		"BEGIN:VEVENT\r\nUID:detached\r\nRECURRENCE-ID:20260615T100000Z\r\nDTSTART:20260615T100000Z\r\nDTEND:20260615T110000Z\r\nEND:VEVENT\r\n"+
-		"END:VCALENDAR\r\n")
-	// A plain one-off must stay NULL through both files: the columns mean
-	// "recurring", and filling them for every row would widen every candidate
-	// scan for nothing.
-	seed("single", "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"+
-		"BEGIN:VEVENT\r\nUID:single\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nEND:VEVENT\r\n"+
-		"END:VCALENDAR\r\n")
+			"BEGIN:VEVENT\r\nUID:detached\r\nRECURRENCE-ID:20260615T100000Z\r\nDTSTART:20260615T100000Z\r\nDTEND:20260615T110000Z\r\nEND:VEVENT\r\n")
+	seed("single", "BEGIN:VEVENT\r\nUID:single\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nEND:VEVENT\r\n")
 
-	// Ascending version order, which is the order findMigrations applies them in.
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "v1.1.7.sql"))
-	if err != nil {
-		t.Fatalf("read v1.1.7: %v", err)
-	}
-	if _, err := pool.Exec(string(migration)); err != nil {
-		t.Fatalf("apply v1.1.7: %v", err)
+	objectPath := fmt.Sprintf("/dav/calendars/%d/rrule", calendarID)
+	if _, err := pool.Exec(`
+INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES
+    ($1 || '.ics', 'DAV:all',            TRUE,  'read', NOW() - INTERVAL '2 days'),
+    ($1,           '/dav/principals/2/', FALSE, 'read', NOW() - INTERVAL '1 day')`, objectPath); err != nil {
+		t.Fatalf("seed ACL: %v", err)
 	}
 
-	bounds := func(uid string) (*time.Time, *time.Time) {
-		t.Helper()
+	migrateWithRunner(t, pool, "../../migrations", "v1.2.0")
+
+	for _, uid := range []string{"rrule", "rdate", "detached"} {
 		var start, until *time.Time
 		if err := pool.QueryRow(`SELECT recurrence_start, recurrence_until FROM events WHERE uid = $1`, uid).
 			Scan(&start, &until); err != nil {
 			t.Fatalf("read %s bounds: %v", uid, err)
 		}
-		return start, until
+		if start == nil || until == nil ||
+			!start.UTC().Equal(icalpkg.RecurrenceStartSentinel) || !until.UTC().Equal(icalpkg.RecurrenceUntilSentinel) {
+			t.Errorf("%s bounds = %v, %v, want the open-ended sentinels", uid, start, until)
+		}
 	}
-	// The shipped file leaves the detached resource unbounded; that is the
-	// state this release inherits and has to repair rather than rewrite.
-	if start, until := bounds("detached"); start != nil || until != nil {
-		t.Fatalf("v1.1.7 bounds = %v, %v, want the shipped file to leave both NULL", start, until)
+	var singleStart, singleUntil *time.Time
+	if err := pool.QueryRow(`SELECT recurrence_start, recurrence_until FROM events WHERE uid = 'single'`).
+		Scan(&singleStart, &singleUntil); err != nil {
+		t.Fatalf("read single bounds: %v", err)
+	}
+	if singleStart != nil || singleUntil != nil {
+		t.Errorf("non-recurring bounds = %v, %v, want both NULL", singleStart, singleUntil)
 	}
 
-	applyV120Migration(t, pool)
+	start := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 0, 1)
+	events, err := New(pool).Events.ListForCalendarFiltered(t.Context(), calendarID, EventFilter{Start: &start, End: &end})
+	if err != nil {
+		t.Fatalf("ListForCalendarFiltered() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Errorf("June candidates = %d, want the three recurring resources", len(events))
+	}
 
-	start, until := bounds("detached")
-	if start == nil || until == nil {
-		t.Fatalf("detached bounds after the upgrade = %v, %v, want both repaired", start, until)
+	orders := map[string]int{}
+	rows, err := pool.Query(`SELECT principal_href, ace_order FROM acl_entries WHERE resource_path_norm = $1`, objectPath)
+	if err != nil {
+		t.Fatalf("read ACL: %v", err)
 	}
-	if !start.UTC().Equal(icalpkg.RecurrenceStartSentinel) || !until.UTC().Equal(icalpkg.RecurrenceUntilSentinel) {
-		t.Fatalf("detached bounds = %s, %s, want the open-ended sentinels", start.UTC(), until.UTC())
+	defer rows.Close()
+	for rows.Next() {
+		var principal string
+		var order int
+		if err := rows.Scan(&principal, &order); err != nil {
+			t.Fatalf("scan ACL: %v", err)
+		}
+		orders[principal] = order
 	}
-	if start, until := bounds("single"); start != nil || until != nil {
-		t.Fatalf("non-recurring bounds = %v, %v, want both NULL", start, until)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read ACL: %v", err)
+	}
+	if len(orders) != 2 || orders["/dav/principals/2/"] != 0 || orders["DAV:all"] != 1 {
+		t.Errorf("ace_order = %v, want the denial first across both path spellings", orders)
+	}
+
+	user, err := New(pool).Users.UpsertOAuthUser(t.Context(), "subject-v119", "v119@example.test", "Dana Lee", "Dana")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() after the upgrade: %v", err)
+	}
+	if user.FullName != "Dana Lee" || user.FirstName != "Dana" {
+		t.Errorf("UpsertOAuthUser() = %#v, want the profile names stored", user)
 	}
 }
 
@@ -381,7 +554,7 @@ VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11
 // upgrade has to leave the table claimable and the primary key has to be what
 // rejects the second claim.
 func TestPostgres_V120MigrationCreatesClaimableDigestNonceTable(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
 
 	ctx := context.Background()
@@ -463,14 +636,10 @@ const legacyRecurrenceRepairPredicate = `
 type recurrenceRepairCase struct {
 	uid       string
 	raw       string
-	start     *string
-	until     *string
 	recurring bool
 }
 
 func recurrenceRepairCases() []recurrenceRepairCase {
-	precise := "2026-01-15T10:00:00Z"
-	preciseUntil := "2026-06-15T11:00:00Z"
 	return []recurrenceRepairCase{
 		// A recurrence property on each component the predicate scans.
 		{uid: "vevent-rrule", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:vevent-rrule\r\nDTSTART:20260115T100000Z\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
@@ -504,9 +673,6 @@ func recurrenceRepairCases() []recurrenceRepairCase {
 		{uid: "non-ascii-recurring", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:non-ascii-recurring\r\nSUMMARY:Café à la crème 😀\r\nRRULE:FREQ=WEEKLY\r\nLOCATION:Zürich\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
 		{uid: "non-ascii-plain", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:non-ascii-plain\r\nSUMMARY:Café 😀\r\nDTSTART:20260115T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 
-		// One bound already precise still leaves the other to fill.
-		{uid: "partial-bound", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:partial-bound\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", start: &precise, recurring: true},
-
 		// VTIMEZONE DST rules are RRULEs outside every scanned component. The
 		// placement between two VEVENTs is what separates a span reaching from
 		// the first BEGIN to the last END from the per-component match: the
@@ -526,10 +692,6 @@ func recurrenceRepairCases() []recurrenceRepairCase {
 		{uid: "rrule-after-end", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rrule-after-end\r\nDTSTART:20260115T100000Z\r\nEND:VEVENT\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n"},
 		{uid: "unterminated", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:unterminated\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n"},
 		{uid: "plain", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:plain\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nSUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
-
-		// Recurring, but both bounds are already precise, so the NULL guard
-		// keeps the repair away from them.
-		{uid: "already-bound", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:already-bound\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", start: &precise, until: &preciseUntil},
 	}
 }
 
@@ -551,7 +713,7 @@ func TestPostgres_V120MigrationRepairsExactlyTheRecurringRowSet(t *testing.T) {
 }
 
 func testV120MigrationRepairsExactlyTheRecurringRowSet(t *testing.T, collation string) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	if collation != "" {
 		if _, err := pool.Exec(fmt.Sprintf(`ALTER TABLE events ALTER COLUMN raw_ical TYPE TEXT COLLATE %q`, collation)); err != nil {
 			t.Fatalf("set raw_ical collation: %v", err)
@@ -572,16 +734,18 @@ INSERT INTO calendars (user_id, name) SELECT id, 'Row set' FROM seeded_user RETU
 	cases := recurrenceRepairCases()
 	for _, test := range cases {
 		if _, err := pool.Exec(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
-VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, $4, $5, NOW())`,
-			calendarID, test.uid, test.raw, test.start, test.until); err != nil {
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NOW())`,
+			calendarID, test.uid, test.raw); err != nil {
 			t.Fatalf("seed %s: %v", test.uid, err)
 		}
 	}
 
-	readUIDs := func(query string, args ...any) map[string]bool {
+	readUIDs := func(q interface {
+		Query(string, ...any) (*sql.Rows, error)
+	}, query string) map[string]bool {
 		t.Helper()
-		rows, err := pool.Query(query, args...)
+		rows, err := q.Query(query)
 		if err != nil {
 			t.Fatalf("query: %v", err)
 		}
@@ -601,37 +765,28 @@ VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-01-15T10:00:00Z', '2026-01-15T11
 	}
 
 	// Taken before the repair runs, because the predicate reads the bounds the
-	// repair is about to write.
-	legacy := readUIDs(`SELECT uid FROM events WHERE ` + legacyRecurrenceRepairPredicate)
+	// repair is about to write. v1.1.9 has no bound columns, so they are added the
+	// way the migration first adds them, in a transaction that is rolled back.
+	tx, err := pool.Begin()
+	if err != nil {
+		t.Fatalf("begin legacy predicate transaction: %v", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE events ADD COLUMN recurrence_start TIMESTAMPTZ, ADD COLUMN recurrence_until TIMESTAMPTZ`); err != nil {
+		tx.Rollback()
+		t.Fatalf("add recurrence bounds: %v", err)
+	}
+	legacy := readUIDs(tx, `SELECT uid FROM events WHERE `+legacyRecurrenceRepairPredicate)
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("roll back legacy predicate transaction: %v", err)
+	}
 
 	applyV120Migration(t, pool)
 
-	// A row the repair touched is one whose bounds are no longer what they were
-	// seeded as, which is the only reading that treats a partially bounded row
-	// and a fully unbounded one alike.
-	repaired := readUIDs(`
+	// Every row enters the upgrade without bounds, so a row the repair touched is
+	// one that has any.
+	repaired := readUIDs(pool, `
 SELECT uid FROM events
-WHERE recurrence_start IS DISTINCT FROM $1::timestamptz
-   OR recurrence_until IS DISTINCT FROM $2::timestamptz`, nil, nil)
-	for _, test := range cases {
-		if test.start != nil || test.until != nil {
-			delete(repaired, test.uid)
-		}
-	}
-	// The two seeded with a bound of their own are judged on the bound that was
-	// NULL, which the repair fills only for a recurring resource.
-	for _, test := range cases {
-		if test.start == nil && test.until == nil {
-			continue
-		}
-		var until *time.Time
-		if err := pool.QueryRow(`SELECT recurrence_until FROM events WHERE uid = $1`, test.uid).Scan(&until); err != nil {
-			t.Fatalf("read %s bounds: %v", test.uid, err)
-		}
-		if test.until == nil && until != nil {
-			repaired[test.uid] = true
-		}
-	}
+WHERE recurrence_start IS NOT NULL OR recurrence_until IS NOT NULL`)
 
 	expected := map[string]bool{}
 	for _, test := range cases {
@@ -765,7 +920,7 @@ func recurrenceRepairComponentMatches(t *testing.T, plan map[string]any) []compo
 // unfolds the same body once per test. The repair names it once, as a function
 // scan whose column every test reads, and the plan is what settles that.
 func TestPostgres_V120MigrationUnfoldsEachBodyOnce(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
 
 	if unfolds := countInPlan(explainRecurrenceRepair(t, pool, false), "regexp_replace("); unfolds != 1 {
@@ -810,7 +965,7 @@ INSERT INTO calendars (user_id, name) SELECT id, 'Repair' FROM seeded_user RETUR
 // it, and how often each match actually ran is where that shows. Each body stops
 // at a different stage, and no match past that stage may run for it.
 func TestPostgres_V120MigrationRunsTheCheapRecurrenceFiltersFirst(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
 	calendarID := seedRepairCalendar(t, pool, "subject-stages")
 
@@ -876,12 +1031,12 @@ VALUES ($1, 'stage', 'stage.ics', $2, 'etag', '2026-01-15T10:00:00Z', '2026-01-1
 // assertion is on how often each match ran rather than on elapsed time, which
 // the load on the database server decides as much as the predicate does.
 func TestPostgres_V120MigrationBackfillKeepsTimezoneRulesOffTheComponentMatch(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	calendarID := seedRepairCalendar(t, pool, "subject-backfill")
 
 	const seededRows = 200
 	if _, err := pool.Exec(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified)
 SELECT $1, 'bulk-' || g, 'bulk-' || g || '.ics',
        'BEGIN:VCALENDAR' || E'\r\n' || 'VERSION:2.0' || E'\r\n' ||
        'BEGIN:VTIMEZONE' || E'\r\n' || 'TZID:America/New_York' || E'\r\n' ||
@@ -895,11 +1050,15 @@ SELECT $1, 'bulk-' || g, 'bulk-' || g || '.ics',
        'DTEND;TZID=America/New_York:20260115T110000' || E'\r\n' ||
        'DESCRIPTION:' || repeat('a', 2200) || E'\r\n' ||
        'END:VEVENT' || E'\r\n' || 'END:VCALENDAR' || E'\r\n',
-       'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NULL, NULL, NOW()
+       'etag', '2026-01-15T10:00:00Z', '2026-01-15T11:00:00Z', FALSE, NOW()
 FROM generate_series(1, $2) g`, calendarID, seededRows); err != nil {
 		t.Fatalf("seed events: %v", err)
 	}
 
+	applyV120Migration(t, pool)
+
+	// The repair reads the bound columns the migration adds, so its plan is taken
+	// once they exist. The rows it rejected keep NULL bounds and reach it again.
 	// Every row passes the property-name search, so each greedy span runs once
 	// per row and rejects it; the component match must never run.
 	for _, match := range recurrenceRepairComponentMatches(t, explainRecurrenceRepair(t, pool, true)) {
@@ -910,8 +1069,6 @@ FROM generate_series(1, $2) g`, calendarID, seededRows); err != nil {
 			t.Errorf("%s ran %v times over %d non-recurring rows, want never", match.call, match.loops, seededRows)
 		}
 	}
-
-	applyV120Migration(t, pool)
 
 	var repaired int
 	if err := pool.QueryRow(
@@ -940,16 +1097,7 @@ func TestPostgres_UpgradeRepairsFoldedRecurrenceBounds(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, version := range []string{"v1.1.3.sql", "v1.1.4.sql", "v1.1.6.sql", "v1.1.7.sql", "v1.1.8.sql", "v1.1.9.sql"} {
-		body, err := os.ReadFile(filepath.Join("..", "..", "migrations", version))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(string(body)); err != nil {
-			t.Fatalf("%s: %v", version, err)
-		}
-	}
-	applyV120Migration(t, pool)
+	migrateWithRunner(t, pool, "../../migrations", "v1.2.0")
 	start := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
 	end := start.AddDate(0, 0, 1)
 	events, err := New(pool).Events.ListForCalendarFiltered(t.Context(), calendarID, EventFilter{Start: &start, End: &end})
@@ -1019,7 +1167,7 @@ CREATE INDEX idx_events_calendar_keyset ON events (calendar_id, id);
 CREATE INDEX idx_contacts_book_keyset ON contacts (address_book_id, id);`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			pool := newV119Pool(t)
+			pool := newV119ReleasePool(t)
 			if test.setup != "" {
 				if _, err := pool.Exec(test.setup); err != nil {
 					t.Fatalf("build release candidate indexes: %v", err)
@@ -1043,10 +1191,12 @@ CREATE INDEX idx_contacts_book_keyset ON contacts (address_book_id, id);`},
 }
 
 // Everything in this file runs under ACCESS EXCLUSIVE inside the startup budget,
-// so no index is built twice, and the recurrence repair runs while no index
-// reading the columns it writes exists: each repaired row would otherwise
-// maintain every one of them.
-func TestV120MigrationBuildsEachIndexOnceAfterTheRepair(t *testing.T) {
+// so no index costs more than one build. None is built twice. An index the
+// upgrade retires goes before any table is rewritten or updated, so no rewrite
+// rebuilds it and no backfill maintains it. The recurrence repair and the
+// ace_order backfill run while no index they would maintain per row and the file
+// builds anyway exists yet.
+func TestV120MigrationMaintainsNoIndexItRebuildsOrRetires(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "migrations", "v1.2.0.sql"))
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
@@ -1062,14 +1212,30 @@ func TestV120MigrationBuildsEachIndexOnceAfterTheRepair(t *testing.T) {
 		statements = append(statements, strings.TrimSpace(strings.Join(code, "\n")))
 	}
 
-	repair := -1
+	repair, aceOrderBackfill, firstWrite := -1, -1, -1
 	for i, statement := range statements {
 		if strings.HasPrefix(statement, "UPDATE events\n") {
 			repair = i
 		}
+		if strings.Contains(statement, "UPDATE acl_entries") {
+			aceOrderBackfill = i
+		}
+		if firstWrite < 0 && (strings.HasPrefix(statement, "ALTER TABLE") || strings.HasPrefix(statement, "UPDATE ")) {
+			firstWrite = i
+		}
 	}
 	if repair < 0 {
 		t.Fatal("the migration no longer carries the recurrence repair")
+	}
+	if aceOrderBackfill < 0 {
+		t.Fatal("the migration no longer carries the ace_order backfill")
+	}
+
+	dropped := map[string]int{}
+	for i, statement := range statements {
+		if name, ok := strings.CutPrefix(statement, "DROP INDEX IF EXISTS "); ok {
+			dropped[name] = i
+		}
 	}
 
 	built := map[string]int{}
@@ -1088,6 +1254,15 @@ func TestV120MigrationBuildsEachIndexOnceAfterTheRepair(t *testing.T) {
 		}
 		if strings.Contains(statement, "ON events") && strings.Contains(statement, "recurrence_") && i < repair {
 			t.Errorf("%s reads the recurrence columns and is built before the repair writes them", name)
+		}
+		if strings.Contains(statement, "ON acl_entries") && i < aceOrderBackfill {
+			t.Errorf("%s is built before the ace_order backfill updates every row it covers", name)
+		}
+	}
+
+	for name, at := range dropped {
+		if _, rebuilt := built[name]; !rebuilt && at > firstWrite {
+			t.Errorf("%s is retired only after a table is rewritten or updated, which maintains it until then", name)
 		}
 	}
 }
@@ -1145,7 +1320,7 @@ func TestPostgres_V120MigrationStampsSyncChangesLikeBaselineSchema(t *testing.T)
 		}
 	}
 
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
 	applyV120Migration(t, pool)
 	got := syncStampDefinitions(t, pool)
@@ -1166,7 +1341,7 @@ func TestPostgres_V120MigrationStampsSyncChangesLikeBaselineSchema(t *testing.T)
 // the card itself into NoYearBirthdayYear, moves the address book's CTag so
 // clients notice, and leaves every birthday that carries a year alone.
 func TestPostgres_V120MigrationRederivesYearlessBirthdays(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	card := func(bday string) string {
 		return "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Someone\r\nBDAY" + bday + "\r\nEND:VCARD\r\n"
 	}
@@ -1308,7 +1483,7 @@ INSERT INTO address_books (user_id, name) SELECT id, 'Birthdays' FROM seeded_use
 // flattens a subquery with no FROM into the expressions that read it, and a
 // regex column referenced from ten places is then evaluated ten times per row.
 func TestPostgres_V120MigrationParsesEachBirthdayOnce(t *testing.T) {
-	pool := newV119Pool(t)
+	pool := newV119ReleasePool(t)
 	applyV120Migration(t, pool)
 
 	plan := explainStatement(t, pool, migrationStatement(t, "UPDATE contacts AS contact\n"), false)

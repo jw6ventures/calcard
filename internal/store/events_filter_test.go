@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -92,31 +91,6 @@ func TestListForCalendarPageAfterUsesKeysetAndFilter(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestRecurrenceBackfillScopesToEventLikeComponents(t *testing.T) {
-	sql, err := os.ReadFile("../../migrations/v1.1.7.sql")
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
-	}
-	migration := string(sql)
-	if strings.Contains(migration, "raw_ical ILIKE '%RRULE%'") || strings.Contains(migration, "raw_ical ILIKE '%RDATE%'") {
-		t.Fatal("recurrence backfill must not match RRULE/RDATE globally because VTIMEZONE rules would be false positives")
-	}
-	for _, component := range []string{"BEGIN:VEVENT", "BEGIN:VTODO", "BEGIN:VJOURNAL"} {
-		if !strings.Contains(migration, component) {
-			t.Fatalf("expected recurrence backfill to inspect %s components", component)
-		}
-	}
-	if !strings.Contains(migration, "regexp_matches(events.raw_ical") {
-		t.Fatal("expected recurrence backfill to inspect component bodies in SQL")
-	}
-	if !strings.Contains(migration, "recurrence_start = '1900-01-01T00:00:00Z'") {
-		t.Fatal("expected recurring backfill to use a safe lower start bound")
-	}
-	if !strings.Contains(migration, "idx_events_recurrence_start") {
-		t.Fatal("expected migration to add a recurrence_start index")
 	}
 }
 

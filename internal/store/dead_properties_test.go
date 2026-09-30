@@ -110,8 +110,8 @@ func TestPatchCalendarPropertiesRollsBackLiveChangeWhenDeadPropertyFails(t *test
 	}
 }
 
-func TestMigrationV118ContainsDeadPropertyAndScopedACLIndexes(t *testing.T) {
-	contents, err := os.ReadFile("../../migrations/v1.1.8.sql")
+func TestMigrationContainsDeadPropertyAndScopedACLIndexes(t *testing.T) {
+	contents, err := os.ReadFile("../../migrations/v1.2.0.sql")
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
@@ -121,7 +121,7 @@ func TestMigrationV118ContainsDeadPropertyAndScopedACLIndexes(t *testing.T) {
 		"PRIMARY KEY (resource_path, namespace_uri, local_name)",
 		"ON acl_entries (resource_path, principal_href)",
 		"ADD COLUMN IF NOT EXISTS object_acl_path",
-		"UPDATE application SET value = 'v1.1.8'",
+		"UPDATE application SET value = 'v1.2.0'",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("migration missing %q", required)
