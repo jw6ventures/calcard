@@ -732,6 +732,67 @@ END:VCALENDAR`
 	}
 }
 
+func TestParseICSFileKeepsNestedAlarms(t *testing.T) {
+	icsContent := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:with-alarm@example.com\r\nDTSTART:20260320T100000Z\r\n" +
+		"BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:plain@example.com\r\nDTSTART:20260321T100000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ParseICSFile() returned %d resources, want 2", len(events))
+	}
+	if !strings.Contains(events[0], "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\n") {
+		t.Fatalf("expected the alarm to stay inside its event, got: %s", events[0])
+	}
+	if strings.Contains(events[1], "VALARM") {
+		t.Fatalf("expected the alarm not to leak into the next event, got: %s", events[1])
+	}
+}
+
+func TestParseICSFileGroupsByEventUIDNotAlarmUID(t *testing.T) {
+	const eventUID = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+	icsContent := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.0//EN\r\n" +
+		"BEGIN:VEVENT\r\n" + appleAlarm("A1A1A1A1-0000-4000-8000-000000000001") +
+		"UID:" + eventUID + "\r\nSUMMARY:Standup\r\nDTSTART:20260320T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\n" + appleAlarm("B2B2B2B2-0000-4000-8000-000000000002") +
+		"UID:" + eventUID + "\r\nRECURRENCE-ID:20260327T100000Z\r\nSUMMARY:Standup (moved)\r\nDTSTART:20260327T110000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("ParseICSFile() should group the master and override into one resource, got %d", len(events))
+	}
+	if strings.Count(events[0], "BEGIN:VEVENT") != 2 || strings.Count(events[0], "BEGIN:VALARM") != 2 {
+		t.Fatalf("expected both VEVENTs and their alarms in the resource, got: %s", events[0])
+	}
+	if got := ExtractUID(events[0]); got != eventUID {
+		t.Fatalf("ExtractUID() = %q, want %q", got, eventUID)
+	}
+}
+
+func TestParseICSFileGroupsPlainAndParameterizedUIDs(t *testing.T) {
+	icsContent := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID;X-SOURCE=import:series@example.com\r\nDTSTART:20260320T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:series@example.com\r\nRECURRENCE-ID:20260327T100000Z\r\nDTSTART:20260327T110000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	events, err := ParseICSFile(icsContent)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 1 || strings.Count(events[0], "BEGIN:VEVENT") != 2 {
+		t.Fatalf("ParseICSFile() should group the master and override into one resource, got %q", events)
+	}
+}
+
 func TestParseICSFileRejectsMalformedInput(t *testing.T) {
 	tests := []struct {
 		name string
@@ -788,6 +849,33 @@ END:VEVENT
 END:VCALENDAR`,
 			want: "spaced-uid@example.com",
 		},
+		{
+			name: "Apple alarm UID before the event UID",
+			ical: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n" + appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") +
+				"UID:6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10",
+		},
+		{
+			name: "UID with parameters",
+			ical: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID;X-SOURCE=import:param-uid@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: "param-uid@example.com",
+		},
+		{
+			name: "UID with a quoted parameter holding a colon",
+			ical: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID;X-SOURCE=\"https://example.com:8443/feed\":param-uid@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: "param-uid@example.com",
+		},
+		{
+			name: "property name merely starting with UID",
+			ical: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUIDX:not-a-uid@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: "",
+		},
+		{
+			name: "UID only on the alarm",
+			ical: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Test\r\n" + appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") +
+				"END:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -806,6 +894,20 @@ func TestEnsureUID(t *testing.T) {
 	if !strings.Contains(got, "UID:generated@example.com") {
 		t.Fatalf("expected UID to be injected, got: %s", got)
 	}
+}
+
+func TestEnsureUIDIgnoresAlarmUID(t *testing.T) {
+	ical := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Test\r\n" + appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") + "END:VEVENT\r\nEND:VCALENDAR\r\n"
+	got := EnsureUID(ical, "generated@example.com")
+	if ExtractUID(got) != "generated@example.com" {
+		t.Fatalf("expected the event UID to be injected, got: %s", got)
+	}
+}
+
+// appleAlarm is a VALARM as Apple Calendar writes it: RFC 9074 §4 gives the
+// alarm its own UID, mirrored in X-WR-ALARMUID.
+func appleAlarm(uid string) string {
+	return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
 }
 
 func TestResourceNameForUID(t *testing.T) {

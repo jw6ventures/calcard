@@ -1507,6 +1507,83 @@ func TestImportCalendarHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("stores Apple events under the event UID not the alarm UIDs", func(t *testing.T) {
+		const eventUID = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil)
+
+		alarm := func(uid string) string {
+			return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
+		}
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.0//EN\r\n" +
+			"BEGIN:VEVENT\r\n" + alarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") +
+			"UID:" + eventUID + "\r\nSUMMARY:Standup\r\nDTSTART:20260320T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEND:VEVENT\r\n" +
+			"BEGIN:VEVENT\r\n" + alarm("B2B2B2B2-0000-4000-8000-000000000002") +
+			"UID:" + eventUID + "\r\nRECURRENCE-ID:20260327T100000Z\r\nSUMMARY:Standup (moved)\r\nDTSTART:20260327T110000Z\r\nEND:VEVENT\r\n" +
+			"END:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "apple.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+") {
+			t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+		}
+		if len(eventRepo.events) != 1 {
+			t.Fatalf("expected 1 stored resource, got %d", len(eventRepo.events))
+		}
+		stored := eventRepo.events["1:"+eventUID]
+		if stored == nil {
+			t.Fatalf("expected the series stored under %q", eventUID)
+		}
+		if stored.ResourceName != utils.ResourceNameForUID(eventUID) {
+			t.Fatalf("ResourceName = %q, want %q", stored.ResourceName, utils.ResourceNameForUID(eventUID))
+		}
+		if strings.Count(stored.RawICAL, "BEGIN:VEVENT") != 2 {
+			t.Fatalf("expected master and override in one resource, got: %s", stored.RawICAL)
+		}
+	})
+
+	t.Run("stores an event under its parameterized UID", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil)
+
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID;X-SOURCE=import:param@example.com\r\nSUMMARY:Param\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "param.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+") {
+			t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+		}
+		stored := eventRepo.events["1:param@example.com"]
+		if stored == nil || len(eventRepo.events) != 1 {
+			t.Fatalf("expected one event stored under param@example.com, got %v", eventRepo.events)
+		}
+		if n := strings.Count(strings.ToUpper(stored.RawICAL), "\r\nUID"); n != 1 {
+			t.Fatalf("expected the original UID line alone, found %d UID lines in: %s", n, stored.RawICAL)
+		}
+	})
+
 	t.Run("rejects malformed ICS", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			calendars: map[int64]*store.Calendar{

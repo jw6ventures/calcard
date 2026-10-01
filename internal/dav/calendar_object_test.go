@@ -111,6 +111,15 @@ func TestRFC4791_ValidCalendarData_EnforcesICalendarGrammar(t *testing.T) {
 			"DTEND:20240601T120000")),
 		"VFREEBUSY DTEND is not later than DTSTART": buildCalendarObject(buildVFreeBusy("freebusy-order",
 			"DTSTART:20240601T120000Z", "DTEND:20240601T110000Z")),
+		"VALARM carrying two UIDs": buildCalendarObject(buildVEvent("alarm-uids",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M",
+				"UID:alarm-one", "UID:alarm-two"))),
+		"VALARM acknowledged twice": buildCalendarObject(buildVEvent("alarm-acknowledged",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M",
+				"ACKNOWLEDGED:20240601T094500Z", "ACKNOWLEDGED:20240601T095000Z"))),
+		"VALARM with two proximity triggers": buildCalendarObject(buildVEvent("alarm-proximity",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER;VALUE=DATE-TIME:19760401T005545Z",
+				"PROXIMITY:ARRIVE", "PROXIMITY:DEPART"))),
 		"VALARM nested in a VJOURNAL": buildCalendarObject(buildVJournal("journal-alarm",
 			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M"))),
 		"content line with no value delimiter": buildCalendarObject(buildComponent("VEVENT",
@@ -599,6 +608,110 @@ func TestRFC4791_PutPreservesNonStandardCalendarData(t *testing.T) {
 	}
 	if stored.RawICAL != body {
 		t.Fatalf("stored octets = %q, want the submitted %q", stored.RawICAL, body)
+	}
+}
+
+// appleAlarmEvent is a VEVENT as Apple Calendar writes it: every VALARM carries
+// the RFC 9074 §4 UID beside Apple's X-WR-ALARMUID, an acknowledged alarm
+// carries ACKNOWLEDGED (§6), and a snoozed alarm is a second VALARM pointing back
+// at the first through RELATED-TO (§5, §7).
+const appleAlarmEvent = "BEGIN:VCALENDAR\r\n" +
+	"VERSION:2.0\r\n" +
+	"PRODID:-//Apple Inc.//macOS 14.6.1//EN\r\n" +
+	"CALSCALE:GREGORIAN\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:America/New_York\r\n" +
+	"BEGIN:DAYLIGHT\r\n" +
+	"TZOFFSETFROM:-0500\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\n" +
+	"DTSTART:20070311T020000\r\n" +
+	"TZNAME:EDT\r\n" +
+	"TZOFFSETTO:-0400\r\n" +
+	"END:DAYLIGHT\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"TZOFFSETFROM:-0400\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n" +
+	"DTSTART:20071104T020000\r\n" +
+	"TZNAME:EST\r\n" +
+	"TZOFFSETTO:-0500\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"CREATED:20240601T140512Z\r\n" +
+	"DTEND;TZID=America/New_York:20240603T100000\r\n" +
+	"DTSTAMP:20240601T140539Z\r\n" +
+	"DTSTART;TZID=America/New_York:20240603T090000\r\n" +
+	"LAST-MODIFIED:20240601T140538Z\r\n" +
+	"SEQUENCE:0\r\n" +
+	"SUMMARY:Team sync\r\n" +
+	"TRANSP:OPAQUE\r\n" +
+	"UID:6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10\r\n" +
+	"X-APPLE-CREATOR-IDENTITY:com.apple.calendar\r\n" +
+	"X-APPLE-CREATOR-TEAM-IDENTITY:0000000000\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACKNOWLEDGED:20240603T124500Z\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:This is an event reminder\r\n" +
+	"TRIGGER:-PT15M\r\n" +
+	"UID:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"X-WR-ALARMUID:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"END:VALARM\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:This is an event reminder\r\n" +
+	"RELATED-TO;RELTYPE=SNOOZE:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"TRIGGER;VALUE=DATE-TIME:20240603T125000Z\r\n" +
+	"UID:0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\r\n" +
+	"X-WR-ALARMUID:0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\r\n" +
+	"END:VALARM\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:AUDIO\r\n" +
+	"ATTACH;VALUE=URI:Chord\r\n" +
+	"TRIGGER:-PT5M\r\n" +
+	"UID:7F6E5D4C-3B2A-4190-8F7E-6D5C4B3A2910\r\n" +
+	"X-APPLE-DEFAULT-ALARM:TRUE\r\n" +
+	"X-WR-ALARMUID:7F6E5D4C-3B2A-4190-8F7E-6D5C4B3A2910\r\n" +
+	"END:VALARM\r\n" +
+	"END:VEVENT\r\n" +
+	"END:VCALENDAR\r\n"
+
+// RFC 9074 extends every VALARM, whatever its ACTION, with UID, RELATED-TO,
+// ACKNOWLEDGED and PROXIMITY. Apple Calendar writes a UID on every alarm it
+// saves, so refusing these refuses any event with a reminder.
+func TestRFC9074_PutAcceptsAlarmExtensions(t *testing.T) {
+	tests := map[string]string{
+		"Apple Calendar alarms": appleAlarmEvent,
+		"EMAIL alarm with UID and RELATED-TO": buildCalendarObject(buildVEvent("email-alarm",
+			buildComponent("VALARM", "ACTION:EMAIL", "TRIGGER:-PT1H", "DESCRIPTION:Body", "SUMMARY:Subject",
+				"ATTENDEE:mailto:someone@example.test", "UID:email-alarm-uid",
+				"RELATED-TO:first-alarm", "RELATED-TO;RELTYPE=SNOOZE:second-alarm"))),
+		"proximity alarm": buildCalendarObject(buildVEvent("proximity-alarm",
+			buildComponent("VALARM", "UID:77D80D14-906B-4257-963F-85B1E734DBB6", "ACTION:DISPLAY",
+				"TRIGGER;VALUE=DATE-TIME:19760401T005545Z", "DESCRIPTION:Remember to buy milk",
+				"PROXIMITY:DEPART"))),
+		"VTODO alarm with UID": buildCalendarObject(buildVTodo("todo-alarm",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Due soon", "TRIGGER:-PT15M",
+				"UID:todo-alarm-uid"))),
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "alarm.ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+			}
+			if len(eventRepo.events) != 1 {
+				t.Fatalf("stored %d objects, want 1", len(eventRepo.events))
+			}
+			for _, stored := range eventRepo.events {
+				if stored.RawICAL != body {
+					t.Fatalf("stored octets = %q, want the submitted %q", stored.RawICAL, body)
+				}
+			}
+		})
 	}
 }
 

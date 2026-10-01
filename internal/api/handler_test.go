@@ -657,6 +657,54 @@ func TestCreateEventRawICSSuccess(t *testing.T) {
 	}
 }
 
+// Apple Calendar gives every VALARM its own UID (RFC 9074 §4); only the UID on
+// the top-level VEVENT names the object.
+func TestRawICSUpsertUsesTheEventUIDNotTheAlarmUIDs(t *testing.T) {
+	const eventUID = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+	alarm := func(uid string) string {
+		return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
+	}
+	rawICS := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.0//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:" + eventUID + "\r\nSUMMARY:Standup\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T103000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n" +
+		alarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") + "END:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\n" + alarm("B2B2B2B2-0000-4000-8000-000000000002") +
+		"UID:" + eventUID + "\r\nRECURRENCE-ID:20260327T100000Z\r\nSUMMARY:Standup (moved)\r\nDTSTART:20260327T110000Z\r\nDTEND:20260327T113000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	eventRepo := &fakeEventRepo{events: map[string]store.Event{}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.CalendarAccess{
+				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: eventRepo,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(rawICS))
+	req.Header.Set("Content-Type", "text/calendar")
+	req = withUserAndRoute(req, "1", "")
+	rec := httptest.NewRecorder()
+	handler.CreateEvent(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("CreateEvent() status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	stored, ok := eventRepo.events["1:"+eventUID]
+	if !ok || len(eventRepo.events) != 1 {
+		t.Fatalf("expected one event stored under %q, got %v", eventUID, eventRepo.events)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/calendars/1/events/"+eventUID, strings.NewReader(rawICS))
+	req.Header.Set("Content-Type", "text/calendar")
+	req.Header.Set("If-Match", `"`+stored.ETag+`"`)
+	req = withUserAndRoute(req, "1", eventUID)
+	rec = httptest.NewRecorder()
+	handler.UpdateEvent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UpdateEvent() status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
 func TestUpdateEventUnauthorizedAndSuccess(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{})
 	req := httptest.NewRequest(http.MethodPut, "/api/calendars/1/events/event-1", strings.NewReader(`{}`))

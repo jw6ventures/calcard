@@ -1007,28 +1007,23 @@ func countICalAttendeesLines(lines []string) int {
 }
 
 func extractUIDFromICalendar(icalData string) (string, error) {
-	lines := utils.UnfoldLines(icalData)
-	seenUIDs := make(map[string]struct{})
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !hasPrefixFold(trimmed, "UID:") {
-			continue
+	uid := ""
+	for _, componentUIDs := range topLevelComponentUIDs(utils.UnfoldLines(icalData)) {
+		for _, candidate := range componentUIDs {
+			switch {
+			case candidate == "":
+				return "", fmt.Errorf("empty uid")
+			case uid == "":
+				uid = candidate
+			case candidate != uid:
+				return "", fmt.Errorf("multiple uids")
+			}
 		}
-		uid := strings.TrimSpace(trimmed[4:])
-		if uid == "" {
-			return "", fmt.Errorf("empty uid")
-		}
-		seenUIDs[uid] = struct{}{}
 	}
-	switch len(seenUIDs) {
-	case 0:
+	if uid == "" {
 		return "", fmt.Errorf("missing uid")
-	case 1:
-		for uid := range seenUIDs {
-			return uid, nil
-		}
 	}
-	return "", fmt.Errorf("multiple uids")
+	return uid, nil
 }
 
 func validateCalendarObjectResource(icalData string) []string {
@@ -1053,32 +1048,67 @@ func isComponentBoundary(trimmed, boundary string) bool {
 	}
 }
 
-func validateCalendarObjectResourceLines(lines []string) []string {
-	var conditions []string
-	inEvent := false
-	currentUID := ""
-	seenUID := false
-	seenUIDs := make(map[string]struct{})
+// topLevelComponentUIDs returns, for each VEVENT, VTODO, VJOURNAL, or
+// VFREEBUSY directly inside VCALENDAR, the values of the UID properties set on
+// that component itself. UIDs on nested components do not identify the
+// calendar object resource: RFC 9074 §4 lets a VALARM carry its own UID, and
+// Apple Calendar writes one on every alarm.
+func topLevelComponentUIDs(lines []string) [][]string {
+	var components [][]string
+	depth := 0
+	inComponent := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		switch {
-		case isComponentBoundary(trimmed, "BEGIN:"):
-			inEvent = true
-			currentUID = ""
-			seenUID = false
-		case isComponentBoundary(trimmed, "END:"):
-			if inEvent && !seenUID {
-				conditions = append(conditions, "valid-calendar-object-resource")
+		case hasPrefixFold(trimmed, "BEGIN:"):
+			depth++
+			if depth == 2 {
+				inComponent = isComponentBoundary(trimmed, "BEGIN:")
+				if inComponent {
+					components = append(components, nil)
+				}
 			}
-			if currentUID != "" {
-				seenUIDs[currentUID] = struct{}{}
+		case hasPrefixFold(trimmed, "END:"):
+			if depth == 2 {
+				inComponent = false
 			}
-			inEvent = false
-		default:
-			if inEvent && hasPrefixFold(trimmed, "UID:") {
-				currentUID = strings.TrimSpace(trimmed[4:])
-				seenUID = currentUID != ""
+			depth--
+		case inComponent && depth == 2:
+			if uid, ok := uidPropertyValue(trimmed); ok {
+				last := len(components) - 1
+				components[last] = append(components[last], uid)
 			}
+		}
+	}
+	return components
+}
+
+// uidPropertyValue returns the value of a UID content line, which may carry
+// parameters ("UID;X-SOURCE=import:value") whose quoted values hold colons.
+func uidPropertyValue(trimmed string) (string, bool) {
+	if !hasPrefixFold(trimmed, "UID") {
+		return "", false
+	}
+	keyPart, value, ok := ical.SplitContentLine(trimmed)
+	if !ok || !strings.EqualFold(strings.TrimSpace(ical.PropertyName(keyPart)), "UID") {
+		return "", false
+	}
+	return strings.TrimSpace(value), true
+}
+
+func validateCalendarObjectResourceLines(lines []string) []string {
+	var conditions []string
+	seenUIDs := make(map[string]struct{})
+	for _, componentUIDs := range topLevelComponentUIDs(lines) {
+		hasUID := false
+		for _, uid := range componentUIDs {
+			if uid != "" {
+				hasUID = true
+				seenUIDs[uid] = struct{}{}
+			}
+		}
+		if !hasUID {
+			conditions = append(conditions, "valid-calendar-object-resource")
 		}
 	}
 	if len(seenUIDs) > 1 {
@@ -1093,10 +1123,8 @@ func hasMultipleDifferentUIDs(icalData string) bool {
 
 func hasMultipleDifferentUIDsLines(lines []string) bool {
 	seenUIDs := make(map[string]struct{})
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if hasPrefixFold(trimmed, "UID:") {
-			uid := strings.TrimSpace(trimmed[4:])
+	for _, componentUIDs := range topLevelComponentUIDs(lines) {
+		for _, uid := range componentUIDs {
 			if uid != "" {
 				seenUIDs[uid] = struct{}{}
 			}

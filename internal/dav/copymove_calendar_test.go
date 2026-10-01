@@ -106,6 +106,44 @@ func TestCalendarObjectCopyMoveApplyPutCalendarPreconditions(t *testing.T) {
 	}
 }
 
+// COPY and MOVE re-validate the stored body, so an alarm shape PUT accepts must
+// also survive a transfer.
+func TestCalendarObjectCopyMoveAcceptAlarmExtensions(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			calendars := &fakeCalendarRepo{accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}, Editor: true},
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Destination"}, Editor: true},
+			}}
+			const uid = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+			events := &fakeEventRepo{events: map[string]*store.Event{
+				"1:" + uid: {
+					CalendarID:   1,
+					UID:          uid,
+					ResourceName: "apple",
+					RawICAL:      appleAlarmEvent,
+					ETag:         "source-etag",
+				},
+			}}
+			h := NewDavServer(Options{Store: &store.Store{Calendars: calendars, Events: events, CalendarTransfers: events}})
+			req := httptest.NewRequest(method, "/dav/calendars/1/apple.ics", nil)
+			req.Header.Set("Destination", "/dav/calendars/2/apple.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("%s = %d, want 201; body: %s", method, rr.Code, rr.Body.String())
+			}
+			moved := events.events[events.key(2, uid)]
+			if moved == nil || moved.RawICAL != appleAlarmEvent {
+				t.Fatalf("%s destination = %#v, want the source body", method, moved)
+			}
+		})
+	}
+}
+
 func TestCalendarObjectCopyMoveRetryOneConcurrentStateChangeFromFreshSnapshot(t *testing.T) {
 	for _, method := range []string{"COPY", "MOVE"} {
 		t.Run(method, func(t *testing.T) {

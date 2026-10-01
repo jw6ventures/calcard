@@ -1118,3 +1118,166 @@ func TestCreateEventBoundsTheUID(t *testing.T) {
 		t.Fatalf("UID at the limit: created=%v err=%v", created, err)
 	}
 }
+
+const appleEventUID = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+
+// appleAlarm is a VALARM as Apple Calendar writes it: RFC 9074 §4 gives the
+// alarm its own UID, mirrored in X-WR-ALARMUID.
+func appleAlarm(uid string) string {
+	return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
+}
+
+func appleCalendar(components ...string) string {
+	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.0//EN\r\n" + strings.Join(components, "") + "END:VCALENDAR\r\n"
+}
+
+func TestRawICSIdentifiesTheObjectByTopLevelComponentUIDs(t *testing.T) {
+	user := &store.User{ID: 1}
+	accepted := []struct {
+		name string
+		ics  string
+	}{
+		{
+			name: "alarm after the event UID",
+			ics: appleCalendar("BEGIN:VEVENT\r\nUID:" + appleEventUID + "\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n" +
+				appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") + "END:VEVENT\r\n"),
+		},
+		{
+			name: "alarm before the event UID",
+			ics: appleCalendar("BEGIN:VEVENT\r\n" + appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") +
+				"UID:" + appleEventUID + "\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\n"),
+		},
+		{
+			name: "recurring master and override with distinct alarm UIDs",
+			ics: appleCalendar(
+				"BEGIN:VEVENT\r\nUID:"+appleEventUID+"\r\nSUMMARY:Standup\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T103000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n"+
+					appleAlarm("A1A1A1A1-0000-4000-8000-000000000001")+"END:VEVENT\r\n",
+				"BEGIN:VEVENT\r\n"+appleAlarm("B2B2B2B2-0000-4000-8000-000000000002")+
+					"UID:"+appleEventUID+"\r\nRECURRENCE-ID:20260327T100000Z\r\nSUMMARY:Standup (moved)\r\nDTSTART:20260327T110000Z\r\nDTEND:20260327T113000Z\r\nEND:VEVENT\r\n",
+			),
+		},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			if conds := validateCalendarObjectResource(tt.ics); len(conds) != 0 {
+				t.Fatalf("validateCalendarObjectResource() = %v, want none", conds)
+			}
+			if hasMultipleDifferentUIDs(tt.ics) {
+				t.Fatal("hasMultipleDifferentUIDs() = true, want false")
+			}
+			if uid, err := extractUIDFromICalendar(tt.ics); err != nil || uid != appleEventUID {
+				t.Fatalf("extractUIDFromICalendar() = %q, %v; want %q", uid, err, appleEventUID)
+			}
+
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if err != nil || !created || ev == nil || ev.UID != appleEventUID {
+				t.Fatalf("CreateEvent() ev=%+v created=%v err=%v", ev, created, err)
+			}
+			ev, created, err = svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if err != nil || created || ev == nil || ev.UID != appleEventUID {
+				t.Fatalf("UpdateEvent() ev=%+v created=%v err=%v", ev, created, err)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name string
+		ics  string
+		want error
+	}{
+		{
+			name: "UID only on the alarm",
+			ics: appleCalendar("BEGIN:VEVENT\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n" +
+				appleAlarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") + "END:VEVENT\r\n"),
+			want: ErrBadRequest,
+		},
+		{
+			name: "different UIDs on two top-level events",
+			ics: appleCalendar(
+				"BEGIN:VEVENT\r\nUID:"+appleEventUID+"\r\nDTSTART:20260320T100000Z\r\n"+appleAlarm("A1A1A1A1-0000-4000-8000-000000000001")+"END:VEVENT\r\n",
+				"BEGIN:VEVENT\r\nUID:other-event\r\nDTSTART:20260321T100000Z\r\n"+appleAlarm("A1A1A1A1-0000-4000-8000-000000000001")+"END:VEVENT\r\n",
+			),
+			want: ErrConflict,
+		},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if len(repo.events) != 0 {
+				t.Fatal("the event was stored")
+			}
+		})
+	}
+}
+
+func TestRawICSReadsUIDWithParameters(t *testing.T) {
+	user := &store.User{ID: 1}
+	event := func(uidLine string) string {
+		return "BEGIN:VEVENT\r\n" + uidLine + "\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n" +
+			"BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nUID;X-SOURCE=alarm:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+	}
+	accepted := []struct {
+		name string
+		ics  string
+	}{
+		{name: "parameter", ics: appleCalendar(event("UID;X-SOURCE=import:" + appleEventUID))},
+		{name: "lowercase name", ics: appleCalendar(event("uid;x-source=import:" + appleEventUID))},
+		{name: "quoted parameter holding a colon", ics: appleCalendar(event(`UID;X-SOURCE="https://example.com:8443/feed":` + appleEventUID))},
+		{name: "plain and parameterized on master and override", ics: appleCalendar(
+			event("UID:"+appleEventUID),
+			"BEGIN:VEVENT\r\nUID;X-SOURCE=import:"+appleEventUID+"\r\nRECURRENCE-ID:20260327T100000Z\r\nDTSTART:20260327T110000Z\r\nEND:VEVENT\r\n",
+		)},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			if conds := validateCalendarObjectResource(tt.ics); len(conds) != 0 {
+				t.Fatalf("validateCalendarObjectResource() = %v, want none", conds)
+			}
+			if uid, err := extractUIDFromICalendar(tt.ics); err != nil || uid != appleEventUID {
+				t.Fatalf("extractUIDFromICalendar() = %q, %v; want %q", uid, err, appleEventUID)
+			}
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if err != nil || !created || ev == nil || ev.UID != appleEventUID {
+				t.Fatalf("CreateEvent() ev=%+v created=%v err=%v", ev, created, err)
+			}
+			if _, _, err := svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"}); err != nil {
+				t.Fatalf("UpdateEvent() err=%v", err)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name string
+		ics  string
+		want error
+	}{
+		{name: "property name merely starting with UID", ics: appleCalendar(event("UIDX:" + appleEventUID)), want: ErrBadRequest},
+		{name: "empty parameterized UID", ics: appleCalendar(event("UID;X-SOURCE=import:")), want: ErrBadRequest},
+		{name: "parameterized UID differing from another event's UID", ics: appleCalendar(
+			event("UID:"+appleEventUID),
+			event("UID;X-SOURCE=import:other-event"),
+		), want: ErrConflict},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if len(repo.events) != 0 {
+				t.Fatal("the event was stored")
+			}
+		})
+	}
+}

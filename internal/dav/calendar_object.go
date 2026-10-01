@@ -238,10 +238,16 @@ var icalObjectComponentRules = map[string]icalComponentRules{
 	},
 	"VALARM": {
 		required: []string{"ACTION", "TRIGGER"},
-		once:     []string{"ACTION", "TRIGGER", "DURATION", "REPEAT", "DESCRIPTION", "SUMMARY"},
-		allowed:  nameSet("ACTION", "TRIGGER", "DURATION", "REPEAT", "ATTACH", "DESCRIPTION", "SUMMARY", "ATTENDEE"),
+		once: []string{"ACTION", "TRIGGER", "DURATION", "REPEAT", "DESCRIPTION", "SUMMARY",
+			"UID", "ACKNOWLEDGED", "PROXIMITY"},
+		allowed: nameSet("ACTION", "TRIGGER", "DURATION", "REPEAT", "ATTACH", "DESCRIPTION", "SUMMARY", "ATTENDEE",
+			"UID", "RELATED-TO", "ACKNOWLEDGED", "PROXIMITY"),
 	},
 }
+
+// alarmExtensionProperties are the properties RFC 9074 adds to every VALARM
+// whatever its ACTION. Apple Calendar writes UID on each alarm it saves.
+var alarmExtensionProperties = nameSet("UID", "RELATED-TO", "ACKNOWLEDGED", "PROXIMITY")
 
 // validateCalendarObject applies the RFC 4791 §5.3.2.1 preconditions a submitted
 // calendar object resource must satisfy before it is stored, in the order the
@@ -675,7 +681,7 @@ func alarmPropertiesMatchAction(node *icalNode, action string) bool {
 		return true
 	}
 	for _, property := range node.properties {
-		if allowed.contains(property.name) {
+		if allowed.contains(property.name) || alarmExtensionProperties.contains(property.name) {
 			continue
 		}
 		if _, standard := knownICalendarProperties[property.name]; standard {

@@ -801,27 +801,24 @@ func ParseICSFile(icsContent string) ([]string, error) {
 		}
 
 		if currentEventDepth > 0 {
-			if upper == "END:VEVENT" {
+			if strings.HasPrefix(upper, "BEGIN:") {
+				currentEventDepth++
+			} else if strings.HasPrefix(upper, "END:") {
 				currentEventDepth--
-				if currentEventDepth == 0 {
-					uid := extractUIDFromLines(currentEvent)
-					if uid == "" {
-						uid = fmt.Sprintf("__missing_uid_%d", len(groupedEventUIDOrder))
-					}
-					if _, ok := eventGroups[uid]; !ok {
-						groupedEventUIDOrder = append(groupedEventUIDOrder, uid)
-					}
-					eventGroups[uid] = append(eventGroups[uid], append([]string(nil), currentEvent...))
-					currentEvent = nil
-					continue
-				}
+			}
+			if currentEventDepth > 0 {
 				currentEvent = append(currentEvent, trimmed)
 				continue
 			}
-			if strings.HasPrefix(upper, "BEGIN:") {
-				currentEventDepth++
+			uid := extractUIDFromLines(currentEvent)
+			if uid == "" {
+				uid = fmt.Sprintf("__missing_uid_%d", len(groupedEventUIDOrder))
 			}
-			currentEvent = append(currentEvent, trimmed)
+			if _, ok := eventGroups[uid]; !ok {
+				groupedEventUIDOrder = append(groupedEventUIDOrder, uid)
+			}
+			eventGroups[uid] = append(eventGroups[uid], append([]string(nil), currentEvent...))
+			currentEvent = nil
 			continue
 		}
 
@@ -874,20 +871,65 @@ func ParseICSFile(icsContent string) ([]string, error) {
 	return groupedEvents, nil
 }
 
-// ExtractUID extracts the UID from an iCalendar VEVENT.
+// ExtractUID returns the UID set directly on the first VEVENT, or "" if that
+// VEVENT has none.
 func ExtractUID(ical string) string {
-	lines := UnfoldLines(ical)
-	return extractUIDFromLines(lines)
-}
-
-func extractUIDFromLines(lines []string) string {
-	for _, line := range lines {
-		if !strings.HasPrefix(strings.ToUpper(line), "UID:") {
-			continue
+	depth := 0
+	eventDepth := 0
+	for _, line := range UnfoldLines(ical) {
+		trimmed := strings.TrimSpace(line)
+		upper := strings.ToUpper(trimmed)
+		switch {
+		case strings.HasPrefix(upper, "BEGIN:"):
+			depth++
+			if eventDepth == 0 && upper == "BEGIN:VEVENT" {
+				eventDepth = depth
+			}
+		case strings.HasPrefix(upper, "END:"):
+			if eventDepth > 0 && depth == eventDepth {
+				return ""
+			}
+			depth--
+		case eventDepth > 0 && depth == eventDepth:
+			if uid, ok := uidPropertyValue(trimmed); ok {
+				return uid
+			}
 		}
-		return strings.TrimSpace(line[4:])
 	}
 	return ""
+}
+
+// extractUIDFromLines returns the UID among a VEVENT's own properties, given
+// the lines between its BEGIN and END markers. UIDs inside nested components
+// are skipped: RFC 9074 §4 lets a VALARM carry its own UID, and Apple Calendar
+// writes one on every alarm.
+func extractUIDFromLines(lines []string) string {
+	depth := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		upper := strings.ToUpper(trimmed)
+		switch {
+		case strings.HasPrefix(upper, "BEGIN:"):
+			depth++
+		case strings.HasPrefix(upper, "END:"):
+			depth--
+		case depth == 0:
+			if uid, ok := uidPropertyValue(trimmed); ok {
+				return uid
+			}
+		}
+	}
+	return ""
+}
+
+// uidPropertyValue returns the value of a UID content line, which may carry
+// parameters ("UID;X-SOURCE=import:value") whose quoted values hold colons.
+func uidPropertyValue(line string) (string, bool) {
+	keyPart, value, ok := ical.SplitContentLine(line)
+	if !ok || !strings.EqualFold(strings.TrimSpace(ical.PropertyName(keyPart)), "UID") {
+		return "", false
+	}
+	return strings.TrimSpace(value), true
 }
 
 // EnsureUID injects a UID into the first VEVENT if missing.
