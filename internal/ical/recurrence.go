@@ -6,6 +6,8 @@ package ical
 import (
 	"errors"
 	"fmt"
+	"math/bits"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -491,7 +493,8 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return len(instances) > limit, true
 	}
-	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule)
+	work := newRecurrenceWork()
+	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
 	if overBudget {
 		return true, true
 	}
@@ -516,9 +519,11 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 
 	periodStart := recurrencePeriodStart(dtstart, rule)
 	occurrences := 0
+	barren := newBarrenPeriodRun(rule)
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-		bounded, exceeded := false, false
-		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
+		bounded, exceeded, offered := false, false, false
+		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, work, func(current time.Time) bool {
+			offered = true
 			if current.Before(dtstart) {
 				return false
 			}
@@ -546,7 +551,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 		if overBudget || exceeded {
 			return true, true
 		}
-		if bounded {
+		if bounded || barren.settles(offered) {
 			return len(instances) > limit, true
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
@@ -572,7 +577,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	}
 	countedRule := rule
 	countedRule.Count = countLimit
-	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, &occurrences, add); handled {
+	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &occurrences, add); handled {
 		return exceeds, true
 	}
 	// The scan guard ran out before the horizon above was reached, so how many
@@ -591,10 +596,17 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 // also accounts for sub-daily clock alignment without visiting every second in
 // the cycle.
 func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) bool {
+	switch rule.Freq {
+	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
+	default:
+		// The normal scan covers at least a complete calendar cycle of periods
+		// for weekly and coarser frequencies. No candidate there means the rule
+		// cannot justify treating COUNT as an attainable lower bound.
+		return false
+	}
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return false
 	}
-	const daysInGregorianCycle = int64(146097)
 	base := recurrencePeriodStart(dtstart, rule)
 
 	var subDailyResidues map[int64]struct{}
@@ -614,32 +626,142 @@ func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) b
 		}
 	}
 
-	for year := 2000; year < 2400; year++ {
-		for dayNumber := 1; dayNumber <= daysInYear(year); dayNumber++ {
-			day := time.Date(year, 1, dayNumber, 0, 0, 0, 0, dtstart.Location())
-			if !dateMatchesRule(day, rule) {
-				continue
+	days := newRecurrenceDayMask(rule)
+	dailyDivisor := greatestCommonDivisor(int64(rule.Interval), daysInGregorianCycle)
+	for dayNumber := recurrenceDayMaskOrigin; dayNumber < recurrenceDayMaskOrigin+daysInGregorianCycle; dayNumber++ {
+		if !days.admits(dayNumber) {
+			continue
+		}
+		if rule.Freq == "DAILY" {
+			if positiveRemainder(dayNumber-civilDayNumber(base), dailyDivisor) == 0 {
+				return true
 			}
-			switch rule.Freq {
-			case "SECONDLY", "MINUTELY", "HOURLY":
-				required := positiveRemainder(base.Unix()-day.Unix(), subDailyDivisor)
-				if _, ok := subDailyResidues[required]; ok {
-					return true
-				}
-			case "DAILY":
-				divisor := greatestCommonDivisor(int64(rule.Interval), daysInGregorianCycle)
-				if positiveRemainder(civilDayNumber(day)-civilDayNumber(base), divisor) == 0 {
-					return true
-				}
-			default:
-				// The normal scan covers far more than a complete calendar cycle for
-				// weekly and coarser frequencies. No candidate there means the rule
-				// cannot justify treating COUNT as an attainable lower bound.
-				return false
-			}
+			continue
+		}
+		required := positiveRemainder(base.Unix()-civilDayStart(dayNumber, dtstart.Location()).Unix(), subDailyDivisor)
+		if _, ok := subDailyResidues[required]; ok {
+			return true
 		}
 	}
 	return false
+}
+
+// daysInGregorianCycle is the length of the 400-year cycle after which the
+// Gregorian calendar repeats, weekdays included: it is exactly 20,871 weeks.
+const daysInGregorianCycle = int64(146097)
+
+// recurrenceDayMask marks the days of one Gregorian cycle, starting on
+// recurrenceDayMaskOrigin, that a rule's date filters admit. Those filters read
+// only the calendar date, which repeats with the cycle, so the mask answers for
+// every day there is, and a scan that steps from one admitted day to the next
+// reads a word for every 64 days it passes over rather than looking at each.
+type recurrenceDayMask struct {
+	words     []uint64
+	admitsAny bool
+}
+
+// recurrenceDayMaskOrigin is the civil day number of 2000-01-01, the first day
+// a recurrenceDayMask describes.
+var recurrenceDayMaskOrigin = civilDayNumber(time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
+
+func newRecurrenceDayMask(rule recurrenceRule) recurrenceDayMask {
+	mask := recurrenceDayMask{words: make([]uint64, (daysInGregorianCycle+63)/64)}
+	index := 0
+	weekday := civilWeekday(2000, time.January, 1)
+	for year := 2000; year < 2400; year++ {
+		yearDay := 0
+		for month := time.January; month <= time.December; month++ {
+			for monthDay := 1; monthDay <= daysInMonth(year, month); monthDay++ {
+				yearDay++
+				if civilDateMatchesRule(year, month, monthDay, yearDay, weekday, rule) {
+					mask.words[index/64] |= 1 << (index % 64)
+					mask.admitsAny = true
+				}
+				index++
+				weekday = (weekday + 1) % 7
+			}
+		}
+	}
+	return mask
+}
+
+// admits reports whether the day with the given civil day number is admitted.
+func (m recurrenceDayMask) admits(dayNumber int64) bool {
+	index := positiveRemainder(dayNumber-recurrenceDayMaskOrigin, daysInGregorianCycle)
+	return m.words[index/64]&(1<<(index%64)) != 0
+}
+
+// next returns the civil day number of the first admitted day at or after from,
+// and how many words of the mask it read to find it, which is never more than
+// one cycle's worth. ok is false when the mask admits no day at all.
+func (m recurrenceDayMask) next(from int64) (dayNumber int64, wordsRead int, ok bool) {
+	if !m.admitsAny {
+		return 0, 0, false
+	}
+	index := positiveRemainder(from-recurrenceDayMaskOrigin, daysInGregorianCycle)
+	dayNumber = from
+	for {
+		wordsRead++
+		if word := m.words[index/64] >> (index % 64); word != 0 {
+			return dayNumber + int64(bits.TrailingZeros64(word)), wordsRead, true
+		}
+		advance := min(64-index%64, daysInGregorianCycle-index)
+		dayNumber += advance
+		index = (index + advance) % daysInGregorianCycle
+	}
+}
+
+// civilDayStart is the start of the day with the given civil day number in loc.
+func civilDayStart(dayNumber int64, loc *time.Location) time.Time {
+	return time.Date(2000, time.January, 1+int(dayNumber-recurrenceDayMaskOrigin), 0, 0, 0, 0, loc)
+}
+
+// barrenPeriodRun recognizes a daily or coarser rule that will never offer
+// another candidate. What a period offers depends on where it falls in the
+// Gregorian cycle, and a rule's periods step through every position they can
+// take there in a fixed number of periods: at most 400 for a yearly rule and
+// 4,800 for a monthly one. A run of that many periods offering nothing has seen
+// every position the rule will ever reach, so no later period can offer
+// anything either. Time-zone
+// transitions are the one thing two periods at the same position can differ
+// in, and past a zone's recorded history they repeat by a yearly rule as well.
+//
+// Without this a rule whose BY parts can never hold together is scanned to the
+// period limit, which for a yearly rule naming hundreds of days a year is
+// minutes of work for an answer one cycle already gave. Sub-daily rules are
+// left to the sparse scan, which skips the days they cannot match.
+type barrenPeriodRun struct {
+	cycle int
+	run   int
+}
+
+func newBarrenPeriodRun(rule recurrenceRule) barrenPeriodRun {
+	var units int64
+	switch rule.Freq {
+	case "DAILY":
+		units = daysInGregorianCycle
+	case "WEEKLY":
+		units = daysInGregorianCycle / 7
+	case "MONTHLY":
+		units = 400 * 12
+	case "YEARLY":
+		units = 400
+	default:
+		return barrenPeriodRun{}
+	}
+	interval := int64(max(rule.Interval, 1))
+	return barrenPeriodRun{cycle: int(units / greatestCommonDivisor(interval, units))}
+}
+
+// settles records whether the latest period offered any candidate, and reports
+// that the periods since the last one that did make up a whole cycle.
+func (r *barrenPeriodRun) settles(offered bool) bool {
+	if offered || r.cycle == 0 {
+		r.run = 0
+		return false
+	}
+	r.run++
+	return r.run >= r.cycle
 }
 
 func recurrenceFrequencySeconds(freq string) (int64, bool) {
@@ -894,11 +1016,10 @@ var ErrRecurrenceExpansionLimit = errors.New("recurrence expansion work limit ex
 // treats every incomplete expansion alike need not tell the two apart.
 var ErrRecurrenceScanLimit = fmt.Errorf("%w: recurrence rule scan work exhausted", ErrRecurrenceExpansionLimit)
 
-// Sparse rules are evaluated exactly while work remains. Validation fails
-// closed on max-instances; reads return ErrRecurrenceExpansionLimit.
-const sparseRecurrenceWorkLimit = 10_000_000
-
-func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule, occurrences *int, add func(time.Time) bool) (bool, bool) {
+// finishSparseRecurrence carries on a sub-daily or daily rule the period scan
+// gave up on, one admitted day at a time, while work remains. Running out of work fails
+// closed on max-instances.
+func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule, work *recurrenceWork, occurrences *int, add func(time.Time) bool) (bool, bool) {
 	if rule.Until == nil && (rule.Count == 0 || *occurrences == 0) {
 		return false, false
 	}
@@ -937,7 +1058,7 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 		return false
 	}
 
-	stopped, overBudget := visitSparseRecurrence(periodStart, dtstart, until, rule, addCandidate)
+	stopped, overBudget := visitSparseRecurrence(periodStart, dtstart, until, rule, work, addCandidate)
 	if overBudget {
 		return true, true
 	}
@@ -947,58 +1068,53 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 	return false, true
 }
 
-func visitSparseRecurrence(periodStart, dtstart, until time.Time, rule recurrenceRule, add func(time.Time) bool) (stopped, overBudget bool) {
-	remainingWork := sparseRecurrenceWorkLimit
-	for year := periodStart.Year(); until.IsZero() || year <= until.Year(); year++ {
-		for dayNumber := 1; dayNumber <= daysInYear(year); dayNumber++ {
-			remainingWork--
-			if remainingWork <= 0 {
+// visitSparseRecurrence follows a daily or sub-daily rule from periodStart
+// through the days its date filters admit, so how far apart those days fall
+// costs a mask word per 64 days rather than a unit per day.
+func visitSparseRecurrence(periodStart, dtstart, until time.Time, rule recurrenceRule, work *recurrenceWork, add func(time.Time) bool) (stopped, overBudget bool) {
+	days := newRecurrenceDayMask(rule)
+	for from := civilDayNumber(periodStart); ; {
+		dayNumber, wordsRead, ok := days.next(from)
+		if !ok {
+			return false, false
+		}
+		if !work.spend(wordsRead) {
+			return true, true
+		}
+		from = dayNumber + 1
+		day := civilDayStart(dayNumber, dtstart.Location())
+		if !until.IsZero() && day.After(until) {
+			return false, false
+		}
+		if rule.Freq == "DAILY" {
+			if day.Before(periodStart) || !dailyRecurrencePeriodAligned(day, dtstart, rule.Interval) {
+				continue
+			}
+			stopped, overBudget := visitRecurrenceCandidates(day, dtstart, rule, work, func(current time.Time) bool {
+				if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
+					return false
+				}
+				return add(current)
+			})
+			// A day over budget leaves its candidates only partly visited, so
+			// it is failed closed rather than treated as producing none, the
+			// same way every other visitRecurrenceCandidates caller handles it.
+			if overBudget {
 				return true, true
 			}
-			day := time.Date(year, 1, dayNumber, 0, 0, 0, 0, dtstart.Location())
-			if !until.IsZero() && day.After(until) {
-				return false, false
-			}
-			if !dateMatchesRule(day, rule) {
-				continue
-			}
-			if rule.Freq == "DAILY" {
-				if day.Before(periodStart) || !dailyRecurrencePeriodAligned(day, dtstart, rule.Interval) {
-					continue
-				}
-				stopped, overBudget := visitRecurrenceCandidates(day, dtstart, rule, func(current time.Time) bool {
-					if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
-						return false
-					}
-					return add(current)
-				})
-				// A day over budget leaves its candidates only partly visited, so
-				// it is failed closed rather than treated as producing none, the
-				// same way every other visitRecurrenceCandidates caller handles it.
-				if overBudget {
-					return true, true
-				}
-				if stopped {
-					return true, false
-				}
-				continue
-			}
-
-			if stop, overBudget := visitSparseSubDailyPeriods(day, periodStart, dtstart, until, rule, &remainingWork, add); stop {
-				if overBudget {
-					return true, true
-				}
-				if remainingWork <= 0 {
-					return true, true
-				}
+			if stopped {
 				return true, false
 			}
+			continue
+		}
+
+		if stop, overBudget := visitSparseSubDailyPeriods(day, periodStart, dtstart, until, rule, work, add); stop {
+			return true, overBudget
 		}
 	}
-	return false, false
 }
 
-func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule recurrenceRule, remainingWork *int, add func(time.Time) bool) (stop, overBudget bool) {
+func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule recurrenceRule, work *recurrenceWork, add func(time.Time) bool) (stop, overBudget bool) {
 	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
 	if !ok {
 		return false, false
@@ -1019,12 +1135,8 @@ func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule
 	}
 
 	for periodUnix := firstUnix; periodUnix < lastUnix; {
-		(*remainingWork)--
-		if *remainingWork <= 0 {
-			return true, false
-		}
 		period := time.Unix(periodUnix, 0).In(day.Location())
-		stopped, periodOverBudget := visitRecurrenceCandidates(period, dtstart, rule, func(current time.Time) bool {
+		stopped, periodOverBudget := visitRecurrenceCandidates(period, dtstart, rule, work, func(current time.Time) bool {
 			if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
 				return false
 			}
@@ -1116,7 +1228,8 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return dtstart, true, true
 	}
-	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule)
+	work := newRecurrenceWork()
+	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
 	if overBudget {
 		return dtstart, true, false
 	}
@@ -1135,12 +1248,15 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 			occurrences = 1
 		}
 		periodStart := recurrencePeriodStart(dtstart, rule)
+		barren := newBarrenPeriodRun(rule)
 		for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
 			done := occurrences >= rule.Count
 			if done {
 				return latest, true, true
 			}
-			_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
+			offered := false
+			_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, work, func(candidate time.Time) bool {
+				offered = true
 				if candidate.Before(dtstart) {
 					return false
 				}
@@ -1159,14 +1275,14 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 			if overBudget {
 				return latest, !latest.IsZero(), false
 			}
-			if done {
+			if done || barren.settles(offered) {
 				return latest, !latest.IsZero(), true
 			}
 			periodStart = advanceRecurrencePeriod(periodStart, rule)
 		}
-		// The scan bound ran out with the rule still generating, so what was
-		// reached is not the end of it.
-		return latest, !latest.IsZero(), false
+		// The scan bound ran out. Unless the rule can never produce a
+		// candidate, what was reached is not the end of it.
+		return latest, !latest.IsZero(), !recurrenceRuleMayProduceCandidate(dtstart, rule)
 	}
 
 	// The DTSTART answers only when no generated occurrence does, since every
@@ -1178,12 +1294,18 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		return dtstart, true
 	}
 	periodStart := fastForwardRecurrencePeriod(recurrencePeriodStart(dtstart, rule), threshold, rule)
-	for scanned := 0; scanned < 1000; scanned++ {
+	// A thousand periods back is further than any observance rule a time zone
+	// uses needs; a rule that offers nothing needs a whole cycle of periods to
+	// show it.
+	barren := newBarrenPeriodRun(rule)
+	for scanned := 0; scanned < max(1000, barren.cycle); scanned++ {
 		// The whole period is wanted here, so a period too large to generate
 		// leaves no usable answer: without BYSETPOS the maximum reached is only
 		// the maximum of the days that were generated, and with it nothing is
 		// selected at all, because BYSETPOS resolves only once the period ends.
-		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(candidate time.Time) bool {
+		offered := false
+		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, work, func(candidate time.Time) bool {
+			offered = true
 			if candidate.Before(dtstart) || candidate.After(before) || pastUntil(candidate) {
 				return false
 			}
@@ -1199,11 +1321,15 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 			return latest, true, true
 		}
 		previous := retreatRecurrencePeriod(periodStart, rule)
-		if !previous.Before(periodStart) || previous.Before(dtstart) {
+		if !previous.Before(periodStart) || previous.Before(dtstart) || barren.settles(offered) {
 			start, found := fallback()
 			return start, found, true
 		}
 		periodStart = previous
+	}
+	if !recurrenceRuleMayProduceCandidate(dtstart, rule) {
+		start, found := fallback()
+		return start, found, true
 	}
 	return time.Time{}, false, false
 }
@@ -1280,11 +1406,12 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	// RFC 5545 §3.8.5.3 makes the DTSTART the first instance of the set, and
 	// the first toward COUNT, whether or not the rule generates it. A rule that
 	// does generate it visits it below like any other candidate.
+	work := newRecurrenceWork()
 	selects := recurrenceBySetPosMaySelect(recurrenceStart, rule)
 	generatesStart := false
 	if selects {
 		var overBudget bool
-		generatesStart, overBudget = recurrenceRuleGeneratesStart(recurrenceStart, rule)
+		generatesStart, overBudget = recurrenceRuleGeneratesStart(recurrenceStart, rule, work)
 		if overBudget {
 			// Whether or not the rule generates it, the DTSTART is an
 			// instance, so it is collected with whatever else is returned.
@@ -1324,12 +1451,17 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		periodStart = fastForwardedStart
 		occurrences += skipped
 	}
+	barren := newBarrenPeriodRun(rule)
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-		_, overBudget := visitRecurrenceCandidates(periodStart, recurrenceStart, rule, visit)
+		offered := false
+		_, overBudget := visitRecurrenceCandidates(periodStart, recurrenceStart, rule, work, func(current time.Time) bool {
+			offered = true
+			return visit(current)
+		})
 		if overBudget {
 			return false, ErrRecurrenceScanLimit
 		}
-		if done {
+		if done || barren.settles(offered) {
 			return true, nil
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
@@ -1343,7 +1475,13 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	}
 	switch rule.Freq {
 	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
-		_, overBudget := visitSparseRecurrence(periodStart, recurrenceStart, scanEnd, rule, visit)
+		// A daily rule's cycle runs to more periods than the scan above
+		// covers, so a rule that can never produce a candidate is recognized
+		// from the rule itself, before following it day by day to scanEnd.
+		if !recurrenceRuleMayProduceCandidate(recurrenceStart, rule) {
+			return true, nil
+		}
+		_, overBudget := visitSparseRecurrence(periodStart, recurrenceStart, scanEnd, rule, work, visit)
 		if !overBudget {
 			return true, nil
 		}
@@ -1354,12 +1492,12 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 // recurrenceRuleGeneratesStart reports whether rule itself generates dtstart,
 // which only the period containing it can. overBudget reports that the period
 // was too large to decide within recurrencePeriodWorkLimit.
-func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule) (generates, overBudget bool) {
+func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule, work *recurrenceWork) (generates, overBudget bool) {
 	// A rule with no BY part derives every candidate from the DTSTART itself.
 	if !recurrenceRuleHasOtherByPart(rule) && len(rule.BySetPos) == 0 {
 		return true, false
 	}
-	_, overBudget = visitRecurrenceCandidates(recurrencePeriodStart(dtstart, rule), dtstart, rule, func(candidate time.Time) bool {
+	_, overBudget = visitRecurrenceCandidates(recurrencePeriodStart(dtstart, rule), dtstart, rule, work, func(candidate time.Time) bool {
 		if candidate.Before(dtstart) {
 			return false
 		}
@@ -2006,6 +2144,10 @@ const (
 	unboundedRecurrenceHorizonYears = 1
 )
 
+// recurrenceRule is a parsed RRULE. Its integer BY lists are sorted and free of
+// duplicates, and its BYDAY list is free of duplicates, which is what bounds the
+// work a rule can ask of each day it is matched against however its text
+// repeats them.
 type recurrenceRule struct {
 	Freq       string
 	Interval   int
@@ -2021,6 +2163,10 @@ type recurrenceRule struct {
 	ByWeekNo   []int
 	ByDay      []weekdaySpecifier
 	BySetPos   []int
+
+	// byDaySet is ByDay in the form a day is matched against.
+	// parseRecurrenceRule builds it, as anything else assembling a rule must.
+	byDaySet weekdaySet
 }
 
 type weekdaySpecifier struct {
@@ -2114,6 +2260,7 @@ func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeR
 	if rule.ByDay, ok = parseWeekdayList(params["BYDAY"]); !ok {
 		return recurrenceRule{}, false
 	}
+	rule.byDaySet = newWeekdaySet(rule.ByDay)
 	ordinalWeekday := false
 	for _, day := range rule.ByDay {
 		if day.Ordinal != 0 {
@@ -2213,6 +2360,7 @@ func parseWeekdayList(value string) ([]weekdaySpecifier, bool) {
 	if strings.TrimSpace(value) == "" {
 		return nil, true
 	}
+	seen := make(map[weekdaySpecifier]struct{})
 	var result []weekdaySpecifier
 	for _, part := range strings.Split(value, ",") {
 		part = strings.ToUpper(strings.TrimSpace(part))
@@ -2232,7 +2380,12 @@ func parseWeekdayList(value string) ([]weekdaySpecifier, bool) {
 			}
 			ordinal = n
 		}
-		result = append(result, weekdaySpecifier{Ordinal: ordinal, Day: day})
+		spec := weekdaySpecifier{Ordinal: ordinal, Day: day}
+		if _, ok := seen[spec]; ok {
+			continue
+		}
+		seen[spec] = struct{}{}
+		result = append(result, spec)
 	}
 	return result, true
 }
@@ -2361,8 +2514,8 @@ func advanceRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // second describes about 31.5 million of them. Generating that set to answer a
 // question about its first thousand entries is work no answer needs, and the
 // PUT validation path reaches it. Exhausting the bound fails closed on
-// max-instances, as sparseRecurrenceWorkLimit does: a period this large is over
-// any instance limit the server advertises.
+// max-instances, as recurrenceWorkLimit does: a period this large is over any
+// instance limit the server advertises.
 //
 // One day cannot exceed the bound on its own -- 24 hours, 60 minutes and the 61
 // second values BYSECOND admits come to 87,840 -- so a rule is only ever refused
@@ -2371,15 +2524,55 @@ func advanceRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // is at most an hour.
 const recurrencePeriodWorkLimit = 100_000
 
+// recurrenceWorkLimit bounds the generation work one evaluation of a rule may
+// do, summed over every period it visits: a period, each day its day list
+// holds, and each candidate start those days expand to all cost one unit, and
+// the sparse scan pays a unit for each recurrenceDayMask word it reads.
+//
+// Counting periods alone bounds nothing, because what a period costs is up to
+// the rule: a yearly period can offer hundreds of days, so a rule that matches
+// rarely or never could spend minutes inside a period count that looks small.
+// Running out fails closed, like recurrencePeriodWorkLimit: validation answers
+// max-instances and expansion returns ErrRecurrenceScanLimit. The bound sits
+// well above what a rule anyone writes needs -- a daily rule for a 29th of
+// February that falls on a Monday, with a COUNT of a thousand, runs 28,000
+// years and takes about 360,000 -- and holds the costliest evaluation a rule
+// can ask for to a few tenths of a second.
+const recurrenceWorkLimit = 2_000_000
+
+// recurrenceWork is the budget one evaluation of a rule draws on.
+type recurrenceWork struct {
+	remaining int
+}
+
+func newRecurrenceWork() *recurrenceWork {
+	return &recurrenceWork{remaining: recurrenceWorkLimit}
+}
+
+// spend takes units from the budget and reports whether it held them. A budget
+// that has refused once stays exhausted.
+func (w *recurrenceWork) spend(units int) bool {
+	if units > w.remaining {
+		w.remaining = -1
+		return false
+	}
+	w.remaining -= units
+	return true
+}
+
 // visitRecurrenceCandidates hands visit each of the period's candidate starts in
 // ascending order, stopping as soon as visit returns true. Candidates are
 // streamed rather than collected so a caller that needs the first few -- every
 // caller with a COUNT, an UNTIL or an instance limit -- pays for the first few.
 //
 // stopped reports that visit asked to stop. overBudget reports that the period
-// exceeded recurrencePeriodWorkLimit, which leaves the candidate set only
-// partly visited and is never a set the caller may treat as complete.
-func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRule, visit func(time.Time) bool) (stopped, overBudget bool) {
+// exceeded recurrencePeriodWorkLimit or that work ran out, either of which
+// leaves the candidate set only partly visited and is never a set the caller
+// may treat as complete.
+func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRule, work *recurrenceWork, visit func(time.Time) bool) (stopped, overBudget bool) {
+	if !work.spend(1) {
+		return false, true
+	}
 	selector := newBySetPosSelector(rule.BySetPos, visit)
 
 	switch rule.Freq {
@@ -2387,6 +2580,9 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 		// At most one hour of minutes and seconds, so the whole period is
 		// already small enough to hold.
 		candidates := subDailyCandidatesForPeriod(periodStart, dtstart, rule)
+		if !work.spend(len(candidates)) {
+			return false, true
+		}
 		sortTimes(candidates)
 		for _, candidate := range uniqueTimes(candidates) {
 			if selector.offer(candidate) {
@@ -2412,6 +2608,9 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 	default:
 		return false, false
 	}
+	if !work.spend(len(days)) {
+		return false, true
+	}
 	// The day list is bounded by the length of the period, so ordering it here
 	// is what lets the times below stream out already sorted. It is deduplicated
 	// by calendar date rather than by instant: a DST transition can land two
@@ -2432,7 +2631,7 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 		if !dateMatchesRule(day, rule) {
 			continue
 		}
-		if perDay > budget {
+		if perDay > budget || !work.spend(perDay) {
 			return false, true
 		}
 		budget -= perDay
@@ -2566,10 +2765,7 @@ func (s *bySetPosSelector) exhausted() bool {
 }
 
 func sortTimes(values []time.Time) {
-	if len(values) < 2 {
-		return
-	}
-	sort.Slice(values, func(i, j int) bool { return values[i].Before(values[j]) })
+	slices.SortFunc(values, time.Time.Compare)
 }
 
 func subDailyCandidatesForPeriod(periodStart, dtstart time.Time, rule recurrenceRule) []time.Time {
@@ -2645,19 +2841,31 @@ func timeMatchesRule(t, dtstart time.Time, rule recurrenceRule) bool {
 }
 
 func dateMatchesRule(day time.Time, rule recurrenceRule) bool {
-	if len(rule.ByMonth) > 0 && !intInSlice(int(day.Month()), rule.ByMonth) {
+	year, month, monthDay := day.Date()
+	return civilDateMatchesRule(year, month, monthDay, day.YearDay(), day.Weekday(), rule)
+}
+
+// civilDateMatchesRule reports whether the rule's date filters admit a calendar
+// date given by its parts. RFC 5545 §3.3.10 counts a numbered BYDAY weekday
+// within the year for a YEARLY rule without BYMONTH, and within the month
+// otherwise.
+func civilDateMatchesRule(year int, month time.Month, monthDay, yearDay int, weekday time.Weekday, rule recurrenceRule) bool {
+	if len(rule.ByMonth) > 0 && !intInSlice(int(month), rule.ByMonth) {
 		return false
 	}
-	if len(rule.ByMonthDay) > 0 && !monthDayMatches(day, rule.ByMonthDay) {
+	if len(rule.ByMonthDay) > 0 && !dayNumberMatches(monthDay, daysInMonth(year, month), rule.ByMonthDay) {
 		return false
 	}
-	if len(rule.ByYearDay) > 0 && !yearDayMatches(day, rule.ByYearDay) {
+	if len(rule.ByYearDay) > 0 && !dayNumberMatches(yearDay, daysInYear(year), rule.ByYearDay) {
 		return false
 	}
-	if len(rule.ByDay) > 0 && !weekdayMatchesForRule(day, rule) {
-		return false
+	if len(rule.ByDay) == 0 {
+		return true
 	}
-	return true
+	if rule.Freq == "YEARLY" && len(rule.ByMonth) == 0 {
+		return rule.byDaySet.contains(weekday, yearDay, daysInYear(year))
+	}
+	return rule.byDaySet.contains(weekday, monthDay, daysInMonth(year, month))
 }
 
 func intMatchesOrDefault(value int, allowed []int, fallback int) bool {
@@ -2771,8 +2979,13 @@ func yearlyDays(year int, dtstart time.Time, rule recurrenceRule) []time.Time {
 	return days
 }
 
+// daysByWeekNoInYear lists the days of the numbered weeks. A week named both
+// from the start and from the end is listed twice; visitRecurrenceCandidates
+// orders and deduplicates the day list it generates, as it does for every
+// frequency.
 func daysByWeekNoInYear(year int, weekNumbers []int, wkst time.Weekday, loc *time.Location) []time.Time {
 	weeks := weeksInYear(year, wkst)
+	firstWeek := firstWeekStart(year, wkst, loc)
 	var days []time.Time
 	for _, weekNo := range weekNumbers {
 		resolved := weekNo
@@ -2782,13 +2995,12 @@ func daysByWeekNoInYear(year int, weekNumbers []int, wkst time.Weekday, loc *tim
 		if resolved < 1 || resolved > weeks {
 			continue
 		}
-		weekStart := firstWeekStart(year, wkst, loc).AddDate(0, 0, (resolved-1)*7)
+		weekStart := firstWeek.AddDate(0, 0, (resolved-1)*7)
 		for day := 0; day < 7; day++ {
 			days = append(days, weekStart.AddDate(0, 0, day))
 		}
 	}
-	sortTimes(days)
-	return uniqueTimes(days)
+	return days
 }
 
 func weeksInYear(year int, wkst time.Weekday) int {
@@ -2817,13 +3029,7 @@ func hasOrdinalWeekday(specifiers []weekdaySpecifier) bool {
 }
 
 func daysByWeekdayInYear(year int, specifiers []weekdaySpecifier, loc *time.Location) []time.Time {
-	return daysByWeekday(daysInYear(year), specifiers, func(day int) time.Time {
-		return time.Date(year, 1, day, 0, 0, 0, 0, loc)
-	})
-}
-
-func nthWeekdayInYear(year int, spec weekdaySpecifier, loc *time.Location) (time.Time, bool) {
-	return nthWeekday(daysInYear(year), spec, func(day int) time.Time {
+	return daysByWeekday(daysInYear(year), civilWeekday(year, time.January, 1), specifiers, func(day int) time.Time {
 		return time.Date(year, 1, day, 0, 0, 0, 0, loc)
 	})
 }
@@ -2841,99 +3047,97 @@ func resolveMonthDay(year int, month time.Month, monthDay int, loc *time.Locatio
 }
 
 func daysByWeekdayInMonth(year int, month time.Month, specifiers []weekdaySpecifier, loc *time.Location) []time.Time {
-	return daysByWeekday(daysInMonth(year, month), specifiers, func(day int) time.Time {
+	return daysByWeekday(daysInMonth(year, month), civilWeekday(year, month, 1), specifiers, func(day int) time.Time {
 		return time.Date(year, month, day, 0, 0, 0, 0, loc)
 	})
 }
 
-func nthWeekdayInMonth(year int, month time.Month, spec weekdaySpecifier, loc *time.Location) (time.Time, bool) {
-	return nthWeekday(daysInMonth(year, month), spec, func(day int) time.Time {
-		return time.Date(year, month, day, 0, 0, 0, 0, loc)
-	})
-}
-
-func daysByWeekday(dayCount int, specifiers []weekdaySpecifier, dayAt func(int) time.Time) []time.Time {
+// daysByWeekday lists the days a BYDAY list names in a month or year of
+// dayCount days whose first day is a firstWeekday. Each day number is computed
+// rather than found by walking the period, so the cost is the days produced and
+// not the specifiers times the length of the period.
+func daysByWeekday(dayCount int, firstWeekday time.Weekday, specifiers []weekdaySpecifier, dayAt func(int) time.Time) []time.Time {
 	var days []time.Time
 	for _, spec := range specifiers {
-		if spec.Ordinal != 0 {
-			if day, ok := nthWeekday(dayCount, spec, dayAt); ok {
-				days = append(days, day)
+		first := firstDayNumberOfWeekday(firstWeekday, spec.Day)
+		if spec.Ordinal == 0 {
+			for day := first; day <= dayCount; day += 7 {
+				days = append(days, dayAt(day))
 			}
 			continue
 		}
-		for day := 1; day <= dayCount; day++ {
-			candidate := dayAt(day)
-			if candidate.Weekday() == spec.Day {
-				days = append(days, candidate)
-			}
+		day := first + 7*(spec.Ordinal-1)
+		if spec.Ordinal < 0 {
+			last := first + 7*((dayCount-first)/7)
+			day = last + 7*(spec.Ordinal+1)
+		}
+		if day >= 1 && day <= dayCount {
+			days = append(days, dayAt(day))
 		}
 	}
 	return days
 }
 
-func nthWeekday(dayCount int, spec weekdaySpecifier, dayAt func(int) time.Time) (time.Time, bool) {
-	if spec.Ordinal == 0 {
-		return time.Time{}, false
-	}
-	day, step, countStep := 1, 1, 1
-	if spec.Ordinal < 0 {
-		day, step, countStep = dayCount, -1, -1
-	}
-	count := 0
-	for ; day >= 1 && day <= dayCount; day += step {
-		candidate := dayAt(day)
-		if candidate.Weekday() != spec.Day {
-			continue
-		}
-		count += countStep
-		if count == spec.Ordinal {
-			return candidate, true
-		}
-	}
-	return time.Time{}, false
+// firstDayNumberOfWeekday is the 1-based number of the first weekday in a month
+// or year whose first day is a firstWeekday.
+func firstDayNumberOfWeekday(firstWeekday, weekday time.Weekday) int {
+	return 1 + (int(weekday)-int(firstWeekday)+7)%7
 }
 
-func monthDayMatches(day time.Time, allowed []int) bool {
-	monthDay := day.Day()
-	negativeDay := day.Day() - daysInMonth(day.Year(), day.Month()) - 1
-	return intInSlice(monthDay, allowed) || intInSlice(negativeDay, allowed)
+// civilWeekday is the weekday of a calendar date, which no time zone changes.
+func civilWeekday(year int, month time.Month, day int) time.Weekday {
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC).Weekday()
 }
 
-func yearDayMatches(day time.Time, allowed []int) bool {
-	yearDay := day.YearDay()
-	negativeDay := day.YearDay() - daysInYear(day.Year()) - 1
-	return intInSlice(yearDay, allowed) || intInSlice(negativeDay, allowed)
+// dayNumberMatches reports whether allowed names the day at position (1-based)
+// of a month or year length days long, counted from its start or its end.
+// allowed is sorted by parseRecurrenceRule: BYYEARDAY can name 732 values, and
+// scanning them for every day a period offers would make the day the unit of a
+// quadratic cost.
+func dayNumberMatches(position, length int, allowed []int) bool {
+	return sortedIntsContain(allowed, position) || sortedIntsContain(allowed, position-length-1)
 }
 
-func weekdayMatches(day time.Time, allowed []weekdaySpecifier) bool {
-	for _, spec := range allowed {
-		if spec.Ordinal == 0 && day.Weekday() == spec.Day {
-			return true
-		}
-		if spec.Ordinal != 0 {
-			if t, ok := nthWeekdayInMonth(day.Year(), day.Month(), spec, day.Location()); ok && sameDate(t, day) {
-				return true
-			}
+func sortedIntsContain(sorted []int, value int) bool {
+	i := sort.SearchInts(sorted, value)
+	return i < len(sorted) && sorted[i] == value
+}
+
+// weekdaySet is a BYDAY list as a lookup. A day is the nth of its weekday
+// counted from either end of its month or year by its position alone, so
+// matching it costs the same however many specifiers the list holds -- and a
+// deduplicated list can still hold 749.
+type weekdaySet struct {
+	every [7]bool
+	// fromStart and fromEnd carry bit n for the ordinals n and -n; parsing caps
+	// an ordinal at 53.
+	fromStart [7]uint64
+	fromEnd   [7]uint64
+}
+
+func newWeekdaySet(specifiers []weekdaySpecifier) weekdaySet {
+	var set weekdaySet
+	for _, spec := range specifiers {
+		switch {
+		case spec.Ordinal == 0:
+			set.every[spec.Day] = true
+		case spec.Ordinal > 0:
+			set.fromStart[spec.Day] |= 1 << spec.Ordinal
+		default:
+			set.fromEnd[spec.Day] |= 1 << -spec.Ordinal
 		}
 	}
-	return false
+	return set
 }
 
-func weekdayMatchesForRule(day time.Time, rule recurrenceRule) bool {
-	if rule.Freq == "YEARLY" && len(rule.ByMonth) == 0 {
-		for _, spec := range rule.ByDay {
-			if spec.Ordinal == 0 && day.Weekday() == spec.Day {
-				return true
-			}
-			if spec.Ordinal != 0 {
-				if t, ok := nthWeekdayInYear(day.Year(), spec, day.Location()); ok && sameDate(t, day) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	return weekdayMatches(day, rule.ByDay)
+// contains reports whether the day numbered position (1-based) of a month or
+// year length days long, falling on weekday, is in the set.
+func (s weekdaySet) contains(weekday time.Weekday, position, length int) bool {
+	fromStart := (position-1)/7 + 1
+	fromEnd := (length-position)/7 + 1
+	return s.every[weekday] ||
+		s.fromStart[weekday]&(1<<fromStart) != 0 ||
+		s.fromEnd[weekday]&(1<<fromEnd) != 0
 }
 
 func uniqueTimes(values []time.Time) []time.Time {
@@ -2958,10 +3162,13 @@ func uniqueDates(values []time.Time) []time.Time {
 		return values
 	}
 	unique := values[:1]
+	lastYear, lastMonth, lastDay := values[0].Date()
 	for _, value := range values[1:] {
-		if sameDate(value, unique[len(unique)-1]) {
+		year, month, day := value.Date()
+		if year == lastYear && month == lastMonth && day == lastDay {
 			continue
 		}
+		lastYear, lastMonth, lastDay = year, month, day
 		unique = append(unique, value)
 	}
 	return unique
@@ -2976,8 +3183,4 @@ func daysInYear(year int) int {
 		return 366
 	}
 	return 365
-}
-
-func sameDate(a, b time.Time) bool {
-	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
 }

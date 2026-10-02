@@ -104,3 +104,117 @@ func TestRecurrenceReportsHandleIncompleteExpansion(t *testing.T) {
 		})
 	}
 }
+
+// A rule whose BY parts can never hold together -- the twenty-sixth weekday of
+// a year always falls after the 23rd of June -- describes the DTSTART alone. On
+// the PUT gate, as a VTIMEZONE observance, and stored under free-busy and an
+// open-ended calendar-query, that has to be answered exactly and promptly: the
+// 316-byte object once took ten minutes of CPU on each, and repeating its BYDAY
+// list multiplied that. A daily or hourly rule for a date that does not exist,
+// the 30th of February, is the same answer reached through the scan that
+// follows a rule day by day.
+func TestNeverMatchingRecurrenceIsAnsweredPromptly(t *testing.T) {
+	monthDays := make([]string, 0, 22)
+	for day := 2; day <= 23; day++ {
+		monthDays = append(monthDays, fmt.Sprint(day))
+	}
+	ordinals := "26MO,26TU,26WE,26TH,26FR,26SA,26SU"
+	never := "FREQ=YEARLY;BYMONTHDAY=" + strings.Join(monthDays, ",")
+	rule := never + ";COUNT=2;BYDAY=" + ordinals
+	repeated := never + ";COUNT=2;BYDAY=" + strings.Repeat(ordinals+",", 99) + ordinals
+	stored := map[string]string{
+		"yearly": rule,
+		"daily":  "FREQ=DAILY;COUNT=2;BYMONTH=2;BYMONTHDAY=30",
+		"hourly": "FREQ=HOURLY;BYMONTH=2;BYMONTHDAY=30",
+	}
+
+	event := func(rrule string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Review//EN\r\nBEGIN:VEVENT\r\nUID:never\r\nDTSTAMP:20260101T000000Z\r\n" +
+			"DTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\nRRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	// RFC 5545 §3.6.5 gives an observance no COUNT, so its rule runs forever.
+	observance := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Review//EN\r\n" +
+		"BEGIN:VTIMEZONE\r\nTZID:Review/Never\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\n" +
+		"BEGIN:DAYLIGHT\r\nDTSTART:19700102T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0100\r\nRRULE:" + never + ";BYDAY=" + ordinals + "\r\nEND:DAYLIGHT\r\n" +
+		"END:VTIMEZONE\r\n" +
+		"BEGIN:VEVENT\r\nUID:never\r\nDTSTAMP:20260101T000000Z\r\n" +
+		"DTSTART;TZID=Review/Never:20260101T090000\r\nDTEND;TZID=Review/Never:20260101T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	// evaluate runs on its own goroutine, which may outlive the test, so it
+	// leaves its assertions to the caller. The budget is not asserted under the
+	// race detector, whose per-access cost would decide it.
+	promptly := func(t *testing.T, evaluate func()) {
+		t.Helper()
+		const budget, hardLimit = 500 * time.Millisecond, 10 * time.Second
+		done := make(chan time.Duration, 1)
+		go func() {
+			started := time.Now()
+			evaluate()
+			done <- time.Since(started)
+		}()
+		select {
+		case elapsed := <-done:
+			if elapsed > budget && !raceDetectorEnabled {
+				t.Errorf("took %v, want at most %v", elapsed, budget)
+			}
+		case <-time.After(hardLimit):
+			t.Fatalf("did not return within %v", hardLimit)
+		}
+	}
+
+	putBodies := map[string]string{
+		"repeated BYDAY":       event(repeated),
+		"VTIMEZONE observance": observance,
+	}
+	for name, rrule := range stored {
+		putBodies[name+" rule"] = event(rrule)
+	}
+	for name, raw := range putBodies {
+		t.Run("PUT validation/"+name, func(t *testing.T) {
+			var fault *calendarObjectFault
+			promptly(t, func() {
+				_, fault = validateCalendarObjectForStorage(raw, nil)
+			})
+			if fault != nil {
+				t.Errorf("refused: %+v", fault)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name, body, want, absent string
+		status                   int
+	}{
+		{
+			name:   "free-busy",
+			body:   `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav"><C:time-range start="20260101T000000Z" end="20360101T000000Z"/></C:free-busy-query>`,
+			want:   "FREEBUSY:20260101T090000Z/20260101T100000Z",
+			absent: "FREEBUSY:2027",
+			status: 200,
+		},
+		{
+			name:   "open-ended calendar-query",
+			body:   `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260102T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`,
+			absent: "never.ics",
+			status: 207,
+		},
+	} {
+		for name, rrule := range stored {
+			t.Run(test.name+"/"+name, func(t *testing.T) {
+				h := hostileRecurrenceServer()
+				h.store.Events = &fakeEventRepo{events: map[string]*store.Event{"1:never": {ID: 1, CalendarID: 1, UID: "never", ResourceName: "never", ETag: "e", RawICAL: event(rrule)}}}
+				req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(test.body))
+				req.Header.Set("Depth", "1")
+				rr := httptest.NewRecorder()
+				promptly(t, func() {
+					h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
+				})
+				body := rr.Body.String()
+				if rr.Code != test.status || !strings.Contains(body, test.want) || strings.Contains(body, test.absent) {
+					t.Fatalf("%d %s", rr.Code, body)
+				}
+			})
+		}
+	}
+}

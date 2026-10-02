@@ -2,8 +2,10 @@ package ical
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -968,7 +970,7 @@ func TestVisitRecurrenceCandidatesDedupesDayListByCalendarDate(t *testing.T) {
 	periodStart := recurrencePeriodStart(dtstart, rule)
 
 	var got []time.Time
-	visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
+	visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(current time.Time) bool {
 		got = append(got, current)
 		return false
 	})
@@ -1018,7 +1020,7 @@ func TestVisitRecurrenceCandidatesBySetPosOverDeduplicatedDayList(t *testing.T) 
 			periodStart := recurrencePeriodStart(dtstart, rule)
 
 			var got []time.Time
-			visitRecurrenceCandidates(periodStart, dtstart, rule, func(current time.Time) bool {
+			visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(current time.Time) bool {
 				got = append(got, current)
 				return false
 			})
@@ -1062,7 +1064,7 @@ func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
 	}
 
 	occurrences := 0
-	exceeds, handled := finishSparseRecurrence(dtstart, dtstart, rule, &occurrences, func(time.Time) bool {
+	exceeds, handled := finishSparseRecurrence(dtstart, dtstart, rule, newRecurrenceWork(), &occurrences, func(time.Time) bool {
 		return false
 	})
 	if !handled || !exceeds {
@@ -1330,6 +1332,233 @@ func TestUnreachableBySetPosIsAnsweredWithoutScanning(t *testing.T) {
 				t.Errorf("RecurringBusyPeriods() = %v, want the DTSTART alone", periods)
 			}
 		})
+	}
+}
+
+// finishesWithin runs evaluate, which returns what it found wrong or "" for
+// nothing, and fails the test with that, or if evaluate takes longer than
+// budget, or does not return at all within the hard limit. evaluate runs on its
+// own goroutine, which may outlive the test, so it reports rather than calling
+// t. The budget is not asserted under the race detector, whose per-access cost
+// would decide it.
+func finishesWithin(t *testing.T, budget time.Duration, evaluate func() string) {
+	t.Helper()
+	const hardLimit = 10 * time.Second
+	type outcome struct {
+		problem string
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		started := time.Now()
+		problem := evaluate()
+		done <- outcome{problem: problem, elapsed: time.Since(started)}
+	}()
+	select {
+	case got := <-done:
+		if got.problem != "" {
+			t.Error(got.problem)
+		}
+		if got.elapsed > budget && !raceDetectorEnabled {
+			t.Errorf("took %v, want at most %v", got.elapsed, budget)
+		}
+	case <-time.After(hardLimit):
+		t.Fatalf("did not return within %v", hardLimit)
+	}
+}
+
+// A rule whose BY parts can never be satisfied together generates nothing past
+// its DTSTART. The twenty-sixth weekday of a year falls between the 24th of June
+// and the 1st of July, so no BYMONTHDAY from 2 to 23 can ever hold one. Every
+// period pattern of the Gregorian calendar repeats after 400 years, so that is
+// known once one cycle of periods has been generated: scanning further is work
+// no answer needs, and on this 316-byte rule it came to ten minutes of CPU per
+// evaluation, with a duplicated BYDAY list multiplying it. Each entry point a
+// stored rule reaches -- the PUT gate, free-busy, an open-ended calendar-query
+// and a VTIMEZONE observance -- has to answer it exactly and promptly.
+//
+// A daily or sub-daily rule's cycle is more periods than the period scan
+// covers, so the same answer has to come from the rule itself: a date its
+// filters can never admit, or a clock its interval can never reach, is known
+// without generating a single period.
+func TestNeverMatchingRuleIsAnsweredWithinOneCalendarCycle(t *testing.T) {
+	yearOrdinals := "26MO,26TU,26WE,26TH,26FR,26SA,26SU"
+	yearly := ";BYMONTHDAY=" + rangeInts(2, 23) + ";BYDAY=" + yearOrdinals
+	// The second weekday of a month falls between its 8th and 14th days.
+	monthly := ";BYMONTHDAY=" + rangeInts(1, 7) + ";BYDAY=2MO,2TU,2WE,2TH,2FR,2SA,2SU"
+	// February has no 30th.
+	daily := ";BYMONTH=2;BYMONTHDAY=30"
+	rules := map[string]string{
+		"daily with COUNT":      "FREQ=DAILY;COUNT=2" + daily,
+		"daily without an end":  "FREQ=DAILY" + daily,
+		"hourly with COUNT":     "FREQ=HOURLY;COUNT=2" + daily,
+		"hourly without an end": "FREQ=HOURLY" + daily,
+		// Every date is admitted, but five-second steps from :00 never reach :22.
+		"secondly off its interval": "FREQ=SECONDLY;INTERVAL=5;BYSECOND=22;COUNT=5",
+		"yearly with COUNT":         "FREQ=YEARLY;COUNT=2" + yearly,
+		"yearly with UNTIL":         "FREQ=YEARLY;UNTIL=99991231T000000Z" + yearly,
+		"yearly without an end":     "FREQ=YEARLY" + yearly,
+		"yearly with BYDAY repeats": "FREQ=YEARLY;COUNT=2;BYMONTHDAY=" + rangeInts(2, 23) + ";BYDAY=" + strings.Repeat(yearOrdinals+",", 99) + yearOrdinals,
+		"yearly every third year":   "FREQ=YEARLY;INTERVAL=3;COUNT=2" + yearly,
+		"monthly with COUNT":        "FREQ=MONTHLY;COUNT=2" + monthly,
+		"monthly without an end":    "FREQ=MONTHLY" + monthly,
+	}
+	const budget = 250 * time.Millisecond
+	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	for name, rule := range rules {
+		t.Run(name, func(t *testing.T) {
+			raw := recurringTestComponent(rule)
+
+			t.Run("PUT validation", func(t *testing.T) {
+				finishesWithin(t, budget, func() string {
+					exceeds, valid := RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances)
+					if !valid || exceeds {
+						return fmt.Sprintf("RecurrenceSetExceedsLimit() = (exceeds=%t, valid=%t), want (false, true): the set is the DTSTART alone", exceeds, valid)
+					}
+					return ""
+				})
+			})
+			t.Run("free-busy", func(t *testing.T) {
+				finishesWithin(t, budget, func() string {
+					periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(100, 0, 0), MaxRecurrenceInstances, nil)
+					if err != nil || len(periods) != 1 || !periods[0].Start.Equal(dtstart) {
+						return fmt.Sprintf("RecurringBusyPeriods() = (%v, %v), want the DTSTART alone", periods, err)
+					}
+					return ""
+				})
+			})
+			t.Run("open-ended calendar-query", func(t *testing.T) {
+				finishesWithin(t, budget, func() string {
+					instances, err := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart, RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
+					if err != nil || len(instances) != 1 || !instances[0].Start.Equal(dtstart) {
+						return fmt.Sprintf("RecurrenceInstances() = (%v, %v), want the DTSTART alone", instances, err)
+					}
+					return ""
+				})
+			})
+			t.Run("VTIMEZONE observance", func(t *testing.T) {
+				finishesWithin(t, budget, func() string {
+					latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, dtstart.AddDate(500, 0, 0), rule)
+					if !found || !complete || !latest.Equal(dtstart) {
+						return fmt.Sprintf("LatestRecurrenceOnOrBefore() = (%v, found=%t, complete=%t), want the DTSTART, found and complete", latest, found, complete)
+					}
+					return ""
+				})
+			})
+		})
+	}
+}
+
+// The sparse scan pays for the days a rule's date filters admit, not for the
+// calendar days between them, so a rule whose days are centuries apart is
+// still followed exactly: validated against its COUNT, and expanded to the end
+// of an open-ended range.
+func TestRareDailyRuleIsFollowedToItsEnd(t *testing.T) {
+	const budget = 250 * time.Millisecond
+	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, rule := range []string{
+		// Every other leap day: 1,461 days separate two of them, so
+		// INTERVAL=2 reaches one leap day in two. A thousand span 8,000 years.
+		"FREQ=DAILY;INTERVAL=2;COUNT=1000;BYMONTH=2;BYMONTHDAY=29",
+		// A leap day falling on a Monday or a Tuesday: 28 in 400 years.
+		"FREQ=DAILY;COUNT=1000;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO,TU",
+		"FREQ=HOURLY;COUNT=1000;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO,TU;BYHOUR=9",
+	} {
+		t.Run("PUT validation/"+rule, func(t *testing.T) {
+			finishesWithin(t, budget, func() string {
+				exceeds, valid := RecurrenceSetExceedsLimit(recurringTestComponent(rule), MaxRecurrenceInstances)
+				if !valid || exceeds {
+					return fmt.Sprintf("RecurrenceSetExceedsLimit() = (exceeds=%t, valid=%t), want (false, true): COUNT holds the set to the limit", exceeds, valid)
+				}
+				return ""
+			})
+		})
+	}
+
+	t.Run("open-ended calendar-query", func(t *testing.T) {
+		var want []string
+		for year := dtstart.Year(); year <= RecurrenceUntilSentinel.Year(); year++ {
+			if day := time.Date(year, time.February, 29, 0, 0, 0, 0, time.UTC); day.Month() == time.February && day.Weekday() == time.Monday {
+				want = append(want, day.Format(time.DateOnly))
+			}
+		}
+		raw := recurringTestComponent("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO")
+		finishesWithin(t, budget, func() string {
+			instances, err := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart.AddDate(0, 0, 1), RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
+			if err != nil {
+				return fmt.Sprintf("RecurrenceInstances() err = %v, want every leap-day Monday to the end of the range", err)
+			}
+			got := make([]string, 0, len(instances))
+			for _, instance := range instances {
+				got = append(got, instance.Start.Format(time.DateOnly))
+			}
+			if !slices.Equal(got, want) {
+				return fmt.Sprintf("RecurrenceInstances() = %d starts from %v, want %d from %v", len(got), got[:min(3, len(got))], len(want), want[:3])
+			}
+			return ""
+		})
+	})
+}
+
+// The generation a rule costs is bounded however it spreads across periods. The
+// 29th of February is always the ninth of its weekday in the year, so this rule
+// selects it when it falls on a Monday -- fourteen times in 400 years -- while
+// every one of its yearly periods generates 732 days. Its thousand instances
+// span about 28,000 years, which is within the period limit and far beyond the
+// work limit, so each entry point fails closed rather than spend seconds on it:
+// validation answers max-instances, expansion ErrRecurrenceScanLimit, and the
+// observance search an incomplete answer.
+func TestRecurrenceWorkIsBoundedAcrossPeriods(t *testing.T) {
+	var yearDays []string
+	for day := 1; day <= 366; day++ {
+		yearDays = append(yearDays, strconv.Itoa(day), strconv.Itoa(-day))
+	}
+	rule := "FREQ=YEARLY;COUNT=1000;BYYEARDAY=" + strings.Join(yearDays, ",") + ";BYMONTHDAY=29;BYDAY=9MO"
+	raw := recurringTestComponent(rule)
+	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	farAhead := dtstart.AddDate(20_000, 0, 0)
+	const budget = time.Second
+
+	t.Run("PUT validation", func(t *testing.T) {
+		finishesWithin(t, budget, func() string {
+			exceeds, valid := RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances)
+			if !valid || !exceeds {
+				return fmt.Sprintf("RecurrenceSetExceedsLimit() = (exceeds=%t, valid=%t), want (true, true)", exceeds, valid)
+			}
+			return ""
+		})
+	})
+	t.Run("expansion", func(t *testing.T) {
+		finishesWithin(t, budget, func() string {
+			_, err := RecurringBusyPeriods(raw, dtstart, time.Hour, farAhead, farAhead.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+			if !errors.Is(err, ErrRecurrenceScanLimit) {
+				return fmt.Sprintf("RecurringBusyPeriods() err = %v, want ErrRecurrenceScanLimit", err)
+			}
+			return ""
+		})
+	})
+	t.Run("VTIMEZONE observance", func(t *testing.T) {
+		finishesWithin(t, budget, func() string {
+			if _, _, complete := LatestRecurrenceOnOrBefore(dtstart, farAhead, rule); complete {
+				return "LatestRecurrenceOnOrBefore() complete = true, want false"
+			}
+			return ""
+		})
+	})
+}
+
+// A BYDAY list costs whatever its distinct specifiers cost, however often the
+// text repeats them.
+func TestParseRecurrenceRuleDeduplicatesByDay(t *testing.T) {
+	rule, ok := parseRecurrenceRule("FREQ=MONTHLY;BYDAY="+strings.Repeat("MO,2TU,-1FR,+2TU,", 100)+"MO", time.UTC, nil)
+	if !ok {
+		t.Fatal("parseRecurrenceRule() ok = false")
+	}
+	want := []weekdaySpecifier{{Day: time.Monday}, {Ordinal: 2, Day: time.Tuesday}, {Ordinal: -1, Day: time.Friday}}
+	if !slices.Equal(rule.ByDay, want) {
+		t.Fatalf("ByDay = %+v, want %+v", rule.ByDay, want)
 	}
 }
 
@@ -2012,7 +2241,7 @@ func TestRecurrenceCandidateBoundIsNeverBelowWhatAPeriodOffers(t *testing.T) {
 			// differs from the first one is covered too.
 			for period := 0; period < 40; period++ {
 				offered := 0
-				_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, func(time.Time) bool {
+				_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(time.Time) bool {
 					offered++
 					return false
 				})
