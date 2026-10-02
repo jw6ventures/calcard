@@ -188,6 +188,9 @@ func TestCalendarMultigetFallsBackToResolvedCollectionPrivileges(t *testing.T) {
 
 func (f *fakeContactRepo) ListForBookPageAfter(ctx context.Context, bookID, afterID int64, limit int) ([]store.Contact, error) {
 	f.pageLookupCount++
+	if f.listPageErr != nil {
+		return nil, f.listPageErr
+	}
 	contacts, err := f.ListForBook(ctx, bookID)
 	if err != nil {
 		return nil, err

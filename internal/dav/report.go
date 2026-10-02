@@ -186,6 +186,9 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			http.Error(w, "calendar not found", http.StatusNotFound)
 			return
 		}
+		if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+			return
+		}
 		h.logger().Error("Report", "failed to resolve calendar for %s: %v", cleanPath, err)
 		http.Error(w, "failed to resolve calendar", http.StatusInternalServerError)
 		return
@@ -197,6 +200,9 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	if resourceName != "" && report.XMLName.Local == "calendar-multiget" {
 		equivalent, err := h.calendarMultigetHrefIdentifiesResource(r.Context(), user, calID, resourceName, report.Hrefs[0], r)
 		if err != nil {
+			if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+				return
+			}
 			http.Error(w, "failed to resolve calendar-multiget href", http.StatusInternalServerError)
 			return
 		}
@@ -217,6 +223,9 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calID, cleanPath, loadPrivilege)
 	if err != nil {
+		if !collectionLoadRefused(err) && h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+			return
+		}
 		if report.XMLName.Local == "free-busy-query" {
 			_ = writePrivilegeRequirementError(w, requirePrivatePrivilegeAt(err, cleanPath, loadPrivilege))
 			return
@@ -242,7 +251,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		// matches, answered without reading the collection at all.
 		var freeBusyData string
 		if freeBusyExcludedByDepth(r, report) {
-			freeBusyData, _ = h.generateFreeBusy(nil, report.TimeRange)
+			freeBusyData, _ = h.generateFreeBusy(r.Context(), nil, report.TimeRange)
 		} else {
 			var err error
 			freeBusyData, err = h.freeBusyQuery(r.Context(), user, cal, report.TimeRange)
@@ -281,9 +290,46 @@ func (h *DavServer) writeReportMultiStatus(w http.ResponseWriter, r *http.Reques
 // answered ones use, so a client that received no responses and one that
 // received a refusal are told apart in the log.
 func (h *DavServer) writeReportFailure(w http.ResponseWriter, r *http.Request, reportName string, err error) {
+	if h.answerAbandonedReport(w, r, reportName, err) {
+		return
+	}
 	h.logger().Error("Report", "%s failed for %s: %v", reportName, r.URL.Path, err)
 	writeReportError(w, err)
 }
+
+// answerAbandonedReport answers a REPORT that failed after its client closed
+// the request, and reports whether it did. Nobody reads that answer, so the
+// status only records why the report stopped. Only the cancellation itself is
+// not the server's failure: one that merely coincided with the client leaving
+// is still logged as the failure it is.
+//
+// net/http ends a request's context with context.Canceled when the client goes
+// away. A deadline ends it with context.DeadlineExceeded instead, and a client
+// still waiting on a report the server could not finish in time is owed the
+// server's failure, so that is left to the caller.
+func (h *DavServer) answerAbandonedReport(w http.ResponseWriter, r *http.Request, reportName string, err error) bool {
+	if !errors.Is(r.Context().Err(), context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || store.IsQueryCanceled(err) {
+		h.logger().Debug("Report", "%s abandoned by the client for %s: %v", reportName, r.URL.Path, err)
+	} else {
+		h.logger().Error("Report", "%s failed for %s after the client left: %v", reportName, r.URL.Path, err)
+	}
+	w.WriteHeader(statusClientClosedRequest)
+	return true
+}
+
+// collectionLoadRefused reports whether loading a report's collection failed
+// with an answer for the client -- absent, or not theirs to read -- rather
+// than a failure of the server's.
+func collectionLoadRefused(err error) bool {
+	return errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) || isPrivilegeNotGranted(err)
+}
+
+// statusClientClosedRequest is the nonstandard 499 proxies such as nginx log
+// for a request the client closed before it was answered.
+const statusClientClosedRequest = 499
 
 // writeReportError answers a failed REPORT. The sentinels are shared by the
 // calendar, birthday and address book paths, so the mapping from one to its
@@ -342,20 +388,20 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 					h.writeReportFailure(w, r, report.XMLName.Local, errNumberOfMatchesExceeded)
 					return
 				}
-				http.Error(w, "failed to generate birthday events", http.StatusInternalServerError)
+				h.writeReportFailure(w, r, report.XMLName.Local, fmt.Errorf("failed to generate birthday events: %w", err))
 				return
 			}
 			// Free-busy carries no CALDAV:timezone element of its own, and the
 			// generated birthday collection defines no
 			// CALDAV:calendar-timezone, so §7.3 leaves UTC as the only source
 			// for a floating value.
-			candidates, err = filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, floatingZone{}), report.TimeRange)
+			candidates, err = filterFreeBusyCandidatesByTimeRange(r.Context(), freeBusyCandidates(events, floatingZone{}), report.TimeRange)
 			if err != nil {
 				h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
 				return
 			}
 		}
-		freeBusyData, err := h.generateFreeBusy(candidates, report.TimeRange)
+		freeBusyData, err := h.generateFreeBusy(r.Context(), candidates, report.TimeRange)
 		if err != nil {
 			h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
 			return
@@ -431,6 +477,9 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 			http.Error(w, "address book not found", http.StatusNotFound)
 			return
 		}
+		if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+			return
+		}
 		http.Error(w, "failed to resolve address book", http.StatusInternalServerError)
 		return
 	}
@@ -460,6 +509,9 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 
 	book, err := h.loadAddressBookWithPrivilege(r.Context(), user, bookID, cleanPath, "read")
 	if err != nil {
+		if !collectionLoadRefused(err) && h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+			return
+		}
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
 			writeNeedPrivileges(w, cleanPath, "read")
 			return

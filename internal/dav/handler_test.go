@@ -8026,6 +8026,10 @@ type fakeEventRepo struct {
 	batchResourceLookupCount int
 	listForCalendarCalls     int
 	pageLookupCount          int
+	// listPageErr fails every ListForCalendarPageAfter call when set.
+	listPageErr error
+	// listByResourceNamesErr fails every ListByResourceNames call when set.
+	listByResourceNamesErr   error
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -8107,6 +8111,9 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 
 func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
 	f.batchResourceLookupCount++
+	if f.listByResourceNamesErr != nil {
+		return nil, f.listByResourceNamesErr
+	}
 	wanted := make(map[string]struct{}, len(resourceNames))
 	for _, name := range resourceNames {
 		wanted[name] = struct{}{}
@@ -8142,6 +8149,9 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 
 func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
 	f.pageLookupCount++
+	if f.listPageErr != nil {
+		return nil, f.listPageErr
+	}
 	var result []store.Event
 	for _, event := range f.events {
 		if event.CalendarID == calendarID && (event.ID > afterID || afterID == 0 && event.ID == 0) && f.keeps(*event, filter) {
@@ -8463,7 +8473,11 @@ func (e *errorEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toC
 }
 
 type fakeContactRepo struct {
-	contacts                 map[string]*store.Contact
+	contacts map[string]*store.Contact
+	// listPageErr fails every ListForBookPageAfter call when set.
+	listPageErr error
+	// listByResourceNamesErr fails every ListByResourceNames call when set.
+	listByResourceNamesErr   error
 	deleted                  []string
 	copyErr                  error
 	moveErr                  error
@@ -8661,6 +8675,9 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 
 func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]store.Contact, error) {
 	f.batchResourceLookupCount++
+	if f.listByResourceNamesErr != nil {
+		return nil, f.listByResourceNamesErr
+	}
 	wanted := make(map[string]struct{}, len(resourceNames))
 	for _, name := range resourceNames {
 		wanted[name] = struct{}{}
@@ -8761,6 +8778,8 @@ type fakeCalendarRepo struct {
 	listAccessibleCalls int
 	getByIDCalls        int
 	deleteErr           error
+	// accessErr fails every GetAccessible and ListAccessible call when set.
+	accessErr error
 }
 
 type fakeCalendarStateCreator struct {
@@ -8870,6 +8889,9 @@ func (f *fakeCalendarRepo) ListByUser(ctx context.Context, userID int64) ([]stor
 
 func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]store.CalendarAccess, error) {
 	f.listAccessibleCalls++
+	if f.accessErr != nil {
+		return nil, f.accessErr
+	}
 	if f.accessibleByUser != nil {
 		return f.accessibleByUser[userID], nil
 	}
@@ -8877,6 +8899,9 @@ func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]
 }
 
 func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*store.CalendarAccess, error) {
+	if f.accessErr != nil {
+		return nil, f.accessErr
+	}
 	if f.accessibleByUser != nil {
 		for _, c := range f.accessibleByUser[userID] {
 			if c.ID == calendarID {
@@ -8983,6 +9008,8 @@ type fakeAddressBookRepo struct {
 	accessibleByUser    map[int64][]store.AddressBook
 	listAccessibleCalls int
 	getByIDCalls        int
+	// readErr fails every GetByID and ListByUser call when set.
+	readErr error
 }
 
 func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name string) bool {
@@ -8999,6 +9026,9 @@ func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name str
 
 func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.AddressBook, error) {
 	f.getByIDCalls++
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	if f.books == nil {
 		return nil, nil
 	}
@@ -9006,6 +9036,9 @@ func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.Add
 }
 
 func (f *fakeAddressBookRepo) ListByUser(ctx context.Context, userID int64) ([]store.AddressBook, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	var res []store.AddressBook
 	for _, b := range f.books {
 		if b.UserID == userID {
@@ -9089,9 +9122,14 @@ func (f *fakeAddressBookRepo) Delete(ctx context.Context, userID, id int64) erro
 
 type fakeDeletedResourceRepo struct {
 	deleted []store.DeletedResource
+	// listErr fails every ListDeletedSincePageAfter call when set.
+	listErr error
 }
 
 func (f *fakeDeletedResourceRepo) ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]store.DeletedResource, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	var result []store.DeletedResource
 	for _, d := range f.deleted {
 		if d.ResourceType == resourceType && d.CollectionID == collectionID && d.DeletedAt.After(since) {

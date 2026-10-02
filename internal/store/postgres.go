@@ -1119,6 +1119,16 @@ func IsDataError(err error) bool {
 	return errors.As(err, &pqErr) && (pqErr.Code.Class() == "22" || pqErr.Code.Class() == "54")
 }
 
+// IsQueryCanceled reports whether err is PostgreSQL canceling a statement
+// (SQLSTATE 57014). lib/pq reports a query whose context ended that way rather
+// than with an error wrapping context.Canceled, but PostgreSQL raises the same
+// code when statement_timeout expires, so it shows the caller's cancellation
+// only alongside a context the caller knows was canceled.
+func IsQueryCanceled(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "57014"
+}
+
 // isMissingCollection reports whether err is a member insert failing the
 // named foreign key to its collection, which means the collection was removed.
 func isMissingCollection(err error, constraint string) bool {

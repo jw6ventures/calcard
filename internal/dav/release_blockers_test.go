@@ -135,7 +135,7 @@ func TestReleaseBlockerRDatePeriodQueryAndExpansion(t *testing.T) {
 	if !eventMatchesFilter(event, calQueryWithTimeRange("20240605T110000Z", "20240605T113000Z"), floatingZone{}) {
 		t.Error("calendar-query drops the RDATE occurrence while it is still running")
 	}
-	candidates, rangeErr := filterFreeBusyCandidatesByTimeRange(freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240605T110000Z", End: "20240605T113000Z"})
+	candidates, rangeErr := filterFreeBusyCandidatesByTimeRange(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240605T110000Z", End: "20240605T113000Z"})
 	if rangeErr != nil {
 		t.Fatal(rangeErr)
 	}

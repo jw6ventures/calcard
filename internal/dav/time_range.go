@@ -27,11 +27,13 @@ var recurringTimeRangeComponents = nameSet("VEVENT", "VTODO", "VJOURNAL")
 //
 // loc holds the host's location only as the fallback for a definition this
 // server cannot walk -- one carrying no usable STANDARD or DAYLIGHT observance.
-// The two are never both in force, so whichever is set is the zone.
+// The two are never both in force, so whichever is set is the zone. defined
+// records that a VTIMEZONE was supplied at all, which §7.3 selects even when
+// neither source can resolve through it and its values are read as UTC.
 type floatingZone struct {
-	loc  *time.Location
-	root *icalNode
-	tzid string
+	defined     bool
+	loc         *time.Location
+	observances []submittedTimezoneObservance
 }
 
 // newFloatingZone reads the first VTIMEZONE out of an iCalendar object. An
@@ -52,15 +54,15 @@ func newFloatingZone(icalText string) floatingZone {
 		if tzid == "" {
 			return floatingZone{}
 		}
-		if observances, ok := submittedTimezoneObservances(root, tzid); ok && len(observances) > 0 {
-			return floatingZone{root: root, tzid: tzid}
+		if observances, ok := submittedTimezoneObservances(root, tzid); ok {
+			return floatingZone{defined: true, observances: observances}
 		}
 		// Nothing walkable was submitted. The host's database is the only
 		// remaining source of rules for this name.
 		if loc, err := time.LoadLocation(tzid); err == nil {
-			return floatingZone{loc: loc, root: root, tzid: tzid}
+			return floatingZone{defined: true, loc: loc}
 		}
-		return floatingZone{root: root, tzid: tzid}
+		return floatingZone{defined: true}
 	}
 	return floatingZone{}
 }
@@ -70,15 +72,11 @@ func newFloatingZone(icalText string) floatingZone {
 // carries, else the CALDAV:calendar-timezone the targeted collection defines,
 // else UTC. requestTimezone is empty for free-busy, which has no such element.
 func reportFloatingZone(requestTimezone string, collectionTimezone *string) floatingZone {
-	if zone := newFloatingZone(requestTimezone); zone.root != nil {
-		return zone
+	zone := newFloatingZone(requestTimezone)
+	if !zone.defined && collectionTimezone != nil {
+		zone = newFloatingZone(wrapCalendarTimezone(*collectionTimezone))
 	}
-	if collectionTimezone != nil {
-		if zone := newFloatingZone(wrapCalendarTimezone(*collectionTimezone)); zone.root != nil {
-			return zone
-		}
-	}
-	return floatingZone{}
+	return zone
 }
 
 func (z floatingZone) resolve(value string) (time.Time, bool) {
@@ -90,10 +88,8 @@ func (z floatingZone) resolve(value string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	if z.root != nil {
-		if offset, ok := submittedTimezoneOffset(z.root, z.tzid, wall); ok {
-			return wall.Add(-offset).UTC(), true
-		}
+	if offset, ok := observanceOffsetAtWall(z.observances, wall); ok {
+		return wall.Add(-offset).UTC(), true
 	}
 	return wall, true
 }
@@ -108,12 +104,10 @@ func (z floatingZone) resolve(value string) (time.Time, bool) {
 // the only day whose length this function exists to get right -- is exactly
 // where they would disagree.
 func (z floatingZone) addDays(instant time.Time, days int) time.Time {
-	if z.root != nil {
-		if offset, ok := submittedTimezoneOffsetAtInstant(z.root, z.tzid, instant); ok {
-			wall := instant.Add(offset).UTC().AddDate(0, 0, days)
-			if shifted, ok := submittedTimezoneOffset(z.root, z.tzid, wall); ok {
-				return wall.Add(-shifted).UTC()
-			}
+	if offset, ok := observanceOffsetAtInstant(z.observances, instant); ok {
+		wall := instant.Add(offset).UTC().AddDate(0, 0, days)
+		if shifted, ok := observanceOffsetAtWall(z.observances, wall); ok {
+			return wall.Add(-shifted).UTC()
 		}
 	}
 	if z.loc == nil {
@@ -128,10 +122,8 @@ func (z floatingZone) wallClock(instant time.Time) time.Time {
 	if z.loc != nil {
 		return instant.In(z.loc)
 	}
-	if z.root != nil {
-		if offset, ok := submittedTimezoneOffsetAtInstant(z.root, z.tzid, instant); ok {
-			return instant.Add(offset).UTC()
-		}
+	if offset, ok := observanceOffsetAtInstant(z.observances, instant); ok {
+		return instant.Add(offset).UTC()
 	}
 	return instant.UTC()
 }
@@ -167,10 +159,14 @@ type calendarTimeRangeMatcher struct {
 
 // matcherIndexes holds what a matcher derives from its resource once and
 // consults per instance. Each map is allocated on first use, so a resource that
-// recurs through no override pays for neither.
+// recurs through no override and names no zone pays for none of them.
 type matcherIndexes struct {
 	overrides map[recurrenceOverrideIndexKey]recurrenceOverrideIndex
 	masters   map[*icalNode]map[string]*icalNode
+	// timezones holds the observances of each VTIMEZONE the resource ships,
+	// by TZID; a nil entry records a TZID the resource defines no usable
+	// zone for.
+	timezones map[string][]submittedTimezoneObservance
 }
 
 func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) calendarTimeRangeMatcher {
@@ -247,8 +243,8 @@ func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDa
 	if tzid = strings.TrimSpace(tzid); tzid != "" {
 		// RFC 4791 §4.1 requires the resource to carry a VTIMEZONE for every
 		// TZID it uses, so that definition is authoritative over the host's.
-		if wall, err := ical.ParseDateTime(value); err == nil && m.root != nil {
-			if offset, ok := submittedTimezoneOffset(m.root, tzid, wall); ok {
+		if wall, err := ical.ParseDateTime(value); err == nil {
+			if offset, ok := observanceOffsetAtWall(m.timezoneObservances(tzid), wall); ok {
 				return wall.Add(-offset).UTC(), true
 			}
 		}
@@ -258,6 +254,20 @@ func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDa
 		}
 	}
 	return m.zone.resolve(value)
+}
+
+// timezoneObservances is the definition the resource ships for tzid, read once
+// per resource however many of its values name it.
+func (m calendarTimeRangeMatcher) timezoneObservances(tzid string) []submittedTimezoneObservance {
+	if observances, ok := m.indexes.timezones[tzid]; ok {
+		return observances
+	}
+	observances, _ := submittedTimezoneObservances(m.root, tzid)
+	if m.indexes.timezones == nil {
+		m.indexes.timezones = make(map[string][]submittedTimezoneObservance)
+	}
+	m.indexes.timezones[tzid] = observances
+	return observances
 }
 
 // resolveContentLine answers one date-valued content line for the recurrence
@@ -295,14 +305,8 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 		return m.alarmInTimeRange(node, parent, start, end, noShift)
 	}
 	master := m.recurrenceMaster(node, parent)
-	instances, expandable, settled := m.recurrenceInstances(node, master, start, end)
-	if !expandable {
-		// A frequency this server cannot expand is kept rather than filtered
-		// out: reporting nothing would hide a resource that does occur in the
-		// range.
-		return true
-	}
-	for _, instance := range instances {
+	matched := false
+	expandable, settled := m.visitRecurrenceInstances(node, master, start, end, func(instance recurrenceInstance) bool {
 		content, enclosing := node, parent
 		shift := instance.shift
 		if master != nil {
@@ -314,14 +318,19 @@ func (m calendarTimeRangeMatcher) componentSetInTimeRange(node, parent *icalNode
 			}
 			shift = noShift
 		}
-		if m.componentInTimeRange(content, enclosing, start, end, shift) {
-			return true
-		}
+		matched = m.componentInTimeRange(content, enclosing, start, end, shift)
+		return matched
+	})
+	if !expandable {
+		// A frequency this server cannot expand is kept rather than filtered
+		// out: reporting nothing would hide a resource that does occur in the
+		// range.
+		return true
 	}
-	// No instance returned matched, which settles the question only when they
+	// No instance visited matched, which settles the question only when they
 	// were the whole set. Otherwise the resource is kept on the same ground
 	// an inexpressible frequency is.
-	return !settled
+	return matched || !settled
 }
 
 // recurrenceMaster is the component whose recurrence set governs node: node
@@ -360,21 +369,38 @@ func openTimeRangeEnd(end time.Time) bool {
 	return end.After(maxTime)
 }
 
-// recurrenceInstances retains the effective duration and original identity of
-// each occurrence. expandable is false when nothing here can be enumerated at
-// all. settled is false when the instances returned are only part of the set
-// and that part does not answer the question asked of it, which a caller deciding
-// a §9.9 match has to read as "no answer" rather than "no match".
+// recurrenceInstances collects every instance visitRecurrenceInstances visits,
+// for a caller that owes the whole set rather than one instance of it.
 func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) (_ []recurrenceInstance, expandable, settled bool) {
+	var instances []recurrenceInstance
+	expandable, settled = m.visitRecurrenceInstances(node, master, start, end, func(instance recurrenceInstance) bool {
+		instances = append(instances, instance)
+		return false
+	})
+	if !expandable {
+		return nil, false, false
+	}
+	return instances, true, settled
+}
+
+// visitRecurrenceInstances hands visit each instance of the recurrence set that
+// reaches the range, carrying its effective duration and original identity, and
+// stops as soon as visit returns true. expandable is false when nothing here can
+// be enumerated at all. settled is false when the instances visited are only
+// part of the set and none of them ended the visit, which a caller deciding a
+// §9.9 match has to read as "no answer" rather than "no match".
+func (m calendarTimeRangeMatcher) visitRecurrenceInstances(node, master *icalNode, start, end time.Time, visit func(recurrenceInstance) bool) (expandable, settled bool) {
 	if master == nil {
-		return []recurrenceInstance{{}}, true, true
+		visit(recurrenceInstance{})
+		return true, true
 	}
 	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
-		return nil, false, false
+		return false, false
 	}
 	dtstart, ok := m.dateValue(master, "DTSTART", noShift)
 	if !ok {
-		return []recurrenceInstance{{}}, true, true
+		visit(recurrenceInstance{})
+		return true, true
 	}
 	window := m.occurrenceWindow(master, dtstart)
 	scanStart, scanEnd := start, end
@@ -383,34 +409,34 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 	}
 	// Inclusive candidate bounds can add an instance at each endpoint that the
 	// component-specific test excludes. The output budget is checked after that test.
-	generated, err := ical.RecurrenceInstances(m.raw, master.name, dtstart.instant, window,
-		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine)
-	// Exhausting the budget is not a failure of the report. The partial set
-	// settles a match on its own, since an instance had to reach the range to be generated
-	// at all, and its silence about the rest of the set is reported as unsettled
-	// rather than as an error: the callers answer that the way they answer a
-	// frequency this server cannot expand, by keeping the resource. Refusing
-	// instead would lose every other resource of the collection over one
-	// "repeats daily, no end date" event, and a range holding more instances
-	// than one resource may store is an ordinary request, not a malformed one.
+	err := ical.VisitRecurrenceInstances(m.raw, master.name, dtstart.instant, window,
+		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine,
+		func(instance ical.RecurrenceInstance) bool {
+			return visit(recurrenceInstance{
+				shift:     shiftBetween(dtstart.instant, instance.Start),
+				slotShift: shiftBetween(dtstart.instant, instance.RecurrenceID),
+				duration:  instance.End.Sub(instance.Start),
+			})
+		})
+	// Exhausting the budget is not a failure of the report. The instances
+	// visited settle a match on their own, since an instance had to reach the
+	// range to be generated at all, and their silence about the rest of the set
+	// is reported as unsettled rather than as an error: the callers answer that
+	// the way they answer a frequency this server cannot expand, by keeping the
+	// resource. Refusing instead would lose every other resource of the
+	// collection over one "repeats daily, no end date" event, and a range
+	// holding more instances than one resource may store is an ordinary
+	// request, not a malformed one.
 	truncated := errors.Is(err, ical.ErrRecurrenceExpansionLimit)
 	if err != nil && !truncated {
 		*m.expansionError = err
-		return nil, false, false
-	}
-	instances := make([]recurrenceInstance, 0, len(generated))
-	for _, instance := range generated {
-		instances = append(instances, recurrenceInstance{
-			shift:     shiftBetween(dtstart.instant, instance.Start),
-			slotShift: shiftBetween(dtstart.instant, instance.RecurrenceID),
-			duration:  instance.End.Sub(instance.Start),
-		})
+		return false, false
 	}
 	// A truncated set settles a match it contains. Whether it settles the
 	// absence of one is the caller's question, and truncated is what tells it
 	// apart: §9.9 needs only one instance, while the §9.6.5 expansion owes the
 	// whole set and refuses the resource on the same signal.
-	return instances, true, !truncated
+	return true, !truncated
 }
 
 // alarmScanLead is how far outside the requested range an instance can start
@@ -813,11 +839,8 @@ func (m calendarTimeRangeMatcher) inferredPropertyInTimeRange(name string, node,
 // every instance to be considered and makes one match enough.
 func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, name string, node, parent *icalNode, start, end time.Time) bool {
 	master := m.recurrenceMaster(node, parent)
-	instances, expandable, settled := m.recurrenceInstances(node, master, start, end)
-	if !expandable {
-		return true
-	}
-	for _, instance := range instances {
+	matched := false
+	expandable, settled := m.visitRecurrenceInstances(node, master, start, end, func(instance recurrenceInstance) bool {
 		effective := instance.shift.apply(instant)
 		if master == node {
 			occurrence := expandedInstance(m, m.root, master, instance)
@@ -829,9 +852,11 @@ func (m calendarTimeRangeMatcher) shiftedInstantInTimeRange(instant time.Time, n
 				}
 			}
 		}
-		if !start.After(effective) && end.After(effective) {
-			return true
-		}
+		matched = !start.After(effective) && end.After(effective)
+		return matched
+	})
+	if !expandable {
+		return true
 	}
-	return !settled
+	return matched || !settled
 }

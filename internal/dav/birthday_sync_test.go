@@ -411,15 +411,15 @@ func generatedBirthday(t *testing.T, contact *store.Contact) store.Event {
 
 func birthdayOccurrences(t *testing.T, ev store.Event, from, to time.Time) []time.Time {
 	t.Helper()
-	instances, err := ical.RecurrenceInstances(ev.RawICAL, "VEVENT", *ev.DTStart, 24*time.Hour, from, to, 1000, nil)
-	if err != nil {
-		t.Fatalf("RecurrenceInstances: %v\n%s", err, ev.RawICAL)
-	}
 	var starts []time.Time
-	for _, instance := range instances {
+	err := ical.VisitRecurrenceInstances(ev.RawICAL, "VEVENT", *ev.DTStart, 24*time.Hour, from, to, 1000, nil, func(instance ical.RecurrenceInstance) bool {
 		if !instance.Start.Before(from) && instance.Start.Before(to) {
 			starts = append(starts, instance.Start)
 		}
+		return false
+	})
+	if err != nil {
+		t.Fatalf("VisitRecurrenceInstances: %v\n%s", err, ev.RawICAL)
 	}
 	return starts
 }

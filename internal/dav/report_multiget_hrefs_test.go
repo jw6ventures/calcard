@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -180,5 +181,74 @@ func TestBirthdayCalendarMultiGetReturnsPerHrefStatus(t *testing.T) {
 	}
 	if got := strings.Count(respBody, "404 Not Found"); got != 2 {
 		t.Fatalf("expected both out-of-scope hrefs to report 404, got %d: %s", got, respBody)
+	}
+}
+
+// A multiget reads its hrefs' resources in one batch and then builds one
+// response per href, which for hundreds of hrefs with calendar-data is the
+// bulk of the report's work. A client that has already left stops that loop
+// rather than leaving it to project every resource for nobody, over a stored
+// collection and over the generated birthday collection alike. Each request is
+// first answered for a client that stays, so the href is known to name a
+// resource the loop would otherwise build a response for.
+func TestMultiGetStopsForACancelledRequest(t *testing.T) {
+	birthdayServer := func() *DavServer {
+		birthday := time.Date(1990, 6, 1, 0, 0, 0, 0, time.UTC)
+		name := "Ada"
+		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:ada": {AddressBookID: 1, UID: "ada", DisplayName: &name, Birthday: &birthday},
+		}}
+		return &DavServer{store: &store.Store{Contacts: contactRepo}}
+	}
+	birthdays, err := birthdayServer().generateBirthdayEvents(t.Context(), 1)
+	if err != nil || len(birthdays) != 1 {
+		t.Fatalf("generateBirthdayEvents() = %d events, %v; want one", len(birthdays), err)
+	}
+
+	tests := []struct {
+		name   string
+		server func() *DavServer
+		path   string
+		href   string
+	}{
+		{
+			name:   "calendar",
+			server: multiGetCalendarServer,
+			path:   "/dav/calendars/1/",
+			href:   "/dav/calendars/1/event.ics",
+		},
+		{
+			name:   "birthday calendar",
+			server: birthdayServer,
+			path:   "/dav/calendars/-1/",
+			href:   calendarObjectHref("/dav/calendars/-1/", eventResourceName(birthdays[0])),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := calendarMultiGetBody(tt.href)
+
+			answered := httptest.NewRecorder()
+			tt.server().Report(answered, reportRequestFor(tt.path, body, &store.User{ID: 1}))
+			if answered.Code != http.StatusMultiStatus {
+				t.Fatalf("multiget = %d, want 207: %s", answered.Code, answered.Body.String())
+			}
+			if resp := davResponseForHref(t, answered.Body.String(), tt.href); !strings.Contains(resp, "200 OK") {
+				t.Fatalf("expected %q to name a resource, got %s", tt.href, resp)
+			}
+
+			req := reportRequestFor(tt.path, body, &store.User{ID: 1})
+			ctx, cancel := context.WithCancel(req.Context())
+			cancel()
+			abandoned := httptest.NewRecorder()
+			tt.server().Report(abandoned, req.WithContext(ctx))
+
+			if abandoned.Code != statusClientClosedRequest {
+				t.Fatalf("multiget = %d, want %d: %s", abandoned.Code, statusClientClosedRequest, abandoned.Body.String())
+			}
+			if abandoned.Body.Len() != 0 {
+				t.Fatalf("body = %q, want none for a client that left", abandoned.Body.String())
+			}
+		})
 	}
 }

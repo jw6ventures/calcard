@@ -360,7 +360,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	}
 	state, err := h.birthdayCollectionState(ctx, user.ID)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to read birthday collection state")
+		return nil, "", fmt.Errorf("failed to read birthday collection state: %w", err)
 	}
 	if report.XMLName.Local == "sync-collection" && report.SyncToken != "" {
 		return h.birthdayCalendarSyncFromToken(ctx, user, principalHref, cleanPath, state, report)
@@ -378,7 +378,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 			}
 			return nil, "", err
 		}
-		return nil, "", fmt.Errorf("failed to generate birthday events")
+		return nil, "", fmt.Errorf("failed to generate birthday events: %w", err)
 	}
 	// Response hrefs are built from the collection, so an object-resource
 	// Request-URI narrows the candidate set instead of moving the base href.
@@ -398,18 +398,17 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, birthdayCalendarDataProjection(report), request)
 		return res, "", err
 	case "calendar-query":
+		projection := birthdayCalendarDataProjection(report)
 		if report.Filter != nil {
-			// The collection is generated rather than stored, so it defines no
-			// CALDAV:calendar-timezone of its own and §7.3 resolves floating
-			// values against the request's CALDAV:timezone, else UTC. Its
-			// entries are DTSTART;VALUE=DATE, so the zone decides which instants
-			// the implied day covers.
-			events, err = applyCalendarFilter(events, report.Filter, reportFloatingZone(report.Timezone, nil))
+			// The entries are DTSTART;VALUE=DATE, so the zone decides which
+			// instants the implied day covers; the filter and the projection
+			// resolve through the same one.
+			events, err = applyCalendarFilter(ctx, events, report.Filter, projection.zone)
 			if err != nil {
 				return nil, "", err
 			}
 		}
-		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, birthdayCalendarDataProjection(report))
+		res, err := h.calendarResourceReportResponses(ctx, user, collectionPath, events, report.selector, projection)
 		return res, "", err
 	case "sync-collection":
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
@@ -418,7 +417,10 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 		responses := []response{
 			birthdayCalendarCollection(collectionHref, principalHref, state),
 		}
-		resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
+		resourceResponses, err := rawCalendarResourceReportResponsesLimit(ctx, collectionHref, events, projection, h.multistatusBuildLimit()-len(responses))
+		if err != nil {
+			return nil, "", err
+		}
 		responses = h.appendMultistatusResponses(responses, resourceResponses)
 		responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
 		if err != nil {
@@ -477,6 +479,9 @@ func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.Us
 
 	var responses []response
 	for _, href := range hrefs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		resolved, ok := h.resolveCalendarHrefForRequest(href, request)
 		uid := resolved.ResourceName
 		// The birthday collection is addressed only by its constant ID, never by

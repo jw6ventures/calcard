@@ -1007,8 +1007,8 @@ func TestRFC4791_FreeBusyResponseUIDIsUnique(t *testing.T) {
 		return freeBusy.value("UID")
 	}
 
-	first := uidOf(mustReportText(h.generateFreeBusy(nil, tr)))
-	second := uidOf(mustReportText(h.generateFreeBusy(nil, tr)))
+	first := uidOf(mustReportText(h.generateFreeBusy(t.Context(), nil, tr)))
+	second := uidOf(mustReportText(h.generateFreeBusy(t.Context(), nil, tr)))
 	if first == "" {
 		t.Fatal("VFREEBUSY carries no UID")
 	}

@@ -923,14 +923,24 @@ func icalInstants(root *icalNode, property icalProperty, value string) ([]time.T
 // in the submitted zone. A VTIMEZONE observance names its transitions in local
 // time, so the reading and the transitions are already on one scale.
 func submittedTimezoneOffset(root *icalNode, tzid string, wall time.Time) (time.Duration, bool) {
-	return submittedTimezoneOffsetBefore(root, tzid, wall, localTransition)
+	observances, ok := submittedTimezoneObservances(root, tzid)
+	if !ok {
+		return 0, false
+	}
+	return observanceOffsetAtWall(observances, wall)
 }
 
-// submittedTimezoneOffsetAtInstant resolves the offset in force at an absolute
-// instant. VTIMEZONE transition values are local wall clocks, so each one is
-// converted with TZOFFSETFROM before it is compared with the instant.
-func submittedTimezoneOffsetAtInstant(root *icalNode, tzid string, instant time.Time) (time.Duration, bool) {
-	return submittedTimezoneOffsetBefore(root, tzid, instant, absoluteTransition)
+// observanceOffsetAtWall is submittedTimezoneOffset over observances already
+// read.
+func observanceOffsetAtWall(observances []submittedTimezoneObservance, wall time.Time) (time.Duration, bool) {
+	return observanceOffsetBefore(observances, wall, localTransition, sharedTimezoneOnsets)
+}
+
+// observanceOffsetAtInstant resolves the offset in force at an absolute instant.
+// VTIMEZONE transition values are local wall clocks, so each one is converted
+// with TZOFFSETFROM before it is compared with the instant.
+func observanceOffsetAtInstant(observances []submittedTimezoneObservance, instant time.Time) (time.Duration, bool) {
+	return observanceOffsetBefore(observances, instant, absoluteTransition, sharedTimezoneOnsets)
 }
 
 // localTransition and absoluteTransition are how far an observance's local
@@ -944,21 +954,17 @@ func absoluteTransition(observance submittedTimezoneObservance) time.Duration {
 	return -observance.offsetFrom
 }
 
-// submittedTimezoneOffsetBefore is the TZOFFSETTO of the last transition at or
-// before bound, or the TZOFFSETFROM of the first one when bound precedes them
-// all -- a moment before a zone's earliest observance is still in the offset
-// that observance says it is moving away from.
+// observanceOffsetBefore is the TZOFFSETTO of the last transition at or before
+// bound, or the TZOFFSETFROM of the first one when bound precedes them all -- a
+// moment before a zone's earliest observance is still in the offset that
+// observance says it is moving away from.
 //
 // shift is the only thing the two readings differ by, and it applies to every
 // RDATE and RRULE occurrence as well, so an observance is judged the same way
-// however its transitions are spelled.
-func submittedTimezoneOffsetBefore(root *icalNode, tzid string, bound time.Time,
-	shift func(submittedTimezoneObservance) time.Duration) (time.Duration, bool) {
-	observances, ok := submittedTimezoneObservances(root, tzid)
-	if !ok {
-		return 0, false
-	}
-
+// however its transitions are spelled. onsets says where each RRULE puts its
+// transitions; a nil cache walks every rule.
+func observanceOffsetBefore(observances []submittedTimezoneObservance, bound time.Time,
+	shift func(submittedTimezoneObservance) time.Duration, onsets *timezoneOnsets) (time.Duration, bool) {
 	var latest, earliest time.Time
 	var latestOffset, earliestOffsetFrom time.Duration
 	for _, observance := range observances {
@@ -983,7 +989,7 @@ func submittedTimezoneOffsetBefore(root *icalNode, tzid string, bound time.Time,
 		for _, rule := range observance.rrules {
 			// The rule generates local values, so it is walked up to the bound
 			// moved onto that same scale.
-			candidate, found, complete := ical.LatestRecurrenceOnOrBefore(observance.dtstart, bound.Add(-toBoundScale), rule)
+			candidate, found, complete := onsets.latest(observance.dtstart, bound.Add(-toBoundScale), rule)
 			if !complete {
 				// The rule describes more than this server will generate, so
 				// which observance is in force cannot be established. Answering

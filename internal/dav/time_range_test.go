@@ -1,15 +1,26 @@
 package dav
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
+	"github.com/lib/pq"
 )
 
 // wrapCalendar puts component lines inside a VCALENDAR so the strict parser
@@ -576,8 +587,8 @@ func TestTimeRangeResolvesFloatingValuesThroughTheSelectedZone(t *testing.T) {
 	}
 
 	zone := newFloatingZone(zoneDefinition)
-	if zone.tzid != "America/Chicago" {
-		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", zone.tzid)
+	if len(zone.observances) == 0 {
+		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", zone)
 	}
 	if assertComponentInRange(t, raw, "VEVENT", utcRange[0], utcRange[1], zone) {
 		t.Fatal("floating value still resolved as UTC despite a request timezone")
@@ -879,8 +890,8 @@ func TestRecurrenceDatesResolveThroughTheSelectedZone(t *testing.T) {
 	}
 	// CDT in June, so a 10:00 wall clock is 15:00Z and a date starts at 05:00Z.
 	chicago := newFloatingZone(chicagoVTimezoneObject())
-	if chicago.tzid != "America/Chicago" {
-		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", chicago.tzid)
+	if len(chicago.observances) == 0 {
+		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", chicago)
 	}
 	// A TZID no host knows, resolved by walking the observances the definition
 	// ships. That path yields no *time.Location, so the offset has to reach the
@@ -893,7 +904,7 @@ func TestRecurrenceDatesResolveThroughTheSelectedZone(t *testing.T) {
 		"TZOFFSETTO:+0300",
 		"END:STANDARD",
 	)...))
-	if shipped.loc != nil || shipped.root == nil {
+	if shipped.loc != nil || len(shipped.observances) == 0 {
 		t.Fatal("Custom/Offset did not fall back to its shipped observances")
 	}
 
@@ -1088,42 +1099,46 @@ func TestTimeRangePropFilterUsesEffectiveDTEndAndDue(t *testing.T) {
 // targeted collection defines, then UTC. §7.4 gives free-busy only the second,
 // since that report has no timezone element of its own.
 func TestReportFloatingZoneFollowsTheSectionSevenThreeOrder(t *testing.T) {
-	for _, tzid := range []string{"America/Chicago", "Europe/Berlin"} {
-		if _, err := time.LoadLocation(tzid); err != nil {
-			t.Skipf("tzdata unavailable: %v", err)
-		}
-	}
-	definition := func(tzid string) string {
+	// Each definition fixes its own offset, so the instant a floating value
+	// resolves to names the definition that was selected.
+	definition := func(tzid, offset string) string {
 		return wrapCalendar(componentLines("VTIMEZONE",
 			"TZID:"+tzid,
 			"BEGIN:STANDARD",
 			"DTSTART:19701101T020000",
-			"TZOFFSETFROM:+0000",
-			"TZOFFSETTO:+0000",
+			"TZOFFSETFROM:"+offset,
+			"TZOFFSETTO:"+offset,
 			"END:STANDARD",
 		)...)
 	}
-	requestTimezone := definition("America/Chicago")
-	collectionTimezone := definition("Europe/Berlin")
+	requestTimezone := definition("America/Chicago", "-0600")
+	collectionTimezone := definition("Europe/Berlin", "+0100")
+	// A definition with no observance, under a name no host knows, can resolve
+	// nothing, yet it is still the zone the request supplied.
+	unusableTimezone := wrapCalendar(componentLines("VTIMEZONE", "TZID:Example/Unwalkable")...)
+	const floating = "20240601T120000"
+	request := time.Date(2024, 6, 1, 18, 0, 0, 0, time.UTC)
+	collection := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+	utc := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
 		name       string
 		request    string
 		collection *string
-		want       string
+		want       time.Time
 	}{
-		{name: "the request timezone wins", request: requestTimezone, collection: &collectionTimezone, want: "America/Chicago"},
-		{name: "the collection timezone is next", collection: &collectionTimezone, want: "Europe/Berlin"},
-		{name: "UTC is the fallback", want: ""},
-		{name: "an undefined collection timezone falls back to UTC", want: ""},
+		{name: "the request timezone wins", request: requestTimezone, collection: &collectionTimezone, want: request},
+		{name: "the collection timezone is next", collection: &collectionTimezone, want: collection},
+		{name: "an unusable request timezone still wins", request: unusableTimezone, collection: &collectionTimezone, want: utc},
+		{name: "UTC is the fallback", want: utc},
+		{name: "an undefined collection timezone falls back to UTC", want: utc},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			zone := reportFloatingZone(tt.request, tt.collection)
-			got := zone.tzid
-			if got != tt.want {
-				t.Fatalf("reportFloatingZone() resolved %q, want %q", got, tt.want)
+			got, ok := reportFloatingZone(tt.request, tt.collection).resolve(floating)
+			if !ok || !got.Equal(tt.want) {
+				t.Fatalf("reportFloatingZone() resolved %s to %v (ok=%t), want %v", floating, got, ok, tt.want)
 			}
 		})
 	}
@@ -1132,9 +1147,9 @@ func TestReportFloatingZoneFollowsTheSectionSevenThreeOrder(t *testing.T) {
 	// component, so the value is enveloped on the way in exactly as
 	// calendarTimezoneValue envelopes it on the way out.
 	bare := "BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\n" +
-		"TZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
-	if zone := reportFloatingZone("", &bare); zone.tzid != "Europe/Berlin" {
-		t.Fatalf("a bare stored VTIMEZONE did not resolve: %#v", zone)
+		"TZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	if got, ok := reportFloatingZone("", &bare).resolve(floating); !ok || !got.Equal(collection) {
+		t.Fatalf("a bare stored VTIMEZONE resolved %s to %v (ok=%t), want %v", floating, got, ok, collection)
 	}
 }
 
@@ -1150,8 +1165,8 @@ func TestTimeRangeAllDayValueSpansItsNominalDayAcrossAZoneTransition(t *testing.
 		t.Skipf("tzdata unavailable: %v", err)
 	}
 	zone := newFloatingZone(chicagoVTimezoneObject())
-	if zone.tzid != "America/Chicago" {
-		t.Fatalf("newFloatingZone() resolved %q, want America/Chicago", zone.tzid)
+	if len(zone.observances) == 0 {
+		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", zone)
 	}
 
 	tests := []struct {
@@ -1238,7 +1253,7 @@ func TestSubmittedTimezoneWallClockUsesAbsoluteTransitions(t *testing.T) {
 		"END:DAYLIGHT",
 	)...)
 	zone := newFloatingZone(zoneDefinition)
-	if zone.loc != nil || zone.root == nil {
+	if zone.loc != nil || len(zone.observances) == 0 {
 		t.Fatalf("expected a submitted-only timezone, got %#v", zone)
 	}
 
@@ -1362,5 +1377,746 @@ func TestFloatingZoneFallsBackToTheHostDatabaseWithoutObservances(t *testing.T) 
 	want := time.Date(2026, 6, 15, 14, 0, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Errorf("floating 10:00 resolved to %s, want %s (the host's America/New_York)", got.UTC(), want)
+	}
+}
+
+// outlookEasternTimezone is the VTIMEZONE Exchange and Outlook ship: both
+// observances start in 1601, so every transition lookup has four centuries of
+// rule to cover before it reaches a present-day instant.
+var outlookEasternTimezone = componentLines("VTIMEZONE",
+	"TZID:Eastern Standard Time",
+	"BEGIN:STANDARD",
+	"DTSTART:16010101T020000",
+	"TZOFFSETFROM:-0400",
+	"TZOFFSETTO:-0500",
+	"RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11",
+	"END:STANDARD",
+	"BEGIN:DAYLIGHT",
+	"DTSTART:16010101T020000",
+	"TZOFFSETFROM:-0500",
+	"TZOFFSETTO:-0400",
+	"RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3",
+	"END:DAYLIGHT",
+)
+
+// outlookWeeklySeries is a weekly meeting as Outlook writes it: zoned in its own
+// VTIMEZONE, starting on the given day of January 2024, with a reminder.
+func outlookWeeklySeries(uid string, day int, rrule string) string {
+	lines := append([]string{"VERSION:2.0", "PRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN"}, outlookEasternTimezone...)
+	lines = append(lines,
+		"BEGIN:VEVENT",
+		"UID:"+uid,
+		"DTSTAMP:20240101T000000Z",
+		fmt.Sprintf("DTSTART;TZID=Eastern Standard Time:202401%02dT100000", day),
+		fmt.Sprintf("DTEND;TZID=Eastern Standard Time:202401%02dT110000", day),
+		"SUMMARY:weekly sync",
+		"RRULE:"+rrule,
+	)
+	lines = append(lines, componentLines("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Reminder", "TRIGGER:-PT15M")...)
+	lines = append(lines, "END:VEVENT")
+	return wrapCalendar(lines...)
+}
+
+// useTimezoneOnsets gives the test a cache of its own for the server's
+// observance lookups, so what the cache counts is the test's work alone.
+func useTimezoneOnsets(t *testing.T, budget int) *timezoneOnsets {
+	t.Helper()
+	previous := sharedTimezoneOnsets
+	sharedTimezoneOnsets = newTimezoneOnsets(budget)
+	t.Cleanup(func() { sharedTimezoneOnsets = previous })
+	return sharedTimezoneOnsets
+}
+
+// DAVx5 syncs a calendar with a calendar-query whose time-range has a start and
+// no end. Over ordinary recurring series in an Outlook zone, expanding every
+// instance up to the limit and walking the zone's 1601 observances for each
+// runs a few hundred series past the write timeout. RFC 4791 §9.9 needs one
+// matching instance, and the zone's onsets are the same for every resource, so
+// each series resolves a handful of values and the zone's two rules are listed
+// once for all of them. The work is counted rather than timed, so a slow or
+// instrumented test run cannot fail it and a regression cannot hide in a fast
+// one.
+func TestOpenEndedCalendarQueryOverOutlookSeriesIsAnsweredPromptly(t *testing.T) {
+	const series = 500
+	events := make(map[string]*store.Event, series+1)
+	for i := 0; i < series; i++ {
+		uid := fmt.Sprintf("series-%d", i)
+		events["1:"+uid] = &store.Event{ID: int64(i + 1), CalendarID: 1, UID: uid, ResourceName: uid, ETag: "e",
+			RawICAL: outlookWeeklySeries(uid, (i%28)+1, "FREQ=WEEKLY")}
+	}
+	events["1:ended"] = &store.Event{ID: series + 1, CalendarID: 1, UID: "ended", ResourceName: "ended", ETag: "e",
+		RawICAL: outlookWeeklySeries("ended", 1, "FREQ=WEEKLY;UNTIL=20250101T000000Z")}
+	h := hostileRecurrenceServer()
+	h.store.Events = &fakeEventRepo{events: events}
+	onsets := useTimezoneOnsets(t, maxHeldOnsets)
+
+	body := `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop>` +
+		`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260901T000000Z"/>` +
+		`</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	rr := httptest.NewRecorder()
+	h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	got := rr.Body.String()
+	if matched := strings.Count(got, "<d:href>/dav/calendars/1/series-"); matched != series {
+		t.Fatalf("reported %d of the %d live series", matched, series)
+	}
+	if strings.Contains(got, "ended.ics") {
+		t.Fatal("a series that ended before the range was reported")
+	}
+	if walks := onsets.walks.Load(); walks != 0 {
+		t.Fatalf("walked an observance rule %d times, want every lookup answered from its listing", walks)
+	}
+	if listed := len(onsets.rules); listed != 2 {
+		t.Fatalf("listed %d observance rules, want the zone's two", listed)
+	}
+	// Expanding every instance up to the limit would ask about each of a
+	// thousand instances of every series.
+	if lookups, budget := onsets.lookups.Load(), int64(64*series); lookups > budget {
+		t.Fatalf("asked %d observance lookups, want at most %d", lookups, budget)
+	}
+}
+
+// The cache answers from a listing of each observance rule rather than by
+// walking it per value, so every offset it gives has to be the one the walk
+// gives. The zones cover what clients ship: Exchange's 1601 rules, a Sunday
+// rule retired by UNTIL in favour of its successor, an RDATE-only history, a
+// counted rule, and the last-Sunday rule of the EU zones. One cache serves them
+// all, as the server's cache serves every resource, and a cache too small to
+// hold even one of them answers the same while evicting on every lookup.
+func TestTimezoneOnsetsAgreeWithWalkingEachRule(t *testing.T) {
+	zones := map[string][]string{
+		"Exchange": outlookEasternTimezone,
+		"US history": componentLines("VTIMEZONE",
+			"TZID:America/New_York",
+			"BEGIN:DAYLIGHT", "DTSTART:19870405T020000", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400",
+			"RRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z", "END:DAYLIGHT",
+			"BEGIN:STANDARD", "DTSTART:19671029T020000", "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500",
+			"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20061029T060000Z", "END:STANDARD",
+			"BEGIN:DAYLIGHT", "DTSTART:20070311T020000", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400",
+			"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", "END:DAYLIGHT",
+			"BEGIN:STANDARD", "DTSTART:20071104T020000", "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500",
+			"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU", "END:STANDARD",
+		),
+		"RDATE history": componentLines("VTIMEZONE",
+			"TZID:Example/Rdates",
+			"BEGIN:STANDARD", "DTSTART:20001029T030000", "TZOFFSETFROM:+0200", "TZOFFSETTO:+0100",
+			"RDATE:20011028T030000,20021027T030000", "END:STANDARD",
+			"BEGIN:DAYLIGHT", "DTSTART:20010325T020000", "TZOFFSETFROM:+0100", "TZOFFSETTO:+0200",
+			"RDATE:20020331T020000", "END:DAYLIGHT",
+		),
+		"counted": componentLines("VTIMEZONE",
+			"TZID:Example/Counted",
+			"BEGIN:STANDARD", "DTSTART:20101031T030000", "TZOFFSETFROM:+1100", "TZOFFSETTO:+1000",
+			"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;COUNT=12", "END:STANDARD",
+			"BEGIN:DAYLIGHT", "DTSTART:20110327T020000", "TZOFFSETFROM:+1000", "TZOFFSETTO:+1100",
+			"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;COUNT=12", "END:DAYLIGHT",
+		),
+		"EU": componentLines("VTIMEZONE",
+			"TZID:Europe/Berlin",
+			"BEGIN:DAYLIGHT", "DTSTART:19810329T020000", "TZOFFSETFROM:+0100", "TZOFFSETTO:+0200",
+			"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU", "END:DAYLIGHT",
+			"BEGIN:STANDARD", "DTSTART:19961027T030000", "TZOFFSETFROM:+0200", "TZOFFSETTO:+0100",
+			"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU", "END:STANDARD",
+		),
+	}
+	shared := newTimezoneOnsets(maxHeldOnsets)
+	for name, definition := range zones {
+		t.Run(name, func(t *testing.T) {
+			root, err := parseICalendarObject(wrapCalendar(definition...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			observances, ok := submittedTimezoneObservances(root, strings.TrimPrefix(definition[1], "TZID:"))
+			if !ok {
+				t.Fatal("definition has no usable observance")
+			}
+			agree := func(onsets *timezoneOnsets, instants []time.Time) {
+				t.Helper()
+				for _, instant := range instants {
+					for _, scale := range []func(submittedTimezoneObservance) time.Duration{localTransition, absoluteTransition} {
+						want, wantOK := observanceOffsetBefore(observances, instant, scale, nil)
+						got, gotOK := observanceOffsetBefore(observances, instant, scale, onsets)
+						if got != want || gotOK != wantOK {
+							t.Fatalf("offset at %v = %v, %t through the cache, %v, %t walking", instant, got, gotOK, want, wantOK)
+						}
+					}
+				}
+			}
+
+			// Running backwards from the latest instant lists each rule once,
+			// and every later lookup is searched below what that listing covers.
+			from, to := time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2045, 1, 1, 0, 0, 0, 0, time.UTC)
+			step := 157*time.Hour + 17*time.Minute
+			var instants []time.Time
+			for instant := to; instant.After(from); instant = instant.Add(-step) {
+				instants = append(instants, instant)
+			}
+			for instant := from; instant.Before(to); instant = instant.Add(step) {
+				instants = append(instants, instant)
+			}
+			agree(shared, instants)
+			// Listing a rule again for every lookup is slow, so the cache
+			// that evicts on every lookup is asked about a sample.
+			var sample []time.Time
+			for i := 0; i < len(instants); i += 41 {
+				sample = append(sample, instants[i])
+			}
+			agree(newTimezoneOnsets(1), sample)
+
+			// Running forwards across centuries passes the listing horizon
+			// many times over, so each open-ended rule's listing is extended
+			// again and again.
+			var ascending []time.Time
+			for instant := time.Date(1700, 1, 1, 0, 0, 0, 0, time.UTC); instant.Before(time.Date(2250, 1, 1, 0, 0, 0, 0, time.UTC)); instant = instant.Add(1009*time.Hour + 13*time.Minute) {
+				ascending = append(ascending, instant)
+			}
+			agree(newTimezoneOnsets(maxHeldOnsets), ascending)
+		})
+	}
+}
+
+// exchangeStandardRule is the STANDARD observance rule Exchange ships, which
+// the cache tests ask about as every Outlook-zoned resource does.
+var exchangeStandardRule = struct {
+	dtstart time.Time
+	rrule   string
+}{time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"}
+
+// One value far in the future -- a stored DTSTART in the year 4000 can come
+// first in a collection -- asks for more onsets than a rule may list. The
+// listing stops at its limit, and every instant before that, which is every
+// present-day instant, is still answered from it rather than by walking four
+// centuries of the rule.
+func TestTimezoneOnsetsKeepWhatAFarFutureLookupListed(t *testing.T) {
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	rule := exchangeStandardRule
+	for _, before := range []time.Time{
+		time.Date(4000, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC),
+	} {
+		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(rule.dtstart, before, rule.rrule)
+		got, found, complete := onsets.latest(rule.dtstart, before, rule.rrule)
+		if !got.Equal(want) || found != wantFound || complete != wantComplete {
+			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
+		}
+	}
+	if walks := onsets.walks.Load(); walks != 1 {
+		t.Fatalf("walked the rule %d times, want once, for the instant past the listing alone", walks)
+	}
+}
+
+// The cache keeps a bounded number of onsets across every rule. A burst of
+// distinct rules -- a resource can ship a zone of its own under every TZID it
+// names -- pushes out the least recently used, and a rule that every other
+// resource shares is listed again the next time it is asked for rather than
+// left to be walked for the rest of the server's life.
+func TestTimezoneOnsetsEvictTheLeastRecentlyUsedRule(t *testing.T) {
+	const budget = 4096
+	onsets := newTimezoneOnsets(budget)
+	rule := exchangeStandardRule
+	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	ask := func(dtstart time.Time, rrule string) {
+		t.Helper()
+		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+		if got, found, complete := onsets.latest(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+			t.Fatalf("latest(%v, %q) = %v, %t, %t, want %v", dtstart, rrule, got, found, complete, want)
+		}
+	}
+
+	ask(rule.dtstart, rule.rrule)
+	for i := 0; i < 500; i++ {
+		ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute), "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU")
+		if onsets.held > budget {
+			t.Fatalf("holding %d units after %d rules, want at most %d", onsets.held, i+1, budget)
+		}
+	}
+	key := observanceRuleKey{seconds: rule.dtstart.Unix(), rrule: rule.rrule}
+	if _, ok := onsets.rules[key]; ok {
+		t.Fatal("the shared rule outlived five hundred more recently used ones")
+	}
+	ask(rule.dtstart, rule.rrule)
+	if _, ok := onsets.rules[key]; !ok {
+		t.Fatal("the shared rule was not listed again")
+	}
+	if walks := onsets.walks.Load(); walks != 0 {
+		t.Fatalf("walked a rule %d times, want every lookup answered from a listing", walks)
+	}
+}
+
+// A rule's RRULE text is held for as long as the rule is, so the cache charges
+// it alongside the rule's onsets. A burst of rules carrying long text -- a
+// resource can repeat a BY value as often as its size allows -- holds no more
+// than the budget, and a rule whose text alone outweighs the whole budget is
+// answered by walking it rather than cached at all.
+func TestTimezoneOnsetsChargeEachRuleItsText(t *testing.T) {
+	const budget = 4096
+	onsets := newTimezoneOnsets(budget)
+	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	onsetBytes := int(reflect.TypeFor[time.Time]().Size())
+	ask := func(dtstart time.Time, rrule string) {
+		t.Helper()
+		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+		if got, found, complete := onsets.latest(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+			t.Fatalf("latest(%v) = %v, %t, %t, want %v", dtstart, got, found, complete, want)
+		}
+	}
+
+	long := "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=" + strings.Repeat("2,", 5000) + "2"
+	for i := 0; i < 100; i++ {
+		ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute), long)
+		text := 0
+		for key := range onsets.rules {
+			text += len(key.rrule)
+		}
+		if text > budget*onsetBytes {
+			t.Fatalf("holding %d bytes of rule text after %d rules, want at most the %d bytes the budget's onsets would take", text, i+1, budget*onsetBytes)
+		}
+	}
+
+	onsets = newTimezoneOnsets(budget)
+	oversized := "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=" + strings.Repeat("2,", budget*onsetBytes) + "2"
+	ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC), oversized)
+	if len(onsets.rules) != 0 || onsets.held != 0 {
+		t.Fatalf("cached %d rules holding %d units, want a rule larger than the budget left uncached", len(onsets.rules), onsets.held)
+	}
+	if walks := onsets.walks.Load(); walks != 1 {
+		t.Fatalf("walked %d times, want the uncached rule walked once", walks)
+	}
+}
+
+// An RRULE read out of a calendar object is a slice of that object's text, so
+// keeping it as a key would keep the whole object -- up to the ten megabytes a
+// PUT may carry -- alive for as long as the rule stays cached.
+func TestTimezoneOnsetsDoNotKeepTheObjectARuleWasReadFrom(t *testing.T) {
+	const objects = 8
+	padding := strings.Repeat("X-PADDING:"+strings.Repeat("a", 70)+"\r\n", 4<<20/82)
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	heap := func() int64 {
+		runtime.GC()
+		var stats runtime.MemStats
+		runtime.ReadMemStats(&stats)
+		return int64(stats.HeapAlloc)
+	}
+
+	start := heap()
+	for i := 0; i < objects; i++ {
+		object := "BEGIN:VCALENDAR\r\n" + padding + strings.Join(componentLines("VTIMEZONE",
+			"TZID:Example/Padded",
+			"BEGIN:STANDARD",
+			fmt.Sprintf("DTSTART:19961027T03%02d00", i),
+			"TZOFFSETFROM:+0200",
+			"TZOFFSETTO:+0100",
+			"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+			"END:STANDARD",
+		), "\r\n") + "\r\nEND:VCALENDAR\r\n"
+		root, err := parseICalendarObject(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observances, ok := submittedTimezoneObservances(root, "Example/Padded")
+		if !ok {
+			t.Fatal("the padded definition has no usable observance")
+		}
+		if _, found, complete := onsets.latest(observances[0].dtstart, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances[0].rrules[0]); !found || !complete {
+			t.Fatal("the padded definition's rule did not resolve")
+		}
+	}
+	retained := heap() - start
+	runtime.KeepAlive(onsets)
+
+	if len(onsets.rules) != objects {
+		t.Fatalf("cached %d rules, want %d", len(onsets.rules), objects)
+	}
+	if limit := int64(len(padding)); retained > limit {
+		t.Fatalf("%d cached rules keep %d bytes alive, want less than one %d-byte object", objects, retained, limit)
+	}
+}
+
+// Every value an instance carries in a zone is resolved through the cache, so a
+// lookup the listing already answers is the hot path of every report over a
+// zoned series. It allocates nothing: the rule is found by the text it was read
+// with, which is copied only when a rule is first cached.
+func TestTimezoneOnsetsAnswerAListedInstantWithoutAllocating(t *testing.T) {
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	rule := exchangeStandardRule
+	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	if _, found, complete := onsets.latest(rule.dtstart, before, rule.rrule); !found || !complete {
+		t.Fatal("the rule did not resolve")
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		onsets.latest(rule.dtstart, before.Add(time.Hour), rule.rrule)
+	}); allocs != 0 {
+		t.Fatalf("a listed lookup allocated %v times, want none", allocs)
+	}
+}
+
+// A listing that halted is not listed again for a later instant: the listing
+// would stop at the same place, after costing what walking costs, every time an
+// instant past it came up. Instants before the halt are still answered from it.
+func TestTimezoneOnsetsDoNotRetryAHaltedListing(t *testing.T) {
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	dtstart := time.Date(1900, 3, 11, 2, 0, 0, 0, time.UTC)
+	const monthly = "FREQ=MONTHLY;BYDAY=2SU"
+	// A horizon past 2026 holds more monthly onsets than one rule may list.
+	listed := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	past := time.Date(2150, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, before := range []time.Time{listed, past, time.Date(1910, 6, 1, 0, 0, 0, 0, time.UTC), past.AddDate(1, 0, 0)} {
+		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, monthly)
+		got, found, complete := onsets.latest(dtstart, before, monthly)
+		if !got.Equal(want) || found != wantFound || complete != wantComplete {
+			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
+		}
+	}
+	rule := onsets.rules[observanceRuleKey{seconds: dtstart.Unix(), rrule: monthly}].Value.(*listedRule)
+	if rule.lister.Len() != maxListedOnsetsPerRule {
+		t.Fatalf("listed %d onsets, want the %d a rule may keep", rule.lister.Len(), maxListedOnsetsPerRule)
+	}
+	if walks := onsets.walks.Load(); walks != 2 {
+		t.Fatalf("walked the rule %d times, want twice, once for each instant past the listing", walks)
+	}
+}
+
+// Concurrent lookups of one rule grow its listing one after another, and the
+// charge each records has to be the size of the listing as it ends up rather
+// than as it stood when that lookup grew it: a smaller charge landing last
+// would leave the cache holding more than it counts, and past its budget.
+func TestTimezoneOnsetsChargeWhatEachListingHolds(t *testing.T) {
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	rules := []struct {
+		dtstart time.Time
+		rrule   string
+	}{
+		exchangeStandardRule,
+		{time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3"},
+		{time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=1SU"},
+	}
+	// Each lookup reaches past the last one's horizon, so nearly every one
+	// grows its rule's listing.
+	var befores []time.Time
+	for year := 1650; year < 3600; year += onsetListingHorizonYears + 1 {
+		befores = append(befores, time.Date(year, 6, 1, 0, 0, 0, 0, time.UTC))
+	}
+	workers := 4 * runtime.GOMAXPROCS(0)
+
+	for round := 0; round < 50; round++ {
+		var wg sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range befores {
+					for _, rule := range rules {
+						onsets.latest(rule.dtstart, befores[min(i+worker%3, len(befores)-1)], rule.rrule)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		held := 0
+		for _, element := range onsets.rules {
+			rule := element.Value.(*listedRule)
+			held += ruleCost(rule.key.rrule, rule.lister.Len())
+		}
+		if onsets.held != held {
+			t.Fatalf("round %d: the cache counts %d units, its listings hold %d", round, onsets.held, held)
+		}
+		onsets = newTimezoneOnsets(maxHeldOnsets)
+	}
+}
+
+// Every report, PUT and COPY or MOVE shares the cache, so lookups of one rule
+// and of rules that evict each other arrive at once.
+func TestTimezoneOnsetsServeConcurrentLookups(t *testing.T) {
+	onsets := newTimezoneOnsets(256)
+	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	rules := []struct {
+		dtstart time.Time
+		rrule   string
+	}{exchangeStandardRule}
+	for i := 0; i < 20; i++ {
+		rules = append(rules, struct {
+			dtstart time.Time
+			rrule   string
+		}{time.Date(1981, 3, 29, 2, i, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU"})
+	}
+	want := make([]time.Time, len(rules))
+	for i, rule := range rules {
+		want[i], _, _ = ical.LatestRecurrenceOnOrBefore(rule.dtstart, before, rule.rrule)
+	}
+
+	var wg sync.WaitGroup
+	failures := make(chan string, 8*len(rules))
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range rules {
+				rule := rules[(i+worker)%len(rules)]
+				got, found, complete := onsets.latest(rule.dtstart, before, rule.rrule)
+				if expected := want[(i+worker)%len(rules)]; !found || !complete || !got.Equal(expected) {
+					failures <- fmt.Sprintf("latest(%v) = %v, %t, %t, want %v", rule.dtstart, got, found, complete, expected)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+	if onsets.held > 256 {
+		t.Fatalf("holding %d units, want at most 256", onsets.held)
+	}
+}
+
+// A client that disconnects -- DAVx5 does once its own timeout passes -- cancels
+// the request's context, and every per-resource loop of a report stops there
+// rather than filter, expand or project the rest of the collection for nobody.
+func TestReportLoopsStopForACancelledRequest(t *testing.T) {
+	events := benchTimeRangeEvents(3)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	filter := &calFilter{CompFilter: compFilter{
+		Name:       "VCALENDAR",
+		CompFilter: []compFilter{{Name: "VEVENT", TimeRange: &timeRange{Start: "20240601T000000Z"}}},
+	}}
+	if matched, err := applyCalendarFilter(ctx, events, filter, floatingZone{}); !errors.Is(err, context.Canceled) || matched != nil {
+		t.Fatalf("applyCalendarFilter() = %d events, %v; want none and context.Canceled", len(matched), err)
+	}
+	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, floatingZone{}), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"})
+	if !errors.Is(err, context.Canceled) || candidates != nil {
+		t.Fatalf("filterFreeBusyCandidatesByTimeRange() = %d candidates, %v; want none and context.Canceled", len(candidates), err)
+	}
+	if body, err := (&DavServer{}).generateFreeBusy(ctx, freeBusyCandidates(events, floatingZone{}), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"}); !errors.Is(err, context.Canceled) || body != "" {
+		t.Fatalf("generateFreeBusy() = %q, %v; want nothing and context.Canceled", body, err)
+	}
+	expand := newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC), End: time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC)}}, floatingZone{})
+	if responses, err := rawCalendarResourceReportResponsesLimit(ctx, "/dav/calendars/1/", events, expand, len(events)); !errors.Is(err, context.Canceled) || responses != nil {
+		t.Fatalf("rawCalendarResourceReportResponsesLimit() = %d responses, %v; want none and context.Canceled", len(responses), err)
+	}
+}
+
+// levelRecorder keeps the level and message of every line logged through it.
+type levelRecorder struct {
+	levels   []jw6_utils.LogLevel
+	messages []string
+}
+
+func (r *levelRecorder) Log(_, _ string, level jw6_utils.LogLevel, message string) {
+	r.levels = append(r.levels, level)
+	r.messages = append(r.messages, message)
+}
+
+// logged reports whether a line at level carries text.
+func (r *levelRecorder) logged(level jw6_utils.LogLevel, text string) bool {
+	for i, logged := range r.levels {
+		if logged == level && strings.Contains(r.messages[i], text) {
+			return true
+		}
+	}
+	return false
+}
+
+// A REPORT the client abandoned has nobody to answer. It is told apart from a
+// failure of the server's own -- recorded with 499, the status proxies use for a
+// client that closed its request, and logged below the error level -- so a sync
+// client timing out does not read as the server failing in its logs or metrics.
+// The client can leave while the collection is still being read, and lib/pq
+// then answers with PostgreSQL's "canceling statement" error rather than one
+// wrapping context.Canceled, which counts as the cancellation all the same.
+func TestReportAbandonedByTheClientIsNotAServerFailure(t *testing.T) {
+	bodies := map[string]string{
+		"calendar-query": `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop>` +
+			`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260901T000000Z"/>` +
+			`</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`,
+		"free-busy-query": `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+			`<C:time-range start="20260901T000000Z" end="20261001T000000Z"/></C:free-busy-query>`,
+	}
+	statementCanceled := &pq.Error{Code: "57014", Message: "canceling statement due to user request"}
+	stages := []struct {
+		name    string
+		listErr error
+	}{
+		{name: "while filtering"},
+		{name: "while reading the collection", listErr: statementCanceled},
+	}
+	for name, body := range bodies {
+		for _, stage := range stages {
+			t.Run(name+" "+stage.name, func(t *testing.T) {
+				h := hostileRecurrenceServer()
+				h.store.Events.(*fakeEventRepo).listPageErr = stage.listErr
+				recorder := &levelRecorder{}
+				h.log = logging.New(recorder, logClass)
+
+				ctx, cancel := context.WithCancel(auth.WithUser(t.Context(), &store.User{ID: 1}))
+				cancel()
+				req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body)).WithContext(ctx)
+				req.Header.Set("Depth", "1")
+				rr := httptest.NewRecorder()
+				h.Report(rr, req)
+
+				if rr.Code != statusClientClosedRequest {
+					t.Fatalf("status = %d, want %d: %s", rr.Code, statusClientClosedRequest, rr.Body.String())
+				}
+				if rr.Body.Len() != 0 {
+					t.Fatalf("body = %q, want none", rr.Body.String())
+				}
+				for _, level := range recorder.levels {
+					if level == jw6_utils.Error || level == jw6_utils.Warn {
+						t.Fatalf("logged at level %v for a request the client abandoned", level)
+					}
+				}
+			})
+		}
+
+		// A failure of the server's own that merely coincides with the client
+		// leaving is still logged as a failure, though nobody reads the answer.
+		t.Run(name+" failing after the client left", func(t *testing.T) {
+			h := hostileRecurrenceServer()
+			h.store.Events.(*fakeEventRepo).listPageErr = errors.New("pq: relation is locked")
+			recorder := &levelRecorder{}
+			h.log = logging.New(recorder, logClass)
+
+			ctx, cancel := context.WithCancel(auth.WithUser(t.Context(), &store.User{ID: 1}))
+			cancel()
+			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body)).WithContext(ctx)
+			req.Header.Set("Depth", "1")
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+
+			if rr.Code != statusClientClosedRequest {
+				t.Fatalf("status = %d, want %d: %s", rr.Code, statusClientClosedRequest, rr.Body.String())
+			}
+			if !recorder.logged(jw6_utils.Error, "relation is locked") {
+				t.Fatalf("logged %q, want the failure at the error level", recorder.messages)
+			}
+		})
+
+		// The same failure while the client is still waiting is the server's,
+		// and is answered and logged as one.
+		t.Run(name+" with the client still waiting", func(t *testing.T) {
+			h := hostileRecurrenceServer()
+			h.store.Events.(*fakeEventRepo).listPageErr = statementCanceled
+			recorder := &levelRecorder{}
+			h.log = logging.New(recorder, logClass)
+
+			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			req.Header.Set("Depth", "1")
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500: %s", rr.Code, rr.Body.String())
+			}
+			if !slices.Contains(recorder.levels, jw6_utils.Error) {
+				t.Fatalf("logged levels %v, want the failure at the error level", recorder.levels)
+			}
+		})
+	}
+}
+
+// A client can leave while the report is still finding the collection it names,
+// before any of the report's own reads. The lookup then fails on the
+// cancellation, which is no more the server's failure there than it is later.
+func TestReportAbandonedWhileFindingItsCollectionIsNotAServerFailure(t *testing.T) {
+	const calendarQuery = `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop>` +
+		`<C:filter><C:comp-filter name="VCALENDAR"/></C:filter></C:calendar-query>`
+	const freeBusyQuery = `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+		`<C:time-range start="20240101T000000Z" end="20250101T000000Z"/></C:free-busy-query>`
+	const addressBookQuery = `<C:addressbook-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">` +
+		`<D:prop><D:getetag/></D:prop><C:filter><C:prop-filter name="FN"/></C:filter></C:addressbook-query>`
+	calendars := func() *DavServer {
+		return &DavServer{store: &store.Store{
+			Calendars: &fakeCalendarRepo{accessErr: context.Canceled},
+			Events:    &fakeEventRepo{},
+		}}
+	}
+	addressBooks := func() *DavServer {
+		return &DavServer{store: &store.Store{
+			AddressBooks: &fakeAddressBookRepo{readErr: context.Canceled},
+			Contacts:     &fakeContactRepo{},
+		}}
+	}
+	birthdays := func() *DavServer {
+		return &DavServer{store: &store.Store{Contacts: &fakeContactRepo{birthdayErr: context.Canceled}}}
+	}
+
+	tests := []struct {
+		name   string
+		server func() *DavServer
+		path   string
+		depth  string
+		body   string
+	}{
+		{"calendar named by its name", calendars, "/dav/calendars/Test/", "1", calendarQuery},
+		{"calendar loaded for calendar-query", calendars, "/dav/calendars/1/", "1", calendarQuery},
+		{"calendar loaded for free-busy-query", calendars, "/dav/calendars/1/", "1", freeBusyQuery},
+		{"calendar-multiget href naming its calendar by name", calendars, "/dav/calendars/1/event.ics", "0",
+			calendarMultiGetBody("/dav/calendars/Test/event.ics")},
+		{"address book named by its name", addressBooks, "/dav/addressbooks/Contacts/", "1", addressBookQuery},
+		{"address book loaded", addressBooks, "/dav/addressbooks/5/", "1", addressBookQuery},
+		{"birthday collection generated for free-busy-query", birthdays, "/dav/calendars/-1/", "1", freeBusyQuery},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := tt.server()
+			recorder := &levelRecorder{}
+			h.log = logging.New(recorder, logClass)
+
+			ctx, cancel := context.WithCancel(auth.WithUser(t.Context(), &store.User{ID: 1}))
+			cancel()
+			req := httptest.NewRequest("REPORT", tt.path, strings.NewReader(tt.body)).WithContext(ctx)
+			req.Header.Set("Depth", tt.depth)
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+
+			if rr.Code != statusClientClosedRequest {
+				t.Fatalf("status = %d, want %d: %s", rr.Code, statusClientClosedRequest, rr.Body.String())
+			}
+			if rr.Body.Len() != 0 {
+				t.Fatalf("body = %q, want none", rr.Body.String())
+			}
+			for i, level := range recorder.levels {
+				if level == jw6_utils.Error || level == jw6_utils.Warn {
+					t.Fatalf("logged %q at level %v for a request the client abandoned", recorder.messages[i], level)
+				}
+			}
+		})
+	}
+}
+
+// A deadline the server puts on a request ends its context too, but the client
+// is still waiting for the answer the server failed to finish in time: that is
+// the server's failure, answered and logged as one, not a client that left.
+func TestReportCutShortByAServerDeadlineIsAServerFailure(t *testing.T) {
+	h := hostileRecurrenceServer()
+	recorder := &levelRecorder{}
+	h.log = logging.New(recorder, logClass)
+	body := `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop>` +
+		`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260901T000000Z"/>` +
+		`</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`
+
+	ctx, cancel := context.WithDeadline(auth.WithUser(t.Context(), &store.User{ID: 1}), time.Now().Add(-time.Second))
+	defer cancel()
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Depth", "1")
+	rr := httptest.NewRecorder()
+	h.Report(rr, req)
+
+	if rr.Code == statusClientClosedRequest || rr.Code < 500 {
+		t.Fatalf("status = %d, want a server error", rr.Code)
+	}
+	if !recorder.logged(jw6_utils.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("logged %q, want the deadline at the error level", recorder.messages)
 	}
 }

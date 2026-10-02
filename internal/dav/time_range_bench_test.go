@@ -52,7 +52,7 @@ func BenchmarkCalendarQueryTimeRange(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		applyCalendarFilter(events, filter, floatingZone{})
+		applyCalendarFilter(b.Context(), events, filter, floatingZone{})
 	}
 }
 
@@ -74,7 +74,7 @@ func BenchmarkCalendarQueryTimeRangeNestedAlarm(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		applyCalendarFilter(events, filter, floatingZone{})
+		applyCalendarFilter(b.Context(), events, filter, floatingZone{})
 	}
 }
 
@@ -92,6 +92,38 @@ func BenchmarkFreeBusyPeriods(b *testing.B) {
 			if _, err := freeBusyIntervals(candidate, rangeStart, rangeEnd, budget); err != nil {
 				b.Fatal(err)
 			}
+		}
+	}
+}
+
+// benchOutlookWeeklyEvents builds n open-ended weekly series in the Outlook
+// zone, the shape a DAVx5 sync reads with a start-only time-range.
+func benchOutlookWeeklyEvents(n int) []store.Event {
+	events := make([]store.Event, 0, n)
+	for i := 0; i < n; i++ {
+		uid := fmt.Sprintf("outlook-%d", i)
+		events = append(events, store.Event{ID: int64(i + 1), UID: uid, ResourceName: uid, RawICAL: outlookWeeklySeries(uid, (i%28)+1, "FREQ=WEEKLY")})
+	}
+	return events
+}
+
+// BenchmarkCalendarQueryOpenEndedOutlookZone is the open-ended calendar-query
+// DAVx5 syncs with, over series whose instances resolve through an Outlook
+// VTIMEZONE.
+func BenchmarkCalendarQueryOpenEndedOutlookZone(b *testing.B) {
+	events := benchOutlookWeeklyEvents(100)
+	filter := &calFilter{CompFilter: compFilter{
+		Name: "VCALENDAR",
+		CompFilter: []compFilter{{
+			Name:      "VEVENT",
+			TimeRange: &timeRange{Start: "20260901T000000Z"},
+		}},
+	}}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := applyCalendarFilter(b.Context(), events, filter, reportFloatingZone("", nil)); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

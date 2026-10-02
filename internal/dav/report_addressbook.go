@@ -75,7 +75,7 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 	for len(responses) < stopAfter {
 		contacts, err := h.store.Contacts.ListForBookPageAfter(ctx, book.ID, afterID, multistatusPageSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list contacts")
+			return nil, fmt.Errorf("failed to list contacts: %w", err)
 		}
 		if len(contacts) == 0 {
 			break
@@ -168,7 +168,7 @@ func (h *DavServer) addressBookQuery(ctx context.Context, user *store.User, book
 func (h *DavServer) addressBookObjectQuery(ctx context.Context, user *store.User, book *store.AddressBook, baseHref, resourceName string, filter *cardFilter, reqProp *reportProp, addressDataReq *addressDataQuery) ([]response, error) {
 	contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, resourceName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch contact")
+		return nil, fmt.Errorf("failed to fetch contact: %w", err)
 	}
 	var responses []response
 	if contact != nil && contactMatchesCardFilter(*contact, filter) {
@@ -228,7 +228,7 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	// segment lookup per href.
 	contacts, err := h.store.Contacts.ListByResourceNames(ctx, bookID, resourceNames)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch contact")
+		return nil, fmt.Errorf("failed to fetch contacts: %w", err)
 	}
 	contactsByName := make(map[string]*store.Contact, len(contacts))
 	for i := range contacts {
@@ -317,7 +317,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 		if errors.Is(err, errTooManyCandidateRows) {
 			return nil, "", err
 		}
-		return nil, "", errors.New("failed to list contacts")
+		return nil, "", fmt.Errorf("failed to list contacts: %w", err)
 	}
 	candidateCount := len(contacts)
 	contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
@@ -360,7 +360,7 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 			if errors.Is(err, errTooManyCandidateRows) {
 				return nil, "", err
 			}
-			return nil, "", fmt.Errorf("failed to list deleted contacts")
+			return nil, "", fmt.Errorf("failed to list deleted contacts: %w", err)
 		}
 		deletedNames := make([]string, 0, len(deleted))
 		for _, d := range deleted {

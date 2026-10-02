@@ -61,7 +61,10 @@ func calendarResourceResponsesFilteredLimit(base string, events []store.Event, p
 }
 
 func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *store.User, base string, events []store.Event, selector propertySelector, projection calendarDataProjection) ([]response, error) {
-	responses := rawCalendarResourceReportResponsesLimit(base, events, projection, h.multistatusBuildLimit())
+	responses, err := rawCalendarResourceReportResponsesLimit(ctx, base, events, projection, h.multistatusBuildLimit())
+	if err != nil {
+		return nil, err
+	}
 	// One response past the limit is built so the overflow can be told from a
 	// match set that ends exactly on it, and the report answers the §7.8
 	// postcondition rather than a set trimmed to fit.
@@ -71,10 +74,14 @@ func (h *DavServer) calendarResourceReportResponses(ctx context.Context, user *s
 	return h.finishCalendarReportResponses(ctx, user, responses, selector, projection.requested())
 }
 
-func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, projection calendarDataProjection, limit int) []response {
+// rawCalendarResourceReportResponsesLimit builds up to limit responses, each
+// carrying calendar-data projected for the report. An expanded or limited
+// recurrence set can take milliseconds per resource, so the request is checked
+// before each one for the reason applyCalendarFilter does.
+func rawCalendarResourceReportResponsesLimit(ctx context.Context, base string, events []store.Event, projection calendarDataProjection, limit int) ([]response, error) {
 	baseHref := strings.TrimSuffix(base, "/") + "/"
 	if limit <= 0 {
-		return nil
+		return nil, nil
 	}
 	if limit > len(events) {
 		limit = len(events)
@@ -84,10 +91,13 @@ func rawCalendarResourceReportResponsesLimit(base string, events []store.Event, 
 		if len(responses) >= limit {
 			break
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		href := calendarObjectHref(baseHref, eventResourceName(ev))
 		responses = append(responses, rawCalendarResourceReportResponse(href, ev, projection))
 	}
-	return responses
+	return responses, nil
 }
 
 func rawCalendarResourceReportResponse(href string, event store.Event, projection calendarDataProjection) response {

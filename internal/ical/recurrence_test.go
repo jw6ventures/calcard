@@ -324,7 +324,7 @@ func TestRecurrenceInstancesExpandNonEventComponents(t *testing.T) {
 			if !componentHasRecurrence(raw, component) {
 				t.Fatalf("componentHasRecurrence(%s) = false", component)
 			}
-			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, component, dtstart, 0,
+			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, component, dtstart, 0,
 				time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 				time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)))
 
@@ -334,7 +334,7 @@ func TestRecurrenceInstancesExpandNonEventComponents(t *testing.T) {
 				time.Date(2025, 1, 20, 10, 0, 0, 0, time.UTC),
 			}
 			if len(got) != len(want) {
-				t.Fatalf("RecurrenceInstances() = %v, want %v", got, want)
+				t.Fatalf("collectRecurrenceInstances() = %v, want %v", got, want)
 			}
 			for i := range want {
 				if !got[i].Equal(want[i]) {
@@ -360,9 +360,9 @@ func TestRecurrenceInstancesIncludeOccurrencesOnTheBounds(t *testing.T) {
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
 	boundary := time.Date(2025, 1, 7, 10, 0, 0, 0, time.UTC)
 
-	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, 0, boundary, boundary, 1000, nil)))
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, 0, boundary, boundary, 1000, nil)))
 	if len(got) != 1 || !got[0].Equal(boundary) {
-		t.Fatalf("RecurrenceInstances() = %v, want exactly %v", got, boundary)
+		t.Fatalf("collectRecurrenceInstances() = %v, want exactly %v", got, boundary)
 	}
 }
 
@@ -383,7 +383,7 @@ func TestRecurrenceInstancesOmitOverriddenInstances(t *testing.T) {
 		"END:VCALENDAR\r\n"
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
 
-	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
 		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil)))
 
@@ -396,7 +396,7 @@ func TestRecurrenceInstancesOmitOverriddenInstances(t *testing.T) {
 		}
 	}
 	if len(got) != 1 || !got[0].Equal(dtstart) {
-		t.Fatalf("RecurrenceInstances() = %v, want exactly %v", got, dtstart)
+		t.Fatalf("collectRecurrenceInstances() = %v, want exactly %v", got, dtstart)
 	}
 }
 
@@ -431,13 +431,13 @@ func TestRecurrenceInstancesUseTheSuppliedResolver(t *testing.T) {
 		t.Fatal("resolver rejected the DTSTART")
 	}
 
-	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, 0, scanStart, scanEnd, 1000, behind)))
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, 0, scanStart, scanEnd, 1000, behind)))
 	want := []time.Time{
 		time.Date(2025, 1, 6, 13, 0, 0, 0, time.UTC),
 		time.Date(2025, 1, 20, 13, 0, 0, 0, time.UTC),
 	}
 	if len(got) != len(want) {
-		t.Fatalf("RecurrenceInstances() = %v, want %v", got, want)
+		t.Fatalf("collectRecurrenceInstances() = %v, want %v", got, want)
 	}
 	for i := range want {
 		if !got[i].Equal(want[i]) {
@@ -448,7 +448,7 @@ func TestRecurrenceInstancesUseTheSuppliedResolver(t *testing.T) {
 	// A nil resolver keeps the ParsePropertyDateTimeLocal reading, which is what
 	// every caller holding no zone of its own relies on.
 	plain, _ := ParsePropertyDateTimeLocal("DTSTART", "20250106T100000")
-	bare := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", plain, 0, scanStart, scanEnd, 1000, nil)))
+	bare := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", plain, 0, scanStart, scanEnd, 1000, nil)))
 	if len(bare) != 2 || !bare[0].Equal(plain) {
 		t.Fatalf("a nil resolver did not read as ParsePropertyDateTimeLocal: %v", bare)
 	}
@@ -514,11 +514,11 @@ func TestRecurrenceInstancesResolveEveryGeneratedCivilTime(t *testing.T) {
 				"END:VEVENT\r\n" +
 				"END:VCALENDAR\r\n"
 
-			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
 				test.wantStarts[0].Add(-time.Hour), test.wantStarts[len(test.wantStarts)-1].Add(2*time.Hour),
 				1000, resolve)))
 			if len(got) != len(test.wantStarts) {
-				t.Fatalf("RecurrenceInstances() = %v, want %v", got, test.wantStarts)
+				t.Fatalf("collectRecurrenceInstances() = %v, want %v", got, test.wantStarts)
 			}
 			for i := range test.wantStarts {
 				if !got[i].Equal(test.wantStarts[i]) {
@@ -589,11 +589,11 @@ func TestParsePropertyDateTimeLocalHonorsTZID(t *testing.T) {
 	}
 }
 
-// RecurrenceInstances keeps the slot each occurrence belongs to alongside where
-// it actually falls. The two diverge under a RANGE=THISANDFUTURE override, and a
-// caller writing a RECURRENCE-ID out needs the slot: RFC 5545 §3.8.4.4 makes the
-// property identify the instance within the master's pattern, not the time the
-// override moved it to.
+// VisitRecurrenceInstances keeps the slot each occurrence belongs to alongside
+// where it actually falls. The two diverge under a RANGE=THISANDFUTURE override,
+// and a caller writing a RECURRENCE-ID out needs the slot: RFC 5545 §3.8.4.4
+// makes the property identify the instance within the master's pattern, not the
+// time the override moved it to.
 func TestRecurrenceInstancesReportsTheSlotSeparatelyFromTheOccurrence(t *testing.T) {
 	raw := "BEGIN:VCALENDAR\r\n" +
 		"BEGIN:VEVENT\r\n" +
@@ -613,7 +613,7 @@ func TestRecurrenceInstancesReportsTheSlotSeparatelyFromTheOccurrence(t *testing
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 4 {
 		t.Fatalf("instances = %d, want 4: %#v", len(instances), instances)
 	}
@@ -705,7 +705,7 @@ func TestRecurrenceInstancesSlotMatchesTheStartWithoutAnOverride(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 3 {
 		t.Fatalf("instances = %d, want 3", len(instances))
 	}
@@ -736,7 +736,7 @@ func TestRecurrenceInstancesKeepDistinctSlotsAtTheSameScheduledTime(t *testing.T
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
 	if len(instances) != 2 {
 		t.Fatalf("instances = %d, want 2 distinct recurrence slots: %#v", len(instances), instances)
 	}
@@ -865,7 +865,7 @@ func TestRecurrenceInstancesAppliesBySetPosOverTheWholePeriod(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-			instances := requireRecurrenceResult[RecurrenceInstance](t)(RecurrenceInstances(recurringTestComponent(tt.rrule), "VEVENT", dtstart, time.Hour,
+			instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(recurringTestComponent(tt.rrule), "VEVENT", dtstart, time.Hour,
 				dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil))
 
 			var got []string
@@ -1072,6 +1072,21 @@ func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
 	}
 }
 
+// collectRecurrenceInstances gathers every instance VisitRecurrenceInstances
+// hands out, returning them with its error the way a caller owing the whole set
+// reads them: a budget error keeps what was collected, any other error none.
+func collectRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]RecurrenceInstance, error) {
+	var instances []RecurrenceInstance
+	err := VisitRecurrenceInstances(raw, componentName, dtstart, duration, rangeStart, rangeEnd, maxInstances, resolve, func(instance RecurrenceInstance) bool {
+		instances = append(instances, instance)
+		return false
+	})
+	if err != nil && !errors.Is(err, ErrRecurrenceExpansionLimit) {
+		return nil, err
+	}
+	return instances, err
+}
+
 func requireRecurrenceResult[T any](t *testing.T) func([]T, error) []T {
 	t.Helper()
 	return func(values []T, err error) []T {
@@ -1125,7 +1140,7 @@ func TestRecurrenceInstancePeriodDurationAndRangeOverride(t *testing.T) {
 				raw += "BEGIN:VEVENT\r\nUID:period\r\nRECURRENCE-ID;RANGE=THISANDFUTURE:20240603T090000Z\r\nDTSTART:20240603T100000Z\r\nDTEND:20240603T140000Z\r\nEND:VEVENT\r\n"
 			}
 			raw += "END:VCALENDAR\r\n"
-			instances, err := RecurrenceInstances(raw, "VEVENT", start, time.Hour, start.AddDate(0, 0, 4), start.AddDate(0, 0, 5), 10, nil)
+			instances, err := collectRecurrenceInstances(raw, "VEVENT", start, time.Hour, start.AddDate(0, 0, 4), start.AddDate(0, 0, 5), 10, nil)
 			if err != nil || len(instances) != 1 {
 				t.Fatalf("%+v, %v", instances, err)
 			}
@@ -1430,9 +1445,9 @@ func TestNeverMatchingRuleIsAnsweredWithinOneCalendarCycle(t *testing.T) {
 			})
 			t.Run("open-ended calendar-query", func(t *testing.T) {
 				finishesWithin(t, budget, func() string {
-					instances, err := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart, RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
+					instances, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart, RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
 					if err != nil || len(instances) != 1 || !instances[0].Start.Equal(dtstart) {
-						return fmt.Sprintf("RecurrenceInstances() = (%v, %v), want the DTSTART alone", instances, err)
+						return fmt.Sprintf("collectRecurrenceInstances() = (%v, %v), want the DTSTART alone", instances, err)
 					}
 					return ""
 				})
@@ -1486,16 +1501,16 @@ func TestRareDailyRuleIsFollowedToItsEnd(t *testing.T) {
 		}
 		raw := recurringTestComponent("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO")
 		finishesWithin(t, budget, func() string {
-			instances, err := RecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart.AddDate(0, 0, 1), RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
+			instances, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart.AddDate(0, 0, 1), RecurrenceUntilSentinel, MaxRecurrenceInstances+2, nil)
 			if err != nil {
-				return fmt.Sprintf("RecurrenceInstances() err = %v, want every leap-day Monday to the end of the range", err)
+				return fmt.Sprintf("collectRecurrenceInstances() err = %v, want every leap-day Monday to the end of the range", err)
 			}
 			got := make([]string, 0, len(instances))
 			for _, instance := range instances {
 				got = append(got, instance.Start.Format(time.DateOnly))
 			}
 			if !slices.Equal(got, want) {
-				return fmt.Sprintf("RecurrenceInstances() = %d starts from %v, want %d from %v", len(got), got[:min(3, len(got))], len(want), want[:3])
+				return fmt.Sprintf("collectRecurrenceInstances() = %d starts from %v, want %d from %v", len(got), got[:min(3, len(got))], len(want), want[:3])
 			}
 			return ""
 		})
@@ -2306,5 +2321,529 @@ func TestFastForwardCountedSubDailyRecurrenceSpansCenturies(t *testing.T) {
 	}
 	if wantSkipped := int((want.Unix() - periodStart.Unix()) / 3600); skipped != wantSkipped {
 		t.Fatalf("skipped %d instances, want %d", skipped, wantSkipped)
+	}
+}
+
+// A RecurrenceStartLister lists the set LatestRecurrenceOnOrBefore searches, so
+// the latest listed start at or before any bound has to be the start
+// LatestRecurrenceOnOrBefore answers for that bound -- whether the listing was
+// made in one extension or grown a few years at a time, as a caller resolving
+// ever later instants grows it. The rules cover the shapes a VTIMEZONE
+// observance takes -- Exchange's 1601 DTSTART, a rule retired by UNTIL, a
+// counted rule, a DTSTART the rule does not generate -- and the selection paths
+// that end a set early.
+func TestRecurrenceStartListerAgreesWithLatestRecurrenceOnOrBefore(t *testing.T) {
+	tests := []struct {
+		name    string
+		dtstart time.Time
+		rrule   string
+	}{
+		{"Exchange standard", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"},
+		{"Exchange daylight", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3"},
+		{"last Sunday", time.Date(1996, 10, 27, 3, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU"},
+		{"retired by UNTIL", time.Date(1987, 4, 5, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z"},
+		{"counted", time.Date(2007, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=2"},
+		{"counted past the range", time.Date(1990, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU;COUNT=90"},
+		{"unsynchronized start", time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU"},
+		{"every other year", time.Date(2000, 3, 26, 1, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYDAY=-1SU"},
+		{"monthly set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"},
+		{"unreachable set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=1;BYSETPOS=5"},
+		{"never matching", time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30"},
+		{"week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU"},
+		{"counted week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1,-1;BYDAY=MO,SU;COUNT=40"},
+		{"unparsable", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=FORTNIGHTLY"},
+	}
+	through := time.Date(2041, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			whole := NewRecurrenceStartLister(tt.dtstart, tt.rrule)
+			if !whole.ListThrough(through, 4096) {
+				t.Fatal("ListThrough() = false, want the whole range listed")
+			}
+			if !slices.IsSortedFunc(whole.starts, time.Time.Compare) {
+				t.Fatalf("listed %v, want ascending", whole.starts)
+			}
+			grown := NewRecurrenceStartLister(tt.dtstart, tt.rrule)
+			for bound := tt.dtstart; bound.Before(through); bound = bound.Add(3*365*24*time.Hour + 17*time.Hour) {
+				if !grown.ListThrough(bound, 4096) {
+					t.Fatalf("ListThrough(%v) = false while growing, want true", bound)
+				}
+			}
+			if !grown.ListThrough(through, 4096) {
+				t.Fatal("ListThrough() = false at the end of growing, want true")
+			}
+
+			var bounds []time.Time
+			for bound := tt.dtstart.Add(-time.Hour); bound.Before(through); bound = bound.Add(97 * 24 * time.Hour) {
+				bounds = append(bounds, bound)
+			}
+			if whole.Covers(through.AddDate(500, 0, 0)) {
+				// A listing of a set that has ended answers every later bound
+				// as well, which is what lets a caller stop extending it.
+				bounds = append(bounds, through, through.AddDate(1, 0, 0), through.AddDate(500, 0, 0))
+			}
+			for _, bound := range bounds {
+				for _, before := range []time.Time{bound, bound.Add(-time.Nanosecond)} {
+					wantLatest, wantFound, wantComplete := LatestRecurrenceOnOrBefore(tt.dtstart, before, tt.rrule)
+					if !wantComplete {
+						t.Fatalf("LatestRecurrenceOnOrBefore(%v) complete = false", before)
+					}
+					for name, lister := range map[string]*RecurrenceStartLister{"whole": whole, "grown": grown} {
+						got, found, ok := lister.LatestOnOrBefore(before)
+						if !ok || found != wantFound || (found && !got.Equal(wantLatest)) {
+							t.Fatalf("%s listing at or before %v = %v (found=%t, ok=%t), LatestRecurrenceOnOrBefore = %v (found=%t)",
+								name, before, got, found, ok, wantLatest, wantFound)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// Growing a listing continues from where the last extension stopped. Listing
+// four centuries of Exchange's rule a year at a time costs about what listing
+// it at once does, where starting again from 1601 every year would cost some
+// four hundred times as much.
+func TestRecurrenceStartListerResumesWhereItStopped(t *testing.T) {
+	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
+	const rrule = "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"
+	through := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	spent := func(list func(*RecurrenceStartLister)) int {
+		lister := NewRecurrenceStartLister(dtstart, rrule)
+		list(lister)
+		if !lister.Covers(through) {
+			t.Fatal("the listing does not reach the bound")
+		}
+		return recurrenceWorkLimit - lister.work.remaining
+	}
+	once := spent(func(l *RecurrenceStartLister) {
+		l.ListThrough(through, 4096)
+	})
+	yearly := spent(func(l *RecurrenceStartLister) {
+		for bound := dtstart; bound.Before(through); bound = bound.AddDate(1, 0, 0) {
+			l.ListThrough(bound, 4096)
+		}
+		l.ListThrough(through, 4096)
+	})
+	if yearly > 3*once {
+		t.Fatalf("growing a year at a time spent %d units, listing at once %d", yearly, once)
+	}
+}
+
+// A set is ended, and answers every later bound, only when it is known to have
+// no start past what was listed: a counted or UNTIL-bounded rule that ran out,
+// or one that can never produce a start.
+func TestRecurrenceStartListerReportsWhetherTheSetEnded(t *testing.T) {
+	soon := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		rrule   string
+		through time.Time
+		ended   bool
+	}{
+		{"open-ended", "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", soon, false},
+		{"retired by UNTIL", "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;UNTIL=20100101T000000Z", soon, true},
+		{"counted out", "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=3", soon, true},
+		{"counted past through", "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=300", soon, false},
+		// One Gregorian cycle of yearly periods offering nothing shows that
+		// none ever will.
+		{"never matching", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC), true},
+	}
+	dtstart := time.Date(2007, 3, 11, 2, 0, 0, 0, time.UTC)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lister := NewRecurrenceStartLister(dtstart, tt.rrule)
+			if !lister.ListThrough(tt.through, 4096) {
+				t.Fatal("ListThrough() = false, want true")
+			}
+			if ended := lister.Covers(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)); ended != tt.ended {
+				t.Fatalf("listing covers every later bound = %t, want %t", ended, tt.ended)
+			}
+		})
+	}
+}
+
+// A listing draws every extension from one work budget, the one a single
+// LatestRecurrenceOnOrBefore spends. Growing it in steps would otherwise carry
+// it to a bound that walking a counted rule refuses as too costly, and whether
+// a bound was answered would depend on which bounds had been asked about
+// before it. The
+// rule here costs about 9,700 units a year, as every minute of the first week
+// of January is generated for BYSETPOS to pick one, so three centuries outrun
+// the budget while any 25-year step of them fits.
+func TestRecurrenceStartListerAnswersOnlyWhatOneWalkAnswers(t *testing.T) {
+	dtstart := time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)
+	hours := make([]string, 0, 23)
+	for hour := 1; hour < 24; hour++ {
+		hours = append(hours, strconv.Itoa(hour))
+	}
+	minutes := make([]string, 0, 60)
+	for minute := 0; minute < 60; minute++ {
+		minutes = append(minutes, strconv.Itoa(minute))
+	}
+	rrule := "FREQ=YEARLY;COUNT=100000;BYMONTH=1;BYMONTHDAY=1,2,3,4,5,6,7;BYHOUR=" + strings.Join(hours, ",") +
+		";BYMINUTE=" + strings.Join(minutes, ",") + ";BYSETPOS=-1"
+	near := time.Date(1650, 6, 1, 0, 0, 0, 0, time.UTC)
+	far := time.Date(1900, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	if _, _, complete := LatestRecurrenceOnOrBefore(dtstart, far, rrule); complete {
+		t.Fatalf("walking %q to %v fit the work budget; the test needs a bound it refuses", rrule, far)
+	}
+	want, wantFound, wantComplete := LatestRecurrenceOnOrBefore(dtstart, near, rrule)
+	if !wantComplete || !wantFound {
+		t.Fatalf("walking %q to %v = %v, %t, %t; want a complete answer", rrule, near, want, wantFound, wantComplete)
+	}
+
+	lister := NewRecurrenceStartLister(dtstart, rrule)
+	for bound := dtstart; bound.Before(far); bound = bound.AddDate(25, 0, 0) {
+		lister.ListThrough(bound, 4096)
+	}
+	lister.ListThrough(far, 4096)
+	if got, found, ok := lister.LatestOnOrBefore(near); !ok || !found || !got.Equal(want) {
+		t.Fatalf("listing answered %v with %v, %t, %t; want %v as walking it does", near, got, found, ok, want)
+	}
+	if got, found, ok := lister.LatestOnOrBefore(far); ok {
+		t.Fatalf("listing grown in steps answered %v with %v, %t; walking the rule refuses it", far, got, found)
+	}
+}
+
+// RFC 5545 numbers a year's weeks from the one holding its first Thursday, so a
+// yearly BYWEEKNO=1 period generates days up to three days before its January
+// 1. A bound in those days has to see them, whether it is answered by walking
+// the rule or from a listing grown to it, and a listing grown past them in
+// steps that landed among them still holds them.
+func TestRecurrenceStartsIncludeWeeksBegunInThePreviousYear(t *testing.T) {
+	dtstart := time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC)
+	at := func(year int, month time.Month, day int) time.Time {
+		return time.Date(year, month, day, 10, 0, 0, 0, time.UTC)
+	}
+	// Week 1 of 2025 begins on Monday 2024-12-30, and week 1 of 2026 on Monday
+	// 2025-12-29.
+	want := []time.Time{
+		dtstart,
+		at(2021, 1, 4), at(2021, 1, 5),
+		at(2022, 1, 3), at(2022, 1, 4),
+		at(2023, 1, 2), at(2023, 1, 3),
+		at(2024, 1, 1), at(2024, 1, 2),
+		at(2024, 12, 30), at(2024, 12, 31),
+		at(2025, 12, 29), at(2025, 12, 30),
+	}
+	bounds := []struct {
+		before time.Time
+		want   time.Time
+	}{
+		{time.Date(2024, 12, 30, 23, 0, 0, 0, time.UTC), at(2024, 12, 30)},
+		{time.Date(2024, 12, 31, 12, 0, 0, 0, time.UTC), at(2024, 12, 31)},
+		{time.Date(2025, 12, 29, 9, 0, 0, 0, time.UTC), at(2024, 12, 31)},
+		{time.Date(2025, 12, 29, 11, 0, 0, 0, time.UTC), at(2025, 12, 29)},
+	}
+	end := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, rrule := range []string{"FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU", "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU;COUNT=20"} {
+		t.Run(rrule, func(t *testing.T) {
+			grown := NewRecurrenceStartLister(dtstart, rrule)
+			for _, bound := range bounds {
+				if latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, bound.before, rrule); !found || !complete || !latest.Equal(bound.want) {
+					t.Errorf("LatestRecurrenceOnOrBefore(%v) = %v, %t, %t, want %v", bound.before, latest, found, complete, bound.want)
+				}
+				if !grown.ListThrough(bound.before, 4096) {
+					t.Fatalf("ListThrough(%v) = false, want true", bound.before)
+				}
+				if latest, found, ok := grown.LatestOnOrBefore(bound.before); !ok || !found || !latest.Equal(bound.want) {
+					t.Errorf("listing grown to %v answered %v, %t, %t, want %v", bound.before, latest, found, ok, bound.want)
+				}
+			}
+			if !grown.ListThrough(end, 4096) {
+				t.Fatalf("ListThrough(%v) = false, want true", end)
+			}
+			if !slices.EqualFunc(grown.starts, want, time.Time.Equal) {
+				t.Fatalf("listed %v, want %v", grown.starts, want)
+			}
+		})
+	}
+}
+
+// A yearly BYWEEKNO period's weeks overhang its calendar year at both ends: week
+// 1 can begin up to three days before January 1, and the last week can end up
+// to three days after December 31. Expansion has to reach into the periods on
+// either side of a range for the instances they put inside it.
+func TestRecurrenceInstancesIncludeWeeksOverhangingTheYear(t *testing.T) {
+	event := func(dtstart, rrule string) string {
+		return "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weeks\r\nDTSTART:" + dtstart + "\r\nRRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	at := func(year int, month time.Month, day int) time.Time {
+		return time.Date(year, month, day, 10, 0, 0, 0, time.UTC)
+	}
+	tests := []struct {
+		name                 string
+		dtstart              time.Time
+		rrule                string
+		rangeStart, rangeEnd time.Time
+		want                 []time.Time
+	}{
+		{
+			// Week 1 of 2025 begins on Monday 2024-12-30, in the period after
+			// the one holding the range.
+			name:       "week 1 begun before the range's year ends",
+			dtstart:    at(2020, 1, 6),
+			rrule:      "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU",
+			rangeStart: time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC),
+			rangeEnd:   time.Date(2024, 12, 31, 12, 0, 0, 0, time.UTC),
+			want:       []time.Time{at(2024, 12, 30), at(2024, 12, 31)},
+		},
+		{
+			// Week 53 of 2020 ends on Sunday 2021-01-03, in the period before
+			// the one holding the range.
+			name:       "last week ending after the range's year begins",
+			dtstart:    at(2019, 12, 28),
+			rrule:      "FREQ=YEARLY;BYWEEKNO=-1;BYDAY=SA,SU",
+			rangeStart: time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC),
+			rangeEnd:   time.Date(2021, 1, 5, 0, 0, 0, 0, time.UTC),
+			want:       []time.Time{at(2021, 1, 2), at(2021, 1, 3)},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := event(tt.dtstart.Format("20060102T150405Z"), tt.rrule)
+			got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", tt.dtstart, time.Hour, tt.rangeStart, tt.rangeEnd, MaxRecurrenceInstances, nil)))
+			if !slices.EqualFunc(got, tt.want, time.Time.Equal) {
+				t.Fatalf("collectRecurrenceInstances() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// PUT validation counts a set to UNTIL, or over the horizon an unbounded rule is
+// measured across, and a yearly BYWEEKNO period that begins past either can
+// still put instances before it.
+func TestRecurrenceSetExceedsLimitCountsWeeksBegunInThePreviousYear(t *testing.T) {
+	event := func(dtstart, rrule string) string {
+		return "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weeks\r\nDTSTART:" + dtstart + "\r\nRRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	tests := []struct {
+		name  string
+		raw   string
+		count int
+	}{
+		{
+			// The DTSTART and two days a year through 2024, the last two of
+			// them in week 1 of 2025.
+			name:  "bounded by UNTIL",
+			raw:   event("20200106T100000Z", "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU;UNTIL=20241231T120000Z"),
+			count: 11,
+		},
+		{
+			// The year from 2023-12-30 holds the DTSTART, 2024-01-01,
+			// 2024-01-02 and 2024-12-30, which week 1 of 2025 begins on.
+			name:  "unbounded, over its horizon",
+			raw:   event("20231230T100000Z", "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU"),
+			count: 4,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if exceeds, ok := RecurrenceSetExceedsLimit(tt.raw, tt.count-1); !ok || !exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances to exceed it", tt.count-1, exceeds, ok, tt.count)
+			}
+			if exceeds, ok := RecurrenceSetExceedsLimit(tt.raw, tt.count); !ok || exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances within it", tt.count, exceeds, ok, tt.count)
+			}
+		})
+	}
+}
+
+// A set holding more starts than the caller will keep halts the listing at the
+// last start it could keep. Everything before that is still listed exactly and
+// answers its bounds; a bound past it is left to the caller, and asking again
+// does not extend the listing, since it would only stop at the same place.
+func TestRecurrenceStartListerHaltsAtItsLimit(t *testing.T) {
+	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
+	const rrule = "FREQ=YEARLY;BYDAY=1SU;BYMONTH=11"
+	lister := NewRecurrenceStartLister(dtstart, rrule)
+	if lister.ListThrough(time.Date(4050, 1, 1, 0, 0, 0, 0, time.UTC), 1024) {
+		t.Fatal("ListThrough() = true for 2,450 yearly starts with a limit of 1024, want false")
+	}
+	if lister.Len() != 1024 {
+		t.Fatalf("kept %d starts, want 1024", lister.Len())
+	}
+	for _, before := range []time.Time{
+		time.Date(1700, 6, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		lister.starts[1023],
+	} {
+		want, wantFound, _ := LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+		got, found, ok := lister.LatestOnOrBefore(before)
+		if !ok || found != wantFound || !got.Equal(want) {
+			t.Fatalf("LatestOnOrBefore(%v) = %v, %t, %t; want %v, %t, true", before, got, found, ok, want, wantFound)
+		}
+	}
+	past := time.Date(2700, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, _, ok := lister.LatestOnOrBefore(past); ok {
+		t.Fatalf("LatestOnOrBefore(%v) answered past the halted listing", past)
+	}
+	if lister.ListThrough(past, 4096) || lister.Len() != 1024 {
+		t.Fatalf("a halted listing was extended to %d starts", lister.Len())
+	}
+}
+
+// RFC 4791 §9.9 makes one matching instance enough, so a visitor that has its
+// answer ends the expansion there instead of paying for the rest of the range.
+func TestVisitRecurrenceInstancesStopsWhenAsked(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:daily\r\nDTSTART:20250101T100000Z\r\n" +
+		"RRULE:FREQ=DAILY\r\nRDATE:20250101T200000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	dtstart := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	rangeStart := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	rangeEnd := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	visited := 0
+	err := VisitRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, func(RecurrenceInstance) bool {
+		visited++
+		return visited == 3
+	})
+	if err != nil {
+		t.Fatalf("VisitRecurrenceInstances() error = %v, want nil after stopping", err)
+	}
+	if visited != 3 {
+		t.Fatalf("visited %d instances, want 3", visited)
+	}
+
+	// A visitor that never stops sees every instance the budget admits, and
+	// then the budget error the range runs into.
+	visited = 0
+	err = VisitRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, func(RecurrenceInstance) bool {
+		visited++
+		return false
+	})
+	if !errors.Is(err, ErrRecurrenceExpansionLimit) {
+		t.Fatalf("VisitRecurrenceInstances() error = %v, want the expansion limit", err)
+	}
+	if visited != MaxRecurrenceInstances {
+		t.Fatalf("visited %d instances, want %d", visited, MaxRecurrenceInstances)
+	}
+}
+
+// The period holding the DTSTART begins before it, and a rule whose DTSTART is
+// not its first onset of that period generates later onsets inside it. The
+// backward search has to reach that period rather than stop at its start.
+func TestLatestRecurrenceOnOrBeforeSearchesThePeriodHoldingTheDTStart(t *testing.T) {
+	tests := []struct {
+		name    string
+		dtstart time.Time
+		rrule   string
+		before  time.Time
+		want    time.Time
+	}{
+		{
+			name:    "a later onset in the DTSTART's year",
+			dtstart: time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU",
+			before:  time.Date(2011, 2, 7, 0, 0, 0, 0, time.UTC),
+			want:    time.Date(2010, 10, 31, 2, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "a DTSTART the rule generates",
+			dtstart: time.Date(1996, 10, 27, 3, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+			before:  time.Date(1997, 2, 1, 0, 0, 0, 0, time.UTC),
+			want:    time.Date(1996, 10, 27, 3, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			latest, found, complete := LatestRecurrenceOnOrBefore(tt.dtstart, tt.before, tt.rrule)
+			if !found || !complete || !latest.Equal(tt.want) {
+				t.Fatalf("LatestRecurrenceOnOrBefore() = %v, %t, %t, want %v, true, true", latest, found, complete, tt.want)
+			}
+		})
+	}
+}
+
+// A counted rule is followed forward from its DTSTART, and the answer is the
+// last start reached, so following it holds that one start rather than every
+// start before the bound. A rule four times an hour for six years reaches
+// about 210,000 of them.
+func TestLatestRecurrenceOnOrBeforeOfACountedRuleHoldsOnlyItsLatestStart(t *testing.T) {
+	dtstart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	rrule := "FREQ=DAILY;COUNT=10000000;BYHOUR=" + enumeratedInts(24) + ";BYMINUTE=0,15,30,45"
+	before := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	var start, end runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&start)
+	latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+	runtime.ReadMemStats(&end)
+
+	if !found || !complete || !latest.Equal(before) {
+		t.Fatalf("LatestRecurrenceOnOrBefore() = %v, %t, %t, want %v, true, true", latest, found, complete, before)
+	}
+	// Generating six years of these periods allocates about 6 MB on its own.
+	// Keeping the 210,000 starts as well adds more than 20 MB: the starts and
+	// the copies a growing slice leaves behind.
+	const allocationBudget = 16 << 20
+	if allocated := end.TotalAlloc - start.TotalAlloc; allocated > allocationBudget {
+		t.Fatalf("allocated %d bytes, want at most %d: the starts before the latest are being kept", allocated, allocationBudget)
+	}
+}
+
+// A bound can lie further past the DTSTART than the scan bound counts periods
+// -- 274 years of days, 1,917 of weeks, 8,333 of months -- and the backward
+// search has to start from the period holding the bound all the same. Starting
+// short of it would offer an onset centuries old as the latest, and as a
+// complete answer. Each expected start is found by stepping the rule from its
+// DTSTART one period at a time.
+func TestLatestRecurrenceOnOrBeforeReachesBoundsCenturiesPastTheDTStart(t *testing.T) {
+	tests := []struct {
+		name    string
+		dtstart time.Time
+		rrule   string
+		before  time.Time
+		step    func(time.Time) time.Time
+		admits  func(time.Time) bool
+	}{
+		{
+			name:    "daily, once a year",
+			dtstart: time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=DAILY;BYMONTH=3;BYMONTHDAY=25",
+			before:  time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			step:    func(t time.Time) time.Time { return t.AddDate(0, 0, 1) },
+			admits:  func(t time.Time) bool { return t.Month() == time.March && t.Day() == 25 },
+		},
+		{
+			name:    "every third day",
+			dtstart: time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=DAILY;INTERVAL=3",
+			before:  time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			step:    func(t time.Time) time.Time { return t.AddDate(0, 0, 3) },
+		},
+		{
+			name:    "weekly",
+			dtstart: time.Date(90, 1, 7, 2, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=WEEKLY",
+			before:  time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			step:    func(t time.Time) time.Time { return t.AddDate(0, 0, 7) },
+		},
+		{
+			name:    "monthly",
+			dtstart: time.Date(1, 1, 15, 2, 0, 0, 0, time.UTC),
+			rrule:   "FREQ=MONTHLY",
+			before:  time.Date(9500, 6, 1, 0, 0, 0, 0, time.UTC),
+			step:    func(t time.Time) time.Time { return t.AddDate(0, 1, 0) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.dtstart
+			for start := tt.dtstart; !start.After(tt.before); start = tt.step(start) {
+				if tt.admits == nil || tt.admits(start) {
+					want = start
+				}
+			}
+			latest, found, complete := LatestRecurrenceOnOrBefore(tt.dtstart, tt.before, tt.rrule)
+			if !found || !complete || !latest.Equal(want) {
+				t.Fatalf("LatestRecurrenceOnOrBefore() = %v, %t, %t, want %v, true, true", latest, found, complete, want)
+			}
+		})
 	}
 }

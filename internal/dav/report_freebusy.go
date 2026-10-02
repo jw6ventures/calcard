@@ -72,10 +72,10 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 		if errors.Is(err, errTooManyCandidateRows) {
 			return "", errNumberOfMatchesExceeded
 		}
-		return "", errors.New("failed to list events")
+		return "", fmt.Errorf("failed to list events: %w", err)
 	}
 
-	candidates, err := filterFreeBusyCandidatesByTimeRange(freeBusyCandidates(events, zone), tr)
+	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, zone), tr)
 	if err != nil {
 		return "", freeBusyReportError(err)
 	}
@@ -84,7 +84,7 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 		return "", err
 	}
 
-	body, err := h.generateFreeBusy(candidates, tr)
+	body, err := h.generateFreeBusy(ctx, candidates, tr)
 	if err != nil {
 		return "", freeBusyReportError(err)
 	}
@@ -137,12 +137,17 @@ func freeBusyCandidates(events []store.Event, zone floatingZone) []freeBusyCandi
 	return candidates
 }
 
-func filterFreeBusyCandidatesByTimeRange(candidates []freeBusyCandidate, tr *timeRange) ([]freeBusyCandidate, error) {
+// filterFreeBusyCandidatesByTimeRange keeps the candidates intersecting tr,
+// checking the request before each one for the reason applyCalendarFilter does.
+func filterFreeBusyCandidatesByTimeRange(ctx context.Context, candidates []freeBusyCandidate, tr *timeRange) ([]freeBusyCandidate, error) {
 	if tr == nil {
 		return candidates, nil
 	}
 	kept := make([]freeBusyCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if matcherInTimeRange(candidate.matcher, tr) {
 			kept = append(kept, candidate)
 		}
@@ -238,8 +243,10 @@ func freeBusyHasTimeRange(tr *timeRange) bool {
 
 // generateFreeBusy builds the §7.10 response body. Each candidate resolves its
 // periods through the zone it was parsed with, which RFC 4791 §7.3 makes the
-// collection's CALDAV:calendar-timezone for this report.
-func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRange) (string, error) {
+// collection's CALDAV:calendar-timezone for this report. Expanding a recurring
+// candidate can take milliseconds, so the request is checked before each one
+// for the reason applyCalendarFilter does.
+func (h *DavServer) generateFreeBusy(ctx context.Context, candidates []freeBusyCandidate, tr *timeRange) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
@@ -269,6 +276,9 @@ func (h *DavServer) generateFreeBusy(candidates []freeBusyCandidate, tr *timeRan
 	var intervals []freeBusyInterval
 	budget := newFreeBusyBudget()
 	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		published, err := freeBusyIntervals(candidate, rangeStart, rangeEnd, budget)
 		if err != nil {
 			return "", err

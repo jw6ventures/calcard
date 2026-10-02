@@ -23,7 +23,7 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	if targetResource != "" {
 		event, err := h.store.Events.GetByResourceName(ctx, cal.ID, targetResource)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to fetch event")
+			return nil, "", fmt.Errorf("failed to fetch event: %w", err)
 		}
 		if event == nil {
 			return nil, "", store.ErrNotFound
@@ -87,14 +87,20 @@ type calendarReportRequest struct {
 }
 
 // applyCalendarFilter keeps the events a CALDAV:filter matches, resolving
-// floating values through zone, which RFC 4791 §7.3 orders ahead of UTC.
-func applyCalendarFilter(events []store.Event, filter *calFilter, zone floatingZone) ([]store.Event, error) {
+// floating values through zone, which RFC 4791 §7.3 orders ahead of UTC. A
+// recurring resource can take milliseconds to judge, so the request is checked
+// before each one: a client that gave up on a large collection stops the work
+// rather than leaving it to run to the end unread.
+func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calFilter, zone floatingZone) ([]store.Event, error) {
 	if filter == nil {
 		return events, nil
 	}
 
 	var filtered []store.Event
 	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		matcher, parsed := newEventTimeRangeMatcher(event, zone)
 		if !parsed {
 			continue
@@ -418,7 +424,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest
 	for len(responses) < buildLimit {
 		events, err := h.store.Events.ListForCalendarPageAfter(ctx, req.cal.ID, afterID, multistatusPageSize, databaseFilter)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list events")
+			return nil, fmt.Errorf("failed to list events: %w", err)
 		}
 		if len(events) == 0 {
 			break
@@ -430,7 +436,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest
 
 		matching := events
 		if filter != nil {
-			matching, err = applyCalendarFilter(matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone)
 			if err != nil {
 				return nil, err
 			}
@@ -439,7 +445,11 @@ func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest
 		if err != nil {
 			return nil, err
 		}
-		responses = append(responses, rawCalendarResourceReportResponsesLimit(req.collectionPath, matching, req.projection, buildLimit-len(responses))...)
+		built, err := rawCalendarResourceReportResponsesLimit(ctx, req.collectionPath, matching, req.projection, buildLimit-len(responses))
+		if err != nil {
+			return nil, err
+		}
+		responses = append(responses, built...)
 
 		lastID := events[len(events)-1].ID
 		if lastID <= afterID || len(events) < multistatusPageSize {
@@ -499,7 +509,7 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, req calendarReportRequ
 		var err error
 		events, err = h.store.Events.ListByResourceNames(ctx, req.cal.ID, uids)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch event")
+			return nil, fmt.Errorf("failed to fetch events: %w", err)
 		}
 		prefetchedACLEntries, err = h.prefetchCalendarACLEntries(ctx, req.user, req.cal.ID, events)
 		if err != nil {
@@ -514,6 +524,9 @@ func (h *DavServer) calendarMultiGet(ctx context.Context, req calendarReportRequ
 
 	responses := make([]response, 0, len(hrefs))
 	for i, href := range hrefs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		uid := resolved[i].ResourceName
 		// RFC 4791 §7.9: every requested href needs a DAV:response, so an
 		// unresolvable or out-of-scope one reports 404 under the best href the
@@ -566,13 +579,13 @@ func multigetHrefInScope(targetResource, uid string) bool {
 func (h *DavServer) calendarObjectQuery(ctx context.Context, req calendarReportRequest, filter *calFilter) ([]response, error) {
 	event, err := h.store.Events.GetByResourceName(ctx, req.cal.ID, req.targetResource)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch event")
+		return nil, fmt.Errorf("failed to fetch event: %w", err)
 	}
 	var matching []store.Event
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching, err = applyCalendarFilter(matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone)
 			if err != nil {
 				return nil, err
 			}
@@ -582,7 +595,10 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, req calendarReportR
 			return nil, err
 		}
 	}
-	responses := rawCalendarResourceReportResponsesLimit(req.collectionPath, matching, req.projection, h.multistatusBuildLimit())
+	responses, err := rawCalendarResourceReportResponsesLimit(ctx, req.collectionPath, matching, req.projection, h.multistatusBuildLimit())
+	if err != nil {
+		return nil, err
+	}
 	return h.finishCalendarReportResponses(ctx, req.user, responses, req.selector, req.projection.requested())
 }
 
@@ -630,7 +646,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 		if errors.Is(err, errTooManyCandidateRows) {
 			return nil, "", err
 		}
-		return nil, "", errors.New("failed to list events")
+		return nil, "", fmt.Errorf("failed to list events: %w", err)
 	}
 	allEvents := events
 	events, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, events)
@@ -641,7 +657,10 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 	responses := []response{
 		calendarCollectionResponseWithPrivileges(collectionHref, req.cal.Name, req.cal.Calendar, req.principalHref, syncToken, strconv.FormatInt(req.cal.CTag, 10), req.cal.EffectivePrivileges()),
 	}
-	resourceResponses := rawCalendarResourceReportResponsesLimit(collectionHref, events, req.projection, h.multistatusBuildLimit()-len(responses))
+	resourceResponses, err := rawCalendarResourceReportResponsesLimit(ctx, collectionHref, events, req.projection, h.multistatusBuildLimit()-len(responses))
+	if err != nil {
+		return nil, "", err
+	}
 	responses = h.appendMultistatusResponses(responses, resourceResponses)
 
 	// Include deleted resources if this is an incremental sync
@@ -683,7 +702,7 @@ func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarRepo
 			if errors.Is(err, errTooManyCandidateRows) {
 				return nil, "", err
 			}
-			return nil, "", fmt.Errorf("failed to list deleted events")
+			return nil, "", fmt.Errorf("failed to list deleted events: %w", err)
 		}
 		for _, d := range deleted {
 			if h.multistatusBuildComplete(responses) {

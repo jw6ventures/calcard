@@ -6,6 +6,7 @@ package ical
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"sort"
@@ -87,6 +88,9 @@ type recurrenceExpansion struct {
 	maxInstances      int
 	resolve           PropertyTimeResolver
 	reaches           func(original, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool
+	// visit, when set, receives each occurrence in place of the returned
+	// slice and ends the expansion by returning true.
+	visit func(recurrenceOccurrence) bool
 }
 
 // RecurringBusyPeriods expands a recurring event (RRULE, RDATE, EXDATE and
@@ -127,25 +131,31 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 	return periods, err
 }
 
-// RecurrenceInstances expands the recurrence set of the named component and
-// returns every *generated* instance whose occurrence window touches
+// VisitRecurrenceInstances expands the recurrence set of the named component
+// and hands visit every *generated* instance whose occurrence window touches
 // [rangeStart, rangeEnd], each paired with the slot of the master's pattern it
-// belongs to. Overridden instances are left out: RFC 4791 §9.7.1 scopes a
-// comp-filter to each component of the resource, so an override is matched as
-// the component it is rather than through its master's pattern. Both bounds are
-// inclusive, because the caller re-applies the exact §9.9 condition and an
-// exclusive bound here would drop an occurrence that starts precisely at the end
-// of the range.
+// belongs to, one at a time as the expansion produces them. Overridden instances
+// are left out: RFC 4791 §9.7.1 scopes a comp-filter to each component of the
+// resource, so an override is matched as the component it is rather than through
+// its master's pattern. Both bounds are inclusive, because the caller re-applies
+// the exact §9.9 condition and an exclusive bound here would drop an occurrence
+// that starts precisely at the end of the range.
+//
+// The expansion ends as soon as visit returns true, which is not an error. A
+// caller asking whether any one instance answers a question -- RFC 4791 §9.9
+// makes one matching instance enough -- then pays for the instances up to that
+// one rather than for the whole range.
 //
 // Work budget exhaustion returns ErrRecurrenceExpansionLimit (or the
-// ErrRecurrenceScanLimit wrapping it) alongside the instances collected before
-// the budget ran out. Those are not a prefix of the set in ascending order --
-// RDATE instances are collected after the rule's, and a RANGE=THISANDFUTURE
-// override can reorder placements -- but each of them does reach the range, so
-// a caller asking only whether the set reaches it can answer from them; one
-// that owes the complete set has to treat the error as fatal.
-func RecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]RecurrenceInstance, error) {
-	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+// ErrRecurrenceScanLimit wrapping it) after visit has seen every instance
+// collected before the budget ran out. Those are not a prefix of the set in
+// ascending order -- RDATE instances are collected after the rule's, and a
+// RANGE=THISANDFUTURE override can reorder placements -- but each of them does
+// reach the range, so a caller asking only whether the set reaches it can
+// answer from them; one that owes the complete set has to treat the error as
+// fatal.
+func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver, visit func(RecurrenceInstance) bool) error {
+	_, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    componentName,
 		includeOverrides: false,
 		maxInstances:     maxInstances,
@@ -153,19 +163,15 @@ func RecurrenceInstances(raw, componentName string, dtstart time.Time, duration 
 		reaches: func(_ BusyPeriod, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
 			return !suppressed && periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
 		},
+		visit: func(occurrence recurrenceOccurrence) bool {
+			return visit(RecurrenceInstance{
+				RecurrenceID: occurrence.recurrenceID,
+				Start:        occurrence.period.Start,
+				End:          occurrence.period.End,
+			})
+		},
 	})
-	if err != nil && !errors.Is(err, ErrRecurrenceExpansionLimit) {
-		return nil, err
-	}
-	instances := make([]RecurrenceInstance, 0, len(occurrences))
-	for _, occurrence := range occurrences {
-		instances = append(instances, RecurrenceInstance{
-			RecurrenceID: occurrence.recurrenceID,
-			Start:        occurrence.period.Start,
-			End:          occurrence.period.End,
-		})
-	}
-	return instances, err
+	return err
 }
 
 // RecurrenceSlots expands only the identities generated by the master. It
@@ -218,13 +224,15 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		}
 	}
 	seen := make(map[string]struct{})
-	periods := make([]recurrenceOccurrence, 0)
+	var periods []recurrenceOccurrence
+	collected := 0
 	var limitErr error
+	stopped := false
 	// recurrenceID is the slot the occurrence belongs to, which a
 	// RANGE=THISANDFUTURE shift moves the period away from. EXDATE and an
 	// ordinary RECURRENCE-ID override both name that slot, not the shifted start.
 	addPeriod := func(recurrenceID time.Time, original BusyPeriod, generated, applyExDates bool) {
-		if limitErr != nil {
+		if limitErr != nil || stopped {
 			return
 		}
 		if applyExDates && exdates.contains(recurrenceID) {
@@ -254,19 +262,25 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		if _, ok := seen[key]; ok {
 			return
 		}
-		if len(periods) >= expansion.maxInstances {
+		if collected >= expansion.maxInstances {
 			limitErr = ErrRecurrenceExpansionLimit
 			return
 		}
 		seen[key] = struct{}{}
-		periods = append(periods, recurrenceOccurrence{
+		collected++
+		occurrence := recurrenceOccurrence{
 			recurrenceID:  recurrenceID,
 			original:      original,
 			period:        effective,
 			suppressed:    suppressed,
 			exactOverride: exactOverride,
 			governing:     governing,
-		})
+		}
+		if expansion.visit == nil {
+			periods = append(periods, occurrence)
+		} else if expansion.visit(occurrence) {
+			stopped = true
+		}
 	}
 
 	if rrule := componentPropertyValue(component, "RRULE"); rrule != "" {
@@ -283,7 +297,7 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		}
 		ok, err := rruleBusyPeriods(component, dtstart, duration, rrule, exdates, scanStart, scanEnd, scanExpansion, func(id time.Time, period BusyPeriod) bool {
 			addPeriod(id, period, true, true)
-			return limitErr != nil
+			return limitErr != nil || stopped
 		})
 		if err != nil {
 			// The occurrences already collected are kept for the same reason the
@@ -559,10 +573,11 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 			return len(instances) > limit, true
 		}
 		periodStart = next
-		if rule.Until != nil && periodStart.After(*rule.Until) {
+		earliest := recurrencePeriodEarliestCandidate(periodStart, rule)
+		if rule.Until != nil && earliest.After(*rule.Until) {
 			return len(instances) > limit, true
 		}
-		if unbounded && periodStart.After(horizon) {
+		if unbounded && earliest.After(horizon) {
 			return len(instances) > limit, true
 		}
 	}
@@ -1242,47 +1257,15 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 	}
 
 	if rule.Count > 0 {
-		occurrences := 0
-		if !generatesStart {
-			latest = dtstart
-			occurrences = 1
+		// COUNT numbers occurrences from the DTSTART, so a counted rule can only
+		// be followed forward from there.
+		lister := newRecurrenceStartLister(dtstart, rule, generatesStart, work)
+		lister.latestOnly = true
+		complete := lister.ListThrough(before, math.MaxInt)
+		if len(lister.starts) == 0 {
+			return time.Time{}, false, complete
 		}
-		periodStart := recurrencePeriodStart(dtstart, rule)
-		barren := newBarrenPeriodRun(rule)
-		for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
-			done := occurrences >= rule.Count
-			if done {
-				return latest, true, true
-			}
-			offered := false
-			_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, work, func(candidate time.Time) bool {
-				offered = true
-				if candidate.Before(dtstart) {
-					return false
-				}
-				if pastUntil(candidate) {
-					done = true
-					return true
-				}
-				occurrences++
-				if occurrences > rule.Count || candidate.After(before) {
-					done = true
-					return true
-				}
-				latest = candidate
-				return false
-			})
-			if overBudget {
-				return latest, !latest.IsZero(), false
-			}
-			if done || barren.settles(offered) {
-				return latest, !latest.IsZero(), true
-			}
-			periodStart = advanceRecurrencePeriod(periodStart, rule)
-		}
-		// The scan bound ran out. Unless the rule can never produce a
-		// candidate, what was reached is not the end of it.
-		return latest, !latest.IsZero(), !recurrenceRuleMayProduceCandidate(dtstart, rule)
+		return lister.starts[len(lister.starts)-1], true, complete
 	}
 
 	// The DTSTART answers only when no generated occurrence does, since every
@@ -1293,7 +1276,13 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		}
 		return dtstart, true
 	}
-	periodStart := fastForwardRecurrencePeriod(recurrencePeriodStart(dtstart, rule), threshold, rule)
+	firstPeriod := recurrencePeriodStart(dtstart, rule)
+	periodStart := fastForwardRecurrencePeriod(firstPeriod, threshold, rule)
+	// The period after the one holding the threshold can already have
+	// generated starts at or before it, so the search begins there.
+	if next := advanceRecurrencePeriod(periodStart, rule); next.After(periodStart) && !recurrencePeriodEarliestCandidate(next, rule).After(threshold) {
+		periodStart = next
+	}
 	// A thousand periods back is further than any observance rule a time zone
 	// uses needs; a rule that offers nothing needs a whole cycle of periods to
 	// show it.
@@ -1320,8 +1309,10 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		if !latest.IsZero() {
 			return latest, true, true
 		}
+		// The period holding the DTSTART usually begins before it, and the
+		// rule can still generate starts after the DTSTART within it.
 		previous := retreatRecurrencePeriod(periodStart, rule)
-		if !previous.Before(periodStart) || previous.Before(dtstart) || barren.settles(offered) {
+		if !previous.Before(periodStart) || previous.Before(firstPeriod) || barren.settles(offered) {
 			start, found := fallback()
 			return start, found, true
 		}
@@ -1332,6 +1323,208 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		return start, found, true
 	}
 	return time.Time{}, false, false
+}
+
+// RecurrenceStartLister lists, in ascending order, the starts of the recurrence
+// set a DTSTART and RRULE describe: the DTSTART, which RFC 5545 §3.8.5.3 makes
+// the first instance whether or not the rule generates it, and every start the
+// rule generates after it. It is the set LatestRecurrenceOnOrBefore searches,
+// listed once, so a caller resolving many instants against one VTIMEZONE
+// observance can look each one up rather than walk the rule again per instant.
+//
+// The listing grows on demand, and each extension continues from where the last
+// one stopped rather than from the DTSTART. Every extension draws on one work
+// budget, the one a single LatestRecurrenceOnOrBefore spends, so growing a
+// listing in steps cannot carry it further than one walk of the rule may go. A
+// lister is not safe for concurrent use.
+type RecurrenceStartLister struct {
+	dtstart time.Time
+	rule    recurrenceRule
+	starts  []time.Time
+	// covered is the instant through which starts holds every start.
+	covered time.Time
+	// ended reports that starts holds the whole set.
+	ended bool
+	// halted reports that the listing cannot be extended past covered: the
+	// rule needed more work than this package undertakes, or the set held
+	// more starts than the caller's limit.
+	halted bool
+	// latestOnly keeps only the latest start listed, for a caller that asks
+	// nothing else of the listing and may follow a rule through hundreds of
+	// thousands of starts to reach it.
+	latestOnly bool
+	work       *recurrenceWork
+
+	periodStart time.Time
+	occurrences int
+	barren      barrenPeriodRun
+	scanned     int
+}
+
+// NewRecurrenceStartLister prepares a listing of the set dtstart and rrule
+// describe. Nothing past the DTSTART is generated until ListThrough asks.
+func NewRecurrenceStartLister(dtstart time.Time, rrule string) *RecurrenceStartLister {
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
+	if !ok {
+		// LatestRecurrenceOnOrBefore finds nothing in a rule it cannot parse,
+		// not even the DTSTART.
+		return &RecurrenceStartLister{dtstart: dtstart, ended: true}
+	}
+	if !recurrenceBySetPosMaySelect(dtstart, rule) {
+		return &RecurrenceStartLister{dtstart: dtstart, starts: []time.Time{dtstart}, ended: true}
+	}
+	work := newRecurrenceWork()
+	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
+	if overBudget {
+		return &RecurrenceStartLister{dtstart: dtstart, halted: true}
+	}
+	return newRecurrenceStartLister(dtstart, rule, generatesStart, work)
+}
+
+func newRecurrenceStartLister(dtstart time.Time, rule recurrenceRule, generatesStart bool, work *recurrenceWork) *RecurrenceStartLister {
+	lister := &RecurrenceStartLister{
+		dtstart:     dtstart,
+		rule:        rule,
+		work:        work,
+		periodStart: recurrencePeriodStart(dtstart, rule),
+		barren:      newBarrenPeriodRun(rule),
+	}
+	if !generatesStart {
+		lister.starts = []time.Time{dtstart}
+		lister.occurrences = 1
+	}
+	return lister
+}
+
+// Len is the number of starts listed so far.
+func (l *RecurrenceStartLister) Len() int {
+	return len(l.starts)
+}
+
+// Covers reports whether the listing holds every start at or before through.
+func (l *RecurrenceStartLister) Covers(through time.Time) bool {
+	return l.ended || !through.After(l.covered)
+}
+
+// LatestOnOrBefore answers what LatestRecurrenceOnOrBefore answers for the same
+// bound, from the listing. ok is false when the listing does not reach before.
+func (l *RecurrenceStartLister) LatestOnOrBefore(before time.Time) (latest time.Time, found, ok bool) {
+	if before.Before(l.dtstart) {
+		return time.Time{}, false, true
+	}
+	if !l.Covers(before) {
+		return time.Time{}, false, false
+	}
+	index, exact := slices.BinarySearchFunc(l.starts, before, time.Time.Compare)
+	if exact {
+		index++
+	}
+	if index == 0 {
+		return time.Time{}, false, true
+	}
+	return l.starts[index-1], true, true
+}
+
+// ListThrough extends the listing to hold every start at or before through,
+// keeping at most limit starts in all, and reports whether it now does. A
+// listing that halts keeps what it listed exactly, but is not extended again:
+// the work or the starts it would take have already been found to be too many.
+func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
+	if through.Before(l.dtstart) {
+		through = l.dtstart
+	}
+	if l.Covers(through) {
+		return true
+	}
+	if l.halted {
+		return false
+	}
+	for ; l.scanned < recurrenceScanLimit; l.scanned++ {
+		if l.rule.Count > 0 && l.occurrences >= l.rule.Count {
+			l.ended = true
+			return true
+		}
+		if recurrencePeriodEarliestCandidate(l.periodStart, l.rule).After(through) {
+			l.covered = through
+			return true
+		}
+		offered, finished, passed := false, false, false
+		var overflow time.Time
+		_, overBudget := visitRecurrenceCandidates(l.periodStart, l.dtstart, l.rule, l.work, func(candidate time.Time) bool {
+			offered = true
+			// A period the last extension stopped partway through is visited
+			// again from its start, and what it listed then is skipped.
+			if candidate.Before(l.dtstart) || !candidate.After(l.covered) {
+				return false
+			}
+			if l.rule.Until != nil && candidate.After(*l.rule.Until) && !candidate.Equal(l.dtstart) {
+				finished = true
+				return true
+			}
+			if candidate.After(through) {
+				passed = true
+				return true
+			}
+			if l.rule.Count > 0 && l.occurrences >= l.rule.Count {
+				finished = true
+				return true
+			}
+			if len(l.starts) >= limit {
+				overflow = candidate
+				return true
+			}
+			l.occurrences++
+			if l.latestOnly && len(l.starts) > 0 {
+				l.starts[0] = candidate
+			} else {
+				l.starts = append(l.starts, candidate)
+			}
+			return false
+		})
+		switch {
+		case overBudget:
+			// Only the periods before this one were visited whole.
+			l.halt(l.periodStart.Add(-time.Nanosecond))
+			return false
+		case !overflow.IsZero():
+			l.halt(overflow.Add(-time.Nanosecond))
+			return false
+		case finished:
+			l.ended = true
+			return true
+		case passed:
+			l.covered = through
+			return true
+		case l.barren.settles(offered):
+			l.ended = true
+			return true
+		}
+		next := advanceRecurrencePeriod(l.periodStart, l.rule)
+		if !next.After(l.periodStart) {
+			l.halt(l.periodStart.Add(-time.Nanosecond))
+			return false
+		}
+		l.periodStart = next
+	}
+	// The scan bound ran out. Unless the rule can never produce a candidate,
+	// what was reached is not the end of it.
+	if !recurrenceRuleMayProduceCandidate(l.dtstart, l.rule) {
+		l.ended = true
+		return true
+	}
+	l.halt(l.periodStart.Add(-time.Nanosecond))
+	return false
+}
+
+// halt stops the listing, which holds every start at or before covered, and
+// drops whatever it listed past that.
+func (l *RecurrenceStartLister) halt(covered time.Time) {
+	if covered.After(l.covered) {
+		l.covered = covered
+	}
+	kept := sort.Search(len(l.starts), func(i int) bool { return l.starts[i].After(l.covered) })
+	l.starts = l.starts[:kept]
+	l.halted = true
 }
 
 func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
@@ -1443,7 +1636,8 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	}
 	periodStart := recurrencePeriodStart(recurrenceStart, rule)
 	if rule.Count == 0 {
-		periodStart = fastForwardRecurrencePeriod(periodStart, scanStart.Add(-duration), rule)
+		threshold := scanStart.Add(-duration)
+		periodStart = rewindToPeriodReaching(fastForwardRecurrencePeriod(periodStart, threshold, rule), periodStart, threshold, rule)
 	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
 		if occurrences+skipped >= rule.Count {
 			return true, nil
@@ -1469,7 +1663,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 			return false, ErrRecurrenceScanLimit
 		}
 		periodStart = next
-		if periodStart.After(scanEnd) || (rule.Count > 0 && occurrences >= rule.Count) {
+		if recurrencePeriodEarliestCandidate(periodStart, rule).After(scanEnd) || (rule.Count > 0 && occurrences >= rule.Count) {
 			return true, nil
 		}
 	}
@@ -2447,6 +2641,13 @@ func fastForwardRecurrencePeriod(periodStart, threshold time.Time, rule recurren
 		if steps := (threshold.Unix() - periodStart.Unix()) / seconds; steps > 0 {
 			periodStart = time.Unix(periodStart.Unix()+steps*seconds, int64(periodStart.Nanosecond())).In(periodStart.Location())
 		}
+	} else if threshold.After(periodStart) {
+		// The loop below is bounded by recurrenceScanLimit periods, which a
+		// daily, weekly or monthly rule from a distant DTSTART outruns, so the
+		// whole periods to the threshold are jumped at once. A caller searching
+		// backward from here would otherwise read a period centuries short of
+		// the threshold as the one holding it.
+		periodStart = jumpCalendarRecurrencePeriods(periodStart, threshold, rule)
 	}
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
 		next := advanceRecurrencePeriod(periodStart, rule)
@@ -2459,6 +2660,82 @@ func fastForwardRecurrencePeriod(periodStart, threshold time.Time, rule recurren
 		periodStart = next
 	}
 	return periodStart
+}
+
+// recurrencePeriodEarliestCandidate is the earliest instant the period
+// starting at periodStart can generate. That is the period's start, except for
+// a yearly BYWEEKNO period: RFC 5545 numbers weeks from the one holding the
+// year's first Thursday, so week 1 can begin up to three days before January 1
+// and the period reaches back into the year before it.
+func recurrencePeriodEarliestCandidate(periodStart time.Time, rule recurrenceRule) time.Time {
+	if rule.Freq != "YEARLY" || len(rule.ByWeekNo) == 0 {
+		return periodStart
+	}
+	if first := firstWeekStart(periodStart.Year(), rule.WKST, periodStart.Location()); first.Before(periodStart) {
+		return first
+	}
+	return periodStart
+}
+
+// rewindToPeriodReaching steps back from periodStart, the period holding
+// threshold, to the one before it when that one can still generate an instant
+// at or after threshold. Only a yearly BYWEEKNO period can: RFC 5545's last
+// week of a year can end up to three days after December 31. firstPeriod is the
+// period holding the DTSTART, which nothing is generated before.
+func rewindToPeriodReaching(periodStart, firstPeriod, threshold time.Time, rule recurrenceRule) time.Time {
+	if rule.Freq != "YEARLY" || len(rule.ByWeekNo) == 0 {
+		return periodStart
+	}
+	previous := retreatRecurrencePeriod(periodStart, rule)
+	if !previous.Before(periodStart) || previous.Before(firstPeriod) {
+		return periodStart
+	}
+	// A year's weeks run up to the first week of the year after it.
+	if firstWeekStart(previous.Year()+1, rule.WKST, previous.Location()).After(threshold) {
+		return previous
+	}
+	return periodStart
+}
+
+// jumpCalendarRecurrencePeriods advances periodStart by as many whole periods
+// of a daily, weekly, monthly or yearly rule as start at or before threshold,
+// counted on the period's calendar so the result stays aligned to INTERVAL.
+func jumpCalendarRecurrencePeriods(periodStart, threshold time.Time, rule recurrenceRule) time.Time {
+	interval := rule.Interval
+	if interval <= 0 {
+		interval = 1
+	}
+	wall := threshold.In(periodStart.Location())
+	var steps int
+	var jump func(steps int) time.Time
+	switch rule.Freq {
+	case "DAILY", "WEEKLY":
+		days := 1
+		if rule.Freq == "WEEKLY" {
+			days = 7
+		}
+		steps = int((civilDayNumber(wall) - civilDayNumber(periodStart)) / int64(days*interval))
+		jump = func(steps int) time.Time { return periodStart.AddDate(0, 0, steps*days*interval) }
+	case "MONTHLY":
+		months := (wall.Year()-periodStart.Year())*12 + int(wall.Month()) - int(periodStart.Month())
+		steps = months / interval
+		jump = func(steps int) time.Time { return periodStart.AddDate(0, steps*interval, 0) }
+	case "YEARLY":
+		steps = (wall.Year() - periodStart.Year()) / interval
+		jump = func(steps int) time.Time { return periodStart.AddDate(steps*interval, 0, 0) }
+	default:
+		return periodStart
+	}
+	if steps <= 0 {
+		return periodStart
+	}
+	jumped := jump(steps)
+	// A period begins at the start of its calendar unit, which a zone's
+	// transition can move past the threshold on the threshold's own day.
+	if jumped.After(threshold) {
+		jumped = jump(steps - 1)
+	}
+	return jumped
 }
 
 func subDailyRecurrenceStep(rule recurrenceRule) (time.Duration, bool) {

@@ -15,7 +15,9 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 )
 
 // limitsTestServer builds a calendar collection of size events behind the given
@@ -1261,6 +1263,142 @@ func TestSyncCollectionRepositoryFailureCarriesNoStorageDetail(t *testing.T) {
 	}
 	if got := strings.TrimSpace(rr.Body.String()); got != "failed to build report response" {
 		t.Fatalf("body = %q, want the fixed report failure message", got)
+	}
+}
+
+// A report whose read fails keeps the repository's error out of the response,
+// as above, but not out of the server's log: the fixed message tells an operator
+// which read failed, and only the cause it wraps says why -- or that it was the
+// client leaving rather than the server failing. That holds for every read a
+// report makes: the collection listings, the batch fetch behind a multiget, the
+// single fetch behind a report on one object, and the generated birthday
+// collection.
+func TestReportReadFailureLogsItsCause(t *testing.T) {
+	cause := errors.New("pq: relation is locked")
+	since := buildSyncToken("cal", 1, limitsFixtureModified.Add(-time.Hour))
+	cardSince := buildSyncToken("card", 5, limitsFixtureModified.Add(-time.Hour))
+	const addressBookQuery = `<?xml version="1.0" encoding="utf-8"?>
+<C:addressbook-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:prop><D:getetag/></D:prop><C:filter><C:prop-filter name="FN"/></C:filter>
+</C:addressbook-query>`
+	const freeBusyQuery = `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+		`<C:time-range start="20240101T000000Z" end="20250101T000000Z"/></C:free-busy-query>`
+	send := func(t *testing.T, h *DavServer, path, depth, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("REPORT", path, strings.NewReader(body))
+		req.Header.Set("Depth", depth)
+		rr := httptest.NewRecorder()
+		h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
+		return rr
+	}
+	birthdayServer := func(contacts *fakeContactRepo, books *fakeAddressBookRepo) *DavServer {
+		birthday := time.Date(1990, 6, 1, 0, 0, 0, 0, time.UTC)
+		name := "Ada"
+		contacts.contacts = map[string]*store.Contact{
+			"1:ada": {AddressBookID: 1, UID: "ada", DisplayName: &name, Birthday: &birthday},
+		}
+		h := &DavServer{store: &store.Store{Contacts: contacts}}
+		if books != nil {
+			h.store.AddressBooks = books
+		}
+		return h
+	}
+
+	tests := []struct {
+		name   string
+		report func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder
+	}{
+		{"calendar-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsTestServer(t, &config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Events.(*fakeEventRepo).listPageErr = cause
+			return limitsReportRequest(t, h, limitsCalendarQueryBody)
+		}},
+		{"calendar-query on one object", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsTestServer(t, &config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Events.(*fakeEventRepo).getByResourceNameErr = cause
+			return send(t, h, "/dav/calendars/1/event-1.ics", "0", limitsCalendarQueryBody)
+		}},
+		{"calendar-multiget", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsTestServer(t, &config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Events.(*fakeEventRepo).listByResourceNamesErr = cause
+			return send(t, h, "/dav/calendars/1/", "1", calendarMultiGetBody("/dav/calendars/1/event-1.ics"))
+		}},
+		{"calendar sync-collection", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsTestServer(t, &config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Events.(*fakeEventRepo).listPageErr = cause
+			return limitsReportRequest(t, h, syncCollectionBody(""))
+		}},
+		{"calendar sync-collection removals", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsTestServer(t, &config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.DeletedResources = &fakeDeletedResourceRepo{listErr: cause}
+			return limitsReportRequest(t, h, syncCollectionBody(since))
+		}},
+		{"addressbook-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsAddressBookServer(&config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Contacts.(*fakeContactRepo).listPageErr = cause
+			return limitsAddressBookReport(t, h, addressBookQuery)
+		}},
+		{"addressbook-query on one object", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsAddressBookServer(&config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Contacts.(*fakeContactRepo).getByResourceNameErr = cause
+			return send(t, h, "/dav/addressbooks/5/contact-1.vcf", "0", addressBookQuery)
+		}},
+		{"addressbook-multiget", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsAddressBookServer(&config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Contacts.(*fakeContactRepo).listByResourceNamesErr = cause
+			return send(t, h, "/dav/addressbooks/5/", "0", cardMultigetBody(1))
+		}},
+		{"address book sync-collection", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsAddressBookServer(&config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.Contacts.(*fakeContactRepo).listPageErr = cause
+			return limitsAddressBookReport(t, h, syncCollectionBody(""))
+		}},
+		{"address book sync-collection removals", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := limitsAddressBookServer(&config.Config{}, 1)
+			h.log = logging.New(recorder, logClass)
+			h.store.DeletedResources = &fakeDeletedResourceRepo{listErr: cause}
+			return limitsAddressBookReport(t, h, syncCollectionBody(cardSince))
+		}},
+		{"birthday calendar-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := birthdayServer(&fakeContactRepo{birthdayErr: cause}, nil)
+			h.log = logging.New(recorder, logClass)
+			return send(t, h, "/dav/calendars/-1/", "1", limitsCalendarQueryBody)
+		}},
+		{"birthday collection state", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := birthdayServer(&fakeContactRepo{}, &fakeAddressBookRepo{readErr: cause})
+			h.log = logging.New(recorder, logClass)
+			return send(t, h, "/dav/calendars/-1/", "1", limitsCalendarQueryBody)
+		}},
+		{"birthday free-busy-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+			h := birthdayServer(&fakeContactRepo{birthdayErr: cause}, nil)
+			h.log = logging.New(recorder, logClass)
+			return send(t, h, "/dav/calendars/-1/", "1", freeBusyQuery)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &levelRecorder{}
+			rr := tt.report(t, recorder)
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
+			}
+			if got := strings.TrimSpace(rr.Body.String()); got != "failed to build report response" {
+				t.Fatalf("body = %q, want the fixed report failure message", got)
+			}
+			if !recorder.logged(jw6_utils.Error, cause.Error()) {
+				t.Fatalf("logged %q, want the repository's cause at the error level", recorder.messages)
+			}
+		})
 	}
 }
 
