@@ -208,11 +208,12 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- which then has to be dropped by hand.
 
 -- Every events index that reads recurrence_start or recurrence_until is dropped
--- ahead of the repair and built after it, so building each once over the
--- repaired rows replaces maintaining it per repaired row. idx_events_object_acl_path
--- is built after the repair for the same reason where the upgrade is what adds
--- it. The repair's updates still fire trg_events_touch_last_modified, so they
--- rewrite last_modified and maintain every index that remains.
+-- ahead of the two recurrence repairs and built after them, so building each
+-- once over the repaired rows replaces maintaining it per repaired row.
+-- idx_events_object_acl_path is built after the repairs for the same reason
+-- where the upgrade is what adds it. The repairs' updates still fire
+-- trg_events_touch_last_modified, so they rewrite last_modified and maintain
+-- every index that remains.
 --
 -- The two time-range expression indexes are built on the expressions
 -- ListForCalendarFiltered filters on:
@@ -320,6 +321,105 @@ UPDATE events
                   )
           END
       );
+
+-- Reopen every finite recurrence_until the series it bounds can outlast.
+--
+-- ical.ConservativeRecurrenceBounds writes a finite bound only for a rule with
+-- UNTIL, or with COUNT, FREQ=DAILY or WEEKLY and no BY parts, and the sentinel
+-- for every other. Two of those series run past a bound read from the rule
+-- alone. RFC 5545 section 3.3.10 leaves an instance whose local start time a
+-- timezone transition skips out of the set without counting it, so a COUNT
+-- series whose DTSTART names a zone reaches its last instance one step later
+-- per instance skipped: a day or more for DAILY, a week or more for WEEKLY.
+-- And UNTIL is inclusive, so a date UNTIL on a timed series admits that day's
+-- instances, up to a day past the day's start. Neither can be left to the
+-- candidate filter's 48-hour margin, which covers the zones the column and the
+-- RFC 4791 section 9.9 test read a time in (maxStoredInstantSkew in
+-- internal/dav).
+--
+-- A finite bound is reset to the sentinel when the body carries a DAILY or
+-- WEEKLY rule with COUNT and a DTSTART with a TZID, or a rule with a date UNTIL
+-- and a DTSTART with a time of day outside every VTIMEZONE, whose observances
+-- always carry one. The tests read the whole body rather than one component,
+-- which can only reset a bound that needed none: the row stays a candidate for
+-- every range, and the next write of the resource stores its exact bound. Only
+-- finite bounds are read, so the statement can run again, and a body whose row
+-- holds none is never unfolded.
+--
+-- The body is unfolded as in the repair above. Names and values match without
+-- regard to case, and the parts of a rule and the parameters of a property in
+-- any order. A parameter value may be quoted and hold a colon or a semicolon, so
+-- a TZID parameter is looked for anywhere on its DTSTART line. A negated class
+-- such as [^\r\n] admits every other character under any collation; it is the
+-- named classes that a C collation confines to ASCII. Stripping the VTIMEZONEs
+-- costs a non-greedy match, so the CASE runs it only for a body the cheap tests
+-- have not settled.
+UPDATE events
+    SET recurrence_until = '9999-12-31T23:59:59Z'
+    WHERE recurrence_until <> '9999-12-31T23:59:59Z'
+      AND EXISTS (
+          SELECT 1
+          FROM regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') AS unfolded(body)
+          WHERE CASE
+              WHEN unfolded.body ~* $re$(^|\r|\n)RRULE(?=[^\r\n]*[;:][ \t]*COUNT[ \t]*=)[^\r\n]*[;:][ \t]*FREQ[ \t]*=[ \t]*(DAILY|WEEKLY)$re$
+                  AND unfolded.body ~* $re$(^|\r|\n)DTSTART;[^\r\n]*TZID[ \t]*=$re$ THEN TRUE
+              WHEN unfolded.body !~* $re$(^|\r|\n)RRULE[^\r\n]*[;:][ \t]*UNTIL[ \t]*=[ \t]*[0-9]{8}[ \t]*(;|\r|\n|$)$re$ THEN FALSE
+              ELSE regexp_replace(unfolded.body, $re$BEGIN:VTIMEZONE.*?END:VTIMEZONE$re$, '', 'gi')
+                  ~* $re$(^|\r|\n)DTSTART[;:][^\r\n]*[0-9]{8}T$re$
+          END
+      );
+
+-- Store the end an event occupies where its DTEND cannot end it.
+--
+-- RFC 5545 requires DTEND later than DTSTART. Earlier releases stored the DTEND
+-- as written whatever it said, but the reports read an event whose DTEND is not
+-- later -- a DATE DTEND on or before a DATE DTSTART, or a DATE-TIME DTEND before
+-- a DATE-TIME DTSTART -- as though it had none: a DATE start occupies its day,
+-- a DATE-TIME start is the instant it names, and a DURATION, where the event
+-- carries one, sets its length. A dtend before dtstart drops such a row from
+-- the time-range narrowing on COALESCE(recurrence_until, dtend, ...) before the
+-- RFC 4791 section 9.9 test sees it. Each row gets the end a write of the same
+-- body stores (ical.StoredEventEnd): dtstart plus a day for an all-day event,
+-- dtstart itself for a timed one, and none where the body carries a DURATION,
+-- which leaves the row a candidate for every range.
+--
+-- all_day records whether the DTSTART the columns were read from is a DATE; it
+-- is the column every release has written that way. A DATE's dtstart is its UTC
+-- midnight, so its day ends 24 hours later. The DURATION test reads the whole
+-- unfolded body, an alarm's DURATION included, which can only clear a dtend a
+-- write would have kept. The new dtend is never earlier than the one it
+-- replaces, and never earlier than dtstart, so no row the narrowing kept
+-- before is dropped by it. Only rows still in one of these shapes are read, and
+-- none is left in one, so the statement can run again.
+UPDATE events
+    SET dtend = CASE
+        WHEN regexp_replace(raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') ~* $re$(^|\r|\n)DURATION[;:]$re$ THEN NULL
+        WHEN all_day THEN dtstart + interval '24 hours'
+        ELSE dtstart
+    END
+    WHERE dtstart IS NOT NULL
+      AND dtend IS NOT NULL
+      AND (dtend < dtstart OR (all_day AND dtend = dtstart));
+
+-- Store the end an event without a DTEND occupies.
+--
+-- Earlier releases stored no dtend for an event without a DTEND, which kept the
+-- row a candidate for every range. A write stores the end the reports read such
+-- an event with (ical.StoredEventEnd): dtstart plus a day for an all-day event,
+-- dtstart itself for a timed one, and none where a DURATION decides its end.
+--
+-- A row whose body carries a DTEND keeps no dtend: the release that wrote it
+-- could not read that DTEND, so the end it names is unknown here, and only the
+-- RFC 4791 section 9.9 test, which reads it, can bound the row. Both tests
+-- read the whole unfolded body -- an alarm's DURATION or an override's DTEND
+-- included -- which can only leave a row without the dtend a write would
+-- store, a candidate for every range as it was. A row given a dtend leaves the
+-- set this reads, so the statement can run again.
+UPDATE events
+    SET dtend = CASE WHEN all_day THEN dtstart + interval '24 hours' ELSE dtstart END
+    WHERE dtstart IS NOT NULL
+      AND dtend IS NULL
+      AND regexp_replace(raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') !~* $re$(^|\r|\n)(DTEND|DURATION)[;:]$re$;
 
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
     ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));

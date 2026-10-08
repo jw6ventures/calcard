@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
@@ -430,6 +432,84 @@ func calendarAcceptsUIWrite(cal *store.CalendarAccess) bool {
 	return cal != nil && cal.AcceptsComponent(uiCalendarComponent)
 }
 
+// validatedEvent puts calendar data the UI built or imported through the
+// validator a DAV PUT into cal applies, so the UI stores nothing a CalDAV client
+// could not have written, and returns the event to store: the octets the
+// validator accepted, under the UID they carry, indexed by the metadata the
+// validator derived.
+func (h *Handler) validatedEvent(cal *store.CalendarAccess, resourceName, raw string) (store.Event, error) {
+	object, err := h.validateCalendarObject(raw, cal)
+	if err != nil {
+		return store.Event{}, err
+	}
+	return store.Event{
+		CalendarID:    cal.ID,
+		UID:           object.UID,
+		ResourceName:  resourceName,
+		RawICAL:       object.Body,
+		ETag:          utils.GenerateETag(object.Body),
+		WriteMetadata: &object.Metadata,
+	}, nil
+}
+
+// occurrenceRemovedEvent is the event to store once an occurrence is removed
+// from existing, leaving raw. Data stored before the validator existed may fail
+// it, and the editor refuses every change to such a series; removing an
+// occurrence leaves that data no worse than it was, so it is still allowed,
+// as the only way to drop one short of deleting the series. That result is
+// stored as it is, and the store derives its metadata.
+func (h *Handler) occurrenceRemovedEvent(cal *store.CalendarAccess, existing *store.Event, resourceName, raw string) (store.Event, error) {
+	event, err := h.validatedEvent(cal, resourceName, raw)
+	if err == nil {
+		return event, nil
+	}
+	if _, storedErr := h.validateCalendarObject(existing.RawICAL, cal); storedErr == nil {
+		return store.Event{}, err
+	}
+	return store.Event{
+		CalendarID:   cal.ID,
+		UID:          existing.UID,
+		ResourceName: resourceName,
+		RawICAL:      raw,
+		ETag:         utils.GenerateETag(raw),
+	}, nil
+}
+
+// invalidEventMessage is the flash message for calendar data the validator
+// refused: what did not happen, then why, in words for the user rather than
+// the RFC 4791 precondition names a DAV client is answered with.
+func invalidEventMessage(action string, err error) string {
+	const fallback = "the server could not accept its calendar data"
+	var refusal *calobject.Error
+	if !errors.As(err, &refusal) || len(refusal.Conditions) == 0 {
+		return action + ": " + fallback
+	}
+	reasons := make([]string, 0, len(refusal.Conditions))
+	for _, condition := range refusal.Conditions {
+		reason, ok := calendarObjectRefusalReasons[condition]
+		if !ok {
+			reason = fallback
+		}
+		if !slices.Contains(reasons, reason) {
+			reasons = append(reasons, reason)
+		}
+	}
+	return action + ": " + strings.Join(reasons, "; ")
+}
+
+var calendarObjectRefusalReasons = map[string]string{
+	"valid-calendar-data":            "its calendar data is not valid iCalendar",
+	"valid-calendar-object-resource": "it is not a single event with one UID, or it uses a time zone it does not define",
+	"supported-calendar-component":   "this calendar does not accept that kind of item",
+	"max-resource-size":              "it is larger than this server accepts",
+	"min-date-time":                  "it has a date earlier than this server accepts",
+	"max-date-time":                  "it has a date later than this server accepts",
+	"max-instances":                  "it repeats more times than this server allows",
+	"max-attendees-per-instance":     "it has more attendees than this server allows",
+}
+
+const eventNotSaved = "the event could not be saved"
+
 func (h *Handler) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourcePath, privilege string) error {
 	if cal == nil || user == nil {
 		return store.ErrNotFound
@@ -741,7 +821,7 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	// Build JSON response
 	eventsJSONData := make([]map[string]any, 0, len(relevantEvents))
 	for _, ev := range relevantEvents {
-		eventsJSONData = append(eventsJSONData, calendarEventJSON(ev))
+		eventsJSONData = append(eventsJSONData, unfoldedEventJSON(ev, rangeStart, rangeEndExclusive, h.timezoneOnsets))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -875,10 +955,11 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		// Restrict to the requested window before any ACL work so large
 		// calendars only pay to resolve access for events that can appear in
 		// the response, not their entire history.
-		windowed := filterEventsForMonth(allEvents, rangeStart, rangeEnd)
-		if len(windowed) == 0 {
+		unfolded := filterEventsForMonth(allEvents, rangeStart, rangeEnd)
+		if len(unfolded) == 0 {
 			continue
 		}
+		windowed := unfoldedStoreEvents(unfolded)
 
 		// One scoped ACL prefetch per calendar then resolves read,
 		// write-content, and unbind for every windowed event in memory.
@@ -889,13 +970,14 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 		}
 
 		color := calendarColor(cal.Calendar.Color, i)
-		for _, ev := range windowed {
+		for _, unfoldedEv := range unfolded {
+			ev := unfoldedEv.event
 			resourcePath := calendarEventResourcePath(cal.ID, calendarEventResourceName(ev.UID, &ev))
 			if !decide(resourcePath, "read") {
 				continue
 			}
 
-			payload := calendarEventJSON(ev)
+			payload := unfoldedEventJSON(unfoldedEv, rangeStart, rangeEndExclusive, h.timezoneOnsets)
 			payload["calendarId"] = cal.ID
 			payload["calendarName"] = cal.Name
 			payload["calendarColor"] = color
@@ -1045,6 +1127,71 @@ func rawICalComponents(raw, componentName string) []string {
 	return components
 }
 
+// importAccess is what an import into a calendar may write: everything the
+// collection grants bind or write-content on, or only the events a
+// resource-level grant lets the caller change.
+type importAccess int
+
+const (
+	importForbidden importAccess = iota
+	importPerEvent
+	importCollection
+)
+
+// calendarImportAccess decides an import's access before any of the upload is
+// read: from the collection's own grants, else from whether any resource
+// beneath it grants the caller write-content.
+func (h *Handler) calendarImportAccess(ctx context.Context, user *store.User, cal *store.CalendarAccess) (importAccess, error) {
+	collectionPath := calendarACLResourcePath(cal.ID)
+	for _, privilege := range []string{"bind", "write-content"} {
+		allowed, err := h.hasCalendarPrivilege(ctx, user, cal, collectionPath, privilege)
+		if err != nil {
+			return importForbidden, err
+		}
+		if allowed {
+			return importCollection, nil
+		}
+	}
+	if h.store.ACLEntries == nil {
+		return importForbidden, nil
+	}
+	for _, principal := range calendarApplicablePrincipalHrefs(user) {
+		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principal)
+		if err != nil {
+			return importForbidden, err
+		}
+		for _, entry := range entries {
+			if !entry.IsGrant || !strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+				continue
+			}
+			allowed, err := h.hasCalendarPrivilege(ctx, user, cal, entry.ResourcePath, "write-content")
+			if err != nil {
+				return importForbidden, err
+			}
+			if allowed {
+				return importPerEvent, nil
+			}
+		}
+	}
+	return importForbidden, nil
+}
+
+// importTarget is the stored event an import of uid replaces, if any, and
+// whether the caller may write it: bind on the resource a new event takes,
+// write-content on the one an existing event has.
+func (h *Handler) importTarget(ctx context.Context, user *store.User, cal *store.CalendarAccess, uid string) (*store.Event, bool, error) {
+	existing, err := h.store.Events.GetByUID(ctx, cal.ID, uid)
+	if err != nil {
+		return nil, false, err
+	}
+	privilege := "bind"
+	if existing != nil {
+		privilege = "write-content"
+	}
+	allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, calendarEventResourceName(uid, existing)), privilege)
+	return existing, allowed, err
+}
+
 // ImportCalendar imports events from an ICS file into an existing calendar.
 func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	calendarID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -1061,6 +1208,17 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	}
 	if cal == nil {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// A caller who can write nothing in the calendar is refused before the
+	// upload is read, so none of it is validated.
+	access, err := h.calendarImportAccess(r.Context(), user, cal)
+	if err != nil {
+		http.Error(w, "failed to check calendar access", http.StatusInternalServerError)
+		return
+	}
+	if access == importForbidden {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	if !calendarAcceptsUIWrite(cal) {
@@ -1086,74 +1244,90 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, err := utils.ParseICSFile(string(icsData))
+	events, leftOut, err := utils.ParseICSFile(string(icsData))
 	if err != nil {
 		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": fmt.Sprintf("invalid ICS file: %v", err)})
 		return
 	}
 
-	imported := 0
-	skipped := 0
-	type pendingImport struct {
-		uid          string
-		resourceName string
-		rawICAL      string
-		etag         string
-	}
-	pending := make([]pendingImport, 0, len(events))
+	// Items the file holds that are not events, or that the validator refuses,
+	// are skipped so the rest of the file still imports.
+	//
+	// Where the collection grants the import its writes, an event is validated
+	// before its lookup and privilege check, which only what will be stored
+	// needs, and a forbidden event fails the whole import before anything is
+	// stored. Where only resource-level grants do, each event's privilege is
+	// decided first, so an event the caller cannot write costs no validation,
+	// and is skipped.
+	refused := leftOut
+	pending := make([]store.Event, 0, len(events))
 	for _, eventICAL := range events {
 		uid := utils.ExtractUID(eventICAL)
 		if uid == "" {
 			uid = utils.GenerateUID()
 			eventICAL = utils.EnsureUID(eventICAL, uid)
 		}
-		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
+		var existing *store.Event
+		decided := false
+		if access == importPerEvent {
+			allowed := false
+			existing, allowed, err = h.importTarget(r.Context(), user, cal, uid)
+			if err != nil {
+				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				return
+			}
+			if !allowed {
+				refused++
+				continue
+			}
+			decided = true
 		}
-		requiredPrivilege := "bind"
-		resourceName := calendarEventResourceName(uid, existing)
-		if existing != nil {
-			requiredPrivilege = "write-content"
+		event, err := h.validatedEvent(cal, "", eventICAL)
+		if err != nil || event.UID != uid {
+			refused++
+			continue
 		}
-		if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, resourceName), requiredPrivilege); err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
+		if !decided {
+			allowed := false
+			existing, allowed, err = h.importTarget(r.Context(), user, cal, uid)
+			if err != nil {
+				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				return
+			}
+			if !allowed {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
 		}
-		pending = append(pending, pendingImport{
-			uid:          uid,
-			resourceName: resourceName,
-			rawICAL:      eventICAL,
-			etag:         utils.GenerateETag(eventICAL),
-		})
+		event.ResourceName = calendarEventResourceName(uid, existing)
+		pending = append(pending, event)
 	}
 
-	for _, candidate := range pending {
-		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-			CalendarID:   calendarID,
-			UID:          candidate.uid,
-			ResourceName: candidate.resourceName,
-			RawICAL:      candidate.rawICAL,
-			ETag:         candidate.etag,
-		}); err != nil {
-			skipped++
+	imported := 0
+	failed := 0
+	for _, event := range pending {
+		if _, err := h.store.Events.Upsert(r.Context(), event); err != nil {
+			failed++
 			continue
 		}
 		imported++
 	}
 
+	var skippedParts []string
+	if refused > 0 {
+		skippedParts = append(skippedParts, fmt.Sprintf("skipped %d (not valid or not events)", refused))
+	}
+	if failed > 0 {
+		skippedParts = append(skippedParts, fmt.Sprintf("%d could not be saved", failed))
+	}
 	if imported == 0 {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": fmt.Sprintf("failed to import events; skipped %d", skipped)})
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{
+			"error": strings.Join(append([]string{"failed to import events"}, skippedParts...), "; "),
+		})
 		return
 	}
-
-	statusMsg := fmt.Sprintf("Imported %d event(s)", imported)
-	if skipped > 0 {
-		statusMsg = fmt.Sprintf("%s; skipped %d", statusMsg, skipped)
-	}
 	h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{
-		"status": statusMsg,
+		"status": strings.Join(append([]string{fmt.Sprintf("Imported %d event(s)", imported)}, skippedParts...), "; "),
 	})
 }
 
@@ -1243,16 +1417,16 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allDay := r.FormValue("all_day") == "on"
+	opts := parseEventOptions(r)
 
 	// Validate date format and range
-	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
+	if err := utils.ValidateEventDates(dtstart, dtend, allDay, utils.EventZoneIn(opts.Timezone, nil)); err != nil {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
 		return
 	}
 
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
-	opts := parseEventOptions(r)
 
 	// Parse recurrence options
 	recurrence := utils.ParseRecurrenceOptions(r)
@@ -1266,16 +1440,18 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "this calendar does not accept events"})
 		return
 	}
-	ical := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, opts)
-	etag := utils.GenerateETag(ical)
+	body, err := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, opts)
+	if err != nil {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
+		return
+	}
+	event, err := h.validatedEvent(cal, uid, body)
+	if err != nil {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage(eventNotSaved, err)})
+		return
+	}
 
-	if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-		CalendarID:   calendarID,
-		UID:          uid,
-		ResourceName: uid,
-		RawICAL:      ical,
-		ETag:         etag,
-	}); err != nil {
+	if _, err := h.store.Events.Upsert(r.Context(), event); err != nil {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to create event"})
 		return
 	}
@@ -1349,6 +1525,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	if existing.ResourceName != "" {
 		resourceName = existing.ResourceName
 	}
+	destinationCalendar := cal
 	if movingCalendar {
 		sourcePath := calendarEventResourcePath(calendarID, resourceName)
 		if err := h.requireCalendarPrivilege(r.Context(), user, cal, sourcePath, "unbind"); err != nil {
@@ -1356,7 +1533,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		destinationCalendar, err := h.store.Calendars.GetAccessible(r.Context(), destinationCalendarID, user.ID)
+		destinationCalendar, err = h.store.Calendars.GetAccessible(r.Context(), destinationCalendarID, user.ID)
 		if err != nil {
 			http.Error(w, "failed to load destination calendar", http.StatusInternalServerError)
 			return
@@ -1405,30 +1582,40 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allDay := r.FormValue("all_day") == "on"
+	opts := parseEventOptions(r)
+	opts.Object = withoutServerZoneDefinitions(utils.UnfoldLines(existing.RawICAL))
 
 	// Validate date format and range
-	if err := validateEventDates(dtstart, dtend, allDay); err != nil {
+	if err := utils.ValidateEventDates(dtstart, dtend, allDay, utils.EventZoneIn(opts.Timezone, opts.Object)); err != nil {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
 		return
 	}
 
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
-	opts := parseEventOptions(r)
 
 	// Parse recurrence options
 	recurrence := utils.ParseRecurrenceOptions(r)
 
+	header, components, footer := utils.SplitComponentLines(opts.Object)
 	ical := ""
 	if editScope == "occurrence" && recurrenceID != "" && existing.RawICAL != "" {
 		// Update only a single occurrence by replacing/adding a RECURRENCE-ID component.
-		header, components, footer := utils.SplitComponents(existing.RawICAL)
-		override := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "", opts)
+		override, err := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "", opts)
+		if err != nil {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
+			return
+		}
 		recurrenceZone := strings.TrimSpace(r.FormValue("recurrence_timezone"))
 		if recurrenceZone == "" {
 			recurrenceZone = opts.Timezone
 		}
-		if recLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", recurrenceZone); err == nil && recLine != "" {
+		recLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", utils.EventZoneIn(recurrenceZone, opts.Object))
+		if err != nil {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid occurrence date"})
+			return
+		}
+		if recLine != "" {
 			if len(override) >= 2 {
 				override = append(override[:2], append([]string{recLine}, override[2:]...)...)
 			} else {
@@ -1447,12 +1634,15 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		ical = utils.BuildFromComponents(header, newComponents, footer)
 	} else {
 		// Update the series/master event while keeping overrides intact.
-		header, components, footer := utils.SplitComponents(existing.RawICAL)
-		master := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
+		master, err := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
+		if err != nil {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
+			return
+		}
 		replaced := false
 		for i, comp := range components {
 			if utils.RecurrenceIDValue(comp) == "" && !replaced {
-				components[i] = master
+				components[i] = withUneditedProperties(master, comp, opts.Object)
 				replaced = true
 			}
 		}
@@ -1461,14 +1651,10 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		ical = utils.BuildFromComponents(header, components, footer)
 	}
-	etag := utils.GenerateETag(ical)
-
-	updatedEvent := store.Event{
-		CalendarID:   destinationCalendarID,
-		UID:          uid,
-		ResourceName: resourceName,
-		RawICAL:      ical,
-		ETag:         etag,
+	updatedEvent, err := h.validatedEvent(destinationCalendar, resourceName, ical)
+	if err != nil {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage(eventNotSaved, err)})
+		return
 	}
 	if movingCalendar {
 		fromPath := calendarEventResourcePath(calendarID, resourceName)
@@ -1538,7 +1724,11 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		if timezone == "" {
 			timezone = strings.TrimSpace(r.FormValue("timezone"))
 		}
-		exdateLine, err := utils.FormatICalDateTime(recurrenceID, recurrenceAllDay, false, "EXDATE", timezone)
+		// The occurrence is removed as an edit of it is stored: from the object
+		// less the definitions the server wrote, read in the host's zones,
+		// whose definitions the validator stores afresh.
+		object := withoutServerZoneDefinitions(utils.UnfoldLines(existing.RawICAL))
+		exdateLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "EXDATE", utils.EventZoneIn(timezone, object))
 		if err != nil || exdateLine == "" {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
 			return
@@ -1550,7 +1740,7 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		targetValue := targetValueParts[1]
 
-		header, components, footer := utils.SplitComponents(existing.RawICAL)
+		header, components, footer := utils.SplitComponentLines(object)
 		var newComponents [][]string
 		masterHandled := false
 		targetIdentity := []string{strings.Replace(exdateLine, "EXDATE", "RECURRENCE-ID", 1)}
@@ -1580,18 +1770,16 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		updatedICAL := utils.BuildFromComponents(header, newComponents, footer)
 		resourceName := uid
 		if existing.ResourceName != "" {
 			resourceName = existing.ResourceName
 		}
-		if _, err := h.store.Events.Upsert(r.Context(), store.Event{
-			CalendarID:   calendarID,
-			UID:          uid,
-			ResourceName: resourceName,
-			RawICAL:      updatedICAL,
-			ETag:         utils.GenerateETag(updatedICAL),
-		}); err != nil {
+		updatedEvent, err := h.occurrenceRemovedEvent(cal, existing, resourceName, utils.BuildFromComponents(header, newComponents, footer))
+		if err != nil {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage("the occurrence could not be deleted", err)})
+			return
+		}
+		if _, err := h.store.Events.Upsert(r.Context(), updatedEvent); err != nil {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete occurrence"})
 			return
 		}
@@ -1670,73 +1858,142 @@ func parseReminderMinutes(values []string) []int {
 	return out
 }
 
-// filterEventsForMonth returns events relevant to the given month range.
-func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Time) []store.Event {
-	var relevant []store.Event
+// unfoldedEvent is a stored event with the unfolded content lines of its
+// object, unfolded once for every reader of the object a request makes.
+type unfoldedEvent struct {
+	event store.Event
+	lines []string
+}
+
+func unfoldedStoreEvents(events []unfoldedEvent) []store.Event {
+	stored := make([]store.Event, len(events))
+	for i, ev := range events {
+		stored[i] = ev.event
+	}
+	return stored
+}
+
+// filterEventsForMonth returns the events relevant to the given month range,
+// each with its unfolded lines. Each object is unfolded as it is read, and its
+// lines kept only when the event is relevant, so a request holds the lines of
+// the events it shows rather than of the whole calendar.
+func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Time) []unfoldedEvent {
+	var relevant []unfoldedEvent
 	for _, ev := range allEvents {
-		rruleLines := rawICalEventRRuleLines(ev.RawICAL)
-		hasRRule := len(rruleLines) > 0
-		startDate := eventMonthFilterStart(ev)
+		unfolded := unfoldedEvent{event: ev, lines: utils.UnfoldLines(ev.RawICAL)}
+		rules := eventSeriesRules(unfolded.lines)
+		hasRRule := len(rules) > 0
+		rangeStart, rangeEnd := monthFilterRange(unfolded.lines)
+		startDate := eventMonthFilterStart(ev, rangeStart)
 
 		if hasRRule {
 			if startDate != nil && !startDate.After(monthEnd) {
 				hasEnded := false
-				for _, line := range rruleLines {
-					if strings.Contains(line, "UNTIL=") {
-						parts := strings.Split(line, "UNTIL=")
-						if len(parts) > 1 {
-							untilStr := strings.Split(parts[1], ";")[0]
-							untilStr = strings.Split(untilStr, "T")[0]
-							if len(untilStr) >= 8 {
-								untilYear, _ := strconv.Atoi(untilStr[0:4])
-								untilMonth, _ := strconv.Atoi(untilStr[4:6])
-								untilDay, _ := strconv.Atoi(untilStr[6:8])
-								untilDate := time.Date(untilYear, time.Month(untilMonth), untilDay, 0, 0, 0, 0, time.UTC)
-								if untilDate.Before(monthStart) {
-									hasEnded = true
-								}
-							}
-						}
+				for _, rule := range rules {
+					if rruleUntilEndsBefore(rruleUntil(rule.rrule), monthStart, rule.dtstart, unfolded.lines) {
+						hasEnded = true
 					}
 				}
 				if !hasEnded {
-					relevant = append(relevant, ev)
+					relevant = append(relevant, unfolded)
 				}
 			}
 		} else {
-			endDate := eventMonthFilterEnd(ev, startDate)
+			endDate := eventMonthFilterEnd(ev, startDate, rangeEnd)
 			if startDate != nil && endDate != nil && !startDate.After(monthEnd) && !endDate.Before(monthStart) {
-				relevant = append(relevant, ev)
+				relevant = append(relevant, unfolded)
 			}
 		}
 	}
 	return relevant
 }
 
-func rawICalEventRRuleLines(raw string) []string {
-	var lines []string
-	inEvent := false
-	for _, line := range utils.UnfoldLines(raw) {
+// maxUTCOffset is the furthest east of UTC any zone's clocks run.
+const maxUTCOffset = 14 * time.Hour
+
+// rruleUntilEndsBefore reports whether a series whose RRULE ends at the UNTIL
+// value until has no occurrence on or after day, a UTC midnight that stands for
+// that date wherever the calendar is viewed. dtstart is the series' DTSTART
+// content line and object the unfolded object holding it. A UTC UNTIL is an
+// instant whose date a viewer east of UTC sees up to maxUTCOffset later. A
+// DATE UNTIL is inclusive of its day (RFC 5545 §3.3.10), and a floating one is
+// a wall clock on its date; either is read in the DTSTART's zone, as the DAV
+// layer reads it, so the series may have an instance until that day ends
+// there, which a viewer east of UTC sees up to maxUTCOffset later still. In a
+// series of dates or of floating times, the date is the one every viewer sees.
+// An UNTIL it cannot read, or a series without a DTSTART, ends nothing.
+func rruleUntilEndsBefore(until string, day time.Time, dtstart string, object []string) bool {
+	if instant, err := time.Parse("20060102T150405Z", until); err == nil {
+		return instant.Add(maxUTCOffset).Before(day)
+	}
+	if len(until) < 8 {
+		return false
+	}
+	date, err := time.Parse("20060102", until[:8])
+	if err != nil {
+		return false
+	}
+	keyPart, value, ok := ical.SplitContentLine(dtstart)
+	if !ok {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	tzid, zoned := ical.PropertyParam(keyPart, "TZID")
+	utc := strings.HasSuffix(strings.ToUpper(value), "Z")
+	if ical.PropertyParamEquals(keyPart, "VALUE", "DATE") || len(value) == len("20060102") || (!utc && !zoned) {
+		return date.Before(day)
+	}
+	end := date.AddDate(0, 0, 1)
+	if !utc {
+		end = utils.EventZoneIn(tzid, object).Instant(end)
+	}
+	return !end.Add(maxUTCOffset).After(day)
+}
+
+// eventSeriesRule is an RRULE value of a VEVENT among an object's content
+// lines, with that VEVENT's first DTSTART line, or "" when it has none.
+type eventSeriesRule struct {
+	rrule, dtstart string
+}
+
+// eventSeriesRules lists the RRULEs of the VEVENTs among an object's unfolded
+// content lines, a VEVENT left open included.
+func eventSeriesRules(unfolded []string) []eventSeriesRule {
+	var rules []eventSeriesRule
+	var rrules []string
+	dtstart, inEvent := "", false
+	for _, line := range unfolded {
 		switch {
 		case strings.EqualFold(line, "BEGIN:VEVENT"):
-			inEvent = true
+			inEvent, rrules, dtstart = true, rrules[:0], ""
 			continue
 		case strings.EqualFold(line, "END:VEVENT"):
-			inEvent = false
+			for _, rrule := range rrules {
+				rules = append(rules, eventSeriesRule{rrule: rrule, dtstart: dtstart})
+			}
+			inEvent, rrules = false, rrules[:0]
 			continue
 		case !inEvent:
 			continue
 		}
-		key, _, _, ok := parseICalProperty(line)
-		if ok && key == "RRULE" {
-			lines = append(lines, line)
+		key, _, value, ok := parseICalProperty(line)
+		switch {
+		case !ok:
+		case key == "RRULE":
+			rrules = append(rrules, value)
+		case key == "DTSTART" && dtstart == "":
+			dtstart = line
 		}
 	}
-	return lines
+	for _, rrule := range rrules {
+		rules = append(rules, eventSeriesRule{rrule: rrule, dtstart: dtstart})
+	}
+	return rules
 }
 
-func eventMonthFilterStart(ev store.Event) *time.Time {
-	start, _ := rawICalMonthFilterRange(ev.RawICAL)
+// eventMonthFilterStart is the date the month filter starts ev on: start,
+// what monthFilterRange read from its object, else its stored dtstart.
+func eventMonthFilterStart(ev store.Event, start *time.Time) *time.Time {
 	if start != nil {
 		return start
 	}
@@ -1747,8 +2004,10 @@ func eventMonthFilterStart(ev store.Event) *time.Time {
 	return &normalized
 }
 
-func eventMonthFilterEnd(ev store.Event, start *time.Time) *time.Time {
-	_, end := rawICalMonthFilterRange(ev.RawICAL)
+// eventMonthFilterEnd is the date the month filter ends ev on: end, what
+// monthFilterRange read from its object, else its stored dtend, and never
+// before start.
+func eventMonthFilterEnd(ev store.Event, start, end *time.Time) *time.Time {
 	if end != nil {
 		if start != nil && end.Before(*start) {
 			return start
@@ -1765,12 +2024,15 @@ func eventMonthFilterEnd(ev store.Event, start *time.Time) *time.Time {
 	return start
 }
 
-func rawICalMonthFilterRange(raw string) (*time.Time, *time.Time) {
+// monthFilterRange reads the dates the month filter places an event on from
+// its object's unfolded content lines: the master VEVENT's DTSTART and DTEND,
+// else the first of an override's.
+func monthFilterRange(lines []string) (*time.Time, *time.Time) {
 	inEvent := false
 	componentHasRecurrenceID := false
 	var startFallback, endFallback *time.Time
 
-	for _, line := range utils.UnfoldLines(raw) {
+	for _, line := range lines {
 		switch line {
 		case "BEGIN:VEVENT":
 			inEvent = true
@@ -1846,16 +2108,136 @@ func rawICalCalendarDate(value string, params map[string]string, isEnd bool) *ti
 	return &start
 }
 
-func calendarEventJSON(ev store.Event) map[string]any {
+// unfoldedEventJSON is the view model of an event shown from viewStart to
+// viewEnd, the range the browser asked for, reading the rules of the zones the
+// object defines through onsets, or through listings of its own when onsets is
+// nil.
+func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, onsets ical.ObservanceOnsets) map[string]any {
+	ev, lines := unfolded.event, unfolded.lines
 	payload := map[string]any{
 		"uid":     ev.UID,
 		"ical":    ev.RawICAL,
 		"lastMod": ev.LastModified.Format(time.RFC3339),
 	}
 
-	parsed := parseCalendarEventMetadata(ev)
+	zones := calendarEventZones{times: ical.NewObjectTimesSharingOnsets(lines, onsets)}
+	parsed := parseCalendarEventMetadata(ev, lines, &zones)
 	parsed.addToPayload(payload)
+	if offsets := calendarEventTimezoneOffsets(parsed, viewStart, viewEnd, &zones); len(offsets) > 0 {
+		payload["timezoneOffsets"] = offsets
+	}
 	return payload
+}
+
+// calendarTimezoneOffset is one entry of a zone's offset listing in the view
+// model: the zone keeps Offset seconds east of UTC from the instant From on.
+type calendarTimezoneOffset struct {
+	From   string `json:"from"`
+	Offset int    `json:"offset"`
+}
+
+// calendarEventTimezoneOffsets lists, for each zone an event's times are wall
+// clocks in that the object itself defines, the offsets that definition keeps
+// at the instants the browser reads in it. The browser need not know such a
+// zone -- Outlook's "Eastern Standard Time" -- or may define it differently,
+// while the DAV layer reads the object's definition. A zone read through the
+// host's database, which the browser shares, is left out.
+//
+// The browser reads the event's and its overrides' own times and UNTIL, and
+// places instances from viewStart to viewEnd; each is listed with two days
+// either side, more than any offset. Between them the browser reads the entry
+// before, which places only instances before the view. A counted series is
+// listed whole, since a skipped local time before the view changes which
+// instances its COUNT reaches.
+func calendarEventTimezoneOffsets(event calendarEventMetadata, viewStart, viewEnd time.Time, zones *calendarEventZones) map[string][]calendarTimezoneOffset {
+	tzids := make(map[string]struct{})
+	var points []time.Time
+	include := func(t *time.Time) {
+		if t != nil {
+			points = append(points, *t)
+		}
+	}
+	for _, component := range append([]calendarEventMetadata{event}, event.Overrides...) {
+		for _, tzid := range []string{component.Timezone, component.RecurrenceTimezone} {
+			if tzid != "" && tzid != "UTC" {
+				tzids[tzid] = struct{}{}
+			}
+		}
+		include(component.DTStart)
+		include(component.DTEnd)
+		include(component.RecurrenceID)
+	}
+	if len(tzids) == 0 || len(points) == 0 {
+		return nil
+	}
+	if until, err := ical.ParseDateTime(event.RRuleParsed["UNTIL"]); err == nil {
+		until = until.Add(24 * time.Hour)
+		include(&until)
+	}
+	const reach = 48 * time.Hour
+	type span struct{ from, through time.Time }
+	var spans []span
+	for _, point := range points {
+		spans = append(spans, span{point.Add(-reach), point.Add(reach)})
+	}
+	if !viewEnd.IsZero() {
+		spans = append(spans, span{viewStart.Add(-reach), viewEnd.Add(reach)})
+	}
+	if event.RRuleParsed["COUNT"] != "" {
+		whole := spans[0]
+		for _, s := range spans[1:] {
+			whole.from, whole.through = minTime(whole.from, s.from), maxTime(whole.through, s.through)
+		}
+		spans = []span{whole}
+	}
+	slices.SortFunc(spans, func(a, b span) int { return a.from.Compare(b.from) })
+	merged := spans[:1]
+	for _, s := range spans[1:] {
+		if last := &merged[len(merged)-1]; !s.from.After(last.through) {
+			last.through = maxTime(last.through, s.through)
+			continue
+		}
+		merged = append(merged, s)
+	}
+
+	listings := make(map[string][]calendarTimezoneOffset)
+	for tzid := range tzids {
+		zone := zones.times.Timezone(tzid)
+		var listing []calendarTimezoneOffset
+		listed := true
+		for _, s := range merged {
+			offsets, ok := zone.Offsets(s.from, s.through)
+			if !ok {
+				listed = false
+				break
+			}
+			for _, offset := range offsets {
+				seconds := int(offset.Offset / time.Second)
+				if len(listing) > 0 && listing[len(listing)-1].Offset == seconds {
+					continue
+				}
+				listing = append(listing, calendarTimezoneOffset{From: offset.From.UTC().Format(time.RFC3339), Offset: seconds})
+			}
+		}
+		if listed {
+			listings[tzid] = listing
+		}
+	}
+	return listings
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 type calendarEventMetadata struct {
@@ -1968,8 +2350,10 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 	}
 }
 
-func parseCalendarEventMetadata(ev store.Event) calendarEventMetadata {
-	components := parseCalendarEventComponents(ev.RawICAL)
+// parseCalendarEventMetadata reads the event whose unfolded content lines are
+// lines, its wall clocks in the zones zones resolves.
+func parseCalendarEventMetadata(ev store.Event, lines []string, zones *calendarEventZones) calendarEventMetadata {
+	components := parseCalendarEventComponents(lines, zones)
 	var master *calendarEventMetadata
 	var overrides []calendarEventMetadata
 
@@ -2012,19 +2396,19 @@ func parseCalendarEventMetadata(ev store.Event) calendarEventMetadata {
 	return *master
 }
 
-func parseCalendarEventComponents(raw string) []calendarEventMetadata {
+func parseCalendarEventComponents(lines []string, zones *calendarEventZones) []calendarEventMetadata {
 	var components []calendarEventMetadata
 	var current []string
 	inEvent := false
 
-	for _, line := range utils.UnfoldLines(raw) {
+	for _, line := range lines {
 		switch {
 		case strings.EqualFold(line, "BEGIN:VEVENT"):
 			inEvent = true
 			current = nil
 		case strings.EqualFold(line, "END:VEVENT"):
 			if inEvent {
-				components = append(components, parseCalendarEventComponent(current))
+				components = append(components, parseCalendarEventComponent(current, zones))
 			}
 			inEvent = false
 			current = nil
@@ -2036,7 +2420,7 @@ func parseCalendarEventComponents(raw string) []calendarEventMetadata {
 	return components
 }
 
-func parseCalendarEventComponent(lines []string) calendarEventMetadata {
+func parseCalendarEventComponent(lines []string, zones *calendarEventZones) calendarEventMetadata {
 	var event calendarEventMetadata
 	inAlarm := false
 
@@ -2075,7 +2459,7 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 		case "DESCRIPTION":
 			event.Description = unescapeICalText(value)
 		case "RECURRENCE-ID":
-			if t, allDay := parseCalendarEventDate(value, params); t != nil {
+			if t, allDay := parseCalendarEventDate(value, params, zones); t != nil {
 				event.RecurrenceID = t
 				event.RecurrenceIDAllDay = allDay
 				event.RecurrenceTimezone = params["TZID"]
@@ -2090,7 +2474,7 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 		case "LOCATION":
 			event.Location = unescapeICalText(value)
 		case "DTSTART":
-			if t, allDay := parseCalendarEventDate(value, params); t != nil {
+			if t, allDay := parseCalendarEventDate(value, params, zones); t != nil {
 				event.DTStart = t
 				event.AllDay = allDay
 			}
@@ -2098,7 +2482,7 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 				event.Timezone = tzid
 			}
 		case "DTEND":
-			if t, _ := parseCalendarEventDate(value, params); t != nil {
+			if t, _ := parseCalendarEventDate(value, params, zones); t != nil {
 				event.DTEnd = t
 			}
 			if event.Timezone == "" {
@@ -2108,9 +2492,9 @@ func parseCalendarEventComponent(lines []string) calendarEventMetadata {
 			event.Duration = value
 		case "RRULE":
 			event.RRule = value
-			event.RRuleParsed = parseRRuleParts(value)
+			event.RRuleParsed = ical.RRuleParts(value)
 		case "EXDATE":
-			event.Exdates = append(event.Exdates, parseCalendarEventDateList(value, params)...)
+			event.Exdates = append(event.Exdates, parseCalendarEventDateList(value, params, zones)...)
 		case "STATUS":
 			event.Status = value
 		case "CATEGORIES":
@@ -2175,18 +2559,18 @@ func splitICalParameterParts(value string) []string {
 	return parts
 }
 
-func parseCalendarEventDateList(value string, params map[string]string) []time.Time {
+func parseCalendarEventDateList(value string, params map[string]string, zones *calendarEventZones) []time.Time {
 	values := strings.Split(value, ",")
 	dates := make([]time.Time, 0, len(values))
 	for _, v := range values {
-		if t, _ := parseCalendarEventDate(v, params); t != nil {
+		if t, _ := parseCalendarEventDate(v, params, zones); t != nil {
 			dates = append(dates, *t)
 		}
 	}
 	return dates
 }
 
-func parseCalendarEventDate(value string, params map[string]string) (*time.Time, bool) {
+func parseCalendarEventDate(value string, params map[string]string, zones *calendarEventZones) (*time.Time, bool) {
 	value = strings.TrimSpace(value)
 	allDay := strings.EqualFold(params["VALUE"], "DATE") || (len(value) == 8 && !strings.Contains(value, "T"))
 	if allDay {
@@ -2207,44 +2591,36 @@ func parseCalendarEventDate(value string, params map[string]string) (*time.Time,
 		}
 	}
 
-	tzid := params["TZID"]
-	loc := time.UTC
-	if tzid != "" {
-		if loaded, err := loadCalendarEventLocation(tzid); err == nil {
-			loc = loaded
-		}
+	wall, err := ical.ParseDateTimeInLocation(strings.TrimSuffix(value, "Z"), time.UTC)
+	if err != nil {
+		return nil, false
 	}
-	if t, err := time.ParseInLocation("20060102T150405", strings.TrimSuffix(value, "Z"), loc); err == nil {
-		utc := t.UTC()
-		return &utc, false
-	}
-
-	return nil, false
+	instant := zones.instant(params["TZID"], wall)
+	return &instant, false
 }
 
-func loadCalendarEventLocation(tzid string) (*time.Location, error) {
-	switch tzid {
-	case "US/Central":
-		tzid = "America/Chicago"
-	case "US/Eastern":
-		tzid = "America/New_York"
-	case "US/Mountain":
-		tzid = "America/Denver"
-	case "US/Pacific":
-		tzid = "America/Los_Angeles"
-	}
-	return time.LoadLocation(tzid)
+// calendarEventZones reads the wall clocks of one calendar object in the zones
+// its TZIDs name, as the DAV layer reads them: through the VTIMEZONE the object
+// ships, else the host's zone of that name, else in UTC. times resolves each
+// TZID once for the view model's times and its offset listings alike.
+type calendarEventZones struct {
+	times *ical.ObjectTimes
 }
 
-func parseRRuleParts(value string) map[string]string {
-	parts := make(map[string]string)
-	for _, part := range strings.Split(value, ";") {
-		key, val, ok := strings.Cut(part, "=")
-		if ok {
-			parts[strings.ToUpper(strings.TrimSpace(key))] = strings.TrimSpace(val)
-		}
+func (z *calendarEventZones) instant(tzid string, wall time.Time) time.Time {
+	if tzid == "" {
+		return wall
 	}
-	return parts
+	if zone := z.times.Timezone(tzid); zone.Defined() {
+		return zone.Instant(wall).UTC()
+	}
+	return wall
+}
+
+// rruleUntil is an RRULE's UNTIL, read as ical.RRuleParam reads it.
+func rruleUntil(value string) string {
+	until, _ := ical.RRuleParam(value, "UNTIL")
+	return until
 }
 
 func parseTriggerMinutes(value string) (int, bool) {
@@ -2349,46 +2725,4 @@ func formatCalendarEventTimes(times []time.Time) []string {
 		formatted = append(formatted, t.Format(time.RFC3339))
 	}
 	return formatted
-}
-
-// validateEventDates validates that the date strings are parseable and the range is valid.
-func validateEventDates(dtstart, dtend string, allDay bool) error {
-	// Try parsing as datetime-local format (YYYY-MM-DDTHH:MM)
-	layouts := []string{
-		"2006-01-02T15:04",          // datetime-local
-		"2006-01-02T15:04:05",       // datetime-local with seconds
-		"2006-01-02T15:04:05Z07:00", // RFC3339
-		"2006-01-02",                // date only
-	}
-
-	var startTime, endTime time.Time
-	var startErr, endErr error
-
-	// Try parsing start time
-	for _, layout := range layouts {
-		startTime, startErr = time.Parse(layout, dtstart)
-		if startErr == nil {
-			break
-		}
-	}
-	if startErr != nil {
-		return fmt.Errorf("invalid start date format")
-	}
-
-	// Try parsing end time
-	for _, layout := range layouts {
-		endTime, endErr = time.Parse(layout, dtend)
-		if endErr == nil {
-			break
-		}
-	}
-	if endErr != nil {
-		return fmt.Errorf("invalid end date format")
-	}
-
-	if endTime.Before(startTime) || (!allDay && endTime.Equal(startTime)) {
-		return fmt.Errorf("end date must be after start date")
-	}
-
-	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/events"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -29,7 +30,7 @@ func TestCreateEventStructured(t *testing.T) {
 			},
 		},
 		Events: eventRepo,
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(`{
 		"inputMode":"structured",
@@ -69,7 +70,7 @@ func TestCreateEventRawICSRejectsMethod(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]store.Event{}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	rawICS := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:test-1\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(rawICS))
@@ -100,7 +101,7 @@ func TestUpdateEventRequiresMatchingIfMatch(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]store.Event{"1:event-1": existing}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/calendars/1/events/event-1", strings.NewReader(`{
 		"inputMode":"structured",
@@ -145,7 +146,7 @@ func TestGetEventReturnsJSON(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]store.Event{"1:event-1": ev}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events/event-1", nil)
 	req = withUserAndRoute(req, "1", "event-1")
@@ -169,7 +170,7 @@ func TestGetEventReturnsJSON(t *testing.T) {
 }
 
 func TestListCalendarsUnauthorized(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars", nil)
 	rec := httptest.NewRecorder()
 
@@ -185,7 +186,8 @@ func TestListCalendarsSuccess(t *testing.T) {
 		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true, OwnerEmail: "owner@example.com"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rec := httptest.NewRecorder()
@@ -207,7 +209,8 @@ func TestListCalendarsIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *te
 				PrivilegesResolved: true,
 			},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rec := httptest.NewRecorder()
@@ -250,7 +253,8 @@ func TestListCalendarsIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *te
 func TestListCalendarsInternalError(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{listAccessibleErr: errors.New("boom")},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rec := httptest.NewRecorder()
@@ -263,7 +267,7 @@ func TestListCalendarsInternalError(t *testing.T) {
 }
 
 func TestGetCalendarUnauthorizedAndInvalidID(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	rec := httptest.NewRecorder()
@@ -289,7 +293,8 @@ func TestGetCalendarSuccess(t *testing.T) {
 		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true, OwnerEmail: "owner@example.com"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	req = withUserAndRoute(req, "1", "")
 	rec := httptest.NewRecorder()
@@ -312,7 +317,8 @@ func TestGetCalendarIncludesPartialWriteCapabilities(t *testing.T) {
 				Privileges: store.CalendarPrivileges{Read: true, Bind: true},
 			},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	req = withUserAndRoute(req, "1", "")
 	rec := httptest.NewRecorder()
@@ -364,7 +370,8 @@ func TestGetCalendarDoesNotAdvertiseDeniedWriteSubPrivileges(t *testing.T) {
 				},
 			},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	req = withUserAndRoute(req, "1", "")
 	rec := httptest.NewRecorder()
@@ -407,7 +414,8 @@ func TestGetCalendarIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *test
 				PrivilegesResolved: true,
 			},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	req = withUserAndRoute(req, "1", "")
 	rec := httptest.NewRecorder()
@@ -436,7 +444,8 @@ func TestGetCalendarIncludesObjectOnlyGrantWithoutCollectionCapabilities(t *test
 func TestGetCalendarNotFound(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1", nil)
 	req = withUserAndRoute(req, "1", "")
 	rec := httptest.NewRecorder()
@@ -456,7 +465,7 @@ func TestListEventsSuccessAndUnauthorized(t *testing.T) {
 		Events: &fakeEventRepo{events: map[string]store.Event{
 			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", ETag: "e1", LastModified: time.Now().UTC()},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events", nil)
 	rec := httptest.NewRecorder()
@@ -492,7 +501,7 @@ func TestListEventsFilter(t *testing.T) {
 			"1:b": {CalendarID: 1, UID: "b", ResourceName: "b", ETag: "e", Summary: strptr("Budget review"), Description: strptr("Discuss Q3 budget"), DTStart: tm("2026-06-20T09:00:00Z")},
 			"1:c": {CalendarID: 1, UID: "c", ResourceName: "c", ETag: "e", Summary: strptr("Lunch"), Location: strptr("Cafe Paris"), DTStart: tm("2026-07-01T12:00:00Z")},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	listUIDs := func(query string) []string {
 		req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events?"+query, nil)
@@ -542,7 +551,8 @@ func TestListEventsFilterInvalidParams(t *testing.T) {
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]store.Event{}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	for _, query := range []string{"start=not-a-date", "end=2026-13-40", "limit=-1", "start=2026-06-10&end=2026-06-01"} {
 		req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events?"+query, nil)
 		req = withUserAndRoute(req, "1", "")
@@ -555,7 +565,7 @@ func TestListEventsFilterInvalidParams(t *testing.T) {
 }
 
 func TestListEventsInvalidCalendarID(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/x/events", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	routeCtx := chi.NewRouteContext()
@@ -571,7 +581,7 @@ func TestListEventsInvalidCalendarID(t *testing.T) {
 }
 
 func TestDeleteEventInvalidUID(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 	req := httptest.NewRequest(http.MethodDelete, "/api/calendars/1/events/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	routeCtx := chi.NewRouteContext()
@@ -593,7 +603,7 @@ func TestGetEventUnauthorizedAndNotFound(t *testing.T) {
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]store.Event{}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/calendars/1/events/event-1", nil)
 	rec := httptest.NewRecorder()
@@ -612,7 +622,7 @@ func TestGetEventUnauthorizedAndNotFound(t *testing.T) {
 }
 
 func TestCreateEventUnauthorizedAndBadJSON(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
@@ -640,7 +650,8 @@ func TestCreateEventRawICSSuccess(t *testing.T) {
 			},
 		},
 		Events: eventRepo,
-	})
+	}, dav.ValidateCalendarObject)
+
 	rawICS := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:raw-1\r\nSUMMARY:Raw\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(rawICS))
 	req.Header.Set("Content-Type", "text/calendar")
@@ -679,7 +690,7 @@ func TestRawICSUpsertUsesTheEventUIDNotTheAlarmUIDs(t *testing.T) {
 			},
 		},
 		Events: eventRepo,
-	})
+	}, dav.ValidateCalendarObject)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(rawICS))
 	req.Header.Set("Content-Type", "text/calendar")
@@ -706,7 +717,7 @@ func TestRawICSUpsertUsesTheEventUIDNotTheAlarmUIDs(t *testing.T) {
 }
 
 func TestUpdateEventUnauthorizedAndSuccess(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 	req := httptest.NewRequest(http.MethodPut, "/api/calendars/1/events/event-1", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	handler.UpdateEvent(rec, req)
@@ -727,7 +738,8 @@ func TestUpdateEventUnauthorizedAndSuccess(t *testing.T) {
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]store.Event{"1:event-1": existing}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req = httptest.NewRequest(http.MethodPut, "/api/calendars/1/events/event-1", strings.NewReader(`{
 		"inputMode":"structured",
 		"structured":{"uid":"event-1","summary":"Updated","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00"}
@@ -752,7 +764,8 @@ func TestDeleteEventSuccess(t *testing.T) {
 		Events: &fakeEventRepo{events: map[string]store.Event{
 			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", ETag: "e1"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req := httptest.NewRequest(http.MethodDelete, "/api/calendars/1/events/event-1", nil)
 	req = withUserAndRoute(req, "1", "event-1")
 	rec := httptest.NewRecorder()
@@ -765,7 +778,7 @@ func TestDeleteEventSuccess(t *testing.T) {
 }
 
 func TestDeleteEventUnauthorizedAndNotFound(t *testing.T) {
-	handler := NewHandler(&config.Config{}, &store.Store{})
+	handler := NewHandler(&config.Config{}, &store.Store{}, dav.ValidateCalendarObject)
 	req := httptest.NewRequest(http.MethodDelete, "/api/calendars/1/events/event-1", nil)
 	rec := httptest.NewRecorder()
 	handler.DeleteEvent(rec, req)
@@ -778,7 +791,8 @@ func TestDeleteEventUnauthorizedAndNotFound(t *testing.T) {
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]store.Event{}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	req = httptest.NewRequest(http.MethodDelete, "/api/calendars/1/events/missing", nil)
 	req = withUserAndRoute(req, "1", "missing")
 	rec = httptest.NewRecorder()
@@ -1197,6 +1211,78 @@ func TestUIDRouteParamsDecodeExactlyOnceThroughChiRouting(t *testing.T) {
 				if got != tt.want {
 					t.Errorf("%s with %q resolved to %q, want %q", name, tt.segment, got, tt.want)
 				}
+			}
+		})
+	}
+}
+
+// A structured event's start and end have the shape allDay says: dates for an
+// all-day event, date-times for a timed one. A value of the other shape is
+// refused with 400 rather than dropped from the event written.
+func TestCreateEventStructuredRefusesDatesOfTheWrongShape(t *testing.T) {
+	for name, body := range map[string]string{
+		"all-day with a timed end":   `{"inputMode":"structured","structured":{"summary":"Trip","allDay":true,"dtstart":"2026-03-20","dtend":"2026-03-25T10:00"}}`,
+		"all-day with a timed start": `{"inputMode":"structured","structured":{"summary":"Trip","allDay":true,"dtstart":"2026-03-20T10:00","dtend":"2026-03-25"}}`,
+		"timed with a date end":      `{"inputMode":"structured","structured":{"summary":"Call","allDay":false,"dtstart":"2026-03-20T10:00","dtend":"2026-03-21"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eventRepo := &fakeEventRepo{events: map[string]store.Event{}}
+			handler := NewHandler(&config.Config{}, &store.Store{
+				Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+					1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+				}},
+				Events: eventRepo,
+			}, dav.ValidateCalendarObject)
+			req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.CreateEvent(rec, withUserAndRoute(req, "1", ""))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("CreateEvent() status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+			}
+			if len(eventRepo.events) != 0 {
+				t.Errorf("stored %v", eventRepo.events)
+			}
+		})
+	}
+}
+
+// Calendar data the validator refuses is a bad request, which the client fixes
+// by sending other data. Only a body that is a scheduling message (METHOD) or
+// names more than one UID, and so cannot be the one resource the request
+// writes, conflicts with the target.
+func TestCreateEventRawICSRefusalStatuses(t *testing.T) {
+	event := func(lines ...string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" + strings.Join(lines, "") + "END:VCALENDAR\r\n"
+	}
+	vevent := func(lines ...string) string {
+		return "BEGIN:VEVENT\r\n" + strings.Join(lines, "\r\n") + "\r\nEND:VEVENT\r\n"
+	}
+	tests := map[string]struct {
+		body string
+		want int
+	}{
+		"no UID":          {event(vevent("DTSTAMP:20260101T000000Z", "DTSTART:20260320T100000Z")), http.StatusBadRequest},
+		"empty UID":       {event(vevent("UID:", "DTSTAMP:20260101T000000Z", "DTSTART:20260320T100000Z")), http.StatusBadRequest},
+		"two masters":     {event(vevent("UID:a", "DTSTART:20260320T100000Z"), vevent("UID:a", "DTSTART:20260321T100000Z")), http.StatusBadRequest},
+		"event with task": {event(vevent("UID:a", "DTSTART:20260320T100000Z"), "BEGIN:VTODO\r\nUID:a\r\nEND:VTODO\r\n"), http.StatusBadRequest},
+		"METHOD":          {strings.Replace(event(vevent("UID:a", "DTSTART:20260320T100000Z")), "VERSION:2.0", "METHOD:REQUEST\r\nVERSION:2.0", 1), http.StatusConflict},
+		"two UIDs":        {event(vevent("UID:a", "DTSTART:20260320T100000Z"), vevent("UID:b", "DTSTART:20260321T100000Z")), http.StatusConflict},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			handler := NewHandler(&config.Config{}, &store.Store{
+				Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+					1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+				}},
+				Events: &fakeEventRepo{events: map[string]store.Event{}},
+			}, dav.ValidateCalendarObject)
+			req := httptest.NewRequest(http.MethodPost, "/api/calendars/1/events", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "text/calendar")
+			rec := httptest.NewRecorder()
+			handler.CreateEvent(rec, withUserAndRoute(req, "1", ""))
+			if rec.Code != tt.want {
+				t.Errorf("CreateEvent() status = %d, want %d, body=%s", rec.Code, tt.want, rec.Body.String())
 			}
 		})
 	}

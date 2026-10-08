@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -438,29 +437,12 @@ func completeCalendarTimezoneComponent(component *icalComponent) bool {
 	}
 }
 
+// validUTCOffset admits a submitted UTC-OFFSET value: one the observance reader
+// parses, written without the surrounding whitespace that reader reads past in
+// stored data.
 func validUTCOffset(value string) bool {
-	if len(value) != 5 && len(value) != 7 {
-		return false
-	}
-	if value[0] != '+' && value[0] != '-' {
-		return false
-	}
-	digits := value[1:]
-	for _, digit := range digits {
-		if digit < '0' || digit > '9' {
-			return false
-		}
-	}
-	hour, _ := strconv.Atoi(digits[:2])
-	minute, _ := strconv.Atoi(digits[2:4])
-	second := 0
-	if len(digits) == 6 {
-		second, _ = strconv.Atoi(digits[4:6])
-	}
-	if hour > 23 || minute > 59 || second > 59 {
-		return false
-	}
-	return value[0] != '-' || hour != 0 || minute != 0 || second != 0
+	_, ok := ical.ParseUTCOffset(value)
+	return ok && strings.TrimSpace(value) == value
 }
 
 func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, href string, target davTarget, request *proppatchRequest, lockPreconditions []store.LockPrecondition) ([]response, error) {

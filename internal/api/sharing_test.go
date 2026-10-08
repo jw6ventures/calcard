@@ -14,6 +14,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -117,7 +118,8 @@ func newSharingHandler() (*Handler, *fakeACLRepo) {
 			1: {ID: 1, PrimaryEmail: "owner@example.com"},
 			2: {ID: 2, PrimaryEmail: "sharee@example.com"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 	return h, acl
 }
 

@@ -4,7 +4,7 @@
 // which this page shows in the browser's zone. Run under several TZ values:
 // reading a UTC value as local is only visible where the zone is not UTC.
 //
-// Usage: node ical_date_parsing.mjs calendar_view.html safe_html_js.tmpl
+// Usage: node ical_date_parsing.mjs <calendar_view.html as rendered>
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';

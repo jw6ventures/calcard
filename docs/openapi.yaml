@@ -640,7 +640,12 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorText"
     Conflict:
-      description: The request conflicts with existing calendar data or resource constraints.
+      description: |
+        The request conflicts with the resource it writes: the calendar data is
+        a scheduling message (`METHOD`) or names more than one UID, its UID
+        belongs to another resource in the collection, or a contact's UID or
+        resource name is taken. Calendar data refused for any other reason is a
+        `400`.
       content:
         text/plain; charset=utf-8:
           schema:
@@ -752,9 +757,17 @@ components:
         dtstart:
           type: string
           format: date-time
+          description: |
+            The start of the event's first component as stored for indexing,
+            in UTC (RFC 3339 with `Z`). An all-day event's start is midnight UTC
+            of its first day.
         dtend:
           type: string
           format: date-time
+          description: |
+            The end of the event's first component as stored for indexing, in
+            UTC (RFC 3339 with `Z`). An all-day event's end is midnight UTC of
+            the day after its last day, the exclusive iCalendar `DTEND`.
         allDay:
           type: boolean
         etag:
@@ -804,24 +817,63 @@ components:
           type: string
         dtstart:
           type: string
-          description: Event start. Accepted formats include local date-time and all-day date values.
+          description: |
+            Event start. For a timed event (`allDay` false or omitted) a local
+            date-time, `YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`, read as a
+            wall clock in `timezone`. A value carrying a UTC offset or `Z` is
+            refused with `400`; to give a UTC time, send the UTC wall clock and
+            omit `timezone`. For an all-day event a date, `YYYY-MM-DD`, the
+            event's first day. A value of the other shape than `allDay` calls
+            for is refused with `400`.
           examples:
             - "2026-03-20T10:00"
             - "2026-03-20"
         dtend:
           type: string
-          description: Event end. Accepted formats include local date-time and all-day date values.
+          description: |
+            Event end, in the same format as `dtstart` and read the same way. A
+            timed end may equal the start but not precede it, compared as the
+            instants both name in `timezone`; otherwise the request is refused
+            with `400`. For an all-day event it is the event's last day,
+            inclusive: `dtstart` and `dtend` both `2026-03-20` is a one-day
+            event, stored with the exclusive iCalendar `DTEND` of 2026-03-21.
           examples:
             - "2026-03-20T11:00"
             - "2026-03-21"
         allDay:
           type: boolean
+          description: |
+            Whether the event is all-day, its times being dates with no time of
+            day or zone (`VALUE=DATE`). Defaults to false.
         location:
           type: string
         description:
           type: string
         timezone:
           type: string
+          description: |
+            The time zone a timed event's `dtstart`, `dtend` and recurrence
+            `until` are wall clocks in, as an IANA name from the server's time
+            zone database, such as `America/Chicago`. The event is stored with
+            `DTSTART;TZID=<timezone>:<wall clock>` exactly as given, and the
+            server adds the `VTIMEZONE` defining the zone from its database.
+
+            When `timezone` is omitted, empty, `UTC`, or a name the server's
+            database does not define, the values are read as UTC wall clocks and
+            stored as UTC (`DTSTART:20260320T100000Z`); an unknown name is not
+            an error. Before 1.2.0 they were read in the time zone of the server
+            process, so a client of a server not running in UTC that omits
+            `timezone` now gets times that many hours from where it did. A
+            structured update replaces the whole event, so a zone a stored
+            event defines only by its own `VTIMEZONE`, such as Outlook's
+            `Eastern Standard Time`, is UTC here as well; send `rawIcal` to keep
+            it.
+
+            A wall clock a daylight-saving change skips (02:30 on the morning
+            New York springs forward) is stored as given and names the instant
+            RFC 5545 §3.3.5 gives it, read with the offset before the change
+            (02:30 EST, which is 03:30 EDT); a wall clock a change repeats names
+            its first occurrence. Ignored for all-day events.
           example: America/Chicago
         url:
           type: string
@@ -874,6 +926,15 @@ components:
           minimum: 0
         until:
           type: string
+          description: |
+            The last day of the series, `YYYY-MM-DD`, inclusive: an occurrence
+            on that day is part of it. For an all-day series it is stored as
+            the date `UNTIL`; for a timed one as the last second of that day
+            (23:59:59) in the event's `timezone`, or in UTC under the same rules
+            `timezone` describes, written as a UTC `UNTIL`. Ignored when
+            `count` is greater than zero. A value that is not a `YYYY-MM-DD`
+            date is ignored too, leaving the series without an end.
+          example: "2026-06-30"
         byDay:
           type: array
           items:

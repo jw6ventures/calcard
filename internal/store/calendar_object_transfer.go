@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 )
@@ -41,7 +42,6 @@ type CalendarObjectTransfer struct {
 	SourceUID          string
 	SourceResourceName string
 	ExpectedSourceETag string
-	ExpectedSourceRaw  string
 
 	DestinationCalendarID   int64
 	DestinationResourceName string
@@ -52,7 +52,10 @@ type CalendarObjectTransfer struct {
 	// checks read.
 	ExpectedACL *ACLGuard
 
-	RawICAL  string
+	// RawICAL is the source's octets as they were read, which the store
+	// guards on and a COPY stores. A MOVE keeps the row's octets and ETag.
+	RawICAL string
+	// ETag is the ETag a COPY stores its copy under.
 	ETag     string
 	Metadata *EventWriteMetadata
 
@@ -87,6 +90,9 @@ func (s *Store) TransferCalendarObject(ctx context.Context, transfer CalendarObj
 	}
 	if transfer.Operation != CalendarObjectCopy && transfer.Operation != CalendarObjectMove {
 		return nil, fmt.Errorf("unsupported calendar object transfer operation %q", transfer.Operation)
+	}
+	if transfer.RawICAL == "" || (transfer.Operation == CalendarObjectCopy && transfer.ETag == "") {
+		return nil, errors.New("calendar object transfer has no body or ETag to store")
 	}
 	if transfer.SourceResourceName == "" {
 		transfer.SourceResourceName = transfer.SourceUID
@@ -144,7 +150,7 @@ func transferCalendarObjectTx(ctx context.Context, tx *sql.Tx, transfer Calendar
 	if source == nil {
 		return nil, ErrNotFound
 	}
-	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.ExpectedSourceRaw {
+	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
 		return nil, ErrResourceStateChanged
 	}
 
@@ -209,8 +215,8 @@ RETURNING ` + calendarObjectColumns
 			return nil, err
 		}
 	case CalendarObjectMove:
-		const update = `UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE id=$3 RETURNING ` + calendarObjectColumns
-		moved, err := scanEvent(tx.QueryRowContext(ctx, update, transfer.DestinationCalendarID, transfer.DestinationResourceName, source.ID).Scan)
+		moved, err := rebindEventTx(ctx, tx, source.ID, transfer.DestinationCalendarID, transfer.DestinationResourceName,
+			calendarObjectTransferMetadata(transfer, source))
 		if err != nil {
 			if isEventIdentityConflict(err) {
 				return nil, ErrConflict
@@ -238,6 +244,20 @@ VALUES ('event', $1, $2, $3)`, source.CalendarID, source.UID, storedResourceName
 	return &CalendarObjectTransferResult{Event: event, Created: created}, nil
 }
 
+// rebindEventTx binds an existing events row to a calendar and resource name,
+// keeping its octets and ETag, and sets its columns to the metadata the
+// transfer read from them.
+func rebindEventTx(ctx context.Context, tx *sql.Tx, id, calendarID int64, resourceName string, metadata EventWriteMetadata) (Event, error) {
+	const update = `
+UPDATE events SET calendar_id=$2, resource_name=$3, summary=$4, description=$5, location=$6,
+        dtstart=$7, dtend=$8, all_day=$9, recurrence_start=$10, recurrence_until=$11, last_modified=NOW()
+WHERE id=$1
+RETURNING ` + calendarObjectColumns
+	return scanEvent(tx.QueryRowContext(ctx, update, id, calendarID, resourceName,
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay,
+		metadata.RecurrenceStart, metadata.RecurrenceUntil).Scan)
+}
+
 func eventID(event *Event) int64 {
 	if event == nil {
 		return 0
@@ -259,15 +279,17 @@ func calendarObjectTransferMetadata(transfer CalendarObjectTransfer, source *Eve
 	if transfer.Metadata != nil {
 		return *transfer.Metadata
 	}
-	if source != nil {
-		metadata := EventWriteMetadata{
+	var metadata EventWriteMetadata
+	if source != nil && source.RawICAL == transfer.RawICAL {
+		metadata = EventWriteMetadata{
 			Summary: source.Summary, Description: source.Description, Location: source.Location,
 			DTStart: source.DTStart, DTEnd: source.DTEnd, AllDay: source.AllDay,
 		}
-		metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(source.RawICAL)
-		return metadata
+	} else {
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(transfer.RawICAL)
 	}
-	return EventWriteMetadata{}
+	metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(transfer.RawICAL)
+	return metadata
 }
 
 func calendarObjectTransferLockKeys(transfer CalendarObjectTransfer) []string {

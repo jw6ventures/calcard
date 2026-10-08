@@ -1050,417 +1050,10 @@
     // Raw event data from server (loaded via AJAX)
     var rawEvents = [];
 
-    // Parse iCalendar data
-    function parseICAL(ical) {
-        var lines = unfoldLines(ical);
-        var components = [];
-        var current = [];
-        var inEvent = false;
-
-        for (var i = 0; i < lines.length; i++) {
-            var line = lines[i];
-            if (line === 'BEGIN:VEVENT') {
-                inEvent = true;
-                current = [];
-                continue;
-            }
-            if (line === 'END:VEVENT') {
-                components.push(current);
-                inEvent = false;
-                continue;
-            }
-            if (inEvent) {
-                current.push(line);
-            }
-        }
-
-        function parseEventLines(evLines) {
-            var event = {
-                attendees: [],
-                attachments: [],
-                reminders: []
-            };
-            var inAlarm = false;
-            evLines.forEach(function(line) {
-                var colonIdx = line.indexOf(':');
-                if (colonIdx === -1) return;
-
-                var key = line.substring(0, colonIdx);
-                var value = line.substring(colonIdx + 1);
-
-                var params = {};
-                var semicolonIdx = key.indexOf(';');
-                if (semicolonIdx !== -1) {
-                    var paramStr = key.substring(semicolonIdx + 1);
-                    key = key.substring(0, semicolonIdx);
-                    paramStr.split(';').forEach(function(p) {
-                        var eq = p.indexOf('=');
-                        if (eq !== -1) {
-                            params[p.substring(0, eq)] = p.substring(eq + 1);
-                        }
-                    });
-                }
-
-                if (key === 'BEGIN' && value === 'VALARM') {
-                    inAlarm = true;
-                    return;
-                }
-                if (key === 'END' && value === 'VALARM') {
-                    inAlarm = false;
-                    return;
-                }
-                if (inAlarm) {
-                    if (key === 'TRIGGER') {
-                        var minutes = parseTriggerMinutes(value);
-                        if (minutes !== null) {
-                            event.reminders.push(minutes);
-                        }
-                    }
-                    return;
-                }
-
-                switch (key) {
-                    case 'UID':
-                        event.uid = value;
-                        break;
-                    case 'SUMMARY':
-                        event.summary = unescapeText(value);
-                        break;
-                    case 'DESCRIPTION':
-                        event.description = unescapeText(value);
-                        break;
-                    case 'RECURRENCE-ID':
-                        event.recurrenceId = parseICALDate(value, params);
-                        event.recurrenceIdAllDay = value.length === 8 || params['VALUE'] === 'DATE';
-                        break;
-                    case 'X-ALT-DESC':
-                        if (params['FMTTYPE'] === 'text/html') {
-                            event.htmlDescription = value;
-                        }
-                        break;
-                    case 'LOCATION':
-                        event.location = unescapeText(value);
-                        break;
-                    case 'DTSTART':
-                        event.dtstart = parseICALDate(value, params);
-                        event.allDay = value.length === 8 || params['VALUE'] === 'DATE';
-                        if (params['TZID']) event.timezone = params['TZID'];
-                        break;
-                    case 'DTEND':
-                        event.dtend = parseICALDate(value, params);
-                        if (!event.timezone && params['TZID']) event.timezone = params['TZID'];
-                        break;
-                    case 'DURATION':
-                        event.duration = value;
-                        break;
-                    case 'RRULE':
-                        event.rrule = value;
-                        event.rruleParsed = parseRRule(value);
-                        break;
-                    case 'EXDATE':
-                        // One EXDATE may list several dates.
-                        event.exdates = (event.exdates || []).concat(value.split(',').map(function(v) {
-                            return parseICALDate(v, params);
-                        }));
-                        break;
-                    case 'STATUS':
-                        event.status = value;
-                        break;
-                    case 'CATEGORIES':
-                        event.categories = value.split(',').map(function(c) { return c.trim(); });
-                        break;
-                    case 'URL':
-                        event.url = value;
-                        break;
-                    case 'CLASS':
-                        event.class = value;
-                        break;
-                    case 'TRANSP':
-                        event.transp = value;
-                        break;
-                    case 'ORGANIZER':
-                        event.organizer = formatEmailValue(value, params);
-                        break;
-                    case 'ATTENDEE':
-                        event.attendees = event.attendees || [];
-                        event.attendees.push(formatEmailValue(value, params));
-                        break;
-                    case 'ATTACH':
-                        event.attachments = event.attachments || [];
-                        event.attachments.push(value);
-                        break;
-                }
-            });
-            return event;
-        }
-
-        var parsedComponents = components.map(parseEventLines);
-        var master = parsedComponents.find(function(c) { return !c.recurrenceId; }) || parsedComponents[0] || {};
-        var overrides = parsedComponents.filter(function(c) { return c.recurrenceId; });
-        overrides.forEach(function(o) {
-            if (!o.uid && master.uid) o.uid = master.uid;
-        });
-        master.overrides = overrides;
-        return master;
-    }
-
-    function unfoldLines(ical) {
-        return ical.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
-    }
-
-
-    function formatEmailValue(value, params) {
-        var email = value || '';
-        if (email.toLowerCase().indexOf('mailto:') === 0) {
-            email = email.substring(7);
-        }
-        if (!email) return '';
-        var name = (params && params['CN'] ? params['CN'] : '').trim();
-        // Clients that have no display name for an attendee often set CN to the
-        // address itself, which would otherwise render it twice.
-        if (!name || name.toLowerCase() === email.toLowerCase()) return email;
-        return name + ' <' + email + '>';
-    }
-
-    function parseTriggerMinutes(value) {
-        if (!value) return null;
-        var sign = 1;
-        if (value[0] === '-') {
-            sign = -1;
-            value = value.substring(1);
-        } else if (value[0] === '+') {
-            value = value.substring(1);
-        }
-        var match = value.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
-        if (!match) return null;
-        var days = parseInt(match[1] || '0', 10);
-        var hours = parseInt(match[2] || '0', 10);
-        var mins = parseInt(match[3] || '0', 10);
-        var secs = parseInt(match[4] || '0', 10);
-        var total = days * 1440 + hours * 60 + mins + Math.round(secs / 60);
-        if (sign >= 0) return null;
-        return total;
-    }
-
-    // Reads an iCalendar DATE or basic-format DATE-TIME (RFC 5545 section
-    // 3.3.4 and 3.3.5). A time ending in Z is UTC and is read as that instant.
-    // A floating or TZID time is wall-clock time, shown in the browser's zone,
-    // and a DATE is local midnight. Anything else is an invalid Date.
-    function parseICALDate(str, params) {
-        var match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z?))?$/.exec(String(str).trim());
-        if (!match) {
-            return new Date(NaN);
-        }
-        var year = parseInt(match[1], 10);
-        var month = parseInt(match[2], 10) - 1;
-        var day = parseInt(match[3], 10);
-        var hour = match[4] ? parseInt(match[4], 10) : 0;
-        var min = match[5] ? parseInt(match[5], 10) : 0;
-        var sec = match[6] ? parseInt(match[6], 10) : 0;
-        if (match[7] === 'Z') {
-            return new Date(Date.UTC(year, month, day, hour, min, sec));
-        }
-        return new Date(year, month, day, hour, min, sec);
-    }
-
-    function parseRRule(rrule) {
-        var result = {};
-        rrule.split(';').forEach(function(part) {
-            var eq = part.indexOf('=');
-            if (eq !== -1) {
-                var key = part.substring(0, eq);
-                var value = part.substring(eq + 1);
-                result[key] = value;
-            }
-        });
-        return result;
-    }
-
-    function makeOccurrenceKey(date, allDay) {
-        if (!date) return '';
-        if (allDay) {
-            var y = date.getFullYear();
-            var m = String(date.getMonth() + 1).padStart(2, '0');
-            var d = String(date.getDate()).padStart(2, '0');
-            return y + '-' + m + '-' + d;
-        }
-        return String(date.getTime());
-    }
-
-    function expandRecurringEvents(events, rangeStart, rangeEnd) {
-        var expanded = [];
-        var maxOccurrences = 500;
-
-        events.forEach(function(event) {
-            var overrides = event.overrides || [];
-            var overrideMap = {};
-            overrides.forEach(function(ov) {
-                if (!ov.recurrenceId) return;
-                var key = makeOccurrenceKey(ov.recurrenceId, ov.recurrenceIdAllDay || ov.allDay || event.allDay);
-                var merged = Object.assign({}, event, ov);
-                merged.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
-                overrideMap[key] = merged;
-            });
-
-            if (!event.rrule) {
-                expanded.push(event);
-                overrides.forEach(function(ov) {
-                    var overrideEv = Object.assign({}, event, ov);
-                    overrideEv.recurrenceId = ov.recurrenceId;
-                    overrideEv.recurrenceIdAllDay = ov.recurrenceIdAllDay || ov.allDay || event.allDay;
-                    expanded.push(overrideEv);
-                });
-                return;
-            }
-
-            var rr = event.rruleParsed;
-            var freq = rr.FREQ;
-            var interval = parseInt(rr.INTERVAL || '1', 10);
-            var count = rr.COUNT ? parseInt(rr.COUNT, 10) : null;
-            var until = rr.UNTIL ? parseICALDate(rr.UNTIL, {}) : null;
-            var byDay = rr.BYDAY ? rr.BYDAY.split(',') : null;
-            var byMonthDay = rr.BYMONTHDAY ? rr.BYMONTHDAY.split(',').map(function(d) { return parseInt(d, 10); }) : null;
-            var byMonth = rr.BYMONTH ? rr.BYMONTH.split(',').map(function(m) { return parseInt(m, 10); }) : null;
-
-            var duration = 0;
-            if (event.dtend) {
-                duration = event.dtend.getTime() - event.dtstart.getTime();
-            }
-
-            var exdateSet = {};
-            if (event.exdates) {
-                event.exdates.forEach(function(d) {
-                    exdateSet[makeOccurrenceKey(d, event.allDay)] = true;
-                });
-            }
-
-            var current = new Date(event.dtstart);
-            var occurrences = 0;
-            var effectiveEnd = until || rangeEnd;
-
-            while (occurrences < maxOccurrences) {
-                if (count && occurrences >= count) break;
-                if (current > effectiveEnd) break;
-
-                var matches = true;
-
-                if (byDay) {
-                    var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
-                    var currentDay = dayNames[current.getDay()];
-                    matches = byDay.some(function(d) { return d.endsWith(currentDay); });
-                }
-
-                if (byMonthDay) {
-                    matches = matches && byMonthDay.indexOf(current.getDate()) !== -1;
-                }
-
-                if (byMonth) {
-                    matches = matches && byMonth.indexOf(current.getMonth() + 1) !== -1;
-                }
-
-                if (exdateSet[makeOccurrenceKey(current, event.allDay)]) {
-                    matches = false;
-                }
-
-                if (matches && current >= rangeStart) {
-                    var key = makeOccurrenceKey(current, event.allDay);
-                    var override = overrideMap[key];
-                    var occurrence;
-                    if (override) {
-                        occurrence = Object.assign({}, override);
-                        occurrence.recurrenceId = override.recurrenceId || new Date(current);
-                        occurrence.recurrenceIdAllDay = override.recurrenceIdAllDay || override.allDay || event.allDay;
-                    } else {
-                        occurrence = Object.assign({}, event);
-                        occurrence.dtstart = new Date(current);
-                        if (event.dtend) {
-                            occurrence.dtend = new Date(current.getTime() + duration);
-                        }
-                        occurrence.recurrenceId = new Date(current);
-                        occurrence.recurrenceIdAllDay = event.allDay;
-                    }
-                    occurrence.isOccurrence = true;
-                    occurrence.seriesEvent = event;
-                    expanded.push(occurrence);
-                }
-
-                if (matches) occurrences++;
-
-                switch (freq) {
-                    case 'DAILY':
-                        current.setDate(current.getDate() + interval);
-                        break;
-                    case 'WEEKLY':
-                        if (byDay) {
-                            var found = false;
-                            for (var attempts = 0; attempts < 7 * interval + 1; attempts++) {
-                                current.setDate(current.getDate() + 1);
-                                var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
-                                var d = dayNames[current.getDay()];
-                                if (byDay.some(function(bd) { return bd.endsWith(d); })) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) break;
-                        } else {
-                            current.setDate(current.getDate() + 7 * interval);
-                        }
-                        break;
-                    case 'MONTHLY':
-                        current.setMonth(current.getMonth() + interval);
-                        break;
-                    case 'YEARLY':
-                        current.setFullYear(current.getFullYear() + interval);
-                        break;
-                    default:
-                        current.setDate(current.getDate() + 1);
-                }
-            }
-        });
-
-        return expanded;
-    }
+    {{template "calendar_events_js"}}
 
     var baseEvents = [];
     var events = [];
-
-    // An all-day value names a date, not an instant: the server parses the DATE
-    // as UTC midnight and sends it as RFC3339, while every reader here takes
-    // local calendar parts off the result. West of UTC that instant lands on the
-    // previous day, so the event rendered -- and saved -- one day early.
-    // Rebuilding it on local midnight is what parseICALDate already does for the
-    // iCal fallback, so both paths land an all-day event on the same day.
-    function parseServerDate(value, allDay) {
-        if (!value) return null;
-        var parsed = new Date(value);
-        if (isNaN(parsed.getTime())) return null;
-        if (!allDay) return parsed;
-        return new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
-    }
-
-    function normalizeServerEvent(raw) {
-        var parsed = Object.assign({}, raw);
-        var allDay = !!raw.allDay;
-        parsed.dtstart = parseServerDate(raw.dtstart, allDay);
-        parsed.dtend = parseServerDate(raw.dtend, allDay);
-        parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);
-        // Passing parseServerDate to map directly would hand it the index as the
-        // all-day flag.
-        parsed.exdates = (raw.exdates || []).map(function(value) {
-            return parseServerDate(value, allDay);
-        }).filter(Boolean);
-        parsed.overrides = (raw.overrides || []).map(normalizeServerEvent);
-        if (!parsed.dtstart && raw.ical) {
-            var fallback = parseICAL(raw.ical);
-            parsed = Object.assign(fallback, parsed);
-            parsed.dtstart = parsed.dtstart || fallback.dtstart;
-            parsed.dtend = parsed.dtend || fallback.dtend;
-            parsed.exdates = parsed.exdates.length ? parsed.exdates : (fallback.exdates || []);
-            parsed.overrides = parsed.overrides.length ? parsed.overrides : (fallback.overrides || []);
-        }
-        return parsed;
-    }
 
     function parseEvents(rawEventsData) {
         baseEvents = rawEventsData.map(function(raw) {
@@ -1682,24 +1275,9 @@
         return formatLocalDate(date);
     }
 
-    function formatDateTimeInput(date, timezone) {
-        if (timezone) {
-            var parts = {};
-            new Intl.DateTimeFormat('en-US', {
-                timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
-                hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
-            }).formatToParts(date).forEach(function(part) { parts[part.type] = part.value; });
-            return parts.year + '-' + parts.month + '-' + parts.day + 'T' + parts.hour + ':' + parts.minute +
-                (parts.second === '00' ? '' : ':' + parts.second);
-        }
-        return formatLocalDate(date) + 'T' +
-            String(date.getHours()).padStart(2, '0') + ':' +
-            String(date.getMinutes()).padStart(2, '0');
-    }
-
-    function formatRecurrenceInput(date, allDay, timezone) {
+    function formatRecurrenceInput(date, allDay, clock) {
         if (!date) return '';
-        return allDay ? formatDateInput(date) : formatDateTimeInput(date, timezone);
+        return allDay ? formatDateInput(date) : formatDateTimeForInput(date, clock);
     }
 
     // An all-day event's DTEND is exclusive -- the day after the last one it
@@ -1719,13 +1297,15 @@
     }
 
     // end is always the exclusive end; allDay decides how it is presented.
-    function setEditorDateValues(start, end, allDay, timezone) {
+    // A timed value is read on clock, a timeZoneClock, or, without one, in the
+    // browser's zone.
+    function setEditorDateValues(start, end, allDay, clock) {
         var startInput = document.getElementById('event-dtstart');
         var endInput = document.getElementById('event-dtend');
         startInput.type = allDay ? 'date' : 'datetime-local';
         endInput.type = allDay ? 'date' : 'datetime-local';
-        startInput.value = allDay ? formatDateInput(start) : formatDateTimeInput(start, timezone);
-        endInput.value = allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end, timezone);
+        startInput.value = allDay ? formatDateInput(start) : formatDateTimeForInput(start, clock);
+        endInput.value = allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeForInput(end, clock);
         document.getElementById('event-all-day').checked = allDay;
     }
 
@@ -1804,6 +1384,7 @@
         document.getElementById('delete-event-btn').style.display = 'none';
         document.getElementById('event-return-to').value = currentReturnPath();
         setEditorDateValues(start, end, allDay);
+        document.getElementById('event-timezone').value = browserTimeZone();
         editorForm.action = '/calendars/' + encodeURIComponent(editorCalendar.value) + '/events';
         editorModal.classList.add('show');
         document.getElementById('event-summary').focus();
@@ -1846,11 +1427,12 @@
         // of one day, which is an exclusive end of the day after DTSTART.
         var eventEnd = event.dtend ||
             (event.allDay ? addDays(startOfDay(event.dtstart), 1) : new Date(event.dtstart.getTime() + 30 * 60000));
-        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay, event.timezone || 'UTC');
+        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay, timeZoneClock(event, event.timezone));
         var recurrenceID = event.recurrenceId || (event.isOccurrence ? event.dtstart : null);
+        var recurrenceZone = event.recurrenceTimezone || event.timezone || 'UTC';
         document.getElementById('event-recurrence-id').value =
-            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay, event.recurrenceTimezone || event.timezone || 'UTC');
-        document.getElementById('event-recurrence-timezone').value = event.recurrenceTimezone || event.timezone || 'UTC';
+            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay, timeZoneClock(event, recurrenceZone));
+        document.getElementById('event-recurrence-timezone').value = recurrenceZone;
         document.getElementById('event-recurrence-all-day').value =
             event.recurrenceIdAllDay ? 'true' : 'false';
         document.getElementById('event-edit-scope-group').style.display = event.isOccurrence ? 'block' : 'none';
@@ -1875,7 +1457,7 @@
         } else if (rrule.UNTIL) {
             document.getElementById('event-recurrence-end').value = 'on';
             document.getElementById('event-recurrence-until').value =
-                rrule.UNTIL.slice(0, 4) + '-' + rrule.UNTIL.slice(4, 6) + '-' + rrule.UNTIL.slice(6, 8);
+                formatDateInput(rruleUntilDay(rrule.UNTIL, event));
         }
 
         var encodedUID = encodeURIComponent(event.uid);
@@ -2131,7 +1713,7 @@
             body += '<p><strong>Reminders:</strong> ' + escapeHtml(reminderText) + '</p>';
         }
         if (event.rrule) {
-            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event.rrule)) + '</p>';
+            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event)) + '</p>';
         }
         if (event.htmlDescription) {
             // The sanitized description is appended below as a node. Serializing
@@ -2172,82 +1754,6 @@
             opts.minute = '2-digit';
         }
         return date.toLocaleDateString(undefined, opts);
-    }
-
-    function formatRRule(rrule) {
-        var rr = {};
-        rrule.split(';').forEach(function(part) {
-            var eq = part.indexOf('=');
-            if (eq !== -1) {
-                rr[part.substring(0, eq)] = part.substring(eq + 1);
-            }
-        });
-
-        var freq = (rr.FREQ || '').toLowerCase();
-        var interval = parseInt(rr.INTERVAL || '1', 10);
-        var result = '';
-
-        if (interval === 1) {
-            switch (freq) {
-                case 'daily': result = 'Daily'; break;
-                case 'weekly': result = 'Weekly'; break;
-                case 'monthly': result = 'Monthly'; break;
-                case 'yearly': result = 'Yearly'; break;
-                default: result = freq.charAt(0).toUpperCase() + freq.slice(1);
-            }
-        } else {
-            switch (freq) {
-                case 'daily': result = 'Every ' + interval + ' days'; break;
-                case 'weekly': result = 'Every ' + interval + ' weeks'; break;
-                case 'monthly': result = 'Every ' + interval + ' months'; break;
-                case 'yearly': result = 'Every ' + interval + ' years'; break;
-                default: result = 'Every ' + interval + ' ' + freq;
-            }
-        }
-
-        if (rr.BYDAY) {
-            var dayMap = {
-                'SU': 'Sunday', 'MO': 'Monday', 'TU': 'Tuesday', 'WE': 'Wednesday',
-                'TH': 'Thursday', 'FR': 'Friday', 'SA': 'Saturday'
-            };
-            var days = rr.BYDAY.split(',').map(function(d) {
-                var match = d.match(/^(-?\d*)(\w{2})$/);
-                if (match) {
-                    var ordinal = match[1];
-                    var day = dayMap[match[2]] || match[2];
-                    if (ordinal === '1') return '1st ' + day;
-                    if (ordinal === '2') return '2nd ' + day;
-                    if (ordinal === '3') return '3rd ' + day;
-                    if (ordinal === '-1') return 'last ' + day;
-                    if (ordinal) return ordinal + 'th ' + day;
-                    return day;
-                }
-                return d;
-            });
-            result += ' on ' + days.join(', ');
-        }
-
-        if (rr.BYMONTHDAY) {
-            result += ' on day ' + rr.BYMONTHDAY;
-        }
-
-        if (rr.BYMONTH) {
-            var monthNames = ['', 'January', 'February', 'March', 'April', 'May', 'June',
-                              'July', 'August', 'September', 'October', 'November', 'December'];
-            var months = rr.BYMONTH.split(',').map(function(m) {
-                return monthNames[parseInt(m, 10)] || m;
-            });
-            result += ' in ' + months.join(', ');
-        }
-
-        if (rr.COUNT) {
-            result += ', ' + rr.COUNT + ' times';
-        } else if (rr.UNTIL) {
-            var until = parseICALDate(rr.UNTIL, {});
-            result += ', until ' + until.toLocaleDateString();
-        }
-
-        return result;
     }
 
     var expandedEvents = [];

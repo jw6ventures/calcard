@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -197,7 +198,8 @@ func newContactsHandler(books map[int64]*store.AddressBook, contacts map[string]
 	return NewHandler(&config.Config{}, &store.Store{
 		AddressBooks: &fakeAddressBookRepo{books: books},
 		Contacts:     &fakeContactRepo{contacts: contacts},
-	})
+	}, dav.ValidateCalendarObject)
+
 }
 
 func strptr(s string) *string { return &s }

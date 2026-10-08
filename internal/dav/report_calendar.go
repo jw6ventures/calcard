@@ -101,47 +101,53 @@ func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calF
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		matcher, parsed := newEventTimeRangeMatcher(event, zone)
-		if !parsed {
-			continue
+		matched, err := matchEventFilter(event, filter, zone)
+		if err != nil {
+			return nil, err
 		}
-		if matcherMatchesFilter(matcher, filter) {
+		if matched {
 			filtered = append(filtered, event)
-		}
-		if *matcher.expansionError != nil {
-			return nil, *matcher.expansionError
 		}
 	}
 	return filtered, nil
 }
 
-// eventMatchesFilter applies one CALDAV:filter to a calendar object resource.
-// RFC 4791 §9.7 scopes each filter element to a component, a property of that
-// component, or a parameter of that property, so matching runs over the parsed
-// tree rather than over the object's text: a substring search cannot tell a
-// SUMMARY value from a DESCRIPTION that quotes one. An object whose stored
-// octets do not parse matches nothing rather than failing the whole report.
-func eventMatchesFilter(event store.Event, filter *calFilter, zone floatingZone) bool {
+// matchEventFilter applies one CALDAV:filter to a calendar object resource,
+// and returns the error a recurrence expansion hit while judging the object,
+// which a report answers instead of a result built from a partial instance
+// set. RFC 4791 §9.7 scopes each filter element to a component, a property of
+// that component, or a parameter of that property, so matching runs over the
+// parsed tree rather than over the object's text: a substring search cannot
+// tell a SUMMARY value from a DESCRIPTION that quotes one.
+//
+// An object holding no VCALENDAR to match against is kept. GET and
+// sync-collection still list it, and a sync client reconciling against a
+// calendar-query result deletes what the result leaves out: reporting a
+// resource the filter would not have selected costs the client a fetch, while
+// leaving it out costs the client the resource.
+func matchEventFilter(event store.Event, filter *calFilter, zone floatingZone) (bool, error) {
 	matcher, ok := newEventTimeRangeMatcher(event, zone)
 	if !ok {
-		return false
+		return true, nil
 	}
-	return matcherMatchesFilter(matcher, filter)
+	matched := matcherMatchesFilter(matcher, filter)
+	return matched, *matcher.expansionError
 }
 
 // newEventTimeRangeMatcher parses one stored object so the filter walk, the
 // §9.9 time-range test and the free-busy period derivation can share a single
-// parse. ok is false for octets that do not parse; the matcher is still
-// returned, since a caller may fall back to the denormalized store columns.
+// parse. It reads the object as parseStoredICalendarObject does, so ok is false
+// only when there is no VCALENDAR to read; the matcher is then returned with no
+// tree for a caller to judge by.
 func newEventTimeRangeMatcher(event store.Event, zone floatingZone) (calendarTimeRangeMatcher, bool) {
-	root, err := parseICalendarObject(event.RawICAL)
+	root, err := parseStoredICalendarObject(event.RawICAL)
 	if err != nil {
 		return newCalendarTimeRangeMatcher(event.RawICAL, nil, zone), false
 	}
 	return newCalendarTimeRangeMatcher(event.RawICAL, root, zone), true
 }
 
-// matcherMatchesFilter is eventMatchesFilter over an object already parsed.
+// matcherMatchesFilter is matchEventFilter over an object already parsed.
 func matcherMatchesFilter(matcher calendarTimeRangeMatcher, filter *calFilter) bool {
 	// RFC 4791 §9.7.1: the outermost comp-filter is scoped to the calendar
 	// object resource itself.
@@ -345,15 +351,15 @@ func eventFilterFromCalFilter(filter *calFilter) (store.EventFilter, bool) {
 // maxStoredInstantSkew bounds how far the instant the RFC 4791 §9.9 test judges
 // can sit from the denormalized dtstart/dtend the narrowing predicates read.
 //
-// The two resolve the same property against different zones. A column is
-// ical.ParsePropertyDateTimeLocal: a TZID resolves against the host's zone
-// database, and a TZID the host does not know reads as UTC, as a floating value
-// does. The §9.9 evaluator resolves a TZID against the VTIMEZONE the resource
-// ships, which RFC 4791 §4.1 makes authoritative for the TZIDs it uses, and a
-// floating value against the §7.3 zone. A shipped observance offset reaches
-// ±23:59:59 and a host zone reaches ±16:00 once the pre-1900 local-mean-time
-// entries CALDAV:min-date-time admits are in play, so 48 hours covers every
-// pairing of the two.
+// A column is written through ical.ObjectTimes, which reads a TZID as the
+// §9.9 evaluator does, but reads a floating value, and a TZID neither the
+// resource nor the host defines, as UTC where the evaluator reads them in the
+// §7.3 zone. Stored columns may also have been read with every TZID against
+// the host's zone database and one the host does not know as UTC, where the
+// evaluator reads the VTIMEZONE the resource ships, and nothing re-reads them. A shipped observance offset reaches ±23:59:59 and a host zone
+// reaches ±16:00 once the pre-1900 local-mean-time entries
+// CALDAV:min-date-time admits are in play, so 48 hours covers every pairing of
+// the two.
 const maxStoredInstantSkew = 48 * time.Hour
 
 // eventFilterFromTimeRange turns a request time-range into the narrowing the

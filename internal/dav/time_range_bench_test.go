@@ -2,9 +2,11 @@ package dav
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -125,5 +127,65 @@ func BenchmarkCalendarQueryOpenEndedOutlookZone(b *testing.B) {
 		if _, err := applyCalendarFilter(b.Context(), events, filter, reportFloatingZone("", nil)); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// benchCountedSubDailyEvents builds n counted sub-daily series in New York
+// that began years before the queried range: half a minutely rule that ended
+// long ago, half an hourly one still running. With definition set each carries
+// the VTIMEZONE validation stores with an object naming a host zone.
+func benchCountedSubDailyEvents(b *testing.B, n int, definition bool) []store.Event {
+	var timezone []string
+	if definition {
+		text, ok := ical.VTimezone("America/New_York", time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+		if !ok {
+			b.Fatal("no definition of America/New_York")
+		}
+		timezone = strings.Split(strings.TrimSuffix(text, "\r\n"), "\r\n")
+	}
+	events := make([]store.Event, 0, n)
+	for i := 0; i < n; i++ {
+		uid := fmt.Sprintf("counted-%d", i)
+		rrule := "RRULE:FREQ=MINUTELY;COUNT=1000"
+		if i%2 == 1 {
+			rrule = "RRULE:FREQ=HOURLY;COUNT=50000"
+		}
+		lines := append([]string{"VERSION:2.0", "PRODID:-//bench//EN"}, timezone...)
+		lines = append(lines,
+			"BEGIN:VEVENT",
+			"UID:"+uid,
+			"DTSTAMP:20220101T000000Z",
+			fmt.Sprintf("DTSTART;TZID=America/New_York:202203%02dT090000", (i%28)+1),
+			"DURATION:PT30M",
+			rrule,
+			"END:VEVENT",
+		)
+		events = append(events, store.Event{ID: int64(i + 1), UID: uid, ResourceName: uid, RawICAL: wrapCalendar(lines...)})
+	}
+	return events
+}
+
+// BenchmarkCalendarQueryCountedSubDailyZoned is a calendar-query over counted
+// sub-daily series whose DTSTART names a zone with transitions, years before
+// the range: each has to be counted up to the range, past the local times the
+// zone skips, before §9.9 can judge it.
+func BenchmarkCalendarQueryCountedSubDailyZoned(b *testing.B) {
+	filter := &calFilter{CompFilter: compFilter{
+		Name: "VCALENDAR",
+		CompFilter: []compFilter{{
+			Name:      "VEVENT",
+			TimeRange: &timeRange{Start: "20260601T000000Z", End: "20260701T000000Z"},
+		}},
+	}}
+	for name, definition := range map[string]bool{"host zone": false, "shipped definition": true} {
+		b.Run(name, func(b *testing.B) {
+			events := benchCountedSubDailyEvents(b, 50, definition)
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := applyCalendarFilter(b.Context(), events, filter, floatingZone{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

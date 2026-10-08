@@ -145,6 +145,21 @@ func expandedSingleton(m calendarTimeRangeMatcher, root, node *icalNode, r calen
 	}
 	expanded := utcComponent(m, node, noShift)
 	expanded.properties = dropRecurrenceRange(expanded.properties)
+	if node.name == "VEVENT" {
+		if start, ok := m.dateValue(node, "DTSTART", noShift); ok {
+			// An override taking its series' length writes no end of its own,
+			// so it is given the one it occupies, which a client would
+			// otherwise read as RFC 5545 §3.6.1 reads a VEVENT without one.
+			if extent := m.eventEnd(node, start, noShift); extent.InheritsLength {
+				property, _ := firstICalProperty(node, "DTSTART")
+				if end, ok := utcProperty(m, property, durationShift(extent.SeriesLength)); ok {
+					end.name = "DTEND"
+					end.keyPart = end.name + propertyParameterPart(end.keyPart)
+					expanded.properties = append(expanded.properties, end)
+				}
+			}
+		}
+	}
 	return []*icalNode{expanded}
 }
 
@@ -184,8 +199,11 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 
 	expanded := utcComponent(m, content, contentShift)
 	if start, ok := m.dateValue(content, "DTSTART", noShift); ok {
-		delta := instance.duration - m.occurrenceWindow(content, start)
-		if delta != 0 {
+		delta := instance.duration - writtenOccurrenceLength(m, content, start)
+		// An override taking its series' length writes no end of its own, so
+		// the instance is given one, which a client would otherwise read as
+		// RFC 5545 §3.6.1 reads a VEVENT without one.
+		if delta != 0 || m.eventEnd(content, start, noShift).InheritsLength {
 			adjusted := false
 			for i, property := range expanded.properties {
 				switch property.name {
@@ -218,6 +236,23 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 		expanded.properties = append(expanded.properties, id)
 	}
 	return expanded
+}
+
+// endProperties name the property that writes where an occurrence of a
+// component ends.
+var endProperties = map[string]string{"VEVENT": "DTEND", "VTODO": "DUE"}
+
+// writtenOccurrenceLength is how long an occurrence of node lasts as its end is
+// written. It differs from occurrenceWindow where that end is one the window
+// reads past, such as a DATE DTEND equal to its DTSTART, whose occurrence lasts
+// a day; an expanded instance then has its end rewritten to the one it occupies.
+func writtenOccurrenceLength(m calendarTimeRangeMatcher, node *icalNode, dtstart icalTimeValue) time.Duration {
+	if name, ok := endProperties[node.name]; ok {
+		if end, ok := m.dateValue(node, name, noShift); ok {
+			return end.instant.Sub(dtstart.instant)
+		}
+	}
+	return m.occurrenceWindow(node, dtstart)
 }
 
 // instanceShiftFrom re-expresses an occurrence offset so it moves the override's
@@ -547,7 +582,7 @@ func (s *rangeSlots) of(master *icalNode) ([]ical.RecurrenceSlot, bool) {
 	}
 	window := s.m.occurrenceWindow(master, dtstart)
 	slots, err := ical.RecurrenceSlots(s.m.raw, master.name, dtstart.instant, window,
-		s.r.Start, s.r.End, ical.MaxRecurrenceInstances, s.m.resolveContentLine)
+		s.r.Start, s.r.End, ical.MaxRecurrenceInstances, s.m)
 	if err != nil {
 		*s.m.expansionError = err
 		return nil, false
@@ -572,7 +607,7 @@ func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, 
 	}
 	// The original scheduled time occupies one occurrence of the master's
 	// window. A masterless override still names an instant, which is enough to
-	// retain it when that instant falls strictly inside the requested range.
+	// retain it when that instant falls within the requested range.
 	master := m.recurrenceSetMaster(root, override)
 	window := time.Duration(0)
 	if master != nil {
@@ -580,7 +615,7 @@ func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, 
 			window = m.occurrenceWindow(master, dtstart)
 		}
 	}
-	if r.Start.Before(original.instant.Add(window)) && r.End.After(original.instant) {
+	if periodInTimeRange(original.instant, original.instant.Add(window), r.Start, r.End) {
 		return true
 	}
 	if ical.PropertyParamEquals(property.keyPart, "RANGE", "THISANDFUTURE") {
@@ -595,18 +630,14 @@ func overrideImpactsRange(m calendarTimeRangeMatcher, root, override *icalNode, 
 			if slot.ExactOverride || !slot.GoverningRangeRecurrenceID.Equal(original.instant) {
 				continue
 			}
-			if recurrencePeriodIntersects(slot.Original, r.Start, r.End) ||
-				(!slot.Suppressed && recurrencePeriodIntersects(slot.Effective, r.Start, r.End)) {
+			if periodInTimeRange(slot.Original.Start, slot.Original.End, r.Start, r.End) ||
+				(!slot.Suppressed && periodInTimeRange(slot.Effective.Start, slot.Effective.End, r.Start, r.End)) {
 				return true
 			}
 		}
 		return false
 	}
 	return false
-}
-
-func recurrencePeriodIntersects(period ical.BusyPeriod, start, end time.Time) bool {
-	return period.Start.Before(end) && period.End.After(start)
 }
 
 // recurrenceSetMaster is the component an override belongs to: the first

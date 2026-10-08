@@ -1,0 +1,711 @@
+{{define "calendar_events_js"}}
+    // How both calendar views read an event -- from the server's JSON or, failing
+    // that, the iCalendar it carries -- which occurrences a series has, how its
+    // rule is summarized, and how its times fill an edit form. Each view
+    // includes this inside its own script's function scope rather than as a
+    // script of its own, so it adds no globals.
+    // unescapeText comes from safe_html_js.
+
+    // Parse iCalendar data
+    function parseICAL(ical) {
+        var lines = unfoldLines(ical);
+        var components = [];
+        var current = [];
+        var inEvent = false;
+
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line === 'BEGIN:VEVENT') {
+                inEvent = true;
+                current = [];
+                continue;
+            }
+            if (line === 'END:VEVENT') {
+                components.push(current);
+                inEvent = false;
+                continue;
+            }
+            if (inEvent) {
+                current.push(line);
+            }
+        }
+
+        function parseEventLines(evLines) {
+            var event = {
+                attendees: [],
+                attachments: [],
+                reminders: []
+            };
+            var inAlarm = false;
+            evLines.forEach(function(line) {
+                var colonIdx = line.indexOf(':');
+                if (colonIdx === -1) return;
+
+                var key = line.substring(0, colonIdx);
+                var value = line.substring(colonIdx + 1);
+
+                var params = {};
+                var semicolonIdx = key.indexOf(';');
+                if (semicolonIdx !== -1) {
+                    var paramStr = key.substring(semicolonIdx + 1);
+                    key = key.substring(0, semicolonIdx);
+                    paramStr.split(';').forEach(function(p) {
+                        var eq = p.indexOf('=');
+                        if (eq !== -1) {
+                            params[p.substring(0, eq)] = p.substring(eq + 1);
+                        }
+                    });
+                }
+
+                if (key === 'BEGIN' && value === 'VALARM') {
+                    inAlarm = true;
+                    return;
+                }
+                if (key === 'END' && value === 'VALARM') {
+                    inAlarm = false;
+                    return;
+                }
+                if (inAlarm) {
+                    if (key === 'TRIGGER') {
+                        var minutes = parseTriggerMinutes(value);
+                        if (minutes !== null) {
+                            event.reminders.push(minutes);
+                        }
+                    }
+                    return;
+                }
+
+                switch (key) {
+                    case 'UID':
+                        event.uid = value;
+                        break;
+                    case 'SUMMARY':
+                        event.summary = unescapeText(value);
+                        break;
+                    case 'DESCRIPTION':
+                        event.description = unescapeText(value);
+                        break;
+                    case 'RECURRENCE-ID':
+                        event.recurrenceId = parseICALDate(value, params);
+                        event.recurrenceIdAllDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        break;
+                    case 'X-ALT-DESC':
+                        if (params['FMTTYPE'] === 'text/html') {
+                            event.htmlDescription = value;
+                        }
+                        break;
+                    case 'LOCATION':
+                        event.location = unescapeText(value);
+                        break;
+                    case 'DTSTART':
+                        event.dtstart = parseICALDate(value, params);
+                        event.allDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        if (params['TZID']) event.timezone = params['TZID'];
+                        break;
+                    case 'DTEND':
+                        event.dtend = parseICALDate(value, params);
+                        if (!event.timezone && params['TZID']) event.timezone = params['TZID'];
+                        break;
+                    case 'DURATION':
+                        event.duration = value;
+                        break;
+                    case 'RRULE':
+                        event.rrule = value;
+                        event.rruleParsed = parseRRule(value);
+                        break;
+                    case 'EXDATE':
+                        // One EXDATE may list several dates.
+                        event.exdates = (event.exdates || []).concat(value.split(',').map(function(v) {
+                            return parseICALDate(v, params);
+                        }));
+                        break;
+                    case 'STATUS':
+                        event.status = value;
+                        break;
+                    case 'CATEGORIES':
+                        event.categories = value.split(',').map(function(c) { return c.trim(); });
+                        break;
+                    case 'URL':
+                        event.url = value;
+                        break;
+                    case 'CLASS':
+                        event.class = value;
+                        break;
+                    case 'TRANSP':
+                        event.transp = value;
+                        break;
+                    case 'ORGANIZER':
+                        event.organizer = formatEmailValue(value, params);
+                        break;
+                    case 'ATTENDEE':
+                        event.attendees = event.attendees || [];
+                        event.attendees.push(formatEmailValue(value, params));
+                        break;
+                    case 'ATTACH':
+                        event.attachments = event.attachments || [];
+                        event.attachments.push(value);
+                        break;
+                }
+            });
+            return event;
+        }
+
+        var parsedComponents = components.map(parseEventLines);
+        var master = parsedComponents.find(function(c) { return !c.recurrenceId; }) || parsedComponents[0] || {};
+        var overrides = parsedComponents.filter(function(c) { return c.recurrenceId; });
+        overrides.forEach(function(o) {
+            if (!o.uid && master.uid) o.uid = master.uid;
+        });
+        master.overrides = overrides;
+        return master;
+    }
+
+    function unfoldLines(ical) {
+        return ical.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
+    }
+
+
+    function formatEmailValue(value, params) {
+        var email = value || '';
+        if (email.toLowerCase().indexOf('mailto:') === 0) {
+            email = email.substring(7);
+        }
+        if (!email) return '';
+        var name = (params && params['CN'] ? params['CN'] : '').trim();
+        // Clients that have no display name for an attendee often set CN to the
+        // address itself, which would otherwise render it twice.
+        if (!name || name.toLowerCase() === email.toLowerCase()) return email;
+        return name + ' <' + email + '>';
+    }
+
+    function parseTriggerMinutes(value) {
+        if (!value) return null;
+        var sign = 1;
+        if (value[0] === '-') {
+            sign = -1;
+            value = value.substring(1);
+        } else if (value[0] === '+') {
+            value = value.substring(1);
+        }
+        var match = value.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
+        if (!match) return null;
+        var days = parseInt(match[1] || '0', 10);
+        var hours = parseInt(match[2] || '0', 10);
+        var mins = parseInt(match[3] || '0', 10);
+        var secs = parseInt(match[4] || '0', 10);
+        var total = days * 1440 + hours * 60 + mins + Math.round(secs / 60);
+        if (sign >= 0) return null;
+        return total;
+    }
+
+    // Reads an iCalendar DATE or basic-format DATE-TIME (RFC 5545 section
+    // 3.3.4 and 3.3.5). A time ending in Z is UTC and is read as that instant.
+    // A floating or TZID time is wall-clock time, shown in the browser's zone,
+    // and a DATE is local midnight. Anything else is an invalid Date.
+    function parseICALDate(str, params) {
+        var match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z?))?$/.exec(String(str).trim());
+        if (!match) {
+            return new Date(NaN);
+        }
+        var year = parseInt(match[1], 10);
+        var month = parseInt(match[2], 10) - 1;
+        var day = parseInt(match[3], 10);
+        var hour = match[4] ? parseInt(match[4], 10) : 0;
+        var min = match[5] ? parseInt(match[5], 10) : 0;
+        var sec = match[6] ? parseInt(match[6], 10) : 0;
+        if (match[7] === 'Z') {
+            return new Date(Date.UTC(year, month, day, hour, min, sec));
+        }
+        return new Date(year, month, day, hour, min, sec);
+    }
+
+    // The offsets, in milliseconds east of UTC, that the server lists for zone
+    // tzid in event.timezoneOffsets, as a function of the instant: the entry
+    // in force then -- the last one from at or before it -- or, before the
+    // listing begins, the first. Past either end of the listing the nearest
+    // entry stands. Null when the event lists no offsets for tzid.
+    function listedOffsets(event, tzid) {
+        var listings = event.timezoneOffsets;
+        if (!tzid || !listings || !Object.prototype.hasOwnProperty.call(listings, tzid)) return null;
+        var listing = listings[tzid];
+        if (!Array.isArray(listing) || !listing.length) return null;
+        var froms = listing.map(function(entry) { return Date.parse(entry.from); });
+        var offsets = listing.map(function(entry) { return entry.offset * 1000; });
+        return function(time) {
+            var low = 0;
+            var high = froms.length - 1;
+            while (low < high) {
+                var middle = (low + high + 1) >> 1;
+                if (froms[middle] <= time) {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            return offsets[low];
+        };
+    }
+
+    // The offsets, in milliseconds east of UTC, that Intl's zone tzid keeps,
+    // as a function of the instant. Null for no zone and one Intl does not
+    // know.
+    function intlOffsets(tzid) {
+        if (!tzid) return null;
+        var format;
+        try {
+            format = new Intl.DateTimeFormat('en-US', {
+                timeZone: tzid, hourCycle: 'h23',
+                year: 'numeric', month: 'numeric', day: 'numeric',
+                hour: 'numeric', minute: 'numeric', second: 'numeric'
+            });
+        } catch (e) {
+            return null;
+        }
+        return function(time) {
+            var parts = {};
+            format.formatToParts(new Date(time)).forEach(function(part) { parts[part.type] = part.value; });
+            var wall = new Date(0);
+            wall.setUTCFullYear(parseInt(parts.year, 10), parseInt(parts.month, 10) - 1, parseInt(parts.day, 10));
+            wall.setUTCHours(parseInt(parts.hour, 10) % 24, parseInt(parts.minute, 10), parseInt(parts.second, 10), new Date(time).getUTCMilliseconds());
+            return wall.getTime() - time;
+        };
+    }
+
+    // The wall clock of zone tzid as the server reads event's times in it. A
+    // reading is held in a Date's UTC fields. The offsets the server lists
+    // for the zone come first: they are the object's own definition of it,
+    // which the server reads even where Intl knows the name. A zone it lists
+    // none for is Intl's zone of that name, and no zone, or one Intl does not
+    // know, is UTC, as the server reads a TZID its zone database lacks.
+    // place() reads a wall clock as RFC 5545 section 3.3.5 does -- a time the
+    // zone repeats as its first occurrence, a time it skips with the offset
+    // before the gap -- and reports whether it exists, since section 3.3.10
+    // leaves an instance on a skipped time out of a series.
+    function timeZoneClock(event, tzid) {
+        var offsetAt = listedOffsets(event, tzid) || intlOffsets(tzid);
+        if (!offsetAt) {
+            return {
+                wallOf: function(instant) { return new Date(instant); },
+                place: function(wall) { return { instant: new Date(wall), exists: true }; }
+            };
+        }
+        var day = 24 * 60 * 60 * 1000;
+        function wallOf(instant) {
+            return new Date(instant.getTime() + offsetAt(instant.getTime()));
+        }
+        function readsAs(time, offset) {
+            return offsetAt(time - offset) === offset;
+        }
+        // The offset the last reading placed was read with. A series places
+        // readings in ascending order and at least a day apart, so a reading
+        // that exists with it is no later occurrence of a repeated time, and
+        // only a reading next to a transition needs more lookups.
+        var lastOffset = null;
+        function place(wall) {
+            var reading = wall.getTime();
+            if (lastOffset !== null && readsAs(reading, lastOffset)) {
+                return { instant: new Date(reading - lastOffset), exists: true };
+            }
+            // No zone's offset reaches a day, so the offsets a day either
+            // side of the reading are the ones it can be read with.
+            var before = offsetAt(reading - day);
+            var candidates = [before, offsetAt(reading + day), offsetAt(reading - before)];
+            for (var i = 0; i < candidates.length; i++) {
+                if (readsAs(reading, candidates[i])) {
+                    lastOffset = candidates[i];
+                    return { instant: new Date(reading - candidates[i]), exists: true };
+                }
+            }
+            return { instant: new Date(reading - before), exists: false };
+        }
+        return { wallOf: wallOf, place: place };
+    }
+
+    // The latest instant an RRULE's UNTIL lets an occurrence of event start.
+    // A UTC value is that instant. RFC 5545 section 3.3.10 makes a DATE UNTIL
+    // inclusive of its day, which the server ends where the next day begins
+    // in the zone the DTSTART is read in, and reads a floating one, which the
+    // RFC does not allow beside a timed DTSTART, in that zone too. An all-day
+    // event's dates are the browser's local days, so its limit is the end of
+    // the day rruleUntilDay names. The limit gets a zone clock of its own
+    // because place() expects readings in ascending order.
+    function rruleUntilLimit(value, event) {
+        if (event.allDay) {
+            var lastDay = rruleUntilDay(value, event);
+            return new Date(lastDay.getFullYear(), lastDay.getMonth(), lastDay.getDate() + 1, 0, 0, 0, -1);
+        }
+        var text = String(value).trim();
+        var wall = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/.exec(text);
+        if (!wall) return parseICALDate(text, {});
+        var year = parseInt(wall[1], 10), month = parseInt(wall[2], 10) - 1, day = parseInt(wall[3], 10);
+        var zoneClock = recurrenceZoneClock(event);
+        if (!wall[4]) {
+            var nextDay = new Date(Date.UTC(year, month, day + 1));
+            return new Date(zoneClock.place(nextDay).instant.getTime() - 1);
+        }
+        var reading = new Date(Date.UTC(year, month, day, parseInt(wall[4], 10), parseInt(wall[5], 10), parseInt(wall[6], 10)));
+        return zoneClock.place(reading).instant;
+    }
+
+    // The day a series whose RRULE ends at UNTIL value ends on, as local
+    // midnight. A DATE or floating value names its day directly. A UTC value
+    // -- which the server writes for a timed series as the last second of the
+    // picked day in the event's zone -- is read on the clock of the zone the
+    // server reads the event's DTSTART in (timeZoneClock). That holds for an
+    // all-day event too, whose DATEs the server reads as midnight in that
+    // zone.
+    function rruleUntilDay(value, event) {
+        var text = String(value).trim();
+        var until = parseICALDate(text, {});
+        if (isNaN(until.getTime())) return until;
+        if (!/Z$/.test(text)) {
+            return new Date(until.getFullYear(), until.getMonth(), until.getDate());
+        }
+        var wall = timeZoneClock(event, event.timezone).wallOf(until);
+        return new Date(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate());
+    }
+
+    function parseRRule(rrule) {
+        var result = {};
+        rrule.split(';').forEach(function(part) {
+            var eq = part.indexOf('=');
+            if (eq !== -1) {
+                var key = part.substring(0, eq);
+                var value = part.substring(eq + 1);
+                result[key] = value;
+            }
+        });
+        return result;
+    }
+
+    function makeOccurrenceKey(date, allDay) {
+        if (!date) return '';
+        if (allDay) {
+            var y = date.getFullYear();
+            var m = String(date.getMonth() + 1).padStart(2, '0');
+            var d = String(date.getDate()).padStart(2, '0');
+            return y + '-' + m + '-' + d;
+        }
+        return String(date.getTime());
+    }
+
+    // The clock a timed series repeats on: the wall clock of its TZID's zone
+    // as the server reads it (timeZoneClock), wherever the browser is, which
+    // is how CalDAV clients and the server expand it. Null for an all-day
+    // event, which repeats on the browser's own calendar.
+    function recurrenceZoneClock(event) {
+        return event.allDay ? null : timeZoneClock(event, event.timezone);
+    }
+
+    // The calendar a series' cursor steps over: a zone clock's wall clock,
+    // held in UTC fields, or, for an all-day series, the browser's own.
+    function recurrenceCalendar(wallClock) {
+        if (wallClock) {
+            return {
+                weekday: function(d) { return d.getUTCDay(); },
+                monthDay: function(d) { return d.getUTCDate(); },
+                month: function(d) { return d.getUTCMonth(); },
+                addDays: function(d, n) { d.setUTCDate(d.getUTCDate() + n); },
+                addMonths: function(d, n) { d.setUTCMonth(d.getUTCMonth() + n); },
+                addYears: function(d, n) { d.setUTCFullYear(d.getUTCFullYear() + n); }
+            };
+        }
+        return {
+            weekday: function(d) { return d.getDay(); },
+            monthDay: function(d) { return d.getDate(); },
+            month: function(d) { return d.getMonth(); },
+            addDays: function(d, n) { d.setDate(d.getDate() + n); },
+            addMonths: function(d, n) { d.setMonth(d.getMonth() + n); },
+            addYears: function(d, n) { d.setFullYear(d.getFullYear() + n); }
+        };
+    }
+
+    function expandRecurringEvents(events, rangeStart, rangeEnd) {
+        var expanded = [];
+        var maxOccurrences = 500;
+
+        events.forEach(function(event) {
+            var overrides = event.overrides || [];
+            var overrideMap = {};
+            overrides.forEach(function(ov) {
+                if (!ov.recurrenceId) return;
+                var key = makeOccurrenceKey(ov.recurrenceId, ov.recurrenceIdAllDay || ov.allDay || event.allDay);
+                var merged = Object.assign({}, event, ov);
+                merged.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
+                overrideMap[key] = merged;
+            });
+
+            if (!event.rrule) {
+                expanded.push(event);
+                overrides.forEach(function(ov) {
+                    var overrideEv = Object.assign({}, event, ov);
+                    overrideEv.recurrenceId = ov.recurrenceId;
+                    overrideEv.recurrenceIdAllDay = ov.recurrenceIdAllDay || ov.allDay || event.allDay;
+                    expanded.push(overrideEv);
+                });
+                return;
+            }
+
+            var rr = event.rruleParsed;
+            var freq = rr.FREQ;
+            var interval = parseInt(rr.INTERVAL || '1', 10);
+            var count = rr.COUNT ? parseInt(rr.COUNT, 10) : null;
+            var until = rr.UNTIL ? rruleUntilLimit(rr.UNTIL, event) : null;
+            var byDay = rr.BYDAY ? rr.BYDAY.split(',') : null;
+            var byMonthDay = rr.BYMONTHDAY ? rr.BYMONTHDAY.split(',').map(function(d) { return parseInt(d, 10); }) : null;
+            var byMonth = rr.BYMONTH ? rr.BYMONTH.split(',').map(function(m) { return parseInt(m, 10); }) : null;
+
+            var duration = 0;
+            if (event.dtend) {
+                duration = event.dtend.getTime() - event.dtstart.getTime();
+            }
+
+            var exdateSet = {};
+            if (event.exdates) {
+                event.exdates.forEach(function(d) {
+                    exdateSet[makeOccurrenceKey(d, event.allDay)] = true;
+                });
+            }
+
+            var zoneClock = recurrenceZoneClock(event);
+            var calendar = recurrenceCalendar(!!zoneClock);
+            var current = zoneClock ? zoneClock.wallOf(event.dtstart) : new Date(event.dtstart);
+            var firstWall = current.getTime();
+            var occurrences = 0;
+            var effectiveEnd = until || rangeEnd;
+
+            while (occurrences < maxOccurrences) {
+                if (count && occurrences >= count) break;
+                // The DTSTART is the first instance whatever local time it
+                // names (RFC 5545 section 3.8.5.3); a later instance on one the
+                // zone skips is no part of the series and does not count
+                // toward COUNT (section 3.3.10).
+                var start = new Date(current);
+                var exists = true;
+                if (zoneClock && current.getTime() === firstWall) {
+                    start = new Date(event.dtstart);
+                } else if (zoneClock) {
+                    var placed = zoneClock.place(current);
+                    start = placed.instant;
+                    exists = placed.exists;
+                }
+                if (start > effectiveEnd) break;
+
+                var matches = true;
+
+                if (byDay) {
+                    var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+                    var currentDay = dayNames[calendar.weekday(current)];
+                    matches = byDay.some(function(d) { return d.endsWith(currentDay); });
+                }
+
+                if (byMonthDay) {
+                    matches = matches && byMonthDay.indexOf(calendar.monthDay(current)) !== -1;
+                }
+
+                if (byMonth) {
+                    matches = matches && byMonth.indexOf(calendar.month(current) + 1) !== -1;
+                }
+
+                matches = matches && exists;
+
+                // An EXDATE removes an instance from the set COUNT has already
+                // bounded (RFC 5545 section 3.8.5.1), so an excluded one counts.
+                var key = makeOccurrenceKey(start, event.allDay);
+                if (matches && !exdateSet[key] && start >= rangeStart) {
+                    var override = overrideMap[key];
+                    var occurrence;
+                    if (override) {
+                        occurrence = Object.assign({}, override);
+                        occurrence.recurrenceId = override.recurrenceId || new Date(start);
+                        occurrence.recurrenceIdAllDay = override.recurrenceIdAllDay || override.allDay || event.allDay;
+                    } else {
+                        occurrence = Object.assign({}, event);
+                        occurrence.dtstart = new Date(start);
+                        if (event.dtend) {
+                            occurrence.dtend = new Date(start.getTime() + duration);
+                        }
+                        occurrence.recurrenceId = new Date(start);
+                        occurrence.recurrenceIdAllDay = event.allDay;
+                    }
+                    occurrence.isOccurrence = true;
+                    occurrence.seriesEvent = event;
+                    expanded.push(occurrence);
+                }
+
+                if (matches) occurrences++;
+
+                switch (freq) {
+                    case 'DAILY':
+                        calendar.addDays(current, interval);
+                        break;
+                    case 'WEEKLY':
+                        if (byDay) {
+                            var found = false;
+                            for (var attempts = 0; attempts < 7 * interval + 1; attempts++) {
+                                calendar.addDays(current, 1);
+                                var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+                                var d = dayNames[calendar.weekday(current)];
+                                if (byDay.some(function(bd) { return bd.endsWith(d); })) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) break;
+                        } else {
+                            calendar.addDays(current, 7 * interval);
+                        }
+                        break;
+                    case 'MONTHLY':
+                        calendar.addMonths(current, interval);
+                        break;
+                    case 'YEARLY':
+                        calendar.addYears(current, interval);
+                        break;
+                    default:
+                        calendar.addDays(current, 1);
+                }
+            }
+        });
+
+        return expanded;
+    }
+
+    // An all-day value names a date, not an instant: the server parses the DATE
+    // as UTC midnight and sends it as RFC3339, while every reader here takes
+    // local calendar parts off the result. West of UTC that instant lands on the
+    // previous day, so the event rendered -- and saved -- one day early.
+    // Rebuilding it on local midnight is what parseICALDate already does for the
+    // iCal fallback, so both paths land an all-day event on the same day.
+    function parseServerDate(value, allDay) {
+        if (!value) return null;
+        var parsed = new Date(value);
+        if (isNaN(parsed.getTime())) return null;
+        if (!allDay) return parsed;
+        return new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
+    }
+
+    function normalizeServerEvent(raw) {
+        var parsed = Object.assign({}, raw);
+        var allDay = !!raw.allDay;
+        parsed.dtstart = parseServerDate(raw.dtstart, allDay);
+        parsed.dtend = parseServerDate(raw.dtend, allDay);
+        parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);
+        // Passing parseServerDate to map directly would hand it the index as the
+        // all-day flag.
+        parsed.exdates = (raw.exdates || []).map(function(value) {
+            return parseServerDate(value, allDay);
+        }).filter(Boolean);
+        parsed.overrides = (raw.overrides || []).map(normalizeServerEvent);
+        if (!parsed.dtstart && raw.ical) {
+            var fallback = parseICAL(raw.ical);
+            parsed = Object.assign(fallback, parsed);
+            parsed.dtstart = parsed.dtstart || fallback.dtstart;
+            parsed.dtend = parsed.dtend || fallback.dtend;
+            parsed.exdates = parsed.exdates.length ? parsed.exdates : (fallback.exdates || []);
+            parsed.overrides = parsed.overrides.length ? parsed.overrides : (fallback.overrides || []);
+        }
+        return parsed;
+    }
+
+    // A summary of event's RRULE, such as "Weekly on Monday, until 3/2/2026".
+    function formatRRule(event) {
+        var rr = {};
+        event.rrule.split(';').forEach(function(part) {
+            var eq = part.indexOf('=');
+            if (eq !== -1) {
+                rr[part.substring(0, eq)] = part.substring(eq + 1);
+            }
+        });
+
+        var freq = (rr.FREQ || '').toLowerCase();
+        var interval = parseInt(rr.INTERVAL || '1', 10);
+        var result = '';
+
+        if (interval === 1) {
+            switch (freq) {
+                case 'daily': result = 'Daily'; break;
+                case 'weekly': result = 'Weekly'; break;
+                case 'monthly': result = 'Monthly'; break;
+                case 'yearly': result = 'Yearly'; break;
+                default: result = freq.charAt(0).toUpperCase() + freq.slice(1);
+            }
+        } else {
+            switch (freq) {
+                case 'daily': result = 'Every ' + interval + ' days'; break;
+                case 'weekly': result = 'Every ' + interval + ' weeks'; break;
+                case 'monthly': result = 'Every ' + interval + ' months'; break;
+                case 'yearly': result = 'Every ' + interval + ' years'; break;
+                default: result = 'Every ' + interval + ' ' + freq;
+            }
+        }
+
+        if (rr.BYDAY) {
+            var dayMap = {
+                'SU': 'Sunday', 'MO': 'Monday', 'TU': 'Tuesday', 'WE': 'Wednesday',
+                'TH': 'Thursday', 'FR': 'Friday', 'SA': 'Saturday'
+            };
+            var days = rr.BYDAY.split(',').map(function(d) {
+                var match = d.match(/^(-?\d*)(\w{2})$/);
+                if (match) {
+                    var ordinal = match[1];
+                    var day = dayMap[match[2]] || match[2];
+                    if (ordinal === '1') return '1st ' + day;
+                    if (ordinal === '2') return '2nd ' + day;
+                    if (ordinal === '3') return '3rd ' + day;
+                    if (ordinal === '-1') return 'last ' + day;
+                    if (ordinal) return ordinal + 'th ' + day;
+                    return day;
+                }
+                return d;
+            });
+            result += ' on ' + days.join(', ');
+        }
+
+        if (rr.BYMONTHDAY) {
+            result += ' on day ' + rr.BYMONTHDAY;
+        }
+
+        if (rr.BYMONTH) {
+            var monthNames = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                              'July', 'August', 'September', 'October', 'November', 'December'];
+            var months = rr.BYMONTH.split(',').map(function(m) {
+                return monthNames[parseInt(m, 10)] || m;
+            });
+            result += ' in ' + months.join(', ');
+        }
+
+        if (rr.COUNT) {
+            result += ', ' + rr.COUNT + ' times';
+        } else if (rr.UNTIL) {
+            result += ', until ' + rruleUntilDay(rr.UNTIL, event).toLocaleDateString();
+        }
+
+        return result;
+    }
+
+    // date as a datetime-local input value: its reading on clock, a
+    // timeZoneClock, when one is given, and in the browser's zone otherwise.
+    // A clock's reading shows its seconds when they are not zero.
+    function formatDateTimeForInput(date, clock) {
+        function pad(value) { return String(value).padStart(2, '0'); }
+        if (clock) {
+            var wall = clock.wallOf(date);
+            return wall.getUTCFullYear() + '-' + pad(wall.getUTCMonth() + 1) + '-' + pad(wall.getUTCDate()) +
+                'T' + pad(wall.getUTCHours()) + ':' + pad(wall.getUTCMinutes()) +
+                (wall.getUTCSeconds() ? ':' + pad(wall.getUTCSeconds()) : '');
+        }
+        return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+            'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+    }
+
+    // The browser's own zone, which the create forms submit beside the times
+    // they prefill in it.
+    function browserTimeZone() {
+        try {
+            return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        } catch (e) {
+            return '';
+        }
+    }
+{{end}}

@@ -28,10 +28,19 @@ type calendarTopLevelComponent struct {
 	UIDCount        int
 	UIDEmpty        bool
 	HasRecurrenceID bool
+	HasDuration     bool
 	Metadata        store.EventWriteMetadata
 }
 
 func analyzeICalendar(raw string) (calendarAnalysis, error) {
+	lines := ical.UnfoldLines(raw)
+	return analyzeUnfoldedICalendar(raw, lines, ical.NewObjectTimesSharingOnsets(lines, sharedTimezoneOnsets))
+}
+
+// analyzeUnfoldedICalendar is analyzeICalendar for a caller that already
+// unfolded raw into lines, reading its dates through times, the ObjectTimes of
+// those lines.
+func analyzeUnfoldedICalendar(raw string, lines []string, times *ical.ObjectTimes) (calendarAnalysis, error) {
 	analysis := calendarAnalysis{ComponentTypes: make(map[string]struct{})}
 	trimmed := strings.TrimSpace(raw)
 	upperTrimmed := strings.ToUpper(trimmed)
@@ -42,7 +51,6 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 		return analysis, fmt.Errorf("missing END:VCALENDAR")
 	}
 
-	lines := ical.UnfoldLines(raw)
 	var stack []string
 	var current *calendarTopLevelComponent
 	currentAttendees := 0
@@ -116,6 +124,8 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 				}
 			case "RECURRENCE-ID":
 				current.HasRecurrenceID = true
+			case "DURATION":
+				current.HasDuration = true
 			case "RRULE":
 				if recurrenceLimitedComponent(current.Type) {
 					if count, ok := rruleCount(value); ok {
@@ -127,7 +137,7 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 				}
 			}
 			if current.Type == "VEVENT" {
-				applyEventMetadataProperty(&current.Metadata, name, keyPart, value)
+				applyEventMetadataProperty(&current.Metadata, times, name, keyPart, value)
 			}
 		}
 	}
@@ -141,7 +151,7 @@ func analyzeICalendar(raw string) (calendarAnalysis, error) {
 		return analysis, fmt.Errorf("no calendar component found (VEVENT, VTODO, VJOURNAL, or VFREEBUSY required)")
 	}
 	analysis.Metadata = primaryEventMetadata(analysis.Components)
-	applyRecurrenceMetadata(&analysis.Metadata, lines)
+	applyRecurrenceMetadata(&analysis.Metadata, times)
 	return analysis, nil
 }
 
@@ -153,24 +163,29 @@ func recurrenceLimitedComponent(componentType string) bool {
 	return componentType == "VEVENT" || componentType == "VTODO" || componentType == "VJOURNAL"
 }
 
+// primaryEventMetadata is the metadata of the VEVENT the store indexes the
+// object by, its end the one ical.StoredEventEnd stores.
 func primaryEventMetadata(components []calendarTopLevelComponent) store.EventWriteMetadata {
-	var fallback *store.EventWriteMetadata
+	var primary *calendarTopLevelComponent
 	for i := range components {
 		component := &components[i]
 		if component.Type != "VEVENT" {
 			continue
 		}
-		if fallback == nil {
-			fallback = &component.Metadata
+		if primary == nil {
+			primary = component
 		}
 		if !component.HasRecurrenceID {
-			return component.Metadata
+			primary = component
+			break
 		}
 	}
-	if fallback != nil {
-		return *fallback
+	if primary == nil {
+		return store.EventWriteMetadata{}
 	}
-	return store.EventWriteMetadata{}
+	metadata := primary.Metadata
+	metadata.DTEnd = ical.StoredEventEnd(metadata.DTStart, metadata.AllDay, metadata.DTEnd, primary.HasDuration)
+	return metadata
 }
 
 func splitICalendarProperty(line string) (name, keyPart, value string, ok bool) {
@@ -187,18 +202,18 @@ func splitICalendarProperty(line string) (name, keyPart, value string, ok bool) 
 }
 
 func rruleCount(rule string) (int, bool) {
-	for _, part := range strings.Split(rule, ";") {
-		key, value, ok := strings.Cut(part, "=")
-		if !ok || !strings.EqualFold(strings.TrimSpace(key), "COUNT") {
-			continue
-		}
-		count, err := strconv.Atoi(strings.TrimSpace(value))
-		return count, err == nil
+	value, ok := ical.RRuleParam(rule, "COUNT")
+	if !ok {
+		return 0, false
 	}
-	return 0, false
+	count, err := strconv.Atoi(value)
+	return count, err == nil
 }
 
-func applyEventMetadataProperty(metadata *store.EventWriteMetadata, name, keyPart, value string) {
+// applyEventMetadataProperty records one property of a VEVENT in its metadata,
+// reading dates through times so the stored instants are the ones the reports
+// match the event at.
+func applyEventMetadataProperty(metadata *store.EventWriteMetadata, times *ical.ObjectTimes, name, keyPart, value string) {
 	switch name {
 	case "SUMMARY":
 		if metadata.Summary == nil {
@@ -214,7 +229,7 @@ func applyEventMetadataProperty(metadata *store.EventWriteMetadata, name, keyPar
 		}
 	case "DTSTART":
 		if metadata.DTStart == nil {
-			parsed, ok := ical.ParsePropertyDateTimeLocal(keyPart, value)
+			parsed, ok := times.ResolvePropertyTime(keyPart, value)
 			if !ok {
 				return
 			}
@@ -223,7 +238,7 @@ func applyEventMetadataProperty(metadata *store.EventWriteMetadata, name, keyPar
 		}
 	case "DTEND":
 		if metadata.DTEnd == nil {
-			parsed, ok := ical.ParsePropertyDateTimeLocal(keyPart, value)
+			parsed, ok := times.ResolvePropertyTime(keyPart, value)
 			if !ok {
 				return
 			}
@@ -232,8 +247,8 @@ func applyEventMetadataProperty(metadata *store.EventWriteMetadata, name, keyPar
 	}
 }
 
-func applyRecurrenceMetadata(metadata *store.EventWriteMetadata, lines []string) {
-	bounds := ical.ConservativeRecurrenceBoundsFromUnfoldedLines(lines)
+func applyRecurrenceMetadata(metadata *store.EventWriteMetadata, times *ical.ObjectTimes) {
+	bounds := ical.ConservativeRecurrenceBoundsOf(times)
 	if !bounds.Recurring {
 		return
 	}

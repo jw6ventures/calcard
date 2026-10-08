@@ -6,12 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
-	"github.com/jw6ventures/calcard/internal/ical"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -28,11 +26,18 @@ var (
 )
 
 type Service struct {
-	store *store.Store
+	store    *store.Store
+	validate calobject.Validator
 }
 
-func NewService(st *store.Store) *Service {
-	return &Service{store: st}
+// NewService returns a Service that stores calendar data in st once validate
+// accepts it. validate is required: a Service without one would store data a
+// CalDAV client could not have written, so a nil validate panics.
+func NewService(st *store.Store, validate calobject.Validator) *Service {
+	if validate == nil {
+		panic("events: NewService requires a calendar object validator")
+	}
+	return &Service{store: st, validate: validate}
 }
 
 type StructuredRecurrence struct {
@@ -327,10 +332,11 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, false, err
 	}
 
-	body, uid, err := s.normalizeEventPayload(input, "")
+	object, err := s.normalizeEventPayload(input, "", cal)
 	if err != nil {
 		return nil, false, err
 	}
+	uid := object.UID
 	// The UID is also the resource name; both are unique index keys, whose
 	// entries PostgreSQL bounds in size.
 	if len(uid) > store.MaxIdentifierOctets {
@@ -350,7 +356,7 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, false, err
 	}
 
-	event, created, err := s.saveEvent(ctx, calendarID, uid, uid, body, input.IfMatch, input.IfNoneMatch)
+	event, created, err := s.saveEvent(ctx, calendarID, uid, uid, object, input.IfMatch, input.IfNoneMatch)
 	return event, created, err
 }
 
@@ -366,14 +372,6 @@ func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, false, ErrPreconditionFailed
 	}
 
-	body, normalizedUID, err := s.normalizeEventPayload(input, uid)
-	if err != nil {
-		return nil, false, err
-	}
-	if normalizedUID != uid {
-		return nil, false, fmt.Errorf("%w: uid mismatch", ErrBadRequest)
-	}
-
 	resourceName := existing.ResourceName
 	if resourceName == "" {
 		resourceName = uid
@@ -385,7 +383,11 @@ func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID 
 	if err := s.requireCalendarPrivilege(ctx, user, cal, resourceName, "write-content"); err != nil {
 		return nil, false, err
 	}
-	event, created, err := s.saveEvent(ctx, calendarID, uid, resourceName, body, input.IfMatch, input.IfNoneMatch)
+	object, err := s.normalizeEventPayload(input, uid, cal)
+	if err != nil {
+		return nil, false, err
+	}
+	event, created, err := s.saveEvent(ctx, calendarID, uid, resourceName, object, input.IfMatch, input.IfNoneMatch)
 	return event, created, err
 }
 
@@ -668,39 +670,62 @@ func pathExt(resourceName string) string {
 	return resourceName[idx:]
 }
 
-func (s *Service) normalizeEventPayload(input UpsertInput, expectedUID string) (string, string, error) {
-	if strings.TrimSpace(input.RawICS) != "" {
+// normalizeEventPayload builds the calendar object a request describes and puts
+// it through the validator a DAV PUT into cal applies, so the API stores nothing
+// a CalDAV client could not have written. expectedUID, when set, is the UID the
+// request path names.
+func (s *Service) normalizeEventPayload(input UpsertInput, expectedUID string, cal *store.CalendarAccess) (*calobject.Object, error) {
+	var body string
+	switch {
+	case strings.TrimSpace(input.RawICS) != "":
 		if err := validateCalendarContentType(input.ContentType); err != nil {
-			return "", "", err
+			return nil, err
 		}
-		body := strings.TrimSpace(input.RawICS)
-		if err := validateStrictICalendar(body); err != nil {
-			return "", "", err
-		}
-		uid, err := extractUIDFromICalendar(body)
+		body = ensureCRLF(strings.TrimSpace(input.RawICS))
+	case input.Structured != nil:
+		built, _, err := buildStructuredEvent(input.Structured, expectedUID)
 		if err != nil {
-			return "", "", fmt.Errorf("%w: invalid uid", ErrBadRequest)
+			return nil, err
 		}
-		if expectedUID != "" && uid != expectedUID {
-			return "", "", fmt.Errorf("%w: path uid does not match calendar data uid", ErrBadRequest)
-		}
-		return ensureCRLF(body), uid, nil
-	}
-	if input.Structured == nil {
-		return "", "", fmt.Errorf("%w: missing event body", ErrBadRequest)
+		body = built
+	default:
+		return nil, fmt.Errorf("%w: missing event body", ErrBadRequest)
 	}
 
-	body, uid, err := buildStructuredEvent(input.Structured, expectedUID)
+	object, err := s.validate(body, cal)
 	if err != nil {
-		return "", "", err
+		return nil, calendarObjectError(err)
 	}
-	if err := validateStrictICalendar(body); err != nil {
-		return "", "", err
+	if expectedUID != "" && object.UID != expectedUID {
+		return nil, fmt.Errorf("%w: path uid does not match calendar data uid", ErrBadRequest)
 	}
-	return body, uid, nil
+	return object, nil
 }
 
-func (s *Service) saveEvent(ctx context.Context, calendarID int64, uid, resourceName, body, ifMatch, ifNoneMatch string) (*store.Event, bool, error) {
+// calendarObjectError maps a refusal from the CalDAV validator onto this API's
+// errors. A body that is a scheduling message, or that names more than one
+// UID, cannot be the one resource the request writes, which is a conflict;
+// every other refusal is a bad request the caller fixes by sending other data.
+// The message names the RFC 4791 precondition or the reason for the refusal,
+// never the validator's own error text.
+func calendarObjectError(err error) error {
+	var refusal *calobject.Error
+	if !errors.As(err, &refusal) {
+		return err
+	}
+	conditions := strings.Join(refusal.Conditions, ", ")
+	for _, reason := range []error{calobject.ErrSchedulingMessage, calobject.ErrMultipleUIDs} {
+		if errors.Is(refusal, reason) {
+			return fmt.Errorf("%w: %s: %w", ErrConflict, conditions, reason)
+		}
+	}
+	if errors.Is(refusal, calobject.ErrUndefinedTimezone) {
+		return fmt.Errorf("%w: %w", ErrBadRequest, calobject.ErrUndefinedTimezone)
+	}
+	return fmt.Errorf("%w: %s", ErrBadRequest, conditions)
+}
+
+func (s *Service) saveEvent(ctx context.Context, calendarID int64, uid, resourceName string, object *calobject.Object, ifMatch, ifNoneMatch string) (*store.Event, bool, error) {
 	existingByResource, err := s.store.Events.GetByResourceName(ctx, calendarID, resourceName)
 	if err != nil {
 		return nil, false, err
@@ -720,14 +745,15 @@ func (s *Service) saveEvent(ctx context.Context, calendarID int64, uid, resource
 		return nil, false, ErrPreconditionFailed
 	}
 
-	etag := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
+	etag := fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body)))
 	created := existing == nil
 	ev, err := s.store.Events.Upsert(ctx, store.Event{
-		CalendarID:   calendarID,
-		UID:          uid,
-		ResourceName: resourceName,
-		RawICAL:      body,
-		ETag:         etag,
+		CalendarID:    calendarID,
+		UID:           uid,
+		ResourceName:  resourceName,
+		RawICAL:       object.Body,
+		ETag:          etag,
+		WriteMetadata: &object.Metadata,
 	})
 	if err != nil {
 		return nil, false, err
@@ -745,7 +771,7 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	if dtstart == "" || dtend == "" {
 		return "", "", fmt.Errorf("%w: start and end are required", ErrBadRequest)
 	}
-	if err := validateEventDates(dtstart, dtend); err != nil {
+	if err := utils.ValidateEventDates(dtstart, dtend, input.AllDay, utils.EventZoneIn(input.Timezone, nil)); err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
 
@@ -786,7 +812,7 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 		Reminders:    input.Reminders,
 	}
 
-	body := utils.BuildEvent(
+	body, err := utils.BuildEvent(
 		uid,
 		summary,
 		dtstart,
@@ -797,41 +823,10 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 		recurrence,
 		opts,
 	)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %v", ErrBadRequest, err)
+	}
 	return body, uid, nil
-}
-
-func validateEventDates(dtstart, dtend string) error {
-	layouts := []string{
-		"2006-01-02T15:04",
-		"2006-01-02T15:04:05",
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02",
-	}
-
-	var startTime, endTime time.Time
-	var startErr, endErr error
-	for _, layout := range layouts {
-		startTime, startErr = time.Parse(layout, dtstart)
-		if startErr == nil {
-			break
-		}
-	}
-	if startErr != nil {
-		return fmt.Errorf("invalid start date format")
-	}
-	for _, layout := range layouts {
-		endTime, endErr = time.Parse(layout, dtend)
-		if endErr == nil {
-			break
-		}
-	}
-	if endErr != nil {
-		return fmt.Errorf("invalid end date format")
-	}
-	if !endTime.After(startTime) {
-		return fmt.Errorf("end date must be after start date")
-	}
-	return nil
 }
 
 func validateCalendarContentType(contentType string) error {
@@ -862,337 +857,6 @@ func checkConditionalHeaders(ifMatch, ifNoneMatch string, existing *store.Event)
 		return strings.Trim(ifNoneMatch, "\"") != existing.ETag
 	}
 	return true
-}
-
-func validateStrictICalendar(data string) error {
-	if err := validateICalendar(data); err != nil {
-		return fmt.Errorf("%w: invalid calendar data", ErrBadRequest)
-	}
-	componentTypes := extractICalComponentTypes(data)
-	allowedComponents := map[string]struct{}{
-		"VCALENDAR": {},
-		"VEVENT":    {},
-		"VTODO":     {},
-		"VJOURNAL":  {},
-		"VFREEBUSY": {},
-		"VTIMEZONE": {},
-		"STANDARD":  {},
-		"DAYLIGHT":  {},
-		"VALARM":    {},
-	}
-	for comp := range componentTypes {
-		if _, ok := allowedComponents[comp]; !ok {
-			return fmt.Errorf("%w: unsupported calendar component", ErrBadRequest)
-		}
-	}
-	_, hasEvent := componentTypes["VEVENT"]
-	_, hasTodo := componentTypes["VTODO"]
-	_, hasJournal := componentTypes["VJOURNAL"]
-	_, hasFreeBusy := componentTypes["VFREEBUSY"]
-	if !hasEvent && !hasTodo && !hasJournal && !hasFreeBusy {
-		return fmt.Errorf("%w: missing supported calendar component", ErrBadRequest)
-	}
-	// Unfold once and reuse the lines across every line-oriented check below,
-	// instead of re-unfolding for each pass (cost grows with attendees/lines).
-	lines := utils.UnfoldLines(data)
-	if containsICalMethodPropertyLines(lines) {
-		return fmt.Errorf("%w: METHOD property not allowed", ErrConflict)
-	}
-	if conditions := validateCalendarObjectResourceLines(lines); len(conditions) > 0 {
-		if hasMultipleDifferentUIDsLines(lines) {
-			return fmt.Errorf("%w: multiple UIDs in single resource", ErrConflict)
-		}
-		return fmt.Errorf("%w: invalid calendar object resource", ErrBadRequest)
-	}
-	minDate, maxDate := ical.DateLimits()
-	for _, t := range extractICalDateTimesLines(lines) {
-		if t.Before(minDate) || t.After(maxDate) {
-			return fmt.Errorf("%w: date outside supported range", ErrBadRequest)
-		}
-	}
-	if attendeeCount := countICalAttendeesLines(lines); attendeeCount > ical.MaxAttendeesPerInstance {
-		return fmt.Errorf("%w: too many attendees", ErrBadRequest)
-	}
-	if count, ok := extractICalRRULECount(data); ok && count > ical.MaxRecurrenceInstances {
-		return fmt.Errorf("%w: too many recurrence instances", ErrBadRequest)
-	}
-	return nil
-}
-
-func validateICalendar(data string) error {
-	trimmed := strings.TrimSpace(data)
-	if !strings.HasPrefix(strings.ToUpper(trimmed), "BEGIN:VCALENDAR") {
-		return fmt.Errorf("missing BEGIN:VCALENDAR")
-	}
-	if !strings.HasSuffix(strings.ToUpper(trimmed), "END:VCALENDAR") {
-		return fmt.Errorf("missing END:VCALENDAR")
-	}
-	upper := strings.ToUpper(trimmed)
-	beginCount := strings.Count(upper, "BEGIN:VCALENDAR")
-	endCount := strings.Count(upper, "END:VCALENDAR")
-	if beginCount != endCount {
-		return fmt.Errorf("unbalanced VCALENDAR tags")
-	}
-	componentTypes := extractICalComponentTypes(data)
-	if _, ok := componentTypes["VEVENT"]; !ok {
-		if _, ok := componentTypes["VTODO"]; !ok {
-			if _, ok := componentTypes["VJOURNAL"]; !ok {
-				if _, ok := componentTypes["VFREEBUSY"]; !ok {
-					return fmt.Errorf("missing supported calendar component")
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// hasPrefixFold reports whether s starts with prefix, case-insensitively,
-// without allocating an uppercased copy of s (unlike strings.ToUpper). The
-// validation scanners run this per line, so avoiding the allocation matters.
-func hasPrefixFold(s, prefix string) bool {
-	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
-}
-
-func extractICalComponentTypes(icalData string) map[string]struct{} {
-	componentTypes := make(map[string]struct{})
-	lines := strings.Split(icalData, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if hasPrefixFold(line, "BEGIN:") {
-			componentType := strings.ToUpper(strings.TrimSpace(line[6:]))
-			if componentType != "" {
-				componentTypes[componentType] = struct{}{}
-			}
-		}
-	}
-	return componentTypes
-}
-
-func extractICalRRULECount(icalData string) (int, bool) {
-	lines := strings.Split(icalData, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if !hasPrefixFold(line, "RRULE:") {
-			continue
-		}
-		rrule := line[len("RRULE:"):]
-		parts := strings.Split(rrule, ";")
-		for _, part := range parts {
-			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-			if len(kv) != 2 || !strings.EqualFold(kv[0], "COUNT") {
-				continue
-			}
-			count, err := strconv.Atoi(kv[1])
-			if err != nil {
-				return 0, false
-			}
-			return count, true
-		}
-	}
-	return 0, false
-}
-
-func countICalAttendees(icalData string) int {
-	return countICalAttendeesLines(utils.UnfoldLines(icalData))
-}
-
-func countICalAttendeesLines(lines []string) int {
-	count := 0
-	for _, line := range lines {
-		if hasPrefixFold(strings.TrimSpace(line), "ATTENDEE") {
-			count++
-		}
-	}
-	return count
-}
-
-func extractUIDFromICalendar(icalData string) (string, error) {
-	uid := ""
-	for _, componentUIDs := range topLevelComponentUIDs(utils.UnfoldLines(icalData)) {
-		for _, candidate := range componentUIDs {
-			switch {
-			case candidate == "":
-				return "", fmt.Errorf("empty uid")
-			case uid == "":
-				uid = candidate
-			case candidate != uid:
-				return "", fmt.Errorf("multiple uids")
-			}
-		}
-	}
-	if uid == "" {
-		return "", fmt.Errorf("missing uid")
-	}
-	return uid, nil
-}
-
-func validateCalendarObjectResource(icalData string) []string {
-	return validateCalendarObjectResourceLines(utils.UnfoldLines(icalData))
-}
-
-// isComponentBoundary reports whether trimmed is exactly a "<boundary><type>"
-// marker for one of the calendar object components, case-insensitively and
-// without allocating (boundary is "BEGIN:" or "END:").
-func isComponentBoundary(trimmed, boundary string) bool {
-	if !hasPrefixFold(trimmed, boundary) {
-		return false
-	}
-	switch component := trimmed[len(boundary):]; {
-	case strings.EqualFold(component, "VEVENT"),
-		strings.EqualFold(component, "VTODO"),
-		strings.EqualFold(component, "VJOURNAL"),
-		strings.EqualFold(component, "VFREEBUSY"):
-		return true
-	default:
-		return false
-	}
-}
-
-// topLevelComponentUIDs returns, for each VEVENT, VTODO, VJOURNAL, or
-// VFREEBUSY directly inside VCALENDAR, the values of the UID properties set on
-// that component itself. UIDs on nested components do not identify the
-// calendar object resource: RFC 9074 §4 lets a VALARM carry its own UID, and
-// Apple Calendar writes one on every alarm.
-func topLevelComponentUIDs(lines []string) [][]string {
-	var components [][]string
-	depth := 0
-	inComponent := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case hasPrefixFold(trimmed, "BEGIN:"):
-			depth++
-			if depth == 2 {
-				inComponent = isComponentBoundary(trimmed, "BEGIN:")
-				if inComponent {
-					components = append(components, nil)
-				}
-			}
-		case hasPrefixFold(trimmed, "END:"):
-			if depth == 2 {
-				inComponent = false
-			}
-			depth--
-		case inComponent && depth == 2:
-			if uid, ok := uidPropertyValue(trimmed); ok {
-				last := len(components) - 1
-				components[last] = append(components[last], uid)
-			}
-		}
-	}
-	return components
-}
-
-// uidPropertyValue returns the value of a UID content line, which may carry
-// parameters ("UID;X-SOURCE=import:value") whose quoted values hold colons.
-func uidPropertyValue(trimmed string) (string, bool) {
-	if !hasPrefixFold(trimmed, "UID") {
-		return "", false
-	}
-	keyPart, value, ok := ical.SplitContentLine(trimmed)
-	if !ok || !strings.EqualFold(strings.TrimSpace(ical.PropertyName(keyPart)), "UID") {
-		return "", false
-	}
-	return strings.TrimSpace(value), true
-}
-
-func validateCalendarObjectResourceLines(lines []string) []string {
-	var conditions []string
-	seenUIDs := make(map[string]struct{})
-	for _, componentUIDs := range topLevelComponentUIDs(lines) {
-		hasUID := false
-		for _, uid := range componentUIDs {
-			if uid != "" {
-				hasUID = true
-				seenUIDs[uid] = struct{}{}
-			}
-		}
-		if !hasUID {
-			conditions = append(conditions, "valid-calendar-object-resource")
-		}
-	}
-	if len(seenUIDs) > 1 {
-		conditions = append(conditions, "no-uid-conflict")
-	}
-	return conditions
-}
-
-func hasMultipleDifferentUIDs(icalData string) bool {
-	return hasMultipleDifferentUIDsLines(utils.UnfoldLines(icalData))
-}
-
-func hasMultipleDifferentUIDsLines(lines []string) bool {
-	seenUIDs := make(map[string]struct{})
-	for _, componentUIDs := range topLevelComponentUIDs(lines) {
-		for _, uid := range componentUIDs {
-			if uid != "" {
-				seenUIDs[uid] = struct{}{}
-			}
-		}
-	}
-	return len(seenUIDs) > 1
-}
-
-func containsICalMethodProperty(icalData string) bool {
-	return containsICalMethodPropertyLines(utils.UnfoldLines(icalData))
-}
-
-func containsICalMethodPropertyLines(lines []string) bool {
-	for _, line := range lines {
-		if hasPrefixFold(strings.TrimSpace(line), "METHOD:") {
-			return true
-		}
-	}
-	return false
-}
-
-func extractICalDateTimes(ical string) []time.Time {
-	return extractICalDateTimesLines(utils.UnfoldLines(ical))
-}
-
-func extractICalDateTimesLines(lines []string) []time.Time {
-	var values []time.Time
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if !hasPrefixFold(trimmed, "DTSTART") && !hasPrefixFold(trimmed, "DTEND") && !hasPrefixFold(trimmed, "DUE") && !hasPrefixFold(trimmed, "RECURRENCE-ID") {
-			continue
-		}
-		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		value := strings.TrimSpace(parts[1])
-		if value == "" {
-			continue
-		}
-		if t, err := parseICalDateTime(value); err == nil {
-			values = append(values, t)
-		}
-	}
-	return values
-}
-
-func parseICalDateTime(s string) (time.Time, error) {
-	formats := []string{
-		"20060102",
-		"20060102T150405",
-		"20060102T150405Z",
-		"20060102T150405-0700",
-		"20060102T150405-07:00",
-		"2006-01-02T15:04:05",
-		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04:05-0700",
-		"2006-01-02T15:04:05-07:00",
-	}
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t.UTC(), nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
 }
 
 func ensureCRLF(body string) string {

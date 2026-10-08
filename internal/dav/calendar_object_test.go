@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,25 +55,17 @@ func putCalendarObject(t *testing.T, h *DavServer, name, body string) *httptest.
 // well-formed as a nesting of components and invalid as iCalendar.
 func TestRFC4791_ValidCalendarData_EnforcesICalendarGrammar(t *testing.T) {
 	tests := map[string]string{
-		"VCALENDAR without PRODID": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
-			buildVEvent("no-prodid") + "END:VCALENDAR\r\n",
-		"VCALENDAR without VERSION": "BEGIN:VCALENDAR\r\nPRODID:" + testProdID + "\r\n" +
-			buildVEvent("no-version") + "END:VCALENDAR\r\n",
 		"VCALENDAR at another version": "BEGIN:VCALENDAR\r\nVERSION:1.0\r\nPRODID:" + testProdID + "\r\n" +
 			buildVEvent("old-version") + "END:VCALENDAR\r\n",
 		"non-Gregorian CALSCALE": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + testProdID +
 			"\r\nCALSCALE:JULIAN\r\n" + buildVEvent("calscale") + "END:VCALENDAR\r\n",
-		"VEVENT without DTSTAMP": buildCalendarObject(buildComponent("VEVENT",
-			"UID:no-dtstamp", "DTSTART:"+testDTStart)),
 		"VEVENT without DTSTART in a METHOD-less object": buildCalendarObject(buildComponent("VEVENT",
 			"UID:no-dtstart", "DTSTAMP:"+testDTStamp)),
-		"repeated SUMMARY": buildCalendarObject(buildVEvent("twice",
-			"SUMMARY:One", "SUMMARY:Two")),
 		"DTEND alongside DURATION": buildCalendarObject(buildVEvent("both",
 			"DTEND:20240601T110000Z", "DURATION:PT1H")),
 		"VEVENT date types do not match": buildCalendarObject(buildVEvent("event-types",
 			"DTSTART;VALUE=DATE:20240601", "DTEND:20240601T110000Z")),
-		"VEVENT DTEND is not later than DTSTART": buildCalendarObject(buildVEvent("event-order",
+		"VEVENT DTEND is earlier than DTSTART": buildCalendarObject(buildVEvent("event-order",
 			"DTSTART:20240601T110000Z", "DTEND:20240601T100000Z")),
 		"malformed DURATION": buildCalendarObject(buildVEvent("bad-duration",
 			"DURATION:not-a-duration")),
@@ -89,12 +83,10 @@ func TestRFC4791_ValidCalendarData_EnforcesICalendarGrammar(t *testing.T) {
 			"DURATION:PT1H")),
 		"VTODO date types do not match": buildCalendarObject(buildVTodo("todo-types",
 			"DTSTART;VALUE=DATE:20240601", "DUE:20240601T110000Z")),
-		"VTODO DUE is not later than DTSTART": buildCalendarObject(buildVTodo("todo-order",
+		"VTODO DUE is earlier than DTSTART": buildCalendarObject(buildVTodo("todo-order",
 			"DTSTART:20240601T110000Z", "DUE:20240601T100000Z")),
 		"VALARM without ACTION": buildCalendarObject(buildVEvent("alarm",
 			buildComponent("VALARM", "TRIGGER:-PT15M"))),
-		"DISPLAY VALARM without DESCRIPTION": buildCalendarObject(buildVEvent("display-alarm",
-			buildComponent("VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M"))),
 		"VALARM REPEAT without DURATION": buildCalendarObject(buildVEvent("repeat-alarm",
 			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm",
 				"TRIGGER:-PT15M", "REPEAT:2"))),
@@ -124,17 +116,6 @@ func TestRFC4791_ValidCalendarData_EnforcesICalendarGrammar(t *testing.T) {
 			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M"))),
 		"content line with no value delimiter": buildCalendarObject(buildComponent("VEVENT",
 			"UID:no-colon", "DTSTAMP:"+testDTStamp, "DTSTART:"+testDTStart, "SUMMARY")),
-		"parameter with no value": buildCalendarObject(buildComponent("VEVENT",
-			"UID:bare-param", "DTSTAMP:"+testDTStamp, "DTSTART;TZID:"+testDTStart)),
-		"VEVENT property after VALARM": buildCalendarObject(buildComponent("VEVENT",
-			"UID:late-event-property", "DTSTAMP:"+testDTStamp, "DTSTART:"+testDTStart,
-			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M"),
-			"SUMMARY:Too late")),
-		"VTIMEZONE property after observance": buildCalendarObject(
-			buildComponent("VTIMEZONE",
-				buildComponent("STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:+0000", "TZOFFSETTO:+0000"),
-				"TZID:Example/Late"),
-			buildVEvent("late-timezone-property")),
 		"VTIMEZONE without an observance": buildCalendarObject(
 			buildComponent("VTIMEZONE", "TZID:Example/Zone"),
 			buildVEvent("no-observance")),
@@ -245,18 +226,28 @@ func TestSubmittedVTimezoneResolverAppliesRecurringObservances(t *testing.T) {
 		{wall: time.Date(2024, 7, 15, 10, 0, 0, 0, time.UTC), want: -4 * time.Hour},
 	}
 	for _, tt := range tests {
-		got, ok := submittedTimezoneOffset(root, "Example/Eastern", tt.wall)
+		got, ok := submittedOffset(root, "Example/Eastern", tt.wall)
 		if !ok || got != tt.want {
-			t.Errorf("submittedTimezoneOffset(%s) = %s, %t; want %s", tt.wall, got, ok, tt.want)
+			t.Errorf("submittedOffset(%s) = %s, %t; want %s", tt.wall, got, ok, tt.want)
 		}
 	}
+}
+
+// submittedOffset is the offset the definition the object ships for tzid reads
+// wall with.
+func submittedOffset(root *icalNode, tzid string, wall time.Time) (time.Duration, bool) {
+	observances, ok := submittedTimezoneObservances(root, tzid)
+	if !ok {
+		return 0, false
+	}
+	return observanceOffsetAtWall(observances, wall)
 }
 
 // An observance rule describing more candidate starts than the server will
 // generate leaves the resolver unable to say which observance is in force. The
 // offset reachable from a half-generated period is the wrong one and reads
-// exactly like the right one, so the object is refused rather than stored
-// against it.
+// exactly like the right one, so for a zone the host does not define either the
+// object is refused rather than stored against it.
 func TestSubmittedVTimezoneObservanceTooLargeToResolveIsRefused(t *testing.T) {
 	enumerate := func(n int) string {
 		parts := make([]string, n)
@@ -290,7 +281,7 @@ func TestSubmittedVTimezoneObservanceTooLargeToResolveIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse calendar: %v", err)
 	}
-	if _, ok := submittedTimezoneOffset(root, "Example/Dense", time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)); ok {
+	if _, ok := submittedOffset(root, "Example/Dense", time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)); ok {
 		t.Fatal("an observance the server cannot resolve still produced an offset")
 	}
 	if fault := validateCalendarObject(root); fault == nil {
@@ -315,7 +306,6 @@ func TestRFC4791_ValidCalendarData_RejectsIllFormedDateValues(t *testing.T) {
 		"numeric offset on DTSTART":         "DTSTART:20240601T100000-0700",
 		"colon offset on DTSTART":           "DTSTART:20240601T100000-07:00",
 		"extended format on DTSTART":        "DTSTART:2024-06-01T10:00:00Z",
-		"bare DATE without VALUE=DATE":      "DTSTART:20240601",
 		"VALUE=DATE with a time":            "DTSTART;VALUE=DATE:20240601T100000Z",
 		"unknown VALUE on DTSTART":          "DTSTART;VALUE=BOGUS:20240601T100000Z",
 		"VALUE=DATE on UTC-only DTSTAMP":    "DTSTAMP;VALUE=DATE:20240601T000000Z",
@@ -366,6 +356,83 @@ func TestRFC4791_DateLimitsIncludeExplicitlyTypedExtensionProperties(t *testing.
 	assertErrorConditions(t, rr, http.StatusForbidden, calQN("min-date-time"))
 	if len(eventRepo.events) != 0 {
 		t.Fatalf("extension date before min-date-time was stored: %#v", eventRepo.events)
+	}
+}
+
+// fixedOffsetVTimezone defines tzid as a zone at one constant UTC offset.
+func fixedOffsetVTimezone(tzid, offset string) string {
+	return buildComponent("VTIMEZONE", "TZID:"+tzid,
+		buildComponent("STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:"+offset, "TZOFFSETTO:"+offset))
+}
+
+// RFC 5545 §3.3.10 makes UNTIL inclusive, and a DATE UNTIL on a timed series
+// names the day the series runs through in DTSTART's zone. The date limits
+// admit that day when any instant of it lies within them, as they admit a DATE
+// value on its date: neither a zone west of UTC pushing its last second past
+// CALDAV:max-date-time, nor one east of UTC pulling its first before
+// CALDAV:min-date-time, refuses a date inside the limits. A DATE series and a
+// timed UNTIL are read as written.
+func TestRecurrenceUntilDateOnATimedSeriesIsBoundedAsItsDay(t *testing.T) {
+	requireHostZones(t, "America/New_York", "Asia/Tokyo")
+	tests := []struct {
+		name      string
+		timezones string
+		dtstart   string
+		until     string
+		refusal   string
+	}{
+		{"last day, west of UTC", "", "DTSTART;TZID=America/New_York:20250101T100000", "21001231", ""},
+		{"day after the last, west of UTC", "", "DTSTART;TZID=America/New_York:20250101T100000", "21010101", "max-date-time"},
+		{"last day, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:20250101T100000", "21001231", ""},
+		{"last day, UTC series", "", "DTSTART:20250101T100000Z", "21001231", ""},
+		{"last day, floating series", "", "DTSTART:20250101T100000", "21001231", ""},
+		{"first day, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:19000101T100000", "19000101", ""},
+		{"day before the first, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:19000101T100000", "18991231", "min-date-time"},
+		{"last day, DATE series", "", "DTSTART;VALUE=DATE:20250101", "21001231", ""},
+		{"day after the last, DATE series", "", "DTSTART;VALUE=DATE:20250101", "21010101", "max-date-time"},
+		{"timed UNTIL at the limit", fixedOffsetVTimezone("Custom/Minus5", "-0500"),
+			"DTSTART;TZID=Custom/Minus5:20250101T090000", "21001231T235959Z", ""},
+		{"timed UNTIL past the limit", fixedOffsetVTimezone("Custom/Minus5", "-0500"),
+			"DTSTART;TZID=Custom/Minus5:20250101T090000", "21010101T000000Z", "max-date-time"},
+	}
+	// A daily series through the last day is refused for its instances, which
+	// outnumber CALDAV:max-instances, not for its UNTIL.
+	daily := buildCalendarObject(buildComponent("VEVENT", "UID:e",
+		"DTSTART;TZID=America/New_York:20250101T100000", "RRULE:FREQ=DAILY;UNTIL=21001231"))
+	if _, fault := validateCalendarObjectForStorage(daily, nil); fault == nil || !reflect.DeepEqual(fault.conditions, []string{"max-instances"}) {
+		t.Errorf("daily series through 2100 refused with %+v, want max-instances", fault)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := buildCalendarObject(tt.timezones,
+				buildComponent("VEVENT", "UID:e", tt.dtstart, "RRULE:FREQ=YEARLY;UNTIL="+tt.until))
+			_, fault := validateCalendarObjectForStorage(raw, nil)
+			switch {
+			case tt.refusal == "" && fault != nil:
+				t.Fatalf("refused: %+v", fault)
+			case tt.refusal != "" && (fault == nil || !reflect.DeepEqual(fault.conditions, []string{tt.refusal})):
+				t.Fatalf("fault = %+v, want %s", fault, tt.refusal)
+			}
+		})
+	}
+}
+
+// A series that starts at min-date-time and runs through the day it starts on
+// ends inside the limits, however far west of UTC that day falls.
+func TestRFC4791_DateLimitsReadADateUntilThroughItsWholeDay(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(fixedOffsetVTimezone("Custom/Minus12", "-1200"),
+		buildVEvent("until-min-day",
+			"DTSTART;TZID=Custom/Minus12:18991231T120000",
+			"RRULE:FREQ=HOURLY;UNTIL=18991231"))
+
+	rr := putCalendarObject(t, h, "until-min-day.ics", body)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(eventRepo.events) != 1 {
+		t.Fatalf("stored %d objects, want 1", len(eventRepo.events))
 	}
 }
 
@@ -554,6 +621,8 @@ func TestRFC4791_ValidCalendarObject_RecurrenceSetShapes(t *testing.T) {
 		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
 	})
 
+	// RFC 5545 §3.3.5 reads 11:30, which the 11:00 transition skips, with the
+	// offset before the gap, so it names 11:30Z, as 12:30 after the gap does.
 	t.Run("equivalent recurrence instants are duplicate overrides", func(t *testing.T) {
 		h, _ := writableCalendarServer()
 		body := buildCalendarObject(
@@ -562,9 +631,9 @@ func TestRFC4791_ValidCalendarObject_RecurrenceSetShapes(t *testing.T) {
 				buildComponent("DAYLIGHT",
 					"DTSTART:20240601T110000", "TZOFFSETFROM:+0000", "TZOFFSETTO:+0100")),
 			buildVEvent("normalized-clash",
-				"RECURRENCE-ID;TZID=Example/Forward:20240601T100000", "DTSTART:20240601T120000Z"),
+				"RECURRENCE-ID;TZID=Example/Forward:20240601T113000", "DTSTART:20240601T120000Z"),
 			buildVEvent("normalized-clash",
-				"RECURRENCE-ID;TZID=Example/Forward:20240601T110000", "DTSTART:20240601T130000Z"))
+				"RECURRENCE-ID;TZID=Example/Forward:20240601T123000", "DTSTART:20240601T130000Z"))
 
 		rr := putCalendarObject(t, h, "normalized-clash.ics", body)
 
@@ -788,4 +857,36 @@ func TestRFC4791_ServerAuthoredNonStandardPropertiesCarryVendorID(t *testing.T) 
 			}
 		}
 	})
+}
+
+// A parsed tree is read by whichever goroutine judges it: the definitions its
+// VTIMEZONEs give are read once, and safely, however many read it at once.
+func TestParsedTreeIsSafeForConcurrentReaders(t *testing.T) {
+	root, err := parseICalendarObject(outlookEasternEvent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wall := time.Date(2024, 3, 4, 9, 0, 0, 0, time.UTC)
+	var wg sync.WaitGroup
+	offsets := make([]time.Duration, 8)
+	for worker := range offsets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				observances, ok := submittedTimezoneObservances(root, "Eastern Standard Time")
+				if !ok {
+					t.Error("the object's definition was not read")
+					return
+				}
+				offsets[worker], _ = observanceOffsetAtWall(observances, wall)
+			}
+		}()
+	}
+	wg.Wait()
+	for worker, offset := range offsets {
+		if offset != -5*time.Hour {
+			t.Errorf("reader %d read offset %v, want -5h", worker, offset)
+		}
+	}
 }

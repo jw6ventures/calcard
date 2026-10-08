@@ -1116,6 +1116,159 @@ func TestPostgres_UpgradeRepairsFoldedRecurrenceBounds(t *testing.T) {
 	}
 }
 
+// A stored recurrence_until may be the end of the series' last instance as an
+// expansion that ignores skipped local times and date UNTILs reads it. Two
+// series end later under RFC 5545 than that:
+// a DAILY or WEEKLY COUNT series in a zone whose transitions skip some of its
+// local times, which leave those instances out uncounted (§3.3.10) and so push
+// the COUNT-th instance a step later per skipped one, and a timed series whose
+// UNTIL is a date, which includes that whole day. The migration reopens those
+// bounds, or the time-range filter drops the instances past them, and leaves
+// every bound both readings agree on alone.
+func TestPostgres_V120MigrationReopensBoundsTheSeriesOutlast(t *testing.T) {
+	t.Run("database collation", func(t *testing.T) {
+		testV120MigrationReopensBoundsTheSeriesOutlast(t, "")
+	})
+	t.Run("C collation", func(t *testing.T) {
+		testV120MigrationReopensBoundsTheSeriesOutlast(t, "C")
+	})
+}
+
+func testV120MigrationReopensBoundsTheSeriesOutlast(t *testing.T, collation string) {
+	pool := newV119ReleasePool(t)
+	if collation != "" {
+		if _, err := pool.Exec(fmt.Sprintf(`ALTER TABLE events ALTER COLUMN raw_ical TYPE TEXT COLLATE %q`, collation)); err != nil {
+			t.Fatalf("set raw_ical collation: %v", err)
+		}
+	}
+	// Stored bounds exist only where the columns do, as on a schema that
+	// carries them.
+	if _, err := pool.Exec(`ALTER TABLE events ADD COLUMN recurrence_start TIMESTAMPTZ, ADD COLUMN recurrence_until TIMESTAMPTZ`); err != nil {
+		t.Fatalf("add recurrence bounds: %v", err)
+	}
+	calendarID := seedRepairCalendar(t, pool, "subject-outlast-"+collation)
+
+	const newYork = "BEGIN:VTIMEZONE\r\nTZID:America/New_York\r\n" +
+		"BEGIN:DAYLIGHT\r\nDTSTART:20070311T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:20071104T020000\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\n" +
+		"END:VTIMEZONE\r\n"
+	body := func(uid, timezone, properties string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + timezone +
+			"BEGIN:VEVENT\r\nUID:" + uid + "\r\n" + properties + "END:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	finiteStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	finiteUntil := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		uid     string
+		raw     string
+		bounded bool
+		reopen  bool
+	}{
+		{uid: "count-weekly-tzid", bounded: true, reopen: true, raw: body("count-weekly-tzid", newYork,
+			"DTSTART;TZID=America/New_York:20260301T023000\r\nDTEND;TZID=America/New_York:20260301T033000\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n")},
+		{uid: "count-daily-tzid", bounded: true, reopen: true, raw: body("count-daily-tzid", newYork,
+			"DTSTART;TZID=America/New_York:20260301T023000\r\nRRULE:FREQ=DAILY;INTERVAL=2;COUNT=30\r\n")},
+		// Folds inside the property names, the TZID parameter and the rule.
+		{uid: "count-weekly-tzid-folded", bounded: true, reopen: true, raw: body("count-weekly-tzid-folded", newYork,
+			"DTST\r\n ART;TZ\r\n\tID=America/New_York:20260301T023000\r\nRRU\r\n LE:FREQ=WEE\r\n KLY;CO\r\n UNT=10\r\n")},
+		// Lowercase names and values, the parts in another order, and a quoted
+		// TZID after a quoted parameter holding a colon and a semicolon.
+		{uid: "count-weekly-tzid-lower-quoted", bounded: true, reopen: true, raw: body("count-weekly-tzid-lower-quoted", newYork,
+			"dtstart;x-label=\"a:b;c\";tzid=\"America/New_York\":20260301T023000\r\nrrule:count=10;freq=weekly\r\n")},
+		// Text outside ASCII ahead of the TZID and of the rule parts.
+		{uid: "count-weekly-tzid-non-ascii", bounded: true, reopen: true, raw: body("count-weekly-tzid-non-ascii", newYork,
+			"SUMMARY:Café 😀\r\nDTSTART;X-LABEL=Zürich;TZID=America/New_York:20260301T023000\r\nRRULE;X-NOTE=Été:FREQ=WEEKLY;COUNT=10\r\n")},
+		// A date UNTIL on a timed series, zoned or UTC.
+		{uid: "date-until-tzid", bounded: true, reopen: true, raw: body("date-until-tzid", newYork,
+			"DTSTART;TZID=America/New_York:20260301T100000\r\nRRULE:FREQ=WEEKLY;UNTIL=20260503\r\n")},
+		{uid: "date-until-utc", bounded: true, reopen: true, raw: body("date-until-utc", "",
+			"DTSTART:20260301T100000Z\r\nRRULE:FREQ=MONTHLY;UNTIL=20260501;BYMONTHDAY=1\r\n")},
+
+		// No zone can skip a UTC or floating time.
+		{uid: "count-weekly-utc", bounded: true, raw: body("count-weekly-utc", "",
+			"DTSTART:20260301T073000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n")},
+		{uid: "count-weekly-floating", bounded: true, raw: body("count-weekly-floating", "",
+			"DTSTART:20260301T023000\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n")},
+		// A skipped instance only removes an instance from a series UNTIL ends.
+		{uid: "until-tzid", bounded: true, raw: body("until-tzid", newYork,
+			"DTSTART;TZID=America/New_York:20260301T023000\r\nRRULE:FREQ=WEEKLY;UNTIL=20260503T063000Z\r\n")},
+		// A date UNTIL on an all-day series, beside a VTIMEZONE whose
+		// observances start at a time of day.
+		{uid: "date-until-all-day", bounded: true, raw: body("date-until-all-day", newYork,
+			"DTSTART;VALUE=DATE:20260301\r\nRRULE:FREQ=WEEKLY;UNTIL=20260503\r\n")},
+		{uid: "plain", raw: body("plain", newYork,
+			"DTSTART;TZID=America/New_York:20260301T100000\r\nDTEND;TZID=America/New_York:20260301T110000\r\n")},
+	}
+	for _, test := range cases {
+		var start, until any
+		if test.bounded {
+			start, until = finiteStart, finiteUntil
+		}
+		if _, err := pool.Exec(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified, recurrence_start, recurrence_until)
+VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-03-01T07:30:00Z', '2026-03-01T08:30:00Z', FALSE, NOW(), $4, $5)`,
+			calendarID, test.uid, test.raw, start, until); err != nil {
+			t.Fatalf("seed %s: %v", test.uid, err)
+		}
+	}
+
+	// The second run is the by-hand application to a database already stamped
+	// v1.2.0, which must leave what the first run wrote as it is.
+	for run := 1; run <= 2; run++ {
+		applyV120Migration(t, pool)
+
+		for _, test := range cases {
+			var start, until *time.Time
+			if err := pool.QueryRow(`SELECT recurrence_start, recurrence_until FROM events WHERE uid = $1`, test.uid).
+				Scan(&start, &until); err != nil {
+				t.Fatalf("run %d: read %s bounds: %v", run, test.uid, err)
+			}
+			switch {
+			case !test.bounded:
+				if start != nil || until != nil {
+					t.Errorf("run %d: %s bounds = %v, %v, want NULL for a resource that does not recur", run, test.uid, start, until)
+				}
+			case test.reopen:
+				if until == nil || !until.UTC().Equal(icalpkg.RecurrenceUntilSentinel) {
+					t.Errorf("run %d: %s recurrence_until = %v, want the open-ended %s", run, test.uid, until, icalpkg.RecurrenceUntilSentinel)
+				}
+				if start == nil || !start.UTC().Equal(finiteStart) {
+					t.Errorf("run %d: %s recurrence_start = %v, want %s kept", run, test.uid, start, finiteStart)
+				}
+			default:
+				if start == nil || until == nil || !start.UTC().Equal(finiteStart) || !until.UTC().Equal(finiteUntil) {
+					t.Errorf("run %d: %s bounds = %v, %v, want %s, %s kept", run, test.uid, start, until, finiteStart, finiteUntil)
+				}
+			}
+		}
+	}
+
+	// The statement reads every row of events under ACCESS EXCLUSIVE, so a body
+	// whose row holds no finite bound must not be unfolded at all.
+	finite := 0
+	for _, test := range cases {
+		if test.bounded && !test.reopen {
+			finite++
+		}
+	}
+	unfolds := 0
+	walkPlan(explainStatement(t, pool, migrationStatement(t, "UPDATE events\n    SET recurrence_until"), true), func(node map[string]any) {
+		call, _ := node["Function Call"].(string)
+		if node["Node Type"] != "Function Scan" || !strings.HasPrefix(call, "regexp_replace(") {
+			return
+		}
+		loops, _ := node["Actual Loops"].(float64)
+		unfolds++
+		if int(loops) != finite {
+			t.Errorf("%s ran %v times, want once per row holding a finite bound (%d)", call, loops, finite)
+		}
+	})
+	if unfolds != 1 {
+		t.Errorf("the plan unfolds each body %d times, want once", unfolds)
+	}
+}
+
 // v120IndexDefinitions reads the definitions of the indexes this migration
 // builds or drops, keyed by name, with the schema qualifier removed so an
 // upgraded database and a fresh one compare directly.
@@ -1492,4 +1645,139 @@ func TestPostgres_V120MigrationParsesEachBirthdayOnce(t *testing.T) {
 			t.Errorf("the birthday backfill plan evaluates %s %d times, want once", call, evaluations)
 		}
 	}
+}
+
+// A stored dtend may be a DTEND as written, even one that cannot end the
+// event, which the reports read as though it were not there, or none for an
+// event without a DTEND. A dtend before dtstart drops the row from the
+// time-range narrowing before the RFC 4791 §9.9 test can match it, and a
+// missing one keeps the row a candidate for every range. The migration stores
+// the end a write of the same body stores (icalpkg.StoredEventEnd): a
+// day after an all-day start, the timed start itself, and none where a
+// DURATION decides the end. A row whose body carries a DTEND its dtend does not
+// hold keeps none. Every other row keeps its dtend, and a second run changes
+// nothing.
+func TestPostgres_V120MigrationStoresTheEndAnUnusableDTENDLeaves(t *testing.T) {
+	pool := newV119ReleasePool(t)
+	calendarID := seedRepairCalendar(t, pool, "subject-unusable-dtend")
+	at := func(value string) time.Time {
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	body := func(uid, properties string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\n" + properties + "END:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	cases := []struct {
+		uid            string
+		properties     string
+		allDay         bool
+		dtstart, dtend *time.Time
+		want           *time.Time
+	}{
+		{uid: "timed-before", properties: "DTSTART:20250301T100000Z\r\nDTEND:20250301T080000Z\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), dtend: ptr(at("2025-03-01T08:00:00Z")), want: ptr(at("2025-03-01T10:00:00Z"))},
+		{uid: "date-equal", properties: "DTSTART;VALUE=DATE:20250301\r\nDTEND;VALUE=DATE:20250301\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), dtend: ptr(at("2025-03-01T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+		{uid: "date-before", properties: "DTSTART:20250301\r\nDTEND:20250226\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), dtend: ptr(at("2025-02-26T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+		// A folded DURATION decides the end, so none is stored.
+		{uid: "timed-before-duration", properties: "DTSTART:20250301T100000Z\r\nDTEND:20250301T080000Z\r\nDURA\r\n TION:PT3H\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), dtend: ptr(at("2025-03-01T08:00:00Z"))},
+		{uid: "recurring-date-equal", properties: "DTSTART;VALUE=DATE:20250301\r\nDTEND;VALUE=DATE:20250301\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), dtend: ptr(at("2025-03-01T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+		// No DTEND at all leaves the same end, stored as none.
+		{uid: "no-dtend", properties: "DTSTART:20250301T100000Z\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), want: ptr(at("2025-03-01T10:00:00Z"))},
+		{uid: "date-no-dtend", properties: "DTSTART;VALUE=DATE:20250301\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+		{uid: "recurring-date-no-dtend", properties: "DTSTART;VALUE=DATE:20250301\r\nRRULE:FREQ=WEEKLY\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+
+		// Rows a write stores as they are.
+		{uid: "timed", properties: "DTSTART:20250301T100000Z\r\nDTEND:20250301T110000Z\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), dtend: ptr(at("2025-03-01T11:00:00Z")), want: ptr(at("2025-03-01T11:00:00Z"))},
+		{uid: "timed-equal", properties: "DTSTART:20250301T100000Z\r\nDTEND:20250301T100000Z\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), dtend: ptr(at("2025-03-01T10:00:00Z")), want: ptr(at("2025-03-01T10:00:00Z"))},
+		{uid: "date", properties: "DTSTART;VALUE=DATE:20250301\r\nDTEND;VALUE=DATE:20250302\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z")), dtend: ptr(at("2025-03-02T00:00:00Z")), want: ptr(at("2025-03-02T00:00:00Z"))},
+		{uid: "duration", properties: "DTSTART:20250301T100000Z\r\nDURATION:PT1H\r\n", dtstart: ptr(at("2025-03-01T10:00:00Z"))},
+		{uid: "date-duration", properties: "DTSTART;VALUE=DATE:20250301\r\nDURA\r\n TION:P2D\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z"))},
+		// A DTEND whose dtend is missing was not read when the row was
+		// stored, so the row keeps no bound, and the §9.9 test, which can
+		// read it, decides.
+		{uid: "unread-dtend", properties: "DTSTART:20250301T100000Z\r\nDTEND;TZID=\"(UTC-05:00) Eastern\":20250301T080000\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z"))},
+		{uid: "folded-unread-dtend", properties: "DTSTART;VALUE=DATE:20250301\r\nDT\r\n END;VALUE=DATE:2025-03-03\r\n", allDay: true,
+			dtstart: ptr(at("2025-03-01T00:00:00Z"))},
+		{uid: "recurring", properties: "DTSTART:20250301T100000Z\r\nDTEND:20250301T110000Z\r\nRRULE:FREQ=DAILY\r\n",
+			dtstart: ptr(at("2025-03-01T10:00:00Z")), dtend: ptr(at("2025-03-01T11:00:00Z")), want: ptr(at("2025-03-01T11:00:00Z"))},
+		{uid: "no-dtstart", properties: "DTEND:20250301T080000Z\r\n", dtend: ptr(at("2025-03-01T08:00:00Z")), want: ptr(at("2025-03-01T08:00:00Z"))},
+	}
+	for _, test := range cases {
+		if _, err := pool.Exec(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified)
+VALUES ($1, $2, $2 || '.ics', $3, 'etag', $4, $5, $6, NOW())`,
+			calendarID, test.uid, body(test.uid, test.properties), test.dtstart, test.dtend, test.allDay); err != nil {
+			t.Fatalf("seed %s: %v", test.uid, err)
+		}
+	}
+
+	// From 08:30 on 1 March only the rows ending after it are candidates: the
+	// ones a dtend before dtstart dropped are among them once repaired.
+	rangeStart := at("2025-03-01T08:30:00Z")
+	repaired := []string{"timed-before", "date-equal", "date-before", "timed-before-duration"}
+	candidates := func() map[string]bool {
+		t.Helper()
+		events, err := New(pool).Events.ListForCalendarFiltered(t.Context(), calendarID, EventFilter{Start: &rangeStart})
+		if err != nil {
+			t.Fatalf("ListForCalendarFiltered() error = %v", err)
+		}
+		found := map[string]bool{}
+		for _, event := range events {
+			found[event.UID] = true
+		}
+		return found
+	}
+	// This schema has no recurrence bounds, so the narrowing reads dtend
+	// alone, as it does for a row that does not recur.
+	for _, uid := range repaired {
+		var candidate bool
+		if err := pool.QueryRow(`SELECT COALESCE(dtend, 'infinity'::timestamptz) >= $2 FROM events WHERE uid = $1`, uid, rangeStart).
+			Scan(&candidate); err != nil {
+			t.Fatalf("read %s: %v", uid, err)
+		}
+		if candidate {
+			t.Fatalf("%s is a candidate before the upgrade; the fixture no longer shows the defect", uid)
+		}
+	}
+
+	migrateWithRunner(t, pool, "../../migrations", "v1.2.0")
+	for run := 1; run <= 2; run++ {
+		if run == 2 {
+			applyV120Migration(t, pool)
+		}
+		for _, test := range cases {
+			var dtend *time.Time
+			if err := pool.QueryRow(`SELECT dtend FROM events WHERE uid = $1`, test.uid).Scan(&dtend); err != nil {
+				t.Fatalf("run %d: read %s: %v", run, test.uid, err)
+			}
+			if (dtend == nil) != (test.want == nil) || dtend != nil && !dtend.Equal(*test.want) {
+				t.Errorf("run %d: %s dtend = %v, want %v", run, test.uid, dtend, test.want)
+			}
+		}
+		after := candidates()
+		for _, uid := range repaired {
+			if !after[uid] {
+				t.Errorf("run %d: %s is not a time-range candidate from %s", run, uid, rangeStart)
+			}
+		}
+	}
+}
+
+func ptr[T any](value T) *T {
+	return &value
 }

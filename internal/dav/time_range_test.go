@@ -395,10 +395,10 @@ func TestTimeRangePropFilterConsidersRecurrenceInstances(t *testing.T) {
 		{property: "DTEND", start: "20240610T105000Z", end: "20240610T111000Z"},
 	}
 	for _, tt := range shifted {
-		if !eventMatchesFilter(event, propFilterQuery(tt.property, tt.start, tt.end), floatingZone{}) {
+		if !filterMatches(event, propFilterQuery(tt.property, tt.start, tt.end), floatingZone{}) {
 			t.Errorf("%s did not take its effective value for the 2024-06-10 instance", tt.property)
 		}
-		if eventMatchesFilter(event, propFilterQuery(tt.property, "20240612T000000Z", "20240613T000000Z"), floatingZone{}) {
+		if filterMatches(event, propFilterQuery(tt.property, "20240612T000000Z", "20240613T000000Z"), floatingZone{}) {
 			t.Errorf("%s matched a day no recurrence instance reaches", tt.property)
 		}
 	}
@@ -409,17 +409,17 @@ func TestTimeRangePropFilterConsidersRecurrenceInstances(t *testing.T) {
 	)...)}
 	todoQuery := propFilterQuery("DUE", "20240610T105000Z", "20240610T111000Z")
 	todoQuery.CompFilter.CompFilter[0].Name = "VTODO"
-	if !eventMatchesFilter(todo, todoQuery, floatingZone{}) {
+	if !filterMatches(todo, todoQuery, floatingZone{}) {
 		t.Error("DUE did not take its effective value for the 2024-06-10 instance")
 	}
 
 	// CREATED and DTSTAMP describe the component, not an occurrence of it, so
 	// they stay where the resource wrote them.
 	for _, property := range []string{"CREATED", "DTSTAMP"} {
-		if !eventMatchesFilter(event, propFilterQuery(property, "20231201T075000Z", "20231201T081000Z"), floatingZone{}) {
+		if !filterMatches(event, propFilterQuery(property, "20231201T075000Z", "20231201T081000Z"), floatingZone{}) {
 			t.Errorf("%s did not match its own written value", property)
 		}
-		if eventMatchesFilter(event, propFilterQuery(property, "20240610T075000Z", "20240610T081000Z"), floatingZone{}) {
+		if filterMatches(event, propFilterQuery(property, "20240610T075000Z", "20240610T081000Z"), floatingZone{}) {
 			t.Errorf("%s was shifted onto a recurrence instance", property)
 		}
 	}
@@ -587,7 +587,7 @@ func TestTimeRangeResolvesFloatingValuesThroughTheSelectedZone(t *testing.T) {
 	}
 
 	zone := newFloatingZone(zoneDefinition)
-	if len(zone.observances) == 0 {
+	if zone.observances == nil {
 		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", zone)
 	}
 	if assertComponentInRange(t, raw, "VEVENT", utcRange[0], utcRange[1], zone) {
@@ -890,7 +890,7 @@ func TestRecurrenceDatesResolveThroughTheSelectedZone(t *testing.T) {
 	}
 	// CDT in June, so a 10:00 wall clock is 15:00Z and a date starts at 05:00Z.
 	chicago := newFloatingZone(chicagoVTimezoneObject())
-	if len(chicago.observances) == 0 {
+	if chicago.observances == nil {
 		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", chicago)
 	}
 	// A TZID no host knows, resolved by walking the observances the definition
@@ -904,7 +904,7 @@ func TestRecurrenceDatesResolveThroughTheSelectedZone(t *testing.T) {
 		"TZOFFSETTO:+0300",
 		"END:STANDARD",
 	)...))
-	if shipped.loc != nil || len(shipped.observances) == 0 {
+	if shipped.loc != nil || shipped.observances == nil {
 		t.Fatal("Custom/Offset did not fall back to its shipped observances")
 	}
 
@@ -1087,8 +1087,8 @@ func TestTimeRangePropFilterUsesEffectiveDTEndAndDue(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			filter := propFilterQuery(tt.component, tt.property, tt.filter)
-			if got := eventMatchesFilter(tt.event, filter, floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter() = %v, want %v", got, tt.want)
+			if got := filterMatches(tt.event, filter, floatingZone{}); got != tt.want {
+				t.Fatalf("filterMatches() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1165,7 +1165,7 @@ func TestTimeRangeAllDayValueSpansItsNominalDayAcrossAZoneTransition(t *testing.
 		t.Skipf("tzdata unavailable: %v", err)
 	}
 	zone := newFloatingZone(chicagoVTimezoneObject())
-	if len(zone.observances) == 0 {
+	if zone.observances == nil {
 		t.Fatalf("newFloatingZone() read no observances from the America/Chicago definition: %#v", zone)
 	}
 
@@ -1253,7 +1253,7 @@ func TestSubmittedTimezoneWallClockUsesAbsoluteTransitions(t *testing.T) {
 		"END:DAYLIGHT",
 	)...)
 	zone := newFloatingZone(zoneDefinition)
-	if zone.loc != nil || len(zone.observances) == 0 {
+	if zone.loc != nil || zone.observances == nil {
 		t.Fatalf("expected a submitted-only timezone, got %#v", zone)
 	}
 
@@ -1471,7 +1471,7 @@ func TestOpenEndedCalendarQueryOverOutlookSeriesIsAnsweredPromptly(t *testing.T)
 	if walks := onsets.walks.Load(); walks != 0 {
 		t.Fatalf("walked an observance rule %d times, want every lookup answered from its listing", walks)
 	}
-	if listed := len(onsets.rules); listed != 2 {
+	if listed := onsets.rules.Len(); listed != 2 {
 		t.Fatalf("listed %d observance rules, want the zone's two", listed)
 	}
 	// Expanding every instance up to the limit would ask about each of a
@@ -1538,9 +1538,11 @@ func TestTimezoneOnsetsAgreeWithWalkingEachRule(t *testing.T) {
 			agree := func(onsets *timezoneOnsets, instants []time.Time) {
 				t.Helper()
 				for _, instant := range instants {
-					for _, scale := range []func(submittedTimezoneObservance) time.Duration{localTransition, absoluteTransition} {
-						want, wantOK := observanceOffsetBefore(observances, instant, scale, nil)
-						got, gotOK := observanceOffsetBefore(observances, instant, scale, onsets)
+					for _, scale := range []func(ical.TimezoneObservances, time.Time, ical.ObservanceOnsets) (time.Duration, bool){
+						ical.TimezoneObservances.OffsetAtWall, ical.TimezoneObservances.OffsetAtInstant,
+					} {
+						want, wantOK := scale(observances.TimezoneObservances, instant, nil)
+						got, gotOK := scale(observances.TimezoneObservances, instant, onsets)
 						if got != want || gotOK != wantOK {
 							t.Fatalf("offset at %v = %v, %t through the cache, %v, %t walking", instant, got, gotOK, want, wantOK)
 						}
@@ -1590,8 +1592,8 @@ var exchangeStandardRule = struct {
 // One value far in the future -- a stored DTSTART in the year 4000 can come
 // first in a collection -- asks for more onsets than a rule may list. The
 // listing stops at its limit, and every instant before that, which is every
-// present-day instant, is still answered from it rather than by walking four
-// centuries of the rule.
+// present-day instant, is still answered from it rather than by walking the
+// rule.
 func TestTimezoneOnsetsKeepWhatAFarFutureLookupListed(t *testing.T) {
 	onsets := newTimezoneOnsets(maxHeldOnsets)
 	rule := exchangeStandardRule
@@ -1601,7 +1603,7 @@ func TestTimezoneOnsetsKeepWhatAFarFutureLookupListed(t *testing.T) {
 		time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC),
 	} {
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(rule.dtstart, before, rule.rrule)
-		got, found, complete := onsets.latest(rule.dtstart, before, rule.rrule)
+		got, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 		}
@@ -1624,7 +1626,7 @@ func TestTimezoneOnsetsEvictTheLeastRecentlyUsedRule(t *testing.T) {
 	ask := func(dtstart time.Time, rrule string) {
 		t.Helper()
 		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-		if got, found, complete := onsets.latest(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+		if got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
 			t.Fatalf("latest(%v, %q) = %v, %t, %t, want %v", dtstart, rrule, got, found, complete, want)
 		}
 	}
@@ -1632,16 +1634,16 @@ func TestTimezoneOnsetsEvictTheLeastRecentlyUsedRule(t *testing.T) {
 	ask(rule.dtstart, rule.rrule)
 	for i := 0; i < 500; i++ {
 		ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute), "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU")
-		if onsets.held > budget {
-			t.Fatalf("holding %d units after %d rules, want at most %d", onsets.held, i+1, budget)
+		if held := onsets.rules.Held(); held > budget {
+			t.Fatalf("holding %d units after %d rules, want at most %d", held, i+1, budget)
 		}
 	}
 	key := observanceRuleKey{seconds: rule.dtstart.Unix(), rrule: rule.rrule}
-	if _, ok := onsets.rules[key]; ok {
+	if _, ok := onsets.rules.Get(key); ok {
 		t.Fatal("the shared rule outlived five hundred more recently used ones")
 	}
 	ask(rule.dtstart, rule.rrule)
-	if _, ok := onsets.rules[key]; !ok {
+	if _, ok := onsets.rules.Get(key); !ok {
 		t.Fatal("the shared rule was not listed again")
 	}
 	if walks := onsets.walks.Load(); walks != 0 {
@@ -1662,7 +1664,7 @@ func TestTimezoneOnsetsChargeEachRuleItsText(t *testing.T) {
 	ask := func(dtstart time.Time, rrule string) {
 		t.Helper()
 		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-		if got, found, complete := onsets.latest(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+		if got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v", dtstart, got, found, complete, want)
 		}
 	}
@@ -1671,9 +1673,10 @@ func TestTimezoneOnsetsChargeEachRuleItsText(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC).Add(time.Duration(i)*time.Minute), long)
 		text := 0
-		for key := range onsets.rules {
+		onsets.rules.Range(func(key observanceRuleKey, _ *listedRule) bool {
 			text += len(key.rrule)
-		}
+			return true
+		})
 		if text > budget*onsetBytes {
 			t.Fatalf("holding %d bytes of rule text after %d rules, want at most the %d bytes the budget's onsets would take", text, i+1, budget*onsetBytes)
 		}
@@ -1682,8 +1685,8 @@ func TestTimezoneOnsetsChargeEachRuleItsText(t *testing.T) {
 	onsets = newTimezoneOnsets(budget)
 	oversized := "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=" + strings.Repeat("2,", budget*onsetBytes) + "2"
 	ask(time.Date(1990, 3, 25, 2, 0, 0, 0, time.UTC), oversized)
-	if len(onsets.rules) != 0 || onsets.held != 0 {
-		t.Fatalf("cached %d rules holding %d units, want a rule larger than the budget left uncached", len(onsets.rules), onsets.held)
+	if onsets.rules.Len() != 0 || onsets.rules.Held() != 0 {
+		t.Fatalf("cached %d rules holding %d units, want a rule larger than the budget left uncached", onsets.rules.Len(), onsets.rules.Held())
 	}
 	if walks := onsets.walks.Load(); walks != 1 {
 		t.Fatalf("walked %d times, want the uncached rule walked once", walks)
@@ -1723,15 +1726,15 @@ func TestTimezoneOnsetsDoNotKeepTheObjectARuleWasReadFrom(t *testing.T) {
 		if !ok {
 			t.Fatal("the padded definition has no usable observance")
 		}
-		if _, found, complete := onsets.latest(observances[0].dtstart, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances[0].rrules[0]); !found || !complete {
+		if _, found, complete := onsets.LatestOnOrBefore(observances.TimezoneObservances[0].Start, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances.TimezoneObservances[0].RRules[0]); !found || !complete {
 			t.Fatal("the padded definition's rule did not resolve")
 		}
 	}
 	retained := heap() - start
 	runtime.KeepAlive(onsets)
 
-	if len(onsets.rules) != objects {
-		t.Fatalf("cached %d rules, want %d", len(onsets.rules), objects)
+	if cached := onsets.rules.Len(); cached != objects {
+		t.Fatalf("cached %d rules, want %d", cached, objects)
 	}
 	if limit := int64(len(padding)); retained > limit {
 		t.Fatalf("%d cached rules keep %d bytes alive, want less than one %d-byte object", objects, retained, limit)
@@ -1746,11 +1749,11 @@ func TestTimezoneOnsetsAnswerAListedInstantWithoutAllocating(t *testing.T) {
 	onsets := newTimezoneOnsets(maxHeldOnsets)
 	rule := exchangeStandardRule
 	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	if _, found, complete := onsets.latest(rule.dtstart, before, rule.rrule); !found || !complete {
+	if _, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule); !found || !complete {
 		t.Fatal("the rule did not resolve")
 	}
 	if allocs := testing.AllocsPerRun(100, func() {
-		onsets.latest(rule.dtstart, before.Add(time.Hour), rule.rrule)
+		onsets.LatestOnOrBefore(rule.dtstart, before.Add(time.Hour), rule.rrule)
 	}); allocs != 0 {
 		t.Fatalf("a listed lookup allocated %v times, want none", allocs)
 	}
@@ -1769,12 +1772,15 @@ func TestTimezoneOnsetsDoNotRetryAHaltedListing(t *testing.T) {
 
 	for _, before := range []time.Time{listed, past, time.Date(1910, 6, 1, 0, 0, 0, 0, time.UTC), past.AddDate(1, 0, 0)} {
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, monthly)
-		got, found, complete := onsets.latest(dtstart, before, monthly)
+		got, found, complete := onsets.LatestOnOrBefore(dtstart, before, monthly)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 		}
 	}
-	rule := onsets.rules[observanceRuleKey{seconds: dtstart.Unix(), rrule: monthly}].Value.(*listedRule)
+	rule, ok := onsets.rules.Get(observanceRuleKey{seconds: dtstart.Unix(), rrule: monthly})
+	if !ok {
+		t.Fatal("the rule was not cached")
+	}
 	if rule.lister.Len() != maxListedOnsetsPerRule {
 		t.Fatalf("listed %d onsets, want the %d a rule may keep", rule.lister.Len(), maxListedOnsetsPerRule)
 	}
@@ -1813,7 +1819,7 @@ func TestTimezoneOnsetsChargeWhatEachListingHolds(t *testing.T) {
 				defer wg.Done()
 				for i := range befores {
 					for _, rule := range rules {
-						onsets.latest(rule.dtstart, befores[min(i+worker%3, len(befores)-1)], rule.rrule)
+						onsets.LatestOnOrBefore(rule.dtstart, befores[min(i+worker%3, len(befores)-1)], rule.rrule)
 					}
 				}
 			}()
@@ -1821,19 +1827,21 @@ func TestTimezoneOnsetsChargeWhatEachListingHolds(t *testing.T) {
 		wg.Wait()
 
 		held := 0
-		for _, element := range onsets.rules {
-			rule := element.Value.(*listedRule)
-			held += ruleCost(rule.key.rrule, rule.lister.Len())
-		}
-		if onsets.held != held {
-			t.Fatalf("round %d: the cache counts %d units, its listings hold %d", round, onsets.held, held)
+		onsets.rules.Range(func(_ observanceRuleKey, rule *listedRule) bool {
+			held += ruleCost(rule.key.rrule, rule.listed())
+			return true
+		})
+		if counted := onsets.rules.Held(); counted != held {
+			t.Fatalf("round %d: the cache counts %d units, its listings hold %d", round, counted, held)
 		}
 		onsets = newTimezoneOnsets(maxHeldOnsets)
 	}
 }
 
 // Every report, PUT and COPY or MOVE shares the cache, so lookups of one rule
-// and of rules that evict each other arrive at once.
+// and of rules that evict each other arrive at once. The Exchange rule's
+// listing to the present outgrows the whole budget by itself, and the cache
+// stays within it after every lookup, whichever finishes last.
 func TestTimezoneOnsetsServeConcurrentLookups(t *testing.T) {
 	onsets := newTimezoneOnsets(256)
 	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
@@ -1853,16 +1861,19 @@ func TestTimezoneOnsetsServeConcurrentLookups(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	failures := make(chan string, 8*len(rules))
+	failures := make(chan string, 2*8*len(rules))
 	for worker := 0; worker < 8; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := range rules {
 				rule := rules[(i+worker)%len(rules)]
-				got, found, complete := onsets.latest(rule.dtstart, before, rule.rrule)
+				got, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule)
 				if expected := want[(i+worker)%len(rules)]; !found || !complete || !got.Equal(expected) {
 					failures <- fmt.Sprintf("latest(%v) = %v, %t, %t, want %v", rule.dtstart, got, found, complete, expected)
+				}
+				if held, budget := onsets.rules.Held(), onsets.rules.Budget(); held > budget {
+					failures <- fmt.Sprintf("holding %d units after a lookup, want at most %d", held, budget)
 				}
 			}
 		}()
@@ -1872,9 +1883,7 @@ func TestTimezoneOnsetsServeConcurrentLookups(t *testing.T) {
 	for failure := range failures {
 		t.Error(failure)
 	}
-	if onsets.held > 256 {
-		t.Fatalf("holding %d units, want at most 256", onsets.held)
-	}
+	requireCacheWithinBudget(t, onsets)
 }
 
 // A client that disconnects -- DAVx5 does once its own timeout passes -- cancels

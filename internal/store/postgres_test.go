@@ -631,3 +631,52 @@ func TestLockPreconditionsHonourLegacySpellingsOfTheTarget(t *testing.T) {
 		}
 	}
 }
+
+// A writer that hands the store no metadata gets the columns the DAV layer's
+// analysis derives: dates read through the object's own VTIMEZONE, and the end
+// the reports read the event with.
+func TestParseICalFieldsReadsDatesAsTheReportsDo(t *testing.T) {
+	const outlookZone = "BEGIN:VTIMEZONE\r\nTZID:Eastern Standard Time\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nRRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11\r\nEND:STANDARD\r\n" +
+		"BEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nRRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3\r\nEND:DAYLIGHT\r\n" +
+		"END:VTIMEZONE\r\n"
+	object := func(properties string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + outlookZone + "BEGIN:VEVENT\r\nUID:x\r\n" + properties + "END:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	at := func(value string) *time.Time {
+		parsed, err := time.Parse("20060102T150405Z", value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &parsed
+	}
+	tests := []struct {
+		name               string
+		properties         string
+		wantStart, wantEnd *time.Time
+	}{
+		{"zone only the object defines",
+			"DTSTART;TZID=\"Eastern Standard Time\":20240304T090000\r\nDTEND;TZID=\"Eastern Standard Time\":20240304T100000\r\n",
+			at("20240304T140000Z"), at("20240304T150000Z")},
+		{"DATE-TIME DTEND before DTSTART", "DTSTART:20250301T100000Z\r\nDTEND:20250301T080000Z\r\n",
+			at("20250301T100000Z"), at("20250301T100000Z")},
+		{"DATE DTEND equal to DTSTART", "DTSTART;VALUE=DATE:20250301\r\nDTEND;VALUE=DATE:20250301\r\n",
+			at("20250301T000000Z"), at("20250302T000000Z")},
+		{"unusable DTEND beside a DURATION", "DTSTART:20250301T100000Z\r\nDTEND:20250301T080000Z\r\nDURATION:PT3H\r\n",
+			at("20250301T100000Z"), nil},
+		{"no DTEND on a DATE-TIME start", "DTSTART:20250301T100000Z\r\n", at("20250301T100000Z"), at("20250301T100000Z")},
+		{"no DTEND on a DATE start", "DTSTART;VALUE=DATE:20250301\r\n", at("20250301T000000Z"), at("20250302T000000Z")},
+		{"no DTEND beside a DURATION", "DTSTART;VALUE=DATE:20250301\r\nDURATION:P2D\r\n", at("20250301T000000Z"), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, dtstart, dtend, _ := parseICalFields(object(tt.properties))
+			if dtstart == nil || !dtstart.Equal(*tt.wantStart) {
+				t.Errorf("dtstart = %v, want %v", dtstart, tt.wantStart)
+			}
+			if (dtend == nil) != (tt.wantEnd == nil) || dtend != nil && !dtend.Equal(*tt.wantEnd) {
+				t.Errorf("dtend = %v, want %v", dtend, tt.wantEnd)
+			}
+		})
+	}
+}

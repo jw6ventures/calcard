@@ -3,6 +3,7 @@ package ical
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"runtime"
 	"slices"
@@ -962,7 +963,7 @@ func TestVisitRecurrenceCandidatesDedupesDayListByCalendarDate(t *testing.T) {
 	if err != nil {
 		t.Skipf("tzdata unavailable: %v", err)
 	}
-	rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23", loc, nil)
+	rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23", loc, nil, nil)
 	if !ok {
 		t.Fatal("parseRecurrenceRule() ok = false")
 	}
@@ -1013,7 +1014,7 @@ func TestVisitRecurrenceCandidatesBySetPosOverDeduplicatedDayList(t *testing.T) 
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23;BYSETPOS="+tt.bysetpos, loc, nil)
+			rule, ok := parseRecurrenceRule("FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=0,23;BYSETPOS="+tt.bysetpos, loc, nil, nil)
 			if !ok {
 				t.Fatal("parseRecurrenceRule() ok = false")
 			}
@@ -1075,7 +1076,7 @@ func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
 // collectRecurrenceInstances gathers every instance VisitRecurrenceInstances
 // hands out, returning them with its error the way a caller owing the whole set
 // reads them: a budget error keeps what was collected, any other error none.
-func collectRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]RecurrenceInstance, error) {
+func collectRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver) ([]RecurrenceInstance, error) {
 	var instances []RecurrenceInstance
 	err := VisitRecurrenceInstances(raw, componentName, dtstart, duration, rangeStart, rangeEnd, maxInstances, resolve, func(instance RecurrenceInstance) bool {
 		instances = append(instances, instance)
@@ -1567,7 +1568,7 @@ func TestRecurrenceWorkIsBoundedAcrossPeriods(t *testing.T) {
 // A BYDAY list costs whatever its distinct specifiers cost, however often the
 // text repeats them.
 func TestParseRecurrenceRuleDeduplicatesByDay(t *testing.T) {
-	rule, ok := parseRecurrenceRule("FREQ=MONTHLY;BYDAY="+strings.Repeat("MO,2TU,-1FR,+2TU,", 100)+"MO", time.UTC, nil)
+	rule, ok := parseRecurrenceRule("FREQ=MONTHLY;BYDAY="+strings.Repeat("MO,2TU,-1FR,+2TU,", 100)+"MO", time.UTC, nil, nil)
 	if !ok {
 		t.Fatal("parseRecurrenceRule() ok = false")
 	}
@@ -1765,13 +1766,13 @@ func TestContentLinesSplitAtTheFirstColonOutsideQuotes(t *testing.T) {
 	}
 
 	eastern := time.FixedZone("Eastern", -5*60*60)
-	resolve := func(keyPart, value string) (time.Time, bool) {
+	resolve := PropertyTimeResolver(func(keyPart, value string) (time.Time, bool) {
 		if zone, ok := PropertyParam(keyPart, "TZID"); ok && zone == "(UTC-05:00) Eastern" {
 			parsed, err := ParseDateTimeInLocation(strings.TrimSpace(value), eastern)
 			return parsed, err == nil
 		}
 		return ParsePropertyDateTimeLocal(keyPart, value)
-	}
+	})
 	start := time.Date(2024, 1, 8, 9, 0, 0, 0, eastern)
 	periods, err := RecurringBusyPeriods(raw, start, time.Hour, start.AddDate(0, 0, -1), start.AddDate(0, 0, 7), MaxRecurrenceInstances, resolve)
 	if err != nil {
@@ -2246,7 +2247,7 @@ func TestRecurrenceCandidateBoundIsNeverBelowWhatAPeriodOffers(t *testing.T) {
 	}
 	for _, spelling := range rules {
 		for _, dtstart := range starts {
-			rule, ok := parseRecurrenceRule(spelling, dtstart.Location(), nil)
+			rule, ok := parseRecurrenceRule(spelling, dtstart.Location(), nil, nil)
 			if !ok {
 				t.Fatalf("%s is not a rule this package parses", spelling)
 			}
@@ -2304,14 +2305,14 @@ func TestThisAndFutureOverrideMovesInstancesCenturiesAway(t *testing.T) {
 }
 
 func TestFastForwardCountedSubDailyRecurrenceSpansCenturies(t *testing.T) {
-	rule, ok := parseRecurrenceRule("FREQ=HOURLY;COUNT=100000000", time.UTC, nil)
+	rule, ok := parseRecurrenceRule("FREQ=HOURLY;COUNT=100000000", time.UTC, nil, nil)
 	if !ok {
 		t.Fatal("rule did not parse")
 	}
 	periodStart := time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)
 	threshold := time.Date(2026, 9, 1, 12, 30, 0, 0, time.UTC)
 
-	got, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, threshold, rule)
+	got, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, threshold, periodStart, rule, rule.Count, nil)
 	if !ok {
 		t.Fatal("fast-forward refused a fixed-step hourly rule")
 	}
@@ -2845,5 +2846,158 @@ func TestLatestRecurrenceOnOrBeforeReachesBoundsCenturiesPastTheDTStart(t *testi
 				t.Fatalf("LatestRecurrenceOnOrBefore() = %v, %t, %t, want %v, true, true", latest, found, complete, want)
 			}
 		})
+	}
+}
+
+// A COUNT rule is followed forward from its DTSTART. When the work budget runs
+// out partway through a period, LatestRecurrenceOnOrBefore answers with the
+// latest start it reached, found and incomplete, as it documents, rather than
+// with nothing.
+func TestLatestRecurrenceOnOrBeforeAnswersWhatItReachedWhenWorkRunsOut(t *testing.T) {
+	var hours, minutes []string
+	for hour := range 24 {
+		hours = append(hours, strconv.Itoa(hour))
+	}
+	for minute := range 60 {
+		minutes = append(minutes, strconv.Itoa(minute))
+	}
+	// Every minute of every day of each month: a month costs more than a day's
+	// candidates, so the budget runs out partway through one.
+	rule := "FREQ=MONTHLY;COUNT=10000000;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=" + strings.Join(hours, ",") + ";BYMINUTE=" + strings.Join(minutes, ",")
+	dtstart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	whole := NewRecurrenceStartLister(dtstart, rule)
+	if whole.ListThrough(before, math.MaxInt) {
+		t.Fatal("the rule was followed to the bound; the case tests nothing")
+	}
+	lastWhole := whole.starts[len(whole.starts)-1]
+
+	latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, before, rule)
+	if !found || complete {
+		t.Fatalf("LatestRecurrenceOnOrBefore = %s, found %v, complete %v; want what it reached, incomplete", latest, found, complete)
+	}
+	if !latest.After(lastWhole) || latest.After(lastWhole.AddDate(0, 1, 0)) || latest.Second() != 0 {
+		t.Errorf("latest = %s, want a start reached in the month after %s, the last the whole periods hold", latest, lastWhole)
+	}
+}
+
+// A listing kept from a later instant holds only the starts from there, with
+// the latest start before it, so a rule too dense to list from its DTSTART to
+// the instants asked within a listing's limit is still answered from a
+// listing. It answers every bound from there as LatestRecurrenceOnOrBefore
+// does, and none before it.
+func TestRecurrenceStartListerFromAnInstantAgreesWithLatestRecurrenceOnOrBefore(t *testing.T) {
+	tests := []struct {
+		name    string
+		dtstart time.Time
+		rrule   string
+	}{
+		{"Exchange monthly", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=1SU"},
+		{"Exchange standard", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"},
+		{"weekly", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=WEEKLY;BYDAY=SU"},
+		{"daily", time.Date(1950, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=DAILY"},
+		{"counted", time.Date(1900, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=-1SU;COUNT=1500"},
+		{"retired by UNTIL", time.Date(1950, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20100101T000000Z"},
+		{"unsynchronized start", time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU"},
+		{"start before the instant only", time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30"},
+		// The period grid INTERVAL steps and the parts BY rules leave to
+		// DTSTART are the DTSTART's, however far from it the listing starts.
+		{"every other year by week number", time.Date(2019, 12, 30, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=2;BYWEEKNO=1;BYDAY=MO"},
+		{"every third month", time.Date(1601, 2, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;INTERVAL=3;BYDAY=1SU"},
+		{"fortnightly from a Wednesday week", time.Date(1601, 1, 3, 2, 0, 0, 0, time.UTC), "FREQ=WEEKLY;INTERVAL=2;WKST=WE;BYDAY=SU,TU"},
+		{"month day from DTSTART, skipping short months", time.Date(1601, 1, 31, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY"},
+		{"29 February", time.Date(1604, 2, 29, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY"},
+		{"last weekday by set position", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"},
+		{"week number on DTSTART's weekday", time.Date(1601, 1, 4, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=2;BYWEEKNO=10,40"},
+		{"time of day from DTSTART", time.Date(1601, 1, 1, 1, 30, 15, 0, time.UTC), "FREQ=MONTHLY;BYMONTHDAY=-1,15"},
+	}
+	through := time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC)
+	for _, tt := range tests {
+		for _, from := range []time.Time{time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)} {
+			t.Run(tt.name+"/"+from.Format("2006-01-02"), func(t *testing.T) {
+				lister := NewRecurrenceStartListerFrom(tt.dtstart, tt.rrule, from)
+				if !lister.ListThrough(through, 2048) {
+					t.Fatal("ListThrough() = false, want the window listed")
+				}
+				for _, start := range lister.starts {
+					if start.Before(from) {
+						t.Fatalf("kept %v, before %v", start, from)
+					}
+				}
+				for before := from.Add(-48 * time.Hour); before.Before(through); before = before.Add(13*24*time.Hour + 5*time.Hour) {
+					got, found, ok := lister.LatestOnOrBefore(before)
+					if before.Before(from) {
+						if ok {
+							t.Fatalf("answered %v, before the listing starts", before)
+						}
+						continue
+					}
+					want, wantFound, wantComplete := LatestRecurrenceOnOrBefore(tt.dtstart, before, tt.rrule)
+					if !wantComplete || !ok || found != wantFound || (found && !got.Equal(want)) {
+						t.Fatalf("at or before %v = %v (found=%t, ok=%t), LatestRecurrenceOnOrBefore = %v (found=%t, complete=%t)",
+							before, got, found, ok, want, wantFound, wantComplete)
+					}
+				}
+			})
+		}
+	}
+}
+
+// RRuleParam reads one part of an RRULE as parseRecurrenceRule reads its
+// parts: the name in any case, white space around the name, the "=" and the
+// value ignored, and a part with no "=" naming nothing. The first part of a
+// name answers, as every reader of the rule takes it.
+func TestRRuleParam(t *testing.T) {
+	tests := []struct {
+		rrule, name, want string
+		found             bool
+	}{
+		{"FREQ=DAILY;UNTIL=20260301T000000Z", "UNTIL", "20260301T000000Z", true},
+		{"freq=daily;until=20260301", "UNTIL", "20260301", true},
+		{"FREQ=DAILY ; Until = 20260301 ", "until", "20260301", true},
+		{" COUNT =3;FREQ=DAILY", "COUNT", "3", true},
+		{"FREQ=DAILY;COUNT", "COUNT", "", false},
+		{"FREQ=DAILY;COUNT=3;COUNT=5", "COUNT", "3", true},
+		{"FREQ=DAILY", "UNTIL", "", false},
+		{"FREQ=DAILY;UNTIL=", "UNTIL", "", true},
+		{"", "FREQ", "", false},
+	}
+	for _, tt := range tests {
+		got, found := RRuleParam(tt.rrule, tt.name)
+		if got != tt.want || found != tt.found {
+			t.Errorf("RRuleParam(%q, %q) = %q, %v; want %q, %v", tt.rrule, tt.name, got, found, tt.want, tt.found)
+		}
+	}
+	if !SupportedRecurrenceRule("freq = weekly;byday=MO") {
+		t.Error("a lowercase FREQ spaced around its = is not supported")
+	}
+}
+
+// RRuleParts reads every part of an RRULE as RRuleParam reads one, under its
+// name in upper case, so each name it holds answers what RRuleParam answers
+// for it.
+func TestRRuleParts(t *testing.T) {
+	tests := []struct {
+		rrule string
+		want  map[string]string
+	}{
+		{"FREQ=DAILY;UNTIL=20260301T000000Z", map[string]string{"FREQ": "DAILY", "UNTIL": "20260301T000000Z"}},
+		{"freq=daily ; Until = 20260301 ", map[string]string{"FREQ": "daily", "UNTIL": "20260301"}},
+		{"FREQ=DAILY;COUNT", map[string]string{"FREQ": "DAILY"}},
+		{"FREQ=DAILY;COUNT=3;count=5", map[string]string{"FREQ": "DAILY", "COUNT": "3"}},
+		{"FREQ=DAILY;UNTIL=", map[string]string{"FREQ": "DAILY", "UNTIL": ""}},
+		{"", map[string]string{}},
+	}
+	for _, tt := range tests {
+		got := RRuleParts(tt.rrule)
+		if !maps.Equal(got, tt.want) {
+			t.Errorf("RRuleParts(%q) = %v, want %v", tt.rrule, got, tt.want)
+		}
+		for name, value := range got {
+			if param, found := RRuleParam(tt.rrule, name); !found || param != value {
+				t.Errorf("RRuleParts(%q)[%s] = %q, RRuleParam = %q, %v", tt.rrule, name, value, param, found)
+			}
+		}
 	}
 }

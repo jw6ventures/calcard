@@ -272,12 +272,12 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
-	validated, fault := validateCalendarObjectForStorage(src.RawICAL, destCal)
+	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal)
 	if fault != nil {
 		writeCalendarObjectFault(w, fault)
 		return
 	}
-	etag := newCopyETag(src.RawICAL, destCalID)
+	etag := newCopyETag(validated.Body, destCalID)
 	fromStatePath, toStatePath, err := h.moveStatePaths(r.Context(), user, srcPath(r), destPath)
 	if err != nil {
 		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
@@ -290,13 +290,12 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		SourceUID:               src.UID,
 		SourceResourceName:      eventResourceName(*src),
 		ExpectedSourceETag:      src.ETag,
-		ExpectedSourceRaw:       src.RawICAL,
 		DestinationCalendarID:   destCalID,
 		DestinationResourceName: destResourceName,
 		ExpectedDestination:     calendarObjectTransferState(existing),
 		Overwrite:               overwrite,
 		ExpectedACL:             aclGuard,
-		RawICAL:                 src.RawICAL,
+		RawICAL:                 validated.Body,
 		ETag:                    etag,
 		Metadata:                &validated.Analysis.Metadata,
 		SourceStatePath:         fromStatePath,
@@ -637,7 +636,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
-	validated, fault := validateCalendarObjectForStorage(src.RawICAL, destCal)
+	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal)
 	if fault != nil {
 		writeCalendarObjectFault(w, fault)
 		return
@@ -655,14 +654,12 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		SourceUID:               src.UID,
 		SourceResourceName:      eventResourceName(*src),
 		ExpectedSourceETag:      src.ETag,
-		ExpectedSourceRaw:       src.RawICAL,
 		DestinationCalendarID:   destCalID,
 		DestinationResourceName: destResourceName,
 		ExpectedDestination:     calendarObjectTransferState(existing),
 		Overwrite:               overwrite,
 		ExpectedACL:             aclGuard,
-		RawICAL:                 src.RawICAL,
-		ETag:                    src.ETag,
+		RawICAL:                 validated.Body,
 		Metadata:                &validated.Analysis.Metadata,
 		SourceStatePath:         fromStatePath,
 		DestinationStatePath:    toStatePath,

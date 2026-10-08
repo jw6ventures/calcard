@@ -37,7 +37,11 @@ type RecurrenceOptions struct {
 
 // EventOptions holds optional VEVENT properties.
 type EventOptions struct {
-	Timezone     string
+	// Timezone is the zone timed values are wall clocks in, per EventZoneIn.
+	Timezone string
+	// Object holds the unfolded content lines of the stored calendar object
+	// an edit rewrites, whose VTIMEZONEs may define Timezone.
+	Object       []string
 	URL          string
 	Status       string
 	Categories   []string
@@ -107,8 +111,20 @@ func ParseRecurrenceOptions(r *http.Request) *RecurrenceOptions {
 	}
 }
 
-// FormatICalDateTime converts form inputs into iCalendar date/time strings.
+// FormatICalDateTime converts form inputs into iCalendar date/time strings,
+// reading a timed value in the host's zone tzid names, as FormatICalDateTimeIn
+// does for EventZoneIn(tzid, nil).
 func FormatICalDateTime(value string, allDay bool, exclusiveEnd bool, prop string, tzid string) (string, error) {
+	return FormatICalDateTimeIn(value, allDay, exclusiveEnd, prop, EventZoneIn(tzid, nil))
+}
+
+// FormatICalDateTimeIn converts a form input into the iCalendar content line
+// for prop. An all-day value is a DATE, the day after it when exclusiveEnd is
+// set. A timed value is a wall clock in zone: a named zone gets it as written,
+// with its TZID, so a wall clock the zone skips keeps the reading RFC 5545
+// §3.3.5 gives it rather than one normalized away from it; otherwise it is
+// written in UTC.
+func FormatICalDateTimeIn(value string, allDay bool, exclusiveEnd bool, prop string, zone EventZone) (string, error) {
 	if value == "" {
 		return "", nil
 	}
@@ -124,48 +140,177 @@ func FormatICalDateTime(value string, allDay bool, exclusiveEnd bool, prop strin
 		return fmt.Sprintf("%s;VALUE=DATE:%s", prop, t.Format("20060102")), nil
 	}
 
-	if tzid != "" {
-		if loc, err := time.LoadLocation(tzid); err == nil {
-			t, err := parseDateTimeLocal(value, loc)
-			if err != nil {
-				return "", err
-			}
-			if tzid == "UTC" {
-				return fmt.Sprintf("%s:%s", prop, t.Format("20060102T150405Z")), nil
-			}
-			return fmt.Sprintf("%s;TZID=%s:%s", prop, tzid, t.Format("20060102T150405")), nil
-		}
-	}
-
-	t, err := parseDateTimeLocal(value, time.Local)
+	wall, err := parseDateTimeLocal(value, time.UTC)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s:%s", prop, t.UTC().Format("20060102T150405Z")), nil
+	if zone.tzid != "" {
+		return fmt.Sprintf("%s;TZID=%s:%s", prop, quoteParamValue(zone.tzid), wall.Format("20060102T150405")), nil
+	}
+	return fmt.Sprintf("%s:%s", prop, wall.Format("20060102T150405Z")), nil
 }
 
-// BuildEventComponent builds a single VEVENT component (without VCALENDAR wrapper).
-func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, recurrenceID string, opts *EventOptions) []string {
+// EventZone is the zone the timed values of an event's form are wall clocks
+// in. The zero EventZone is UTC.
+type EventZone struct {
+	// tzid is the TZID values are written with, or "" for UTC.
+	tzid string
+	zone ical.ObjectTimezone
+}
+
+// EventZoneIn is the zone tzid names for an event: the zone object, the
+// unfolded content lines of the stored calendar object an edit rewrites,
+// defines by that name, read as the DAV layer reads it; else the host's zone
+// of that name; else UTC. The server and the editor both read a value with no
+// TZID, or with one neither the object nor the host defines, in UTC, so saving
+// what the editor shows does not move the event whatever zone the server
+// process runs in.
+func EventZoneIn(tzid string, object []string) EventZone {
+	tzid = strings.TrimSpace(tzid)
+	if tzid == "" || tzid == "UTC" || !validParamValue(tzid) {
+		return EventZone{}
+	}
+	zone := ical.ResolveObjectTimezone(object, tzid)
+	if !zone.Defined() {
+		return EventZone{}
+	}
+	return EventZone{tzid: tzid, zone: zone}
+}
+
+// Instant is the instant a wall clock in the zone names, held as the UTC time
+// with the same fields, read per RFC 5545 §3.3.5 as the DAV layer reads it.
+func (z EventZone) Instant(wall time.Time) time.Time {
+	if z.tzid == "" {
+		return wall
+	}
+	return z.zone.Instant(wall).UTC()
+}
+
+// WallClock is the wall clock the zone shows at instant, held as the UTC time
+// with the same fields: the reading Instant takes back to instant, for every
+// wall clock the zone neither skips nor repeats.
+func (z EventZone) WallClock(instant time.Time) time.Time {
+	if z.tzid == "" {
+		return instant.UTC()
+	}
+	if offsets, ok := z.zone.Offsets(instant, instant); ok && len(offsets) > 0 {
+		return instant.Add(offsets[0].Offset).UTC()
+	}
+	if loc, ok := ical.HostLocation(z.tzid); ok {
+		local := instant.In(loc)
+		return time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), time.UTC)
+	}
+	return instant.UTC()
+}
+
+// FormInstant is the instant a form value names in the zone: a date's
+// midnight, or a timed value's wall clock read as Instant reads it.
+func (z EventZone) FormInstant(value string) (time.Time, error) {
+	if day, err := time.Parse("2006-01-02", value); err == nil {
+		return day, nil
+	}
+	wall, err := parseDateTimeLocal(value, time.UTC)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return z.Instant(wall), nil
+}
+
+// ValidateEventDates checks an event form's start and end: dates for an
+// all-day event and local date-times for a timed one, the forms the builder
+// writes, with the end not before the start as zone reads them.
+func ValidateEventDates(dtstart, dtend string, allDay bool, zone EventZone) error {
+	shaped := func(value string) bool {
+		if allDay {
+			_, err := time.Parse("2006-01-02", value)
+			return err == nil
+		}
+		_, err := parseDateTimeLocal(value, time.UTC)
+		return err == nil
+	}
+	if !shaped(dtstart) {
+		return fmt.Errorf("invalid start date format")
+	}
+	if !shaped(dtend) {
+		return fmt.Errorf("invalid end date format")
+	}
+	startTime, err := zone.FormInstant(dtstart)
+	if err != nil {
+		return fmt.Errorf("invalid start date format")
+	}
+	endTime, err := zone.FormInstant(dtend)
+	if err != nil {
+		return fmt.Errorf("invalid end date format")
+	}
+	if endTime.Before(startTime) {
+		return fmt.Errorf("end date must not be before start date")
+	}
+	return nil
+}
+
+// validParamValue reports whether value can be written as an iCalendar
+// parameter value, quoted where RFC 5545 §3.2 requires: it holds no DQUOTE
+// and no control character.
+func validParamValue(value string) bool {
+	for _, r := range value {
+		if r == '"' || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// quoteParamValue writes value as an RFC 5545 §3.2 parameter value, quoted
+// when it holds a colon, semicolon or comma: Exchange names zones such as
+// "(UTC-05:00) Eastern Time (US & Canada)".
+func quoteParamValue(value string) string {
+	if strings.ContainsAny(value, ":;,") {
+		return `"` + value + `"`
+	}
+	return value
+}
+
+// recurrenceUntil is the RRULE UNTIL value that makes the picked date
+// (YYYY-MM-DD) the last day of a series. RFC 5545 §3.3.10 gives UNTIL the
+// value type of DTSTART: an all-day series takes the DATE, which is inclusive,
+// and a timed one, whose DTSTART is zoned or UTC, takes a UTC DATE-TIME, here
+// the last second of that date in the zone the event's times are read in.
+func recurrenceUntil(date string, allDay bool, zone EventZone) (string, bool) {
+	day, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return "", false
+	}
+	if allDay {
+		return day.Format("20060102"), true
+	}
+	lastSecond := day.Add(24*time.Hour - time.Second)
+	return zone.Instant(lastSecond).Format("20060102T150405Z"), true
+}
+
+// BuildEventComponent builds a single VEVENT component (without VCALENDAR
+// wrapper). It fails when a start, end or RECURRENCE-ID is not of the shape
+// allDay calls for.
+func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, recurrenceID string, opts *EventOptions) ([]string, error) {
 	var lines []string
 	lines = append(lines, fmt.Sprintf("UID:%s", uid))
 	lines = append(lines, fmt.Sprintf("DTSTAMP:%s", time.Now().UTC().Format("20060102T150405Z")))
 
-	tzid := ""
+	var zone EventZone
 	if opts != nil {
-		tzid = strings.TrimSpace(opts.Timezone)
+		zone = EventZoneIn(opts.Timezone, opts.Object)
 	}
 
-	if recurrenceID != "" {
-		if recLine, err := FormatICalDateTime(recurrenceID, allDay, false, "RECURRENCE-ID", tzid); err == nil && recLine != "" {
-			lines = append(lines, recLine)
+	for _, value := range []struct {
+		value, name string
+		end         bool
+	}{{recurrenceID, "RECURRENCE-ID", false}, {dtstart, "DTSTART", false}, {dtend, "DTEND", true}} {
+		line, err := FormatICalDateTimeIn(value.value, allDay, value.end, value.name, zone)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", value.name, err)
 		}
-	}
-
-	if startLine, err := FormatICalDateTime(dtstart, allDay, false, "DTSTART", tzid); err == nil && startLine != "" {
-		lines = append(lines, startLine)
-	}
-	if endLine, err := FormatICalDateTime(dtend, allDay, true, "DTEND", tzid); err == nil && endLine != "" {
-		lines = append(lines, endLine)
+		if line != "" {
+			lines = append(lines, line)
+		}
 	}
 
 	lines = append(lines, fmt.Sprintf("SUMMARY:%s", EscapeICalValue(summary)))
@@ -224,10 +369,8 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 		}
 		if recurrence.Count > 0 {
 			rrule += fmt.Sprintf(";COUNT=%d", recurrence.Count)
-		} else if recurrence.Until != "" {
-			if t, err := time.Parse("2006-01-02", recurrence.Until); err == nil {
-				rrule += fmt.Sprintf(";UNTIL=%s", t.Format("20060102"))
-			}
+		} else if until, ok := recurrenceUntil(recurrence.Until, allDay, zone); ok {
+			rrule += ";UNTIL=" + until
 		}
 		if len(recurrence.ByDay) > 0 {
 			rrule += fmt.Sprintf(";BYDAY=%s", strings.Join(recurrence.ByDay, ","))
@@ -254,178 +397,23 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 		}
 	}
 
-	return lines
+	return lines, nil
 }
 
-// GenerateVTimezone produces a VTIMEZONE component for the given IANA timezone ID.
-// When years are provided, observances are generated for that inclusive range.
-// Returns empty string for UTC or invalid timezone IDs.
-func GenerateVTimezone(tzid string, years ...int) string {
-	tzid = strings.TrimSpace(tzid)
-	if tzid == "" || strings.EqualFold(tzid, "UTC") {
-		return ""
-	}
-	loc, err := time.LoadLocation(tzid)
+// BuildEvent constructs an iCalendar object holding one event. It defines no
+// VTIMEZONE: every caller stores it through the calendar object validator,
+// which adds the host's definition of each zone the object names, spanning
+// every time the object places in it.
+func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, opts *EventOptions) (string, error) {
+	eventLines, err := BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
 	if err != nil {
-		return ""
+		return "", err
 	}
-
-	type zoneInfo struct {
-		name   string
-		offset int // seconds east of UTC
-		start  time.Time
-		prev   int
-	}
-
-	startYear := time.Now().Year()
-	endYear := startYear
-	if len(years) > 0 {
-		startYear = years[0]
-		endYear = years[0]
-		for _, year := range years[1:] {
-			if year < startYear {
-				startYear = year
-			}
-			if year > endYear {
-				endYear = year
-			}
-		}
-	}
-
-	zoneType := func(offset, standardOffset int) string {
-		if offset > standardOffset {
-			return "DAYLIGHT"
-		}
-		return "STANDARD"
-	}
-
-	formatOffset := func(seconds int) string {
-		sign := "+"
-		if seconds < 0 {
-			sign = "-"
-			seconds = -seconds
-		}
-		h := seconds / 3600
-		m := (seconds % 3600) / 60
-		return fmt.Sprintf("%s%02d%02d", sign, h, m)
-	}
-
-	formatTransition := func(utc time.Time, prevOffset int) string {
-		return utc.Add(time.Duration(prevOffset) * time.Second).UTC().Format("20060102T150405")
-	}
-
-	findTransitionUTC := func(lo, hi time.Time, prevName string, prevOffset int) time.Time {
-		for hi.Sub(lo) > time.Second {
-			mid := lo.Add(hi.Sub(lo) / 2)
-			name, offset := mid.In(loc).Zone()
-			if name == prevName && offset == prevOffset {
-				lo = mid
-			} else {
-				hi = mid
-			}
-		}
-		return hi.Truncate(time.Second)
-	}
-
-	var zones []zoneInfo
-	for year := startYear; year <= endYear; year++ {
-		yearStart := time.Date(year, 1, 1, 0, 0, 0, 0, loc)
-		yearEnd := time.Date(year+1, 1, 1, 0, 0, 0, 0, loc)
-		initialName, initialOffset := yearStart.Zone()
-		zones = append(zones, zoneInfo{
-			name:   initialName,
-			offset: initialOffset,
-			start:  yearStart,
-			prev:   initialOffset,
-		})
-
-		scanStartUTC := yearStart.Add(-2 * time.Hour).UTC()
-		scanEndUTC := yearEnd.Add(2 * time.Hour).UTC()
-		prevUTC := scanStartUTC
-		prevName, prevOffset := prevUTC.In(loc).Zone()
-
-		for t := prevUTC.Add(time.Hour); !t.After(scanEndUTC); t = t.Add(time.Hour) {
-			name, offset := t.In(loc).Zone()
-			if name == prevName && offset == prevOffset {
-				prevUTC = t
-				continue
-			}
-
-			transitionUTC := findTransitionUTC(prevUTC, t, prevName, prevOffset)
-			transitionLocal := transitionUTC.In(loc)
-			if transitionLocal.Year() == year {
-				zones = append(zones, zoneInfo{
-					name:   name,
-					offset: offset,
-					start:  transitionUTC,
-					prev:   prevOffset,
-				})
-			}
-
-			prevUTC = t
-			prevName = name
-			prevOffset = offset
-		}
-	}
-
-	if len(zones) == 0 {
-		return ""
-	}
-
-	standardOffset := zones[0].offset
-	for _, z := range zones[1:] {
-		if z.offset < standardOffset {
-			standardOffset = z.offset
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString("BEGIN:VTIMEZONE\r\n")
-	sb.WriteString(fmt.Sprintf("TZID:%s\r\n", tzid))
-
-	if len(zones) == 1 {
-		z := zones[0]
-		sb.WriteString("BEGIN:STANDARD\r\n")
-		sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", z.start.Format("20060102T150405")))
-		sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.offset)))
-		sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
-		sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
-		sb.WriteString("END:STANDARD\r\n")
-	} else {
-		for _, z := range zones {
-			compType := zoneType(z.offset, standardOffset)
-			sb.WriteString(fmt.Sprintf("BEGIN:%s\r\n", compType))
-			start := z.start.Format("20060102T150405")
-			if z.prev != z.offset {
-				start = formatTransition(z.start, z.prev)
-			}
-			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", start))
-			sb.WriteString(fmt.Sprintf("TZOFFSETFROM:%s\r\n", formatOffset(z.prev)))
-			sb.WriteString(fmt.Sprintf("TZOFFSETTO:%s\r\n", formatOffset(z.offset)))
-			sb.WriteString(fmt.Sprintf("TZNAME:%s\r\n", z.name))
-			sb.WriteString(fmt.Sprintf("END:%s\r\n", compType))
-		}
-	}
-
-	sb.WriteString("END:VTIMEZONE\r\n")
-	return sb.String()
-}
-
-// BuildEvent constructs a valid iCalendar event.
-func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, description string, recurrence *RecurrenceOptions, opts *EventOptions) string {
-	eventLines := BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
 
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
 	sb.WriteString("PRODID:-//CalCard//EN\r\n")
-
-	if opts != nil {
-		if vtz := GenerateVTimezone(opts.Timezone, vTimezoneYears(dtstart, allDay, opts.Timezone, recurrence)...); vtz != "" {
-			sb.WriteString(vtz)
-		}
-	}
-
 	sb.WriteString("BEGIN:VEVENT\r\n")
 	for _, line := range eventLines {
 		sb.WriteString(line)
@@ -434,51 +422,7 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	sb.WriteString("END:VEVENT\r\n")
 	sb.WriteString("END:VCALENDAR\r\n")
 
-	return sb.String()
-}
-
-func vTimezoneYears(dtstart string, allDay bool, tzid string, recurrence *RecurrenceOptions) []int {
-	startYear, ok := parseEventYear(dtstart, allDay, tzid)
-	if !ok {
-		return nil
-	}
-
-	endYear := startYear
-	if recurrence != nil && recurrence.Until != "" {
-		if until, err := time.Parse("2006-01-02", recurrence.Until); err == nil {
-			endYear = until.Year()
-		}
-	}
-
-	years := make([]int, 0, endYear-startYear+1)
-	for year := startYear; year <= endYear; year++ {
-		years = append(years, year)
-	}
-	return years
-}
-
-func parseEventYear(value string, allDay bool, tzid string) (int, bool) {
-	if value == "" {
-		return 0, false
-	}
-	if allDay {
-		t, err := time.Parse("2006-01-02", value)
-		if err != nil {
-			return 0, false
-		}
-		return t.Year(), true
-	}
-	if tzid != "" {
-		if loc, err := time.LoadLocation(tzid); err == nil {
-			if t, err := parseDateTimeLocal(value, loc); err == nil {
-				return t.Year(), true
-			}
-		}
-	}
-	if t, err := parseDateTimeLocal(value, time.Local); err == nil {
-		return t.Year(), true
-	}
-	return 0, false
+	return sb.String(), nil
 }
 
 func buildMailtoLine(prop, value string) string {
@@ -608,7 +552,12 @@ func UnfoldLines(ical string) []string {
 
 // SplitComponents separates VCALENDAR header/footer and VEVENT components.
 func SplitComponents(ical string) (header []string, events [][]string, footer []string) {
-	lines := UnfoldLines(ical)
+	return SplitComponentLines(UnfoldLines(ical))
+}
+
+// SplitComponentLines is SplitComponents for the unfolded content lines of an
+// object.
+func SplitComponentLines(lines []string) (header []string, events [][]string, footer []string) {
 	var current []string
 	inEvent := false
 	for _, line := range lines {
@@ -746,24 +695,45 @@ func EscapeICalValue(s string) string {
 	return s
 }
 
-// ParseICSFile parses an ICS file and returns per-resource VCALENDAR payloads grouped by UID.
-func ParseICSFile(icsContent string) ([]string, error) {
+// ParseICSFile parses an ICS file and returns per-resource VCALENDAR payloads
+// grouped by UID, each shaped as a calendar object resource RFC 4791 §4.1
+// admits, and the number of the file's top-level components other than VEVENT
+// and VTIMEZONE, which no payload carries.
+//
+// An export file is not a resource. Its VCALENDAR describes the calendar it
+// was exported from -- METHOD, which §4.1 rules out of a stored resource, and
+// the name, description, colour, source and the like that RFC 7986 and
+// producers' X-WR-* extensions give it -- none of which describes any one
+// event, so each payload carries only the properties saying how its iCalendar
+// is written: PRODID, VERSION and CALSCALE. That leaves out X-WR-TIMEZONE too,
+// which some clients read floating times in while the server reads them in
+// the collection's CALDAV:calendar-timezone. Of the file's other top-level
+// components each payload carries only the VTIMEZONEs its events name, since a
+// resource holds one type of calendar component, and a zone definition one
+// event cannot use should not decide whether another event's payload is valid.
+// A file may also be several exports concatenated, each with its own calendar
+// properties and zone definitions. A resource may carry each property only
+// once, so the first VCALENDAR's are the ones kept; an event's zones are
+// defined as its own VCALENDAR defines them, since exports can define one TZID
+// differently.
+func ParseICSFile(icsContent string) (events []string, leftOut int, err error) {
+	icsContent = ical.TrimByteOrderMark(icsContent)
 	if err := validateICSContent(icsContent); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	lines := UnfoldLines(icsContent)
 	var (
 		headerLines          []string
-		topLevelExtras       [][]string
+		headerNames          = make(map[string]struct{})
+		calendarZones        []calendarTimezones
 		currentExtra         []string
 		currentExtraDepth    int
 		currentEvent         []string
 		currentEventDepth    int
 		inCalendar           bool
-		groupedEvents        []string
 		groupedEventUIDOrder []string
-		eventGroups          = make(map[string][][]string)
+		eventGroups          = make(map[string][]importedEvent)
 	)
 
 	for _, line := range lines {
@@ -775,6 +745,9 @@ func ParseICSFile(icsContent string) ([]string, error) {
 
 		switch upper {
 		case "BEGIN:VCALENDAR":
+			if !inCalendar {
+				calendarZones = append(calendarZones, make(calendarTimezones))
+			}
 			inCalendar = true
 			continue
 		case "END:VCALENDAR":
@@ -793,7 +766,11 @@ func ParseICSFile(icsContent string) ([]string, error) {
 			} else if strings.HasPrefix(upper, "END:") {
 				currentExtraDepth--
 				if currentExtraDepth == 0 {
-					topLevelExtras = append(topLevelExtras, currentExtra)
+					if strings.EqualFold(currentExtra[0], "BEGIN:VTIMEZONE") {
+						calendarZones[len(calendarZones)-1].define(currentExtra)
+					} else {
+						leftOut++
+					}
 					currentExtra = nil
 				}
 			}
@@ -817,7 +794,10 @@ func ParseICSFile(icsContent string) ([]string, error) {
 			if _, ok := eventGroups[uid]; !ok {
 				groupedEventUIDOrder = append(groupedEventUIDOrder, uid)
 			}
-			eventGroups[uid] = append(eventGroups[uid], append([]string(nil), currentEvent...))
+			eventGroups[uid] = append(eventGroups[uid], importedEvent{
+				lines:    append([]string(nil), currentEvent...),
+				calendar: len(calendarZones) - 1,
+			})
 			currentEvent = nil
 			continue
 		}
@@ -834,41 +814,121 @@ func ParseICSFile(icsContent string) ([]string, error) {
 			continue
 		}
 
+		name := strings.ToUpper(strings.TrimSpace(ical.PropertyName(trimmed)))
+		if _, carried := resourceCalendarProperties[name]; !carried {
+			continue
+		}
+		if _, seen := headerNames[name]; seen {
+			continue
+		}
+		headerNames[name] = struct{}{}
 		headerLines = append(headerLines, trimmed)
 	}
 
 	if currentEventDepth != 0 || currentExtraDepth != 0 || inCalendar {
-		return nil, fmt.Errorf("malformed ICS content")
+		return nil, 0, fmt.Errorf("malformed ICS content")
 	}
 
 	if len(groupedEventUIDOrder) == 0 {
-		return nil, fmt.Errorf("no VEVENT components found")
+		return nil, 0, fmt.Errorf("no VEVENT components found")
 	}
 
 	for _, uid := range groupedEventUIDOrder {
-		events := eventGroups[uid]
+		group := eventGroups[uid]
 		var eventICAL strings.Builder
 		writeICalLine(&eventICAL, "BEGIN:VCALENDAR")
 		for _, line := range headerLines {
 			writeICalLine(&eventICAL, line)
 		}
-		for _, comp := range topLevelExtras {
-			for _, line := range comp {
+		for _, definition := range groupTimezones(group, calendarZones) {
+			for _, line := range definition {
 				writeICalLine(&eventICAL, line)
 			}
 		}
-		for _, eventLines := range events {
+		for _, event := range group {
 			writeICalLine(&eventICAL, "BEGIN:VEVENT")
-			for _, line := range eventLines {
+			for _, line := range event.lines {
 				writeICalLine(&eventICAL, line)
 			}
 			writeICalLine(&eventICAL, "END:VEVENT")
 		}
 		writeICalLine(&eventICAL, "END:VCALENDAR")
-		groupedEvents = append(groupedEvents, eventICAL.String())
+		events = append(events, eventICAL.String())
 	}
 
-	return groupedEvents, nil
+	return events, leftOut, nil
+}
+
+// resourceCalendarProperties are the VCALENDAR properties an imported event's
+// payload carries from the file.
+var resourceCalendarProperties = map[string]struct{}{"PRODID": {}, "VERSION": {}, "CALSCALE": {}}
+
+// importedEvent is one VEVENT of an imported file, as the content lines
+// between its BEGIN and END, and the index of the VCALENDAR holding it.
+type importedEvent struct {
+	lines    []string
+	calendar int
+}
+
+// calendarTimezones maps each TZID one VCALENDAR defines to the VTIMEZONE
+// defining it.
+type calendarTimezones map[string][]string
+
+// define records vtimezone unless it names no zone, which RFC 5545 §3.6.5 does
+// not allow and which therefore defines none, or its zone already has a
+// definition: the DAV layer resolves a TZID through the first VTIMEZONE
+// declaring it.
+func (zones calendarTimezones) define(vtimezone []string) {
+	wrapped := make([]string, 0, len(vtimezone)+2)
+	wrapped = append(wrapped, "BEGIN:VCALENDAR")
+	wrapped = append(wrapped, vtimezone...)
+	read := ical.TimezoneComponents(append(wrapped, "END:VCALENDAR"))
+	if len(read) != 1 || read[0].TZID == "" {
+		return
+	}
+	tzid := read[0].TZID
+	if _, defined := zones[tzid]; !defined {
+		zones[tzid] = vtimezone
+	}
+}
+
+// groupTimezones is the VTIMEZONEs defining the zones a group of events name,
+// in the order they are first named. A resource defines each zone once, so a
+// zone named by events from several VCALENDARs is defined as the VCALENDAR of
+// the first event naming it defines it.
+func groupTimezones(group []importedEvent, calendarZones []calendarTimezones) [][]string {
+	var definitions [][]string
+	seen := make(map[string]struct{})
+	for _, event := range group {
+		for _, tzid := range timezoneReferences(event.lines) {
+			if _, ok := seen[tzid]; ok {
+				continue
+			}
+			seen[tzid] = struct{}{}
+			if definition, ok := calendarZones[event.calendar][tzid]; ok {
+				definitions = append(definitions, definition)
+			}
+		}
+	}
+	return definitions
+}
+
+// timezoneReferences lists the non-empty TZID parameter values of lines in the
+// order the lines carry them.
+func timezoneReferences(lines []string) []string {
+	var tzids []string
+	for _, line := range lines {
+		keyPart, _, ok := ical.SplitContentLine(line)
+		if !ok {
+			continue
+		}
+		if tzid, ok := ical.PropertyParam(keyPart, "TZID"); ok {
+			if tzid = strings.TrimSpace(tzid); tzid != "" {
+				tzids = append(tzids, tzid)
+			}
+		}
+	}
+	return tzids
 }
 
 // ExtractUID returns the UID set directly on the first VEVENT, or "" if that

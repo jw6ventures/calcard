@@ -675,16 +675,16 @@ func (r *eventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int6
 		// Keep events whose last instance ends at or after Start, which needs an
 		// upper bound on the interval the object occupies. recurrence_until holds
 		// that end for every recurring object (a far-future sentinel when it
-		// cannot be computed), and dtend holds it for a non-recurring VEVENT that
-		// carries a literal DTEND.
+		// cannot be computed), and dtend holds it for a non-recurring VEVENT
+		// whose end no DURATION decides (icalpkg.StoredEventEnd).
 		//
 		// Nothing else does, so everything else falls to 'infinity' and stays a
 		// candidate for the in-memory RFC 4791 §9.9 pass to judge. dtstart is
 		// deliberately not in this list: an object's start is no bound on where
-		// it ends, so reading it here drops a VEVENT written with DURATION or
-		// with a DATE-valued DTSTART -- both occupy time past dtstart that no
-		// column records -- along with every VTODO, VJOURNAL and VFREEBUSY,
-		// which populate neither column at all.
+		// it ends, so reading it here drops a VEVENT written with DURATION --
+		// which occupies time past dtstart that no column records -- along
+		// with every VTODO, VJOURNAL and VFREEBUSY, which populate neither
+		// column at all.
 		sb.WriteString(` AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= `)
 		sb.WriteString(placeholder(f.Start.UTC()))
 	}
@@ -3264,13 +3264,16 @@ func scanSession(scan rowScanner) (Session, error) {
 	return s, nil
 }
 
-// parseICalFields extracts summary, description, location, dtstart, dtend, and
-// all_day from raw iCalendar data.
+// parseICalFields derives the indexed columns of an event from its body, for a
+// writer that hands the store none: the master VEVENT's text properties, and
+// its dates read through ical.ObjectTimes with the end ical.StoredEventEnd
+// stores, as the DAV layer's analysis of the same body derives them.
 func parseICalFields(raw string) (summary, description, location *string, dtstart, dtend *time.Time, allDay bool) {
 	component := icalpkg.PrimaryVEventComponent(raw)
 	if component == nil {
 		return nil, nil, nil, nil, nil, false
 	}
+	times := icalpkg.NewObjectTimes(icalpkg.UnfoldLines(raw))
 	if property, ok := icalpkg.ComponentProperty(component, "SUMMARY"); ok {
 		summary = util.StrPtr(unescapeICalValue(property.Value))
 	}
@@ -3281,16 +3284,18 @@ func parseICalFields(raw string) (summary, description, location *string, dtstar
 		location = util.StrPtr(unescapeICalValue(property.Value))
 	}
 	if property, ok := icalpkg.ComponentProperty(component, "DTSTART"); ok {
-		if parsed, ok := icalpkg.ParsePropertyDateTimeLocal(property.KeyPart, property.Value); ok {
+		if parsed, ok := times.ResolvePropertyTime(property.KeyPart, property.Value); ok {
 			dtstart = &parsed
 			allDay = len(strings.TrimSpace(property.Value)) == len("20060102") || icalpkg.PropertyParamEquals(property.KeyPart, "VALUE", "DATE")
 		}
 	}
 	if property, ok := icalpkg.ComponentProperty(component, "DTEND"); ok {
-		if parsed, ok := icalpkg.ParsePropertyDateTimeLocal(property.KeyPart, property.Value); ok {
+		if parsed, ok := times.ResolvePropertyTime(property.KeyPart, property.Value); ok {
 			dtend = &parsed
 		}
 	}
+	_, hasDuration := icalpkg.ComponentProperty(component, "DURATION")
+	dtend = icalpkg.StoredEventEnd(dtstart, allDay, dtend, hasDuration)
 	return summary, description, location, dtstart, dtend, allDay
 }
 

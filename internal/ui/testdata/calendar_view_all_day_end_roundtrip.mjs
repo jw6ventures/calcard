@@ -3,14 +3,14 @@
 // This is a sibling of all_day_end_roundtrip.mjs rather than an extension of
 // it: calendar_view.html has no counterpart to all_calendars_view.html's
 // single setEditorDateValues. showCreateEventModal and showEditEventModal
-// each fill their own dtstart/dtend inputs directly, showEditEventModal's
-// body embeds a Go template pipeline ({{.Calendar.ID}}), and both drag in a
+// each fill their own dtstart/dtend inputs directly, and both drag in a
 // much larger DOM surface (recurrence fields, delete forms, scope buttons)
 // that a shared extractor would have to fake regardless of which template it
 // targets. Stubbing all of that inside the other script's fake DOM would
 // have made it harder to follow for both templates; a second script that
-// neutralizes the one template expression and fakes only what these two
-// functions touch stays readable for each.
+// fakes only what these two functions touch stays readable for each.
+//
+// Usage: node calendar_view_all_day_end_roundtrip.mjs <calendar_view.html as rendered>
 import fs from 'node:fs';
 
 const html = fs.readFileSync(process.argv[2], 'utf8');
@@ -26,13 +26,12 @@ function extract(name) {
 }
 
 const pure = ['startOfDay', 'addDays', 'inclusiveAllDayEnd', 'exclusiveAllDayEnd',
-              'formatDateForInput', 'formatDateTimeForInput',
+              'formatDateForInput', 'listedOffsets', 'intlOffsets', 'timeZoneClock',
+              'formatDateTimeForInput', 'browserTimeZone',
               'parseServerDate', 'normalizeServerEvent']
   .map(extract).join('\n');
 
-// showEditEventModal's only server-templated expression, so it can run
-// outside Go's html/template like the rest of the extracted source.
-const showEdit = extract('showEditEventModal').replace('{{.Calendar.ID}}', '1');
+const showEdit = extract('showEditEventModal');
 const showCreate = extract('showCreateEventModal');
 const toggle = extract('toggleAllDay');
 
@@ -67,7 +66,8 @@ const mod = new Function(
   'document', 'window', 'alert', 'setReminderList',
   'toggleRecurrenceOptions', 'toggleRecurrenceEnd', 'setEditScope',
   src + '\nreturn {startOfDay, addDays, inclusiveAllDayEnd, exclusiveAllDayEnd,' +
-    ' formatDateForInput, formatDateTimeForInput, parseServerDate, normalizeServerEvent,' +
+    ' formatDateForInput, timeZoneClock, formatDateTimeForInput, browserTimeZone,' +
+    ' parseServerDate, normalizeServerEvent,' +
     ' showCreateEventModal, showEditEventModal, toggleAllDay};'
 )(document, window, noop, noop, noop, noop, noop);
 
@@ -76,6 +76,9 @@ const mod = new Function(
 window.startOfDay = mod.startOfDay;
 window.inclusiveAllDayEnd = mod.inclusiveAllDayEnd;
 window.exclusiveAllDayEnd = mod.exclusiveAllDayEnd;
+window.formatDateTimeForInput = mod.formatDateTimeForInput;
+window.timeZoneClock = mod.timeZoneClock;
+window.browserTimeZone = mod.browserTimeZone;
 
 let failures = 0;
 const check = (label, got, want) => {

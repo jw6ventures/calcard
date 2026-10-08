@@ -8369,7 +8369,7 @@ func (f *fakeEventRepo) TransferCalendarObject(ctx context.Context, transfer sto
 	if source == nil {
 		return nil, store.ErrNotFound
 	}
-	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.ExpectedSourceRaw {
+	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
 		return nil, store.ErrResourceStateChanged
 	}
 	destination, err := f.GetByResourceName(ctx, transfer.DestinationCalendarID, transfer.DestinationResourceName)
@@ -8401,7 +8401,8 @@ func (f *fakeEventRepo) TransferCalendarObject(ctx context.Context, transfer sto
 	copy.ResourceName = transfer.DestinationResourceName
 	if transfer.Operation == store.CalendarObjectCopy {
 		copy.ETag = transfer.ETag
-	} else {
+	}
+	if transfer.Operation == store.CalendarObjectMove {
 		delete(f.events, f.key(source.CalendarID, source.UID))
 	}
 	if f.events == nil {

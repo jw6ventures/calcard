@@ -71,14 +71,16 @@ func reportCalendarData(report reportRequest) *calendarDataEl {
 // A selection that narrows nothing returns the stored octets untouched: §9.6
 // returns the resource in its entirety when the request names no CALDAV:comp,
 // and a report that only names CALDAV:calendar-data owes the client exactly
-// what was PUT. Octets that do not parse are likewise returned as they stand,
-// since a projection cannot be derived from a tree that was never built.
+// what was PUT. The object is read as parseStoredICalendarObject reads it, the
+// same reading calendar-query matched it by, and one holding no VCALENDAR is
+// likewise returned as it stands, since a projection cannot be derived from a
+// tree that was never built.
 func filterICalendarData(raw string, projection calendarDataProjection) (string, error) {
 	selection := projection.selection
 	if selection == nil || selection.empty() {
 		return raw, nil
 	}
-	root, err := parseICalendarObject(raw)
+	root, err := parseStoredICalendarObject(raw)
 	if err != nil {
 		return raw, nil
 	}

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -75,6 +76,90 @@ func (resolve PropertyTimeResolver) or(keyPart, value string) (time.Time, bool) 
 	return resolve(keyPart, value)
 }
 
+// ResolvePropertyTime calls resolve, or ParsePropertyDateTimeLocal when it is
+// nil.
+func (resolve PropertyTimeResolver) ResolvePropertyTime(keyPart, value string) (time.Time, bool) {
+	return resolve.or(keyPart, value)
+}
+
+// LocalTimeExists answers from the host's zone database, which is where
+// ParsePropertyDateTimeLocal reads a TZID. A TZID the host does not define is
+// read as UTC there, which skips nothing. A resolver reading a TZID through a
+// definition of its own implements RecurrenceTimeResolver itself, so both
+// answers come from one zone.
+func (resolve PropertyTimeResolver) LocalTimeExists(tzid string, wall time.Time) bool {
+	loc, ok := HostLocation(tzid)
+	return !ok || WallClockExists(loc, wall)
+}
+
+// RecurrenceTimeResolver reads the date-valued content lines of a recurrence
+// set in the zones the caller holds. ResolvePropertyTime is a
+// PropertyTimeResolver. LocalTimeExists reports whether wall, a wall-clock
+// reading held as the UTC time with the same fields, is a local time the zone
+// tzid names actually has: RFC 5545 §3.3.10 leaves an instance the RRULE
+// generates on a time a transition skips out of the set, uncounted, and only
+// the definition ResolvePropertyTime reads the TZID through can say which times
+// those are. A nil RecurrenceTimeResolver is PropertyTimeResolver(nil).
+type RecurrenceTimeResolver interface {
+	ResolvePropertyTime(keyPart, value string) (time.Time, bool)
+	LocalTimeExists(tzid string, wall time.Time) bool
+}
+
+// propertyTimeResolver is the PropertyTimeResolver half of resolver.
+func propertyTimeResolver(resolver RecurrenceTimeResolver) PropertyTimeResolver {
+	if resolver == nil {
+		return nil
+	}
+	return resolver.ResolvePropertyTime
+}
+
+// LocalTimeGaps lists the gaps of the host's zone tzid names, per
+// LocalTimeGapLister. A TZID the host does not define skips nothing.
+func (resolve PropertyTimeResolver) LocalTimeGaps(tzid string, after, through time.Time) ([]LocalTimeGap, bool) {
+	loc, ok := HostLocation(tzid)
+	if !ok {
+		return nil, true
+	}
+	return hostLocalTimeGaps(loc)(after, through)
+}
+
+// LocalTimeGapLister is implemented by a RecurrenceTimeResolver that can list
+// where a zone's local times are skipped, which lets a counted sub-daily rule
+// be jumped over whole periods rather than generated one period at a time.
+// LocalTimeGaps lists the gaps of the zone tzid names that start after after
+// and at or before through, both wall clocks held as UTC fields; ok is false
+// when the zone's definition cannot be followed that far. The resolver's
+// LocalTimeExists must report true for every wall clock outside the gaps it
+// lists: those are the only wall clocks a jump tests.
+type LocalTimeGapLister interface {
+	LocalTimeGaps(tzid string, after, through time.Time) (gaps []LocalTimeGap, ok bool)
+}
+
+// localTimeExists is the existence half of resolver, defaulting as
+// PropertyTimeResolver(nil) does.
+func localTimeExists(resolver RecurrenceTimeResolver) func(tzid string, wall time.Time) bool {
+	if resolver == nil {
+		return PropertyTimeResolver(nil).LocalTimeExists
+	}
+	return resolver.LocalTimeExists
+}
+
+// localTimeGapsOf lists the gaps of the zone tzid names through resolver,
+// defaulting as PropertyTimeResolver(nil) does. It is nil when resolver
+// cannot list them.
+func localTimeGapsOf(resolver RecurrenceTimeResolver, tzid string) localTimeGaps {
+	var lister LocalTimeGapLister = PropertyTimeResolver(nil)
+	if resolver != nil {
+		var ok bool
+		if lister, ok = resolver.(LocalTimeGapLister); !ok {
+			return nil
+		}
+	}
+	return func(after, through time.Time) ([]LocalTimeGap, bool) {
+		return lister.LocalTimeGaps(tzid, after, through)
+	}
+}
+
 // recurrenceExpansion selects which component the recurrence set belongs to,
 // how its dates resolve, and how an occurrence is judged to reach the requested
 // window. Consumers need different answers to the last: free-busy wants the
@@ -86,7 +171,7 @@ type recurrenceExpansion struct {
 	includeOverrides  bool
 	includeSuppressed bool
 	maxInstances      int
-	resolve           PropertyTimeResolver
+	resolve           RecurrenceTimeResolver
 	reaches           func(original, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool
 	// visit, when set, receives each occurrence in place of the returned
 	// slice and ends the expansion by returning true.
@@ -97,7 +182,7 @@ type recurrenceExpansion struct {
 // RECURRENCE-ID overrides, including RANGE=THISANDFUTURE) into the concrete
 // busy periods that overlap [rangeStart, rangeEnd). dtstart and duration are
 // the event's resolved start and occurrence length; maxInstances caps the
-// expansion and resolve reads the recurrence dates, per PropertyTimeResolver.
+// expansion and resolve reads the recurrence dates, per RecurrenceTimeResolver.
 //
 // Exhausting maxInstances returns ErrRecurrenceExpansionLimit, and exhausting
 // the rule's scan work returns ErrRecurrenceScanLimit, which wraps it. Either
@@ -109,7 +194,7 @@ type recurrenceExpansion struct {
 // later one. A caller that owes the complete set -- free-busy does, since a
 // dropped period publishes an hour as free that is not -- has to treat the
 // error as fatal rather than publish them.
-func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]BusyPeriod, error) {
+func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver) ([]BusyPeriod, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    "VEVENT",
 		includeOverrides: true,
@@ -154,7 +239,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 // reach the range, so a caller asking only whether the set reaches it can
 // answer from them; one that owes the complete set has to treat the error as
 // fatal.
-func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver, visit func(RecurrenceInstance) bool) error {
+func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, visit func(RecurrenceInstance) bool) error {
 	_, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    componentName,
 		includeOverrides: false,
@@ -179,7 +264,7 @@ func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, dura
 // RANGE=THISANDFUTURE component impacts a requested window without reimplementing
 // recurrence rules or override precedence. Work budget exhaustion returns
 // ErrRecurrenceExpansionLimit.
-func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve PropertyTimeResolver) ([]RecurrenceSlot, error) {
+func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver) ([]RecurrenceSlot, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:     componentName,
 		includeSuppressed: true,
@@ -213,10 +298,11 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 	// per-reader scan of the payload would be paid that many times over.
 	components := componentsNamedFromLines(UnfoldLines(raw), expansion.componentName)
 	component := primaryOf(components)
-	exdates := eventExDates(component, expansion.resolve)
-	overrides := componentRecurrenceOverrides(components, duration, expansion.resolve)
+	resolve := propertyTimeResolver(expansion.resolve)
+	exdates := eventExDates(component, resolve)
+	overrides := componentRecurrenceOverrides(components, resolve, expansion.componentName, duration)
 	overrideIndex := newRecurrenceOverrideIndex(overrides)
-	rdates := componentRDatePeriods(component, expansion.resolve)
+	rdates := componentRDatePeriods(component, resolve)
 	periodEnds := make(map[time.Time]time.Time)
 	for _, rdate := range rdates {
 		if !rdate.End.IsZero() {
@@ -289,6 +375,11 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			if shift := overrideIndex.maxThisAndFutureShiftSeconds(); shift > 0 {
 				scanStart = addSeconds(scanStart, -shift)
 				scanEnd = addSeconds(scanEnd, shift)
+			}
+			// An instance the override lengthens reaches past where the
+			// series' length would end it.
+			if longer := overrideIndex.maxThisAndFutureLengthSeconds() - int64(duration/time.Second); longer > 0 {
+				scanStart = addSeconds(scanStart, -longer)
 			}
 		}
 		scanExpansion := expansion
@@ -364,14 +455,15 @@ func SupportedRecurrenceRule(rrule string) bool {
 	if strings.TrimSpace(rrule) == "" {
 		return true
 	}
-	return supportedRecurrenceFreq(extractRRuleParam(rrule, "FREQ"))
+	freq, _ := RRuleParam(rrule, "FREQ")
+	return supportedRecurrenceFreq(freq)
 }
 
 // ValidRecurrenceRule reports whether value uses the recurrence grammar this
 // package can expand. It is intentionally independent of a DTSTART timezone;
 // callers that expand the rule parse it again with the DTSTART location.
 func ValidRecurrenceRule(value string) bool {
-	_, ok := parseRecurrenceRule(value, time.UTC, nil)
+	_, ok := parseRecurrenceRule(value, time.UTC, nil, nil)
 	return ok
 }
 
@@ -386,14 +478,21 @@ const maxRecurrenceOverrideComponents = 10 * MaxRecurrenceInstances
 // VEVENT, VTODO, or VJOURNAL set carried by raw. The second result is false
 // when a recurrence value cannot be parsed.
 func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
-	components := topLevelComponents(raw, func(name string) bool {
-		switch strings.ToUpper(strings.TrimSpace(name)) {
-		case "VEVENT", "VTODO", "VJOURNAL":
-			return true
-		default:
-			return false
-		}
-	})
+	return RecurrenceSetExceedsLimitFromUnfoldedLines(UnfoldLines(raw), limit)
+}
+
+// RecurrenceSetExceedsLimitFromUnfoldedLines is RecurrenceSetExceedsLimit for
+// a caller that already unfolded the object's content lines.
+func RecurrenceSetExceedsLimitFromUnfoldedLines(lines []string, limit int) (bool, bool) {
+	return RecurrenceSetExceedsLimitOf(NewObjectTimes(lines), limit)
+}
+
+// RecurrenceSetExceedsLimitOf is RecurrenceSetExceedsLimit for the object times
+// reads, resolving its dates as times does, as the DAV layer's matcher reads
+// them.
+func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
+	readTime := times.ResolvePropertyTime
+	components := times.recurringComponents()
 	if len(components) == 0 {
 		return false, true
 	}
@@ -416,7 +515,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 			}
 			continue
 		}
-		parsed, ok := ParsePropertyDateTimeLocal(recurrenceID.KeyPart, recurrenceID.Value)
+		parsed, ok := readTime(recurrenceID.KeyPart, recurrenceID.Value)
 		if !ok {
 			return false, false
 		}
@@ -439,7 +538,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 
 	excluded := make(map[string]struct{})
 	for _, property := range componentProperties(master, "EXDATE") {
-		values, ok := recurrencePropertyInstants(property)
+		values, ok := recurrencePropertyInstants(property, readTime)
 		if !ok {
 			return false, false
 		}
@@ -461,18 +560,41 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 
 	dtstartProperty, hasDTStart := ComponentProperty(master, "DTSTART")
 	var dtstart time.Time
+	var zone tzidDefinition
 	if hasDTStart {
 		var ok bool
-		dtstart, ok = ParsePropertyDateTimeLocal(dtstartProperty.KeyPart, dtstartProperty.Value)
+		dtstart, ok = readTime(dtstartProperty.KeyPart, dtstartProperty.Value)
 		if !ok {
 			return false, false
 		}
+		// The rule is followed on the calendar of the zone the DTSTART names,
+		// so a candidate on a local time that zone skips is never generated or
+		// counted, as RFC 5545 §3.3.10 requires and the expansion does. In a
+		// host zone appendValidTime drops it as it drops an invalid date. In a
+		// zone the object defines the candidates are wall clocks, which the
+		// definition's gaps drop and which are counted as the instants they
+		// resolve to.
+		if tzid, zoned := localDateTimeTZID(dtstartProperty.KeyPart, dtstartProperty.Value); zoned {
+			zone = times.zone(strings.TrimSpace(tzid))
+			switch {
+			case zone.object != nil:
+				dtstart, _ = ParseDateTime(strings.TrimSpace(dtstartProperty.Value))
+			case zone.host != nil:
+				dtstart = dtstart.In(zone.host)
+			}
+		}
+	}
+	instant := func(candidate time.Time) time.Time {
+		if zone.object == nil {
+			return candidate
+		}
+		return zone.instant(candidate)
 	}
 
 	hasRecurrence := false
 	for _, property := range componentProperties(master, "RDATE") {
 		hasRecurrence = true
-		values, ok := recurrencePropertyInstants(property)
+		values, ok := recurrencePropertyInstants(property, readTime)
 		if !ok {
 			return false, false
 		}
@@ -486,7 +608,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	rrule := strings.TrimSpace(componentPropertyValue(master, "RRULE"))
 	if rrule == "" {
 		if hasDTStart {
-			if add(dtstart) {
+			if add(instant(dtstart)) {
 				return true, true
 			}
 		} else if !hasRecurrence {
@@ -497,11 +619,42 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	if !hasDTStart {
 		return false, false
 	}
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
+	var readUntil PropertyTimeResolver
+	if zone.object != nil {
+		// RFC 5545 §3.3.10 admits no floating UNTIL beside a DTSTART with a
+		// TZID; one written anyway is read in the DTSTART's zone.
+		readUntil = func(_, value string) (time.Time, bool) {
+			wall, err := ParseDateTime(value)
+			return instant(wall), err == nil
+		}
+	}
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), readUntil, dtstartWallClock(dtstartProperty.KeyPart, dtstartProperty.Value, readTime))
 	if !ok {
 		return false, false
 	}
-	if add(dtstart) {
+	pastUntil := func(candidate time.Time) bool {
+		return rule.Until != nil && instant(candidate).After(*rule.Until)
+	}
+	// untilWall bounds the wall clocks a rule ending at UNTIL can generate. In
+	// a zone the object defines a wall clock is less than a day from the
+	// instant it names.
+	var untilWall *time.Time
+	if rule.Until != nil {
+		bound := *rule.Until
+		if zone.object != nil {
+			bound = bound.Add(recurrenceCivilScanPad)
+		}
+		untilWall = &bound
+	}
+	if zone.object != nil {
+		// A gap the definition cannot be followed to is not assumed: the
+		// candidate is counted.
+		rule.localTimeExists = existenceFromGaps(func(wall time.Time) bool {
+			skipped, known := zone.object.skips(wall)
+			return !known || !skipped
+		}, zone.object)
+	}
+	if add(instant(dtstart)) {
 		return true, true
 	}
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
@@ -541,7 +694,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 			if current.Before(dtstart) {
 				return false
 			}
-			if rule.Until != nil && current.After(*rule.Until) {
+			if pastUntil(current) {
 				bounded = true
 				return true
 			}
@@ -554,7 +707,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 				bounded = true
 				return true
 			}
-			if add(current) {
+			if add(instant(current)) {
 				exceeded = true
 				return true
 			}
@@ -574,7 +727,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 		}
 		periodStart = next
 		earliest := recurrencePeriodEarliestCandidate(periodStart, rule)
-		if rule.Until != nil && earliest.After(*rule.Until) {
+		if untilWall != nil && earliest.After(*untilWall) {
 			return len(instances) > limit, true
 		}
 		if unbounded && earliest.After(horizon) {
@@ -592,7 +745,11 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 	}
 	countedRule := rule
 	countedRule.Count = countLimit
-	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &occurrences, add); handled {
+	countedRule.Until = untilWall
+	addCandidate := func(candidate time.Time) bool {
+		return !pastUntil(candidate) && add(instant(candidate))
+	}
+	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &occurrences, addCandidate); handled {
 		return exceeds, true
 	}
 	// The scan guard ran out before the horizon above was reached, so how many
@@ -609,7 +766,9 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 // from one whose filters can never select a recurrence period. Gregorian dates
 // repeat every 400 years. Reducing the recurrence interval against that cycle
 // also accounts for sub-daily clock alignment without visiting every second in
-// the cycle.
+// the cycle. Which local times a zone skips is not considered: a daily rule
+// generating only skipped times is followed until the range or the work budget
+// ends, and running out of the budget fails closed.
 func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) bool {
 	switch rule.Freq {
 	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
@@ -641,7 +800,7 @@ func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) b
 		}
 	}
 
-	days := newRecurrenceDayMask(rule)
+	days := rule.days()
 	dailyDivisor := greatestCommonDivisor(int64(rule.Interval), daysInGregorianCycle)
 	for dayNumber := recurrenceDayMaskOrigin; dayNumber < recurrenceDayMaskOrigin+daysInGregorianCycle; dayNumber++ {
 		if !days.admits(dayNumber) {
@@ -653,7 +812,7 @@ func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) b
 			}
 			continue
 		}
-		required := positiveRemainder(base.Unix()-civilDayStart(dayNumber, dtstart.Location()).Unix(), subDailyDivisor)
+		required := positiveRemainder(base.Unix()-civilDayStartUnix(dayNumber, dtstart.Location()), subDailyDivisor)
 		if _, ok := subDailyResidues[required]; ok {
 			return true
 		}
@@ -700,6 +859,22 @@ func newRecurrenceDayMask(rule recurrenceRule) recurrenceDayMask {
 	return mask
 }
 
+// lazyRecurrenceDayMask is a rule's recurrenceDayMask, built on first use.
+type lazyRecurrenceDayMask struct {
+	once sync.Once
+	mask recurrenceDayMask
+}
+
+// days is the rule's recurrenceDayMask, built once per parsed rule however many
+// readers of the rule ask for it.
+func (rule recurrenceRule) days() recurrenceDayMask {
+	if rule.dayMask == nil {
+		return newRecurrenceDayMask(rule)
+	}
+	rule.dayMask.once.Do(func() { rule.dayMask.mask = newRecurrenceDayMask(rule) })
+	return rule.dayMask.mask
+}
+
 // admits reports whether the day with the given civil day number is admitted.
 func (m recurrenceDayMask) admits(dayNumber int64) bool {
 	index := positiveRemainder(dayNumber-recurrenceDayMaskOrigin, daysInGregorianCycle)
@@ -731,15 +906,28 @@ func civilDayStart(dayNumber int64, loc *time.Location) time.Time {
 	return time.Date(2000, time.January, 1+int(dayNumber-recurrenceDayMaskOrigin), 0, 0, 0, 0, loc)
 }
 
+// civilDayStartUnix is civilDayStart(dayNumber, loc).Unix(), counted in whole
+// days in UTC, where every day is 86,400 seconds long.
+func civilDayStartUnix(dayNumber int64, loc *time.Location) int64 {
+	if loc == time.UTC {
+		return (dayNumber - unixEpochDayNumber) * 24 * 60 * 60
+	}
+	return civilDayStart(dayNumber, loc).Unix()
+}
+
+// unixEpochDayNumber is the civil day number of 1970-01-01.
+var unixEpochDayNumber = civilDayNumber(time.Unix(0, 0).UTC())
+
 // barrenPeriodRun recognizes a daily or coarser rule that will never offer
 // another candidate. What a period offers depends on where it falls in the
 // Gregorian cycle, and a rule's periods step through every position they can
 // take there in a fixed number of periods: at most 400 for a yearly rule and
 // 4,800 for a monthly one. A run of that many periods offering nothing has seen
 // every position the rule will ever reach, so no later period can offer
-// anything either. Time-zone
-// transitions are the one thing two periods at the same position can differ
-// in, and past a zone's recorded history they repeat by a yearly rule as well.
+// anything either. Time-zone transitions are the one thing two periods at the
+// same position can differ in -- in where a period falls, and in which of its
+// local times exist to be offered -- and past a zone's recorded history they
+// repeat by a yearly rule as well.
 //
 // Without this a rule whose BY parts can never hold together is scanned to the
 // period limit, which for a yearly rule naming hundreds of days a year is
@@ -1087,7 +1275,7 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 // through the days its date filters admit, so how far apart those days fall
 // costs a mask word per 64 days rather than a unit per day.
 func visitSparseRecurrence(periodStart, dtstart, until time.Time, rule recurrenceRule, work *recurrenceWork, add func(time.Time) bool) (stopped, overBudget bool) {
-	days := newRecurrenceDayMask(rule)
+	days := rule.days()
 	for from := civilDayNumber(periodStart); ; {
 		dayNumber, wordsRead, ok := days.next(from)
 		if !ok {
@@ -1197,7 +1385,7 @@ func civilDayNumber(value time.Time) int64 {
 	return era*146097 + dayOfEra
 }
 
-func recurrencePropertyInstants(property PropertyValue) ([]time.Time, bool) {
+func recurrencePropertyInstants(property PropertyValue, read PropertyTimeResolver) ([]time.Time, bool) {
 	parts := strings.Split(property.Value, ",")
 	values := make([]time.Time, 0, len(parts))
 	for _, part := range parts {
@@ -1205,7 +1393,7 @@ func recurrencePropertyInstants(property PropertyValue) ([]time.Time, bool) {
 		if slash := strings.IndexByte(start, '/'); slash >= 0 {
 			start = strings.TrimSpace(start[:slash])
 		}
-		parsed, ok := ParsePropertyDateTimeLocal(property.KeyPart, start)
+		parsed, ok := read.or(property.KeyPart, start)
 		if !ok {
 			return nil, false
 		}
@@ -1232,7 +1420,7 @@ func recurrenceInstantKey(value time.Time) string {
 // half-generated period names the wrong UTC offset, and nothing downstream can
 // tell.
 func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil, wallClockIn(dtstart.Location()))
 	if !ok || before.Before(dtstart) {
 		return time.Time{}, false, true
 	}
@@ -1261,6 +1449,8 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 		// be followed forward from there.
 		lister := newRecurrenceStartLister(dtstart, rule, generatesStart, work)
 		lister.latestOnly = true
+		// An incomplete listing holds the latest start reached, which may lie
+		// past what it covers.
 		complete := lister.ListThrough(before, math.MaxInt)
 		if len(lister.starts) == 0 {
 			return time.Time{}, false, complete
@@ -1353,6 +1543,11 @@ type RecurrenceStartLister struct {
 	// nothing else of the listing and may follow a rule through hundreds of
 	// thousands of starts to reach it.
 	latestOnly bool
+	// keepFrom, when set, is where the listing starts keeping starts: those
+	// before it are followed but not kept, save the latest, dropped.
+	keepFrom   time.Time
+	dropped    time.Time
+	hasDropped bool
 	work       *recurrenceWork
 
 	periodStart time.Time
@@ -1364,7 +1559,7 @@ type RecurrenceStartLister struct {
 // NewRecurrenceStartLister prepares a listing of the set dtstart and rrule
 // describe. Nothing past the DTSTART is generated until ListThrough asks.
 func NewRecurrenceStartLister(dtstart time.Time, rrule string) *RecurrenceStartLister {
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil)
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil, wallClockIn(dtstart.Location()))
 	if !ok {
 		// LatestRecurrenceOnOrBefore finds nothing in a rule it cannot parse,
 		// not even the DTSTART.
@@ -1379,6 +1574,30 @@ func NewRecurrenceStartLister(dtstart time.Time, rrule string) *RecurrenceStartL
 		return &RecurrenceStartLister{dtstart: dtstart, halted: true}
 	}
 	return newRecurrenceStartLister(dtstart, rule, generatesStart, work)
+}
+
+// NewRecurrenceStartListerFrom prepares a listing of the same set that keeps
+// only the starts at or after from, and the latest start before it, so it
+// answers LatestOnOrBefore for every bound at or after from, and for none
+// before it. The rule is followed from its DTSTART, drawing on the listing's
+// work budget, but the starts before from are neither kept nor counted against
+// ListThrough's limit, so a rule too dense to list from its DTSTART within
+// that limit is listed around the instants asked about.
+func NewRecurrenceStartListerFrom(dtstart time.Time, rrule string, from time.Time) *RecurrenceStartLister {
+	lister := NewRecurrenceStartLister(dtstart, rrule)
+	lister.keepFrom = from
+	lister.dropBefore(len(lister.starts))
+	return lister
+}
+
+// dropBefore moves the first n starts, those before keepFrom, out of the
+// listing, keeping the latest of them as dropped.
+func (l *RecurrenceStartLister) dropBefore(n int) {
+	kept := sort.Search(min(n, len(l.starts)), func(i int) bool { return !l.starts[i].Before(l.keepFrom) })
+	if kept > 0 {
+		l.dropped, l.hasDropped = l.starts[kept-1], true
+		l.starts = l.starts[kept:]
+	}
 }
 
 func newRecurrenceStartLister(dtstart time.Time, rule recurrenceRule, generatesStart bool, work *recurrenceWork) *RecurrenceStartLister {
@@ -1407,8 +1626,12 @@ func (l *RecurrenceStartLister) Covers(through time.Time) bool {
 }
 
 // LatestOnOrBefore answers what LatestRecurrenceOnOrBefore answers for the same
-// bound, from the listing. ok is false when the listing does not reach before.
+// bound, from the listing. ok is false when the listing does not reach before,
+// or, for a listing kept from an instant, before falls before that instant.
 func (l *RecurrenceStartLister) LatestOnOrBefore(before time.Time) (latest time.Time, found, ok bool) {
+	if before.Before(l.keepFrom) {
+		return time.Time{}, false, false
+	}
 	if before.Before(l.dtstart) {
 		return time.Time{}, false, true
 	}
@@ -1420,6 +1643,9 @@ func (l *RecurrenceStartLister) LatestOnOrBefore(before time.Time) (latest time.
 		index++
 	}
 	if index == 0 {
+		if l.hasDropped {
+			return l.dropped, true, true
+		}
 		return time.Time{}, false, true
 	}
 	return l.starts[index-1], true, true
@@ -1469,6 +1695,11 @@ func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
 				finished = true
 				return true
 			}
+			if candidate.Before(l.keepFrom) {
+				l.occurrences++
+				l.dropped, l.hasDropped = candidate, true
+				return false
+			}
 			if len(l.starts) >= limit {
 				overflow = candidate
 				return true
@@ -1517,14 +1748,19 @@ func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
 }
 
 // halt stops the listing, which holds every start at or before covered, and
-// drops whatever it listed past that.
+// drops whatever it listed past that. A latestOnly listing keeps its one start,
+// the latest reached, which LatestRecurrenceOnOrBefore answers with when the
+// listing is incomplete.
 func (l *RecurrenceStartLister) halt(covered time.Time) {
 	if covered.After(l.covered) {
 		l.covered = covered
 	}
+	l.halted = true
+	if l.latestOnly {
+		return
+	}
 	kept := sort.Search(len(l.starts), func(i int) bool { return l.starts[i].After(l.covered) })
 	l.starts = l.starts[:kept]
-	l.halted = true
 }
 
 func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
@@ -1558,10 +1794,19 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 const recurrenceCivilScanPad = 24 * time.Hour
 
 func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates recurrenceInstantSet, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod) bool) (bool, error) {
-	recurrenceStart, resolveCandidate, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
-	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), expansion.resolve)
+	resolve := propertyTimeResolver(expansion.resolve)
+	recurrenceStart, resolveCandidate, candidateExists, gaps, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
+	var startWall wallClockResolver
+	if property, ok := ComponentProperty(component, "DTSTART"); ok {
+		startWall = dtstartWallClock(property.KeyPart, property.Value, resolve)
+	}
+	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), resolve, startWall)
 	if !ok {
 		return false, nil
+	}
+	rule.localTimeExists = candidateExists
+	if candidateExists != nil && gaps != nil {
+		rule.localTimeExists = existenceFromGaps(candidateExists, gaps)
 	}
 
 	occurrences := 0
@@ -1638,7 +1883,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	if rule.Count == 0 {
 		threshold := scanStart.Add(-duration)
 		periodStart = rewindToPeriodReaching(fastForwardRecurrencePeriod(periodStart, threshold, rule), periodStart, threshold, rule)
-	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), rule); ok {
+	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), recurrenceStart, rule, rule.Count-occurrences, gaps); ok {
 		if occurrences+skipped >= rule.Count {
 			return true, nil
 		}
@@ -1701,44 +1946,193 @@ func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule, work *
 	return generates && !overBudget, overBudget
 }
 
-func recurrenceGenerationStart(component *Component, fallback time.Time, resolve PropertyTimeResolver) (time.Time, func(time.Time) (time.Time, bool), bool) {
+// recurrenceGenerationStart is where a rule's candidates are generated from
+// and how each one becomes an instance. A DTSTART with no zone suffix is a wall
+// clock, so its candidates are generated on wall clocks, held as UTC fields, and
+// each is resolved through resolver the way the DTSTART was; civil reports that
+// scale. candidateExists, when set, reports whether a candidate's wall clock is
+// a local time the DTSTART's zone has (RFC 5545 §3.3.10), and gaps, when the
+// resolver can list them, where that zone skips local times. Both are set only
+// for a
+// DATE-TIME carrying a TZID: a UTC value and a DATE name no local time, and a
+// floating value is defined in no zone at all -- the zone RFC 4791 §7.3 reads
+// it in for one request does not make the object's instances depend on that
+// zone's transitions, so each floating instance is kept and placed per §3.3.5.
+func recurrenceGenerationStart(component *Component, fallback time.Time, resolver RecurrenceTimeResolver) (start time.Time, resolveCandidate func(time.Time) (time.Time, bool), candidateExists func(time.Time) bool, gaps localTimeGaps, civil bool) {
 	property, ok := ComponentProperty(component, "DTSTART")
 	if !ok || hasZoneSuffix(strings.TrimSpace(property.Value)) {
-		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, false
+		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, nil, nil, false
 	}
 	wall, err := ParseDateTime(strings.TrimSpace(property.Value))
 	if err != nil {
-		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, false
+		return fallback, func(candidate time.Time) (time.Time, bool) { return candidate, true }, nil, nil, false
 	}
+	resolve := propertyTimeResolver(resolver)
 	dateOnly := !strings.Contains(property.Value, "T")
-	return wall, func(candidate time.Time) (time.Time, bool) {
-		layout := "20060102T150405"
-		if dateOnly {
-			layout = "20060102"
-		}
+	layout := "20060102T150405"
+	if dateOnly {
+		layout = "20060102"
+	}
+	resolveCandidate = func(candidate time.Time) (time.Time, bool) {
 		return resolve.or(property.KeyPart, candidate.Format(layout))
-	}, true
+	}
+	if tzid, zoned := PropertyParam(property.KeyPart, "TZID"); zoned && !dateOnly {
+		exists := localTimeExists(resolver)
+		candidateExists = func(candidate time.Time) bool {
+			return exists(tzid, candidate)
+		}
+		gaps = localTimeGapsOf(resolver, tzid)
+	}
+	return wall, resolveCandidate, candidateExists, gaps, true
 }
 
-func fastForwardCountedSubDailyRecurrence(periodStart, threshold time.Time, rule recurrenceRule) (time.Time, int, bool) {
+// gapListingWindow is how far past a candidate the zone's gaps are listed at
+// once. Candidates arrive in ascending order, so one listing serves a year of
+// them.
+const gapListingWindow = 366 * 24 * time.Hour
+
+// existenceFromGaps answers exists from the zone's gaps, listed a window at a
+// time: a wall clock outside every gap the zone lists exists, per the
+// LocalTimeGapLister contract, so only one inside a gap is asked of exists.
+// The first candidate is asked directly, since an expansion that stops at its
+// first instance -- as a RFC 4791 §9.9 match does -- needs no listing. Where
+// the gaps cannot be listed, every candidate is asked of exists.
+func existenceFromGaps(exists func(time.Time) bool, gaps localTimeGaps) func(time.Time) bool {
+	var windowStart, windowEnd time.Time
+	var listed []LocalTimeGap
+	asked, listing, unlistable := false, false, false
+	return func(wall time.Time) bool {
+		if unlistable {
+			return exists(wall)
+		}
+		if !asked {
+			asked = true
+			return exists(wall)
+		}
+		if !listing || wall.Before(windowStart) || wall.After(windowEnd) {
+			through := wall.Add(gapListingWindow)
+			found, ok := gaps(wall.Add(-maxLocalTimeGap), through)
+			if !ok {
+				unlistable = true
+				return exists(wall)
+			}
+			windowStart, windowEnd, listed, listing = wall, through, found, true
+		}
+		for _, gap := range listed {
+			if !wall.Before(gap.Start) && wall.Before(gap.Start.Add(gap.Length)) {
+				return exists(wall)
+			}
+		}
+		return true
+	}
+}
+
+// fastForwardCountedSubDailyRecurrence jumps a fixed-step sub-daily rule from
+// periodStart over the whole periods before threshold, and returns the period
+// it reaches with the number of instances passed on the way. Once that number
+// reaches remaining, the instances the rule still had to give, the jump may
+// stop short of threshold: the series ends inside it.
+//
+// Each period of such a rule offers one candidate, which is an instance unless
+// it falls on a local time the series' zone skips (RFC 5545 §3.3.10). Where the
+// rule can meet such a time, gaps lists the zone's skipped local times, and
+// each candidate inside one is tested as the period-by-period walk tests it;
+// every candidate outside them exists. ok is false when the rule cannot be
+// jumped this way, and the caller walks its periods.
+func fastForwardCountedSubDailyRecurrence(periodStart, threshold, dtstart time.Time, rule recurrenceRule, remaining int, gaps localTimeGaps) (time.Time, int, bool) {
 	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
-	if !ok || !fixedStepSubDailyRecurrence(rule) {
+	if !ok || !fixedStepSubDailyRecurrence(rule) || (rule.localTimeExists != nil && gaps == nil) {
 		return periodStart, 0, false
 	}
-	if !threshold.After(periodStart) {
-		return periodStart, 0, true
+	passed := 0
+	for passed < remaining {
+		steps := wholePeriodsBefore(periodStart, threshold, stepSeconds)
+		if steps <= 0 {
+			break
+		}
+		if rule.localTimeExists == nil {
+			return addSeconds(periodStart, steps*stepSeconds), passed + int(steps), true
+		}
+		// The jump is held to the periods the series can still need, and
+		// those a gap can take an instance from, so the gaps listed span
+		// the series' end rather than everything up to threshold.
+		steps = min(steps, int64(remaining-passed)+periodsWithinMaxGap(stepSeconds))
+		skipped, ok := skippedSubDailyCandidates(periodStart, steps, stepSeconds, dtstart, rule, gaps)
+		if !ok {
+			break
+		}
+		periodStart = addSeconds(periodStart, steps*stepSeconds)
+		passed += int(steps) - skipped
 	}
-	// Whole seconds rather than a time.Duration, which saturates at about 292
-	// years and would stop the fast-forward short for an early DTSTART.
+	return periodStart, passed, true
+}
+
+// wholePeriodsBefore counts the periods of stepSeconds from periodStart that
+// end at or before threshold. It counts whole seconds rather than a
+// time.Duration, which saturates at about 292 years and would stop short for an
+// early DTSTART.
+func wholePeriodsBefore(periodStart, threshold time.Time, stepSeconds int64) int64 {
+	if !threshold.After(periodStart) {
+		return 0
+	}
 	elapsed := threshold.Unix() - periodStart.Unix()
 	if threshold.Nanosecond() < periodStart.Nanosecond() {
 		elapsed--
 	}
-	steps := elapsed / stepSeconds
-	if steps <= 0 {
-		return periodStart, 0, true
+	return elapsed / stepSeconds
+}
+
+// maxLocalTimeGap bounds the length of a stretch of local time a zone skips:
+// a UTC offset is less than a day either side of UTC.
+const maxLocalTimeGap = 48 * time.Hour
+
+// periodsWithinMaxGap is how many periods of stepSeconds one gap can hold.
+func periodsWithinMaxGap(stepSeconds int64) int64 {
+	return int64(maxLocalTimeGap/time.Second)/stepSeconds + 1
+}
+
+// skippedSubDailyCandidates counts the candidates of the steps periods from
+// periodStart of a fixed-step sub-daily rule that existingLocalTimes leaves
+// out. The candidates are steps apart from the first period's, so only those
+// inside a gap are tested.
+func skippedSubDailyCandidates(periodStart time.Time, steps, stepSeconds int64, dtstart time.Time, rule recurrenceRule, gaps localTimeGaps) (int, bool) {
+	firsts := subDailyCandidatesForPeriod(periodStart, dtstart, rule)
+	if len(firsts) != 1 {
+		return 0, false
 	}
-	return addSeconds(periodStart, steps*stepSeconds), int(steps), true
+	first := firsts[0]
+	last := addSeconds(first, (steps-1)*stepSeconds)
+	found, ok := gaps(first.Add(-maxLocalTimeGap), last)
+	if !ok {
+		return 0, false
+	}
+	slices.SortFunc(found, func(a, b LocalTimeGap) int { return a.Start.Compare(b.Start) })
+	skipped := 0
+	// tested is the first candidate index no gap has covered yet, so a
+	// candidate inside gaps that overlap is tested once.
+	var tested int64
+	for _, gap := range found {
+		from := max(tested, ceilDivide(gap.Start.Unix()-first.Unix(), stepSeconds))
+		through := min(steps, ceilDivide(gap.Start.Add(gap.Length).Unix()-first.Unix(), stepSeconds))
+		for index := from; index < through; index++ {
+			candidate := addSeconds(first, index*stepSeconds)
+			if !candidate.Equal(dtstart) && !rule.localTimeExists(candidate) {
+				skipped++
+			}
+		}
+		tested = max(tested, through)
+	}
+	return skipped, true
+}
+
+// ceilDivide is numerator/denominator rounded toward positive infinity, for a
+// positive denominator.
+func ceilDivide(numerator, denominator int64) int64 {
+	quotient := numerator / denominator
+	if numerator%denominator > 0 {
+		quotient++
+	}
+	return quotient
 }
 
 func fixedStepSubDailyRecurrence(rule recurrenceRule) bool {
@@ -1854,7 +2248,17 @@ type recurrenceOverride struct {
 	rangeThisAndFuture bool
 }
 
-func componentRecurrenceOverrides(components []Component, fallbackDuration time.Duration, resolve PropertyTimeResolver) []recurrenceOverride {
+// componentRecurrenceOverrides reads each override of a componentName series
+// by the EventEnd rule, its end the one it writes: a VTODO's DUE, any other
+// component's DTEND, or its DURATION. A VEVENT override writing neither lasts
+// seriesLength, the length of an occurrence of its series; any other override
+// writing neither ends as RFC 4791 §9.9 places a component with a DTSTART
+// alone, at that start.
+func componentRecurrenceOverrides(components []Component, resolve PropertyTimeResolver, componentName string, seriesLength time.Duration) []recurrenceOverride {
+	endName := "DTEND"
+	if strings.EqualFold(componentName, "VTODO") {
+		endName = "DUE"
+	}
 	var overrides []recurrenceOverride
 	for _, component := range components {
 		recurrenceIDProp, ok := ComponentProperty(&component, "RECURRENCE-ID")
@@ -1866,10 +2270,10 @@ func componentRecurrenceOverrides(components []Component, fallbackDuration time.
 			continue
 		}
 
-		start := recurrenceID
+		start, startProp := recurrenceID, recurrenceIDProp
 		if prop, ok := ComponentProperty(&component, "DTSTART"); ok {
 			if parsed, ok := resolve.or(prop.KeyPart, prop.Value); ok {
-				start = parsed
+				start, startProp = parsed, prop
 			}
 		}
 
@@ -1878,16 +2282,24 @@ func componentRecurrenceOverrides(components []Component, fallbackDuration time.
 			cancelled = strings.EqualFold(strings.TrimSpace(prop.Value), "CANCELLED")
 		}
 
-		end := start.Add(fallbackDuration)
-		if prop, ok := ComponentProperty(&component, "DTEND"); ok {
-			if parsed, ok := resolve.or(prop.KeyPart, prop.Value); ok && parsed.After(start) {
-				end = parsed
-			}
-		} else if prop, ok := ComponentProperty(&component, "DURATION"); ok {
-			if duration, ok := ParseDuration(prop.Value); ok && duration > 0 {
-				end = start.Add(duration)
-			}
+		extent := EventEnd{Start: start, StartIsDate: dateOnlyValue(startProp)}
+		endProp, writesEnd := ComponentProperty(&component, endName)
+		if writesEnd {
+			extent.End, extent.HasEnd = resolve.or(endProp.KeyPart, endProp.Value)
 		}
+		duration, writesDuration := ComponentProperty(&component, "DURATION")
+		if writesDuration {
+			extent.Duration, extent.HasDuration = ParseDuration(duration.Value)
+		}
+		if strings.EqualFold(componentName, "VEVENT") {
+			extent.InheritsLength, extent.SeriesLength = !writesEnd && !writesDuration, seriesLength
+		}
+		end := extent.OccurrenceEnd(func(dayStart time.Time) time.Time {
+			if dayEnd, ok := dayAfterDate(startProp, resolve); ok {
+				return dayEnd
+			}
+			return dayStart.AddDate(0, 0, 1)
+		})
 
 		overrides = append(overrides, recurrenceOverride{
 			recurrenceID:       recurrenceID,
@@ -1897,6 +2309,23 @@ func componentRecurrenceOverrides(components []Component, fallbackDuration time.
 		})
 	}
 	return overrides
+}
+
+// dateOnlyValue reports whether a date-valued property holds a DATE rather than
+// a DATE-TIME.
+func dateOnlyValue(property PropertyValue) bool {
+	return len(strings.TrimSpace(property.Value)) == len("20060102") || PropertyParamEquals(property.KeyPart, "VALUE", "DATE")
+}
+
+// dayAfterDate resolves the date after the DATE property holds, through the
+// same resolver, so the day ends at the midnight the property's own zone
+// places.
+func dayAfterDate(property PropertyValue, resolve PropertyTimeResolver) (time.Time, bool) {
+	date, err := time.Parse("20060102", strings.TrimSpace(property.Value))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return resolve.or(property.KeyPart, date.AddDate(0, 0, 1).Format("20060102"))
 }
 
 // recurrenceOverrideIndex answers the two override questions the expansion
@@ -1953,6 +2382,22 @@ func (index recurrenceOverrideIndex) hasThisAndFuture() bool {
 	return len(index.thisAndFuture) > 0
 }
 
+// maxThisAndFutureLengthSeconds is the longest occurrence any
+// RANGE=THISANDFUTURE override gives the instances it governs, in whole
+// seconds rounded up.
+func (index recurrenceOverrideIndex) maxThisAndFutureLengthSeconds() int64 {
+	var longest int64
+	for _, override := range index.thisAndFuture {
+		if override.cancelled {
+			continue
+		}
+		if length := override.period.End.Unix() - override.period.Start.Unix() + 1; length > longest {
+			longest = length
+		}
+	}
+	return longest
+}
+
 // maxThisAndFutureShiftSeconds is the furthest any RANGE=THISANDFUTURE
 // override moves its instances, in whole seconds rounded up. It is counted in
 // seconds rather than as a time.Duration because the distance can exceed the
@@ -1997,9 +2442,6 @@ func (index recurrenceOverrideIndex) applyThisAndFuture(period BusyPeriod) (Busy
 
 	shiftedStart := moveInstant(period.Start, selected.recurrenceID, selected.period.Start)
 	duration := selected.period.End.Sub(selected.period.Start)
-	if duration <= 0 {
-		duration = period.End.Sub(period.Start)
-	}
 	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, false, selected.recurrenceID
 }
 
@@ -2056,48 +2498,40 @@ func topLevelComponents(ical string, accept func(string) bool) []Component {
 	return topLevelComponentsFromLines(UnfoldLines(ical), accept)
 }
 
+// topLevelComponentsFromLines reads the components directly beneath a
+// VCALENDAR that accept selects, in the order they begin, as ReadComponents
+// reads a stored object, so the DAV layer and this package see the same
+// components. A property belongs to the innermost component open around it, so
+// one that follows a sub-component's END is the enclosing component's.
 func topLevelComponentsFromLines(lines []string, accept func(string) bool) []Component {
+	// A handle is the index of the component it collects, or -1 for the root.
 	var components []Component
-	depth := 0
-	componentDepth := 0
-	componentName := ""
-	var current *Component
-	for _, rawLine := range lines {
-		controlLine := strings.TrimSpace(rawLine)
-		upper := strings.ToUpper(controlLine)
-		switch {
-		case strings.HasPrefix(upper, "BEGIN:"):
-			depth++
-			name := strings.TrimSpace(controlLine[len("BEGIN:"):])
-			if current == nil && depth == 2 && accept(name) {
-				componentDepth = depth
-				componentName = name
-				current = &Component{}
+	root := -1
+	_, _ = ReadComponents(lines, false,
+		func(parent *int, name string) (*int, error) {
+			switch {
+			case parent == nil:
+				return &root, nil
+			case parent != &root || !accept(name):
+				return nil, nil
 			}
-			continue
-		case strings.HasPrefix(upper, "END:"):
-			if current != nil && componentDepth == depth && strings.EqualFold(strings.TrimSpace(controlLine[len("END:"):]), componentName) {
-				components = append(components, *current)
-				current = nil
-				componentDepth = 0
-				componentName = ""
+			index := len(components)
+			components = append(components, Component{})
+			return &index, nil
+		},
+		func(component *int, line string) error {
+			if *component < 0 {
+				return nil
 			}
-			depth--
-			if depth < 0 {
-				depth = 0
+			current := &components[*component]
+			keyPart, value, ok := SplitContentLine(line)
+			if !ok {
+				current.malformedProperties = append(current.malformedProperties, line)
+				return nil
 			}
-			continue
-		}
-		if current == nil || componentDepth != depth {
-			continue
-		}
-		keyPart, value, ok := SplitContentLine(rawLine)
-		if !ok {
-			current.malformedProperties = append(current.malformedProperties, rawLine)
-			continue
-		}
-		current.properties = append(current.properties, PropertyValue{KeyPart: keyPart, Value: value})
-	}
+			current.properties = append(current.properties, PropertyValue{KeyPart: keyPart, Value: value})
+			return nil
+		})
 	return components
 }
 
@@ -2242,7 +2676,7 @@ func ParsePropertyDateTimeLocal(keyPart, value string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if tzid, ok := PropertyParam(keyPart, "TZID"); ok {
-		if loc, err := time.LoadLocation(tzid); err == nil {
+		if loc, ok := HostLocation(tzid); ok {
 			if parsed, err := ParseDateTimeInLocation(value, loc); err == nil {
 				return parsed, true
 			}
@@ -2361,6 +2795,18 @@ type recurrenceRule struct {
 	// byDaySet is ByDay in the form a day is matched against.
 	// parseRecurrenceRule builds it, as anything else assembling a rule must.
 	byDaySet weekdaySet
+	// dayMask holds the rule's recurrenceDayMask once days builds it. It is
+	// shared by every copy of the parsed rule, none of which changes the date
+	// filters the mask is built from.
+	dayMask *lazyRecurrenceDayMask
+
+	// localTimeExists, when set, reports whether a candidate's wall clock is a
+	// local time the series' zone has. RFC 5545 §3.3.10 requires a candidate
+	// on a time a transition skips to be "ignored" and not "counted as part of
+	// the recurrence set", so visitRecurrenceCandidates never offers one. It is
+	// left nil for a VTIMEZONE observance rule, whose onsets are transitions
+	// stated in the offset they leave rather than instances of a series.
+	localTimeExists func(wall time.Time) bool
 }
 
 type weekdaySpecifier struct {
@@ -2368,7 +2814,10 @@ type weekdaySpecifier struct {
 	Day     time.Weekday
 }
 
-func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeResolver) (recurrenceRule, bool) {
+// parseRecurrenceRule parses rrule. loc and resolve read a floating UNTIL, per
+// parseRecurrenceUntil, and startWall reads the wall clock of a DATE-TIME
+// DTSTART; it is nil for a DATE DTSTART.
+func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeResolver, startWall wallClockResolver) (recurrenceRule, bool) {
 	params := make(map[string]string)
 	for _, part := range strings.Split(rrule, ";") {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
@@ -2412,7 +2861,7 @@ func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeR
 		return recurrenceRule{}, false
 	}
 	if untilStr := params["UNTIL"]; untilStr != "" {
-		until, ok := parseRecurrenceUntil(untilStr, loc, resolve)
+		until, ok := parseRecurrenceUntil(untilStr, loc, resolve, startWall)
 		if !ok {
 			return recurrenceRule{}, false
 		}
@@ -2455,6 +2904,7 @@ func parseRecurrenceRule(rrule string, loc *time.Location, resolve PropertyTimeR
 		return recurrenceRule{}, false
 	}
 	rule.byDaySet = newWeekdaySet(rule.ByDay)
+	rule.dayMask = &lazyRecurrenceDayMask{}
 	ordinalWeekday := false
 	for _, day := range rule.ByDay {
 		if day.Ordinal != 0 {
@@ -2504,7 +2954,18 @@ func knownRecurrenceRulePart(name string) bool {
 // of its own belongs to whatever zone resolved DTSTART: the caller's resolver
 // first, since that is the only thing holding a zone the observances of the
 // resource itself define, then the DTSTART location.
-func parseRecurrenceUntil(value string, loc *time.Location, resolve PropertyTimeResolver) (time.Time, bool) {
+//
+// UNTIL is inclusive, so a DATE bounding a DATE-TIME DTSTART admits every
+// instance on that day: it is read as the day's last instant in the DTSTART's
+// zone, through startWall.
+func parseRecurrenceUntil(value string, loc *time.Location, resolve PropertyTimeResolver, startWall wallClockResolver) (time.Time, bool) {
+	if startWall != nil && !strings.Contains(value, "T") {
+		day, err := time.Parse("20060102", value)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return endOfWallClockDay(day, startWall)
+	}
 	if !hasZoneSuffix(value) {
 		if resolve != nil {
 			if parsed, ok := resolve("UNTIL", value); ok {
@@ -2519,6 +2980,52 @@ func parseRecurrenceUntil(value string, loc *time.Location, resolve PropertyTime
 	}
 	parsed, err := ParseDateTime(value)
 	return parsed, err == nil
+}
+
+// wallClockResolver resolves a wall-clock reading, held as the UTC time with the
+// same fields, to the instant it names in one zone.
+type wallClockResolver func(wall time.Time) (time.Time, bool)
+
+func wallClockIn(loc *time.Location) wallClockResolver {
+	return func(wall time.Time) (time.Time, bool) {
+		return WallClockIn(loc, wall), true
+	}
+}
+
+// dtstartWallClock reads wall-clock readings in the zone a DTSTART content line
+// is read in, as resolve reads the line itself. It is nil for a DATE value.
+func dtstartWallClock(keyPart, value string, resolve PropertyTimeResolver) wallClockResolver {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "T") {
+		return nil
+	}
+	if hasZoneSuffix(value) {
+		return wallClockIn(time.UTC)
+	}
+	return func(wall time.Time) (time.Time, bool) {
+		return resolve.or(keyPart, wall.Format("20060102T150405"))
+	}
+}
+
+// endOfWallClockDay is the last instant whose wall-clock reading falls on day.
+// The day ends where the next one begins, or one second after its own last
+// second, whichever is later: where the clocks spring forward at midnight the
+// next day has no 00:00, and a resolver may read that missing reading with the
+// offset after the transition, as the time package does, which lands an hour
+// before the day actually ends.
+func endOfWallClockDay(day time.Time, resolve wallClockResolver) (time.Time, bool) {
+	next, ok := resolve(day.AddDate(0, 0, 1))
+	if !ok {
+		return time.Time{}, false
+	}
+	lastSecond, ok := resolve(day.Add(24*time.Hour - time.Second))
+	if !ok {
+		return time.Time{}, false
+	}
+	if afterLast := lastSecond.Add(time.Second); afterLast.After(next) {
+		next = afterLast
+	}
+	return next.Add(-time.Nanosecond), true
 }
 
 func parseIntList(value string, min, max int) ([]int, bool) {
@@ -2860,6 +3367,7 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 		if !work.spend(len(candidates)) {
 			return false, true
 		}
+		candidates = rule.existingLocalTimes(candidates, dtstart)
 		sortTimes(candidates)
 		for _, candidate := range uniqueTimes(candidates) {
 			if selector.offer(candidate) {
@@ -2924,6 +3432,7 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 				}
 			}
 		}
+		dayTimes = rule.existingLocalTimes(dayTimes, dtstart)
 		sortTimes(dayTimes)
 		for _, candidate := range uniqueTimes(dayTimes) {
 			if selector.offer(candidate) {
@@ -2935,6 +3444,26 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 		}
 	}
 	return selector.finish(), false
+}
+
+// existingLocalTimes drops the candidates whose wall clock the series' zone
+// skips, per recurrenceRule.localTimeExists, reusing the slice. They are dropped
+// before BYSETPOS numbers the period, just as appendValidTime drops an invalid
+// date before it: §3.3.10 treats the two alike, and the idiom
+// BYMONTHDAY=28,29,30,31;BYSETPOS=-1 for "the last day of the month" relies on
+// BYSETPOS counting only the instances that exist. The DTSTART is kept whatever
+// it names, being the first instance of the set (§3.8.5.3).
+func (rule recurrenceRule) existingLocalTimes(candidates []time.Time, dtstart time.Time) []time.Time {
+	if rule.localTimeExists == nil {
+		return candidates
+	}
+	kept := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.Equal(dtstart) || rule.localTimeExists(candidate) {
+			kept = append(kept, candidate)
+		}
+	}
+	return kept
 }
 
 // bySetPosSelector applies BYSETPOS to a streamed period.
@@ -3090,7 +3619,12 @@ func appendValidTime(values []time.Time, year int, month time.Month, day, hour, 
 		return values
 	}
 	t := time.Date(year, month, day, hour, minute, second, 0, loc)
-	if t.Year() != year || t.Month() != month || t.Day() != day || t.Hour() != hour || t.Minute() != minute || t.Second() != second {
+	// Date and Clock each read the zone once, which matters in a zone with
+	// transitions: this runs for every candidate a rule generates.
+	if y, m, d := t.Date(); y != year || m != month || d != day {
+		return values
+	}
+	if h, mi, sec := t.Clock(); h != hour || mi != minute || sec != second {
 		return values
 	}
 	return append(values, t)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/events"
@@ -26,11 +27,13 @@ type Handler struct {
 	contacts *contacts.Service
 }
 
-func NewHandler(cfg *config.Config, st *store.Store) *Handler {
+// NewHandler returns the REST API handler. validate is the validator every
+// calendar object written through the API must pass; it is required.
+func NewHandler(cfg *config.Config, st *store.Store, validate calobject.Validator) *Handler {
 	return &Handler{
 		cfg:      cfg,
 		store:    st,
-		events:   events.NewService(st),
+		events:   events.NewService(st, validate),
 		contacts: contacts.NewService(st),
 	}
 }

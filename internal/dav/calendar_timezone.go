@@ -38,9 +38,57 @@ var knownICalendarParameters = map[string]struct{}{
 	"ROLE": {}, "RSVP": {}, "SENT-BY": {}, "TZID": {}, "VALUE": {},
 }
 
+// icalReading is how a content line is read, which depends on where the object
+// holding it comes from.
+type icalReading int
+
+const (
+	// readSubmitted reads an object a client submits, as parseICalProperty
+	// describes.
+	readSubmitted icalReading = iota
+	// readTransferred reads an object the store holds that COPY or MOVE writes
+	// again: as submitted, except that a parameter without a valid name or an
+	// "=" is left out, as readStored leaves it out.
+	readTransferred
+	// readStored reads an object the store holds to answer a request, which
+	// may only balance its BEGIN and END lines: every control character is
+	// read as written, a parameter without a valid name or an "=" is left out,
+	// and a repeated parameter keeps its first value whatever the others say.
+	readStored
+)
+
+// parseICalProperty reads one submitted content line. Parameters calendar
+// applications write that RFC 5545 §3.1 does not admit but that change nothing
+// the line says -- an empty CN=, a repeated parameter, an attendee's bare RSVP
+// (bareAttendeeRSVP) -- are read: a value outside the grammar as written, a
+// repeat as its first value. Refused are a NUL, CR or LF; any other parameter
+// without a valid name or an "=" (§3.2), since leaving it out can change the
+// line's meaning -- "DTSTART;TZID:20250310T090000" would read as floating; and
+// a repeat of one of singleValuedParameters with a different value.
+//
+// The other control characters §3.1 excludes are read as written: Outlook and
+// Exchange put them in text, and stored objects may carry them. XML responses
+// write calendar-data through sanitizeXMLCharData.
 func parseICalProperty(line string) (icalProperty, bool) {
+	return readICalProperty(line, readSubmitted)
+}
+
+// singleValuedParameters are the parameters the server reads to resolve, type
+// or classify a value: TZID and VALUE place and type a date, RANGE widens an
+// override to the instances after it, RELATED anchors an alarm, and FBTYPE
+// classifies a busy period. Repeated with different values, they would leave
+// the readers free to disagree on which one counts.
+var singleValuedParameters = nameSet("TZID", "VALUE", "RANGE", "RELATED", "FBTYPE")
+
+// readICalProperty reads one content line as reading describes.
+func readICalProperty(line string, reading icalReading) (icalProperty, bool) {
 	keyPart, value, ok := ical.SplitContentLine(line)
 	if !ok || keyPart == "" {
+		return icalProperty{}, false
+	}
+	// PostgreSQL TEXT cannot hold a NUL, and a CR or LF inside a content line
+	// would end it when the line is written out.
+	if reading != readStored && (strings.ContainsAny(keyPart, "\x00\r\n") || strings.ContainsAny(value, "\x00\r\n")) {
 		return icalProperty{}, false
 	}
 	parts, ok := splitOutsideQuotes(keyPart, ';')
@@ -60,22 +108,47 @@ func parseICalProperty(line string) (icalProperty, bool) {
 	for _, rawParameter := range parts[1:] {
 		parameterName, parameterValue, found := strings.Cut(rawParameter, "=")
 		parameterName = strings.ToUpper(strings.TrimSpace(parameterName))
-		parameterValue = strings.TrimSpace(parameterValue)
-		if !found || !validICalendarToken(parameterName) || !validICalendarParameterValue(parameterValue) {
-			return icalProperty{}, false
-		}
-		if _, duplicate := property.parameters[parameterName]; duplicate {
-			if _, standard := knownICalendarParameters[parameterName]; standard {
+		parameterValue = unquoteICalendarParameter(strings.TrimSpace(parameterValue))
+		if !found || !validICalendarToken(parameterName) {
+			if reading == readSubmitted && !(!found && bareAttendeeRSVP(name, parameterName)) {
 				return icalProperty{}, false
 			}
 			continue
 		}
-		property.parameters[parameterName] = unquoteICalendarParameter(parameterValue)
-	}
-	if strings.ContainsAny(property.value, "\x00\r\n") {
-		return icalProperty{}, false
+		if first, duplicate := property.parameters[parameterName]; duplicate {
+			if reading != readStored && conflictingICalendarParameter(parameterName, first, parameterValue) {
+				return icalProperty{}, false
+			}
+			continue
+		}
+		property.parameters[parameterName] = parameterValue
 	}
 	return property, true
+}
+
+// bareAttendeeRSVP reports whether parameterName, written without "=" or a
+// value on a property named propertyName, is an attendee's RSVP. Calendar
+// applications write "ATTENDEE;RSVP:mailto:..." for an attendee asked to reply.
+// The line is accepted and stored as written, and the parameter is read as
+// though absent, which RFC 5545 §3.2.17 makes FALSE: nothing the server reads
+// depends on it, and reading a stored object leaves it out the same way.
+func bareAttendeeRSVP(propertyName, parameterName string) bool {
+	return propertyName == "ATTENDEE" && parameterName == "RSVP"
+}
+
+// conflictingICalendarParameter reports whether a repeat of the parameter name
+// with value says something other than its first value did.
+func conflictingICalendarParameter(name, first, value string) bool {
+	switch {
+	case !singleValuedParameters.contains(name):
+		return false
+	case name == "TZID":
+		// Every TZID lookup matches the value as written.
+		return first != value
+	default:
+		// The others are enumerations, which §3.2 makes case-insensitive.
+		return !strings.EqualFold(first, value)
+	}
 }
 
 func splitOutsideQuotes(value string, delimiter byte) ([]string, bool) {
@@ -110,32 +183,6 @@ func validICalendarToken(value string) bool {
 			continue
 		}
 		return false
-	}
-	return true
-}
-
-func validICalendarParameterValue(value string) bool {
-	parts, ok := splitOutsideQuotes(value, ',')
-	if !ok || len(parts) == 0 {
-		return false
-	}
-	for _, part := range parts {
-		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
-			for _, char := range part[1 : len(part)-1] {
-				if char == '"' || char == '\r' || char == '\n' || char == 0 {
-					return false
-				}
-			}
-			continue
-		}
-		if part == "" || strings.ContainsAny(part, "\";:\r\n") {
-			return false
-		}
-		for _, char := range part {
-			if char < 0x20 && char != '\t' {
-				return false
-			}
-		}
 	}
 	return true
 }

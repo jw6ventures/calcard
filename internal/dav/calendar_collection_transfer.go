@@ -270,14 +270,20 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 				continue
 			}
 		}
-		validated, fault := validateCalendarObjectForStorage(event.RawICAL, source)
+		validated, fault := validateTransferredCalendarObject(event.RawICAL, source)
 		if fault != nil {
 			failures = append(failures, calendarCollectionMemberFailure{href: calendarObjectConflictHref(source.ID, event), fault: fault})
 			continue
 		}
+		// A COPY is a new resource with an ETag of its own; a MOVE keeps the
+		// member's.
+		newETag := ""
+		if operation == store.CalendarCollectionCopy {
+			newETag = newCopyETag(event.RawICAL, source.ID)
+		}
 		members = append(members, store.CalendarCollectionMember{
-			ID: event.ID, UID: event.UID, ResourceName: eventResourceName(*event), RawICAL: event.RawICAL,
-			ETag: event.ETag, NewETag: newCopyETag(event.RawICAL, source.ID), Metadata: &validated.Analysis.Metadata,
+			ID: event.ID, UID: event.UID, ResourceName: eventResourceName(*event),
+			RawICAL: event.RawICAL, ETag: event.ETag, NewETag: newETag, Metadata: &validated.Analysis.Metadata,
 		})
 	}
 	return members, failures, nil

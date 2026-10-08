@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 func TestOpenTrafficCaptureFileAppendsAndRestrictsPermissions(t *testing.T) {
@@ -36,5 +39,29 @@ func TestOpenTrafficCaptureFileAppendsAndRestrictsPermissions(t *testing.T) {
 	}
 	if permissions := info.Mode().Perm(); permissions != 0o600 {
 		t.Fatalf("capture permissions = %o, want 600", permissions)
+	}
+}
+
+// The server embeds Go's time zone database, so every zone it resolves -- the
+// backward-compatible names clients still write, such as US/Eastern, among
+// them -- resolves on any host, and every reader of a calendar object reads
+// such a TZID the same way, through ical.HostLocation.
+func TestServerResolvesBackwardZoneNamesOnAnyHost(t *testing.T) {
+	for alias, zone := range map[string]string{
+		"US/Eastern": "America/New_York", "US/Central": "America/Chicago",
+		"US/Mountain": "America/Denver", "US/Pacific": "America/Los_Angeles",
+	} {
+		aliasLoc, ok := ical.HostLocation(alias)
+		if !ok {
+			t.Fatalf("%s does not resolve", alias)
+		}
+		zoneLoc, _ := ical.HostLocation(zone)
+		for _, at := range []time.Time{time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC), time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)} {
+			_, aliasOffset := at.In(aliasLoc).Zone()
+			_, zoneOffset := at.In(zoneLoc).Zone()
+			if aliasOffset != zoneOffset {
+				t.Errorf("%s keeps offset %d at %v, %s keeps %d", alias, aliasOffset, at, zone, zoneOffset)
+			}
+		}
 	}
 }

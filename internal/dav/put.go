@@ -216,6 +216,20 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
+	// The store keeps the body the validator returns: the submitted octets
+	// less a leading byte order mark, completed as completeCalendarObject
+	// describes. A DATE DTEND on its DTSTART's date is written as the next
+	// day and, while the object stays within the resource size limit,
+	// VERSION, PRODID and DTSTAMP are added where missing and the host's
+	// definition of each zone the object names without defining is added,
+	// replacing any definition of that zone the server wrote before. The ETag
+	// names the stored octets, and the response withholds it when they differ
+	// from the submitted ones.
+	storedText := validated.Body
+	if storedText != bodyText {
+		body = []byte(storedText)
+		etag = fmt.Sprintf("%x", sha256.Sum256(body))
+	}
 	uid := validated.UID
 	resourceName := resourceUID
 	if len(uid) > store.MaxIdentifierOctets || len(resourceName) > store.MaxIdentifierOctets {
@@ -246,7 +260,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		CalendarID:        calendarID,
 		UID:               uid,
 		ResourceName:      resourceName,
-		RawICAL:           bodyText,
+		RawICAL:           storedText,
 		ETag:              etag,
 		Metadata:          &validated.Analysis.Metadata,
 		Precondition:      calendarObjectPrecondition(r),

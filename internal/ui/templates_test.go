@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
@@ -105,14 +110,12 @@ func TestTemplatesDoNotRenderRawTimestamps(t *testing.T) {
 
 // A CN that only repeats the address renders as "x@y.z <x@y.z>" without this.
 func TestCalendarViewsCollapseRedundantAttendeeName(t *testing.T) {
-	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
-		source, err := templateFS.ReadFile("templates/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		if !strings.Contains(string(source), "name.toLowerCase() === email.toLowerCase()") {
-			t.Errorf("%s does not collapse a CN that repeats the address", name)
-		}
+	source, err := templateFS.ReadFile(calendarEventsPartialFile)
+	if err != nil {
+		t.Fatalf("read the shared event helpers: %v", err)
+	}
+	if !strings.Contains(string(source), "name.toLowerCase() === email.toLowerCase()") {
+		t.Error("the calendar views do not collapse a CN that repeats the address")
 	}
 }
 
@@ -163,8 +166,7 @@ func TestEventFormHelpers(t *testing.T) {
 	node := requireNode(t)
 	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
 		t.Run(name, func(t *testing.T) {
-			cmd := exec.Command(node, filepath.Join("testdata", "event_form_helpers.mjs"),
-				filepath.Join("templates", name))
+			cmd := exec.Command(node, filepath.Join("testdata", "event_form_helpers.mjs"), renderedPage(t, name))
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("template helpers: %v\n%s", err, output)
 			}
@@ -184,7 +186,7 @@ func TestAggregateEditorConvertsAllDayEndForDisplay(t *testing.T) {
 	for _, want := range []string{
 		"function inclusiveAllDayEnd(start, exclusiveEnd)",
 		"function exclusiveAllDayEnd(start, lastDay)",
-		"allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeInput(end, timezone)",
+		"allDay ? formatDateInput(inclusiveAllDayEnd(startOfDay(start), end)) : formatDateTimeForInput(end, clock)",
 	} {
 		if !strings.Contains(string(source), want) {
 			t.Errorf("all_calendars_view.html is missing %q: an all-day end reaches the form unconverted", want)
@@ -196,25 +198,29 @@ func TestAggregateEditorConvertsAllDayEndForDisplay(t *testing.T) {
 // moved onto the local day in both. Leaving either on the instant the server
 // sends puts the event a day early everywhere west of UTC.
 func TestCalendarViewsNormalizeAllDayServerDates(t *testing.T) {
-	for _, name := range []string{"all_calendars_view.html", "calendar_view.html"} {
-		source, err := templateFS.ReadFile("templates/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
+	partial, err := templateFS.ReadFile(calendarEventsPartialFile)
+	if err != nil {
+		t.Fatalf("read the shared event helpers: %v", err)
+	}
+	for _, want := range []string{
+		"function parseServerDate(value, allDay)",
+		"parsed.dtstart = parseServerDate(raw.dtstart, allDay);",
+		"parsed.dtend = parseServerDate(raw.dtend, allDay);",
+		"parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);",
+	} {
+		if !strings.Contains(string(partial), want) {
+			t.Errorf("the shared event helpers are missing %q: an all-day date keeps the instant the server sent", want)
 		}
-		for _, want := range []string{
-			"function parseServerDate(value, allDay)",
-			"parsed.dtstart = parseServerDate(raw.dtstart, allDay);",
-			"parsed.dtend = parseServerDate(raw.dtend, allDay);",
-			"parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);",
-		} {
-			if !strings.Contains(string(source), want) {
-				t.Errorf("%s is missing %q: an all-day date keeps the instant the server sent", name, want)
-			}
+	}
+	for _, file := range []string{calendarEventsPartialFile, "templates/all_calendars_view.html", "templates/calendar_view.html"} {
+		source, err := templateFS.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
 		}
 		// map would hand parseServerDate the array index as its all-day flag,
 		// which is false for the first EXDATE and true for every one after it.
 		if strings.Contains(string(source), ".map(parseServerDate)") {
-			t.Errorf("%s passes parseServerDate to map, so the index becomes the all-day flag", name)
+			t.Errorf("%s passes parseServerDate to map, so the index becomes the all-day flag", file)
 		}
 	}
 }
@@ -236,10 +242,10 @@ func TestAggregateEditorAllDayEndRoundTrip(t *testing.T) {
 		"Pacific/Kiritimati", // +14:00, the far side
 		"Asia/Kolkata",       // +05:30, not a whole hour
 	}
+	rendered := renderedPage(t, "all_calendars_view.html")
 	for _, zone := range zones {
 		t.Run(zone, func(t *testing.T) {
-			cmd := exec.Command(node, filepath.Join("testdata", "all_day_end_roundtrip.mjs"),
-				filepath.Join("templates", "all_calendars_view.html"))
+			cmd := exec.Command(node, filepath.Join("testdata", "all_day_end_roundtrip.mjs"), rendered)
 			cmd.Env = append(os.Environ(), "TZ="+zone)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
@@ -288,10 +294,10 @@ func TestCalendarViewAllDayEndRoundTrip(t *testing.T) {
 		"Pacific/Kiritimati", // +14:00, the far side
 		"Asia/Kolkata",       // +05:30, not a whole hour
 	}
+	rendered := renderedPage(t, "calendar_view.html")
 	for _, zone := range zones {
 		t.Run(zone, func(t *testing.T) {
-			cmd := exec.Command(node, filepath.Join("testdata", "calendar_view_all_day_end_roundtrip.mjs"),
-				filepath.Join("templates", "calendar_view.html"))
+			cmd := exec.Command(node, filepath.Join("testdata", "calendar_view_all_day_end_roundtrip.mjs"), rendered)
 			cmd.Env = append(os.Environ(), "TZ="+zone)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
@@ -314,51 +320,295 @@ func TestTimeGridDST(t *testing.T) {
 	}
 }
 
+// The edit forms show a timed event's times, and the day its series ends, in
+// the event's zone, and the server reads what they submit in that zone: a zone
+// neither the browser nor the server knows is UTC to both. Each submitted
+// value has to name the instant, and rebuild the UNTIL, the event already had.
+// The create form prefills a slot on the browser's grid, so it has to submit
+// the browser's zone for the slot to be saved where it was picked.
 func TestTimedEditorTimezoneRoundTrip(t *testing.T) {
 	node := requireNode(t)
 	for _, template := range []string{"all_calendars_view.html", "calendar_view.html"} {
-		for _, browserZone := range []string{"America/Los_Angeles", "UTC", "Pacific/Kiritimati"} {
+		rendered := renderedPage(t, template)
+		for _, browserZone := range []string{"America/Los_Angeles", "UTC", "Europe/Berlin", "Pacific/Kiritimati"} {
 			t.Run(template+"/"+browserZone, func(t *testing.T) {
-				cmd := exec.Command(node, filepath.Join("testdata", "timed_editor_roundtrip.mjs"), filepath.Join("templates", template))
+				cmd := exec.Command(node, filepath.Join("testdata", "timed_editor_roundtrip.mjs"), rendered)
 				cmd.Env = append(os.Environ(), "TZ="+browserZone)
 				output, err := cmd.CombinedOutput()
 				if err != nil {
 					t.Fatalf("template helpers: %v: %s", err, output)
 				}
-				var cases []struct {
-					Start, End, Zone, RecurrenceZone string
-					Values                           []string
+				var result struct {
+					Cases []struct {
+						Start, End, Zone, RecurrenceZone string
+						Values                           []string
+						Until, RRuleUntil                string
+					}
+					Create struct {
+						Start, End, Zone string
+						Values           []string
+					}
 				}
-				if err := json.Unmarshal(output, &cases); err != nil {
+				if err := json.Unmarshal(output, &result); err != nil {
 					t.Fatal(err)
 				}
-				for _, c := range cases {
+				for _, c := range result.Cases {
 					for i, prop := range []string{"DTSTART", "DTEND", "RECURRENCE-ID"} {
 						zone := c.Zone
 						if i == 2 {
 							zone = c.RecurrenceZone
 						}
-						line, err := utils.FormatICalDateTime(c.Values[i], false, false, prop, zone)
-						if err != nil {
-							t.Fatal(err)
-						}
-						key, value, _ := strings.Cut(line, ":")
-						got, ok := ical.ParsePropertyDateTimeLocal(key, value)
 						original := c.Start
 						if i == 1 {
 							original = c.End
 						}
-						want, err := time.Parse(time.RFC3339, original)
-						if err != nil {
-							t.Fatal(err)
-						}
-						if !ok || !got.Equal(want) {
-							t.Errorf("%s: %s submitted as %s, want instant %s", prop, original, line, want)
-						}
+						assertSubmittedInstant(t, prop, c.Values[i], zone, original)
 					}
+					recurrence := &utils.RecurrenceOptions{Frequency: "WEEKLY", Interval: 1, Until: c.Until}
+					component, err := utils.BuildEventComponent("timed", "", c.Values[0], c.Values[1], false, "", "", recurrence, "", &utils.EventOptions{Timezone: c.Zone})
+					if err != nil {
+						t.Fatalf("BuildEventComponent() error = %v", err)
+					}
+					wantRRule := "RRULE:FREQ=WEEKLY;UNTIL=" + c.RRuleUntil
+					if !slices.Contains(component, wantRRule) {
+						t.Errorf("UNTIL=%s in zone %q shown as %q, which saves as %q, want %s", c.RRuleUntil, c.Zone, c.Until, component, wantRRule)
+					}
+				}
+				if result.Create.Zone != browserZone {
+					t.Errorf("the create form submits time zone %q beside times it prefilled in %s", result.Create.Zone, browserZone)
+				}
+				assertSubmittedInstant(t, "DTSTART", result.Create.Values[0], result.Create.Zone, result.Create.Start)
+				assertSubmittedInstant(t, "DTEND", result.Create.Values[1], result.Create.Zone, result.Create.End)
+			})
+		}
+	}
+}
+
+// assertSubmittedInstant reports whether value, submitted from a form with
+// time zone zone, is written as prop naming the instant want (RFC 3339).
+func assertSubmittedInstant(t *testing.T, prop, value, zone, want string) {
+	t.Helper()
+	line, err := utils.FormatICalDateTime(value, false, false, prop, zone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, raw, _ := strings.Cut(line, ":")
+	got, ok := ical.ParsePropertyDateTimeLocal(key, raw)
+	wantInstant, err := time.Parse(time.RFC3339, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !got.Equal(wantInstant) {
+		t.Errorf("%s: %s submitted as %q in %q is written %s, want instant %s", prop, want, value, zone, line, wantInstant)
+	}
+}
+
+// servedOutlookCalendar holds two series in Outlook's "Eastern Standard Time",
+// a zone only the object defines, both crossing the switch to daylight time
+// on 10 March 2024: a Monday 09:00 meeting ending on 25 March, with UNTIL
+// written as the server writes it, whose 11 March instance moved to 11:00; and
+// a daily 02:30 one whose 10 March instance falls in the skipped hour.
+var servedOutlookCalendar = map[string]string{
+	"outlook-standup": "BEGIN:VCALENDAR\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\n" + outlookEastern +
+		"BEGIN:VEVENT\r\nUID:outlook-standup\r\nDTSTAMP:20240101T000000Z\r\nSUMMARY:Standup\r\n" +
+		"DTSTART;TZID=\"Eastern Standard Time\":20240304T090000\r\nDTEND;TZID=\"Eastern Standard Time\":20240304T100000\r\n" +
+		"RRULE:FREQ=WEEKLY;UNTIL=20240326T035959Z;BYDAY=MO\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:outlook-standup\r\nDTSTAMP:20240101T000000Z\r\nSUMMARY:Moved standup\r\n" +
+		"RECURRENCE-ID;TZID=\"Eastern Standard Time\":20240311T090000\r\n" +
+		"DTSTART;TZID=\"Eastern Standard Time\":20240311T110000\r\nDTEND;TZID=\"Eastern Standard Time\":20240311T120000\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n",
+	// A series running since decades before the month viewed, whose zone's
+	// offsets the view still reads where the series starts and in the month.
+	"outlook-decades": "BEGIN:VCALENDAR\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\n" + outlookEastern +
+		"BEGIN:VEVENT\r\nUID:outlook-decades\r\nDTSTAMP:20240101T000000Z\r\nSUMMARY:Monthly review\r\n" +
+		"DTSTART;TZID=\"Eastern Standard Time\":19900305T150000\r\nDTEND;TZID=\"Eastern Standard Time\":19900305T160000\r\n" +
+		"RRULE:FREQ=MONTHLY\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n",
+	"outlook-early": "BEGIN:VCALENDAR\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\n" + outlookEastern +
+		"BEGIN:VEVENT\r\nUID:outlook-early\r\nDTSTAMP:20240101T000000Z\r\nSUMMARY:Early\r\n" +
+		"DTSTART;TZID=\"Eastern Standard Time\":20240309T023000\r\nDTEND;TZID=\"Eastern Standard Time\":20240309T033000\r\n" +
+		"RRULE:FREQ=DAILY;COUNT=4\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n",
+}
+
+// An event in a zone only the object defines reaches the browser with the
+// offsets the object's definition keeps, which the views have to read its
+// times through wherever the browser is: each view's expansion of the events
+// its own endpoint serves has to publish CalDAV's free-busy periods, its
+// editor has to show the zone's wall clocks, and saving what it shows has to
+// leave the stored series, and an occurrence's identity, as they were.
+func TestCalendarViewsEditAnEventInAZoneOnlyTheObjectDefines(t *testing.T) {
+	const zone = "Eastern Standard Time"
+	if _, ok := ical.HostLocation(zone); ok {
+		t.Skipf("the host defines %q", zone)
+	}
+	node := requireNode(t)
+	user := &store.User{ID: 100}
+	for _, template := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		rendered := renderedPage(t, template)
+		for _, browserZone := range []string{"UTC", "America/New_York", "America/Los_Angeles", "Europe/Berlin", "Asia/Tokyo"} {
+			t.Run(template+"/"+browserZone, func(t *testing.T) {
+				handler, s, events := servedOutlookHandler(t)
+				served := servedEventsJSON(t, handler, user, template)
+
+				cmd := exec.Command(node, filepath.Join("testdata", "timed_editor_roundtrip.mjs"), rendered, served)
+				cmd.Env = append(os.Environ(), "TZ="+browserZone)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("view helpers: %v: %s", err, output)
+				}
+				type form struct {
+					Values               []string
+					Zone, RecurrenceZone string
+					Until                string
+				}
+				var result struct {
+					Instances            []string
+					Summary, SummaryWant string
+					Forms                struct{ Series, Override, Occurrence, Decades, DecadesOccurrence form }
+				}
+				if err := json.Unmarshal(output, &result); err != nil {
+					t.Fatalf("%v: %s", err, output)
+				}
+
+				freeBusy := func() []string {
+					// The fake store assigns no ID to an event it saves, and
+					// the DAV server pages rows by it.
+					for i, uid := range slices.Sorted(maps.Keys(servedOutlookCalendar)) {
+						events.events["1:"+uid].ID = int64(i + 1)
+					}
+					return davFreeBusyPeriods(t, s, user, "20240301T000000Z", "20240401T000000Z")
+				}
+				published := freeBusy()
+				if !slices.Equal(result.Instances, published) {
+					t.Errorf("the view places %v, CalDAV publishes %v", result.Instances, published)
+				}
+				if result.Summary != result.SummaryWant {
+					t.Errorf("recurrence summary = %q, want %q", result.Summary, result.SummaryWant)
+				}
+				for _, check := range []struct {
+					name string
+					got  form
+					want form
+				}{
+					{"series", result.Forms.Series, form{Values: []string{"2024-03-04T09:00", "2024-03-04T10:00", ""}, Zone: zone, Until: "2024-03-25"}},
+					{"moved occurrence", result.Forms.Override, form{Values: []string{"2024-03-11T11:00", "2024-03-11T12:00", "2024-03-11T09:00"}, Zone: zone, RecurrenceZone: zone, Until: "2024-03-25"}},
+					{"occurrence", result.Forms.Occurrence, form{Values: []string{"2024-03-18T09:00", "2024-03-18T10:00", "2024-03-18T09:00"}, Zone: zone, RecurrenceZone: zone, Until: "2024-03-25"}},
+					// A series without UNTIL leaves the end field as an earlier
+					// edit of the aggregate view's one form left it.
+					{"series since 1990", result.Forms.Decades, form{Values: []string{"1990-03-05T15:00", "1990-03-05T16:00", ""}, Zone: zone}},
+					{"occurrence of the series since 1990", result.Forms.DecadesOccurrence, form{Values: []string{"2024-03-05T15:00", "2024-03-05T16:00", "2024-03-05T15:00"}, Zone: zone, RecurrenceZone: zone}},
+				} {
+					want := check.want
+					if check.name == "series" || check.name == "series since 1990" {
+						want.RecurrenceZone = check.got.RecurrenceZone
+					}
+					if !slices.Equal(check.got.Values, want.Values) || check.got.Zone != want.Zone ||
+						check.got.RecurrenceZone != want.RecurrenceZone || want.Until != "" && check.got.Until != want.Until {
+						t.Errorf("%s editor shows %+v, want %+v", check.name, check.got, want)
+					}
+				}
+
+				stored := func() *ical.Component {
+					return ical.PrimaryVEventComponent(events.events["1:outlook-standup"].RawICAL)
+				}
+				original := stored()
+				series := result.Forms.Series
+				updateServedEvent(t, handler, user, series.Zone, url.Values{
+					"dtstart": {series.Values[0]}, "dtend": {series.Values[1]},
+					"recurrence": {"WEEKLY"}, "recurrence_byday": {"MO"},
+					"recurrence_end_type": {"on"}, "recurrence_until": {series.Until},
+				})
+				saved := stored()
+				for _, name := range []string{"DTSTART", "DTEND", "RRULE"} {
+					before, _ := ical.ComponentProperty(original, name)
+					after, _ := ical.ComponentProperty(saved, name)
+					beforeZone, _ := ical.PropertyParam(before.KeyPart, "TZID")
+					afterZone, _ := ical.PropertyParam(after.KeyPart, "TZID")
+					if after.Value != before.Value || afterZone != beforeZone {
+						t.Errorf("saving the series unchanged wrote %s;TZID=%s:%s, want %s;TZID=%s:%s", name, afterZone, after.Value, name, beforeZone, before.Value)
+					}
+				}
+				if got := freeBusy(); !slices.Equal(got, published) {
+					t.Errorf("after saving the series unchanged, CalDAV publishes %v, want %v", got, published)
+				}
+
+				occurrence := result.Forms.Occurrence
+				updateServedEvent(t, handler, user, occurrence.Zone, url.Values{
+					"dtstart": {occurrence.Values[0]}, "dtend": {occurrence.Values[1]}, "summary": {"Renamed standup"},
+					"edit_scope": {"occurrence"}, "recurrence_id": {occurrence.Values[2]}, "recurrence_timezone": {occurrence.RecurrenceZone},
+				})
+				if got := freeBusy(); !slices.Equal(got, published) {
+					t.Errorf("after renaming one occurrence, CalDAV publishes %v, want %v\n%s", got, published, events.events["1:outlook-standup"].RawICAL)
+				}
+				if raw := events.events["1:outlook-standup"].RawICAL; !strings.Contains(raw, "RECURRENCE-ID;TZID=Eastern Standard Time:20240318T090000") &&
+					!strings.Contains(raw, "RECURRENCE-ID;TZID=\"Eastern Standard Time\":20240318T090000") {
+					t.Errorf("the renamed occurrence is not the 18 March instance:\n%s", raw)
 				}
 			})
 		}
+	}
+}
+
+// servedOutlookHandler is a handler over calendar 1, owned by user 100, holding
+// servedOutlookCalendar as the validator stores it.
+func servedOutlookHandler(t *testing.T) (*Handler, *store.Store, *fakeEventRepoWithUpsert) {
+	t.Helper()
+	stored := make(map[string]*store.Event)
+	for i, uid := range slices.Sorted(maps.Keys(servedOutlookCalendar)) {
+		raw := servedOutlookCalendar[uid]
+		validated, err := dav.ValidateCalendarObject(raw, nil)
+		if err != nil {
+			t.Fatalf("%s should pass the validator: %v", uid, err)
+		}
+		stored["1:"+uid] = &store.Event{ID: int64(i + 1), CalendarID: 1, UID: uid, ResourceName: uid + ".ics", RawICAL: validated.Body, ETag: "e"}
+	}
+	calendar := store.Calendar{ID: 1, UserID: 100, Name: "Work"}
+	events := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: stored}}
+	s := &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars:      map[int64]*store.Calendar{1: &calendar},
+			listAccessible: []store.CalendarAccess{{Calendar: calendar}},
+		},
+		Events: events,
+	}
+	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject), s, events
+}
+
+// servedEventsJSON writes to a file the March 2024 events JSON the endpoint
+// template loads its events from serves, and returns the file's path.
+func servedEventsJSON(t *testing.T, handler *Handler, user *store.User, template string) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	switch template {
+	case "calendar_view.html":
+		req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2024-03-01&end=2024-04-01", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "1")
+		handler.GetCalendarEventsJSON(w, req.WithContext(context.WithValue(auth.WithUser(req.Context(), user), chi.RouteCtxKey, rctx)))
+	case "all_calendars_view.html":
+		req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2024-03-01&end=2024-04-01", nil)
+		handler.GetAllCalendarEventsJSON(w, req.WithContext(auth.WithUser(req.Context(), user)))
+	default:
+		t.Fatalf("no events endpoint for %s", template)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("events JSON for %s: status %d: %s", template, w.Code, w.Body.String())
+	}
+	path := filepath.Join(t.TempDir(), "events.json")
+	if err := os.WriteFile(path, w.Body.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// updateServedEvent submits the edit form for the "outlook-standup" series.
+func updateServedEvent(t *testing.T, handler *Handler, user *store.User, zone string, fields url.Values) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/outlook-standup", "outlook-standup", user, zone, fields))
+	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
+		t.Fatalf("UpdateEvent(%v) status = %d location = %s", fields, w.Code, location)
 	}
 }
 
@@ -372,7 +622,7 @@ func TestEventModalEscapesRecurrenceSummary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		if !strings.Contains(string(source), "escapeHtml(formatRRule(event.rrule))") {
+		if !strings.Contains(string(source), "escapeHtml(formatRRule(event))") {
 			t.Errorf("%s interpolates formatRRule output into the modal unescaped", name)
 		}
 	}
@@ -397,6 +647,16 @@ func TestTemplatesDoNotBuildEventHandlersByConcatenation(t *testing.T) {
 		}
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			cmd := exec.Command(node, filepath.Join("testdata", "no_concatenated_handlers.mjs"), file)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+		})
+	}
+	// The calendar views' shared event helpers are part of their scripts only
+	// once the page is rendered.
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		t.Run("rendered "+name, func(t *testing.T) {
+			cmd := exec.Command(node, filepath.Join("testdata", "no_concatenated_handlers.mjs"), renderedPage(t, name))
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("%v\n%s", err, output)
 			}
@@ -517,6 +777,73 @@ func TestPagesShareOneCopyOfTheSafeHTMLHelpers(t *testing.T) {
 	}
 }
 
+// Both calendar views read events and expand series through one partial, which
+// each includes inside its own script's function scope. A view carrying its own
+// copy of any of the partial's functions is a copy that can come to disagree
+// with the other view about which occurrences a series has.
+func TestCalendarViewsShareOneCopyOfTheEventHelpers(t *testing.T) {
+	partial, err := templateFS.ReadFile(calendarEventsPartialFile)
+	if err != nil {
+		t.Fatalf("read the shared event helpers: %v", err)
+	}
+	var shared []string
+	for _, match := range regexp.MustCompile(`(?m)^    function (\w+)\(`).FindAllStringSubmatch(string(partial), -1) {
+		shared = append(shared, match[1])
+	}
+	for _, want := range []string{
+		"parseICAL", "parseICALDate", "parseRRule", "listedOffsets", "intlOffsets", "timeZoneClock",
+		"rruleUntilLimit", "rruleUntilDay", "makeOccurrenceKey", "recurrenceZoneClock", "recurrenceCalendar",
+		"expandRecurringEvents", "parseServerDate", "normalizeServerEvent", "formatRRule", "formatDateTimeForInput",
+		"browserTimeZone",
+	} {
+		if !slices.Contains(shared, want) {
+			t.Errorf("the shared event helpers have no %s", want)
+		}
+	}
+
+	const include = `{{template "calendar_events_js"}}`
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := templateFS.ReadFile("templates/" + name)
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			source := string(raw)
+			if templates[name].Lookup("calendar_events_js") == nil {
+				t.Error("the view is parsed without the shared event helpers")
+			}
+			// Included as a script of its own, the helpers would become globals
+			// and stop seeing the view's own scope.
+			at := strings.Index(source, include)
+			if at < 0 {
+				t.Fatal("the view does not include the shared event helpers")
+			}
+			iife := strings.LastIndex(source[:at], "<script>\n(function() {")
+			if iife < 0 || strings.Contains(source[iife:at], "})();") || !strings.Contains(source[at:], "\n})();") {
+				t.Error("the view includes the shared event helpers outside its script's function")
+			}
+			if strings.Count(source, include) != 1 {
+				t.Error("the view includes the shared event helpers more than once")
+			}
+			for _, fn := range shared {
+				if strings.Contains(source, "function "+fn+"(") {
+					t.Errorf("the view defines its own %s", fn)
+				}
+			}
+
+			body, err := os.ReadFile(renderedPage(t, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, fn := range shared {
+				if got := strings.Count(string(body), "function "+fn+"("); got != 1 {
+					t.Errorf("the rendered view defines %s %d times, want once", fn, got)
+				}
+			}
+		})
+	}
+}
+
 // The text of a named JavaScript function declaration, from the keyword through
 // the brace that closes its body.
 func javaScriptFunction(source, name string) (string, bool) {
@@ -571,10 +898,103 @@ func TestBirthdaysPageKeepsLeapDayBirthdays(t *testing.T) {
 func TestCalendarViewsReadUTCDateTimesAsUTC(t *testing.T) {
 	node := requireNode(t)
 	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		rendered := renderedPage(t, name)
 		for _, zone := range []string{"UTC", "America/New_York", "Asia/Kolkata", "Pacific/Kiritimati"} {
 			t.Run(name+"/"+zone, func(t *testing.T) {
-				cmd := exec.Command(node, filepath.Join("testdata", "ical_date_parsing.mjs"),
-					filepath.Join("templates", name), safeHTMLPartial)
+				cmd := exec.Command(node, filepath.Join("testdata", "ical_date_parsing.mjs"), rendered)
+				cmd.Env = append(os.Environ(), "TZ="+zone)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%v\n%s", err, output)
+				}
+			})
+		}
+	}
+}
+
+// A series ends on its UNTIL's day: a DATE UNTIL includes the day, which ends
+// in the zone the series' DTSTART is read in as the server's expansion ends
+// it, and the UTC UNTIL the server writes for a timed series is the picked
+// day's last second in the event's zone, or in UTC for an event with no zone
+// or one the browser does not know. The node script runs each view's own expansion and
+// reading of that day; the editors and the recurrence summary have to read the
+// day through it, or editing a series moves its end.
+func TestCalendarViewsEndSeriesOnTheUntilDay(t *testing.T) {
+	prefills := map[string]string{
+		"calendar_view.html":      "untilInput.value = formatDateForInput(window.rruleUntilDay(rr.UNTIL, event));",
+		"all_calendars_view.html": "formatDateInput(rruleUntilDay(rrule.UNTIL, event));",
+	}
+	for name, prefill := range prefills {
+		source, err := templateFS.ReadFile("templates/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if !strings.Contains(string(source), prefill) {
+			t.Errorf("%s is missing %q", name, prefill)
+		}
+	}
+	partial, err := templateFS.ReadFile(calendarEventsPartialFile)
+	if err != nil {
+		t.Fatalf("read the shared event helpers: %v", err)
+	}
+	for _, want := range []string{
+		"var until = rr.UNTIL ? rruleUntilLimit(rr.UNTIL, event) : null;",
+		"rruleUntilDay(rr.UNTIL, event).toLocaleDateString()",
+	} {
+		if !strings.Contains(string(partial), want) {
+			t.Errorf("the shared event helpers are missing %q", want)
+		}
+	}
+
+	node := requireNode(t)
+	for name := range prefills {
+		rendered := renderedPage(t, name)
+		for _, zone := range []string{"UTC", "America/New_York", "Europe/Berlin", "Asia/Kolkata", "Asia/Tokyo", "Pacific/Kiritimati"} {
+			t.Run(name+"/"+zone, func(t *testing.T) {
+				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_until.mjs"), rendered)
+				cmd.Env = append(os.Environ(), "TZ="+zone)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%v\n%s", err, output)
+				}
+			})
+		}
+	}
+}
+
+// A series with a TZID repeats on its zone's wall clock, and RFC 5545 §3.3.10
+// leaves an instance on a local time that zone skips out of the series and
+// its COUNT, as the server's expansion does. One with no TZID, or one the
+// browser does not know, repeats on UTC's, as the server reads both. The node script runs each view's
+// own expansion under browser zones either side of the event's, which must all
+// show the same instants.
+func TestCalendarViewsLeaveOutInstancesOnSkippedLocalTimes(t *testing.T) {
+	node := requireNode(t)
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		rendered := renderedPage(t, name)
+		for _, zone := range []string{"UTC", "Europe/Berlin", "America/New_York", "Asia/Tokyo", "Australia/Lord_Howe"} {
+			t.Run(name+"/"+zone, func(t *testing.T) {
+				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_skipped_local_time.mjs"), rendered)
+				cmd.Env = append(os.Environ(), "TZ="+zone)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%v\n%s", err, output)
+				}
+			})
+		}
+	}
+}
+
+// COUNT bounds the instances a series' RRULE generates before its EXDATEs
+// remove any (RFC 5545 §3.3.10 and §3.8.5.1), so an excluded instance still
+// counts while one on a local time the zone skips, which the rule never
+// generates, does not; the server's expansion counts both that way. The node
+// script runs each view's own expansion under browser zones either side of
+// the events' and expects the same instants in each.
+func TestCalendarViewsCountExcludedInstancesTowardCount(t *testing.T) {
+	node := requireNode(t)
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
+		rendered := renderedPage(t, name)
+		for _, zone := range []string{"UTC", "Europe/Berlin", "America/New_York", "Asia/Tokyo"} {
+			t.Run(name+"/"+zone, func(t *testing.T) {
+				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_count.mjs"), rendered)
 				cmd.Env = append(os.Environ(), "TZ="+zone)
 				if output, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("%v\n%s", err, output)
@@ -627,6 +1047,10 @@ func TestNoConcatenatedHandlersDetector(t *testing.T) {
 // safeHTMLPartial is the shared helper partial, relative to the package.
 var safeHTMLPartial = filepath.Join("templates", "partials", "safe_html_js.tmpl")
 
+// calendarEventsPartialFile is the calendar views' shared event reading and
+// recurrence partial, as a path in templateFS.
+const calendarEventsPartialFile = "templates/partials/calendar_events_js.tmpl"
+
 // requireNode returns the node binary the template JavaScript tests run on. A
 // developer machine without node skips them; CI must not, or the helpers these
 // tests guard would go unchecked without anyone noticing.
@@ -642,11 +1066,12 @@ func requireNode(t *testing.T) string {
 	return node
 }
 
-// The partial reaches the browser through html/template, which parses the
-// script it sits in. Running the shared helpers' tests over each rendered page
-// proves every page serves them, once, and unaltered.
-func TestRenderedPagesServeTheSharedSafeHTMLHelpers(t *testing.T) {
-	node := requireNode(t)
+// renderedPage serves the named page through its handler to a user who owns
+// one calendar and one address book, and returns the path of a file holding
+// the page as the browser gets it: with its partials included and its
+// template actions executed.
+func renderedPage(t *testing.T, name string) string {
+	t.Helper()
 	withUser := func(req *http.Request, params map[string]string) *http.Request {
 		rctx := chi.NewRouteContext()
 		for key, value := range params {
@@ -661,33 +1086,52 @@ func TestRenderedPagesServeTheSharedSafeHTMLHelpers(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Contacts"},
 		}},
 		Contacts: &fakeContactRepoWithBirthdays{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}}},
-	}, nil)
-	pages := []struct {
-		name  string
-		serve http.HandlerFunc
-		req   *http.Request
-	}{
-		{"calendar_view.html", handler.ViewCalendar, withUser(httptest.NewRequest(http.MethodGet, "/calendars/1", nil), map[string]string{"id": "1"})},
-		{"all_calendars_view.html", handler.ViewAllCalendars, withUser(httptest.NewRequest(http.MethodGet, "/calendars/all", nil), nil)},
-		{"addressbook_view.html", handler.ViewAddressBook, withUser(httptest.NewRequest(http.MethodGet, "/addressbooks/1", nil), map[string]string{"id": "1"})},
-		{"birthdays.html", handler.ViewBirthdays, withUser(httptest.NewRequest(http.MethodGet, "/birthdays", nil), nil)},
+	}, nil, dav.ValidateCalendarObject)
+
+	var serve http.HandlerFunc
+	var req *http.Request
+	switch name {
+	case "calendar_view.html":
+		serve, req = handler.ViewCalendar, withUser(httptest.NewRequest(http.MethodGet, "/calendars/1", nil), map[string]string{"id": "1"})
+	case "all_calendars_view.html":
+		serve, req = handler.ViewAllCalendars, withUser(httptest.NewRequest(http.MethodGet, "/calendars/all", nil), nil)
+	case "addressbook_view.html":
+		serve, req = handler.ViewAddressBook, withUser(httptest.NewRequest(http.MethodGet, "/addressbooks/1", nil), map[string]string{"id": "1"})
+	case "birthdays.html":
+		serve, req = handler.ViewBirthdays, withUser(httptest.NewRequest(http.MethodGet, "/birthdays", nil), nil)
+	default:
+		t.Fatalf("no handler is set up to render %s", name)
 	}
-	for _, page := range pages {
-		t.Run(page.name, func(t *testing.T) {
-			w := httptest.NewRecorder()
-			page.serve(w, page.req)
-			if w.Code != http.StatusOK {
-				t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+
+	w := httptest.NewRecorder()
+	serve(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("render %s: status = %d, want %d: %s", name, w.Code, http.StatusOK, w.Body.String())
+	}
+	rendered := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(rendered, w.Body.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return rendered
+}
+
+// The partial reaches the browser through html/template, which parses the
+// script it sits in. Running the shared helpers' tests over each rendered page
+// proves every page serves them, once, and unaltered.
+func TestRenderedPagesServeTheSharedSafeHTMLHelpers(t *testing.T) {
+	node := requireNode(t)
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html", "addressbook_view.html", "birthdays.html"} {
+		t.Run(name, func(t *testing.T) {
+			rendered := renderedPage(t, name)
+			source, err := os.ReadFile(rendered)
+			if err != nil {
+				t.Fatal(err)
 			}
-			body := w.Body.String()
+			body := string(source)
 			for _, helper := range []string{"escapeHtml", "unescapeText", "safeUrl", "safeHref", "sanitizeHtml"} {
 				if got := strings.Count(body, "function "+helper+"("); got != 1 {
 					t.Errorf("the page defines %s %d times, want once", helper, got)
 				}
-			}
-			rendered := filepath.Join(t.TempDir(), page.name)
-			if err := os.WriteFile(rendered, []byte(body), 0o600); err != nil {
-				t.Fatal(err)
 			}
 			for _, script := range []string{"modal_escaping.mjs", "description_sanitizer.mjs"} {
 				cmd := exec.Command(node, filepath.Join("testdata", script), rendered)

@@ -121,10 +121,10 @@ type freeBusyCandidate struct {
 	matcher calendarTimeRangeMatcher
 }
 
-// freeBusyCandidates parses each stored object once. Octets that do not parse
-// carry no component to read a period, a TRANSP or a STATUS off, so such an
-// object is left out here rather than carried forward as a candidate every
-// later stage would have to keep excluding.
+// freeBusyCandidates parses each stored object once. An object holding no
+// VCALENDAR carries no component to read a period, a TRANSP or a STATUS off, so
+// it is left out here rather than carried forward as a candidate every later
+// stage would have to keep excluding.
 func freeBusyCandidates(events []store.Event, zone floatingZone) []freeBusyCandidate {
 	candidates := make([]freeBusyCandidate, 0, len(events))
 	for _, event := range events {
@@ -198,8 +198,8 @@ func (h *DavServer) listCalendarEventsForTimeRange(ctx context.Context, calendar
 // intersects tr under the RFC 4791 §9.9 tables. It is the resource-level test
 // free-busy selects with, so it applies the tables to every component §9.9
 // defines one for; the calendar-query filter walk scopes the same tables to the
-// single component the comp-filter names instead. Octets that did not parse
-// carry no component to judge and intersect nothing.
+// single component the comp-filter names instead. An object holding no
+// VCALENDAR carries no component to judge and intersects nothing.
 func matcherInTimeRange(matcher calendarTimeRangeMatcher, tr *timeRange) bool {
 	start, end, ok := calendarTimeRangeBounds(tr)
 	if !ok || matcher.root == nil {
@@ -214,17 +214,6 @@ func matcherInTimeRange(matcher calendarTimeRangeMatcher, tr *timeRange) bool {
 		}
 	}
 	return false
-}
-
-// busyPeriodOverlapsRange reports whether one generated candidate reaches the
-// range the reported VFREEBUSY covers. A zero-length VEVENT is selected at its
-// instant here, then removed before serialization because it cannot form a
-// valid PERIOD.
-func busyPeriodOverlapsRange(periodStart, periodEnd, rangeStart, rangeEnd time.Time) bool {
-	if periodEnd.Equal(periodStart) {
-		return !periodStart.Before(rangeStart) && periodStart.Before(rangeEnd)
-	}
-	return periodStart.Before(rangeEnd) && periodEnd.After(rangeStart)
 }
 
 // freeBusyHasTimeRange reports whether the range the §9.11 grammar required
@@ -250,7 +239,7 @@ func (h *DavServer) generateFreeBusy(ctx context.Context, candidates []freeBusyC
 	var sb strings.Builder
 	sb.WriteString("BEGIN:VCALENDAR\r\n")
 	sb.WriteString("VERSION:2.0\r\n")
-	sb.WriteString("PRODID:-//CalCard//CalDAV Server//EN\r\n")
+	sb.WriteString("PRODID:" + calDAVServerProdID + "\r\n")
 	sb.WriteString("BEGIN:VFREEBUSY\r\n")
 	now := time.Now().UTC()
 	// RFC 5545 §3.6.4 makes UID as REQUIRED in a VFREEBUSY as DTSTAMP is, so a
@@ -474,8 +463,8 @@ func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode
 	if !ok {
 		return freeBusyInterval{}, false
 	}
-	end := dtstart.instant.Add(freeBusyOccurrenceLength(candidate.matcher, node, dtstart, candidate.event))
-	if !busyPeriodOverlapsRange(dtstart.instant, end, rangeStart, rangeEnd) {
+	end := dtstart.instant.Add(freeBusyOccurrenceLength(candidate.matcher, node, dtstart))
+	if !periodInTimeRange(dtstart.instant, end, rangeStart, rangeEnd) {
 		return freeBusyInterval{}, false
 	}
 	fbType, publishes := freeBusyEventType(node)
@@ -506,7 +495,7 @@ func freeBusyStoredPeriods(matcher calendarTimeRangeMatcher, node *icalNode, ran
 			if !ok {
 				continue
 			}
-			if !busyPeriodOverlapsRange(start, end, rangeStart, rangeEnd) {
+			if !periodInTimeRange(start, end, rangeStart, rangeEnd) {
 				continue
 			}
 			intervals = append(intervals, freeBusyInterval{start: start, end: end, fbType: fbType})
@@ -585,7 +574,7 @@ func compareFreeBusyPlacement(a, b freeBusyInterval) int {
 type freeBusyExtent struct {
 	start   time.Time
 	length  time.Duration
-	resolve ical.PropertyTimeResolver
+	resolve ical.RecurrenceTimeResolver
 }
 
 // extent resolves the interval one occurrence of master occupies.
@@ -605,8 +594,8 @@ func (c freeBusyCandidate) extent(master *icalNode) (freeBusyExtent, bool) {
 	if dtstart, ok := c.matcher.dateValue(master, "DTSTART", noShift); ok {
 		return freeBusyExtent{
 			start:   dtstart.instant,
-			length:  freeBusyOccurrenceLength(c.matcher, master, dtstart, c.event),
-			resolve: c.matcher.resolveContentLine,
+			length:  freeBusyOccurrenceLength(c.matcher, master, dtstart),
+			resolve: c.matcher,
 		}, true
 	}
 	if c.event.DTStart == nil {
@@ -615,7 +604,7 @@ func (c freeBusyCandidate) extent(master *icalNode) (freeBusyExtent, bool) {
 	return freeBusyExtent{
 		start:   *c.event.DTStart,
 		length:  freeBusyColumnLength(c.event, *c.event.DTStart),
-		resolve: c.matcher.resolveContentLine,
+		resolve: c.matcher,
 	}, true
 }
 
@@ -633,23 +622,11 @@ func freeBusyMasterComponent(root *icalNode) *icalNode {
 	return nil
 }
 
-func freeBusyOccurrenceLength(matcher calendarTimeRangeMatcher, master *icalNode, dtstart icalTimeValue, event store.Event) time.Duration {
-	if dtend, ok := matcher.dateValue(master, "DTEND", noShift); ok {
-		if length := dtend.instant.Sub(dtstart.instant); length > 0 {
-			return length
-		}
-	}
-	// A non-positive duration occupies no time and is removed before the report
-	// serializes its intervals.
-	if length, ok := componentDuration(master, "DURATION"); ok && length >= 0 {
-		return length
-	}
-	if dtstart.isDate {
-		// Nominal rather than a fixed 24 hours, so the day a DATE implies still
-		// ends at midnight on a date the zone changes offset.
-		return matcher.zone.addDays(dtstart.instant, 1).Sub(dtstart.instant)
-	}
-	return freeBusyColumnLength(event, dtstart.instant)
+// freeBusyOccurrenceLength is how long an occurrence of master lasts, by the
+// same reading calendar-query gives it. A zero length occupies no time and is
+// removed before the report serializes its intervals.
+func freeBusyOccurrenceLength(matcher calendarTimeRangeMatcher, master *icalNode, dtstart icalTimeValue) time.Duration {
+	return matcher.eventOccurrenceEnd(master, dtstart, noShift).Sub(dtstart.instant)
 }
 
 // freeBusyColumnLength reads the length off the denormalized columns, for an

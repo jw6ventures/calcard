@@ -146,8 +146,8 @@ func TestPropFilterMatchesExactPropertyName(t *testing.T) {
 				UID:     "prop-filter",
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:prop-filter\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
-			if got := eventMatchesFilter(event, calQueryWithPropFilter(tt.propFilter), floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter = %v, want %v for body %q", got, tt.want, tt.body)
+			if got := filterMatches(event, calQueryWithPropFilter(tt.propFilter), floatingZone{}); got != tt.want {
+				t.Fatalf("matchEventFilter = %v, want %v for body %q", got, tt.want, tt.body)
 			}
 		})
 	}
@@ -197,8 +197,8 @@ func TestTextMatchFoldsOnlyASCIICase(t *testing.T) {
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:collation\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
 			filter := calQueryWithPropFilter(propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: tt.match}})
-			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter = %v, want %v matching %q against %q", got, tt.want, tt.match, tt.body)
+			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
+				t.Fatalf("matchEventFilter = %v, want %v matching %q against %q", got, tt.want, tt.match, tt.body)
 			}
 		})
 	}
@@ -353,12 +353,9 @@ func TestEventInTimeRangeBoundaryOverlap(t *testing.T) {
 		want     bool
 	}{
 		{name: "zero-duration at range start", dtstart: "20240601T100000Z", want: true},
-		// A DTEND equal to DTSTART is not a legal VEVENT -- RFC 5545 §3.6.1
-		// requires DTEND to be later than DTSTART -- and the §9.9 row for a
-		// VEVENT carrying DTEND is (start < DTEND AND end > DTSTART), which the
-		// degenerate spelling cannot satisfy at the range start. A zero-duration
-		// occurrence is written with DURATION:PT0S or with DTSTART alone.
-		{name: "explicit zero-duration DTEND at range start", dtstart: "20240601T100000Z", dtend: "20240601T100000Z", want: false},
+		// A DTEND equal to DTSTART spells the same instant DURATION:PT0S does,
+		// and is placed by the same §9.9 zero-duration row.
+		{name: "explicit zero-duration DTEND at range start", dtstart: "20240601T100000Z", dtend: "20240601T100000Z", want: true},
 		{name: "zero DURATION at range start", dtstart: "20240601T100000Z", duration: "PT0S", want: true},
 		{name: "zero-duration inside range", dtstart: "20240601T103000Z", want: true},
 		{name: "zero-duration just before range start", dtstart: "20240601T095900Z", want: false},
@@ -806,7 +803,7 @@ func TestYearlyByWeekNoInstanceBeforeItsPeriodStart(t *testing.T) {
 	}
 
 	tr := &timeRange{Start: "20241230T000000Z", End: "20241231T000000Z"}
-	if !eventMatchesFilter(event, calQueryWithTimeRange(tr.Start, tr.End), floatingZone{}) {
+	if !filterMatches(event, calQueryWithTimeRange(tr.Start, tr.End), floatingZone{}) {
 		t.Error("calendar-query missed the instance on 2024-12-30")
 	}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
@@ -1247,7 +1244,7 @@ func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
 				Name:      tt.property,
 				TextMatch: &textMatch{Text: tt.text},
 			}}})
-			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("text-match %q on %s = %v, want %v", tt.text, tt.property, got, tt.want)
 			}
 		})
@@ -1281,7 +1278,7 @@ func TestParamFilterIsScopedToTheNamedParameter(t *testing.T) {
 				Name:        "ATTENDEE",
 				ParamFilter: []paramFilter{tt.param},
 			}}})
-			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("param-filter %+v = %v, want %v", tt.param, got, tt.want)
 			}
 		})
@@ -1365,8 +1362,8 @@ func TestCompFilterScopingAndIsNotDefined(t *testing.T) {
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := eventMatchesFilter(event, tt.filter, floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter = %v, want %v", got, tt.want)
+			if got := filterMatches(event, tt.filter, floatingZone{}); got != tt.want {
+				t.Fatalf("matchEventFilter = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1397,7 +1394,7 @@ func TestTextMatchHonoursTheNamedCollation(t *testing.T) {
 				Name:      "SUMMARY",
 				TextMatch: &textMatch{Text: tt.text, Collation: tt.collation},
 			}}})
-			if got := eventMatchesFilter(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("collation %q matching %q = %v, want %v", tt.collation, tt.text, got, tt.want)
 			}
 		})
@@ -1443,21 +1440,10 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 					Collation: "i;octet",
 				},
 			}}})
-			if got := eventMatchesFilter(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter, floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter() = %v, want %v", got, tt.want)
+			if got := filterMatches(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter, floatingZone{}); got != tt.want {
+				t.Fatalf("filterMatches() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-// A calendar object whose stored octets do not parse matches nothing rather
-// than failing the report for every other resource in the collection.
-func TestFilterTreatsUnparseableStoredDataAsNoMatch(t *testing.T) {
-	filter := &calFilter{CompFilter: compFilter{Name: "VCALENDAR"}}
-	for _, raw := range []string{"", "ICAL", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"} {
-		if eventMatchesFilter(store.Event{UID: "broken", RawICAL: raw}, filter, floatingZone{}) {
-			t.Errorf("unparseable data %q matched", raw)
-		}
 	}
 }
 
@@ -1519,8 +1505,8 @@ func TestBirthdayCalendarEventsMatchScopedFilters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := eventMatchesFilter(events[0], tt.filter, floatingZone{}); got != tt.want {
-				t.Fatalf("eventMatchesFilter = %v, want %v for %s", got, tt.want, events[0].RawICAL)
+			if got := filterMatches(events[0], tt.filter, floatingZone{}); got != tt.want {
+				t.Fatalf("matchEventFilter = %v, want %v for %s", got, tt.want, events[0].RawICAL)
 			}
 		})
 	}
@@ -1644,4 +1630,11 @@ func TestBirthdayCalendarReportsAgreeOnTheResourceHref(t *testing.T) {
 	}
 	fetched.Responses[0].assertHref(t, want)
 	fetched.Responses[0].assertPropStatus(t, davQN("getetag"), http.StatusOK)
+}
+
+// filterMatches reports whether matchEventFilter selects event, whatever error
+// a recurrence expansion hit while judging it.
+func filterMatches(event store.Event, filter *calFilter, zone floatingZone) bool {
+	matched, _ := matchEventFilter(event, filter, zone)
+	return matched
 }

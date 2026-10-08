@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -29,9 +30,10 @@ const (
 
 // CalendarCollectionMember is one calendar object resource the HTTP layer has
 // already read, authorized, and validated against the destination's storage
-// preconditions. ETag is what the source carried when it was validated and
-// NewETag is what the copy will carry; the store rejects the transfer if the
-// stored member no longer matches.
+// preconditions. RawICAL and ETag are the member exactly as it was read, which
+// the transfer stores unchanged; the store rejects the transfer if the stored
+// member no longer matches them. NewETag is the ETag a COPY gives the member's
+// copy, and Metadata the columns its body reads as.
 type CalendarCollectionMember struct {
 	ID           int64
 	UID          string
@@ -103,6 +105,13 @@ func (s *Store) TransferCalendarCollection(ctx context.Context, transfer Calenda
 	}
 	if transfer.Operation != CalendarCollectionCopy && transfer.Operation != CalendarCollectionMove && transfer.Operation != CalendarCollectionDelete {
 		return nil, fmt.Errorf("unsupported calendar collection transfer operation %q", transfer.Operation)
+	}
+	if calendarCollectionTransferStoresMembers(transfer) {
+		for _, member := range transfer.Members {
+			if member.RawICAL == "" || transfer.Operation == CalendarCollectionCopy && member.NewETag == "" {
+				return nil, fmt.Errorf("calendar collection member %q has no body or ETag to store", member.ResourceName)
+			}
+		}
 	}
 	if s.pool == nil {
 		if s.CalendarCollections == nil {
@@ -222,6 +231,12 @@ func transferCalendarCollectionTx(ctx context.Context, tx *sql.Tx, transfer Cale
 		if err != nil {
 			return nil, err
 		}
+		// Members move with their octets and ETags, and with their columns set
+		// to what their bodies read as, as a MOVE of one object sets them. Each
+		// row is written once, so its triggers fire as for one write of it.
+		if err := moveEventsWithColumnsTx(ctx, tx, source.ID, moved.ID, transfer.Members); err != nil {
+			return nil, err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE events SET calendar_id=$1, last_modified=NOW() WHERE calendar_id=$2`, moved.ID, source.ID); err != nil {
 			return nil, err
 		}
@@ -281,6 +296,62 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`
 		return &CalendarCollectionTransferResult{Calendar: copied, Created: created}, nil
 	}
 	return nil, ErrNotFound
+}
+
+// moveEventsWithColumnsTx moves, in one statement, each of members still in
+// from whose indexed columns differ from the metadata its body reads as into
+// to, setting those columns. The rows whose columns already agree are left in
+// from for the caller to move.
+func moveEventsWithColumnsTx(ctx context.Context, tx *sql.Tx, from, to int64, members []CalendarCollectionMember) error {
+	if len(members) == 0 {
+		return nil
+	}
+	ids := make([]int64, len(members))
+	allDay := make([]bool, len(members))
+	texts := make([][]sql.NullString, 3)
+	times := make([][]sql.NullString, 4)
+	for i := range texts {
+		texts[i] = make([]sql.NullString, len(members))
+	}
+	for i := range times {
+		times[i] = make([]sql.NullString, len(members))
+	}
+	text := func(value *string) sql.NullString {
+		if value == nil {
+			return sql.NullString{}
+		}
+		return sql.NullString{String: *value, Valid: true}
+	}
+	instant := func(value *time.Time) sql.NullString {
+		if value == nil {
+			return sql.NullString{}
+		}
+		return sql.NullString{String: value.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+	for i, member := range members {
+		metadata := calendarCollectionMemberMetadata(member)
+		ids[i], allDay[i] = member.ID, metadata.AllDay
+		texts[0][i], texts[1][i], texts[2][i] = text(metadata.Summary), text(metadata.Description), text(metadata.Location)
+		times[0][i], times[1][i] = instant(metadata.DTStart), instant(metadata.DTEnd)
+		times[2][i], times[3][i] = instant(metadata.RecurrenceStart), instant(metadata.RecurrenceUntil)
+	}
+	const update = `
+UPDATE events AS e
+SET calendar_id = $11, summary = m.summary, description = m.description, location = m.location,
+    dtstart = m.dtstart::timestamptz, dtend = m.dtend::timestamptz, all_day = m.all_day,
+    recurrence_start = m.recurrence_start::timestamptz, recurrence_until = m.recurrence_until::timestamptz
+FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::boolean[], $9::text[], $10::text[])
+    AS m(id, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until)
+WHERE e.id = m.id AND e.calendar_id = $1
+  AND (e.summary IS DISTINCT FROM m.summary OR e.description IS DISTINCT FROM m.description
+    OR e.location IS DISTINCT FROM m.location OR e.dtstart IS DISTINCT FROM m.dtstart::timestamptz
+    OR e.dtend IS DISTINCT FROM m.dtend::timestamptz OR e.all_day IS DISTINCT FROM m.all_day
+    OR e.recurrence_start IS DISTINCT FROM m.recurrence_start::timestamptz
+    OR e.recurrence_until IS DISTINCT FROM m.recurrence_until::timestamptz)`
+	_, err := tx.ExecContext(ctx, update, from, pq.Array(ids),
+		pq.Array(texts[0]), pq.Array(texts[1]), pq.Array(texts[2]), pq.Array(times[0]), pq.Array(times[1]),
+		pq.Array(allDay), pq.Array(times[2]), pq.Array(times[3]), to)
+	return err
 }
 
 func selectCalendarForUpdate(ctx context.Context, tx *sql.Tx, id int64) (*Calendar, error) {
@@ -395,6 +466,13 @@ func calendarCollectionMemberMetadata(member CalendarCollectionMember) EventWrit
 	metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(member.RawICAL)
 	metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(member.RawICAL)
 	return metadata
+}
+
+// calendarCollectionTransferStoresMembers reports whether the transfer writes
+// its members, as opposed to only guarding on them.
+func calendarCollectionTransferStoresMembers(transfer CalendarCollectionTransfer) bool {
+	return transfer.Operation == CalendarCollectionMove ||
+		transfer.Operation == CalendarCollectionCopy && transfer.Depth == "infinity"
 }
 
 func calendarCollectionTransferLockKeys(transfer CalendarCollectionTransfer) []string {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -42,7 +43,8 @@ func BenchmarkListEvents_Owner(b *testing.B) {
 			}},
 			Events:     &fakeEventRepo{events: benchEvents(n)},
 			ACLEntries: &fakeACLRepo{},
-		})
+		}, dav.ValidateCalendarObject)
+
 		b.Run(fmt.Sprintf("events=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
@@ -111,7 +113,8 @@ func newSharedListService(events map[string]store.Event) *Service {
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
+
 }
 
 // BenchmarkPrefetchCalendarACLEntries isolates the prefetch pass, which builds a
@@ -137,7 +140,7 @@ func BenchmarkPrefetchCalendarACLEntries(b *testing.B) {
 					Privilege:     "read",
 				})
 			}
-			svc := NewService(&store.Store{ACLEntries: &fakeACLRepo{entries: entries}})
+			svc := NewService(&store.Store{ACLEntries: &fakeACLRepo{entries: entries}}, dav.ValidateCalendarObject)
 			b.Run(fmt.Sprintf("events=%d/entries=%d", n, m), func(b *testing.B) {
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
@@ -151,7 +154,7 @@ func BenchmarkPrefetchCalendarACLEntries(b *testing.B) {
 }
 
 // benchICSWithAttendees builds a valid VEVENT carrying the given number of
-// ATTENDEE lines, exercising the multiple line-by-line passes in validation.
+// ATTENDEE lines, which the validator counts against the per-instance limit.
 func benchICSWithAttendees(uid string, attendees int) string {
 	var b strings.Builder
 	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:")
@@ -164,43 +167,15 @@ func benchICSWithAttendees(uid string, attendees int) string {
 	return b.String()
 }
 
-// BenchmarkValidateStrictICalendar measures the per-event write-path validation,
-// which makes several full passes over the unfolded lines. It scales attendee
-// count and includes a recurrence near the instance cap.
-func BenchmarkValidateStrictICalendar(b *testing.B) {
-	for _, attendees := range []int{10, 100, 1000} {
-		body := benchICSWithAttendees("bench", attendees)
-		b.Run(fmt.Sprintf("attendees=%d", attendees), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if err := validateStrictICalendar(body); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-	b.Run("recurrence", func(b *testing.B) {
-		body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bench\r\n" +
-			"SUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n" +
-			"RRULE:FREQ=DAILY;COUNT=1999\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if err := validateStrictICalendar(body); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-}
-
 // BenchmarkNormalizeEventPayload covers the full save-time normalization for both
 // supported inputs: a raw ICS body and a structured payload built from scratch.
 func BenchmarkNormalizeEventPayload(b *testing.B) {
-	svc := &Service{}
+	svc := NewService(&store.Store{}, dav.ValidateCalendarObject)
 	b.Run("raw_ics", func(b *testing.B) {
 		input := UpsertInput{RawICS: benchICSWithAttendees("bench", 100), ContentType: "text/calendar"}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, _, err := svc.normalizeEventPayload(input, ""); err != nil {
+			if _, err := svc.normalizeEventPayload(input, "", nil); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -215,7 +190,7 @@ func BenchmarkNormalizeEventPayload(b *testing.B) {
 		}}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, _, err := svc.normalizeEventPayload(input, ""); err != nil {
+			if _, err := svc.normalizeEventPayload(input, "", nil); err != nil {
 				b.Fatal(err)
 			}
 		}

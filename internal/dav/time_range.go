@@ -33,7 +33,7 @@ var recurringTimeRangeComponents = nameSet("VEVENT", "VTODO", "VJOURNAL")
 type floatingZone struct {
 	defined     bool
 	loc         *time.Location
-	observances []submittedTimezoneObservance
+	observances *ical.IndexedTimezoneObservances
 }
 
 // newFloatingZone reads the first VTIMEZONE out of an iCalendar object. An
@@ -59,7 +59,7 @@ func newFloatingZone(icalText string) floatingZone {
 		}
 		// Nothing walkable was submitted. The host's database is the only
 		// remaining source of rules for this name.
-		if loc, err := time.LoadLocation(tzid); err == nil {
+		if loc, ok := ical.HostLocation(tzid); ok {
 			return floatingZone{defined: true, loc: loc}
 		}
 		return floatingZone{defined: true}
@@ -113,7 +113,9 @@ func (z floatingZone) addDays(instant time.Time, days int) time.Time {
 	if z.loc == nil {
 		return instant.AddDate(0, 0, days)
 	}
-	return instant.In(z.loc).AddDate(0, 0, days).UTC()
+	local := instant.In(z.loc)
+	wall := time.Date(local.Year(), local.Month(), local.Day()+days, local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), time.UTC)
+	return ical.WallClockIn(z.loc, wall).UTC()
 }
 
 // wallClock renders an instant as the wall-clock reading in the zone, which is
@@ -163,10 +165,11 @@ type calendarTimeRangeMatcher struct {
 type matcherIndexes struct {
 	overrides map[recurrenceOverrideIndexKey]recurrenceOverrideIndex
 	masters   map[*icalNode]map[string]*icalNode
-	// timezones holds the observances of each VTIMEZONE the resource ships,
-	// by TZID; a nil entry records a TZID the resource defines no usable
-	// zone for.
-	timezones map[string][]submittedTimezoneObservance
+	// observances is the definition the resource ships for each TZID asked
+	// about, nil for one it ships none of. A matcher serves one request on
+	// one goroutine, so it needs none of the locking the parsed tree's own
+	// index takes.
+	observances map[string]*ical.IndexedTimezoneObservances
 }
 
 func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) calendarTimeRangeMatcher {
@@ -242,40 +245,46 @@ func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDa
 	}
 	if tzid = strings.TrimSpace(tzid); tzid != "" {
 		// RFC 4791 §4.1 requires the resource to carry a VTIMEZONE for every
-		// TZID it uses, so that definition is authoritative over the host's.
+		// TZID it uses, so that definition is authoritative over the host's,
+		// unless the server generated it from the host's (submittedTimezone).
 		if wall, err := ical.ParseDateTime(value); err == nil {
-			if offset, ok := observanceOffsetAtWall(m.timezoneObservances(tzid), wall); ok {
-				return wall.Add(-offset).UTC(), true
+			if instant, ok := zonedWallInstant(m.timezoneObservances(tzid), tzid, wall); ok {
+				return instant, true
 			}
-		}
-		if loc, err := time.LoadLocation(tzid); err == nil {
-			parsed, err := ical.ParseDateTimeInLocation(value, loc)
-			return parsed, err == nil
 		}
 	}
 	return m.zone.resolve(value)
 }
 
 // timezoneObservances is the definition the resource ships for tzid, read once
-// per resource however many of its values name it.
-func (m calendarTimeRangeMatcher) timezoneObservances(tzid string) []submittedTimezoneObservance {
-	if observances, ok := m.indexes.timezones[tzid]; ok {
+// per resource however many of its values name it, or nil when it ships none
+// that can be read.
+func (m calendarTimeRangeMatcher) timezoneObservances(tzid string) *ical.IndexedTimezoneObservances {
+	if m.indexes == nil {
+		observances, _ := submittedTimezoneObservances(m.root, tzid)
+		return observances
+	}
+	if observances, read := m.indexes.observances[tzid]; read {
 		return observances
 	}
 	observances, _ := submittedTimezoneObservances(m.root, tzid)
-	if m.indexes.timezones == nil {
-		m.indexes.timezones = make(map[string][]submittedTimezoneObservance)
+	if m.indexes.observances == nil {
+		m.indexes.observances = make(map[string]*ical.IndexedTimezoneObservances)
 	}
-	m.indexes.timezones[tzid] = observances
+	m.indexes.observances[tzid] = observances
 	return observances
 }
 
-// resolveContentLine answers one date-valued content line for the recurrence
+// The matcher is the ical.RecurrenceTimeResolver its recurrence expansions read
+// their dates through, so one zone answers for the whole recurrence set.
+var _ ical.RecurrenceTimeResolver = calendarTimeRangeMatcher{}
+
+// ResolvePropertyTime answers one date-valued content line for the recurrence
 // expansion, which reaches EXDATE, RDATE, RECURRENCE-ID and a floating UNTIL --
 // the dates a component's DTSTART has to agree with. Handing the expansion this
 // rather than letting it read them itself is what keeps one zone answering for
 // the whole recurrence set.
-func (m calendarTimeRangeMatcher) resolveContentLine(keyPart, value string) (time.Time, bool) {
+func (m calendarTimeRangeMatcher) ResolvePropertyTime(keyPart, value string) (time.Time, bool) {
 	value = strings.TrimSpace(value)
 	form, ok := parseICalDateForm(value)
 	if !ok {
@@ -283,6 +292,39 @@ func (m calendarTimeRangeMatcher) resolveContentLine(keyPart, value string) (tim
 	}
 	tzid, _ := ical.PropertyParam(keyPart, "TZID")
 	return m.resolveInstant(tzid, value, form)
+}
+
+// LocalTimeExists reports whether wall is a local time the zone tzid names
+// actually has, which RFC 5545 §3.3.10 needs to leave an instance a rule
+// generates on a skipped time out of the set. It asks the definition
+// resolveInstant reads the TZID through, in the same order: the VTIMEZONE the
+// resource ships, else the host's zone of that name. A gap the shipped
+// definition cannot be followed to is not assumed: the instance is kept. A
+// TZID neither defines is read in the RFC 4791 §7.3 zone, which is no zone the
+// object defines, so it skips nothing.
+func (m calendarTimeRangeMatcher) LocalTimeExists(tzid string, wall time.Time) bool {
+	tzid = strings.TrimSpace(tzid)
+	if observances := m.timezoneObservances(tzid); observances != nil {
+		skipped, known := observances.Skips(wall, sharedTimezoneOnsets)
+		return !known || !skipped
+	}
+	if loc, ok := ical.HostLocation(tzid); ok {
+		return ical.WallClockExists(loc, wall)
+	}
+	return true
+}
+
+var _ ical.LocalTimeGapLister = calendarTimeRangeMatcher{}
+
+// LocalTimeGaps lists where the zone tzid names skips local times, from the
+// definition LocalTimeExists answers from.
+func (m calendarTimeRangeMatcher) LocalTimeGaps(tzid string, after, through time.Time) ([]ical.LocalTimeGap, bool) {
+	tzid = strings.TrimSpace(tzid)
+	observances := m.timezoneObservances(tzid)
+	if observances == nil {
+		return ical.PropertyTimeResolver(nil).LocalTimeGaps(tzid, after, through)
+	}
+	return observances.Gaps(after, through, sharedTimezoneOnsets)
 }
 
 func componentDuration(node *icalNode, name string) (time.Duration, bool) {
@@ -410,7 +452,7 @@ func (m calendarTimeRangeMatcher) visitRecurrenceInstances(node, master *icalNod
 	// Inclusive candidate bounds can add an instance at each endpoint that the
 	// component-specific test excludes. The output budget is checked after that test.
 	err := ical.VisitRecurrenceInstances(m.raw, master.name, dtstart.instant, window,
-		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m.resolveContentLine,
+		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m,
 		func(instance ical.RecurrenceInstance) bool {
 			return visit(recurrenceInstance{
 				shift:     shiftBetween(dtstart.instant, instance.Start),
@@ -495,22 +537,19 @@ func (m calendarTimeRangeMatcher) hasRecurrenceSet(node *icalNode) bool {
 // occurrenceWindow is how long one occurrence of node lasts, used to bound the
 // recurrence scan. It is deliberately the widest reading each component admits,
 // because the exact §9.9 condition is applied to every candidate afterwards.
+// A VEVENT's is the extent eventOccurrenceEnd gives it.
 func (m calendarTimeRangeMatcher) occurrenceWindow(node *icalNode, dtstart icalTimeValue) time.Duration {
 	switch node.name {
 	case "VEVENT":
-		if dtend, ok := m.dateValue(node, "DTEND", noShift); ok {
-			if d := dtend.instant.Sub(dtstart.instant); d > 0 {
-				return d
-			}
-		}
+		return m.eventOccurrenceEnd(node, dtstart, noShift).Sub(dtstart.instant)
 	case "VTODO":
 		if due, ok := m.dateValue(node, "DUE", noShift); ok {
-			if d := due.instant.Sub(dtstart.instant); d > 0 {
+			if d := due.instant.Sub(dtstart.instant); d >= 0 {
 				return d
 			}
 		}
 	}
-	if d, ok := componentDuration(node, "DURATION"); ok && d > 0 {
+	if d, ok := componentDuration(node, "DURATION"); ok && d >= 0 {
 		return d
 	}
 	if dtstart.isDate {
@@ -543,19 +582,63 @@ func (m calendarTimeRangeMatcher) eventInTimeRange(node *icalNode, start, end ti
 	if !ok {
 		return false
 	}
+	return periodInTimeRange(dtstart.instant, m.eventOccurrenceEnd(node, dtstart, shift), start, end)
+}
+
+// eventEnd is what a VEVENT starting at dtstart writes about where it ends,
+// its DTEND moved by shift, for ical.EventEnd to read. An override writing
+// neither DTEND nor DURATION lasts as long as an occurrence of its series,
+// read from the resource's master as the recurrence expansion reads it.
+func (m calendarTimeRangeMatcher) eventEnd(node *icalNode, dtstart icalTimeValue, shift instantShift) ical.EventEnd {
+	extent := ical.EventEnd{Start: dtstart.instant, StartIsDate: dtstart.isDate}
 	if dtend, ok := m.dateValue(node, "DTEND", shift); ok {
-		return start.Before(dtend.instant) && end.After(dtstart.instant)
+		extent.End, extent.HasEnd = dtend.instant, true
 	}
-	if duration, ok := componentDuration(node, "DURATION"); ok {
-		if duration > 0 {
-			return start.Before(dtstart.instant.Add(duration)) && end.After(dtstart.instant)
+	extent.Duration, extent.HasDuration = componentDuration(node, "DURATION")
+	if node.name == "VEVENT" && node.count("RECURRENCE-ID") > 0 && node.count("DTEND") == 0 && node.count("DURATION") == 0 {
+		if master := m.seriesMaster(node); master != nil {
+			if start, ok := m.dateValue(master, "DTSTART", noShift); ok {
+				extent.InheritsLength, extent.SeriesLength = true, m.occurrenceWindow(master, start)
+			}
 		}
-		return !start.After(dtstart.instant) && end.After(dtstart.instant)
 	}
-	if !dtstart.isDate {
-		return !start.After(dtstart.instant) && end.After(dtstart.instant)
+	return extent
+}
+
+// seriesMaster is the component of the resource an override of node's type
+// overrides an occurrence of: the first of that type with no RECURRENCE-ID.
+func (m calendarTimeRangeMatcher) seriesMaster(node *icalNode) *icalNode {
+	if m.root == nil {
+		return nil
 	}
-	return start.Before(m.zone.addDays(dtstart.instant, 1)) && end.After(dtstart.instant)
+	for _, child := range m.root.children {
+		if child.name == node.name && child.count("RECURRENCE-ID") == 0 {
+			return child
+		}
+	}
+	return nil
+}
+
+// eventOccurrenceEnd is where an occurrence of a VEVENT starting at dtstart
+// ends, by the ical.EventEnd rule every reader of an occurrence shares, with a
+// DATE start's day ended in the matcher's zone.
+func (m calendarTimeRangeMatcher) eventOccurrenceEnd(node *icalNode, dtstart icalTimeValue, shift instantShift) time.Time {
+	return m.eventEnd(node, dtstart, shift).OccurrenceEnd(func(dayStart time.Time) time.Time {
+		return m.zone.addDays(dayStart, 1)
+	})
+}
+
+// periodInTimeRange reports whether a period intersects [start, end). The
+// DTEND row of the §9.9 VEVENT table (start < DTEND AND end > DTSTART) was
+// written for events that occupy time, and read literally it would place a
+// period ending where it starts nowhere a range can begin. Such a period is an
+// instant, the one the table's DURATION = 0 row places with start <= DTSTART
+// AND end > DTSTART, and it is matched by that row however its end is written.
+func periodInTimeRange(periodStart, periodEnd, start, end time.Time) bool {
+	if periodEnd.Equal(periodStart) {
+		return !start.After(periodStart) && end.After(periodStart)
+	}
+	return start.Before(periodEnd) && end.After(periodStart)
 }
 
 // todoInTimeRange implements the eight-row §9.9 VTODO table, whose last row
@@ -760,6 +843,13 @@ func (m calendarTimeRangeMatcher) alarmAnchor(parent *icalNode, trigger icalProp
 	if !strings.EqualFold(strings.TrimSpace(trigger.parameters["RELATED"]), "END") {
 		dtstart, ok := m.dateValue(parent, "DTSTART", shift)
 		return dtstart.instant, ok
+	}
+	if parent.name == "VEVENT" {
+		dtstart, ok := m.dateValue(parent, "DTSTART", shift)
+		if !ok {
+			return time.Time{}, false
+		}
+		return m.eventOccurrenceEnd(parent, dtstart, shift), true
 	}
 	if dtend, ok := m.dateValue(parent, "DTEND", shift); ok {
 		return dtend.instant, true

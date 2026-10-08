@@ -13,6 +13,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -508,13 +509,22 @@ func TestDefaultPageSize(t *testing.T) {
 	}
 }
 
+func TestNewHandlerRequiresAValidator(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewHandler with a nil validator did not panic; the UI would store calendar data unvalidated")
+		}
+	}()
+	NewHandler(&config.Config{}, &store.Store{}, &auth.Service{}, nil)
+}
+
 // Test handler creation
 func TestNewHandler(t *testing.T) {
 	cfg := &config.Config{}
 	store := &store.Store{}
 	authService := &auth.Service{}
 
-	handler := NewHandler(cfg, store, authService)
+	handler := NewHandler(cfg, store, authService, dav.ValidateCalendarObject)
 
 	if handler == nil {
 		t.Fatal("NewHandler() returned nil")

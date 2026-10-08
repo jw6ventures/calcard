@@ -13,9 +13,49 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
+	"github.com/jw6ventures/calcard/internal/calobject"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
+
+func TestNewServiceRequiresAValidator(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewService with a nil validator did not panic; the service would store calendar data unvalidated")
+		}
+	}()
+	NewService(&store.Store{}, nil)
+}
+
+// Every write goes through the validator the service was built with, and its
+// refusal reaches the caller as this API's error.
+func TestServiceWritesThroughItsValidator(t *testing.T) {
+	var validated []string
+	refuse := func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+		validated = append(validated, raw)
+		return nil, calobject.NewError(http.StatusForbidden, []string{"max-instances"}, nil)
+	}
+	repo := &fakeEventRepo{events: map[string]store.Event{}}
+	svc := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+		}},
+		Events: repo,
+	}, refuse)
+
+	_, _, err := svc.CreateEvent(context.Background(), &store.User{ID: 1}, 1, UpsertInput{RawICS: validICS("refused"), ContentType: "text/calendar"})
+	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "max-instances") {
+		t.Fatalf("CreateEvent() error = %v, want the validator's max-instances refusal as ErrBadRequest", err)
+	}
+	if len(validated) != 1 || validated[0] != validICS("refused") {
+		t.Fatalf("validator saw %q, want the submitted object once", validated)
+	}
+	if len(repo.events) != 0 {
+		t.Fatalf("stored %d events after a refusal, want none", len(repo.events))
+	}
+}
 
 func TestServiceCRUDAndValidation(t *testing.T) {
 	user := &store.User{ID: 1}
@@ -26,7 +66,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 				1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 			}},
 			Events: &fakeEventRepo{events: map[string]store.Event{}},
-		})
+		}, dav.ValidateCalendarObject)
+
 		cals, err := svc.ListCalendars(context.Background(), user)
 		if err != nil || len(cals) != 1 {
 			t.Fatalf("ListCalendars() err=%v len=%d", err, len(cals))
@@ -42,7 +83,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	})
 
 	t.Run("get calendar not found", func(t *testing.T) {
-		svc := NewService(&store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{}}})
+		svc := NewService(&store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{}}}, dav.ValidateCalendarObject)
 		_, err := svc.GetCalendar(context.Background(), user, 1)
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("expected ErrNotFound, got %v", err)
@@ -71,7 +112,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 				1: {Calendar: store.Calendar{ID: 1, UserID: 9, Name: "Shared"}, Shared: true, Editor: false},
 			}},
 			Events: &fakeEventRepo{events: map[string]store.Event{}},
-		})
+		}, dav.ValidateCalendarObject)
+
 		_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
 			Structured: &StructuredInput{Summary: "x", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
 		})
@@ -152,7 +194,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 			"1:uid-2": {CalendarID: 1, UID: "uid-2", ResourceName: "resource-b", ETag: "etag-2"},
 		}}
 		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-b", validICS("uid-1"), "", "")
+		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-b", mustCalendarObject(t, validICS("uid-1")), "", "")
 		if !errors.Is(err, ErrConflict) {
 			t.Fatalf("expected ErrConflict, got %v", err)
 		}
@@ -163,7 +205,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "resource-a", ETag: "etag-old"},
 		}}
 		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-a", validICS("uid-1"), `"wrong"`, "")
+		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-a", mustCalendarObject(t, validICS("uid-1")), `"wrong"`, "")
 		if !errors.Is(err, ErrPreconditionFailed) {
 			t.Fatalf("expected ErrPreconditionFailed, got %v", err)
 		}
@@ -177,7 +219,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		svc := NewService(&store.Store{
 			Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true}}},
 			Events:    repo, DeadProperties: dead,
-		})
+		}, dav.ValidateCalendarObject)
+
 		err := svc.DeleteEvent(context.Background(), user, 1, "uid-1", `"etag-1"`, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -206,7 +249,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 			Events: &fakeEventRepo{events: map[string]store.Event{
 				"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "etag-1"},
 			}},
-		})
+		}, dav.ValidateCalendarObject)
+
 		if err := svc.DeleteEvent(context.Background(), user, 1, "uid-1", "", ""); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("expected ErrForbidden, got %v", err)
 		}
@@ -218,13 +262,13 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 
 	t.Run("normalize payload branches", func(t *testing.T) {
 		svc := newServiceWithRepos(true, &fakeEventRepo{events: map[string]store.Event{}})
-		if _, _, err := svc.normalizeEventPayload(UpsertInput{}, ""); !errors.Is(err, ErrBadRequest) {
+		if _, err := svc.normalizeEventPayload(UpsertInput{}, "", nil); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("expected ErrBadRequest, got %v", err)
 		}
-		if _, _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: ""}, ""); !errors.Is(err, ErrUnsupportedMediaType) {
+		if _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: ""}, "", nil); !errors.Is(err, ErrUnsupportedMediaType) {
 			t.Fatalf("expected ErrUnsupportedMediaType, got %v", err)
 		}
-		if _, _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: "text/calendar"}, "other"); !errors.Is(err, ErrBadRequest) {
+		if _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: "text/calendar"}, "other", nil); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("expected ErrBadRequest, got %v", err)
 		}
 	})
@@ -249,7 +293,7 @@ func TestServiceEnforcesCalendarObjectACLs(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
 	if err != nil {
@@ -283,7 +327,7 @@ func TestServiceAllowsDirectObjectAccessWithoutCollectionAccess(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	got, err := svc.GetEvent(context.Background(), delegate, 1, "event-1")
 	if err != nil || got == nil || got.UID != "event-1" {
@@ -321,7 +365,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 			}},
-		})
+		}, dav.ValidateCalendarObject)
 
 		_, _, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{
 			Structured: &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
@@ -347,7 +391,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 			}},
-		})
+		}, dav.ValidateCalendarObject)
 
 		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
 			RawICS:      validICS("event-1"),
@@ -373,7 +417,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 				{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
 			}},
-		})
+		}, dav.ValidateCalendarObject)
 
 		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
 			RawICS:      validICS("event-1"),
@@ -398,7 +442,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 			}},
-		})
+		}, dav.ValidateCalendarObject)
 
 		err := svc.DeleteEvent(context.Background(), delegate, 1, "event-1", `"etag-1"`, "")
 		if !errors.Is(err, ErrForbidden) {
@@ -425,7 +469,7 @@ func TestServiceListEventsBatchesACLLookups(t *testing.T) {
 			"1:visible-3": {CalendarID: 1, UID: "visible-3", ResourceName: "visible-3"},
 		}},
 		ACLEntries: aclRepo,
-	})
+	}, dav.ValidateCalendarObject)
 
 	events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
 	if err != nil {
@@ -477,7 +521,7 @@ func TestServiceListEventsHonorsACEOrderAcrossPrincipalQueries(t *testing.T) {
 					"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1"},
 				}},
 				ACLEntries: &fakeACLRepo{entries: tc.entries},
-			})
+			}, dav.ValidateCalendarObject)
 
 			events, err := svc.ListEvents(context.Background(), delegate, 1, store.EventFilter{})
 			if err != nil {
@@ -527,7 +571,7 @@ func TestServiceListEventsPaginationOnlyPreservesLastModifiedOrder(t *testing.T)
 			"1:mid":   {CalendarID: 1, UID: "mid", ResourceName: "mid", DTStart: &febStart, LastModified: t3},
 			"1:late":  {CalendarID: 1, UID: "late", ResourceName: "late", DTStart: &marStart, LastModified: t2},
 		}},
-	})
+	}, dav.ValidateCalendarObject)
 
 	events, err := svc.ListEvents(context.Background(), owner, 1, store.EventFilter{Limit: 2})
 	if err != nil {
@@ -569,6 +613,28 @@ func TestHelpersAndValidators(t *testing.T) {
 		}
 	})
 
+	t.Run("structured times are read as the calendar object stores them", func(t *testing.T) {
+		if _, err := time.LoadLocation("America/New_York"); err != nil {
+			t.Skipf("tzdata unavailable: %v", err)
+		}
+		for name, input := range map[string]*StructuredInput{
+			// 02:30 falls in the 10 March gap and names 03:30 EDT (RFC 5545
+			// §3.3.5), after the 03:15 EDT end.
+			"end before a skipped start": {Summary: "x", Timezone: "America/New_York", DTStart: "2024-03-10T02:30", DTEnd: "2024-03-10T03:15"},
+			// The builder writes local date-times only.
+			"start with a UTC designator": {Summary: "x", DTStart: "2026-03-20T10:00:00Z", DTEnd: "2026-03-20T11:00"},
+			"end with an offset":          {Summary: "x", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00:00-05:00"},
+		} {
+			if _, _, err := buildStructuredEvent(input, ""); !errors.Is(err, ErrBadRequest) {
+				t.Errorf("%s: buildStructuredEvent() error = %v, want ErrBadRequest", name, err)
+			}
+		}
+		body, _, err := buildStructuredEvent(&StructuredInput{Summary: "x", Timezone: "America/New_York", DTStart: "2024-03-10T02:30", DTEnd: "2024-03-10T03:30"}, "")
+		if err != nil || !strings.Contains(body, "DTSTART;TZID=America/New_York:20240310T023000\r\n") {
+			t.Fatalf("buildStructuredEvent() = %v\n%s, want the entered start", err, body)
+		}
+	})
+
 	t.Run("content type validation", func(t *testing.T) {
 		if !errors.Is(validateCalendarContentType(""), ErrUnsupportedMediaType) {
 			t.Fatal("expected unsupported media type")
@@ -606,85 +672,12 @@ func TestHelpersAndValidators(t *testing.T) {
 		}
 	})
 
-	t.Run("strict calendar validation branches", func(t *testing.T) {
-		if !errors.Is(validateStrictICalendar("bad"), ErrBadRequest) {
-			t.Fatal("expected bad request")
-		}
-		unsupported := "BEGIN:VCALENDAR\r\nBEGIN:VAVAILABILITY\r\nUID:x\r\nEND:VAVAILABILITY\r\nEND:VCALENDAR\r\n"
-		if !errors.Is(validateStrictICalendar(unsupported), ErrBadRequest) {
-			t.Fatal("expected bad request")
-		}
-		if !errors.Is(validateStrictICalendar(methodICS("x")), ErrConflict) {
-			t.Fatal("expected conflict")
-		}
-		multiUID := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:b\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-		if !errors.Is(validateStrictICalendar(multiUID), ErrConflict) {
-			t.Fatal("expected conflict")
-		}
-		tooMany := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nRRULE:FREQ=DAILY;COUNT=2001\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-		if !errors.Is(validateStrictICalendar(tooMany), ErrBadRequest) {
-			t.Fatal("expected bad request")
-		}
-		farFuture := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:22010101T100000Z\r\nDTEND:22010101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-		if !errors.Is(validateStrictICalendar(farFuture), ErrBadRequest) {
-			t.Fatal("expected bad request")
-		}
-		var b strings.Builder
-		b.WriteString("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\n")
-		for i := 0; i < ical.MaxAttendeesPerInstance+1; i++ {
-			b.WriteString("ATTENDEE:mailto:user@example.com\r\n")
-		}
-		b.WriteString("END:VEVENT\r\nEND:VCALENDAR\r\n")
-		if !errors.Is(validateStrictICalendar(b.String()), ErrBadRequest) {
-			t.Fatal("expected bad request")
-		}
-		if err := validateStrictICalendar(validICS("ok")); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("ical parsing helpers", func(t *testing.T) {
-		if _, err := extractUIDFromICalendar("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"); err == nil {
-			t.Fatal("expected missing uid error")
-		}
-		if _, err := extractUIDFromICalendar("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"); err == nil {
-			t.Fatal("expected empty uid error")
-		}
-		if !hasMultipleDifferentUIDs("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:b\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n") {
-			t.Fatal("expected multiple uids")
-		}
-		if !containsICalMethodProperty(methodICS("x")) {
-			t.Fatal("expected method property")
-		}
-		if _, err := parseICalDateTime("not-a-date"); err == nil {
-			t.Fatal("expected parse error")
-		}
-		if _, err := parseICalDateTime("20260320T100000Z"); err != nil {
-			t.Fatalf("unexpected parse error: %v", err)
-		}
-		if got := extractICalComponentTypes(validICS("ok")); len(got) == 0 {
-			t.Fatal("expected components")
-		}
-		if count, ok := extractICalRRULECount("RRULE:FREQ=DAILY;COUNT=2"); !ok || count != 2 {
-			t.Fatalf("unexpected RRULE count result ok=%v count=%d", ok, count)
-		}
-		if count, ok := extractICalRRULECount("RRULE:FREQ=DAILY;COUNT=abc"); ok || count != 0 {
-			t.Fatal("expected invalid count handling")
-		}
-		if count := countICalAttendees("ATTENDEE:a\r\nATTENDEE:b\r\n"); count != 2 {
-			t.Fatalf("expected 2 attendees, got %d", count)
-		}
-		if conds := validateCalendarObjectResource("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"); len(conds) == 0 {
-			t.Fatal("expected validation conditions")
-		}
-		if vals := extractICalDateTimes(validICS("ok")); len(vals) < 2 {
-			t.Fatalf("expected date times, got %d", len(vals))
-		}
-	})
-
 	t.Run("misc helpers", func(t *testing.T) {
-		if err := validateEventDates("2026-03-20", "2026-03-20"); err == nil {
-			t.Fatal("expected end after start error")
+		if err := utils.ValidateEventDates("2026-03-20T10:00", "2026-03-20T10:00", false, utils.EventZone{}); err != nil {
+			t.Fatalf("a zero-length event was refused: %v", err)
+		}
+		if err := utils.ValidateEventDates("2026-03-20T10:00", "2026-03-20T09:00", false, utils.EventZone{}); err == nil {
+			t.Fatal("expected an end before the start to be refused")
 		}
 		if got := ensureCRLF("A\nB"); got != "A\r\nB\r\n" {
 			t.Fatalf("unexpected CRLF result %q", got)
@@ -712,11 +705,12 @@ func newServiceWithRepos(editor bool, repo *fakeEventRepo) *Service {
 			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: editor},
 		}},
 		Events: repo,
-	})
+	}, dav.ValidateCalendarObject)
+
 }
 
 func validICS(uid string) string {
-	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 }
 
 func methodICS(uid string) string {
@@ -1041,27 +1035,107 @@ func key(calendarID int64, uid string) string {
 	return strconv.FormatInt(calendarID, 10) + ":" + uid
 }
 
-// The API path and the DAV path validate the same calendar data, and the CalDAV
-// collection properties advertise one pair of limits for both, so this path
-// enforces the values internal/ical defines rather than a set of its own. A
-// second, more permissive set here would let a payload the DAV handlers refuse
-// be stored through the API and then served over CalDAV as a resource exceeding
-// the advertised limit.
-func TestCalendarLimitsEnforceTheAdvertisedCalDAVValues(t *testing.T) {
-	overAttendees := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:a\r\n" +
-		"DTSTAMP:20240601T100000Z\r\nDTSTART:20240601T100000Z\r\n" +
-		strings.Repeat("ATTENDEE:mailto:a@example.com\r\n", ical.MaxAttendeesPerInstance+1) +
-		"END:VEVENT\r\nEND:VCALENDAR\r\n"
-	if err := validateStrictICalendar(overAttendees); err == nil {
-		t.Errorf("an object carrying %d attendees was accepted", ical.MaxAttendeesPerInstance+1)
+// The API stores what a DAV PUT would and refuses what it would, answering a
+// refusal with the API's own errors: a calendar object resource RFC 4791 §4.1
+// rules out is a conflict, and anything else -- a TZID defined nowhere
+// included -- is a bad request. The limits the CalDAV collection properties
+// advertise are among them, so a payload the DAV handlers refuse cannot be
+// stored here and then served over CalDAV.
+func TestEventWritesApplyTheCalDAVValidator(t *testing.T) {
+	user := &store.User{ID: 1}
+	event := func(lines ...string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\n" + strings.Join(lines, "\r\n") + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	vtimezone := "BEGIN:VTIMEZONE\r\nTZID:Office\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	tests := map[string]struct {
+		ics string
+		// zone is an IANA zone the case needs the host's time zone database for.
+		zone string
+		want error
+		// message is text the error returned to the API client must carry.
+		message string
+	}{
+		"not iCalendar":                   {ics: "bad", want: ErrBadRequest},
+		"unsupported component":           {ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VAVAILABILITY\r\nUID:x\r\nEND:VAVAILABILITY\r\nEND:VCALENDAR\r\n", want: ErrBadRequest},
+		"METHOD":                          {ics: methodICS("x"), want: ErrConflict, message: "valid-calendar-object-resource"},
+		"two UIDs":                        {ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:b\r\nDTSTART:20260321T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", want: ErrConflict, message: "valid-calendar-object-resource"},
+		"missing UID":                     {ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", want: ErrBadRequest},
+		"zone defined twice":              {ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + vtimezone + vtimezone + "BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Office:20260320T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", want: ErrBadRequest},
+		"zone defined nowhere":            {ics: event("DTSTART;TZID=Nowhere/Zone:20260320T100000"), want: ErrBadRequest, message: "time zone it does not define"},
+		"end before start":                {ics: event("DTSTART:20260320T100000Z", "DTEND:20260320T090000Z"), want: ErrBadRequest},
+		"past max-date-time":              {ics: event("DTSTART:22010101T100000Z", "DTEND:22010101T110000Z"), want: ErrBadRequest},
+		"past max-instances":              {ics: event("DTSTART:20240601T100000Z", fmt.Sprintf("RRULE:FREQ=DAILY;COUNT=%d", ical.MaxRecurrenceInstances+1)), want: ErrBadRequest},
+		"past max-attendees-per-instance": {ics: event("DTSTART:20240601T100000Z", strings.TrimSuffix(strings.Repeat("ATTENDEE:mailto:a@example.com\r\n", ical.MaxAttendeesPerInstance+1), "\r\n")), want: ErrBadRequest},
+		"zero-length event":               {ics: event("DTSTART:20260320T100000Z", "DTEND:20260320T100000Z")},
+		"zone defined by the object":      {ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + vtimezone + "BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Office:20260320T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
+		"IANA zone without a VTIMEZONE":   {ics: event("DTSTART;TZID=Europe/Berlin:20260320T100000"), zone: "Europe/Berlin"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tt.zone != "" {
+				if _, err := time.LoadLocation(tt.zone); err != nil {
+					t.Skipf("tzdata unavailable: %v", err)
+				}
+			}
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			if tt.want == nil && err != nil {
+				t.Fatalf("CreateEvent() error = %v, want it stored", err)
+			}
+			for _, sentinel := range []error{ErrBadRequest, ErrConflict} {
+				if errors.Is(err, sentinel) != (sentinel == tt.want) {
+					t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+				}
+			}
+			if tt.message != "" && !strings.Contains(err.Error(), tt.message) {
+				t.Errorf("CreateEvent() error = %q, want it to say %q", err, tt.message)
+			}
+			if stored := len(repo.events) == 1; stored != (tt.want == nil) {
+				t.Fatalf("stored = %v", stored)
+			}
+		})
+	}
+}
+
+// What the API stores is what the validator hands back -- the object less a
+// byte order mark -- indexed by the metadata the validator derived, and a
+// collection's supported components bound it as they bound a PUT.
+func TestEventWritesStoreWhatTheValidatorAccepted(t *testing.T) {
+	user := &store.User{ID: 1}
+	repo := &fakeEventRepo{events: map[string]store.Event{}}
+	svc := newServiceWithRepos(true, repo)
+	if _, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: "\xef\xbb\xbf" + validICS("bom"), ContentType: "text/calendar"}); err != nil {
+		t.Fatalf("CreateEvent() error = %v", err)
+	}
+	stored := repo.events[key(1, "bom")]
+	if stored.RawICAL != validICS("bom") {
+		t.Errorf("stored %q, want the object without its byte order mark", stored.RawICAL)
+	}
+	if stored.WriteMetadata == nil || stored.WriteMetadata.Summary == nil || *stored.WriteMetadata.Summary != "Planning" {
+		t.Errorf("stored metadata = %+v, want the validator's", stored.WriteMetadata)
 	}
 
-	overInstances := fmt.Sprintf("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:b\r\n"+
-		"DTSTAMP:20240601T100000Z\r\nDTSTART:20240601T100000Z\r\nRRULE:FREQ=DAILY;COUNT=%d\r\n"+
-		"END:VEVENT\r\nEND:VCALENDAR\r\n", ical.MaxRecurrenceInstances+1)
-	if err := validateStrictICalendar(overInstances); err == nil {
-		t.Errorf("an object generating %d instances was accepted", ical.MaxRecurrenceInstances+1)
+	todoOnly := NewService(&store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+			1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Tasks", SupportedComponents: []string{"VTODO"}}, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]store.Event{}},
+	}, dav.ValidateCalendarObject)
+
+	_, _, err := todoOnly.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS("event"), ContentType: "text/calendar"})
+	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "supported-calendar-component") {
+		t.Fatalf("CreateEvent() into a VTODO collection error = %v, want supported-calendar-component", err)
 	}
+}
+
+func mustCalendarObject(t *testing.T, raw string) *calobject.Object {
+	t.Helper()
+	object, err := dav.ValidateCalendarObject(raw, nil)
+	if err != nil {
+		t.Fatalf("fixture refused: %v", err)
+	}
+	return object
 }
 
 type changedDeleteEventRepo struct{ *fakeEventRepo }
@@ -1159,16 +1233,6 @@ func TestRawICSIdentifiesTheObjectByTopLevelComponentUIDs(t *testing.T) {
 	}
 	for _, tt := range accepted {
 		t.Run(tt.name, func(t *testing.T) {
-			if conds := validateCalendarObjectResource(tt.ics); len(conds) != 0 {
-				t.Fatalf("validateCalendarObjectResource() = %v, want none", conds)
-			}
-			if hasMultipleDifferentUIDs(tt.ics) {
-				t.Fatal("hasMultipleDifferentUIDs() = true, want false")
-			}
-			if uid, err := extractUIDFromICalendar(tt.ics); err != nil || uid != appleEventUID {
-				t.Fatalf("extractUIDFromICalendar() = %q, %v; want %q", uid, err, appleEventUID)
-			}
-
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
 			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
@@ -1237,12 +1301,6 @@ func TestRawICSReadsUIDWithParameters(t *testing.T) {
 	}
 	for _, tt := range accepted {
 		t.Run(tt.name, func(t *testing.T) {
-			if conds := validateCalendarObjectResource(tt.ics); len(conds) != 0 {
-				t.Fatalf("validateCalendarObjectResource() = %v, want none", conds)
-			}
-			if uid, err := extractUIDFromICalendar(tt.ics); err != nil || uid != appleEventUID {
-				t.Fatalf("extractUIDFromICalendar() = %q, %v; want %q", uid, err, appleEventUID)
-			}
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
 			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})

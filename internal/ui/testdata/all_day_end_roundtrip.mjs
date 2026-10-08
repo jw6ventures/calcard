@@ -8,7 +8,7 @@
 // this under node when node is available.
 import fs from 'node:fs';
 
-// Pull the real helpers straight out of the template so this exercises the
+// Pull the real helpers straight out of the rendered page so this exercises the
 // shipped code, not a paraphrase of it.
 const html = fs.readFileSync(process.argv[2], 'utf8');
 function extract(name) {
@@ -22,7 +22,7 @@ function extract(name) {
   }
   return html.slice(start, i + 1);
 }
-const src = ['formatLocalDate','formatDateInput','formatDateTimeInput','startOfDay','addDays',
+const src = ['formatLocalDate','formatDateInput','listedOffsets','intlOffsets','timeZoneClock','formatDateTimeForInput','startOfDay','addDays',
              'inclusiveAllDayEnd','exclusiveAllDayEnd','setEditorDateValues',
              'parseServerDate','normalizeServerEvent','makeOccurrenceKey']
   .map(extract).join('\n');

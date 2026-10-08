@@ -2,6 +2,7 @@ package ical
 
 import (
 	"fmt"
+	"iter"
 	"strings"
 	"time"
 )
@@ -81,7 +82,8 @@ func ParseDateTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
 }
 
-// ParseDateTimeInLocation parses a floating DATE or DATE-TIME value in loc;
+// ParseDateTimeInLocation parses a floating DATE or DATE-TIME value in loc,
+// reading a wall clock a transition skips or repeats as WallClockIn does;
 // values carrying their own zone information ignore loc.
 func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
 	if loc == nil || hasZoneSuffix(s) {
@@ -90,8 +92,11 @@ func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
 	s = normalizeLeapSecond(s)
 
 	for _, format := range icalLocalFormats {
-		if t, err := time.ParseInLocation(format, s, loc); err == nil {
-			return t.UTC(), nil
+		if wall, err := time.Parse(format, s); err == nil {
+			if loc == time.UTC {
+				return wall, nil
+			}
+			return WallClockIn(loc, wall).UTC(), nil
 		}
 	}
 
@@ -143,25 +148,65 @@ func isDigits(s string) bool {
 	return s != ""
 }
 
-func extractRRuleParam(rrule, param string) string {
-	parts := strings.Split(rrule, ";")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
+// RRuleParam returns the value of the named part of an RRULE value, read as
+// the recurrence expansion reads the rule's parts: the name matched without
+// regard to case, and white space around the name, the "=" and the value
+// ignored. found is false when no part carries the name with an "=". The
+// first part of a name answers; a rule repeating one is refused wherever it is
+// written, and only stored data predating that check holds one.
+func RRuleParam(rrule, name string) (value string, found bool) {
+	for key, value := range rruleParts(rrule) {
+		if strings.EqualFold(key, name) {
+			return value, true
 		}
-		if idx := strings.Index(part, "="); idx != -1 {
-			if strings.EqualFold(part[:idx], param) {
-				return part[idx+1:]
+	}
+	return "", false
+}
+
+// RRuleParts returns every part of an RRULE value as RRuleParam reads it,
+// keyed by its name in upper case: a part with no "=" names nothing, and the
+// first part of a name answers.
+func RRuleParts(rrule string) map[string]string {
+	parts := make(map[string]string)
+	for key, value := range rruleParts(rrule) {
+		key = strings.ToUpper(key)
+		if _, seen := parts[key]; !seen {
+			parts[key] = value
+		}
+	}
+	return parts
+}
+
+// rruleParts yields, in order, the name and value of each part of an RRULE
+// value that has an "=", without the white space around either.
+func rruleParts(rrule string) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for part := range strings.SplitSeq(rrule, ";") {
+			key, value, ok := strings.Cut(part, "=")
+			if ok && !yield(strings.TrimSpace(key), strings.TrimSpace(value)) {
+				return
 			}
 		}
 	}
-	return ""
+}
+
+// ByteOrderMark is the UTF-8 encoding of U+FEFF, which Windows tools put at the
+// start of a text file. It is not iCalendar content, and every reader of an
+// object looks for BEGIN:VCALENDAR at its first octet.
+const ByteOrderMark = "\xef\xbb\xbf"
+
+// TrimByteOrderMark returns raw without the ByteOrderMark it starts with, if
+// any.
+func TrimByteOrderMark(raw string) string {
+	return strings.TrimPrefix(raw, ByteOrderMark)
 }
 
 // UnfoldLines normalizes line endings and unfolds RFC 5545 folded content
-// lines (continuations starting with a space or tab).
+// lines (continuations starting with a space or tab). A leading ByteOrderMark
+// and whitespace before the first line are dropped, so the first line is the
+// object's BEGIN rather than a continuation or an unreadable line.
 func UnfoldLines(raw string) []string {
+	raw = strings.TrimLeft(TrimByteOrderMark(raw), " \t\r\n")
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = strings.ReplaceAll(raw, "\r", "\n")
 	rawLines := strings.Split(raw, "\n")

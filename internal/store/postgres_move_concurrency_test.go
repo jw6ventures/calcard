@@ -19,12 +19,10 @@ func calendarMove(from, to int64, uid string) CalendarObjectTransfer {
 		SourceUID:               uid,
 		SourceResourceName:      uid,
 		ExpectedSourceETag:      "etag-" + uid,
-		ExpectedSourceRaw:       raw,
 		DestinationCalendarID:   to,
 		DestinationResourceName: uid,
 		Overwrite:               true,
 		RawICAL:                 raw,
-		ETag:                    "etag-" + uid,
 		SourceStatePath:         fmt.Sprintf("/dav/calendars/%d/%s.ics", from, uid),
 		DestinationStatePath:    fmt.Sprintf("/dav/calendars/%d/%s.ics", to, uid),
 		LockPreconditions: []LockPrecondition{

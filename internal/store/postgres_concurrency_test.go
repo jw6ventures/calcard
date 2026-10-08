@@ -419,7 +419,6 @@ FOR EACH ROW EXECUTE FUNCTION reject_object_state_change()`, pq.QuoteLiteral(des
 				SourceUID:               "source",
 				SourceResourceName:      "source",
 				ExpectedSourceETag:      "source-etag",
-				ExpectedSourceRaw:       raw,
 				DestinationCalendarID:   destinationCalendarID,
 				DestinationResourceName: "destination",
 				ExpectedDestination:     CalendarObjectTransferState{},
@@ -485,7 +484,6 @@ func TestPostgres_CalendarObjectMovePublishesSourceRemoval(t *testing.T) {
 				SourceUID:               "source",
 				SourceResourceName:      "source",
 				ExpectedSourceETag:      "source-etag",
-				ExpectedSourceRaw:       raw,
 				DestinationCalendarID:   destinationCalendarID,
 				DestinationResourceName: "renamed",
 				ExpectedDestination:     CalendarObjectTransferState{},
@@ -655,7 +653,7 @@ func TestPostgres_CalendarObjectTransferUsesRFC4918MoveLockSemantics(t *testing.
 			}
 			_, err = s.TransferCalendarObject(ctx, CalendarObjectTransfer{
 				Operation: operation, SourceCalendarID: sourceCalendarID, SourceUID: "source", SourceResourceName: "source",
-				ExpectedSourceETag: "source-etag", ExpectedSourceRaw: sourceRaw,
+				ExpectedSourceETag:    "source-etag",
 				DestinationCalendarID: destinationCalendar.ID, DestinationResourceName: "destination",
 				ExpectedDestination: CalendarObjectTransferState{Exists: true, UID: "old-destination", ETag: "destination-etag"},
 				Overwrite:           true, RawICAL: sourceRaw, ETag: "copied-etag", SourceStatePath: sourcePath,
@@ -798,7 +796,8 @@ func TestPostgres_CalendarCollectionCopyRollsBackCreatedCollectionAndMembers(t *
 	members := make([]CalendarCollectionMember, 0, len(events))
 	for _, event := range events {
 		members = append(members, CalendarCollectionMember{
-			ID: event.ID, UID: event.UID, ResourceName: event.ResourceName, RawICAL: event.RawICAL, ETag: event.ETag, NewETag: "copy-" + event.ETag,
+			ID: event.ID, UID: event.UID, ResourceName: event.ResourceName, RawICAL: event.RawICAL, ETag: event.ETag,
+			NewETag: "copy-" + event.ETag,
 		})
 	}
 	sourcePath := calendarCollectionStatePath(sourceID)

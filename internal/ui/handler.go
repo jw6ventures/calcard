@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/contacts"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -22,6 +24,12 @@ type Handler struct {
 	authService *auth.Service
 	contacts    *contacts.Service
 	templates   map[string]*template.Template
+	// validateCalendarObject is the validator every calendar object the UI
+	// stores must pass.
+	validateCalendarObject calobject.Validator
+	// timezoneOnsets lists the observance rules of the VTIMEZONEs the
+	// calendar views read, or is nil for each object to list its own.
+	timezoneOnsets ical.ObservanceOnsets
 }
 
 const (
@@ -29,9 +37,22 @@ const (
 	dashboardRecentEventFetchLimit   = 25
 )
 
-// NewHandler creates a new Handler instance.
-func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service) *Handler {
-	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates}
+// NewHandler creates a new Handler instance. validate is required: a Handler
+// without one would store calendar data a CalDAV client could not have written,
+// so a nil validate panics.
+func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service, validate calobject.Validator) *Handler {
+	if validate == nil {
+		panic("ui: NewHandler requires a calendar object validator")
+	}
+	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates, validateCalendarObject: validate}
+}
+
+// ShareTimezoneOnsets has the calendar views read the observance rules of
+// stored VTIMEZONEs through onsets, a listing shared with the rest of the
+// process, rather than listing every object's rules anew on every request.
+// Call it before the handler serves.
+func (h *Handler) ShareTimezoneOnsets(onsets ical.ObservanceOnsets) {
+	h.timezoneOnsets = onsets
 }
 
 // Dashboard displays the main dashboard.
