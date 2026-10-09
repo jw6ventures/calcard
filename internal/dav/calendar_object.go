@@ -1532,6 +1532,9 @@ type submittedZones struct {
 	// timezones is the VTIMEZONE each TZID names, the first whose TZID it
 	// is; it is nil for a definition submittedTimezone sets aside.
 	timezones map[string]*icalNode
+	// work is what every definition's rules may cost to walk where the
+	// shared listings do not answer them, for as long as the parse is read.
+	work *ical.ObservanceWork
 	// observances is the reading of each TZID asked for so far, guarded by mu.
 	mu          sync.Mutex
 	observances map[string]*ical.IndexedTimezoneObservances
@@ -1544,7 +1547,11 @@ func (root *icalNode) submittedZones() *submittedZones {
 }
 
 func readSubmittedZones(root *icalNode) *submittedZones {
-	zones := &submittedZones{timezones: make(map[string]*icalNode), observances: make(map[string]*ical.IndexedTimezoneObservances)}
+	zones := &submittedZones{
+		timezones:   make(map[string]*icalNode),
+		work:        ical.NewObservanceWork(),
+		observances: make(map[string]*ical.IndexedTimezoneObservances),
+	}
 	for _, child := range root.children {
 		if child.name != "VTIMEZONE" {
 			continue
@@ -1578,7 +1585,7 @@ func submittedTimezoneObservances(root *icalNode, tzid string) (*ical.IndexedTim
 	observances, ok := readSubmittedTimezone(zones.timezones[tzid])
 	var indexed *ical.IndexedTimezoneObservances
 	if ok {
-		indexed = ical.IndexTimezoneObservances(observances)
+		indexed = ical.IndexTimezoneObservances(observances, zones.work)
 	}
 	zones.observances[tzid] = indexed
 	return indexed, ok

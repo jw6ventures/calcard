@@ -128,7 +128,7 @@ func TestIndexedTimezoneObservancesAnswerAsTheScanDoes(t *testing.T) {
 				{name: "walked"},
 				{name: "listed", scanned: onsetListings{}, indexed: onsetListings{}},
 			} {
-				indexed := IndexTimezoneObservances(observances)
+				indexed := IndexTimezoneObservances(observances, nil)
 				for _, bound := range bounds {
 					wantOffset, wantOK := observances.OffsetAtWall(bound, onsets.scanned)
 					gotOffset, gotOK := indexed.OffsetAtWall(bound, onsets.indexed)
@@ -154,7 +154,7 @@ func TestIndexedTimezoneObservancesSearchTheOnsetsTheyState(t *testing.T) {
 		observances = append(observances, observanceAt(wallAt(year, 3, 1, 2), time.Hour, 2*time.Hour, nil),
 			observanceAt(wallAt(year, 10, 1, 3), 2*time.Hour, time.Hour, nil))
 	}
-	indexed := IndexTimezoneObservances(observances)
+	indexed := IndexTimezoneObservances(observances, nil)
 	if _, ok := indexed.OffsetAtWall(wallAt(2026, 6, 1, 0), nil); !ok {
 		t.Fatal("the definition answers no offset")
 	}
@@ -166,5 +166,53 @@ func TestIndexedTimezoneObservancesSearchTheOnsetsTheyState(t *testing.T) {
 	})
 	if allocations != 0 {
 		t.Errorf("a lookup allocates %v times, want none", allocations)
+	}
+}
+
+// Every lookup through the definitions one reading of an object holds walks a
+// rule no listing answers on the reading's one budget. A zone that moves its
+// clock forward at every second costs a day of candidates for each walk, and a
+// series asks for one per instance, so walks on budgets of their own would cost
+// a budget per instance. The reading answers lookups as each walk on its own
+// budget answers them until its budget is spent, and every lookup after that,
+// through any of the object's zones, is incomplete without walking again.
+func TestAReadingWalksItsObservanceRulesOnOneBudget(t *testing.T) {
+	every := "FREQ=DAILY;BYHOUR=" + everyValue(0, 23) + ";BYMINUTE=" + everyValue(0, 59) + ";BYSECOND=" + everyValue(0, 59)
+	observances := TimezoneObservances{
+		observanceAt(wallAt(1601, 1, 1, 0), 0, 0, nil),
+		observanceAt(wallAt(1601, 1, 1, 2), 0, time.Second, nil, every),
+	}
+	work := NewObservanceWork()
+	reading := IndexTimezoneObservances(observances, work)
+	answered := 0
+	for day := range 1000 {
+		wall := time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC).AddDate(0, 0, day)
+		got, ok := reading.OffsetAtWall(wall, nil)
+		if !ok {
+			continue
+		}
+		if answered < day {
+			t.Fatalf("answered %v after a lookup the spent budget refused", wall)
+		}
+		if want, wantOK := observances.OffsetAtWall(wall, nil); !wantOK || got != want {
+			t.Fatalf("OffsetAtWall(%v) = %v, walking it on its own gives %v, %t", wall, got, want, wantOK)
+		}
+		answered++
+	}
+	if answered == 0 || answered >= 1000 {
+		t.Fatalf("answered %d of 1000 lookups, want the reading's budget spent partway", answered)
+	}
+	if work.work.remaining >= 0 {
+		t.Fatalf("%d units left after the reading stopped answering", work.work.remaining)
+	}
+	if _, known := reading.Skips(time.Date(2030, 1, 1, 9, 30, 0, 0, time.UTC), nil); known {
+		t.Error("Skips walked the rule on a spent budget")
+	}
+	if _, ok := reading.Gaps(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 1, 1, 1, 0, 0, 0, time.UTC), nil); ok {
+		t.Error("Gaps listed the rule on a spent budget")
+	}
+	otherZone := IndexTimezoneObservances(observances, work)
+	if _, ok := otherZone.OffsetAtWall(time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC), nil); ok {
+		t.Error("another zone of the same reading walked the rule on the spent budget")
 	}
 }

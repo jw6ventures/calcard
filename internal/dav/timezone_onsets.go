@@ -15,7 +15,8 @@ const (
 	// maxListedOnsetsPerRule bounds the onsets each listing of one observance
 	// rule keeps. A yearly rule from Exchange's 1601 DTSTART reaches past 2100
 	// well inside it; a denser rule keeps what fits, and an instant past that
-	// is answered from a window listed around it (listedRule.latest).
+	// is answered from a window listed around it where the rule is counted
+	// (listedRule.latest), and otherwise not listed.
 	maxListedOnsetsPerRule = 2048
 	// maxHeldOnsets bounds what the cache keeps across every rule, counted in
 	// onsets, about three megabytes. Real zone definitions share a few hundred
@@ -62,13 +63,17 @@ func SharedTimezoneOnsets() ical.ObservanceOnsets {
 // time it is asked for, so a burst of distinct rules costs listings rather than
 // locking out the rules every other resource shares.
 //
-// A nil cache asks every question of the rule directly.
+// A question no listing answers is left to the reader, which walks the rule on
+// the work budget of the object it is reading (ical.ObservanceWork), so one
+// object whose rules every listing misses spends its own budget and no more.
+// A nil cache lists nothing.
 type timezoneOnsets struct {
 	rules *lru.Cache[observanceRuleKey, *listedRule]
 
 	// lookups and walks count the questions asked and those the listings could
-	// not answer, and relists the listings started again from an instant, so
-	// tests can tell the work done apart from the time it took.
+	// not answer, which the reader walked, and relists the listings started
+	// again from an instant, so tests can tell the work done apart from the
+	// time it took.
 	lookups atomic.Int64
 	walks   atomic.Int64
 	relists atomic.Int64
@@ -98,10 +103,10 @@ type listedRule struct {
 	// past lister are walked.
 	window     *ical.RecurrenceStartLister
 	windowless bool
-	// walked reports that the rule keeps no listing and every lookup walks
-	// it: a rule without COUNT whose listing from the DTSTART stopped before
-	// the present, which ical.LatestRecurrenceOnOrBefore answers by searching
-	// back from the instant, in a few microseconds.
+	// walked reports that the rule keeps no listing and every lookup is left
+	// to the reader to walk: a rule without COUNT whose listing from the
+	// DTSTART stopped before the present, which the reader answers by
+	// searching back from the instant.
 	walked bool
 }
 
@@ -138,25 +143,49 @@ var _ ical.ObservanceOnsets = (*timezoneOnsets)(nil)
 
 // LatestOnOrBefore answers what ical.LatestRecurrenceOnOrBefore answers for
 // the same arguments, from a listing of the rule's onsets where one reaches
-// before.
-func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
-	if o == nil || before.Before(dtstart) {
-		return ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+// before. listed is false where none does.
+func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, listed bool) {
+	if before.Before(dtstart) {
+		return time.Time{}, false, true
+	}
+	if o == nil {
+		return time.Time{}, false, false
 	}
 	o.lookups.Add(1)
 	if ruleCost(rrule, 1) > o.rules.Budget() {
 		// The rule could not be cached with even its DTSTART listed without
 		// exceeding the budget on its own.
 		o.walks.Add(1)
-		return ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+		return time.Time{}, false, false
 	}
 	rule := o.rule(observanceRuleKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule})
-	latest, found, listed := rule.latest(o, dtstart, before)
-	if !listed {
+	if latest, found, listed = rule.latest(o, dtstart, before); !listed {
 		o.walks.Add(1)
-		return ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
 	}
-	return latest, found, true
+	return latest, found, listed
+}
+
+// StartsBetween lists the rule's starts after after and at or before through,
+// leaving out the DTSTART, from a listing that holds them all, extending it
+// as LatestOnOrBefore does. listed is false where none does. The starts are
+// the listing's own and must not be modified.
+func (o *timezoneOnsets) StartsBetween(dtstart, after, through time.Time, rrule string) (starts []time.Time, listed bool) {
+	if !through.After(dtstart) || !through.After(after) {
+		return nil, true
+	}
+	if o == nil {
+		return nil, false
+	}
+	o.lookups.Add(1)
+	if ruleCost(rrule, 1) > o.rules.Budget() {
+		o.walks.Add(1)
+		return nil, false
+	}
+	rule := o.rule(observanceRuleKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule})
+	if starts, listed = rule.between(o, dtstart, after, through); !listed {
+		o.walks.Add(1)
+	}
+	return starts, listed
 }
 
 // rule is the cache entry for key, created if absent, marked most recently
@@ -183,7 +212,7 @@ func (o *timezoneOnsets) charge(rule *listedRule) {
 // the rule's other listing holds: what one listing may keep, and no more than
 // fits in the budget beside the rule's text and that listing, so that a rule
 // listed from a distant DTSTART cannot hold the cache past its budget.
-// Instants past the listings are asked of the rule directly.
+// Instants past the listings are left to the reader.
 func (o *timezoneOnsets) listLimit(rule *listedRule, held int) int {
 	return min(maxListedOnsetsPerRule, o.rules.Budget()-ruleCost(rule.key.rrule, held))
 }
@@ -206,19 +235,44 @@ func ruleCost(rrule string, held int) int {
 //
 // A listing from the DTSTART keeps at most listLimit onsets, which for a rule
 // denser than yearly from Exchange's 1601 DTSTART stops short of the present.
-// Past it, a rule without COUNT is walked back from the instant in a few
-// microseconds, so a listing that stops before the present is dropped and the
-// rule held at the cost of its text; with many such rules the cache would
-// otherwise list and evict them in turn. A counted rule can only be walked
-// forward from its DTSTART, so its instants past the listing are answered from
-// a window listed from shortly before the first of them, replaced when a later
-// instant passes it; an instant before the window's start is walked.
+// Past it, the reader walks a rule without COUNT back from the instant, which
+// for a zone's rules takes microseconds, so a listing that stops before the
+// present is dropped and the rule held at the cost of its text; with many such
+// rules the cache would otherwise list and evict them in turn. A counted rule
+// can only be walked forward from its DTSTART, so its instants past the listing
+// are answered from a window listed from shortly before the first of them,
+// replaced when a later instant passes it; an instant before the window's
+// start is left to the reader.
 //
 // A listing that changed is charged before the rule's lock is let go, so two
 // lookups growing it in turn cannot record their sizes out of order.
 func (r *listedRule) latest(cache *timezoneOnsets, dtstart, before time.Time) (latest time.Time, found, listed bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.latestLocked(cache, dtstart, before)
+}
+
+// between lists the starts in (after, through] from whichever of the rule's
+// listings holds them all, once latest has extended them to through.
+func (r *listedRule) between(cache *timezoneOnsets, dtstart, after, through time.Time) ([]time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, _, listed := r.latestLocked(cache, dtstart, through); !listed {
+		return nil, false
+	}
+	for _, listing := range []*ical.RecurrenceStartLister{r.lister, r.window} {
+		if listing == nil {
+			continue
+		}
+		if starts, ok := listing.StartsBetween(after, through); ok {
+			return starts, true
+		}
+	}
+	return nil, false
+}
+
+// latestLocked is latest for a caller holding the rule's lock.
+func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Time) (latest time.Time, found, listed bool) {
 	if r.walked {
 		return time.Time{}, false, false
 	}

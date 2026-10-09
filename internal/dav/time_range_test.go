@@ -1547,6 +1547,13 @@ func TestTimezoneOnsetsAgreeWithWalkingEachRule(t *testing.T) {
 							t.Fatalf("offset at %v = %v, %t through the cache, %v, %t walking", instant, got, gotOK, want, wantOK)
 						}
 					}
+					// The gaps a series' expansion lists a year at a time.
+					through := instant.Add(366 * 24 * time.Hour)
+					want, wantOK := observances.TimezoneObservances.Gaps(instant, through, nil)
+					got, gotOK := observances.TimezoneObservances.Gaps(instant, through, onsets)
+					if !slices.Equal(got, want) || gotOK != wantOK {
+						t.Fatalf("gaps in (%v, %v] = %v, %t through the cache, %v, %t following each rule", instant, through, got, gotOK, want, wantOK)
+					}
 				}
 			}
 
@@ -1603,7 +1610,7 @@ func TestTimezoneOnsetsKeepWhatAFarFutureLookupListed(t *testing.T) {
 		time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC),
 	} {
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(rule.dtstart, before, rule.rrule)
-		got, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule)
+		got, found, complete := readOnset(onsets, rule.dtstart, before, rule.rrule)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 		}
@@ -1626,7 +1633,7 @@ func TestTimezoneOnsetsEvictTheLeastRecentlyUsedRule(t *testing.T) {
 	ask := func(dtstart time.Time, rrule string) {
 		t.Helper()
 		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-		if got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+		if got, found, complete := readOnset(onsets, dtstart, before, rrule); !found || !complete || !got.Equal(want) {
 			t.Fatalf("latest(%v, %q) = %v, %t, %t, want %v", dtstart, rrule, got, found, complete, want)
 		}
 	}
@@ -1664,7 +1671,7 @@ func TestTimezoneOnsetsChargeEachRuleItsText(t *testing.T) {
 	ask := func(dtstart time.Time, rrule string) {
 		t.Helper()
 		want, _, _ := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-		if got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule); !found || !complete || !got.Equal(want) {
+		if got, found, complete := readOnset(onsets, dtstart, before, rrule); !found || !complete || !got.Equal(want) {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v", dtstart, got, found, complete, want)
 		}
 	}
@@ -1726,7 +1733,7 @@ func TestTimezoneOnsetsDoNotKeepTheObjectARuleWasReadFrom(t *testing.T) {
 		if !ok {
 			t.Fatal("the padded definition has no usable observance")
 		}
-		if _, found, complete := onsets.LatestOnOrBefore(observances.TimezoneObservances[0].Start, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances.TimezoneObservances[0].RRules[0]); !found || !complete {
+		if _, found, listed := onsets.LatestOnOrBefore(observances.TimezoneObservances[0].Start, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances.TimezoneObservances[0].RRules[0]); !found || !listed {
 			t.Fatal("the padded definition's rule did not resolve")
 		}
 	}
@@ -1749,13 +1756,35 @@ func TestTimezoneOnsetsAnswerAListedInstantWithoutAllocating(t *testing.T) {
 	onsets := newTimezoneOnsets(maxHeldOnsets)
 	rule := exchangeStandardRule
 	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	if _, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule); !found || !complete {
+	if _, found, listed := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule); !found || !listed {
 		t.Fatal("the rule did not resolve")
 	}
 	if allocs := testing.AllocsPerRun(100, func() {
 		onsets.LatestOnOrBefore(rule.dtstart, before.Add(time.Hour), rule.rrule)
 	}); allocs != 0 {
 		t.Fatalf("a listed lookup allocated %v times, want none", allocs)
+	}
+}
+
+// A series' expansion lists where its zone skips local times a year at a time,
+// and a span the listing already holds is read off it: no walk, no pass of the
+// rule, no allocation.
+func TestTimezoneOnsetsListASpanTheListingHoldsWithoutAllocating(t *testing.T) {
+	onsets := newTimezoneOnsets(maxHeldOnsets)
+	rule := exchangeStandardRule
+	after := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	through := after.AddDate(1, 0, 0)
+	starts, listed := onsets.StartsBetween(rule.dtstart, after, through, rule.rrule)
+	if want := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC); !listed || len(starts) != 1 || !starts[0].Equal(want) {
+		t.Fatalf("starts in 2026 = %v, %t, want [%v] listed", starts, listed, want)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		onsets.StartsBetween(rule.dtstart, after.Add(time.Hour), through, rule.rrule)
+	}); allocs != 0 {
+		t.Fatalf("a listed span allocated %v times, want none", allocs)
+	}
+	if walks := onsets.walks.Load(); walks != 0 {
+		t.Fatalf("left %d spans to the reader, want every one read off the listing", walks)
 	}
 }
 
@@ -1772,7 +1801,7 @@ func TestTimezoneOnsetsDoNotRetryAHaltedListing(t *testing.T) {
 
 	for _, before := range []time.Time{listed, past, time.Date(1910, 6, 1, 0, 0, 0, 0, time.UTC), past.AddDate(1, 0, 0)} {
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, monthly)
-		got, found, complete := onsets.LatestOnOrBefore(dtstart, before, monthly)
+		got, found, complete := readOnset(onsets, dtstart, before, monthly)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 		}
@@ -1868,7 +1897,7 @@ func TestTimezoneOnsetsServeConcurrentLookups(t *testing.T) {
 			defer wg.Done()
 			for i := range rules {
 				rule := rules[(i+worker)%len(rules)]
-				got, found, complete := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule)
+				got, found, complete := readOnset(onsets, rule.dtstart, before, rule.rrule)
 				if expected := want[(i+worker)%len(rules)]; !found || !complete || !got.Equal(expected) {
 					failures <- fmt.Sprintf("latest(%v) = %v, %t, %t, want %v", rule.dtstart, got, found, complete, expected)
 				}

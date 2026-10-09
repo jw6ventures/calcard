@@ -119,6 +119,11 @@ func (c *countingOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule strin
 	return c.listings.LatestOnOrBefore(dtstart, before, rrule)
 }
 
+func (c *countingOnsets) StartsBetween(dtstart, after, through time.Time, rrule string) ([]time.Time, bool) {
+	c.asked++
+	return c.listings.StartsBetween(dtstart, after, through, rrule)
+}
+
 // The recurrence-limit check and the recurrence bounds read an object's dates
 // through the ObjectTimes the analysis read them with, so a definition's rules
 // are listed once for the object, through the listings it shares, rather than

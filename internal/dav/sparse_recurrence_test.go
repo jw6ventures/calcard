@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -105,6 +106,37 @@ func TestRecurrenceReportsHandleIncompleteExpansion(t *testing.T) {
 	}
 }
 
+// requirePrompt runs evaluate and fails the test unless it returns within half
+// a second, the most one evaluation of a recurrence or zone may cost.
+func requirePrompt(t *testing.T, evaluate func()) {
+	t.Helper()
+	requirePromptWithin(t, 500*time.Millisecond, evaluate)
+}
+
+// requirePromptWithin runs evaluate and fails the test unless it returns
+// within budget. evaluate runs on its own goroutine, which may outlive the
+// test, so it leaves its assertions to the caller. The budget is not asserted
+// under the race detector, whose per-access cost would decide it; a hard limit
+// is.
+func requirePromptWithin(t *testing.T, budget time.Duration, evaluate func()) {
+	t.Helper()
+	const hardLimit = 10 * time.Second
+	done := make(chan time.Duration, 1)
+	go func() {
+		started := time.Now()
+		evaluate()
+		done <- time.Since(started)
+	}()
+	select {
+	case elapsed := <-done:
+		if elapsed > budget && !raceDetectorEnabled {
+			t.Errorf("took %v, want at most %v", elapsed, budget)
+		}
+	case <-time.After(hardLimit):
+		t.Fatalf("did not return within %v", hardLimit)
+	}
+}
+
 // A rule whose BY parts can never hold together -- the twenty-sixth weekday of
 // a year always falls after the 23rd of June -- describes the DTSTART alone. On
 // the PUT gate, as a VTIMEZONE observance, and stored under free-busy and an
@@ -141,28 +173,6 @@ func TestNeverMatchingRecurrenceIsAnsweredPromptly(t *testing.T) {
 		"BEGIN:VEVENT\r\nUID:never\r\nDTSTAMP:20260101T000000Z\r\n" +
 		"DTSTART;TZID=Review/Never:20260101T090000\r\nDTEND;TZID=Review/Never:20260101T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	// evaluate runs on its own goroutine, which may outlive the test, so it
-	// leaves its assertions to the caller. The budget is not asserted under the
-	// race detector, whose per-access cost would decide it.
-	promptly := func(t *testing.T, evaluate func()) {
-		t.Helper()
-		const budget, hardLimit = 500 * time.Millisecond, 10 * time.Second
-		done := make(chan time.Duration, 1)
-		go func() {
-			started := time.Now()
-			evaluate()
-			done <- time.Since(started)
-		}()
-		select {
-		case elapsed := <-done:
-			if elapsed > budget && !raceDetectorEnabled {
-				t.Errorf("took %v, want at most %v", elapsed, budget)
-			}
-		case <-time.After(hardLimit):
-			t.Fatalf("did not return within %v", hardLimit)
-		}
-	}
-
 	putBodies := map[string]string{
 		"repeated BYDAY":       event(repeated),
 		"VTIMEZONE observance": observance,
@@ -173,7 +183,7 @@ func TestNeverMatchingRecurrenceIsAnsweredPromptly(t *testing.T) {
 	for name, raw := range putBodies {
 		t.Run("PUT validation/"+name, func(t *testing.T) {
 			var fault *calendarObjectFault
-			promptly(t, func() {
+			requirePrompt(t, func() {
 				_, fault = validateCalendarObjectForStorage(raw, nil)
 			})
 			if fault != nil {
@@ -207,12 +217,114 @@ func TestNeverMatchingRecurrenceIsAnsweredPromptly(t *testing.T) {
 				req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(test.body))
 				req.Header.Set("Depth", "1")
 				rr := httptest.NewRecorder()
-				promptly(t, func() {
+				requirePrompt(t, func() {
 					h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
 				})
 				body := rr.Body.String()
 				if rr.Code != test.status || !strings.Contains(body, test.want) || strings.Contains(body, test.absent) {
 					t.Fatalf("%d %s", rr.Code, body)
+				}
+			})
+		}
+	}
+}
+
+// denseObservanceObject is a calendar object whose zone moves its clock forward
+// one second at every second: a DAYLIGHT rule listing every hour, minute and
+// second of every day from Exchange's 1601 DTSTART. PUT admits it without
+// COUNT; a counted variant can only be stored data, since PUT refuses COUNT in
+// an observance. Its event recurs by eventRule.
+func denseObservanceObject(observanceRule, eventRule string) string {
+	every := func(from, to int) string {
+		values := make([]string, 0, to-from+1)
+		for value := from; value <= to; value++ {
+			values = append(values, fmt.Sprint(value))
+		}
+		return strings.Join(values, ",")
+	}
+	return strings.Join([]string{
+		"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Review//EN",
+		"BEGIN:VTIMEZONE", "TZID:Review/Dense",
+		"BEGIN:STANDARD", "DTSTART:16010101T000000", "TZOFFSETFROM:+0000", "TZOFFSETTO:+0000", "END:STANDARD",
+		"BEGIN:DAYLIGHT", "DTSTART:16010101T020000",
+		"RRULE:" + observanceRule + ";BYHOUR=" + every(0, 23) + ";BYMINUTE=" + every(0, 59) + ";BYSECOND=" + every(0, 59),
+		"TZOFFSETFROM:+0000", "TZOFFSETTO:+000001", "END:DAYLIGHT",
+		"END:VTIMEZONE",
+		"BEGIN:VEVENT", "UID:dense", "DTSTAMP:20240101T000000Z",
+		"DTSTART;TZID=Review/Dense:20240105T093000", "DURATION:PT1H", "RRULE:" + eventRule,
+		"END:VEVENT", "END:VCALENDAR", "",
+	}, "\r\n")
+}
+
+// A zone that skips a local time at every second makes every lookup of its
+// transitions a walk of a day's 86,400 of them, and its gaps cannot be listed
+// for any span longer than about half an hour. Every walk and pass a reading
+// of the object needs draws on one budget for that reading, so PUT and every
+// report over the stored object answer promptly however many instances the
+// series has, rather than paying a walk per instance or per listed gap. A
+// report reads the object twice, once to match it and once to project it.
+func TestDenseObservanceRuleIsAnsweredPromptly(t *testing.T) {
+	useTimezoneOnsets(t, maxHeldOnsets)
+	for _, eventRule := range []string{"FREQ=WEEKLY;COUNT=2", "FREQ=DAILY;COUNT=1000", "FREQ=HOURLY;COUNT=1000", "FREQ=WEEKLY"} {
+		t.Run("PUT validation/"+eventRule, func(t *testing.T) {
+			var fault *calendarObjectFault
+			requirePrompt(t, func() {
+				_, fault = validateCalendarObjectForStorage(denseObservanceObject("FREQ=DAILY", eventRule), nil)
+			})
+			if fault != nil {
+				t.Errorf("refused: %+v", fault)
+			}
+		})
+	}
+
+	stored := map[string]string{
+		"open-ended zone": denseObservanceObject("FREQ=DAILY", "FREQ=DAILY;COUNT=1000"),
+		"counted zone":    denseObservanceObject("FREQ=DAILY;COUNT=100000000", "FREQ=DAILY;COUNT=1000"),
+	}
+	for _, test := range []struct {
+		name, body, want string
+		status           int
+	}{
+		{
+			name:   "free-busy",
+			body:   `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav"><C:time-range start="20240101T000000Z" end="20270101T000000Z"/></C:free-busy-query>`,
+			want:   "FREEBUSY:202401",
+			status: http.StatusOK,
+		},
+		{
+			name:   "open-ended calendar-query",
+			body:   `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20250101T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`,
+			want:   "dense.ics",
+			status: http.StatusMultiStatus,
+		},
+		{
+			name: "expanded calendar-query",
+			body: `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><C:calendar-data><C:expand start="20240101T000000Z" end="20270101T000000Z"/></C:calendar-data></D:prop>` +
+				`<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20240101T000000Z" end="20270101T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`,
+			want:   "RECURRENCE-ID:2024",
+			status: http.StatusMultiStatus,
+		},
+	} {
+		for name, raw := range stored {
+			t.Run(test.name+"/"+name, func(t *testing.T) {
+				h := hostileRecurrenceServer()
+				// The stored bounds the database narrows by are written at PUT,
+				// so the fake does not derive them again on every read.
+				h.store.Events = &fakeEventRepo{ignoreFilter: true, events: map[string]*store.Event{"1:dense": {ID: 1, CalendarID: 1, UID: "dense", ResourceName: "dense", ETag: "e", RawICAL: raw}}}
+				report := func() *httptest.ResponseRecorder {
+					req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(test.body))
+					req.Header.Set("Depth", "1")
+					rr := httptest.NewRecorder()
+					h.Report(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1})))
+					return rr
+				}
+				// The zone's rules are listed once for the whole process, so
+				// the second report pays what every later one does.
+				first := report()
+				var rr *httptest.ResponseRecorder
+				requirePromptWithin(t, time.Second, func() { rr = report() })
+				if rr.Code != test.status || first.Code != test.status || !strings.Contains(rr.Body.String(), test.want) {
+					t.Fatalf("%d then %d, want %d with %q: %s", first.Code, rr.Code, test.status, test.want, rr.Body.String())
 				}
 			})
 		}

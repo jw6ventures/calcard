@@ -650,7 +650,7 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 		// A gap the definition cannot be followed to is not assumed: the
 		// candidate is counted.
 		rule.localTimeExists = existenceFromGaps(func(wall time.Time) bool {
-			skipped, known := zone.object.skips(wall)
+			skipped, known := zone.skips(wall)
 			return !known || !skipped
 		}, zone.object)
 	}
@@ -1420,6 +1420,11 @@ func recurrenceInstantKey(value time.Time) string {
 // half-generated period names the wrong UTC offset, and nothing downstream can
 // tell.
 func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
+	return latestRecurrenceOnOrBefore(dtstart, before, rrule, newRecurrenceWork())
+}
+
+// latestRecurrenceOnOrBefore is LatestRecurrenceOnOrBefore drawing on work.
+func latestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string, work *recurrenceWork) (latest time.Time, found, complete bool) {
 	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil, wallClockIn(dtstart.Location()))
 	if !ok || before.Before(dtstart) {
 		return time.Time{}, false, true
@@ -1431,7 +1436,6 @@ func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return dtstart, true, true
 	}
-	work := newRecurrenceWork()
 	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
 	if overBudget {
 		return dtstart, true, false
@@ -1590,6 +1594,54 @@ func NewRecurrenceStartListerFrom(dtstart time.Time, rrule string, from time.Tim
 	return lister
 }
 
+// recurrenceStartsBetween lists, in ascending order, the starts the rule rrule
+// generates from dtstart after after and at or before through, leaving out the
+// DTSTART, which the set holds whether or not the rule generates it. They are
+// the starts LatestRecurrenceOnOrBefore would answer, asked again from through
+// back to after, but the rule is followed once, forward, on work: a rule
+// without COUNT from the period holding after, a counted one from its DTSTART,
+// since COUNT numbers its occurrences from there. ok is false when the starts
+// number more than limit, or the rule cannot be followed to through on what
+// work has left.
+func recurrenceStartsBetween(dtstart time.Time, rrule string, after, through time.Time, limit int, work *recurrenceWork) (starts []time.Time, ok bool) {
+	rule, parsed := parseRecurrenceRule(rrule, dtstart.Location(), nil, wallClockIn(dtstart.Location()))
+	if !parsed || !recurrenceBySetPosMaySelect(dtstart, rule) {
+		return nil, true
+	}
+	if after.Before(dtstart) {
+		after = dtstart
+	}
+	// A rule retired by UNTIL before the span generates nothing in it, and
+	// following it there would step every period since UNTIL.
+	if !through.After(after) || (rule.Until != nil && !rule.Until.After(after)) {
+		return nil, true
+	}
+	var lister *RecurrenceStartLister
+	if rule.Count > 0 || after.Equal(dtstart) {
+		generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
+		if overBudget {
+			return nil, false
+		}
+		lister = newRecurrenceStartLister(dtstart, rule, generatesStart, work)
+		lister.keepFrom = after.Add(time.Nanosecond)
+		lister.dropBefore(len(lister.starts))
+	} else {
+		firstPeriod := recurrencePeriodStart(dtstart, rule)
+		lister = &RecurrenceStartLister{
+			dtstart:     dtstart,
+			rule:        rule,
+			work:        work,
+			covered:     after,
+			periodStart: rewindToPeriodReaching(fastForwardRecurrencePeriod(firstPeriod, after, rule), firstPeriod, after, rule),
+			barren:      newBarrenPeriodRun(rule),
+		}
+	}
+	if !lister.ListThrough(through, limit) {
+		return nil, false
+	}
+	return lister.starts, true
+}
+
 // dropBefore moves the first n starts, those before keepFrom, out of the
 // listing, keeping the latest of them as dropped.
 func (l *RecurrenceStartLister) dropBefore(n int) {
@@ -1649,6 +1701,28 @@ func (l *RecurrenceStartLister) LatestOnOrBefore(before time.Time) (latest time.
 		return time.Time{}, false, true
 	}
 	return l.starts[index-1], true, true
+}
+
+// StartsBetween lists the starts recurrenceStartsBetween lists for the same
+// span -- every start after after and at or before through but the DTSTART --
+// from the listing. ok is false when the listing does not hold all of them:
+// it does not reach through, or, kept from an instant, that instant falls
+// after after. The caller must not modify starts. They stay valid while the
+// listing grows: a listing only ever appends past its length, and a halt drops
+// only starts past what it covered, none of which a span it covered can hold.
+func (l *RecurrenceStartLister) StartsBetween(after, through time.Time) (starts []time.Time, ok bool) {
+	if after.Before(l.dtstart) {
+		after = l.dtstart
+	}
+	if !through.After(after) {
+		return nil, true
+	}
+	if !l.Covers(through) || after.Before(l.keepFrom) {
+		return nil, false
+	}
+	first := sort.Search(len(l.starts), func(i int) bool { return l.starts[i].After(after) })
+	end := sort.Search(len(l.starts), func(i int) bool { return l.starts[i].After(through) })
+	return l.starts[first:end:end], true
 }
 
 // ListThrough extends the listing to hold every start at or before through,
@@ -1996,7 +2070,8 @@ const gapListingWindow = 366 * 24 * time.Hour
 // LocalTimeGapLister contract, so only one inside a gap is asked of exists.
 // The first candidate is asked directly, since an expansion that stops at its
 // first instance -- as a RFC 4791 §9.9 match does -- needs no listing. Where
-// the gaps cannot be listed, every candidate is asked of exists.
+// the gaps cannot be listed, every candidate is asked of exists, whose walks of
+// an object's definition draw on the object's one ObservanceWork.
 func existenceFromGaps(exists func(time.Time) bool, gaps localTimeGaps) func(time.Time) bool {
 	var windowStart, windowEnd time.Time
 	var listed []LocalTimeGap

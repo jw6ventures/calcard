@@ -463,13 +463,14 @@ type tzidDefinition struct {
 }
 
 func resolveTZID(lines []string, tzid string) tzidDefinition {
-	return resolveTZIDIn(objectTimezones(lines), tzid, nil)
+	return resolveTZIDIn(objectTimezones(lines), tzid, nil, NewObservanceWork())
 }
 
 // resolveTZIDIn is resolveTZID for an object whose VTIMEZONEs objectTimezones
 // indexed as timezones, reading the definition's rules through onsets, or
-// through listings of its own when onsets is nil.
-func resolveTZIDIn(timezones map[string]objectTimezone, tzid string, onsets ObservanceOnsets) tzidDefinition {
+// through listings of its own when onsets is nil, and walking a rule neither
+// answers on work, the budget of the object's reading.
+func resolveTZIDIn(timezones map[string]objectTimezone, tzid string, onsets ObservanceOnsets, work *ObservanceWork) tzidDefinition {
 	timezone, defined := timezones[tzid]
 	if timezone.hostGenerated {
 		if loc, ok := HostLocation(tzid); ok {
@@ -481,17 +482,25 @@ func resolveTZIDIn(timezones map[string]objectTimezone, tzid string, onsets Obse
 		if onsets == nil {
 			onsets = onsetListings{}
 		}
+		indexed := IndexTimezoneObservances(observances, work)
 		return tzidDefinition{
 			object: func(after, through time.Time) ([]LocalTimeGap, bool) {
-				return observances.Gaps(after, through, onsets)
+				return indexed.Gaps(after, through, onsets)
 			},
-			observances: IndexTimezoneObservances(observances),
+			observances: indexed,
 			onsets:      onsets,
 			tzid:        tzid,
 		}
 	}
 	loc, _ := HostLocation(tzid)
 	return tzidDefinition{tzid: tzid, unreadable: defined && len(components) > 0, host: loc}
+}
+
+// skips reports whether the object's own definition of the zone skips wall,
+// per TimezoneObservances.Skips. known is false for a zone the object does not
+// define.
+func (z tzidDefinition) skips(wall time.Time) (skipped, known bool) {
+	return z.observances.Skips(wall, z.onsets)
 }
 
 // instant resolves a wall clock in the object's own definition to the instant
@@ -639,23 +648,6 @@ func objectTimezones(lines []string) map[string]objectTimezone {
 		indexed[timezone.TZID] = objectTimezone{observances: timezone.observances, hostGenerated: timezone.HostDefinition}
 	}
 	return indexed
-}
-
-// skips reports whether wall falls inside one of the zone's gaps. known is
-// false when the zone's definition cannot be followed as far as wall.
-func (gaps localTimeGaps) skips(wall time.Time) (skipped, known bool) {
-	// Every gap is shorter than two days, so only one starting within two
-	// days before wall can hold it.
-	found, ok := gaps(wall.Add(-2*24*time.Hour), wall)
-	if !ok {
-		return false, false
-	}
-	for _, gap := range found {
-		if wall.Before(gap.Start.Add(gap.Length)) {
-			return true, true
-		}
-	}
-	return false, true
 }
 
 func hasRRuleByPart(rrule string) bool {

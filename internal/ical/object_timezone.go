@@ -67,22 +67,13 @@ func (z ObjectTimezone) Offsets(from, through time.Time) (offsets []ZoneOffset, 
 		for _, onset := range observance.RDates {
 			add(onset)
 		}
-		after := from.Add(observance.OffsetFrom)
 		for _, rule := range observance.RRules {
-			before := through.Add(observance.OffsetFrom)
-			for listed := 0; ; listed++ {
-				if listed == maxListedObservanceOnsets {
-					return nil, false
-				}
-				onset, found, complete := latestOnset(onsets, observance.Start, before, rule)
-				if !complete {
-					return nil, false
-				}
-				if !found || !onset.After(after) || !onset.After(observance.Start) {
-					break
-				}
+			ruleOnsets, ok := startsBetween(onsets, observances.work, observance.Start, rule, from.Add(observance.OffsetFrom), through.Add(observance.OffsetFrom))
+			if !ok {
+				return nil, false
+			}
+			for _, onset := range ruleOnsets {
 				add(onset)
-				before = onset.Add(-time.Nanosecond)
 			}
 		}
 	}

@@ -12,17 +12,21 @@ import (
 // sorts the onsets the observances state outright -- each DTSTART and RDATE --
 // once per scale, so a lookup searches them rather than reading every
 // observance. The onsets an RRULE generates are asked of the rule, through the
-// ObservanceOnsets the caller passes, as TimezoneObservances asks them. It is
-// safe for concurrent use.
+// ObservanceOnsets the caller passes, as TimezoneObservances asks them, and a
+// rule no listing answers is walked on the ObservanceWork of the reading the
+// definition belongs to. It is safe for concurrent use.
 type IndexedTimezoneObservances struct {
 	TimezoneObservances
 
+	work          *ObservanceWork
 	wall, instant observanceScale
 }
 
-// IndexTimezoneObservances prepares observances for many lookups.
-func IndexTimezoneObservances(observances TimezoneObservances) *IndexedTimezoneObservances {
-	return &IndexedTimezoneObservances{TimezoneObservances: observances}
+// IndexTimezoneObservances prepares observances, read from one object, for
+// many lookups whose walks draw on work, the budget of that object's reading.
+// With a nil work each walk has a budget of its own.
+func IndexTimezoneObservances(observances TimezoneObservances, work *ObservanceWork) *IndexedTimezoneObservances {
+	return &IndexedTimezoneObservances{TimezoneObservances: observances, work: work}
 }
 
 // OffsetAtWall is TimezoneObservances.OffsetAtWall. A nil definition reads no
@@ -31,7 +35,7 @@ func (x *IndexedTimezoneObservances) OffsetAtWall(wall time.Time, onsets Observa
 	if x == nil {
 		return 0, false
 	}
-	return x.wall.offsetBefore(x.TimezoneObservances, wall, wallScaleShift, onsets)
+	return x.wall.offsetBefore(x.TimezoneObservances, wall, wallScaleShift, onsets, x.work)
 }
 
 // OffsetAtInstant is TimezoneObservances.OffsetAtInstant. A nil definition
@@ -40,7 +44,24 @@ func (x *IndexedTimezoneObservances) OffsetAtInstant(instant time.Time, onsets O
 	if x == nil {
 		return 0, false
 	}
-	return x.instant.offsetBefore(x.TimezoneObservances, instant, instantScaleShift, onsets)
+	return x.instant.offsetBefore(x.TimezoneObservances, instant, instantScaleShift, onsets, x.work)
+}
+
+// Gaps is TimezoneObservances.Gaps. A nil definition lists none.
+func (x *IndexedTimezoneObservances) Gaps(after, through time.Time, onsets ObservanceOnsets) (gaps []LocalTimeGap, ok bool) {
+	if x == nil {
+		return nil, false
+	}
+	return x.TimezoneObservances.gaps(after, through, onsets, x.work)
+}
+
+// Skips is TimezoneObservances.Skips. A nil definition skips nothing it can
+// tell of.
+func (x *IndexedTimezoneObservances) Skips(wall time.Time, onsets ObservanceOnsets) (skipped, known bool) {
+	if x == nil {
+		return false, false
+	}
+	return x.TimezoneObservances.skips(wall, onsets, x.work)
 }
 
 // observanceScale is the onsets of a definition placed on the scale one kind
@@ -132,10 +153,10 @@ func (s *observanceScale) build(observances TimezoneObservances, shift func(Time
 	})
 }
 
-func (s *observanceScale) offsetBefore(observances TimezoneObservances, bound time.Time, shift func(TimezoneObservance) time.Duration, onsets ObservanceOnsets) (time.Duration, bool) {
+func (s *observanceScale) offsetBefore(observances TimezoneObservances, bound time.Time, shift func(TimezoneObservance) time.Duration, onsets ObservanceOnsets, work *ObservanceWork) (time.Duration, bool) {
 	s.once.Do(func() { s.build(observances, shift) })
 	if !s.indexed {
-		return observances.offsetBefore(bound, shift, onsets)
+		return observances.offsetBefore(bound, shift, onsets, work)
 	}
 	var latest indexedTransition
 	found := false
@@ -143,7 +164,7 @@ func (s *observanceScale) offsetBefore(observances TimezoneObservances, bound ti
 		latest, found = s.stated[after-1], true
 	}
 	for _, rule := range s.rules {
-		onset, generated, complete := latestOnset(onsets, rule.start, bound.Add(-rule.shift), rule.rrule)
+		onset, generated, complete := latestOnset(onsets, work, rule.start, bound.Add(-rule.shift), rule.rrule)
 		if !complete {
 			return 0, false
 		}

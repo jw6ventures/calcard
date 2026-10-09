@@ -2,6 +2,7 @@ package ical
 
 import (
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,25 +24,100 @@ type TimezoneObservance struct {
 // define its zone.
 type TimezoneObservances []TimezoneObservance
 
-// ObservanceOnsets answers what LatestRecurrenceOnOrBefore answers for an
-// observance's DTSTART and RRULE, typically from listings shared across the
-// many objects that carry the same rules. A nil ObservanceOnsets walks the rule
-// for every question.
+// ObservanceOnsets answers questions about an observance's DTSTART and RRULE
+// from listings of the rule, typically shared across the many objects that
+// carry the same rules. LatestOnOrBefore answers what
+// LatestRecurrenceOnOrBefore does, and StartsBetween lists the rule's starts
+// after after and at or before through, leaving out the DTSTART; the caller
+// must not modify them. listed is false when no listing holds the answer; the
+// reader then follows the rule itself, on the ObservanceWork of the object it
+// is reading, so what following one object's definitions costs that reading
+// is bounded by the reading.
 type ObservanceOnsets interface {
-	LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool)
+	LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, listed bool)
+	StartsBetween(dtstart, after, through time.Time, rrule string) (starts []time.Time, listed bool)
 }
 
-func latestOnset(onsets ObservanceOnsets, dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
-	if onsets == nil {
-		return LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+// ObservanceWork is the work one reading of a calendar object may spend
+// following VTIMEZONE observance rules where no listing answers: every walk,
+// and every pass over a span, through any of the definitions the reading holds
+// draws on it. A definition whose rules are costly to follow -- one generating
+// a transition every second costs a few milliseconds a walk, and a series asks
+// for one per instance -- costs the reading at most what one
+// LatestRecurrenceOnOrBefore may spend. Once it runs out, a question no listing
+// answers is incomplete, as a walk that ran out of work is, and the reader
+// falls back as it does for any definition that cannot be followed. A question
+// a listing answers costs nothing here, and the listings answer every question
+// about the rules real zones use; what a shared listing costs to make is the
+// listing's own. Create one with NewObservanceWork; it is safe for concurrent
+// use.
+type ObservanceWork struct {
+	mu   sync.Mutex
+	work recurrenceWork
+}
+
+// NewObservanceWork returns the budget for one reading of one object.
+func NewObservanceWork() *ObservanceWork {
+	return &ObservanceWork{work: recurrenceWork{remaining: recurrenceWorkLimit}}
+}
+
+// use runs follow on the budget, which it holds until follow returns. A nil
+// budget gives follow one of its own.
+func (w *ObservanceWork) use(follow func(*recurrenceWork)) {
+	if w == nil {
+		follow(newRecurrenceWork())
+		return
 	}
-	return onsets.LatestOnOrBefore(dtstart, before, rrule)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	follow(&w.work)
 }
 
-// onsetListings answers onset questions for one evaluation from a listing of
+// walk is LatestRecurrenceOnOrBefore drawing on the budget.
+func (w *ObservanceWork) walk(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
+	w.use(func(work *recurrenceWork) {
+		latest, found, complete = latestRecurrenceOnOrBefore(dtstart, before, rrule, work)
+	})
+	return latest, found, complete
+}
+
+// startsBetween is recurrenceStartsBetween drawing on the budget.
+func (w *ObservanceWork) startsBetween(dtstart time.Time, rrule string, after, through time.Time, limit int) (starts []time.Time, ok bool) {
+	w.use(func(work *recurrenceWork) {
+		starts, ok = recurrenceStartsBetween(dtstart, rrule, after, through, limit, work)
+	})
+	return starts, ok
+}
+
+// latestOnset answers from onsets where a listing does, and walks the rule on
+// work where none does.
+func latestOnset(onsets ObservanceOnsets, work *ObservanceWork, dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
+	if onsets != nil {
+		if latest, found, listed := onsets.LatestOnOrBefore(dtstart, before, rrule); listed {
+			return latest, found, true
+		}
+	}
+	return work.walk(dtstart, before, rrule)
+}
+
+// startsBetween lists a rule's starts after after and at or before through,
+// leaving out the DTSTART, from onsets where a listing holds them and on work
+// otherwise. ok is false when they number more than maxListedObservanceOnsets
+// -- a rule whose transitions come closer together than any zone's would
+// otherwise list without end -- or the rule cannot be followed that far.
+func startsBetween(onsets ObservanceOnsets, work *ObservanceWork, dtstart time.Time, rrule string, after, through time.Time) ([]time.Time, bool) {
+	if onsets != nil {
+		if starts, listed := onsets.StartsBetween(dtstart, after, through, rrule); listed {
+			return starts, len(starts) <= maxListedObservanceOnsets
+		}
+	}
+	return work.startsBetween(dtstart, rrule, after, through, maxListedObservanceOnsets)
+}
+
+// onsetListings answers onset questions for one reading from a listing of
 // each rule, so resolving many wall clocks through a definition walks each of
-// its rules once rather than once per wall clock. A rule its listing cannot
-// reach is walked, as LatestRecurrenceOnOrBefore walks it.
+// its rules once rather than once per wall clock. An instant past what a
+// rule's listing can reach is left to the reader to walk.
 type onsetListings map[onsetListingKey]*RecurrenceStartLister
 
 type onsetListingKey struct {
@@ -58,7 +134,7 @@ const onsetListingHorizonYears = 1
 
 func (l onsetListings) LatestOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
 	if before.Before(dtstart) {
-		return LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+		return time.Time{}, false, true
 	}
 	key := onsetListingKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule}
 	lister, ok := l[key]
@@ -69,10 +145,17 @@ func (l onsetListings) LatestOnOrBefore(dtstart, before time.Time, rrule string)
 	if !lister.Covers(before) {
 		lister.ListThrough(before.AddDate(onsetListingHorizonYears, 0, 0), maxListedObservanceOnsets)
 	}
-	if latest, found, listed := lister.LatestOnOrBefore(before); listed {
-		return latest, found, true
+	return lister.LatestOnOrBefore(before)
+}
+
+func (l onsetListings) StartsBetween(dtstart, after, through time.Time, rrule string) ([]time.Time, bool) {
+	if through.Before(dtstart) {
+		return nil, true
 	}
-	return LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+	if _, _, listed := l.LatestOnOrBefore(dtstart, through, rrule); !listed {
+		return nil, false
+	}
+	return l[onsetListingKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule}].StartsBetween(after, through)
 }
 
 // ReadTimezoneObservances reads the observances of one VTIMEZONE, each given as
@@ -217,15 +300,20 @@ func ParseUTCOffset(value string) (time.Duration, bool) {
 // with the offset before the gap, so a transition that moves the clock forward
 // governs readings only from the end of its gap, TZOFFSETTO less TZOFFSETFROM
 // past the value it is stated at.
+//
+// Each walk of a rule no listing in onsets answers has a budget of its own;
+// IndexedTimezoneObservances shares one across a reading's lookups.
 func (o TimezoneObservances) OffsetAtWall(wall time.Time, onsets ObservanceOnsets) (time.Duration, bool) {
-	return o.offsetBefore(wall, wallScaleShift, onsets)
+	return o.offsetBefore(wall, wallScaleShift, onsets, nil)
 }
 
 // OffsetAtInstant resolves the offset in force at an absolute instant. A
 // transition happens at the moment its outgoing offset, TZOFFSETFROM, makes
 // the wall clock it is stated at.
+//
+// Each walk of a rule no listing in onsets answers has a budget of its own.
 func (o TimezoneObservances) OffsetAtInstant(instant time.Time, onsets ObservanceOnsets) (time.Duration, bool) {
-	return o.offsetBefore(instant, instantScaleShift, onsets)
+	return o.offsetBefore(instant, instantScaleShift, onsets, nil)
 }
 
 // offsetBefore is the TZOFFSETTO of the last transition at or before bound, or
@@ -236,7 +324,7 @@ func (o TimezoneObservances) OffsetAtInstant(instant time.Time, onsets Observanc
 // shift is how far an observance's transitions sit from the scale bound is
 // measured on. It applies to every RDATE and RRULE onset as well, so an
 // observance is judged the same way however its transitions are spelled.
-func (o TimezoneObservances) offsetBefore(bound time.Time, shift func(TimezoneObservance) time.Duration, onsets ObservanceOnsets) (time.Duration, bool) {
+func (o TimezoneObservances) offsetBefore(bound time.Time, shift func(TimezoneObservance) time.Duration, onsets ObservanceOnsets, work *ObservanceWork) (time.Duration, bool) {
 	var latest, earliest time.Time
 	var latestOffset, earliestOffsetFrom time.Duration
 	for _, observance := range o {
@@ -261,7 +349,7 @@ func (o TimezoneObservances) offsetBefore(bound time.Time, shift func(TimezoneOb
 		for _, rule := range observance.RRules {
 			// The rule generates local values, so it is walked up to the bound
 			// moved onto that same scale.
-			candidate, found, complete := latestOnset(onsets, observance.Start, bound.Add(-toBoundScale), rule)
+			candidate, found, complete := latestOnset(onsets, work, observance.Start, bound.Add(-toBoundScale), rule)
 			if !complete {
 				// The rule describes more than this server will generate, so
 				// which observance is in force cannot be established. Answering
@@ -287,8 +375,13 @@ func (o TimezoneObservances) offsetBefore(bound time.Time, shift func(TimezoneOb
 // it falls in the gap an observance that moves the clock forward opens, which
 // runs from each of its onsets for TZOFFSETTO less TZOFFSETFROM (RFC 5545
 // §3.6.5). known is false when an observance's onsets cannot be followed as
-// far as wall. It answers from the same onsets Gaps lists.
+// far as wall. It answers from the same onsets Gaps lists. Each walk of a rule
+// no listing in onsets answers has a budget of its own.
 func (o TimezoneObservances) Skips(wall time.Time, onsets ObservanceOnsets) (skipped, known bool) {
+	return o.skips(wall, onsets, nil)
+}
+
+func (o TimezoneObservances) skips(wall time.Time, onsets ObservanceOnsets, work *ObservanceWork) (skipped, known bool) {
 	for _, observance := range o {
 		length := observance.OffsetTo - observance.OffsetFrom
 		if length <= 0 {
@@ -305,7 +398,7 @@ func (o TimezoneObservances) Skips(wall time.Time, onsets ObservanceOnsets) (ski
 			consider(onset)
 		}
 		for _, rule := range observance.RRules {
-			onset, found, complete := latestOnset(onsets, observance.Start, wall, rule)
+			onset, found, complete := latestOnset(onsets, work, observance.Start, wall, rule)
 			if !complete {
 				return false, false
 			}
@@ -321,17 +414,25 @@ func (o TimezoneObservances) Skips(wall time.Time, onsets ObservanceOnsets) (ski
 }
 
 // maxListedObservanceOnsets bounds the onsets one rule may list for one call
-// to Gaps, and the onsets onsetListings keeps for one rule. A rule whose
-// transitions come closer together than any zone's do would otherwise list
-// without end.
+// to Gaps or ObjectTimezone.Offsets, and the onsets onsetListings keeps for one
+// rule.
 const maxListedObservanceOnsets = 2048
 
 // Gaps lists the gaps the observances that move the clock forward open --
 // the stretches of local time Skips reports skipped -- that start after after
-// and at or before through, both wall clocks held as UTC fields. It reads each
-// rule's onsets through onsets, as Skips does, so the two agree on every wall
-// clock. ok is false when an observance's onsets cannot be followed that far.
+// and at or before through, both wall clocks held as UTC fields. Each rule's
+// onsets in that span are read at once, from a listing in onsets that holds
+// them or else in one pass of the rule, rather than looked up one at a time:
+// an onset Skips looks up is one of them, so the two agree on every wall
+// clock, but a rule dense enough to reach maxListedObservanceOnsets would
+// otherwise cost that many walks of it. ok is false when an observance's
+// onsets cannot be followed that far. Each rule's pass has a budget of its
+// own; IndexedTimezoneObservances draws them all from a reading's.
 func (o TimezoneObservances) Gaps(after, through time.Time, onsets ObservanceOnsets) (gaps []LocalTimeGap, ok bool) {
+	return o.gaps(after, through, onsets, nil)
+}
+
+func (o TimezoneObservances) gaps(after, through time.Time, onsets ObservanceOnsets, work *ObservanceWork) (gaps []LocalTimeGap, ok bool) {
 	for _, observance := range o {
 		length := observance.OffsetTo - observance.OffsetFrom
 		if length <= 0 {
@@ -347,22 +448,12 @@ func (o TimezoneObservances) Gaps(after, through time.Time, onsets ObservanceOns
 			add(onset)
 		}
 		for _, rule := range observance.RRules {
-			// The rule's onsets are found from the latest backward, and the
-			// DTSTART, the first of them, is among the observance's own.
-			before := through
-			for listed := 0; ; listed++ {
-				if listed == maxListedObservanceOnsets {
-					return nil, false
-				}
-				onset, found, complete := latestOnset(onsets, observance.Start, before, rule)
-				if !complete {
-					return nil, false
-				}
-				if !found || !onset.After(after) || !onset.After(observance.Start) {
-					break
-				}
+			starts, ok := startsBetween(onsets, work, observance.Start, rule, after, through)
+			if !ok {
+				return nil, false
+			}
+			for _, onset := range starts {
 				add(onset)
-				before = onset.Add(-time.Nanosecond)
 			}
 		}
 	}

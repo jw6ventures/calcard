@@ -31,6 +31,16 @@ func requireCacheWithinBudget(t *testing.T, onsets *timezoneOnsets) {
 	}
 }
 
+// readOnset answers a lookup as a reader of the cache does: from a listing
+// where one reaches before, and otherwise by walking the rule, which the
+// reader does on the work budget of the object it is reading.
+func readOnset(onsets *timezoneOnsets, dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
+	if latest, found, listed := onsets.LatestOnOrBefore(dtstart, before, rrule); listed {
+		return latest, found, true
+	}
+	return ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+}
+
 // rulesByRecency lists the cached rules, most recently used first.
 func rulesByRecency(onsets *timezoneOnsets) []*listedRule {
 	var rules []*listedRule
@@ -56,7 +66,7 @@ func TestTimezoneOnsetsListNoMoreOfARuleThanTheBudgetHolds(t *testing.T) {
 	ask := func(dtstart time.Time, rrule string) {
 		t.Helper()
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-		got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule)
+		got, found, complete := readOnset(onsets, dtstart, before, rrule)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", dtstart, got, found, complete, want, wantFound, wantComplete)
 		}
@@ -112,9 +122,9 @@ func TestTimezoneOnsetsCountTheOnsetARuleStartsWith(t *testing.T) {
 	dtstart := time.Date(1996, 3, 29, 2, 0, 0, 0, time.UTC)
 	const selectsNothing = "FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=29;BYSETPOS=5"
 	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	got, found, complete := onsets.LatestOnOrBefore(dtstart, before, selectsNothing)
-	if !found || !complete || !got.Equal(dtstart) {
-		t.Fatalf("latest = %v, %t, %t, want the DTSTART alone", got, found, complete)
+	got, found, listed := onsets.LatestOnOrBefore(dtstart, before, selectsNothing)
+	if !found || !listed || !got.Equal(dtstart) {
+		t.Fatalf("latest = %v, %t, %t, want the DTSTART alone, listed", got, found, listed)
 	}
 	if cached := onsets.rules.Len(); cached != 1 {
 		t.Fatalf("cached %d rules, want the one asked about", cached)
@@ -140,7 +150,7 @@ func TestTimezoneOnsetsAnswerADenseRulesInstantsWithoutListingItFromItsDTSTART(t
 		for i := range 1000 {
 			before := start.AddDate(0, 6*i, 0).Add(time.Duration(i) * 7 * time.Hour)
 			want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, rrule)
-			got, found, complete := onsets.LatestOnOrBefore(dtstart, before, rrule)
+			got, found, complete := readOnset(onsets, dtstart, before, rrule)
 			if !got.Equal(want) || found != wantFound || complete != wantComplete {
 				t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 			}
@@ -187,7 +197,7 @@ func TestTimezoneOnsetsWalkARuleNoListingCanReach(t *testing.T) {
 	for year := 2000; year < 2005; year++ {
 		before := time.Date(year, 6, 1, 0, 0, 0, 0, time.UTC)
 		want, wantFound, wantComplete := ical.LatestRecurrenceOnOrBefore(dtstart, before, hourly)
-		got, found, complete := onsets.LatestOnOrBefore(dtstart, before, hourly)
+		got, found, complete := readOnset(onsets, dtstart, before, hourly)
 		if !got.Equal(want) || found != wantFound || complete != wantComplete {
 			t.Fatalf("latest(%v) = %v, %t, %t, want %v, %t, %t", before, got, found, complete, want, wantFound, wantComplete)
 		}

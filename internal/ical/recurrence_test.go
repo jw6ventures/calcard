@@ -2325,35 +2325,39 @@ func TestFastForwardCountedSubDailyRecurrenceSpansCenturies(t *testing.T) {
 	}
 }
 
+// observanceRuleShapes are the shapes a VTIMEZONE observance rule takes --
+// Exchange's 1601 DTSTART, a rule retired by UNTIL, a counted rule, a DTSTART
+// the rule does not generate -- and the selection paths that end a set early.
+var observanceRuleShapes = []struct {
+	name    string
+	dtstart time.Time
+	rrule   string
+}{
+	{"Exchange standard", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"},
+	{"Exchange daylight", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3"},
+	{"last Sunday", time.Date(1996, 10, 27, 3, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU"},
+	{"retired by UNTIL", time.Date(1987, 4, 5, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z"},
+	{"monthly retired by UNTIL", time.Date(1900, 1, 7, 2, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=1SU;UNTIL=19700101T000000Z"},
+	{"counted", time.Date(2007, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=2"},
+	{"counted past the range", time.Date(1990, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU;COUNT=90"},
+	{"unsynchronized start", time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU"},
+	{"every other year", time.Date(2000, 3, 26, 1, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYDAY=-1SU"},
+	{"monthly set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"},
+	{"unreachable set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=1;BYSETPOS=5"},
+	{"never matching", time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30"},
+	{"week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU"},
+	{"last week number", time.Date(2019, 12, 29, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=-1;BYDAY=SA,SU"},
+	{"counted week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1,-1;BYDAY=MO,SU;COUNT=40"},
+	{"unparsable", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=FORTNIGHTLY"},
+}
+
 // A RecurrenceStartLister lists the set LatestRecurrenceOnOrBefore searches, so
 // the latest listed start at or before any bound has to be the start
 // LatestRecurrenceOnOrBefore answers for that bound -- whether the listing was
 // made in one extension or grown a few years at a time, as a caller resolving
-// ever later instants grows it. The rules cover the shapes a VTIMEZONE
-// observance takes -- Exchange's 1601 DTSTART, a rule retired by UNTIL, a
-// counted rule, a DTSTART the rule does not generate -- and the selection paths
-// that end a set early.
+// ever later instants grows it.
 func TestRecurrenceStartListerAgreesWithLatestRecurrenceOnOrBefore(t *testing.T) {
-	tests := []struct {
-		name    string
-		dtstart time.Time
-		rrule   string
-	}{
-		{"Exchange standard", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"},
-		{"Exchange daylight", time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3"},
-		{"last Sunday", time.Date(1996, 10, 27, 3, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU"},
-		{"retired by UNTIL", time.Date(1987, 4, 5, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z"},
-		{"counted", time.Date(2007, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=2"},
-		{"counted past the range", time.Date(1990, 1, 1, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU;COUNT=90"},
-		{"unsynchronized start", time.Date(2010, 1, 15, 2, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU"},
-		{"every other year", time.Date(2000, 3, 26, 1, 0, 0, 0, time.UTC), "FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYDAY=-1SU"},
-		{"monthly set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"},
-		{"unreachable set position", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=1;BYSETPOS=5"},
-		{"never matching", time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30"},
-		{"week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU"},
-		{"counted week number", time.Date(2020, 1, 6, 10, 0, 0, 0, time.UTC), "FREQ=YEARLY;BYWEEKNO=1,-1;BYDAY=MO,SU;COUNT=40"},
-		{"unparsable", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), "FREQ=FORTNIGHTLY"},
-	}
+	tests := observanceRuleShapes
 	through := time.Date(2041, 1, 1, 0, 0, 0, 0, time.UTC)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2400,6 +2404,134 @@ func TestRecurrenceStartListerAgreesWithLatestRecurrenceOnOrBefore(t *testing.T)
 			}
 		})
 	}
+}
+
+// Gaps and ObjectTimezone.Offsets read a rule's onsets in a span at once --
+// from a listing that holds them, else in one pass of the rule -- and either
+// has to find exactly the starts LatestRecurrenceOnOrBefore finds asked back
+// from the span's end an onset at a time: those after the span's start and at
+// or before its end, without the DTSTART. Spans begin before the DTSTART, on it, on a start,
+// either side of a year a BYWEEKNO week overhangs, and centuries from the
+// DTSTART of Exchange's rules.
+func TestRecurrenceStartsBetweenAreTheStartsWalkingBackFinds(t *testing.T) {
+	walkedBack := func(t *testing.T, dtstart time.Time, rrule string, after, through time.Time) []time.Time {
+		t.Helper()
+		var starts []time.Time
+		for before := through; ; {
+			latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, before, rrule)
+			if !complete {
+				t.Fatalf("LatestRecurrenceOnOrBefore(%v) complete = false", before)
+			}
+			if !found || !latest.After(after) || !latest.After(dtstart) {
+				break
+			}
+			starts = append(starts, latest)
+			before = latest.Add(-time.Nanosecond)
+		}
+		slices.Reverse(starts)
+		return starts
+	}
+	end := time.Date(2041, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tt := range observanceRuleShapes {
+		t.Run(tt.name, func(t *testing.T) {
+			spans := [][2]time.Time{
+				{tt.dtstart.AddDate(-1, 0, 0), tt.dtstart.AddDate(3, 0, 0)},
+				{tt.dtstart, tt.dtstart.AddDate(2, 0, 0)},
+				{tt.dtstart.AddDate(0, 0, 1), tt.dtstart},
+			}
+			for _, start := range walkedBack(t, tt.dtstart, tt.rrule, tt.dtstart, tt.dtstart.AddDate(6, 0, 0)) {
+				spans = append(spans, [2]time.Time{start, start.AddDate(1, 0, 0)}, [2]time.Time{start.Add(-time.Second), start})
+			}
+			for year := 2019; year < 2028; year++ {
+				newYear := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+				spans = append(spans, [2]time.Time{newYear.AddDate(0, 0, -5), newYear.AddDate(0, 0, 5)}, [2]time.Time{newYear, newYear.AddDate(0, 0, 5)})
+			}
+			for start := tt.dtstart.Add(-time.Hour); start.Before(end); start = start.Add(397*24*time.Hour + 5*time.Hour) {
+				spans = append(spans, [2]time.Time{start, start.Add(gapListingWindow)})
+			}
+			spans = append(spans, [2]time.Time{time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2034, 6, 1, 0, 0, 0, 0, time.UTC)})
+			listings, fromListings := onsetListings{}, 0
+			for _, span := range spans {
+				after, through := span[0], span[1]
+				want := walkedBack(t, tt.dtstart, tt.rrule, after, through)
+				got, ok := recurrenceStartsBetween(tt.dtstart, tt.rrule, after, through, 4096, newRecurrenceWork())
+				if !ok {
+					t.Fatalf("starts in (%v, %v]: ok = false", after, through)
+				}
+				if !slices.EqualFunc(got, want, time.Time.Equal) {
+					t.Fatalf("starts in (%v, %v] = %v, walking back finds %v", after, through, got, want)
+				}
+				listed, ok := listings.StartsBetween(tt.dtstart, after, through, tt.rrule)
+				if !ok {
+					continue
+				}
+				fromListings++
+				if !slices.EqualFunc(listed, want, time.Time.Equal) {
+					t.Fatalf("listing's starts in (%v, %v] = %v, walking back finds %v", after, through, listed, want)
+				}
+			}
+			if fromListings == 0 {
+				t.Fatal("no span was answered from a listing")
+			}
+		})
+	}
+}
+
+// A rule naming every second of every day lists more onsets in a day than one
+// rule may list for a span. The pass stops at that limit within the day it
+// starts in, for no more than one walk of the rule back to a single onset
+// costs; asking for the onsets one at a time would pay that for each.
+func TestRecurrenceStartsBetweenStopsAtTheLimitAfterOnePass(t *testing.T) {
+	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
+	rrule := "FREQ=DAILY;BYHOUR=" + everyValue(0, 23) + ";BYMINUTE=" + everyValue(0, 59) + ";BYSECOND=" + everyValue(0, 59)
+	after := time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC)
+	spent := func(follow func(*recurrenceWork)) int {
+		work := newRecurrenceWork()
+		follow(work)
+		if work.remaining < 0 {
+			t.Fatal("the work budget ran out")
+		}
+		return recurrenceWorkLimit - work.remaining
+	}
+	walk := spent(func(work *recurrenceWork) {
+		if _, found, complete := latestRecurrenceOnOrBefore(dtstart, after, rrule, work); !found || !complete {
+			t.Fatal("walking the rule back found no onset")
+		}
+	})
+	pass := spent(func(work *recurrenceWork) {
+		if starts, ok := recurrenceStartsBetween(dtstart, rrule, after, after.Add(gapListingWindow), maxListedObservanceOnsets, work); ok {
+			t.Fatalf("listed %d starts in a year of a rule that starts every second", len(starts))
+		}
+	})
+	if pass > walk {
+		t.Fatalf("one pass spent %d units, one walk back to a single onset %d", pass, walk)
+	}
+}
+
+// A rule UNTIL retired centuries before a span has no start in it, and saying
+// so costs nothing: following it from UNTIL would step every day since, and
+// a daily rule retired in 1700 would run out of periods before 2024.
+func TestRecurrenceStartsBetweenOfARetiredRuleCostsNothing(t *testing.T) {
+	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
+	const rrule = "FREQ=DAILY;BYHOUR=2;UNTIL=17000101T000000"
+	after := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	work := newRecurrenceWork()
+	starts, ok := recurrenceStartsBetween(dtstart, rrule, after, after.Add(gapListingWindow), maxListedObservanceOnsets, work)
+	if !ok || len(starts) != 0 {
+		t.Fatalf("starts in 2024 of a rule retired in 1700 = %v, %t; want none", starts, ok)
+	}
+	if spent := recurrenceWorkLimit - work.remaining; spent != 0 {
+		t.Fatalf("spent %d units saying a retired rule has no start", spent)
+	}
+}
+
+// everyValue lists the integers from first to last as a BY part's value.
+func everyValue(first, last int) string {
+	values := make([]string, 0, last-first+1)
+	for value := first; value <= last; value++ {
+		values = append(values, strconv.Itoa(value))
+	}
+	return strings.Join(values, ",")
 }
 
 // Growing a listing continues from where the last extension stopped. Listing

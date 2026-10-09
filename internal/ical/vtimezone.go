@@ -49,7 +49,10 @@ const HostDefinitionProperty = "X-CALCARD-HOST-ZONE"
 // transitions, in order. Every observance holds exactly DTSTART, TZOFFSETFROM,
 // TZOFFSETTO and TZNAME, in that order, without parameters. Clients state
 // recurring transitions as rules, and none restates an unchanged offset each 1
-// January, so a client's definition is not mistaken for one. A lone
+// January, so a client's definition is not mistaken for one, and each
+// transition follows the marker of its own year, so a definition stating a
+// change of name alone on some 1 January, decades before its next transition,
+// is not either. A lone
 // observance from fixedOffsetOnset is the form generators, VTimezone among
 // them, conventionally give a zone that has never changed its offset, and is
 // not taken for one either. BEGIN and END
@@ -87,7 +90,8 @@ func V11GeneratedDefinition(vtimezone []string) bool {
 		if !hasStart || !hasFrom || !hasTo || !hasName || len(start) != len("20060102T150405") || start < previous {
 			return false
 		}
-		if _, err := time.Parse("20060102T150405", start); err != nil {
+		onset, err := time.Parse("20060102T150405", start)
+		if err != nil {
 			return false
 		}
 		if strings.HasSuffix(start, "0101T000000") && from == to {
@@ -96,12 +100,21 @@ func V11GeneratedDefinition(vtimezone []string) bool {
 				return false
 			}
 			year = markerYear
-		} else if year == 0 {
+		} else if year == 0 || !withinADayOfYear(onset, year) {
 			return false
 		}
 		previous = start
 	}
 	return tzids == 1 && year != 0 && (observances > 1 || previous != fixedOffsetOnset)
+}
+
+// withinADayOfYear reports whether onset falls in year, or within a day of
+// it: the v1.1 editor wrote a transition that changed only the zone's name as
+// its UTC instant, which can lie across New Year from the local year it
+// belongs to.
+func withinADayOfYear(onset time.Time, year int) bool {
+	first := time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+	return !onset.Before(first.AddDate(0, 0, -1)) && onset.Before(first.AddDate(1, 0, 1))
 }
 
 // componentLineName is the component name a BEGIN or END line, per prefix,
@@ -201,7 +214,8 @@ func validTZIDText(tzid string) bool {
 	return true
 }
 
-// zoneTransition is one change of a zone's UTC offset.
+// zoneTransition is one change of a zone's UTC offset, name or daylight saving
+// status.
 type zoneTransition struct {
 	// at is the instant of the change, in UTC.
 	at time.Time
@@ -219,24 +233,30 @@ func (z zoneTransition) onset() time.Time {
 	return z.at.Add(time.Duration(z.from) * time.Second)
 }
 
-// hostTransitions lists the changes of loc's offset after from through
-// through, preceded by the change that started the offset in force at from
-// when there is one. A change of name or of daylight saving status alone moves
-// no reading and is left out.
+// hostTransitions lists the changes of loc's time after from through through
+// -- of its offset, its name or its daylight saving status -- preceded by the
+// change that began the period in force at from when there is one. A change of
+// name or daylight saving status alone is a transition between equal offsets:
+// it moves no reading, but it is what the zone calls the time from then on.
 func hostTransitions(loc *time.Location, from, through time.Time) []zoneTransition {
 	var transitions []zoneTransition
 	add := func(at time.Time) {
+		if sameZoneAcross(loc, at) {
+			return
+		}
 		_, offsetFrom := at.Add(-time.Second).In(loc).Zone()
 		after := at.In(loc)
 		name, offsetTo := after.Zone()
-		if offsetFrom == offsetTo {
-			return
-		}
 		transitions = append(transitions, zoneTransition{
 			at: at.UTC(), from: offsetFrom, to: offsetTo, dst: after.IsDST(), name: name,
 		})
 	}
 	start, end := from.In(loc).ZoneBounds()
+	// The time package can end a period where the zone's rule is followed
+	// past its listed transitions without anything changing there.
+	for !start.IsZero() && sameZoneAcross(loc, start) {
+		start, _ = start.Add(-time.Second).In(loc).ZoneBounds()
+	}
 	if !start.IsZero() {
 		add(start)
 	}
@@ -248,6 +268,15 @@ func hostTransitions(loc *time.Location, from, through time.Time) []zoneTransiti
 		}
 	}
 	return transitions
+}
+
+// sameZoneAcross reports whether loc keeps the same offset, name and daylight
+// saving status either side of at.
+func sameZoneAcross(loc *time.Location, at time.Time) bool {
+	before, after := at.Add(-time.Second).In(loc), at.In(loc)
+	beforeName, beforeOffset := before.Zone()
+	afterName, afterOffset := after.Zone()
+	return beforeName == afterName && beforeOffset == afterOffset && before.IsDST() == after.IsDST()
 }
 
 // nextZoneChange finds where the zone in force at t ends when ZoneBounds
@@ -306,13 +335,21 @@ func buildVTimezone(tzid string, loc *time.Location, fromYear, throughYear, maxY
 	// Transitions are followed past CALDAV:max-date-time, so a rule the zone
 	// keeps through it is told apart from one it abandons there.
 	horizon := time.Date(maxYear+2, time.February, 1, 0, 0, 0, 0, time.UTC)
-	transitions := hostTransitions(loc, spanStart, horizon)
-	if len(transitions) == 0 {
+	// A zone with no change of offset through the span keeps the one in
+	// force at its start, and states that offset alone, from fixedOffsetOnset
+	// or from the span's start where the span begins before it.
+	fixedOffset := func() string {
 		at := spanStart.In(loc)
 		name, offset := at.Zone()
-		return renderVTimezone(tzid, []vtimezoneObservance{{
-			kind: observanceKind{dst: at.IsDST(), from: offset, to: offset, name: name},
-		}}), true
+		observance := vtimezoneObservance{kind: observanceKind{dst: at.IsDST(), from: offset, to: offset, name: name}}
+		if wall := at.Add(time.Duration(offset) * time.Second).UTC(); wall.Format("20060102T150405") < fixedOffsetOnset {
+			observance.onsets = []time.Time{time.Date(wall.Year(), wall.Month(), wall.Day(), 0, 0, 0, 0, time.UTC)}
+		}
+		return renderVTimezone(tzid, []vtimezoneObservance{observance})
+	}
+	transitions := hostTransitions(loc, spanStart, horizon)
+	if len(transitions) == 0 {
+		return fixedOffset(), true
 	}
 
 	var kinds []observanceKind
@@ -360,6 +397,11 @@ func buildVTimezone(tzid string, loc *time.Location, fromYear, throughYear, maxY
 			observance.onsets = append(observance.onsets, transition.onset())
 		}
 		observances = append(observances, observance)
+	}
+	if len(observances) == 0 {
+		// Every change of offset comes after the span, and the zone had
+		// never changed its offset before it.
+		return fixedOffset(), true
 	}
 	slices.SortStableFunc(observances, func(a, b vtimezoneObservance) int { return a.start.Compare(b.start) })
 	return renderVTimezone(tzid, observances), true

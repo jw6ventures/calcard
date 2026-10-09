@@ -1,6 +1,7 @@
 package ical
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -132,9 +133,9 @@ func TestVTimezoneListsIrregularTransitionsOnlyThroughTheSpan(t *testing.T) {
 	}
 }
 
-// Every onset the definition states, read the way a VTIMEZONE reader reads it,
-// is a transition of the host's zone, and every transition of the host's zone
-// over the span is one of its onsets.
+// Every onset of an offset the definition states, read the way a VTIMEZONE
+// reader reads it, is a change of the host's offset, and every change of the
+// host's offset over the span is one of its onsets.
 func TestVTimezoneOnsetsAreTheHostTransitions(t *testing.T) {
 	minDate, maxDate := DateLimits()
 	spans := [][2]time.Time{
@@ -158,7 +159,9 @@ func TestVTimezoneOnsetsAreTheHostTransitions(t *testing.T) {
 				from := time.Date(span[0].Year(), time.January, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, -2)
 				through := time.Date(span[1].Year()+1, time.January, 1, 0, 0, 0, 0, time.UTC)
 				for _, transition := range hostTransitions(loc, from, through.AddDate(0, 0, 2)) {
-					if transition.at.Before(from) || transition.at.After(through) {
+					// A change of name or daylight saving status alone moves
+					// no reading; the observances' names are checked apart.
+					if transition.at.Before(from) || transition.at.After(through) || transition.from == transition.to {
 						continue
 					}
 					got, found := stated[transition.onset()]
@@ -342,6 +345,160 @@ func TestParseUTCOffsetRefusesNegativeZero(t *testing.T) {
 	for _, value := range []string{"-0000", "-000000", "+2400", "+0060", "0100", "+01:00"} {
 		if got, ok := ParseUTCOffset(value); ok {
 			t.Errorf("ParseUTCOffset(%q) = %v, want refused", value, got)
+		}
+	}
+}
+
+// generatedObservance is one STANDARD or DAYLIGHT of a generated definition,
+// as a client displays it: its kind, TZNAME and onsets.
+type generatedObservance struct {
+	daylight bool
+	name     string
+	onsets   []time.Time
+	TimezoneObservance
+}
+
+// readGeneratedVTimezone reads a generated definition's observances as a
+// VTIMEZONE reader does, listing each one's onsets through through.
+func readGeneratedVTimezone(t *testing.T, text string, through time.Time) []generatedObservance {
+	t.Helper()
+	var observances []generatedObservance
+	var current []PropertyValue
+	var daylight bool
+	inside := false
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\r\n"), "\r\n") {
+		switch line {
+		case "BEGIN:STANDARD", "BEGIN:DAYLIGHT":
+			inside, current, daylight = true, nil, line == "BEGIN:DAYLIGHT"
+		case "END:STANDARD", "END:DAYLIGHT":
+			inside = false
+			read, ok := ReadTimezoneObservances([][]PropertyValue{current})
+			if !ok {
+				t.Fatalf("an observance cannot be read:\n%s", text)
+			}
+			observance := generatedObservance{daylight: daylight, TimezoneObservance: read[0]}
+			observance.onsets = append([]time.Time{read[0].Start}, read[0].RDates...)
+			for _, property := range current {
+				switch property.KeyPart {
+				case "TZNAME":
+					observance.name = property.Value
+				case "RRULE":
+					lister := NewRecurrenceStartLister(read[0].Start, property.Value)
+					if !lister.ListThrough(through, 1<<16) {
+						t.Fatalf("rule %s cannot be listed", property.Value)
+					}
+					observance.onsets = append(observance.onsets, lister.starts...)
+				}
+			}
+			observances = append(observances, observance)
+		default:
+			if inside {
+				keyPart, value, _ := strings.Cut(line, ":")
+				current = append(current, PropertyValue{KeyPart: keyPart, Value: value})
+			}
+		}
+	}
+	if len(observances) == 0 {
+		t.Fatalf("the definition has no observance:\n%s", text)
+	}
+	return observances
+}
+
+// requireDefinitionReadsTheHostZone checks that a reader of the definition
+// generated for one day keeps the offset the host's zone keeps through it, and
+// that the observance in force there names the time the host names, with the
+// host's daylight saving status.
+func requireDefinitionReadsTheHostZone(t *testing.T, tzid string, loc *time.Location, day time.Time) {
+	t.Helper()
+	text, ok := VTimezone(tzid, day, day)
+	if !ok {
+		t.Fatalf("VTimezone(%s, %s) ok = false", tzid, day.Format(time.DateOnly))
+	}
+	observances := readGeneratedVTimezone(t, text, day.AddDate(0, 0, 2))
+	definition := make(TimezoneObservances, len(observances))
+	for i, observance := range observances {
+		definition[i] = observance.TimezoneObservance
+	}
+	for hour := 0; hour < 24; hour += 6 {
+		instant := day.Add(time.Duration(hour) * time.Hour)
+		hostName, hostOffset := instant.In(loc).Zone()
+		got, ok := definition.OffsetAtInstant(instant, nil)
+		if !ok || got != time.Duration(hostOffset)*time.Second {
+			t.Fatalf("%s at %s: the definition reads %v (ok=%t), the host keeps %v\n%s", tzid, instant, got, ok, time.Duration(hostOffset)*time.Second, text)
+		}
+		var inForce *generatedObservance
+		var latest time.Time
+		for i := range observances {
+			for _, onset := range observances[i].onsets {
+				if at := onset.Add(-observances[i].OffsetFrom); !at.After(instant) && (inForce == nil || at.After(latest)) {
+					inForce, latest = &observances[i], at
+				}
+			}
+		}
+		if inForce == nil {
+			// Before every onset only the first one's TZOFFSETFROM speaks,
+			// which states the offset of the zone's first period and no name.
+			if start, _ := instant.In(loc).ZoneBounds(); !start.IsZero() {
+				t.Fatalf("%s at %s: no observance is in force\n%s", tzid, instant, text)
+			}
+			continue
+		}
+		if inForce.name != hostName || inForce.daylight != instant.In(loc).IsDST() {
+			t.Fatalf("%s at %s: the observance in force is %q, daylight %t; the host keeps %q, daylight %t\n%s",
+				tzid, instant, inForce.name, inForce.daylight, hostName, instant.In(loc).IsDST(), text)
+		}
+	}
+}
+
+// A zone whose period in force over the span began with a change of name or
+// of daylight saving status alone, and whose offset does not change within the
+// span, is stated by that period: its start, its name and its daylight saving
+// status, with the offset it keeps. Warsaw's mean time was renamed in 1880
+// without changing its offset until 1915; Buenos Aires stopped calling its
+// offset daylight time in 2000; Yukon kept its daylight offset as standard
+// time from 2020; and Istanbul has kept +03 as standard time since 2016.
+func TestVTimezoneStatesTheOffsetInForceAfterAChangeOfNameAlone(t *testing.T) {
+	for _, tt := range []struct {
+		tzid string
+		day  time.Time
+	}{
+		{"Europe/Warsaw", time.Date(1905, time.June, 1, 0, 0, 0, 0, time.UTC)},
+		{"America/Argentina/Buenos_Aires", time.Date(2000, time.June, 1, 0, 0, 0, 0, time.UTC)},
+		{"America/Whitehorse", time.Date(2024, time.June, 1, 0, 0, 0, 0, time.UTC)},
+		{"Europe/Istanbul", time.Date(2024, time.June, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(tt.tzid, func(t *testing.T) {
+			requireDefinitionReadsTheHostZone(t, tt.tzid, requireHostZone(t, tt.tzid), tt.day)
+		})
+	}
+}
+
+// Every zone the host defines yields a definition holding at least one
+// observance for a span of a single day, in years when hundreds of zones were
+// in a period that a change of name alone began, and the definition keeps the
+// host's offset, name and daylight saving status through that day.
+func TestVTimezoneForEveryHostZoneStatesAnObservance(t *testing.T) {
+	data, err := os.ReadFile("/usr/share/zoneinfo/tzdata.zi")
+	if err != nil {
+		t.Skipf("host zone list unavailable: %v", err)
+	}
+	var zones []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) >= 2 && fields[0] == "Z":
+			zones = append(zones, fields[1])
+		case len(fields) >= 3 && fields[0] == "L":
+			zones = append(zones, fields[2])
+		}
+	}
+	for _, tzid := range zones {
+		loc, err := time.LoadLocation(tzid)
+		if err != nil || !validTZIDText(tzid) {
+			continue
+		}
+		for _, year := range []int{1900, 1905, 1920, 1950, 2000, 2024} {
+			requireDefinitionReadsTheHostZone(t, tzid, loc, time.Date(year, time.June, 1, 0, 0, 0, 0, time.UTC))
 		}
 	}
 }

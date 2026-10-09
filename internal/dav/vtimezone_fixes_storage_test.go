@@ -77,6 +77,37 @@ func TestValidatorStoresTheHostDefinitionOfAZoneTheObjectNames(t *testing.T) {
 	}
 }
 
+// A zone whose offset does not change through an object's values is stated by
+// the offset it keeps there, even where a change of name alone began the
+// period in force, as one did for Warsaw in 1880 and for Buenos Aires in 2000.
+// The stored object is complete, so a client can write back what it reads and
+// the object can be copied or moved.
+func TestValidatorStoresAZoneWhoseNameAloneChangedAsAnObjectThatValidatesAgain(t *testing.T) {
+	for _, tt := range []struct{ tzid, dtstart string }{
+		{"Europe/Warsaw", "19050601T100000"},
+		{"America/Argentina/Buenos_Aires", "20000601T100000"},
+	} {
+		t.Run(tt.tzid, func(t *testing.T) {
+			requireHostZones(t, tt.tzid)
+			raw := producerObject("VEVENT", "UID:e", "DTSTAMP:20261002T120000Z", "DTSTART;TZID="+tt.tzid+":"+tt.dtstart, "DURATION:PT1H")
+			validated, fault := validateCalendarObjectForStorage(raw, nil)
+			if fault != nil {
+				t.Fatalf("refused: %+v", fault)
+			}
+			if !strings.Contains(validated.Body, "TZOFFSETTO:") {
+				t.Fatalf("stored a definition with no observance:\n%s", validated.Body)
+			}
+			again, fault := validateCalendarObjectForStorage(validated.Body, nil)
+			if fault != nil || again.Body != validated.Body {
+				t.Fatalf("a write of the stored body stores something else: %+v", fault)
+			}
+			if _, fault := validateTransferredCalendarObject(validated.Body, nil); fault != nil {
+				t.Fatalf("the stored body cannot be copied or moved: %+v", fault)
+			}
+		})
+	}
+}
+
 // The inserted lines end the way the object's own do, so an object written
 // with bare line feeds is not stored with a mix of the two.
 func TestValidatorInsertsTheHostDefinitionWithTheObjectsLineEndings(t *testing.T) {
