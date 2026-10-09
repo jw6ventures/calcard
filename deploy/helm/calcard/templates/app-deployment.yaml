@@ -17,6 +17,9 @@
 {{- $fullname := (default $name .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
 {{- $dbSecret := default (printf "%s-db-secret" $fullname) .Values.app.db.existingSecret.name -}}
 {{- $imageTag := default (printf "v%s" .Chart.AppVersion) .Values.image.tag -}}
+{{- /* Defaults match values.yaml. helm upgrade --reuse-values carries the
+       previous release's values, whose chart may define no startupProbe. */ -}}
+{{- $startupProbe := default dict .Values.startupProbe -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -98,9 +101,9 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            periodSeconds: {{ include "calcard.integer" (list "startupProbe.periodSeconds" (dig "periodSeconds" 10 $startupProbe) 1) }}
             timeoutSeconds: 2
-            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            failureThreshold: {{ include "calcard.integer" (list "startupProbe.failureThreshold" (dig "failureThreshold" 60 $startupProbe) 1) }}
           # Takes over once the startup probe succeeds, so a process that wedges
           # while serving is restarted within roughly 30 seconds.
           livenessProbe:

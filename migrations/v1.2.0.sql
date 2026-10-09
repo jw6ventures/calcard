@@ -180,19 +180,20 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- repeated; the statements are individually idempotent as well.
 --
 -- The duration is therefore what matters operationally. It is mostly the
--- recurrence repair, plus the index builds and the birthday backfill, and on an
--- installation that lacks the generated ACL join keys, the rewrite of
--- acl_entries, events and contacts that adding them costs. The server does not
--- open its listener until migrations finish, so on a container deployment it
--- is startup time and has to fit the probe budget.
+-- recurrence and event-end repairs, plus the index builds and the birthday
+-- backfill, and on an installation that lacks the generated ACL join keys, the
+-- rewrite of acl_entries, events and contacts that adding them costs. The
+-- server does not open its listener until migrations finish, so on a container
+-- deployment it is startup time and has to fit the probe budget.
 --
--- Check that budget against the table before upgrading. The repair measured
--- about 30 seconds per hundred thousand events when two fifths are recurring and
--- bodies are about 3 KB with a VTIMEZONE, and about 70 seconds with 10 KB
--- bodies; it grows with both. The whole file, run from a v1.1.9 release
--- install, where it also adds the generated columns, measured about 40 seconds
--- per hundred thousand of those 3 KB events. The Helm chart's default startup
--- budget is ten minutes
+-- Check that budget against the table before upgrading. The whole file, run
+-- from a v1.1.9 release install, where it also adds the generated columns,
+-- measured about 25 seconds per hundred thousand events when two fifths are
+-- recurring, a fifth have no DTEND and bodies are about 3 KB with a VTIMEZONE,
+-- and about 55 seconds with 10 KB bodies. It grows with the number of events
+-- and their size, not with how they are spread across calendars: the time was
+-- the same with every event in one calendar as across 500. The Helm chart's
+-- default startup budget is ten minutes
 -- (startupProbe.periodSeconds 10 x failureThreshold 60). A run that overruns it
 -- is killed rather than allowed to finish, and because the file is one
 -- transaction the kill rolls it back: the container then restarts and begins
@@ -232,6 +233,32 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 DROP INDEX IF EXISTS idx_events_recurrence_start;
 DROP INDEX IF EXISTS idx_events_recurrence_until;
 DROP INDEX IF EXISTS idx_events_calendar_keyset;
+
+-- The repairs below can update most rows of events, and every update fires
+-- trg_events_increment_ctag, which updates the row of the event's calendar.
+-- Each of those writes another version of that one calendars row, which the
+-- next has to reach past the versions before it, so the cost grows with the
+-- square of the rows repaired in one calendar. The trigger is therefore off
+-- while the repairs run, and each calendar they changed is moved once after
+-- them. The repairs and both trigger changes are one statement, so the trigger
+-- is never left off, even when the file is run by hand outside a transaction.
+--
+-- The repaired rows are found by their stamp. trg_events_touch_last_modified
+-- stays on, and both the function an earlier release installed (NOW()) and the
+-- one this file installs below (clock_timestamp(), kept past the calendar's
+-- token) stamp a row at or after the start of the transaction that updates
+-- it. A row stamped later than that for any other reason only costs its
+-- calendar a move it did not need.
+--
+-- The move writes updated_at itself because on an earlier release's schema no
+-- trigger on calendars does; stamp_collection_updated_at, where it is
+-- installed, writes the same value. It leaves the sync token at or past every
+-- stamp the repairs wrote, so a client that syncs from it is not told of the
+-- repaired rows again, while one holding an older token is, and the CTag move
+-- tells a client that compares CTags to look again.
+DO $repairs$
+BEGIN
+ALTER TABLE events DISABLE TRIGGER trg_events_increment_ctag;
 
 -- Fill the recurrence bounds of every stored resource that recurs and has none.
 --
@@ -421,6 +448,15 @@ UPDATE events
       AND dtend IS NULL
       AND regexp_replace(raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') !~* $re$(^|\r|\n)(DTEND|DURATION)[;:]$re$;
 
+ALTER TABLE events ENABLE TRIGGER trg_events_increment_ctag;
+
+UPDATE calendars
+    SET ctag = ctag + 1,
+        updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+    WHERE id IN (SELECT calendar_id FROM events WHERE last_modified >= now());
+END
+$repairs$;
+
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
     ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
@@ -595,14 +631,19 @@ FOR EACH ROW EXECUTE FUNCTION stamp_deleted_resource();
 -- Only rows still in year 1, and rows whose year is the card's omitted year,
 -- are touched, and only when the derived date differs, so a birthday genuinely
 -- dated in year 1 and a row already moved stay as they are and the statement
--- can run again. Each update fires the contacts triggers, which move the
--- address book's CTag and sync token and stamp the contact after the old token,
--- so clients pick up the corrected birthday.
+-- can run again. Each update fires trg_contacts_touch_last_modified, which
+-- stamps the contact after the old token, and each address book the repair
+-- changed is then moved once, as the calendars are after the event repairs and
+-- for the same reasons, so clients pick up the corrected birthday.
 --
 -- Each card is unfolded, split and matched once, in LATERAL function scans, and
 -- only the first BDAY line is parsed further. OFFSET 0 keeps the derived steps
 -- from being flattened into the expressions that read them, which would
 -- evaluate each regex again for every reference.
+DO $birthdays$
+BEGIN
+ALTER TABLE contacts DISABLE TRIGGER trg_contacts_increment_ctag;
+
 UPDATE contacts AS contact
 SET birthday = derived.birthday
 FROM (
@@ -666,5 +707,14 @@ WHERE contact.id = derived.id
   AND derived.birthday <> contact.birthday
   AND ((contact.birthday >= DATE '0001-01-01' AND contact.birthday < DATE '0002-01-01')
        OR EXTRACT(YEAR FROM contact.birthday) = derived.omitted_year);
+
+ALTER TABLE contacts ENABLE TRIGGER trg_contacts_increment_ctag;
+
+UPDATE address_books
+    SET ctag = ctag + 1,
+        updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+    WHERE id IN (SELECT address_book_id FROM contacts WHERE last_modified >= now());
+END
+$birthdays$;
 
 UPDATE application SET value = 'v1.2.0' WHERE key = 'version';

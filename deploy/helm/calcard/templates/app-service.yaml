@@ -21,7 +21,7 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   ports:
-    - port: {{ .Values.service.port }}
+    - port: {{ include "calcard.integer" (list "service.port" .Values.service.port 1 65535) }}
       targetPort: http
       protocol: TCP
       name: http

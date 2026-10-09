@@ -1778,6 +1778,136 @@ VALUES ($1, $2, $2 || '.ics', $3, 'etag', $4, $5, $6, NOW())`,
 	}
 }
 
+// Every update of a member row moves its collection's CTag through a row
+// trigger, and each move writes a new version of the one collection row the
+// next move has to reach, so repairing n rows of one calendar row by row costs
+// time quadratic in n. The repairs move each collection they change once, after
+// its last row, and leave its sync token at or past every member stamp they
+// wrote, so a client syncing from that token is not told of the repaired rows
+// again. A collection they do not change keeps its CTag and token.
+func TestPostgres_V120MigrationMovesEachRepairedCollectionOnce(t *testing.T) {
+	const perRepair = 40
+	pool := newV119ReleasePool(t)
+	repairedID := seedRepairCalendar(t, pool, "subject-move-once")
+	var untouchedID, bookID int64
+	if err := pool.QueryRow(`INSERT INTO calendars (user_id, name) SELECT user_id, 'Untouched' FROM calendars WHERE id = $1 RETURNING id`,
+		repairedID).Scan(&untouchedID); err != nil {
+		t.Fatalf("seed untouched calendar: %v", err)
+	}
+	if err := pool.QueryRow(`INSERT INTO address_books (user_id, name) SELECT user_id, 'Birthdays' FROM calendars WHERE id = $1 RETURNING id`,
+		repairedID).Scan(&bookID); err != nil {
+		t.Fatalf("seed address book: %v", err)
+	}
+
+	const eventBody = `E'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:' || $2 || n || E'\r\n' || $3 || E'END:VEVENT\r\nEND:VCALENDAR\r\n'`
+	seedEvents := func(calendarID int64, prefix, properties string, dtend any) {
+		t.Helper()
+		if _, err := pool.Exec(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified)
+SELECT $1, $2 || n, $2 || n || '.ics', `+eventBody+`, 'etag', '2025-03-01T10:00:00Z', $4, FALSE, NOW()
+FROM generate_series(1, $5) AS n`,
+			calendarID, prefix, properties, dtend, perRepair); err != nil {
+			t.Fatalf("seed %s events: %v", prefix, err)
+		}
+	}
+	seedEvents(repairedID, "recurring-", "DTSTART:20250301T100000Z\r\nDTEND:20250301T110000Z\r\nRRULE:FREQ=DAILY\r\n", "2025-03-01T11:00:00Z")
+	seedEvents(repairedID, "no-dtend-", "DTSTART:20250301T100000Z\r\n", nil)
+	seedEvents(repairedID, "dtend-before-", "DTSTART:20250301T100000Z\r\nDTEND:20250301T080000Z\r\n", "2025-03-01T08:00:00Z")
+	seedEvents(untouchedID, "plain-", "DTSTART:20250301T100000Z\r\nDTEND:20250301T110000Z\r\n", "2025-03-01T11:00:00Z")
+	if _, err := pool.Exec(`
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, birthday)
+SELECT $1, 'yearless-' || n, 'yearless-' || n, E'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Someone\r\nBDAY:--02-29\r\nEND:VCARD\r\n', 'etag', DATE '0001-03-01'
+FROM generate_series(1, $2) AS n`, bookID, perRepair); err != nil {
+		t.Fatalf("seed contacts: %v", err)
+	}
+
+	type collectionState struct {
+		ctag       int64
+		syncToken  time.Time
+		lastMember time.Time
+	}
+	collections := []struct {
+		name, table, members, key string
+		id                        int64
+	}{
+		{name: "repaired calendar", table: "calendars", members: "events", key: "calendar_id", id: repairedID},
+		{name: "untouched calendar", table: "calendars", members: "events", key: "calendar_id", id: untouchedID},
+		{name: "address book", table: "address_books", members: "contacts", key: "address_book_id", id: bookID},
+	}
+	states := func() []collectionState {
+		t.Helper()
+		states := make([]collectionState, len(collections))
+		for i, collection := range collections {
+			if err := pool.QueryRow(fmt.Sprintf(`SELECT ctag, updated_at, (SELECT max(last_modified) FROM %s WHERE %s = $1) FROM %s WHERE id = $1`,
+				collection.members, collection.key, collection.table), collection.id).
+				Scan(&states[i].ctag, &states[i].syncToken, &states[i].lastMember); err != nil {
+				t.Fatalf("read %s: %v", collection.name, err)
+			}
+		}
+		return states
+	}
+	upgrade := func(run string, apply func(), wantMoves ...int64) {
+		t.Helper()
+		before := states()
+		apply()
+		after := states()
+		for i, collection := range collections {
+			if moves := after[i].ctag - before[i].ctag; moves != wantMoves[i] {
+				t.Errorf("%s: %s CTag moved %d times, want %d", run, collection.name, moves, wantMoves[i])
+			}
+			if wantMoves[i] == 0 {
+				if !after[i].syncToken.Equal(before[i].syncToken) {
+					t.Errorf("%s: %s sync token moved from %s to %s", run, collection.name, before[i].syncToken, after[i].syncToken)
+				}
+				continue
+			}
+			if !after[i].syncToken.After(before[i].syncToken) {
+				t.Errorf("%s: %s sync token = %s, want it moved past %s", run, collection.name, after[i].syncToken, before[i].syncToken)
+			}
+			if after[i].lastMember.After(after[i].syncToken) {
+				t.Errorf("%s: %s has a member stamped %s, after the sync token %s, so a sync from that token reports it again",
+					run, collection.name, after[i].lastMember, after[i].syncToken)
+			}
+		}
+		var disabled string
+		if err := pool.QueryRow(`
+SELECT COALESCE(string_agg(t.tgname, ', '), '')
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+WHERE NOT t.tgisinternal
+  AND c.relnamespace = current_schema()::regnamespace
+  AND t.tgenabled <> 'O'`).Scan(&disabled); err != nil {
+			t.Fatalf("read trigger states: %v", err)
+		}
+		if disabled != "" {
+			t.Errorf("%s: the upgrade leaves triggers disabled: %s", run, disabled)
+		}
+	}
+
+	upgrade("upgrade from v1.1.9", func() { migrateWithRunner(t, pool, "../../migrations", "v1.2.0") }, 1, 0, 1)
+
+	// Bounds a release candidate stored that the series outlasts are reopened.
+	if _, err := pool.Exec(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified, recurrence_start, recurrence_until)
+SELECT $1, $2 || n, $2 || n || '.ics', `+eventBody+`, 'etag', '2026-03-01T07:30:00Z', '2026-03-01T08:30:00Z', FALSE, NOW(),
+       '2026-03-01T07:30:00Z', '2026-03-10T08:30:00Z'
+FROM generate_series(1, $4) AS n`,
+		repairedID, "outlasted-", "DTSTART;TZID=America/New_York:20260301T023000\r\nRRULE:FREQ=DAILY;COUNT=10\r\n", perRepair); err != nil {
+		t.Fatalf("seed outlasted bounds: %v", err)
+	}
+	upgrade("reopening outlasted bounds", func() { applyV120Migration(t, pool) }, 1, 0, 0)
+	var reopened int
+	if err := pool.QueryRow(`SELECT count(*) FROM events WHERE uid LIKE 'outlasted-%' AND recurrence_until = $1`, icalpkg.RecurrenceUntilSentinel).
+		Scan(&reopened); err != nil {
+		t.Fatalf("read reopened bounds: %v", err)
+	}
+	if reopened != perRepair {
+		t.Errorf("%d of %d outlasted bounds reopened", reopened, perRepair)
+	}
+
+	upgrade("repeated upgrade", func() { applyV120Migration(t, pool) }, 0, 0, 0)
+}
+
 func ptr[T any](value T) *T {
 	return &value
 }

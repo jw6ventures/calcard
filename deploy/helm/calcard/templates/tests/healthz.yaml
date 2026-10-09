@@ -19,5 +19,5 @@ spec:
       imagePullPolicy: IfNotPresent
       args:
         - "-fsS"
-        - "http://{{ $fullname }}:{{ .Values.service.port }}/healthz"
+        - "http://{{ $fullname }}:{{ include "calcard.integer" (list "service.port" .Values.service.port 1 65535) }}/healthz"
   restartPolicy: Never

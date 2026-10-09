@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -602,4 +604,309 @@ func withoutYAMLComments(document string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// chartIntegerValues is every integer the chart renders from a value, with the
+// smallest each accepts. The DAV limits take 0 to turn the limit off. A port is
+// also bounded above, and its schema accepts a string of digits as well as an
+// integer, because 1.1.x had no schema and so accepted a quoted port.
+var chartIntegerValues = []struct {
+	path    string
+	minimum int
+	port    bool
+}{
+	{"app.db.port", 1, true},
+	{"app.db.maxOpenConns", 0, false},
+	{"app.db.maxIdleConns", 0, false},
+	{"app.dav.maxMultistatusResponses", 0, false},
+	{"app.dav.maxMultistatusBytes", 0, false},
+	{"app.dav.maxFilterElements", 0, false},
+	{"app.dav.maxReportElementDepth", 0, false},
+	{"app.dav.maxCardDAVQueryBytes", 0, false},
+	{"app.dav.maxAddressDataProperties", 0, false},
+	{"app.dav.maxMultigetHrefs", 0, false},
+	{"app.dav.maxReportCandidateRows", 0, false},
+	{"service.port", 1, true},
+	{"startupProbe.periodSeconds", 1, false},
+	{"startupProbe.failureThreshold", 1, false},
+}
+
+// quotedPortsValues is a values file quoting both ports, as a 1.1.x release
+// could, with values other than the defaults so the render shows they were read.
+const quotedPortsValues = `app:
+  db:
+    port: "5433"
+service:
+  port: "8080"
+`
+
+// requireQuotedPorts asserts that every place a port is rendered carries the
+// ports quotedPortsValues sets.
+func requireQuotedPorts(t *testing.T, documents map[string]string) {
+	t.Helper()
+	if service := requireDocument(t, documents, "app-service.yaml"); !hasLine(service, "- port: 8080") {
+		t.Errorf("service does not listen on the quoted service.port:\n%s", service)
+	}
+	if ingress := requireDocument(t, documents, "ingress.yaml"); !hasLine(ingress, "number: 8080") {
+		t.Errorf("ingress does not route to the quoted service.port:\n%s", ingress)
+	}
+	if healthz := requireDocument(t, documents, "tests/healthz.yaml"); !strings.Contains(healthz, ":8080/healthz") {
+		t.Errorf("helm test does not address the quoted service.port:\n%s", healthz)
+	}
+	if secret := requireDocument(t, documents, "db-secret.yaml"); !strings.Contains(secret, "-postgres:5433/") {
+		t.Errorf("database DSN does not carry the quoted app.db.port:\n%s", secret)
+	}
+}
+
+// nestedValuesYAML writes the one value at a dotted path as the nested YAML a
+// values file carries.
+func nestedValuesYAML(path, value string) string {
+	var document strings.Builder
+	keys := strings.Split(path, ".")
+	for depth, key := range keys {
+		document.WriteString(strings.Repeat("  ", depth))
+		document.WriteString(key)
+		document.WriteString(":")
+		if depth == len(keys)-1 {
+			document.WriteString(" ")
+			document.WriteString(value)
+		}
+		document.WriteString("\n")
+	}
+	return document.String()
+}
+
+func writeValuesFile(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write values file: %v", err)
+	}
+	return path
+}
+
+// Helm reads every number in a values file as a float64, and a float64 of a
+// million or more prints in exponent form: maxMultistatusBytes: 67108864
+// reaches the container as "6.7108864e+07", which the config loader refuses,
+// and the pod crash-loops. --set parses integers as integers, so only a values
+// file shows it. Each value here is past that threshold except the ports, which
+// cannot be.
+func TestHelmChartRendersValuesFileIntegersAsDecimal(t *testing.T) {
+	valuesFile := writeValuesFile(t, "large-integers.yaml", `app:
+  db:
+    port: 65535
+    maxOpenConns: 67108864
+    maxIdleConns: 67108864
+  dav:
+    maxMultistatusResponses: 67108864
+    maxMultistatusBytes: 67108864
+    maxFilterElements: 67108864
+    maxReportElementDepth: 67108864
+    maxCardDAVQueryBytes: 67108864
+    maxAddressDataProperties: 67108864
+    maxMultigetHrefs: 67108864
+    maxReportCandidateRows: 67108864
+service:
+  port: 65535
+startupProbe:
+  periodSeconds: 1000000
+  failureThreshold: 67108864
+`)
+	documents := renderChart(t, "-f", valuesFile)
+
+	configmap := requireDocument(t, documents, "configmap.yaml")
+	for _, want := range []string{
+		`APP_DB_MAX_OPEN_CONNS: "67108864"`,
+		`APP_DB_MAX_IDLE_CONNS: "67108864"`,
+		`APP_DAV_MAX_MULTISTATUS_RESPONSES: "67108864"`,
+		`APP_DAV_MAX_MULTISTATUS_BYTES: "67108864"`,
+		`APP_DAV_MAX_FILTER_ELEMENTS: "67108864"`,
+		`APP_DAV_MAX_REPORT_ELEMENT_DEPTH: "67108864"`,
+		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "67108864"`,
+		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "67108864"`,
+		`APP_DAV_MAX_MULTIGET_HREFS: "67108864"`,
+		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "67108864"`,
+	} {
+		if !hasLine(configmap, want) {
+			t.Errorf("configmap is missing %s:\n%s", want, configmap)
+		}
+	}
+
+	startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+	if !ok {
+		t.Fatal("app deployment has no startupProbe")
+	}
+	for _, want := range []string{"periodSeconds: 1000000", "failureThreshold: 67108864"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe is missing %q:\n%s", want, startup)
+		}
+	}
+
+	if service := requireDocument(t, documents, "app-service.yaml"); !hasLine(service, "- port: 65535") {
+		t.Errorf("service does not listen on service.port:\n%s", service)
+	}
+	if ingress := requireDocument(t, documents, "ingress.yaml"); !hasLine(ingress, "number: 65535") {
+		t.Errorf("ingress does not route to service.port:\n%s", ingress)
+	}
+	if healthz := requireDocument(t, documents, "tests/healthz.yaml"); !strings.Contains(healthz, ":65535/healthz") {
+		t.Errorf("helm test does not address service.port:\n%s", healthz)
+	}
+	if secret := requireDocument(t, documents, "db-secret.yaml"); !strings.Contains(secret, "-postgres:65535/") {
+		t.Errorf("database DSN does not carry app.db.port:\n%s", secret)
+	}
+
+	exponent := regexp.MustCompile(`[0-9]e\+[0-9]`)
+	for template, document := range documents {
+		if exponent.MatchString(document) {
+			t.Errorf("%s renders a number in exponent form:\n%s", template, document)
+		}
+	}
+}
+
+// The other end of the same conversion: 0 is what turns a DAV limit off, and a
+// values file's 0 is a float64 that has to reach the server as "0" rather than
+// be dropped.
+func TestHelmChartRendersAValuesFileZeroLimit(t *testing.T) {
+	valuesFile := writeValuesFile(t, "zero-limit.yaml", nestedValuesYAML("app.dav.maxReportCandidateRows", "0"))
+	configmap := requireDocument(t, renderChart(t, "-f", valuesFile), "configmap.yaml")
+	if !hasLine(configmap, `APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`) {
+		t.Fatalf("a values file's 0 did not reach the server:\n%s", configmap)
+	}
+}
+
+// A quoted port was valid in 1.1.x, so the schema keeps accepting one and the
+// template renders it as the integer it spells.
+func TestHelmChartAcceptsQuotedPortsFromAValuesFile(t *testing.T) {
+	valuesFile := writeValuesFile(t, "quoted-ports.yaml", quotedPortsValues)
+	requireQuotedPorts(t, renderChart(t, "-f", valuesFile))
+}
+
+// values.schema.json refuses a non-integer first, and the template guard
+// refuses it again for installs run with --skip-schema-validation. Rendering
+// through int64 alone would truncate 1.5 to 1 and turn "abc" into 0, which for
+// a DAV limit silently turns the limit off. A port's schema admits any string of
+// digits, so the template guard alone refuses a quoted port that is out of range
+// or not in plain decimal form, whether or not the schema is validated.
+func TestHelmChartRefusesNonIntegerNumbers(t *testing.T) {
+	for _, key := range chartIntegerValues {
+		valuesFile := func(name, value string) []string {
+			return []string{"-f", writeValuesFile(t, name+".yaml", nestedValuesYAML(key.path, value))}
+		}
+		type badValue struct {
+			name       string
+			values     []string
+			bySchema   bool
+			byTemplate bool
+		}
+		cases := []badValue{
+			{"fractional number", valuesFile("fractional", "1.5"), true, true},
+			{"fractional string", []string{"--set", key.path + "=1.5"}, true, true},
+			{"non-numeric", []string{"--set", key.path + "=abc"}, true, true},
+			{"below minimum", []string{"--set", key.path + "=" + strconv.Itoa(key.minimum-1)}, true, true},
+		}
+		if key.port {
+			cases = append(cases,
+				badValue{"above maximum", []string{"--set", key.path + "=70000"}, true, true},
+				badValue{"quoted below minimum", valuesFile("quoted-zero", `"0"`), false, true},
+				badValue{"quoted above maximum", valuesFile("quoted-large", `"70000"`), false, true},
+				badValue{"quoted leading zero", valuesFile("quoted-octal", `"010"`), false, true},
+			)
+		} else {
+			// The template renders a digit string as the integer it spells, so
+			// only the schema refuses a quoted value for a key that never had one.
+			cases = append(cases, badValue{"quoted integer", valuesFile("quoted", `"5"`), true, false})
+		}
+
+		schemaRefusal := "/" + strings.ReplaceAll(key.path, ".", "/")
+		templateRefusal := key.path + " must be an integer"
+		type gate struct {
+			name  string
+			flags []string
+			want  string
+		}
+		for _, tc := range cases {
+			// A value the schema admits reaches the template guard even with
+			// schema validation on, so the guard's message is what names it.
+			schemaGate := gate{"schema", nil, schemaRefusal}
+			if !tc.bySchema {
+				schemaGate.want = templateRefusal
+			}
+			gates := []gate{schemaGate}
+			if tc.byTemplate {
+				gates = append(gates, gate{"template", []string{"--skip-schema-validation"}, templateRefusal})
+			}
+			for _, gate := range gates {
+				t.Run(key.path+"/"+tc.name+"/"+gate.name, func(t *testing.T) {
+					args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+					args = append(args, gate.flags...)
+					args = append(args, tc.values...)
+					output, err := runHelm(t, args...)
+					if err == nil {
+						t.Fatalf("chart rendered %v:\n%s", tc.values, output)
+					}
+					if !strings.Contains(output, gate.want) {
+						t.Fatalf("expected the refusal to name %q, got:\n%s", gate.want, output)
+					}
+				})
+			}
+		}
+	}
+}
+
+// helm upgrade --reuse-values does not merge the new chart's values.yaml: it
+// replaces the chart's defaults with the previous release's, so every key a
+// later chart introduced is absent rather than defaulted. Rendering a copy of
+// this chart whose values.yaml is a released 1.1.x one reproduces exactly that.
+// v1.1.4 stands for v1.1.0 through v1.1.4 and v1.1.9 for v1.1.5 onward; the two
+// differ in app.logLevel.
+func TestHelmChartRendersOverReusedV1_1Values(t *testing.T) {
+	for _, release := range []string{"v1.1.4", "v1.1.9"} {
+		t.Run(release, func(t *testing.T) {
+			released, err := os.ReadFile(filepath.Join("testdata", "values-"+release+".yaml"))
+			if err != nil {
+				t.Fatalf("read %s values: %v", release, err)
+			}
+			chart := filepath.Join(t.TempDir(), "calcard")
+			if err := os.CopyFS(chart, os.DirFS(chartPath)); err != nil {
+				t.Fatalf("copy chart: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(chart, "values.yaml"), released, 0o600); err != nil {
+				t.Fatalf("write %s values: %v", release, err)
+			}
+
+			// The release's own values are re-validated against this chart's
+			// schema, and a 1.1.x release could quote its ports.
+			quotedPorts := writeValuesFile(t, "quoted-ports.yaml", quotedPortsValues)
+			args := append([]string{"template", "calcard-test", chart}, ciValues()...)
+			args = append(args, "-f", quotedPorts)
+			output, err := runHelm(t, args...)
+			if err != nil {
+				t.Fatalf("chart does not render over the %s values, so helm upgrade --reuse-values fails: %v\n%s", release, err, output)
+			}
+			documents := splitRenderedDocuments(output)
+
+			startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+			if !ok {
+				t.Fatalf("app deployment has no startupProbe over the %s values", release)
+			}
+			for _, want := range []string{"path: /healthz", "periodSeconds: 10", "failureThreshold: 60"} {
+				if !hasLine(startup, want) {
+					t.Errorf("startupProbe is missing the default %q:\n%s", want, startup)
+				}
+			}
+
+			requireQuotedPorts(t, documents)
+
+			configmap := requireDocument(t, documents, "configmap.yaml")
+			data, ok := blockUnder(configmap, "data:")
+			if !ok {
+				t.Fatalf("configmap carries no data:\n%s", configmap)
+			}
+			for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+				if strings.HasSuffix(strings.TrimSpace(line), ":") {
+					t.Errorf("configmap renders %q with no value, which is null rather than a string:\n%s", strings.TrimSpace(line), configmap)
+				}
+			}
+		})
+	}
 }
