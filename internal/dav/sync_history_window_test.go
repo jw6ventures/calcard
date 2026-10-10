@@ -14,14 +14,27 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-type cleanupBeforeHistoryRead struct {
-	store.DeletedResourceRepository
+// cleanupBeforeEventChanges and cleanupBeforeContactChanges run a hook ahead
+// of each change-stream read, so a test can prune history between the
+// retention check a sync makes on arrival and the read itself.
+type cleanupBeforeEventChanges struct {
+	store.EventRepository
 	beforeRead func()
 }
 
-func (r cleanupBeforeHistoryRead) ListDeletedSincePageAfter(ctx context.Context, kind string, collectionID, afterID int64, since time.Time, limit int) ([]store.DeletedResource, error) {
+func (r cleanupBeforeEventChanges) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
 	r.beforeRead()
-	return r.DeletedResourceRepository.ListDeletedSincePageAfter(ctx, kind, collectionID, afterID, since, limit)
+	return r.EventRepository.ListChangesAfter(ctx, calendarID, after, removals, limit)
+}
+
+type cleanupBeforeContactChanges struct {
+	store.ContactRepository
+	beforeRead func()
+}
+
+func (r cleanupBeforeContactChanges) ListChangesAfter(ctx context.Context, addressBookID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	r.beforeRead()
+	return r.ContactRepository.ListChangesAfter(ctx, addressBookID, after, removals, limit)
 }
 
 func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
@@ -35,7 +48,7 @@ func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
 			}
 			var id int64
 			var tokenTime time.Time
-			var resourceType, collectionPath string
+			var collectionPath string
 			if kind == "card" {
 				book, err := database.AddressBooks.Create(ctx, store.AddressBook{UserID: user.ID, Name: "Retention"})
 				if err != nil {
@@ -53,7 +66,7 @@ func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
 				if err := database.Contacts.DeleteByUID(ctx, id, "gone"); err != nil {
 					t.Fatal(err)
 				}
-				resourceType, collectionPath = "contact", fmt.Sprintf("/dav/addressbooks/%d/", id)
+				collectionPath = fmt.Sprintf("/dav/addressbooks/%d/", id)
 			} else {
 				cal, err := database.Calendars.Create(ctx, store.Calendar{UserID: user.ID, Name: "Retention"})
 				if err != nil {
@@ -71,23 +84,37 @@ func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
 				if err := database.Events.DeleteByUID(ctx, id, "gone"); err != nil {
 					t.Fatal(err)
 				}
-				resourceType, collectionPath = "event", fmt.Sprintf("/dav/calendars/%d/", id)
+				collectionPath = fmt.Sprintf("/dav/calendars/%d/", id)
 			}
-			history, err := database.DeletedResources.ListDeletedSincePageAfter(ctx, resourceType, id, 0, tokenTime, 10)
+			var history []store.DeletedResource
+			if kind == "card" {
+				var page store.SyncChanges[store.Contact]
+				page, err = database.Contacts.ListChangesAfter(ctx, id, store.SyncCursorAt(tokenTime), true, 10)
+				history = page.Removals
+			} else {
+				var page store.SyncChanges[store.Event]
+				page, err = database.Events.ListChangesAfter(ctx, id, store.SyncCursorAt(tokenTime), true, 10)
+				history = page.Removals
+			}
 			if err != nil || len(history) != 1 {
 				t.Fatalf("history = %v, error = %v", history, err)
 			}
 			cfg := syncWindowConfig(time.Second)
 			pruned := false
 			repo := database.DeletedResources
-			database.DeletedResources = cleanupBeforeHistoryRead{DeletedResourceRepository: repo, beforeRead: func() {
+			prune := func() {
 				time.Sleep(time.Until(history[0].DeletedAt.Add(cfg.DAV.SyncHistoryRetention + 10*time.Millisecond)))
 				n, err := repo.Cleanup(ctx, cfg.DAV.SyncHistoryRetention)
 				if err != nil || n != 1 {
 					t.Fatalf("pruned = %d, error = %v", n, err)
 				}
 				pruned = true
-			}}
+			}
+			if kind == "card" {
+				database.Contacts = cleanupBeforeContactChanges{ContactRepository: database.Contacts, beforeRead: prune}
+			} else {
+				database.Events = cleanupBeforeEventChanges{EventRepository: database.Events, beforeRead: prune}
+			}
 			h := NewDavServer(Options{Store: database, Config: cfg})
 			req := httptest.NewRequest("REPORT", collectionPath, strings.NewReader(syncCollectionBody(buildSyncToken(kind, id, tokenTime))))
 			req.Header.Set("Depth", "0")

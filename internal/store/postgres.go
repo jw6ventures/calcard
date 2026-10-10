@@ -861,34 +861,6 @@ func (r *eventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int
 	}, nil
 }
 
-// ListModifiedSincePageAfter returns one keyset page of the calendar's rows
-// modified after since, ordered by id so a caller can resume from the last id
-// it saw. The sync report that reads it bounds how many pages it will take.
-func (r *eventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]Event, error) {
-	if limit <= 0 {
-		return []Event{}, nil
-	}
-	// The collection equality scopes the read and the row comparison pins the
-	// keyset index; ListForCalendarPageAfter carries why neither may be dropped.
-	const q = `SELECT ` + eventColumns + ` FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4`
-	defer observeDB(ctx, "events.list_modified_since_page_after")()
-	rows, err := r.pool.QueryContext(ctx, q, calendarID, afterID, since, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var result []Event
-	for rows.Next() {
-		ev, err := scanEvent(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, ev)
-	}
-	return result, rows.Err()
-}
-
 func (r *eventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error) {
 	q := `
 SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified
@@ -1673,34 +1645,6 @@ func (r *contactRepo) ListForBookPaginated(ctx context.Context, addressBookID in
 	}, nil
 }
 
-// ListModifiedSincePageAfter returns one keyset page of the address book's rows
-// modified after since, on the same terms the event repository reads a calendar
-// with.
-func (r *contactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]Contact, error) {
-	if limit <= 0 {
-		return []Contact{}, nil
-	}
-	// The collection equality scopes the read and the row comparison pins the
-	// keyset index; ListForCalendarPageAfter carries why neither may be dropped.
-	const q = `SELECT ` + contactColumns + ` FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4`
-	defer observeDB(ctx, "contacts.list_modified_since_page_after")()
-	rows, err := r.pool.QueryContext(ctx, q, addressBookID, afterID, since, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var result []Contact
-	for rows.Next() {
-		c, err := scanContact(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, c)
-	}
-	return result, rows.Err()
-}
-
 func (r *contactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error) {
 	const q = `
 SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
@@ -2038,34 +1982,6 @@ func (r *digestNonceRepo) DeleteExpired(ctx context.Context) (int64, error) {
 // deletedResourceRepo implements DeletedResourceRepository.
 type deletedResourceRepo struct {
 	pool *sql.DB
-}
-
-// ListDeletedSincePageAfter returns one keyset page of the collection's
-// tombstones recorded after since, ordered by id so a caller can resume from
-// the last id it saw. Nothing prunes this table, so the set a client's sync
-// token selects grows without bound and the sync report that reads it bounds
-// how many pages it will take.
-func (r *deletedResourceRepo) ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]DeletedResource, error) {
-	if limit <= 0 {
-		return []DeletedResource{}, nil
-	}
-	const q = `SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5`
-	defer observeDB(ctx, "deleted_resources.list_deleted_since_page_after")()
-	rows, err := r.pool.QueryContext(ctx, q, resourceType, collectionID, afterID, since, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var result []DeletedResource
-	for rows.Next() {
-		var d DeletedResource
-		if err := rows.Scan(&d.ID, &d.ResourceType, &d.CollectionID, &d.UID, &d.ResourceName, &d.DeletedAt); err != nil {
-			return nil, err
-		}
-		result = append(result, d)
-	}
-	return result, rows.Err()
 }
 
 func (r *deletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {

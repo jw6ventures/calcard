@@ -79,6 +79,7 @@ app:
     # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.
     # maxCardDAVQueryBytes: 65536 # Combined serialized CARDDAV:filter and CARDDAV:address-data bytes per REPORT. Set 0 to disable.
     # maxAddressDataProperties: 100 # CARDDAV:address-data property selectors per REPORT. Set 0 to disable.
+    # maxRequestedProperties: 1000 # Distinct property names one PROPFIND or REPORT may request; each is answered for every resource the request reaches.
     # maxReportElementDepth: 20 # Element nesting one REPORT body may reach.
     # maxMultigetHrefs: 5000 # DAV:href elements one calendar-multiget may carry.
     # maxReportCandidateRows: 50000 # Stored resources one report will read and parse while looking for matches.

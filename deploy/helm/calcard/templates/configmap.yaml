@@ -75,6 +75,9 @@ data:
   {{- if hasKey . "maxAddressDataProperties" }}
   APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: {{ include "calcard.integer" (list "app.dav.maxAddressDataProperties" .maxAddressDataProperties 0) | quote }}
   {{- end }}
+  {{- if hasKey . "maxRequestedProperties" }}
+  APP_DAV_MAX_REQUESTED_PROPERTIES: {{ include "calcard.integer" (list "app.dav.maxRequestedProperties" .maxRequestedProperties 0) | quote }}
+  {{- end }}
   {{- if hasKey . "maxMultigetHrefs" }}
   APP_DAV_MAX_MULTIGET_HREFS: {{ include "calcard.integer" (list "app.dav.maxMultigetHrefs" .maxMultigetHrefs 0) | quote }}
   {{- end }}

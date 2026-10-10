@@ -312,6 +312,7 @@ func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 		"--set", "app.dav.maxFilterElements=25",
 		"--set", "app.dav.maxCardDAVQueryBytes=4096",
 		"--set", "app.dav.maxAddressDataProperties=0",
+		"--set", "app.dav.maxRequestedProperties=250",
 		"--set", "app.dav.maxReportCandidateRows=0",
 		"--set", "app.dav.syncHistoryRetention=504h",
 	)
@@ -320,6 +321,7 @@ func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 		`APP_DAV_MAX_FILTER_ELEMENTS: "25"`,
 		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "4096"`,
 		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "0"`,
+		`APP_DAV_MAX_REQUESTED_PROPERTIES: "250"`,
 		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`,
 		`APP_DAV_SYNC_HISTORY_RETENTION: "504h"`,
 	} {
@@ -624,6 +626,7 @@ var chartIntegerValues = []struct {
 	{"app.dav.maxReportElementDepth", 0, false},
 	{"app.dav.maxCardDAVQueryBytes", 0, false},
 	{"app.dav.maxAddressDataProperties", 0, false},
+	{"app.dav.maxRequestedProperties", 0, false},
 	{"app.dav.maxMultigetHrefs", 0, false},
 	{"app.dav.maxReportCandidateRows", 0, false},
 	{"service.port", 1, true},
@@ -704,6 +707,7 @@ func TestHelmChartRendersValuesFileIntegersAsDecimal(t *testing.T) {
     maxReportElementDepth: 67108864
     maxCardDAVQueryBytes: 67108864
     maxAddressDataProperties: 67108864
+    maxRequestedProperties: 67108864
     maxMultigetHrefs: 67108864
     maxReportCandidateRows: 67108864
 service:
@@ -724,6 +728,7 @@ startupProbe:
 		`APP_DAV_MAX_REPORT_ELEMENT_DEPTH: "67108864"`,
 		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "67108864"`,
 		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "67108864"`,
+		`APP_DAV_MAX_REQUESTED_PROPERTIES: "67108864"`,
 		`APP_DAV_MAX_MULTIGET_HREFS: "67108864"`,
 		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "67108864"`,
 	} {

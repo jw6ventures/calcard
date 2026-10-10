@@ -143,6 +143,7 @@ CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a 
 | `APP_DAV_MAX_FILTER_ELEMENTS` | false | (Default `100`) Elements one `CALDAV:filter` or `CARDDAV:filter` may carry. |
 | `APP_DAV_MAX_CARDDAV_QUERY_BYTES` | false | (Default `65536`) Combined serialized `CARDDAV:filter` and `CARDDAV:address-data` bytes per REPORT. |
 | `APP_DAV_MAX_ADDRESS_DATA_PROPERTIES` | false | (Default `100`) `CARDDAV:address-data` property selectors per REPORT. |
+| `APP_DAV_MAX_REQUESTED_PROPERTIES` | false | (Default `1000`) Distinct property names the `DAV:prop` selectors of one PROPFIND or REPORT may request (the `DAV:property` elements of `DAV:expand-property` count too). A PROPFIND past it is refused with 413, a REPORT with 400. |
 | `APP_DAV_MAX_REPORT_ELEMENT_DEPTH` | false | (Default `20`) Element nesting one REPORT body may reach. |
 | `APP_DAV_MAX_MULTIGET_HREFS` | false | (Default `5000`) `DAV:href` elements one calendar-multiget may carry. |
 | `APP_DAV_MAX_REPORT_CANDIDATE_ROWS` | false | (Default `50000`) Stored resources one report will read and parse while looking for matches. |

@@ -143,8 +143,8 @@ func (f *fakeContacts) ListForBookPaginated(context.Context, int64, int, int) (*
 func (f *fakeContacts) ListByUIDs(context.Context, int64, []string) ([]store.Contact, error) {
 	return nil, nil
 }
-func (f *fakeContacts) ListModifiedSincePageAfter(context.Context, int64, int64, time.Time, int) ([]store.Contact, error) {
-	return nil, nil
+func (f *fakeContacts) ListChangesAfter(ctx context.Context, collectionID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	return store.SyncChanges[store.Contact]{Last: after}, nil
 }
 func (f *fakeContacts) ListRecentByUser(context.Context, int64, int) ([]store.Contact, error) {
 	return nil, nil

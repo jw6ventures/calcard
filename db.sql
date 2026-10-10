@@ -172,13 +172,16 @@ ALTER TABLE events ADD COLUMN dtend TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN all_day BOOLEAN NOT NULL DEFAULT false;
 
 CREATE INDEX idx_events_dtstart ON events(calendar_id, dtstart);
-CREATE INDEX idx_events_last_modified ON events(calendar_id, last_modified DESC);
+-- sync-collection reads a collection's changes in stream order, a cursor of
+-- (stamp, id) at a time; internal/store/sync_changes.go carries why the id is
+-- part of the position.
+CREATE INDEX idx_events_change_stream ON events(calendar_id, last_modified, id);
 
 ALTER TABLE contacts ADD COLUMN display_name TEXT;
 ALTER TABLE contacts ADD COLUMN primary_email TEXT;
 
 CREATE INDEX idx_contacts_display_name ON contacts(address_book_id, display_name);
-CREATE INDEX idx_contacts_last_modified ON contacts(address_book_id, last_modified DESC);
+CREATE INDEX idx_contacts_change_stream ON contacts(address_book_id, last_modified, id);
 
 UPDATE contacts SET resource_name = uid WHERE resource_name = '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_resource_name ON contacts(address_book_id, resource_name);
@@ -191,7 +194,7 @@ CREATE TABLE deleted_resources (
     deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_deleted_resources_lookup ON deleted_resources(resource_type, collection_id, deleted_at);
+CREATE INDEX idx_deleted_resources_change_stream ON deleted_resources(resource_type, collection_id, deleted_at, id);
 
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
@@ -258,8 +261,7 @@ CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS 
 -- the index tuple, so a page does not visit the heap for a row it discards.
 -- idx_events_calendar_keyset is created below, with the recurrence columns its
 -- trailing expressions read.
-CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);
-CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);
+CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);
 
 -- Lock storage for WebDAV Class 2/3 compliance
 CREATE TABLE IF NOT EXISTS locks (
@@ -404,7 +406,7 @@ CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
 -- The events keyset index, created here rather than beside the other two
 -- because its trailing expressions read the recurrence columns added just above.
 CREATE INDEX idx_events_calendar_keyset ON events(
-    calendar_id, id, last_modified,
+    calendar_id, id,
     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 

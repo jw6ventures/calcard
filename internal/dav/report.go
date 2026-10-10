@@ -265,7 +265,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		_, _ = w.Write([]byte(freeBusyData))
 		return
 	}
-	responses, syncToken, err := h.calendarReportResponses(r.Context(), user, cal, h.principalURL(user), canonicalPath, resourceName, report, r)
+	answer, err := h.calendarReportResponses(r.Context(), user, cal, h.principalURL(user), canonicalPath, resourceName, report, r)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "calendar object not found", http.StatusNotFound)
@@ -274,7 +274,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 		h.writeReportFailure(w, r, report.XMLName.Local, err)
 		return
 	}
-	h.writeReportMultiStatus(w, r, report.XMLName.Local, responses, syncToken)
+	h.writeReportAnswer(w, r, report.XMLName.Local, answer)
 }
 
 // writeReportMultiStatus answers a REPORT and records what it answered with.
@@ -284,6 +284,29 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 func (h *DavServer) writeReportMultiStatus(w http.ResponseWriter, r *http.Request, reportName string, responses []response, syncToken string) {
 	h.logger().Debug("Report", "%s %s returned %d responses", reportName, r.URL.Path, len(responses))
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
+}
+
+// reportAnswer is what a collection REPORT answers with. encoded, when set, is
+// the multistatus already encoded under the byte ceiling: a sync-collection
+// page is encoded to learn whether it fits, and is written from that encoding
+// rather than encoded a second time.
+type reportAnswer struct {
+	responses []response
+	syncToken string
+	encoded   []byte
+}
+
+// writeReportAnswer answers a collection REPORT, from its encoding when it
+// carries one.
+func (h *DavServer) writeReportAnswer(w http.ResponseWriter, r *http.Request, reportName string, answer reportAnswer) {
+	if answer.encoded == nil {
+		h.writeReportMultiStatus(w, r, reportName, answer.responses, answer.syncToken)
+		return
+	}
+	h.logger().Debug("Report", "%s %s returned %d responses", reportName, r.URL.Path, len(answer.responses))
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	_, _ = w.Write(answer.encoded)
 }
 
 // writeReportFailure records a refused REPORT under the same component tag the
@@ -339,7 +362,7 @@ func writeReportError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errNumberOfMatchesExceeded):
 		writeNumberOfMatchesWithinLimits(w)
-	case errors.Is(err, errTooManyHrefs), errors.Is(err, errTooManyCandidateRows):
+	case errors.Is(err, errTooManyHrefs), errors.Is(err, errTooManyCandidateRows), errors.Is(err, errMultistatusTooLarge):
 		writeInsufficientStorage(w)
 	case errors.Is(err, errUnsupportedReport):
 		writeDAVError(w, http.StatusForbidden, "supported-report")
@@ -530,10 +553,10 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 		h.writeReportMultiStatus(w, r, report.XMLName.Local, nil, "")
 		return
 	}
-	responses, syncToken, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, r)
+	answer, err := h.addressBookReportResponses(r.Context(), user, book, h.principalURL(user), cleanPath, report, r)
 	if err != nil {
 		h.writeReportFailure(w, r, report.XMLName.Local, err)
 		return
 	}
-	h.writeReportMultiStatus(w, r, report.XMLName.Local, responses, syncToken)
+	h.writeReportAnswer(w, r, report.XMLName.Local, answer)
 }

@@ -39,12 +39,12 @@ func calendarSyncToken(t *testing.T, s *Store, calendarID int64) time.Time {
 
 func reportedSince(t *testing.T, s *Store, calendarID int64, token time.Time) map[string]bool {
 	t.Helper()
-	changed, err := s.Events.ListModifiedSincePageAfter(context.Background(), calendarID, 0, token, 100)
+	page, err := s.Events.ListChangesAfter(context.Background(), calendarID, SyncCursorAt(token), false, 100)
 	if err != nil {
 		t.Fatalf("list changes since %v: %v", token, err)
 	}
-	reported := make(map[string]bool, len(changed))
-	for _, event := range changed {
+	reported := make(map[string]bool, len(page.Members))
+	for _, event := range page.Members {
 		reported[event.UID] = true
 	}
 	return reported
@@ -384,11 +384,11 @@ func TestPostgres_EveryMemberChangeIsStampedAfterTheCollectionIsHeld(t *testing.
 			},
 			token: func(t *testing.T, f fixture) time.Time { return calendarSyncToken(t, f.s, f.calendarID) },
 			reported: func(t *testing.T, f fixture, token time.Time) bool {
-				removed, err := f.s.DeletedResources.ListDeletedSincePageAfter(context.Background(), "event", f.calendarID, 0, token, 100)
+				page, err := f.s.Events.ListChangesAfter(context.Background(), f.calendarID, SyncCursorAt(token), true, 100)
 				if err != nil {
 					t.Fatalf("list removals: %v", err)
 				}
-				return len(removed) == 1 && removed[0].UID == "seeded"
+				return len(page.Removals) == 1 && page.Removals[0].UID == "seeded"
 			},
 		},
 		{
@@ -409,11 +409,11 @@ func TestPostgres_EveryMemberChangeIsStampedAfterTheCollectionIsHeld(t *testing.
 				return book.UpdatedAt
 			},
 			reported: func(t *testing.T, f fixture, token time.Time) bool {
-				changed, err := f.s.Contacts.ListModifiedSincePageAfter(context.Background(), f.addressBook, 0, token, 100)
+				page, err := f.s.Contacts.ListChangesAfter(context.Background(), f.addressBook, SyncCursorAt(token), false, 100)
 				if err != nil {
 					t.Fatalf("list contact changes: %v", err)
 				}
-				return len(changed) == 1 && changed[0].UID == "late"
+				return len(page.Members) == 1 && page.Members[0].UID == "late"
 			},
 		},
 		{
@@ -434,11 +434,11 @@ func TestPostgres_EveryMemberChangeIsStampedAfterTheCollectionIsHeld(t *testing.
 				return book.UpdatedAt
 			},
 			reported: func(t *testing.T, f fixture, token time.Time) bool {
-				removed, err := f.s.DeletedResources.ListDeletedSincePageAfter(context.Background(), "contact", f.addressBook, 0, token, 100)
+				page, err := f.s.Contacts.ListChangesAfter(context.Background(), f.addressBook, SyncCursorAt(token), true, 100)
 				if err != nil {
 					t.Fatalf("list removals: %v", err)
 				}
-				return len(removed) == 1 && removed[0].UID == "seeded"
+				return len(page.Removals) == 1 && page.Removals[0].UID == "seeded"
 			},
 		},
 	}
@@ -590,11 +590,11 @@ func TestPostgres_RepositoryWritesHoldTheCollectionBeforeStamping(t *testing.T) 
 				return err
 			},
 			reported: func(t *testing.T, f fixture, token time.Time) bool {
-				changed, err := f.s.Contacts.ListModifiedSincePageAfter(context.Background(), f.bookID, 0, token, 100)
+				page, err := f.s.Contacts.ListChangesAfter(context.Background(), f.bookID, SyncCursorAt(token), false, 100)
 				if err != nil {
 					t.Fatalf("list contact changes: %v", err)
 				}
-				for _, contact := range changed {
+				for _, contact := range page.Members {
 					if contact.UID == "ui" {
 						return true
 					}

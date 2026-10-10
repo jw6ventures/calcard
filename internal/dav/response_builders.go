@@ -15,6 +15,15 @@ func eventResourceName(ev store.Event) string {
 	return ev.UID
 }
 
+// deletedResourceName is the name a tombstone frees, read as the member it
+// records was named.
+func deletedResourceName(tombstone store.DeletedResource) string {
+	if tombstone.ResourceName != "" {
+		return tombstone.ResourceName
+	}
+	return tombstone.UID
+}
+
 func contactResourceName(contact store.Contact) string {
 	if contact.ResourceName != "" {
 		return contact.ResourceName

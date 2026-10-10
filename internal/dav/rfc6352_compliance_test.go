@@ -4531,6 +4531,7 @@ func TestRFC6352_SyncCollectionOnAddressBook(t *testing.T) {
 		},
 	}
 	deletedRepo := &fakeDeletedResourceRepo{}
+	contactRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	t.Run("Section8_2_InitialSyncReturnsAllContacts", func(t *testing.T) {
@@ -4640,6 +4641,7 @@ func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 5, UID: "carol", ResourceName: "carol", DeletedAt: laterTime},
 		},
 	}
+	contactRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	t.Run("IncrementalSyncReturnsOnlyChangedAndDeleted", func(t *testing.T) {

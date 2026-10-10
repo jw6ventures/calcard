@@ -98,6 +98,98 @@ func (h *DavServer) syncTokenAnswerable(tokenTime, collectionUpdatedAt time.Time
 	return collectionUpdatedAt.Equal(tokenTime)
 }
 
+// syncPosition is where a stored collection's sync-collection report resumes
+// its collection's change stream.
+type syncPosition struct {
+	after store.SyncCursor
+	// fresh marks a report with no client token: the first page of a listing,
+	// which reads no tombstones because the client holds nothing to remove.
+	fresh bool
+	// listing marks a report delivering a listing of the collection, fresh or
+	// resumed from a truncated page, rather than the changes since a state the
+	// client already holds.
+	listing bool
+	// anchor is the instant the retention window is measured from: the
+	// client's token for changes, and the collection's token when a listing
+	// began. A listing's first pages end on the oldest stamps in the
+	// collection, so measuring from the cursor would refuse the continuation of
+	// every listing of a collection older than the window, and the client
+	// would start the listing over forever. A tombstone older than the listing
+	// names a resource the listing never held.
+	anchor time.Time
+}
+
+// syncPageStateKinds name the two kinds of truncated page a token resumes.
+const (
+	syncPageListing = "listing"
+	syncPageChanges = "changes"
+)
+
+// parseStoredSyncPosition reads the client's token for a stored collection of
+// the given kind and id. A stored collection never spells a whole-state token,
+// so a state segment other than a page position was not issued for it.
+func parseStoredSyncPosition(token, kind string, id int64) (syncPosition, error) {
+	if token == "" {
+		return syncPosition{fresh: true, listing: true}, nil
+	}
+	info, err := parseSyncToken(token)
+	if err != nil || info.Kind != kind || info.ID != id {
+		return syncPosition{}, errInvalidSyncToken
+	}
+	if info.State == "" {
+		if info.Timestamp.IsZero() {
+			return syncPosition{fresh: true, listing: true}, nil
+		}
+		return syncPosition{after: store.SyncCursorAt(info.Timestamp), anchor: info.Timestamp}, nil
+	}
+	parts := strings.Split(info.State, "-")
+	if len(parts) != 4 {
+		return syncPosition{}, errInvalidSyncToken
+	}
+	position := syncPosition{anchor: info.Timestamp}
+	switch parts[0] {
+	case syncPageListing:
+		position.listing = true
+	case syncPageChanges:
+	default:
+		return syncPosition{}, errInvalidSyncToken
+	}
+	switch parts[1] {
+	case "m":
+	case "t":
+		position.after.Removal = true
+	default:
+		return syncPosition{}, errInvalidSyncToken
+	}
+	rowID, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || rowID <= 0 {
+		return syncPosition{}, errInvalidSyncToken
+	}
+	nanos, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || nanos <= 0 {
+		return syncPosition{}, errInvalidSyncToken
+	}
+	position.after.ID = rowID
+	position.after.Stamp = time.Unix(0, nanos).UTC()
+	return position, nil
+}
+
+// buildSyncPageToken spells the token RFC 6578 §3.6 hands back with a
+// truncated page: it resumes the change stream after the page's last change,
+// and carries the anchor the retention window is measured from.
+func buildSyncPageToken(kind string, id int64, position syncPosition, last store.SyncCursor) string {
+	phase := syncPageChanges
+	if position.listing {
+		phase = syncPageListing
+	}
+	row := "m"
+	if last.Removal {
+		row = "t"
+	}
+	state := fmt.Sprintf("%s-%s-%d-%d", phase, row, last.ID, syncTokenNanos(last.Stamp))
+	return buildSyncTokenWithState(kind, id, position.anchor, state)
+}
+
 func (h *DavServer) syncHistoryRetention() time.Duration {
 	if h != nil && h.cfg != nil {
 		return h.cfg.DAV.SyncHistoryRetention

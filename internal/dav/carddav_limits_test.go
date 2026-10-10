@@ -120,7 +120,7 @@ func BenchmarkPreparedCardDAVTextMatch(b *testing.B) {
 // limits, so a test can drive one REPORT through the whole handler path rather
 // than against a query helper in isolation. It is the CardDAV counterpart of
 // limitsTestServer.
-func cardLimitsTestServer(t *testing.T, cfg *config.Config, contacts int) *DavServer {
+func cardLimitsTestServer(t testing.TB, cfg *config.Config, contacts int) *DavServer {
 	t.Helper()
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
 		5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: limitsFixtureModified, CTag: 1},

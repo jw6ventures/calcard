@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -43,21 +42,4 @@ func collectBoundedPages[T any](ctx context.Context, rowLimit int, page func(ctx
 	}
 }
 
-// listBoundedDeletedResources reads the tombstones an incremental sync reports
-// as removals, under a budget of its own, equal to the one the collection's own
-// rows are read with. The client's sync token is the only narrowing and nothing
-// prunes the table it selects from, so without this the resident cost of a sync
-// grows for the life of the deployment. The budget bounds the rows the read
-// returns, not the rows the database examines reaching them.
-func (h *DavServer) listBoundedDeletedResources(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]store.DeletedResource, error) {
-	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
-		func(ctx context.Context, afterID int64) ([]store.DeletedResource, error) {
-			return h.store.DeletedResources.ListDeletedSincePageAfter(ctx, resourceType, collectionID, afterID, since, multistatusPageSize)
-		}, deletedResourceID)
-}
-
 func eventID(event store.Event) int64 { return event.ID }
-
-func contactID(contact store.Contact) int64 { return contact.ID }
-
-func deletedResourceID(deleted store.DeletedResource) int64 { return deleted.ID }

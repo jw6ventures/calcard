@@ -120,7 +120,7 @@ func propstatNotFoundNameSet(stats []propstat) map[xml.Name]bool {
 		if stats[i].Status != httpStatusNotFound {
 			continue
 		}
-		for _, name := range stats[i].PropNames {
+		for name := range stats[i].names() {
 			names[name] = true
 		}
 	}

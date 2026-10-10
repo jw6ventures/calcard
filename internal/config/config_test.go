@@ -68,6 +68,9 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.MaxCardDAVQueryBytes != 65536 || cfg.DAV.MaxAddressDataProperties != 100 {
 		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
 	}
+	if cfg.DAV.MaxRequestedProperties != 1000 {
+		t.Fatalf("DAV.MaxRequestedProperties = %d, want 1000", cfg.DAV.MaxRequestedProperties)
+	}
 	if cfg.DAV.MaxReportElementDepth != 20 {
 		t.Fatalf("DAV.MaxReportElementDepth = %d, want 20", cfg.DAV.MaxReportElementDepth)
 	}
@@ -113,6 +116,7 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	t.Setenv("APP_DAV_MAX_FILTER_ELEMENTS", "17")
 	t.Setenv("APP_DAV_MAX_CARDDAV_QUERY_BYTES", "4096")
 	t.Setenv("APP_DAV_MAX_ADDRESS_DATA_PROPERTIES", "12")
+	t.Setenv("APP_DAV_MAX_REQUESTED_PROPERTIES", "64")
 	t.Setenv("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", "7")
 	t.Setenv("APP_DAV_MAX_MULTIGET_HREFS", "42")
 	t.Setenv("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", "9876")
@@ -133,6 +137,9 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	}
 	if cfg.DAV.MaxCardDAVQueryBytes != 4096 || cfg.DAV.MaxAddressDataProperties != 12 {
 		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
+	}
+	if cfg.DAV.MaxRequestedProperties != 64 {
+		t.Fatalf("DAV.MaxRequestedProperties = %d, want 64", cfg.DAV.MaxRequestedProperties)
 	}
 	if cfg.DAV.MaxReportElementDepth != 7 {
 		t.Fatalf("DAV.MaxReportElementDepth = %d, want 7", cfg.DAV.MaxReportElementDepth)
@@ -156,6 +163,7 @@ var davLimitKeys = []string{
 	"APP_DAV_MAX_FILTER_ELEMENTS",
 	"APP_DAV_MAX_CARDDAV_QUERY_BYTES",
 	"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES",
+	"APP_DAV_MAX_REQUESTED_PROPERTIES",
 	"APP_DAV_MAX_REPORT_ELEMENT_DEPTH",
 	"APP_DAV_MAX_MULTIGET_HREFS",
 	"APP_DAV_MAX_REPORT_CANDIDATE_ROWS",
@@ -196,6 +204,7 @@ func TestLoadTreatsZeroDAVLimitAsUnlimited(t *testing.T) {
 		"APP_DAV_MAX_FILTER_ELEMENTS":         func(c *Config) int { return c.DAV.MaxFilterElements },
 		"APP_DAV_MAX_CARDDAV_QUERY_BYTES":     func(c *Config) int { return c.DAV.MaxCardDAVQueryBytes },
 		"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES": func(c *Config) int { return c.DAV.MaxAddressDataProperties },
+		"APP_DAV_MAX_REQUESTED_PROPERTIES":    func(c *Config) int { return c.DAV.MaxRequestedProperties },
 		"APP_DAV_MAX_REPORT_ELEMENT_DEPTH":    func(c *Config) int { return c.DAV.MaxReportElementDepth },
 		"APP_DAV_MAX_MULTIGET_HREFS":          func(c *Config) int { return c.DAV.MaxMultigetHrefs },
 		"APP_DAV_MAX_REPORT_CANDIDATE_ROWS":   func(c *Config) int { return c.DAV.MaxReportCandidateRows },

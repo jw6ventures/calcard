@@ -23,14 +23,15 @@ import (
 // limitsTestServer builds a calendar collection of size events behind the given
 // limits, so a test can drive one REPORT against the whole handler path rather
 // than against a query helper in isolation.
-func limitsTestServer(t *testing.T, cfg *config.Config, events int) *DavServer {
+func limitsTestServer(t testing.TB, cfg *config.Config, events int) *DavServer {
 	t.Helper()
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: limitsFixtureModified}, Editor: true},
 		},
 	}
-	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event, events)}
+	tombstones := &fakeDeletedResourceRepo{}
+	eventRepo := &fakeEventRepo{events: make(map[string]*store.Event, events), tombstones: tombstones}
 	for id := int64(1); id <= int64(events); id++ {
 		uid := fmt.Sprintf("event-%d", id)
 		eventRepo.events["1:"+uid] = &store.Event{
@@ -47,7 +48,7 @@ func limitsTestServer(t *testing.T, cfg *config.Config, events int) *DavServer {
 	return NewDavServer(Options{Config: cfg, Store: &store.Store{
 		Calendars:        calRepo,
 		Events:           eventRepo,
-		DeletedResources: &fakeDeletedResourceRepo{},
+		DeletedResources: tombstones,
 	}})
 }
 
@@ -743,27 +744,6 @@ func TestCalendarPropfindUsesKeysetPageAndStopsAtOverflowSentinel(t *testing.T) 
 	}
 }
 
-// The candidate-row budget reaches sync-collection too, which lists a whole
-// collection on its initial sync. The answer differs from the one
-// calendar-query gives: RFC 6578 states no DAV:number-of-matches-within-limits
-// postcondition, so the refusal is the RFC 4918 capacity status rather than a
-// CalDAV condition borrowed from §7.8.
-func TestCalendarSyncCollectionOverTheCandidateRowLimitReturns507(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := limitsTestServer(t, cfg, 400)
-
-	rr := limitsReportRequest(t, h, `<?xml version="1.0" encoding="utf-8"?>
-<D:sync-collection xmlns:D="DAV:"><D:sync-token/><D:prop><D:getetag/></D:prop></D:sync-collection>`)
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
-		t.Fatalf("sync-collection answered a postcondition RFC 6578 does not give it: %s", rr.Body.String())
-	}
-}
-
 func TestCalendarSyncCollectionAtTheCandidateRowLimitIsAnswered(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.DAV.MaxReportCandidateRows = 256
@@ -777,59 +757,12 @@ func TestCalendarSyncCollectionAtTheCandidateRowLimitIsAnswered(t *testing.T) {
 	}
 }
 
-func TestAddressBookSyncCollectionOverTheCandidateRowLimitReturns507(t *testing.T) {
-	contacts := map[string]*store.Contact{}
-	for i := 1; i <= 400; i++ {
-		uid := fmt.Sprintf("contact-%d", i)
-		contacts["5:"+uid] = &store.Contact{
-			ID: int64(i), AddressBookID: 5, UID: uid, ResourceName: uid, ETag: "e",
-			RawVCard: buildVCard("3.0", "UID:"+uid, "FN:"+uid),
-		}
-	}
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := NewDavServer(Options{Config: cfg, Store: &store.Store{
-		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{5: {ID: 5, UserID: 1, Name: "Contacts"}}},
-		Contacts:     &fakeContactRepo{contacts: contacts},
-	}})
-
-	req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(`<?xml version="1.0" encoding="utf-8"?>
-<D:sync-collection xmlns:D="DAV:"><D:sync-token/><D:prop><D:getetag/></D:prop></D:sync-collection>`))
-	req.Header.Set("Depth", "1")
-	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
-	rr := httptest.NewRecorder()
-	h.Report(rr, req)
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
-}
-
 // syncCollectionBody is the RFC 6578 §3.2 report body, carrying the client's
 // token so the server answers incrementally rather than with an initial sync.
 func syncCollectionBody(syncToken string) string {
 	return `<?xml version="1.0" encoding="utf-8"?>
 <D:sync-collection xmlns:D="DAV:"><D:sync-token>` + syncToken +
 		`</D:sync-token><D:prop><D:getetag/></D:prop></D:sync-collection>`
-}
-
-// An incremental sync narrows on the client's token, not the server's, so a
-// token from before the collection existed selects every row in it. It carries
-// the same row budget the initial sync does, and RFC 6578 gives it no
-// postcondition, so the answer is the RFC 4918 capacity status.
-func TestCalendarIncrementalSyncOverTheCandidateRowLimitReturns507(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := limitsTestServer(t, cfg, 400)
-
-	rr := limitsReportRequest(t, h, syncCollectionBody(buildSyncToken("cal", 1, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
-		t.Fatalf("sync-collection answered a postcondition RFC 6578 does not give it: %s", rr.Body.String())
-	}
 }
 
 func TestCalendarIncrementalSyncAtTheCandidateRowLimitIsAnswered(t *testing.T) {
@@ -860,10 +793,11 @@ func limitsAddressBookServer(cfg *config.Config, contacts int) *DavServer {
 			RawVCard:     buildVCard("3.0", "UID:"+uid, "FN:"+uid),
 		}
 	}
+	tombstones := &fakeDeletedResourceRepo{}
 	return NewDavServer(Options{Config: cfg, Store: &store.Store{
-		AddressBooks:     &fakeAddressBookRepo{books: map[int64]*store.AddressBook{5: {ID: 5, UserID: 1, Name: "Contacts"}}},
-		Contacts:         &fakeContactRepo{contacts: stored},
-		DeletedResources: &fakeDeletedResourceRepo{},
+		AddressBooks:     &fakeAddressBookRepo{books: map[int64]*store.AddressBook{5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: limitsFixtureModified}}},
+		Contacts:         &fakeContactRepo{contacts: stored, tombstones: tombstones},
+		DeletedResources: tombstones,
 	}})
 }
 
@@ -875,18 +809,6 @@ func limitsAddressBookReport(t *testing.T, h *DavServer, body string) *httptest.
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
 	return rr
-}
-
-func TestAddressBookIncrementalSyncOverTheCandidateRowLimitReturns507(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := limitsAddressBookServer(cfg, 400)
-
-	rr := limitsAddressBookReport(t, h, syncCollectionBody(buildSyncToken("card", 5, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
 }
 
 func TestAddressBookIncrementalSyncAtTheCandidateRowLimitIsAnswered(t *testing.T) {
@@ -1157,42 +1079,8 @@ func limitsTombstoneServer(t *testing.T, cfg *config.Config, events, tombstones 
 			DeletedAt:    limitsFixtureModified,
 		})
 	}
-	h.store.DeletedResources = &fakeDeletedResourceRepo{deleted: deleted}
+	h.store.DeletedResources.(*fakeDeletedResourceRepo).deleted = deleted
 	return h
-}
-
-// Nothing prunes the tombstone table, so the removals a sync token selects are
-// bounded only by this budget. RFC 6578 gives sync-collection no postcondition,
-// so an overflow answers the RFC 4918 capacity status.
-func TestCalendarSyncOverTheDeletedResourceRowLimitReturns507(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := limitsTombstoneServer(t, cfg, 10, 400)
-
-	rr := limitsReportRequest(t, h, syncCollectionBody(buildSyncToken("cal", 1, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
-		t.Fatalf("sync-collection answered a postcondition RFC 6578 does not give it: %s", rr.Body.String())
-	}
-}
-
-func TestCalendarSyncAtTheDeletedResourceRowLimitIsAnswered(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 256
-	h := limitsTombstoneServer(t, cfg, 10, 256)
-
-	rr := limitsReportRequest(t, h, syncCollectionBody(buildSyncToken("cal", 1, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
-	}
-	// The collection, its ten modified resources, and one removal per tombstone.
-	if ms := decodeMultistatus(t, rr); len(ms.Responses) != 267 {
-		t.Fatalf("responses = %d, want 267", len(ms.Responses))
-	}
 }
 
 // limitsTombstoneAddressBookServer is a small address book behind a large set
@@ -1210,42 +1098,8 @@ func limitsTombstoneAddressBookServer(cfg *config.Config, contacts, tombstones i
 			DeletedAt:    limitsFixtureModified,
 		})
 	}
-	h.store.DeletedResources = &fakeDeletedResourceRepo{deleted: deleted}
+	h.store.DeletedResources.(*fakeDeletedResourceRepo).deleted = deleted
 	return h
-}
-
-// An address book's tombstones are read under the same budget a calendar's are,
-// and RFC 6578 gives sync-collection no postcondition either way, so the answer
-// is the RFC 4918 capacity status.
-func TestAddressBookSyncOverTheDeletedResourceRowLimitReturns507(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 100
-	h := limitsTombstoneAddressBookServer(cfg, 10, 400)
-
-	rr := limitsAddressBookReport(t, h, syncCollectionBody(buildSyncToken("card", 5, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507; body: %s", rr.Code, rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
-		t.Fatalf("sync-collection answered a postcondition RFC 6578 does not give it: %s", rr.Body.String())
-	}
-}
-
-func TestAddressBookSyncAtTheDeletedResourceRowLimitIsAnswered(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.DAV.MaxReportCandidateRows = 256
-	h := limitsTombstoneAddressBookServer(cfg, 10, 256)
-
-	rr := limitsAddressBookReport(t, h, syncCollectionBody(buildSyncToken("card", 5, limitsFixtureModified.Add(-time.Hour))))
-
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("status = %d, want 207; body: %s", rr.Code, rr.Body.String())
-	}
-	// The collection, its ten modified resources, and one removal per tombstone.
-	if ms := decodeMultistatus(t, rr); len(ms.Responses) != 267 {
-		t.Fatalf("responses = %d, want 267", len(ms.Responses))
-	}
 }
 
 // Every bounded read reaches its repository through collectBoundedPages, so a
@@ -1329,13 +1183,13 @@ func TestReportReadFailureLogsItsCause(t *testing.T) {
 		{"calendar sync-collection", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
 			h := limitsTestServer(t, &config.Config{}, 1)
 			h.log = logging.New(recorder, logClass)
-			h.store.Events.(*fakeEventRepo).listPageErr = cause
+			h.store.Events.(*fakeEventRepo).listChangesErr = cause
 			return limitsReportRequest(t, h, syncCollectionBody(""))
 		}},
-		{"calendar sync-collection removals", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+		{"calendar sync-collection since a token", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
 			h := limitsTestServer(t, &config.Config{}, 1)
 			h.log = logging.New(recorder, logClass)
-			h.store.DeletedResources = &fakeDeletedResourceRepo{listErr: cause}
+			h.store.Events.(*fakeEventRepo).listChangesErr = cause
 			return limitsReportRequest(t, h, syncCollectionBody(since))
 		}},
 		{"addressbook-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
@@ -1359,13 +1213,13 @@ func TestReportReadFailureLogsItsCause(t *testing.T) {
 		{"address book sync-collection", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
 			h := limitsAddressBookServer(&config.Config{}, 1)
 			h.log = logging.New(recorder, logClass)
-			h.store.Contacts.(*fakeContactRepo).listPageErr = cause
+			h.store.Contacts.(*fakeContactRepo).listChangesErr = cause
 			return limitsAddressBookReport(t, h, syncCollectionBody(""))
 		}},
-		{"address book sync-collection removals", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
+		{"address book sync-collection since a token", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
 			h := limitsAddressBookServer(&config.Config{}, 1)
 			h.log = logging.New(recorder, logClass)
-			h.store.DeletedResources = &fakeDeletedResourceRepo{listErr: cause}
+			h.store.Contacts.(*fakeContactRepo).listChangesErr = cause
 			return limitsAddressBookReport(t, h, syncCollectionBody(cardSince))
 		}},
 		{"birthday calendar-query", func(t *testing.T, recorder *levelRecorder) *httptest.ResponseRecorder {
@@ -1402,29 +1256,25 @@ func TestReportReadFailureLogsItsCause(t *testing.T) {
 	}
 }
 
-// A collection larger than one keyset page has to arrive whole: every other
+// A collection larger than one keyset page has to be read whole: every other
 // case here stops on the first page, at or over its budget, which leaves the
-// resume between pages untested.
+// resume between pages untested. Free-busy is the report that drains a
+// collection through collectBoundedPages.
 func TestBoundedReadAccumulatesEveryKeysetPage(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.DAV.MaxReportCandidateRows = 50000
 	h := limitsTestServer(t, cfg, 600)
 
 	rr := limitsReportRequest(t, h, `<?xml version="1.0" encoding="utf-8"?>
-<D:sync-collection xmlns:D="DAV:"><D:sync-token/><D:prop><D:getetag/></D:prop></D:sync-collection>`)
+<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:time-range start="20230101T000000Z" end="20250101T000000Z"/>
+</C:free-busy-query>`)
 
-	ms := decodeMultistatus(t, rr)
-	// The collection response, then one per resource, each exactly once: a
-	// resume that repeated or skipped a page would show up as a duplicate or a
-	// missing href rather than as a count that happens to match.
-	hrefs := make(map[string]struct{}, len(ms.Responses))
-	for _, response := range ms.Responses {
-		for _, href := range response.Hrefs {
-			hrefs[href] = struct{}{}
-		}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
-	if len(ms.Responses) != 601 || len(hrefs) != 601 {
-		t.Fatalf("responses = %d over %d distinct hrefs, want 601 of each", len(ms.Responses), len(hrefs))
+	if !strings.Contains(rr.Body.String(), "20240101T000000Z/20240101T010000Z") {
+		t.Fatalf("free-busy = %s, want the fixture's busy hour", rr.Body.String())
 	}
 	// 600 rows is two full pages of multistatusPageSize and one short one, which
 	// is what ends the read.

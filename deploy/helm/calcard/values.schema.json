@@ -43,6 +43,7 @@
             "maxReportElementDepth": { "type": "integer", "minimum": 0 },
             "maxCardDAVQueryBytes": { "type": "integer", "minimum": 0 },
             "maxAddressDataProperties": { "type": "integer", "minimum": 0 },
+            "maxRequestedProperties": { "type": "integer", "minimum": 0 },
             "maxMultigetHrefs": { "type": "integer", "minimum": 0 },
             "maxReportCandidateRows": { "type": "integer", "minimum": 0 }
           }

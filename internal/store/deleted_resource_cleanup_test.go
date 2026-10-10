@@ -14,10 +14,6 @@ type recordingDeletedResourceRepo struct {
 	returnErr error
 }
 
-func (r *recordingDeletedResourceRepo) ListDeletedSincePageAfter(context.Context, string, int64, int64, time.Time, int) ([]DeletedResource, error) {
-	return nil, nil
-}
-
 func (r *recordingDeletedResourceRepo) DeleteByIdentity(context.Context, string, int64, string, string) error {
 	return nil
 }

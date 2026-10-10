@@ -42,11 +42,14 @@ const maxRecursiveGrammarDepth = 1000
 // where a legitimate body carries a handful of elements and each one multiplies
 // the collection scan. CardDAV filter and address-data subtrees also share a
 // byte budget, and address-data selectors have a count limit: their names and
-// text are work repeated per contact even when the filter itself is small.
+// text are work repeated per contact even when the filter itself is small. The
+// property selectors are bounded by the distinct names they request, each of
+// which is answered in every DAV:response.
 func (h *DavServer) checkReportBodyLimits(body []byte) *reportGrammarFault {
 	maxDepth := h.reportElementDepthLimit()
 	maxFilterElements := h.filterElementLimit()
 	maxQueryBytes, maxAddressProperties := h.cardDAVQueryLimits()
+	properties := requestedPropertyCounter{limit: h.requestedPropertyLimit()}
 
 	decoder := xml.NewDecoder(bytes.NewReader(body))
 	decoder.Entity = xml.HTMLEntity
@@ -70,6 +73,9 @@ func (h *DavServer) checkReportBodyLimits(body []byte) *reportGrammarFault {
 		switch token := token.(type) {
 		case xml.StartElement:
 			depth++
+			if properties.start(token, depth) {
+				return malformedReport("REPORT body requests more than the %d distinct properties this server answers", properties.limit)
+			}
 			if queryDepth == 0 && (token.Name == cardDAVQName("filter") || token.Name == cardDAVQName("address-data")) {
 				queryDepth = depth
 			}
@@ -105,6 +111,7 @@ func (h *DavServer) checkReportBodyLimits(body []byte) *reportGrammarFault {
 				filterDepth = 0
 				filterSpace = ""
 			}
+			properties.end(depth)
 			depth--
 		}
 		if queryDepth > 0 {

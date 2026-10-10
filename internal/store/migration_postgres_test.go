@@ -1280,7 +1280,10 @@ FROM pg_indexes
 WHERE schemaname = current_schema()
   AND indexname IN ('idx_events_recurrence_start', 'idx_events_recurrence_until',
                     'idx_events_calendar_keyset', 'idx_contacts_book_keyset',
-                    'idx_deleted_resources_keyset',
+                    'idx_deleted_resources_keyset', 'idx_deleted_resources_lookup',
+                    'idx_events_last_modified', 'idx_contacts_last_modified',
+                    'idx_events_change_stream', 'idx_contacts_change_stream',
+                    'idx_deleted_resources_change_stream',
                     'idx_events_calendar_id', 'idx_contacts_address_book_id')`)
 	if err != nil {
 		t.Fatalf("read index definitions: %v", err)
@@ -1301,13 +1304,13 @@ WHERE schemaname = current_schema()
 }
 
 // Both upgrade paths have to arrive at the indexes a fresh install creates: a
-// v1.1.9 database, which has none of the keyset indexes, and a database that ran
-// a v1.2.0 release candidate, which built the events and contacts keyset indexes
-// on (collection, id) alone.
+// v1.1.9 database, which has none of the keyset indexes and leads its stamp
+// indexes on the stamp alone, and a database that ran a v1.2.0 release
+// candidate, which built the keyset indexes on other columns.
 func TestPostgres_V120MigrationIndexesMatchBaselineSchema(t *testing.T) {
 	want := v120IndexDefinitions(t, newPostgresPool(t))
-	if len(want) != 5 {
-		t.Fatalf("db.sql carries %d of the migrated indexes, want 5: %v", len(want), want)
+	if len(want) != 7 {
+		t.Fatalf("db.sql carries %d of the migrated indexes, want 7: %v", len(want), want)
 	}
 
 	for _, test := range []struct {
@@ -1317,7 +1320,8 @@ func TestPostgres_V120MigrationIndexesMatchBaselineSchema(t *testing.T) {
 		{name: "from v1.1.9"},
 		{name: "from a release candidate", setup: `
 CREATE INDEX idx_events_calendar_keyset ON events (calendar_id, id);
-CREATE INDEX idx_contacts_book_keyset ON contacts (address_book_id, id);`},
+CREATE INDEX idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified);
+CREATE INDEX idx_deleted_resources_keyset ON deleted_resources (resource_type, collection_id, id);`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pool := newV119ReleasePool(t)

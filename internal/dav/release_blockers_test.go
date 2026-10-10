@@ -62,11 +62,11 @@ func TestReleaseBlockerCardSyncACLRevocation(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						responses, next, err := h.addressBookSyncCollection(req.Context(), guest, current, acl.PrincipalHref(guest.ID), root, reportRequest{SyncToken: token})
+						answer, err := h.addressBookSyncCollection(req.Context(), guest, current, acl.PrincipalHref(guest.ID), root, reportRequest{SyncToken: token})
 						if err != nil {
 							writeReportError(rr, err)
 						} else {
-							h.writeReportMultiStatus(rr, req, "sync-collection", responses, next)
+							h.writeReportAnswer(rr, req, "sync-collection", answer)
 						}
 					} else {
 						h.Report(rr, req)

@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -16,17 +15,17 @@ import (
 // targetResource is the resource name when the Request-URI is a calendar object
 // resource rather than the collection, which RFC 4791 §7 supports for
 // calendar-query and calendar-multiget; it is empty for a collection target.
-func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, responsePath, targetResource string, report reportRequest, request *http.Request) ([]response, string, error) {
+func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.User, cal *store.CalendarAccess, principalHref, responsePath, targetResource string, report reportRequest, request *http.Request) (reportAnswer, error) {
 	// RFC 4791 §7: a report whose Request-URI names a calendar object resource
 	// runs against that resource, so a URI naming none has nothing to report on.
 	// That is a request-level 404, not a 207 saying the resource matched nothing.
 	if targetResource != "" {
 		event, err := h.store.Events.GetByResourceName(ctx, cal.ID, targetResource)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to fetch event: %w", err)
+			return reportAnswer{}, fmt.Errorf("failed to fetch event: %w", err)
 		}
 		if event == nil {
-			return nil, "", store.ErrNotFound
+			return reportAnswer{}, store.ErrNotFound
 		}
 	}
 	// The §7.3 zone every floating value in this report resolves against, the
@@ -48,16 +47,16 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	switch report.XMLName.Local {
 	case "calendar-multiget":
 		res, err := h.calendarMultiGet(ctx, req, report.Hrefs)
-		return res, "", err
+		return reportAnswer{responses: res}, err
 	case "calendar-query":
 		res, err := h.calendarQuery(ctx, req, report.Filter)
-		return res, "", err
+		return reportAnswer{responses: res}, err
 	case "sync-collection":
 		return h.calendarSyncCollection(ctx, req, report)
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
 		// with a full dump of the collection.
-		return nil, "", errUnsupportedReport
+		return reportAnswer{}, errUnsupportedReport
 	}
 }
 
@@ -402,17 +401,6 @@ func (h *DavServer) listBoundedCalendarEvents(ctx context.Context, calendarID in
 		}, eventID)
 }
 
-// listBoundedModifiedCalendarEvents is the same read narrowed to the rows an
-// incremental sync reports on. The narrowing is the client's sync token rather
-// than the server's, so it bounds nothing on its own: a token from before the
-// collection existed selects every row in it.
-func (h *DavServer) listBoundedModifiedCalendarEvents(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
-	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
-		func(ctx context.Context, afterID int64) ([]store.Event, error) {
-			return h.store.Events.ListModifiedSincePageAfter(ctx, calendarID, afterID, since, multistatusPageSize)
-		}, eventID)
-}
-
 func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest, filter *calFilter) ([]response, error) {
 	if req.targetResource != "" {
 		return h.calendarObjectQuery(ctx, req, filter)
@@ -622,117 +610,92 @@ func calendarSegmentMatches(cal *store.CalendarAccess, segment string) bool {
 	return cal.Name == segment
 }
 
-func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarReportRequest, report reportRequest) ([]response, string, error) {
-	syncToken, _ := h.calendarSyncTokenValue(req.cal)
+func (h *DavServer) calendarSyncCollection(ctx context.Context, req calendarReportRequest, report reportRequest) (reportAnswer, error) {
+	position, err := parseStoredSyncPosition(report.SyncToken, "cal", req.cal.ID)
+	if err != nil {
+		return reportAnswer{}, err
+	}
+	if position.fresh {
+		position.anchor = req.cal.UpdatedAt
+	}
+	if !h.syncTokenAnswerable(position.anchor, req.cal.UpdatedAt) {
+		return reportAnswer{}, errInvalidSyncToken
+	}
+	limit, err := h.syncPageLimit(report.SyncLimit)
+	if err != nil {
+		return reportAnswer{}, err
+	}
+	answer, err := h.fitSyncPage(limit, func(limit int) ([]response, string, error) {
+		return h.calendarSyncPage(ctx, req, report, position, limit)
+	})
+	if err != nil {
+		return reportAnswer{}, err
+	}
+	if !h.syncTokenAnswerable(position.anchor, req.cal.UpdatedAt) {
+		return reportAnswer{}, errInvalidSyncToken
+	}
+	return answer, nil
+}
+
+// calendarSyncPage reports up to limit changes of the calendar's change stream
+// after position. A page that leaves changes unreported is truncated under RFC
+// 6578 §3.6, with a token resuming after its last change; one that reaches the
+// end of the stream carries the collection's own token.
+func (h *DavServer) calendarSyncPage(ctx context.Context, req calendarReportRequest, report reportRequest, position syncPosition, limit int) ([]response, string, error) {
+	page, err := h.store.Events.ListChangesAfter(ctx, req.cal.ID, position.after, !position.fresh, limit)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list changes: %w", err)
+	}
+	readable, err := h.filterReadableCalendarEvents(ctx, req.user, req.cal, page.Members)
+	if err != nil {
+		return nil, "", err
+	}
+
 	collectionHref := strings.TrimSuffix(req.collectionPath, "/") + "/"
-
-	var since time.Time
-	if report.SyncToken != "" {
-		info, err := parseSyncToken(report.SyncToken)
-		// A stored collection reports changes since an instant and never
-		// spells a whole-state token, so one carrying that segment was not
-		// issued for it.
-		if err != nil || info.Kind != "cal" || info.ID != req.cal.ID || info.State != "" {
-			return nil, "", errInvalidSyncToken
-		}
-		if !h.syncTokenAnswerable(info.Timestamp, req.cal.UpdatedAt) {
-			return nil, "", errInvalidSyncToken
-		}
-		since = info.Timestamp
+	syncToken, _ := h.calendarSyncTokenValue(req.cal)
+	responses := make([]response, 0, len(page.Members)+len(page.Removals)+1)
+	if !page.More {
+		responses = append(responses, calendarCollectionResponseWithPrivileges(collectionHref, req.cal.Name, req.cal.Calendar, req.principalHref, syncToken, strconv.FormatInt(req.cal.CTag, 10), req.cal.EffectivePrivileges()))
 	}
-
-	var events []store.Event
-	var err error
-	if since.IsZero() {
-		events, err = h.listBoundedCalendarEvents(ctx, req.cal.ID, store.EventFilter{})
-	} else {
-		events, err = h.listBoundedModifiedCalendarEvents(ctx, req.cal.ID, since)
-	}
-	if err != nil {
-		if errors.Is(err, errTooManyCandidateRows) {
-			return nil, "", err
-		}
-		return nil, "", fmt.Errorf("failed to list events: %w", err)
-	}
-	allEvents := events
-	events, err = h.filterReadableCalendarEvents(ctx, req.user, req.cal, events)
+	resourceResponses, err := rawCalendarResourceReportResponsesLimit(ctx, collectionHref, readable, req.projection, len(readable))
 	if err != nil {
 		return nil, "", err
 	}
+	responses = append(responses, resourceResponses...)
 
-	responses := []response{
-		calendarCollectionResponseWithPrivileges(collectionHref, req.cal.Name, req.cal.Calendar, req.principalHref, syncToken, strconv.FormatInt(req.cal.CTag, 10), req.cal.EffectivePrivileges()),
+	// A member the requester can no longer read is reported removed, so a
+	// client that holds it drops it. A first page reports no removals: the
+	// client holds nothing yet.
+	removed := make(map[string]struct{}, len(page.Removals))
+	report404 := func(href string) {
+		if _, ok := removed[href]; ok {
+			return
+		}
+		removed[href] = struct{}{}
+		responses = append(responses, deletedResponse(href))
 	}
-	resourceResponses, err := rawCalendarResourceReportResponsesLimit(ctx, collectionHref, events, req.projection, h.multistatusBuildLimit()-len(responses))
-	if err != nil {
-		return nil, "", err
+	if !position.fresh && len(readable) != len(page.Members) {
+		visible := make(map[int64]struct{}, len(readable))
+		for _, event := range readable {
+			visible[event.ID] = struct{}{}
+		}
+		for _, event := range page.Members {
+			if _, ok := visible[event.ID]; !ok {
+				report404(calendarObjectHref(collectionHref, eventResourceName(event)))
+			}
+		}
 	}
-	responses = h.appendMultistatusResponses(responses, resourceResponses)
-
-	// Include deleted resources if this is an incremental sync
-	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
-		// A resource name freed by a deletion can be bound again, which leaves
-		// a tombstone naming an href the collection now holds. RFC 6578 §3.2
-		// fixes no order over the DAV:response elements, so reporting both the
-		// addition and the removal lets a client apply them in either order and
-		// lose the resource; seeding the reported-removed set with the live
-		// hrefs makes the stored event the authority over its own href.
-		deletedHrefs := make(map[string]struct{}, len(events))
-		visible := make(map[string]struct{}, len(events))
-		for _, event := range events {
-			resourceName := eventResourceName(event)
-			visible[resourceName] = struct{}{}
-			deletedHrefs[calendarObjectHref(collectionHref, resourceName)] = struct{}{}
-		}
-		for _, event := range allEvents {
-			if h.multistatusBuildComplete(responses) {
-				break
-			}
-			if !event.LastModified.After(since) {
-				continue
-			}
-			resourceName := eventResourceName(event)
-			if _, ok := visible[resourceName]; ok {
-				continue
-			}
-			href := calendarObjectHref(collectionHref, resourceName)
-			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
-			deletedHrefs[href] = struct{}{}
-		}
-		if h.multistatusBuildComplete(responses) {
-			responses, err = h.finishCalendarReportResponses(ctx, req.user, responses, propertySelector{Prop: report.Prop}, req.projection.requested())
-			return responses, syncToken, err
-		}
-		deleted, err := h.listBoundedDeletedResources(ctx, "event", req.cal.ID, since)
-		if err != nil {
-			if errors.Is(err, errTooManyCandidateRows) {
-				return nil, "", err
-			}
-			return nil, "", fmt.Errorf("failed to list deleted events: %w", err)
-		}
-		for _, d := range deleted {
-			if h.multistatusBuildComplete(responses) {
-				break
-			}
-			resourceName := d.ResourceName
-			if resourceName == "" {
-				resourceName = d.UID
-			}
-			href := calendarObjectHref(collectionHref, resourceName)
-			if _, ok := deletedHrefs[href]; ok {
-				continue
-			}
-			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
-			deletedHrefs[href] = struct{}{}
-		}
+	for _, tombstone := range page.Removals {
+		report404(calendarObjectHref(collectionHref, deletedResourceName(tombstone)))
 	}
 
 	responses, err = h.finishCalendarReportResponses(ctx, req.user, responses, propertySelector{Prop: report.Prop}, req.projection.requested())
 	if err != nil {
 		return nil, "", err
 	}
-	if !h.syncTokenAnswerable(since, req.cal.UpdatedAt) {
-		return nil, "", errInvalidSyncToken
+	if page.More {
+		responses = append(responses, syncTruncationMarker(collectionHref))
+		syncToken = buildSyncPageToken("cal", req.cal.ID, position, page.Last)
 	}
 	return responses, syncToken, nil
 }

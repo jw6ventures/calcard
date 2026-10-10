@@ -703,26 +703,6 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("GetByResourceName() = %#v, want nil", resource)
 	}
 
-	since := now.Add(-time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4`)).
-		WithArgs(int64(7), int64(1), since, 256).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, nil, nil, true, now))
-	modified, err := eventRepo.ListModifiedSincePageAfter(context.Background(), 7, 1, since, 256)
-	if err != nil {
-		t.Fatalf("ListModifiedSincePageAfter() error = %v", err)
-	}
-	if len(modified) != 1 || !modified[0].AllDay {
-		t.Fatalf("ListModifiedSincePageAfter() = %#v", modified)
-	}
-	empty, err := eventRepo.ListModifiedSincePageAfter(context.Background(), 7, 1, since, 0)
-	if err != nil {
-		t.Fatalf("ListModifiedSincePageAfter(limit 0) error = %v", err)
-	}
-	if len(empty) != 0 {
-		t.Fatalf("ListModifiedSincePageAfter(limit 0) = %#v", empty)
-	}
-
 	// The unfiltered calendar page is the read idx_events_calendar_keyset
 	// exists for, and it is the one statement assembled through a builder
 	// rather than written as a literal -- so the assembled text is what has to
@@ -1731,7 +1711,6 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	repo := &contactRepo{pool: db}
 	now := time.Now().UTC()
 	birthday := time.Date(1985, 7, 20, 0, 0, 0, 0, time.UTC)
-	since := now.Add(-2 * time.Hour)
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`)).
 		WithArgs(int64(5), sqlmock.AnyArg()).
@@ -1770,18 +1749,6 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	}
 	if page.TotalCount != 1 || len(page.Items) != 1 || page.Items[0].DisplayName == nil || *page.Items[0].DisplayName != "Alex" {
 		t.Fatalf("ListForBookPaginated() = %#v", page)
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4`)).
-		WithArgs(int64(5), int64(0), since, 256).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(4), int64(5), "uid-4", "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
-	modified, err := repo.ListModifiedSincePageAfter(context.Background(), 5, 0, since, 256)
-	if err != nil {
-		t.Fatalf("ListModifiedSincePageAfter() error = %v", err)
-	}
-	if len(modified) != 1 || modified[0].PrimaryEmail == nil || *modified[0].PrimaryEmail != "chris@example.com" {
-		t.Fatalf("ListModifiedSincePageAfter() = %#v", modified)
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
@@ -2772,10 +2739,10 @@ func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
 // removing the equality as redundant would turn a paged read into a cross-
 // collection one.
 func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
-	eventsIndex := "idx_events_calendar_keyset ON events (\n    calendar_id, id, last_modified,\n" +
+	eventsIndex := "idx_events_calendar_keyset ON events (\n    calendar_id, id,\n" +
 		"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
 		"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz))"
-	contactsIndex := "idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified)"
+	contactsIndex := "idx_contacts_book_keyset ON contacts (address_book_id, id)"
 
 	sources := map[string][]string{
 		"../../migrations/v1.2.0.sql": {
@@ -2783,27 +2750,37 @@ func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
 			contactsIndex,
 			"DROP INDEX IF EXISTS idx_events_calendar_keyset",
 			"DROP INDEX IF EXISTS idx_contacts_book_keyset",
-			"CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset\n    ON deleted_resources (resource_type, collection_id, id)",
+			"CREATE INDEX IF NOT EXISTS idx_events_change_stream ON events (calendar_id, last_modified, id)",
+			"CREATE INDEX IF NOT EXISTS idx_contacts_change_stream ON contacts (address_book_id, last_modified, id)",
+			"CREATE INDEX IF NOT EXISTS idx_deleted_resources_change_stream\n    ON deleted_resources (resource_type, collection_id, deleted_at, id)",
+			"DROP INDEX IF EXISTS idx_events_last_modified",
+			"DROP INDEX IF EXISTS idx_contacts_last_modified",
+			"DROP INDEX IF EXISTS idx_deleted_resources_lookup",
+			"DROP INDEX IF EXISTS idx_deleted_resources_keyset",
 			"DROP INDEX IF EXISTS idx_events_calendar_id",
 			"DROP INDEX IF EXISTS idx_contacts_address_book_id",
 			"UPDATE application SET value = 'v1.2.0'",
 		},
 		"../../db.sql": {
-			"CREATE INDEX idx_events_calendar_keyset ON events(\n    calendar_id, id, last_modified,\n" +
+			"CREATE INDEX idx_events_calendar_keyset ON events(\n    calendar_id, id,\n" +
 				"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
 				"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));",
-			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id, last_modified);",
-			"CREATE INDEX idx_deleted_resources_keyset ON deleted_resources(resource_type, collection_id, id);",
+			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);",
+			"CREATE INDEX idx_events_change_stream ON events(calendar_id, last_modified, id);",
+			"CREATE INDEX idx_contacts_change_stream ON contacts(address_book_id, last_modified, id);",
+			"CREATE INDEX idx_deleted_resources_change_stream ON deleted_resources(resource_type, collection_id, deleted_at, id);",
 			baselineSchemaVersionRow,
 		},
 		"postgres.go": {
-			"FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND last_modified > $3 ORDER BY calendar_id ASC, id ASC LIMIT $4",
-			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) AND last_modified > $3 ORDER BY address_book_id ASC, id ASC LIMIT $4",
 			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) ORDER BY address_book_id ASC, id ASC LIMIT $3",
-			// deleted_resources keeps the plain cursor: its lookup index leads on
-			// deleted_at, which is the more selective bound for every sync that
-			// reads it, and the row comparison does not improve on that plan.
-			"FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND id>$3 AND deleted_at > $4 ORDER BY id ASC LIMIT $5",
+		},
+		// The change-stream reads lead their row comparison and ORDER BY with
+		// the collection columns of the change-stream indexes, so the cursor is
+		// one index bound and the index provides the order.
+		"sync_changes.go": {
+			"FROM events WHERE calendar_id=$1 AND (calendar_id, last_modified, id) > ($1, $2, $3) ORDER BY calendar_id ASC, last_modified ASC, id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, last_modified, id) > ($1, $2, $3) ORDER BY address_book_id ASC, last_modified ASC, id ASC LIMIT $4",
+			"FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND (resource_type, collection_id, deleted_at, id) > ($1, $2, $3, $4) ORDER BY resource_type ASC, collection_id ASC, deleted_at ASC, id ASC LIMIT $5",
 		},
 	}
 	for path, expected := range sources {

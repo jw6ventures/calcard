@@ -75,6 +75,12 @@ type Config struct {
 		// address-data metadata evaluated for each contact in a REPORT.
 		MaxCardDAVQueryBytes     int
 		MaxAddressDataProperties int
+		// MaxRequestedProperties bounds how many distinct property names one
+		// PROPFIND or REPORT may request through its DAV:prop selectors or, for
+		// DAV:expand-property, its DAV:property elements. Every name is answered
+		// in every DAV:response, so the list multiplies the work and the
+		// multistatus by the number of resources the request reaches.
+		MaxRequestedProperties int
 		// MaxReportElementDepth bounds the nesting of the recursive REPORT
 		// grammar elements, CALDAV:comp-filter and the CALDAV:comp of
 		// CALDAV:calendar-data. RFC 4791's own component tree reaches
@@ -199,6 +205,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.DAV.MaxAddressDataProperties, err = getenvLimitDefault("APP_DAV_MAX_ADDRESS_DATA_PROPERTIES", 100)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.MaxRequestedProperties, err = getenvLimitDefault("APP_DAV_MAX_REQUESTED_PROPERTIES", 1000)
 	if err != nil {
 		return nil, err
 	}

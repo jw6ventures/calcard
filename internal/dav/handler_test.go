@@ -391,7 +391,8 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
-	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses, token := answer.responses, answer.syncToken
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -416,6 +417,7 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 			{ID: 1, ResourceType: "event", CollectionID: 2, UID: "deleted-uid", ResourceName: "deleted-resource", DeletedAt: now},
 		},
 	}
+	repo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: deletedRepo}}
 
 	report := reportRequest{
@@ -423,7 +425,8 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, now.Add(-time.Hour)),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses := answer.responses
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -455,7 +458,7 @@ func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	_, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if !errors.Is(err, errInvalidSyncToken) {
 		t.Fatalf("expected errInvalidSyncToken, got %v", err)
 	}
@@ -943,7 +946,8 @@ func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "", report, nil)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "", report, nil)
+	responses := answer.responses
 	if !errors.Is(err, errUnsupportedReport) {
 		t.Fatalf("calendarReportResponses error = %v, want errUnsupportedReport", err)
 	}
@@ -963,7 +967,8 @@ func TestAddressBookReportUnknownTypeIsRefused(t *testing.T) {
 	book := &store.AddressBook{ID: 4, UserID: 1, Name: "Contacts"}
 	user := &store.User{ID: 1}
 
-	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/4/", nil))
+	answer, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/4/", nil))
+	responses := answer.responses
 	if !errors.Is(err, errUnsupportedReport) {
 		t.Fatalf("addressBookReportResponses error = %v, want errUnsupportedReport", err)
 	}
@@ -1921,6 +1926,7 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 5, UID: "gone", DeletedAt: now},
 		},
 	}
+	contacts.tombstones = deleted
 	h := &DavServer{store: &store.Store{Contacts: contacts, DeletedResources: deleted}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
@@ -1928,7 +1934,8 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 	}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Book", CTag: 1, UpdatedAt: now}
 	user := &store.User{ID: 1}
-	responses, token, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/5/", nil))
+	answer, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/5/", nil))
+	responses, token := answer.responses, answer.syncToken
 	if err != nil {
 		t.Fatalf("addressBookReportResponses returned error: %v", err)
 	}
@@ -1967,7 +1974,8 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 		SyncToken: buildSyncToken("cal", 2, then),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses := answer.responses
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -2465,6 +2473,7 @@ func TestReportCalendarSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "event", CollectionID: 2, UID: "gone", DeletedAt: now},
 		},
 	}
+	eventRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
@@ -2645,6 +2654,7 @@ func TestReportAddressBookSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "bob", DeletedAt: now},
 		},
 	}
+	contactRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
@@ -2677,6 +2687,7 @@ func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "gone-uid", ResourceName: "former", DeletedAt: now},
 		},
 	}
+	contactRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
@@ -2718,6 +2729,7 @@ func TestReportAddressBookSyncCollectionUsesCollectionACLAfterObjectDelete(t *te
 			{ResourcePath: "/dav/addressbooks/3/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
+	contactRepo.tombstones = deletedRepo
 	st := &store.Store{
 		AddressBooks:     bookRepo,
 		Contacts:         contactRepo,
@@ -4139,10 +4151,7 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE within same calendar to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSincePageAfter(req.Context(), "event", 2, 0, time.Time{}, multistatusPageSize)
-	if err != nil {
-		t.Fatalf("ListDeletedSincePageAfter() error = %v", err)
-	}
+	tombstones := deletedRepo.collectionTombstones("event", 2)
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
 			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
@@ -6865,6 +6874,7 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 		},
 		overwriteMoveDeletedRepo: deletedRepo,
 	}
+	contactRepo.tombstones = deletedRepo
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
@@ -6876,10 +6886,7 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSincePageAfter(req.Context(), "contact", 6, 0, time.Time{}, multistatusPageSize)
-	if err != nil {
-		t.Fatalf("ListDeletedSincePageAfter() error = %v", err)
-	}
+	tombstones := deletedRepo.collectionTombstones("contact", 6)
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
 			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
@@ -8031,6 +8038,11 @@ type fakeEventRepo struct {
 	// listByResourceNamesErr fails every ListByResourceNames call when set.
 	listByResourceNamesErr   error
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
+	// tombstones holds the removals ListChangesAfter merges into the change
+	// stream, as the store reads deleted_resources beside the member rows.
+	tombstones *fakeDeletedResourceRepo
+	// listChangesErr fails every ListChangesAfter call when set.
+	listChangesErr error
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -8267,18 +8279,21 @@ func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids [
 	return nil, nil
 }
 
-func (f *fakeEventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]store.Event, error) {
-	var result []store.Event
+func (f *fakeEventRepo) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	if f.listChangesErr != nil {
+		return store.SyncChanges[store.Event]{}, f.listChangesErr
+	}
+	var members []store.Event
 	for _, ev := range f.events {
-		if ev.CalendarID != calendarID {
-			continue
-		}
-		if ev.LastModified.After(since) {
-			copy := *ev
-			result = append(result, copy)
+		if ev.CalendarID == calendarID {
+			members = append(members, *ev)
 		}
 	}
-	return pageByID(result, func(ev store.Event) int64 { return ev.ID }, afterID, limit), nil
+	var tombstones []store.DeletedResource
+	if removals {
+		tombstones = f.tombstones.collectionTombstones("event", calendarID)
+	}
+	return fakeChangesAfter(members, func(ev store.Event) time.Time { return ev.LastModified }, func(ev store.Event) int64 { return ev.ID }, eventResourceName, tombstones, after, limit), nil
 }
 
 func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -8453,8 +8468,8 @@ func (e *errorEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids 
 	return nil, errors.New("fail")
 }
 
-func (e *errorEventRepo) ListModifiedSincePageAfter(ctx context.Context, calendarID, afterID int64, since time.Time, limit int) ([]store.Event, error) {
-	return nil, errors.New("fail")
+func (e *errorEventRepo) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	return store.SyncChanges[store.Event]{}, errors.New("fail")
 }
 
 func (e *errorEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -8475,6 +8490,11 @@ func (e *errorEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toC
 
 type fakeContactRepo struct {
 	contacts map[string]*store.Contact
+	// tombstones holds the removals ListChangesAfter merges into the change
+	// stream, as the store reads deleted_resources beside the member rows.
+	tombstones *fakeDeletedResourceRepo
+	// listChangesErr fails every ListChangesAfter call when set.
+	listChangesErr error
 	// listPageErr fails every ListForBookPageAfter call when set.
 	listPageErr error
 	// listByResourceNamesErr fails every ListByResourceNames call when set.
@@ -8575,18 +8595,21 @@ func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, u
 	return result, nil
 }
 
-func (f *fakeContactRepo) ListModifiedSincePageAfter(ctx context.Context, addressBookID, afterID int64, since time.Time, limit int) ([]store.Contact, error) {
-	var result []store.Contact
+func (f *fakeContactRepo) ListChangesAfter(ctx context.Context, addressBookID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	if f.listChangesErr != nil {
+		return store.SyncChanges[store.Contact]{}, f.listChangesErr
+	}
+	var members []store.Contact
 	for _, c := range f.contacts {
-		if c.AddressBookID != addressBookID {
-			continue
-		}
-		if c.LastModified.After(since) {
-			copy := *c
-			result = append(result, copy)
+		if c.AddressBookID == addressBookID {
+			members = append(members, *c)
 		}
 	}
-	return pageByID(result, func(c store.Contact) int64 { return c.ID }, afterID, limit), nil
+	var tombstones []store.DeletedResource
+	if removals {
+		tombstones = f.tombstones.collectionTombstones("contact", addressBookID)
+	}
+	return fakeChangesAfter(members, func(c store.Contact) time.Time { return c.LastModified }, func(c store.Contact) int64 { return c.ID }, contactResourceName, tombstones, after, limit), nil
 }
 
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
@@ -8620,22 +8643,6 @@ func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, user
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	return truncateToLimit(all, limit), nil
-}
-
-// pageByID mirrors the keyset page a repository returns: the rows after
-// afterID in id order, truncated to limit. A row carrying no id is admitted on
-// the first page only, which is what ListForCalendarPageAfter above does -- a
-// fixture that leaves the column unset would otherwise be invisible to every
-// paged read.
-func pageByID[T any](rows []T, id func(T) int64, afterID int64, limit int) []T {
-	var result []T
-	for _, row := range rows {
-		if id(row) > afterID || (afterID == 0 && id(row) == 0) {
-			result = append(result, row)
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return id(result[i]) < id(result[j]) })
-	return truncateToLimit(result, limit)
 }
 
 // truncateToLimit mirrors what every paged repository in internal/store does
@@ -9123,21 +9130,81 @@ func (f *fakeAddressBookRepo) Delete(ctx context.Context, userID, id int64) erro
 
 type fakeDeletedResourceRepo struct {
 	deleted []store.DeletedResource
-	// listErr fails every ListDeletedSincePageAfter call when set.
-	listErr error
 }
 
-func (f *fakeDeletedResourceRepo) ListDeletedSincePageAfter(ctx context.Context, resourceType string, collectionID, afterID int64, since time.Time, limit int) ([]store.DeletedResource, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
+// collectionTombstones is every tombstone of one collection. A nil repository
+// holds none.
+func (f *fakeDeletedResourceRepo) collectionTombstones(resourceType string, collectionID int64) []store.DeletedResource {
+	if f == nil {
+		return nil
 	}
 	var result []store.DeletedResource
 	for _, d := range f.deleted {
-		if d.ResourceType == resourceType && d.CollectionID == collectionID && d.DeletedAt.After(since) {
+		if d.ResourceType == resourceType && d.CollectionID == collectionID {
 			result = append(result, d)
 		}
 	}
-	return pageByID(result, func(d store.DeletedResource) int64 { return d.ID }, afterID, limit), nil
+	return result
+}
+
+// fakeChangesAfter pages members and tombstones the way the store's change
+// stream does: members by (stamp, id), tombstones by (deleted_at, id), a
+// member before a tombstone of the same instant, and a tombstone whose name a
+// member holds left out of Removals while still counting toward the page.
+func fakeChangesAfter[T any](members []T, stamp func(T) time.Time, id func(T) int64, name func(T) string, tombstones []store.DeletedResource, after store.SyncCursor, limit int) store.SyncChanges[T] {
+	page := store.SyncChanges[T]{Last: after}
+	if limit <= 0 {
+		return page
+	}
+	type change struct {
+		at        store.SyncCursor
+		member    *T
+		tombstone *store.DeletedResource
+	}
+	// The store's zero cursor precedes every row, whose ids and stamps are
+	// never zero; fixtures here leave both unset.
+	first := after == store.SyncCursor{}
+	held := make(map[string]struct{}, len(members))
+	var changes []change
+	for i := range members {
+		held[name(members[i])] = struct{}{}
+		at := store.SyncCursor{Stamp: stamp(members[i]), ID: id(members[i])}
+		if first || syncCursorBefore(after, at) {
+			changes = append(changes, change{at: at, member: &members[i]})
+		}
+	}
+	for i := range tombstones {
+		at := store.SyncCursor{Stamp: tombstones[i].DeletedAt, Removal: true, ID: tombstones[i].ID}
+		if first || syncCursorBefore(after, at) {
+			changes = append(changes, change{at: at, tombstone: &tombstones[i]})
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool { return syncCursorBefore(changes[i].at, changes[j].at) })
+	if len(changes) > limit {
+		changes, page.More = changes[:limit], true
+	}
+	for _, c := range changes {
+		page.Last = c.at
+		if c.member != nil {
+			page.Members = append(page.Members, *c.member)
+			continue
+		}
+		if _, ok := held[deletedResourceName(*c.tombstone)]; !ok {
+			page.Removals = append(page.Removals, *c.tombstone)
+		}
+	}
+	return page
+}
+
+// syncCursorBefore orders two positions of a change stream.
+func syncCursorBefore(a, b store.SyncCursor) bool {
+	if !a.Stamp.Equal(b.Stamp) {
+		return a.Stamp.Before(b.Stamp)
+	}
+	if a.Removal != b.Removal {
+		return !a.Removal
+	}
+	return a.ID < b.ID
 }
 
 func (f *fakeDeletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {

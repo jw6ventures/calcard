@@ -2,50 +2,29 @@ package dav
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// listBoundedAddressBookContacts reads an address book in keyset pages rather
-// than whole, on the same terms listBoundedCalendarEvents reads a calendar.
-func (h *DavServer) listBoundedAddressBookContacts(ctx context.Context, bookID int64) ([]store.Contact, error) {
-	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
-		func(ctx context.Context, afterID int64) ([]store.Contact, error) {
-			return h.store.Contacts.ListForBookPageAfter(ctx, bookID, afterID, multistatusPageSize)
-		}, contactID)
-}
-
-// listBoundedModifiedAddressBookContacts is that read narrowed to the rows an
-// incremental sync reports on, which the client's sync token decides and so
-// bounds nothing on its own.
-func (h *DavServer) listBoundedModifiedAddressBookContacts(ctx context.Context, bookID int64, since time.Time) ([]store.Contact, error) {
-	return collectBoundedPages(ctx, h.reportCandidateRowLimit(),
-		func(ctx context.Context, afterID int64) ([]store.Contact, error) {
-			return h.store.Contacts.ListModifiedSincePageAfter(ctx, bookID, afterID, since, multistatusPageSize)
-		}, contactID)
-}
-
-func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, request *http.Request) ([]response, string, error) {
+func (h *DavServer) addressBookReportResponses(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, request *http.Request) (reportAnswer, error) {
 	addressDataReq := reportAddressData(report)
 	switch report.XMLName.Local {
 	case "addressbook-multiget":
 		res, err := h.addressBookMultiGetReport(ctx, user, book, report.Hrefs, cleanPath, report.Prop, addressDataReq, request)
-		return res, "", err
+		return reportAnswer{responses: res}, err
 	case "addressbook-query":
 		res, err := h.addressBookQuery(ctx, user, book, cleanPath, report.CardFilter, report.Prop, addressDataReq, report.Limit)
-		return res, "", err
+		return reportAnswer{responses: res}, err
 	case "sync-collection":
 		return h.addressBookSyncCollection(ctx, user, book, principalHref, cleanPath, report)
 	default:
 		// RFC 3253 §3.6: unknown report types must be refused, not answered
 		// with a full dump of the collection.
-		return nil, "", errUnsupportedReport
+		return reportAnswer{}, errUnsupportedReport
 	}
 }
 
@@ -287,106 +266,94 @@ func (h *DavServer) addressBookMultiGetReport(ctx context.Context, user *store.U
 	return h.finishReportResponses(ctx, user, responses, propertySelector{Prop: reqProp}, false, addressDataReq)
 }
 
-func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) ([]response, string, error) {
-	syncToken, _ := h.addressBookSyncTokenValue(book)
-	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
-
-	var since time.Time
-	if report.SyncToken != "" {
-		info, err := parseSyncToken(report.SyncToken)
-		// A stored collection reports changes since an instant and never
-		// spells a whole-state token, so one carrying that segment was not
-		// issued for it.
-		if err != nil || info.Kind != "card" || info.ID != book.ID || info.State != "" {
-			return nil, "", errInvalidSyncToken
-		}
-		if !h.syncTokenAnswerable(info.Timestamp, book.UpdatedAt) {
-			return nil, "", errInvalidSyncToken
-		}
-		since = info.Timestamp
-	}
-
-	var contacts []store.Contact
-	var err error
-	if since.IsZero() {
-		contacts, err = h.listBoundedAddressBookContacts(ctx, book.ID)
-	} else {
-		contacts, err = h.listBoundedModifiedAddressBookContacts(ctx, book.ID, since)
-	}
+func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest) (reportAnswer, error) {
+	position, err := parseStoredSyncPosition(report.SyncToken, "card", book.ID)
 	if err != nil {
-		if errors.Is(err, errTooManyCandidateRows) {
-			return nil, "", err
-		}
-		return nil, "", fmt.Errorf("failed to list contacts: %w", err)
+		return reportAnswer{}, err
 	}
-	candidateCount := len(contacts)
-	contacts, err = h.filterReadableAddressBookContacts(ctx, user, book, contacts)
+	if position.fresh {
+		position.anchor = book.UpdatedAt
+	}
+	if !h.syncTokenAnswerable(position.anchor, book.UpdatedAt) {
+		return reportAnswer{}, errInvalidSyncToken
+	}
+	limit, err := h.syncPageLimit(report.SyncLimit)
+	if err != nil {
+		return reportAnswer{}, err
+	}
+	answer, err := h.fitSyncPage(limit, func(limit int) ([]response, string, error) {
+		return h.addressBookSyncPage(ctx, user, book, principalHref, cleanPath, report, position, limit)
+	})
+	if err != nil {
+		return reportAnswer{}, err
+	}
+	if !h.syncTokenAnswerable(position.anchor, book.UpdatedAt) {
+		return reportAnswer{}, errInvalidSyncToken
+	}
+	return answer, nil
+}
+
+// addressBookSyncPage reports up to limit changes of the address book's change
+// stream after position, on the terms calendarSyncPage reports a calendar's.
+//
+// A contact the requester cannot read is never named, not even as removed:
+// reporting the change since a client's token refuses the token instead, and
+// the client's full resynchronization reconciles what it lost. A listing
+// leaves such contacts out, as its first page does, since a refusal there
+// would restart a listing that reaches the same contact again.
+func (h *DavServer) addressBookSyncPage(ctx context.Context, user *store.User, book *store.AddressBook, principalHref, cleanPath string, report reportRequest, position syncPosition, limit int) ([]response, string, error) {
+	page, err := h.store.Contacts.ListChangesAfter(ctx, book.ID, position.after, !position.fresh, limit)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list contact changes: %w", err)
+	}
+	contacts, err := h.filterReadableAddressBookContacts(ctx, user, book, page.Members)
 	if err != nil {
 		return nil, "", err
 	}
-
-	// Reconcile lost visibility without disclosing names the requester cannot read.
-	if !since.IsZero() && len(contacts) != candidateCount {
+	if !position.listing && len(contacts) != len(page.Members) {
 		return nil, "", errInvalidSyncToken
 	}
 
-	responses := []response{
-		addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, strconv.FormatInt(book.CTag, 10)),
+	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
+	syncToken, _ := h.addressBookSyncTokenValue(book)
+	responses := make([]response, 0, len(contacts)+len(page.Removals)+1)
+	if !page.More {
+		responses = append(responses, addressBookCollectionResponse(collectionHref, book.Name, book.Description, principalHref, syncToken, strconv.FormatInt(book.CTag, 10)))
 	}
 	addressDataReq := reportAddressData(report)
-	// A resource name freed by a deletion can be bound again, which leaves a
-	// tombstone naming an href the collection now holds. RFC 6578 §3.2 fixes no
-	// order over the DAV:response elements, so reporting both the addition and
-	// the removal lets a client apply them in either order and lose the
-	// resource; the stored contact is the authority over its own href.
-	liveHrefs := make(map[string]struct{}, len(contacts))
 	for _, contact := range contacts {
-		if h.multistatusBuildComplete(responses) {
-			break
-		}
 		href := addressObjectHref(collectionHref, contactResourceName(contact))
-		liveHrefs[href] = struct{}{}
 		resp, err := h.buildAddressObjectReportResponse(href, contact, report.Prop, addressDataReq)
 		if err != nil {
 			return nil, "", err
 		}
-		responses = h.appendMultistatusResponses(responses, []response{resp})
+		responses = append(responses, resp)
 	}
 
-	// Include deleted resources if this is an incremental sync
-	if !since.IsZero() && !h.multistatusBuildComplete(responses) {
-		deleted, err := h.listBoundedDeletedResources(ctx, "contact", book.ID, since)
-		if err != nil {
-			if errors.Is(err, errTooManyCandidateRows) {
-				return nil, "", err
-			}
-			return nil, "", fmt.Errorf("failed to list deleted contacts: %w", err)
+	if len(page.Removals) > 0 {
+		names := make([]string, len(page.Removals))
+		for i, tombstone := range page.Removals {
+			names[i] = deletedResourceName(tombstone)
 		}
-		deletedNames := make([]string, 0, len(deleted))
-		for _, d := range deleted {
-			resourceName := d.ResourceName
-			if resourceName == "" {
-				resourceName = d.UID
-			}
-			deletedNames = append(deletedNames, resourceName)
-		}
-		entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, deletedNames)
+		entriesByPath, err := h.prefetchAddressBookACLEntries(ctx, user, book.ID, names)
 		if err != nil {
 			return nil, "", err
 		}
 		decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
-		for _, resourceName := range deletedNames {
-			if h.multistatusBuildComplete(responses) {
-				break
-			}
-			if !canReadAddressBookContactWithDecider(resourceName, decider) {
+		removed := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			if !canReadAddressBookContactWithDecider(name, decider) {
+				if position.listing {
+					continue
+				}
 				return nil, "", errInvalidSyncToken
 			}
-			href := addressObjectHref(collectionHref, resourceName)
-			if _, live := liveHrefs[href]; live {
+			href := addressObjectHref(collectionHref, name)
+			if _, ok := removed[href]; ok {
 				continue
 			}
-			responses = h.appendMultistatusResponses(responses, []response{deletedResponse(href)})
+			removed[href] = struct{}{}
+			responses = append(responses, deletedResponse(href))
 		}
 	}
 
@@ -394,8 +361,9 @@ func (h *DavServer) addressBookSyncCollection(ctx context.Context, user *store.U
 	if err != nil {
 		return nil, "", err
 	}
-	if !h.syncTokenAnswerable(since, book.UpdatedAt) {
-		return nil, "", errInvalidSyncToken
+	if page.More {
+		responses = append(responses, syncTruncationMarker(collectionHref))
+		syncToken = buildSyncPageToken("card", book.ID, position, page.Last)
 	}
 	return responses, syncToken, nil
 }

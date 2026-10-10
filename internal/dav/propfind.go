@@ -55,6 +55,11 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		if h.propfindBodyExceedsPropertyLimit(body) {
+			h.logger().Trace("Propfind", "rejected %s: requests more than %d distinct properties", r.URL.Path, h.requestedPropertyLimit())
+			http.Error(w, "PROPFIND requests too many properties", http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err := safeUnmarshalXML(body, &propfindReq); err != nil {
 			// RFC 4918 §9.1: a request body that is not valid XML is a 400,
 			// not an implicit allprop.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"slices"
 	"strconv"
 	"strings"
@@ -61,13 +62,59 @@ type propstat struct {
 	// PropNames renders the prop element as a list of empty property
 	// elements instead of Prop — used for 404 propstats and propname
 	// responses, where RFC 4918 requires names without values.
-	PropNames []xml.Name     `xml:"-"`
+	PropNames []xml.Name `xml:"-"`
+	// requested follows PropNames with the request-wide names a property
+	// filter answers here. It is a pointer so that a response answering none
+	// of them shares one value with every other such response, and so that
+	// propstat, which every response allocates, stays in its size class.
+	requested *requestedNames
 	Status    string         `xml:"d:status"`
 	Error     *propstatError `xml:"d:error,omitempty"`
 }
 
+// requestedNames is a request-wide list of property names less the entries
+// one response answers elsewhere. The list is shared by every response to the
+// request and never written through, so a response holds only its own skips
+// and its cost does not grow with the length of the request.
+type requestedNames struct {
+	all []xml.Name
+	// skip holds ascending indexes into all.
+	skip []int
+}
+
+func (n *requestedNames) len() int {
+	if n == nil {
+		return 0
+	}
+	return len(n.all) - len(n.skip)
+}
+
+// names yields the propstat's empty property elements in document order.
+func (p propstat) names() iter.Seq[xml.Name] {
+	return func(yield func(xml.Name) bool) {
+		for _, name := range p.PropNames {
+			if !yield(name) {
+				return
+			}
+		}
+		if p.requested == nil {
+			return
+		}
+		skip := p.requested.skip
+		for i, name := range p.requested.all {
+			if len(skip) > 0 && skip[0] == i {
+				skip = skip[1:]
+				continue
+			}
+			if !yield(name) {
+				return
+			}
+		}
+	}
+}
+
 func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	if len(p.PropNames) == 0 {
+	if len(p.PropNames) == 0 && p.requested.len() == 0 {
 		type propstatNoMarshal propstat
 		return e.EncodeElement(propstatNoMarshal(p), start)
 	}
@@ -78,7 +125,7 @@ func (p propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	if err := e.EncodeToken(propStart); err != nil {
 		return err
 	}
-	for _, name := range p.PropNames {
+	for name := range p.names() {
 		el := xml.StartElement{Name: wirePropertyName(name)}
 		if err := e.EncodeToken(el); err != nil {
 			return err
@@ -561,6 +608,8 @@ type reportRequest struct {
 	AddressData  *addressDataQuery `xml:"urn:ietf:params:xml:ns:carddav address-data"`
 	Prop         *reportProp       `xml:"DAV: prop"`
 	Limit        *addressbookLimit `xml:"urn:ietf:params:xml:ns:carddav limit"`
+	// SyncLimit is the RFC 6578 §3.7 DAV:limit a sync-collection may carry.
+	SyncLimit *syncCollectionLimit `xml:"DAV: limit"`
 
 	// selector and Timezone are filled by the RFC 4791 §9 grammar pass rather
 	// than by struct tags: the three property selectors are alternatives the
@@ -685,6 +734,8 @@ type propfindRequest struct {
 	expand    expandPropertyExpander
 	expandXML expandXMLPropertyExpander
 	expandErr error
+	// selection caches the request-wide half of the property filter.
+	selection *propfindSelection
 }
 
 // propfindPropQuery lists specific properties requested
@@ -1117,6 +1168,12 @@ type addressDataProp struct {
 
 type addressbookLimit struct {
 	NResults int `xml:"urn:ietf:params:xml:ns:carddav nresults"`
+}
+
+// syncCollectionLimit is the RFC 5323 §5.17 DAV:limit, which RFC 6578 §3.7
+// borrows to let a client cap how many changes one sync-collection reports.
+type syncCollectionLimit struct {
+	NResults int `xml:"DAV: nresults"`
 }
 
 type expandPropertyRequest struct {

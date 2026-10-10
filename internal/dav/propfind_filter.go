@@ -1,7 +1,9 @@
 package dav
 
 import (
+	"cmp"
 	"encoding/xml"
+	"slices"
 	"strings"
 )
 
@@ -462,6 +464,83 @@ func propfindKindOf(resp response) propfindResourceKind {
 	}
 }
 
+// propfindSelection is the part of the property filter that depends on the
+// request alone. A PROPFIND or REPORT asks the same question of every resource
+// it reaches, so this is derived once per request and shared by every
+// response, rather than rebuilt per response at a cost that would scale with
+// responses times requested names.
+type propfindSelection struct {
+	// specs are the requested rows of propfindPropertyTable, in table order.
+	specs []*propfindPropertySpec
+	// custom lists each requested name outside the table once, in the order
+	// the request first names it. RFC 4918 §9.1 answers a property in one
+	// propstat, so a name the request repeats is still answered once.
+	custom      []xml.Name
+	customIndex map[xml.Name]int
+	// noneAnswered is the 404 tail of every response that carries none of
+	// the custom names, shared by all of them.
+	noneAnswered requestedNames
+}
+
+func newPropfindSelection(q *propfindPropQuery) *propfindSelection {
+	selection := &propfindSelection{}
+	for i := range propfindPropertyTable {
+		if spec := &propfindPropertyTable[i]; spec.requested(q) {
+			selection.specs = append(selection.specs, spec)
+		}
+	}
+	for _, name := range q.CustomXML {
+		if name.Local == "" {
+			continue
+		}
+		if _, seen := selection.customIndex[name]; seen {
+			continue
+		}
+		if selection.customIndex == nil {
+			selection.customIndex = make(map[xml.Name]int)
+		}
+		selection.customIndex[name] = len(selection.custom)
+		selection.custom = append(selection.custom, name)
+	}
+	selection.noneAnswered = requestedNames{all: selection.custom}
+	return selection
+}
+
+// selected returns the request's propfindSelection, deriving it on first use.
+func (r *propfindRequest) selected() *propfindSelection {
+	if r.selection == nil {
+		r.selection = newPropfindSelection(r.Prop)
+	}
+	return r.selection
+}
+
+// customAnswer pairs a requested custom name, by its index in
+// propfindSelection.custom, with the source property that answers it.
+type customAnswer struct {
+	requested int
+	source    int
+}
+
+// customAnswers finds the requested custom names the source carries, in
+// request order. It walks the source's properties rather than the request's
+// names, so its cost follows what the resource holds and not the length of
+// the request. Where the source repeats a name its first property answers.
+func (s *propfindSelection) customAnswers(src *prop) []customAnswer {
+	if len(s.custom) == 0 || len(src.CustomXML) == 0 {
+		return nil
+	}
+	var answers []customAnswer
+	for i := range src.CustomXML {
+		if requested, ok := s.customIndex[src.CustomXML[i].Name]; ok {
+			answers = append(answers, customAnswer{requested: requested, source: i})
+		}
+	}
+	slices.SortFunc(answers, func(a, b customAnswer) int {
+		return cmp.Or(cmp.Compare(a.requested, b.requested), cmp.Compare(a.source, b.source))
+	})
+	return slices.CompactFunc(answers, func(a, b customAnswer) bool { return a.requested == b.requested })
+}
+
 // filterPropfindResponseForKind rebuilds the response's propstats from the
 // property table: requested properties the kind defines land in the 200
 // propstat, requested properties it lacks land in a 404 propstat rendered as
@@ -470,16 +549,13 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
 		return resp
 	}
+	selection := req.selected()
 	src := resp.Propstat[0].Prop
 	var okProp prop
 	var okSet bool
 	var notFoundNames []xml.Name
 	var forbiddenNames []xml.Name
-	for i := range propfindPropertyTable {
-		spec := &propfindPropertyTable[i]
-		if !spec.requested(req.Prop) {
-			continue
-		}
+	for _, spec := range selection.specs {
 		if spec.forbidden != nil && spec.forbidden(&src) {
 			forbiddenNames = append(forbiddenNames, spec.emptyName)
 			continue
@@ -506,26 +582,26 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 		}
 		spec.copyValue(&okProp, &src, req.Prop)
 	}
-	for _, name := range req.Prop.CustomXML {
-		if name.Local == "" {
-			continue
+	answers := selection.customAnswers(&src)
+	unanswered := &selection.noneAnswered
+	if len(answers) > 0 {
+		unanswered = &requestedNames{all: selection.custom, skip: make([]int, len(answers))}
+	}
+	for i, answer := range answers {
+		property := src.CustomXML[answer.source]
+		if expanded, ok := req.expandCustomXMLProperty(property); ok {
+			property = expanded
 		}
-		if property, ok := src.customXMLProperty(name); ok {
-			if expanded, ok := req.expandCustomXMLProperty(property); ok {
-				property = expanded
-			}
-			okProp.setCustomXMLProperty(property)
-			okSet = true
-		} else {
-			notFoundNames = append(notFoundNames, name)
-		}
+		okProp.setCustomXMLProperty(property)
+		okSet = true
+		unanswered.skip[i] = answer.requested
 	}
 	resp.Propstat = nil
 	if okSet {
 		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
 	}
-	if len(notFoundNames) > 0 {
-		resp.Propstat = append(resp.Propstat, propstat{PropNames: notFoundNames, Status: httpStatusNotFound})
+	if len(notFoundNames) > 0 || unanswered.len() > 0 {
+		resp.Propstat = append(resp.Propstat, propstat{PropNames: notFoundNames, requested: unanswered, Status: httpStatusNotFound})
 	}
 	if len(forbiddenNames) > 0 {
 		resp.Propstat = append(resp.Propstat, propstat{PropNames: forbiddenNames, Status: httpStatusForbidden})

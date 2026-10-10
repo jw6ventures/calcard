@@ -11,10 +11,18 @@
 -- rebuild them and the backfills do not maintain them row by row.
 -- idx_acl_unique gives way to idx_acl_resource_order, and idx_events_calendar_id
 -- and idx_contacts_address_book_id are leading-column prefixes of the keyset
--- indexes built below and serve no lookup those cannot.
+-- indexes built below and serve no lookup those cannot. The three stamp
+-- indexes give way to the change-stream indexes built below, which add the id
+-- to their stamp and serve every read the stamp alone did;
+-- idx_deleted_resources_keyset, which a v1.2.0 release candidate built, is
+-- superseded the same way.
 DROP INDEX IF EXISTS idx_acl_unique;
 DROP INDEX IF EXISTS idx_events_calendar_id;
 DROP INDEX IF EXISTS idx_contacts_address_book_id;
+DROP INDEX IF EXISTS idx_events_last_modified;
+DROP INDEX IF EXISTS idx_contacts_last_modified;
+DROP INDEX IF EXISTS idx_deleted_resources_lookup;
+DROP INDEX IF EXISTS idx_deleted_resources_keyset;
 
 -- v1.1.6: normalized, indexable join keys for the object-level ACL checks.
 -- resource_path_norm and object_acl_path drop the trailing .ics/.vcf extension
@@ -172,12 +180,13 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- takes SHARE and CREATE TRIGGER SHARE ROW EXCLUSIVE, which block writes but not
 -- reads. In practice acl_entries, events, contacts, users, calendars and
 -- app_passwords are closed from their first ALTER TABLE, which runs on every
--- upgrade path whether or not it finds anything to add. address_books and
--- deleted_resources are closed to writes from their CREATE TRIGGER, and to
--- reads as well when the file runs again and its DROP TRIGGER finds the
--- trigger. A closed table makes a SELECT wait rather than fall back to another
--- plan. A run that fails part way rolls back entirely and can simply be
--- repeated; the statements are individually idempotent as well.
+-- upgrade path whether or not it finds anything to add. deleted_resources is
+-- closed from the DROP INDEX of the stamp index the file replaces.
+-- address_books is closed to writes from its CREATE TRIGGER, and to reads as
+-- well when the file runs again and its DROP TRIGGER finds the trigger. A
+-- closed table makes a SELECT wait rather than fall back to another plan. A run
+-- that fails part way rolls back entirely and can simply be repeated; the
+-- statements are individually idempotent as well.
 --
 -- The duration is therefore what matters operationally. It is mostly the
 -- recurrence and event-end repairs, plus the index builds and the birthday
@@ -482,20 +491,24 @@ CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
 --
 -- The trailing columns are the predicates those reads narrow on, so a page
 -- filters on the index tuple rather than visiting the heap for rows it discards.
---
--- deleted_resources keeps the plain id cursor: its lookup index leads on
--- deleted_at, which is the more selective bound for every sync that reads it.
 CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset ON events (
-    calendar_id, id, last_modified,
+    calendar_id, id,
     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
--- A v1.2.0 release candidate built this as (address_book_id, id) only.
+-- A v1.2.0 release candidate built this on other columns.
 DROP INDEX IF EXISTS idx_contacts_book_keyset;
-CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id, last_modified);
+CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id);
 
-CREATE INDEX IF NOT EXISTS idx_deleted_resources_keyset
-    ON deleted_resources (resource_type, collection_id, id);
+-- sync-collection reads a collection's changes in stream order, member rows by
+-- (last_modified, id) and tombstones by (deleted_at, id), a page at a time from
+-- a cursor; internal/store/sync_changes.go carries why the id is part of the
+-- position. The events index is built here, after the event repairs, and the
+-- contacts index after the birthday repair at the end of the file.
+CREATE INDEX IF NOT EXISTS idx_events_change_stream ON events (calendar_id, last_modified, id);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_resources_change_stream
+    ON deleted_resources (resource_type, collection_id, deleted_at, id);
 
 -- Commit-ordered sync stamps.
 --
@@ -716,5 +729,7 @@ UPDATE address_books
     WHERE id IN (SELECT address_book_id FROM contacts WHERE last_modified >= now());
 END
 $birthdays$;
+
+CREATE INDEX IF NOT EXISTS idx_contacts_change_stream ON contacts (address_book_id, last_modified, id);
 
 UPDATE application SET value = 'v1.2.0' WHERE key = 'version';
