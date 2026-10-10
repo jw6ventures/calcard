@@ -51,6 +51,8 @@ const stubs = `
     function toggleRecurrenceEnd() {}
     function currentReturnPath() { return '/calendars'; }
     function parseICAL() { return {}; }
+    function selectStoredValue(select, value) { select.value = value || ''; }
+    window.selectStoredValue = selectStoredValue;
     window.rruleUntilDay = rruleUntilDay;
     window.formatDateTimeForInput = formatDateTimeForInput;
     window.timeZoneClock = timeZoneClock;

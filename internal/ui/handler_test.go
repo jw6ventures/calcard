@@ -5991,7 +5991,10 @@ func TestUpdateEventRefusesDataTheCalDAVValidatorRefuses(t *testing.T) {
 	}}}
 	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
 
-	form := url.Values{"summary": {"Renamed"}, "dtstart": {"2026-01-05T09:00"}, "dtend": {"2026-01-05T10:00"}, "edit_scope": {"series"}}
+	form := url.Values{
+		"summary": {"Renamed"}, "dtstart": {"2026-01-05T09:00"}, "dtend": {"2026-01-05T10:00"}, "edit_scope": {"series"},
+		"recurrence": {"WEEKLY"}, "recurrence_end_type": {"after"}, "recurrence_count": {"4"},
+	}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/series", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rctx := chi.NewRouteContext()

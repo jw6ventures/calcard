@@ -79,6 +79,8 @@ window.exclusiveAllDayEnd = mod.exclusiveAllDayEnd;
 window.formatDateTimeForInput = mod.formatDateTimeForInput;
 window.timeZoneClock = mod.timeZoneClock;
 window.browserTimeZone = mod.browserTimeZone;
+// The status, visibility and availability selects play no part in the dates.
+window.selectStoredValue = (select, value) => { select.value = value || ''; };
 
 let failures = 0;
 const check = (label, got, want) => {

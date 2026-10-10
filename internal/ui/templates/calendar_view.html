@@ -812,7 +812,7 @@
             </div>
             <div class="form-group">
                 <label for="create-attachments">Attachments</label>
-                <textarea id="create-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+                <textarea id="create-attachments" name="attachments" rows="2" placeholder="One URL per line, or separated by a comma and a space"></textarea>
             </div>
             <div class="form-group">
                 <label>Reminders (minutes before)</label>
@@ -923,8 +923,8 @@
             <div class="form-group" id="edit-scope-group" style="display: none;">
                 <label>Editing</label>
                 <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-series" onclick="setEditScope('series')">Edit series</button>
-                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-occurrence" onclick="setEditScope('occurrence')">Edit this occurrence</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-series" onclick="switchEditScope('series')">Edit series</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="edit-scope-occurrence" onclick="switchEditScope('occurrence')">Edit this occurrence</button>
                 </div>
                 <div id="edit-scope-hint" style="margin-top: 0.25rem; color: #4a5568; font-size: 0.8rem;"></div>
             </div>
@@ -1005,7 +1005,7 @@
             </div>
             <div class="form-group">
                 <label for="edit-attachments">Attachments</label>
-                <textarea id="edit-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+                <textarea id="edit-attachments" name="attachments" rows="2" placeholder="One URL per line, or separated by a comma and a space"></textarea>
             </div>
             <div class="form-group">
                 <label>Reminders (minutes before)</label>
@@ -2273,6 +2273,7 @@
     window.browserTimeZone = browserTimeZone;
     window.inclusiveAllDayEnd = inclusiveAllDayEnd;
     window.exclusiveAllDayEnd = exclusiveAllDayEnd;
+    window.selectStoredValue = selectStoredValue;
 })();
 
 // Create Event Modal
@@ -2441,6 +2442,7 @@ function showEditEventModal(event, scope) {
         return;
     }
     window.currentEditEvent = event;
+    window.currentEditOccurrence = null;
     var effectiveScope = scope || (event && event.recurrenceId ? 'occurrence' : 'series');
     var calendarId = {{.Calendar.ID}};
     document.getElementById('edit-event-form').action = '/calendars/' + calendarId + '/events/' + encodeURIComponent(event.uid);
@@ -2457,9 +2459,9 @@ function showEditEventModal(event, scope) {
     document.getElementById('edit-location').value = event.location || '';
     document.getElementById('edit-description').value = event.description || '';
     document.getElementById('edit-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
-    document.getElementById('edit-status').value = event.status || '';
-    document.getElementById('edit-visibility').value = event.class || '';
-    document.getElementById('edit-availability').value = event.transp || '';
+    window.selectStoredValue(document.getElementById('edit-status'), event.status);
+    window.selectStoredValue(document.getElementById('edit-visibility'), event.class);
+    window.selectStoredValue(document.getElementById('edit-availability'), event.transp);
     document.getElementById('edit-url').value = event.url || '';
     document.getElementById('edit-categories').value = (event.categories || []).join(', ');
     document.getElementById('edit-organizer').value = event.organizer || '';
@@ -2504,7 +2506,7 @@ function showEditEventModal(event, scope) {
     var byDayCheckboxes = document.querySelectorAll('#edit-recurrence-byday-group input[type="checkbox"]');
     
     // Reset recurrence fields to defaults
-    recurrenceSelect.value = '';
+    window.selectStoredValue(recurrenceSelect, '');
     intervalInput.value = '1';
     endTypeSelect.value = 'never';
     countInput.value = '10';
@@ -2518,7 +2520,10 @@ function showEditEventModal(event, scope) {
         
         // Set frequency
         if (rr.FREQ) {
-            recurrenceSelect.value = rr.FREQ;
+            // A frequency the select does not offer, such as HOURLY, is
+            // kept as an option of its own, so "Does not repeat" only
+            // shows for a series that does not repeat.
+            window.selectStoredValue(recurrenceSelect, String(rr.FREQ).toUpperCase());
         }
         
         // Set interval
@@ -2572,6 +2577,29 @@ function closeEditEventModal() {
 function formatRecurrenceIdForInput(date, allDay, clock) {
     if (!date) return '';
     return allDay ? formatDateForInput(date) : window.formatDateTimeForInput(date, clock);
+}
+
+// switchEditScope switches the open editor between the series and the
+// occurrence it was opened on. Each scope's form shows its own component: the
+// series' master, or the occurrence with any override of it, so a series edit
+// never submits an override's fields as the series'. The occurrence is kept
+// while the series is shown, to switch back to.
+function switchEditScope(scope) {
+    var event = window.currentEditEvent;
+    var occurrence = window.currentEditOccurrence;
+    if (scope === 'series' && event && event.recurrenceId) {
+        var master = (window.baseEvents || []).find(function(e) { return e.uid === event.uid && !e.recurrenceId; });
+        if (master) {
+            showEditEventModal(master, 'series');
+            window.currentEditOccurrence = event;
+            return;
+        }
+    }
+    if (scope === 'occurrence' && occurrence && event && occurrence.uid === event.uid && !event.recurrenceId) {
+        showEditEventModal(occurrence, 'occurrence');
+        return;
+    }
+    setEditScope(scope);
 }
 
 function setEditScope(scope, event) {

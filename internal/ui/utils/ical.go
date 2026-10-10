@@ -327,14 +327,25 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 		if urlVal := sanitizeICalURI(opts.URL); urlVal != "" {
 			lines = append(lines, fmt.Sprintf("URL:%s", urlVal))
 		}
-		if opts.Status != "" {
-			lines = append(lines, fmt.Sprintf("STATUS:%s", strings.ToUpper(opts.Status)))
-		}
-		if opts.Class != "" {
-			lines = append(lines, fmt.Sprintf("CLASS:%s", strings.ToUpper(opts.Class)))
-		}
-		if opts.Transparency != "" {
-			lines = append(lines, fmt.Sprintf("TRANSP:%s", strings.ToUpper(opts.Transparency)))
+		for _, token := range []struct {
+			name, value string
+			allowed     func(string) bool
+		}{
+			// A stored event may carry a value RFC 5545 does not list,
+			// such as an x-name, which the editor submits back unchanged;
+			// any token is written, and nothing else is.
+			{"STATUS", opts.Status, ianaToken},
+			{"CLASS", opts.Class, ianaToken},
+			{"TRANSP", opts.Transparency, ianaToken},
+		} {
+			if token.value == "" {
+				continue
+			}
+			value := strings.ToUpper(token.value)
+			if !token.allowed(value) {
+				return nil, fmt.Errorf("invalid %s", strings.ToLower(token.name))
+			}
+			lines = append(lines, token.name+":"+value)
 		}
 		if len(opts.Categories) > 0 {
 			var cats []string
@@ -347,23 +358,27 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 				lines = append(lines, fmt.Sprintf("CATEGORIES:%s", strings.Join(cats, ",")))
 			}
 		}
-		if line := buildMailtoLine("ORGANIZER", opts.Organizer); line != "" {
+		if line := AttendeeLine("ORGANIZER", opts.Organizer); line != "" {
 			lines = append(lines, line)
 		}
 		for _, a := range opts.Attendees {
-			if line := buildMailtoLine("ATTENDEE", a); line != "" {
+			if line := AttendeeLine("ATTENDEE", a); line != "" {
 				lines = append(lines, line)
 			}
 		}
 		for _, att := range opts.Attachments {
-			if attVal := sanitizeICalURI(att); attVal != "" {
-				lines = append(lines, fmt.Sprintf("ATTACH:%s", attVal))
+			if line := AttachmentLine(att); line != "" {
+				lines = append(lines, line)
 			}
 		}
 	}
 
 	if recurrence != nil && recurrence.Frequency != "" && recurrenceID == "" {
-		rrule := fmt.Sprintf("RRULE:FREQ=%s", recurrence.Frequency)
+		frequency := strings.ToUpper(recurrence.Frequency)
+		if !recurrenceFrequency(frequency) {
+			return nil, fmt.Errorf("invalid recurrence frequency")
+		}
+		rrule := "RRULE:FREQ=" + frequency
 		if recurrence.Interval > 1 {
 			rrule += fmt.Sprintf(";INTERVAL=%d", recurrence.Interval)
 		}
@@ -425,8 +440,35 @@ func BuildEvent(uid, summary, dtstart, dtend string, allDay bool, location, desc
 	return sb.String(), nil
 }
 
-func buildMailtoLine(prop, value string) string {
-	name, email := parseNameEmail(value)
+// recurrenceFrequency reports whether frequency, upper-cased, is an RRULE
+// FREQ (RFC 5545 §3.3.10).
+func recurrenceFrequency(frequency string) bool {
+	switch frequency {
+	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY":
+		return true
+	}
+	return false
+}
+
+// ianaToken reports whether value is an RFC 5545 §3.1 iana-token, which an
+// x-name also is: one or more letters, digits and dashes.
+func ianaToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// AttendeeLine is the content line of prop, ORGANIZER or ATTENDEE, for value,
+// an address as the event form takes one -- "Name <address>" or a bare
+// address -- or "" when value holds no mail address.
+func AttendeeLine(prop, value string) string {
+	name, email := NameAndAddress(value)
 	if email == "" {
 		return ""
 	}
@@ -442,23 +484,62 @@ func buildMailtoLine(prop, value string) string {
 		return ""
 	}
 	line := prop
-	if safeName := sanitizeICalText(name); safeName != "" {
-		line += ";CN=" + EscapeICalValue(safeName)
+	if name := DisplayNameParam(name); name != "" {
+		line += ";CN=" + name
 	}
 	line += ":mailto:" + addr.Address
 	return line
 }
 
-func parseNameEmail(value string) (name, email string) {
+// DisplayNameParam writes name as the value of a CN parameter, quoted when RFC
+// 5545 §3.2 requires. A parameter value cannot hold a DQUOTE or a control
+// character, so a name the form quoted is unquoted, any DQUOTE left is
+// dropped, and each control character becomes a space. It is "" for a name
+// with nothing else to write.
+func DisplayNameParam(name string) string {
+	name = strings.TrimSpace(name)
+	if len(name) >= 2 && strings.HasPrefix(name, `"`) && strings.HasSuffix(name, `"`) {
+		name = name[1 : len(name)-1]
+	}
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r == '"':
+			return -1
+		case r < 0x20 || r == 0x7f:
+			return ' '
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return quoteParamValue(name)
+}
+
+// AttachmentLine is the ATTACH content line for a URI the event form takes, or
+// "" when value is not one.
+func AttachmentLine(value string) string {
+	if uri := sanitizeICalURI(value); uri != "" {
+		return "ATTACH:" + uri
+	}
+	return ""
+}
+
+// NameAndAddress splits an address as the event form takes one, "Name
+// <address>" or a bare address, into its display name and address.
+func NameAndAddress(value string) (name, address string) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", ""
 	}
-	if lt := strings.Index(value, "<"); lt != -1 {
-		if gt := strings.Index(value, ">"); gt != -1 && gt > lt {
+	// The address is the last bracketed part: a quoted name may hold
+	// brackets of its own.
+	if lt := strings.LastIndex(value, "<"); lt != -1 {
+		if gt := strings.LastIndex(value, ">"); gt > lt {
 			name = strings.TrimSpace(value[:lt])
-			email = strings.TrimSpace(value[lt+1 : gt])
-			return name, email
+			address = strings.TrimSpace(value[lt+1 : gt])
+			return name, address
 		}
 	}
 	return "", value
@@ -475,19 +556,6 @@ func parseDateTimeLocal(value string, loc *time.Location) (time.Time, error) {
 		lastErr = err
 	}
 	return time.Time{}, lastErr
-}
-
-func sanitizeICalText(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.ReplaceAll(value, "\r\n", "\n")
-	value = strings.ReplaceAll(value, "\r", "\n")
-	if value == "" {
-		return ""
-	}
-	if hasInvalidICalText(value) {
-		return ""
-	}
-	return value
 }
 
 func sanitizeICalURI(value string) string {

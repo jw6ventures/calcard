@@ -384,11 +384,23 @@ func TestEventInAZoneOnlyTheObjectDefinesKeepsItsInstants(t *testing.T) {
 
 // calendarEventView is the part of an event's view model the editor reads.
 type calendarEventView struct {
-	DTStart            string `json:"dtstart"`
-	DTEnd              string `json:"dtend"`
-	Timezone           string `json:"timezone"`
-	RecurrenceID       string `json:"recurrenceId"`
-	RecurrenceTimezone string `json:"recurrenceTimezone"`
+	Summary            string   `json:"summary"`
+	Description        string   `json:"description"`
+	Location           string   `json:"location"`
+	Status             string   `json:"status"`
+	URL                string   `json:"url"`
+	Class              string   `json:"class"`
+	Transparency       string   `json:"transp"`
+	Categories         []string `json:"categories"`
+	Organizer          string   `json:"organizer"`
+	Attendees          []string `json:"attendees"`
+	Attachments        []string `json:"attachments"`
+	Reminders          []int    `json:"reminders"`
+	DTStart            string   `json:"dtstart"`
+	DTEnd              string   `json:"dtend"`
+	Timezone           string   `json:"timezone"`
+	RecurrenceID       string   `json:"recurrenceId"`
+	RecurrenceTimezone string   `json:"recurrenceTimezone"`
 	RRuleParsed        map[string]string
 	TimezoneOffsets    map[string][]calendarTimezoneOffset `json:"timezoneOffsets"`
 	Overrides          []calendarEventView                 `json:"overrides"`

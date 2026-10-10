@@ -70,3 +70,66 @@ if (source.includes('function createEventDateError(')) {
     );
   }
 }
+
+// A stored STATUS, CLASS or TRANSP the select does not offer is given an
+// option of its own, so saving the form unchanged submits it; the option goes
+// again when the select is set to another event's value.
+{
+  class FakeOption {
+    constructor(value) { this.value = value; this.textContent = value; this.attributes = {}; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    hasAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name); }
+  }
+  class FakeSelect {
+    constructor(values) { this.options = values.map((v) => new FakeOption(v)); this.selected = ''; }
+    remove(i) { this.options.splice(i, 1); }
+    appendChild(option) { this.options.push(option); }
+    // A select takes only a value one of its options holds.
+    set value(v) { this.selected = this.options.some((o) => o.value === v) ? v : ''; }
+    get value() { return this.selected; }
+  }
+  const selectContext = { document: { createElement: () => new FakeOption('') } };
+  vm.createContext(selectContext);
+  vm.runInContext(extract('selectStoredValue'), selectContext);
+  const select = new FakeSelect(['', 'PUBLIC', 'PRIVATE', 'CONFIDENTIAL']);
+  selectContext.selectStoredValue(select, 'X-TEAM-ONLY');
+  assert.equal(select.value, 'X-TEAM-ONLY', 'an x-name CLASS is selected');
+  selectContext.selectStoredValue(select, 'PRIVATE');
+  assert.equal(select.value, 'PRIVATE');
+  assert.deepEqual(select.options.map((o) => o.value), ['', 'PUBLIC', 'PRIVATE', 'CONFIDENTIAL'],
+    'the option added for the earlier event is gone');
+  selectContext.selectStoredValue(select, undefined);
+  assert.equal(select.value, '');
+  assert.equal(select.options.length, 4);
+}
+
+// switchEditScope only exists on the single-calendar page; the aggregate page
+// reopens its editor on the series itself.
+if (source.includes('function switchEditScope(')) {
+  const master = { uid: 'u', summary: 'Series', recurrenceId: null };
+  const occurrence = { uid: 'u', summary: 'Moved', recurrenceId: new Date(0) };
+  const calls = [];
+  const scopeContext = {
+    window: { baseEvents: [master], currentEditEvent: occurrence, currentEditOccurrence: null },
+  };
+  scopeContext.showEditEventModal = (event, scope) => {
+    calls.push(['show', event.summary, scope]);
+    scopeContext.window.currentEditEvent = event;
+    scopeContext.window.currentEditOccurrence = null;
+  };
+  scopeContext.setEditScope = (scope) => calls.push(['scope', scope]);
+  vm.createContext(scopeContext);
+  vm.runInContext(extract('switchEditScope'), scopeContext);
+
+  scopeContext.switchEditScope('series');
+  scopeContext.switchEditScope('occurrence');
+  assert.deepEqual(calls, [['show', 'Series', 'series'], ['show', 'Moved', 'occurrence']],
+    'the series scope shows the master, and switching back shows the occurrence');
+
+  calls.length = 0;
+  scopeContext.window.currentEditEvent = master;
+  scopeContext.switchEditScope('occurrence');
+  scopeContext.switchEditScope('series');
+  assert.deepEqual(calls, [['scope', 'occurrence'], ['scope', 'series']],
+    'an editor opened on the series only switches scope');
+}

@@ -872,7 +872,7 @@
                     </div>
                     <div class="form-group">
                         <label for="event-attachments">Attachments</label>
-                        <textarea id="event-attachments" name="attachments" rows="2" placeholder="One URL per line or comma-separated"></textarea>
+                        <textarea id="event-attachments" name="attachments" rows="2" placeholder="One URL per line, or separated by a comma and a space"></textarea>
                     </div>
                     <div class="form-group">
                         <label>Reminders (minutes before)</label>
@@ -1358,6 +1358,10 @@
 
     function resetEditorFields() {
         editorForm.reset();
+        // Options added for the last event's stored values go with it.
+        ['event-status', 'event-visibility', 'event-availability', 'event-recurrence'].forEach(function(id) {
+            selectStoredValue(document.getElementById(id), '');
+        });
         document.getElementById('event-reminders').innerHTML = '';
         document.querySelectorAll('#event-editor-form input[name="recurrence_byday"]').forEach(function(input) {
             input.checked = false;
@@ -1413,9 +1417,9 @@
         document.getElementById('event-location').value = event.location || '';
         document.getElementById('event-description').value = event.description || '';
         document.getElementById('event-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
-        document.getElementById('event-status').value = event.status || '';
-        document.getElementById('event-visibility').value = event.class || '';
-        document.getElementById('event-availability').value = event.transp || '';
+        selectStoredValue(document.getElementById('event-status'), event.status);
+        selectStoredValue(document.getElementById('event-visibility'), event.class);
+        selectStoredValue(document.getElementById('event-availability'), event.transp);
         document.getElementById('event-url').value = event.url || '';
         document.getElementById('event-categories').value = (event.categories || []).join(', ');
         document.getElementById('event-organizer').value = event.organizer || '';
@@ -1439,7 +1443,10 @@
         document.getElementById('event-edit-scope').value = event.isOccurrence ? 'occurrence' : 'series';
 
         var rrule = rruleForEvent(event);
-        document.getElementById('event-recurrence').value = rrule.FREQ || '';
+        // A frequency the select does not offer, such as HOURLY, is kept as
+        // an option of its own, so "Does not repeat" only shows for a
+        // series that does not repeat.
+        selectStoredValue(document.getElementById('event-recurrence'), String(rrule.FREQ || '').toUpperCase());
         document.getElementById('event-recurrence-interval').value = rrule.INTERVAL || '1';
         document.getElementById('event-recurrence-monthday').value = rrule.BYMONTHDAY || '';
         document.getElementById('event-recurrence-month').value = rrule.BYMONTH || '';

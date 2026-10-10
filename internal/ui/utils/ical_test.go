@@ -572,6 +572,77 @@ func TestBuildEvent_SkipsInjectedOptionValues(t *testing.T) {
 	}
 }
 
+// STATUS, CLASS and TRANSP and the RRULE's FREQ are written as the form sends
+// them, so a value that is not a token -- for FREQ, not one of its seven -- is
+// refused rather than written: a line break in one would start a content line
+// of the sender's choosing.
+func TestBuildEventRefusesValuesThatAreNotTokens(t *testing.T) {
+	injected := "CONFIRMED\r\nATTENDEE;CN=Evil:mailto:evil@example.com"
+	tests := []struct {
+		name       string
+		opts       EventOptions
+		recurrence *RecurrenceOptions
+	}{
+		{name: "status", opts: EventOptions{Status: injected}},
+		{name: "class", opts: EventOptions{Class: "PUBLIC\r\nX-INJECTED:1"}},
+		{name: "class with a space", opts: EventOptions{Class: "VERY PRIVATE"}},
+		{name: "transparency", opts: EventOptions{Transparency: "OPAQUE\nX-INJECTED:1"}},
+		{name: "frequency", recurrence: &RecurrenceOptions{Frequency: "WEEKLY\r\nX-INJECTED:1", Interval: 1}},
+		{name: "frequency with a rule part", recurrence: &RecurrenceOptions{Frequency: "DAILY;BYHOUR=1,2,3", Interval: 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines, err := BuildEventComponent("uid", "Event", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", tt.recurrence, "", &tt.opts)
+			if err == nil {
+				t.Fatalf("BuildEventComponent() = %q, want an error", lines)
+			}
+		})
+	}
+
+	lines := mustBuildEventComponent(t, "uid", "Event", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "",
+		&RecurrenceOptions{Frequency: "weekly", Interval: 1},
+		"", &EventOptions{Status: "tentative", Class: "x-team-only", Transparency: "Transparent"})
+	for _, want := range []string{"STATUS:TENTATIVE", "CLASS:X-TEAM-ONLY", "TRANSP:TRANSPARENT", "RRULE:FREQ=WEEKLY"} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("BuildEventComponent() = %q, want it to hold %q", lines, want)
+		}
+	}
+	// A stored event may carry a value RFC 5545 does not list for VEVENT,
+	// which an edit submits back as the editor showed it.
+	lines = mustBuildEventComponent(t, "uid", "Event", "2025-01-15T14:00", "2025-01-15T15:00", false, "", "", nil,
+		"", &EventOptions{Status: "NEEDS-ACTION", Transparency: "X-FOO"})
+	for _, want := range []string{"STATUS:NEEDS-ACTION", "TRANSP:X-FOO"} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("BuildEventComponent() = %q, want it to hold %q", lines, want)
+		}
+	}
+}
+
+// A display name is a CN parameter value, which RFC 5545 §3.2 quotes when it
+// holds a colon, semicolon or comma and which cannot hold a DQUOTE or a
+// control character at all.
+func TestBuildEventQuotesDisplayNames(t *testing.T) {
+	tests := []struct {
+		attendee string
+		want     string
+	}{
+		{"Doe, John <john@example.com>", `ATTENDEE;CN="Doe, John":mailto:john@example.com`},
+		{"Doe; John <john@example.com>", `ATTENDEE;CN="Doe; John":mailto:john@example.com`},
+		{"Dr: Who <who@example.com>", `ATTENDEE;CN="Dr: Who":mailto:who@example.com`},
+		{`"Doe, Jane" <jane@example.com>`, `ATTENDEE;CN="Doe, Jane":mailto:jane@example.com`},
+		{`Bob "the Builder" Smith <bob@example.com>`, `ATTENDEE;CN=Bob the Builder Smith:mailto:bob@example.com`},
+		{"Ann\tLee <ann@example.com>", `ATTENDEE;CN=Ann Lee:mailto:ann@example.com`},
+		{`Back\slash <b@example.com>`, `ATTENDEE;CN=Back\slash:mailto:b@example.com`},
+		{"plain@example.com", `ATTENDEE:mailto:plain@example.com`},
+		{`"Ops <team>" <ops@example.com>`, `ATTENDEE;CN=Ops <team>:mailto:ops@example.com`},
+	}
+	for _, tt := range tests {
+		if got := AttendeeLine("ATTENDEE", tt.attendee); got != tt.want {
+			t.Errorf("AttendeeLine(%q) = %q, want %q", tt.attendee, got, tt.want)
+		}
+	}
+}
+
 func TestUnfoldLines(t *testing.T) {
 	tests := []struct {
 		name  string

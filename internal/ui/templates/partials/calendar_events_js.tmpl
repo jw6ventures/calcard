@@ -160,6 +160,29 @@
         return master;
     }
 
+    // Sets select, one of the editor's STATUS, CLASS, TRANSP or repeat
+    // selects, to a stored value. A value the select does not offer -- a CLASS
+    // x-name such as X-TEAM-ONLY, or an HOURLY rule -- gets an option of its
+    // own, so saving the form unchanged submits it rather than nothing.
+    function selectStoredValue(select, value) {
+        value = value || '';
+        for (var i = select.options.length - 1; i >= 0; i--) {
+            if (select.options[i].hasAttribute('data-stored-value')) select.remove(i);
+        }
+        var offered = false;
+        for (var j = 0; j < select.options.length; j++) {
+            if (select.options[j].value === value) offered = true;
+        }
+        if (!offered) {
+            var option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            option.setAttribute('data-stored-value', '');
+            select.appendChild(option);
+        }
+        select.value = value;
+    }
+
     function unfoldLines(ical) {
         return ical.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
     }

@@ -1624,11 +1624,19 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var newComponents [][]string
+		var previous []string
 		for _, comp := range components {
 			if utils.SameRecurrenceID(comp, override) {
+				previous = comp
 				continue
 			}
+			if previous == nil && utils.RecurrenceIDValue(comp) == "" {
+				previous = comp
+			}
 			newComponents = append(newComponents, comp)
+		}
+		if previous != nil {
+			override = withUneditedOverrideProperties(override, previous, opts)
 		}
 		newComponents = append(newComponents, override)
 		ical = utils.BuildFromComponents(header, newComponents, footer)
@@ -1642,8 +1650,10 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		replaced := false
 		for i, comp := range components {
 			if utils.RecurrenceIDValue(comp) == "" && !replaced {
-				components[i] = withUneditedProperties(master, comp, opts.Object)
+				components[i] = withUneditedProperties(master, comp, opts.Object, opts)
+				components = overridesFollowingSeries(components, comp, components[i], opts.Object)
 				replaced = true
+				break
 			}
 		}
 		if !replaced {
@@ -1816,8 +1826,8 @@ func parseEventOptions(r *http.Request) *utils.EventOptions {
 	organizer := strings.TrimSpace(r.FormValue("organizer"))
 
 	categories := splitListField(r.FormValue("categories"))
-	attendees := splitListField(r.FormValue("attendees"))
-	attachments := splitListField(r.FormValue("attachments"))
+	attendees := splitAddressList(r.FormValue("attendees"))
+	attachments := splitAttachmentList(r.FormValue("attachments"))
 	reminders := parseReminderMinutes(r.Form["reminder_minutes"])
 
 	return &utils.EventOptions{
@@ -1840,6 +1850,69 @@ func splitListField(value string) []string {
 		if v := strings.TrimSpace(part); v != "" {
 			out = append(out, v)
 		}
+	}
+	return out
+}
+
+// splitAddressList splits the attendee field into its addresses, each
+// "Name <address>" or a bare address: one per line, or several on a line
+// separated by commas. A display name may hold a comma itself -- Exchange
+// writes "Last, First" -- so a comma separates two addresses only once the
+// text before it holds an address, and never inside quotes or angle brackets.
+func splitAddressList(value string) []string {
+	var out []string
+	var current strings.Builder
+	quoted, bracketed, addressed := false, false, false
+	flush := func() {
+		if item := strings.Trim(current.String(), ", \t"); item != "" {
+			out = append(out, item)
+		}
+		current.Reset()
+		quoted, bracketed, addressed = false, false, false
+	}
+	for _, r := range value {
+		switch {
+		case r == '\n' || r == '\r':
+			flush()
+			continue
+		case r == '"' && !bracketed:
+			quoted = !quoted
+		case quoted:
+		case r == '<':
+			bracketed = true
+		case r == '>':
+			bracketed, addressed = false, true
+		case r == '@':
+			addressed = true
+		case r == ',' && !bracketed && addressed:
+			flush()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	flush()
+	return out
+}
+
+// splitAttachmentList splits the attachment field into its URIs: one per
+// line, or several on a line separated by a comma and whitespace. A URI may
+// hold a comma but no whitespace, so a comma alone does not separate two.
+func splitAttachmentList(value string) []string {
+	var out []string
+	add := func(uri string) {
+		if uri = strings.Trim(uri, ", \t"); uri != "" {
+			out = append(out, uri)
+		}
+	}
+	for _, line := range strings.FieldsFunc(value, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		start := 0
+		for i := 0; i+1 < len(line); i++ {
+			if line[i] == ',' && (line[i+1] == ' ' || line[i+1] == '\t') {
+				add(line[start:i])
+				start = i + 1
+			}
+		}
+		add(line[start:])
 	}
 	return out
 }
@@ -2344,10 +2417,28 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 		for _, override := range m.Overrides {
 			overridePayload := make(map[string]any)
 			override.addToPayload(overridePayload)
+			// The browser shows an override as its series with the
+			// override's fields over it, and an override replaces its
+			// instance (RFC 5545 §3.8.4.4): a field it leaves out is
+			// empty, not the series'. Only the summary, which the editor
+			// requires, is the series' when the override has none.
+			for key, empty := range emptyOverrideFields {
+				if _, set := overridePayload[key]; !set {
+					overridePayload[key] = empty
+				}
+			}
 			overrides = append(overrides, overridePayload)
 		}
 		payload["overrides"] = overrides
 	}
+}
+
+// emptyOverrideFields are the view model's values for the descriptive fields
+// an override leaves out.
+var emptyOverrideFields = map[string]any{
+	"description": "", "htmlDescription": "", "location": "", "status": "", "url": "", "class": "",
+	"transp": "", "organizer": "", "categories": []string{}, "attendees": []string{},
+	"attachments": []string{}, "reminders": []int{},
 }
 
 // parseCalendarEventMetadata reads the event whose unfolded content lines are
@@ -2422,32 +2513,30 @@ func parseCalendarEventComponents(lines []string, zones *calendarEventZones) []c
 
 func parseCalendarEventComponent(lines []string, zones *calendarEventZones) calendarEventMetadata {
 	var event calendarEventMetadata
-	inAlarm := false
+	var alarm []string
 
 	for _, line := range lines {
 		key, params, value, ok := parseICalProperty(line)
 		if !ok {
 			continue
 		}
-		switch key {
-		case "BEGIN":
-			if strings.EqualFold(value, "VALARM") {
-				inAlarm = true
-			}
-			continue
-		case "END":
-			if strings.EqualFold(value, "VALARM") {
-				inAlarm = false
+		if alarm != nil {
+			alarm = append(alarm, line)
+			if key == "END" && strings.EqualFold(strings.TrimSpace(value), "VALARM") {
+				if minutes, ok := editorReminder(alarm); ok {
+					event.Reminders = append(event.Reminders, minutes)
+				}
+				alarm = nil
 			}
 			continue
 		}
-
-		if inAlarm {
-			if key == "TRIGGER" {
-				if minutes, ok := parseTriggerMinutes(value); ok {
-					event.Reminders = append(event.Reminders, minutes)
-				}
+		switch key {
+		case "BEGIN":
+			if strings.EqualFold(strings.TrimSpace(value), "VALARM") {
+				alarm = []string{line}
 			}
+			continue
+		case "END":
 			continue
 		}
 
@@ -2492,25 +2581,32 @@ func parseCalendarEventComponent(lines []string, zones *calendarEventZones) cale
 			event.Duration = value
 		case "RRULE":
 			event.RRule = value
+			// Rule part values are case-insensitive, and the editors'
+			// selects hold them upper-cased.
 			event.RRuleParsed = ical.RRuleParts(value)
+			for part, partValue := range event.RRuleParsed {
+				event.RRuleParsed[part] = strings.ToUpper(partValue)
+			}
 		case "EXDATE":
 			event.Exdates = append(event.Exdates, parseCalendarEventDateList(value, params, zones)...)
 		case "STATUS":
-			event.Status = value
+			event.Status = strings.ToUpper(strings.TrimSpace(value))
 		case "CATEGORIES":
-			event.Categories = splitICalTextList(value)
+			event.Categories = append(event.Categories, splitICalTextList(value)...)
 		case "URL":
 			event.URL = value
 		case "CLASS":
-			event.Class = value
+			event.Class = strings.ToUpper(strings.TrimSpace(value))
 		case "TRANSP":
-			event.Transparency = value
+			event.Transparency = strings.ToUpper(strings.TrimSpace(value))
 		case "ORGANIZER":
 			event.Organizer = formatICalEmailValue(value, params)
 		case "ATTENDEE":
 			event.Attendees = append(event.Attendees, formatICalEmailValue(value, params))
 		case "ATTACH":
-			event.Attachments = append(event.Attachments, value)
+			if keyPart, _, _ := ical.SplitContentLine(line); !binaryAttachment(keyPart) {
+				event.Attachments = append(event.Attachments, value)
+			}
 		}
 	}
 
@@ -2623,64 +2719,68 @@ func rruleUntil(value string) string {
 	return until
 }
 
+// parseTriggerMinutes reads a TRIGGER duration (RFC 5545 §3.3.6) as how many
+// minutes before the start it is, rounded to the nearest minute. It fails for a
+// duration after the start: the editor writes reminders before it.
 func parseTriggerMinutes(value string) (int, bool) {
 	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, false
-	}
-	if value[0] == '+' {
-		return 0, false
-	}
-	if value[0] == '-' {
+	before := strings.HasPrefix(value, "-")
+	if before || strings.HasPrefix(value, "+") {
 		value = value[1:]
 	}
 	if !strings.HasPrefix(value, "P") {
 		return 0, false
 	}
 
-	days, hours, minutes, seconds := 0, 0, 0, 0
+	seconds := 0
 	timePart := false
-	var digits strings.Builder
-	flush := func(unit rune) bool {
-		if digits.Len() == 0 {
-			return false
-		}
-		n, err := strconv.Atoi(digits.String())
-		if err != nil {
-			return false
-		}
-		digits.Reset()
-		switch unit {
-		case 'D':
-			days = n
-		case 'H':
-			hours = n
-		case 'M':
-			if timePart {
-				minutes = n
-			}
-		case 'S':
-			seconds = n
-		}
-		return true
-	}
-
+	digits := 0
+	read, units, timeUnits := false, 0, 0
 	for _, r := range value[1:] {
-		switch {
-		case r >= '0' && r <= '9':
-			digits.WriteRune(r)
-		case r == 'T':
-			timePart = true
-		case r == 'D' || r == 'H' || r == 'M' || r == 'S':
-			if !flush(r) {
+		unit := 0
+		switch r {
+		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			if digits > 100_000_000 {
 				return 0, false
 			}
+			digits = digits*10 + int(r-'0')
+			read = true
+			continue
+		case 'T':
+			if timePart || read {
+				return 0, false
+			}
+			timePart = true
+			continue
+		case 'W':
+			unit = 7 * 24 * 3600
+		case 'D':
+			unit = 24 * 3600
+		case 'H':
+			unit = 3600
+		case 'M':
+			unit = 60
+		case 'S':
+			unit = 1
 		default:
 			return 0, false
 		}
+		if !read || timePart != (r == 'H' || r == 'M' || r == 'S') {
+			return 0, false
+		}
+		if seconds += digits * unit; seconds > 100_000_000*7*24*3600 {
+			return 0, false
+		}
+		digits, read = 0, false
+		units++
+		if timePart {
+			timeUnits++
+		}
 	}
-
-	return days*1440 + hours*60 + minutes + (seconds+30)/60, true
+	if read || units == 0 || (timePart && timeUnits == 0) || (!before && seconds != 0) {
+		return 0, false
+	}
+	return (seconds + 30) / 60, true
 }
 
 func unescapeICalText(value string) string {
@@ -2692,18 +2792,31 @@ func unescapeICalText(value string) string {
 	return value
 }
 
+// splitICalTextList splits a TEXT list value (RFC 5545 §3.1.1) at the commas
+// that separate its values, not at an escaped one inside a value, and
+// unescapes each.
 func splitICalTextList(value string) []string {
-	parts := strings.Split(value, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(unescapeICalText(part))
-		if part != "" {
-			out = append(out, part)
+	var out []string
+	start := 0
+	for i := 0; i <= len(value); i++ {
+		switch {
+		case i < len(value)-1 && value[i] == '\\':
+			i++
+		case i == len(value) || value[i] == ',':
+			if part := strings.TrimSpace(unescapeICalText(value[start:i])); part != "" {
+				out = append(out, part)
+			}
+			start = i + 1
 		}
 	}
 	return out
 }
 
+// formatICalEmailValue is how the editor shows an ORGANIZER or ATTENDEE:
+// "Name <address>", or the address alone when there is no name or the name is
+// the address, as clients with no name for an attendee write it. Any other
+// name holding what would read as an address of its own -- an @ or angle
+// brackets -- is quoted, so the attendee field splits it as one entry.
 func formatICalEmailValue(value string, params map[string]string) string {
 	email := strings.TrimSpace(value)
 	if strings.HasPrefix(strings.ToLower(email), "mailto:") {
@@ -2713,8 +2826,11 @@ func formatICalEmailValue(value string, params map[string]string) string {
 	if email == "" {
 		return ""
 	}
-	if name == "" {
+	if name == "" || strings.EqualFold(strings.TrimSpace(name), email) {
 		return email
+	}
+	if strings.ContainsAny(name, "@<>") {
+		name = `"` + name + `"`
 	}
 	return fmt.Sprintf("%s <%s>", name, email)
 }
