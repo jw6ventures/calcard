@@ -191,15 +191,26 @@ type EventZone struct {
 // what the editor shows does not move the event whatever zone the server
 // process runs in.
 func EventZoneIn(tzid string, object []string) EventZone {
+	zone, _ := ResolveEventZone(tzid, object)
+	return zone
+}
+
+// ResolveEventZone is EventZoneIn, also reporting whether tzid names a zone
+// rather than falling back to UTC: known holds for no name, for UTC, and for a
+// name the object or the host defines.
+func ResolveEventZone(tzid string, object []string) (zone EventZone, known bool) {
 	tzid = strings.TrimSpace(tzid)
-	if tzid == "" || tzid == "UTC" || !validParamValue(tzid) {
-		return EventZone{}
+	if tzid == "" || tzid == "UTC" {
+		return EventZone{}, true
 	}
-	zone := ical.ResolveObjectTimezone(object, tzid)
-	if !zone.Defined() {
-		return EventZone{}
+	if !validParamValue(tzid) {
+		return EventZone{}, false
 	}
-	return EventZone{tzid: tzid, zone: zone}
+	defined := ical.ResolveObjectTimezone(object, tzid)
+	if !defined.Defined() {
+		return EventZone{}, false
+	}
+	return EventZone{tzid: tzid, zone: defined}, true
 }
 
 // Instant is the instant a wall clock in the zone names, held as the UTC time

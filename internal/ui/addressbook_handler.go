@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/mail"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -267,7 +266,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 	page, limit := h.parsePagination(r)
 	offset := (page - 1) * limit
 
-	result, err := h.store.Contacts.ListForBookPaginated(r.Context(), id, limit, offset)
+	result, err := h.contacts.ListContactsPage(r.Context(), user, *book, limit, offset)
 	if err != nil {
 		http.Error(w, "failed to load contacts", http.StatusInternalServerError)
 		return
@@ -398,11 +397,19 @@ func contactWriteFlashError(r *http.Request, err error, fallback string) string 
 		return "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead."
 	case errors.Is(err, contacts.ErrPreconditionFailed):
 		return "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again."
+	case errors.Is(err, contacts.ErrChangedConcurrently):
+		return contactKeptChangingMessage("saved")
 	case contacts.StatusCode(err) == http.StatusBadRequest:
 		return unclassified
 	}
 	httperrors.LogError(r, fallback, err)
 	return fallback
+}
+
+// contactKeptChangingMessage is the flash text for a contact write given up
+// because another client kept changing the contact or its access under it.
+func contactKeptChangingMessage(action string) string {
+	return "This contact kept changing elsewhere and could not be " + action + ". Reload the page and try again."
 }
 
 // contactFieldLabels names the structured fields the way the form does.
@@ -575,30 +582,27 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
+	// The service decides the delete as a CardDAV DELETE is decided, on
+	// DAV:unbind rather than the write-content an edit needs, so the page only
+	// has to be one the user can see.
+	user, _ := auth.UserFromContext(r.Context())
+	if _, err := h.contacts.GetAddressBook(r.Context(), user, bookID); err != nil {
+		h.writeContactAccessError(w, err)
 		return
 	}
-
-	contact, err := h.store.Contacts.GetByUID(r.Context(), bookID, uid)
-	if err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to delete contact"})
-		return
+	page := fmt.Sprintf("/addressbooks/%d", bookID)
+	err = h.contacts.DeleteContact(r.Context(), user, bookID, uid, "", "")
+	switch {
+	case err == nil, errors.Is(err, contacts.ErrNotFound):
+		h.redirect(w, r, page, map[string]string{"status": "contact_deleted"})
+	case errors.Is(err, contacts.ErrForbidden):
+		h.redirect(w, r, page, map[string]string{"error": "You may not delete contacts from this address book."})
+	case errors.Is(err, contacts.ErrChangedConcurrently):
+		h.redirect(w, r, page, map[string]string{"error": contactKeptChangingMessage("deleted")})
+	default:
+		httperrors.LogError(r, "failed to delete contact", err)
+		h.redirect(w, r, page, map[string]string{"error": "failed to delete contact"})
 	}
-	if contact == nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_deleted"})
-		return
-	}
-	resourceName := contact.ResourceName
-	if resourceName == "" {
-		resourceName = contact.UID
-	}
-	resourcePath := path.Join("/dav/addressbooks", strconv.FormatInt(bookID, 10), resourceName)
-	if err := h.store.DeleteContactAndState(r.Context(), bookID, store.ContactDAVResourceState(contact), resourcePath, nil); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to delete contact"})
-		return
-	}
-
-	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"status": "contact_deleted"})
 }
 
 // MoveContact moves a contact from one address book to another.
@@ -632,65 +636,38 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The service decides the move as a CardDAV MOVE is decided, on DAV:unbind
+	// here and DAV:bind on the target rather than the write-content an edit
+	// needs, so the pages only have to be ones the user can see.
 	user, _ := auth.UserFromContext(r.Context())
-
-	// Moving = remove from source + create in target, so the user needs editor
-	// access (owner or write share) on both books.
-	if _, ok := h.requireEditableAddressBook(w, r, bookID); !ok {
+	if _, err := h.contacts.GetAddressBook(r.Context(), user, bookID); err != nil {
+		h.writeContactAccessError(w, err)
 		return
 	}
-	targetBook, err := h.contacts.GetAddressBook(r.Context(), user, targetBookID)
-	if err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "target address book not found"})
-		return
-	}
-	targetAccess, err := h.contacts.AddressBookAccessFor(r.Context(), user, *targetBook)
-	if err != nil {
-		http.Error(w, "failed to resolve access", http.StatusInternalServerError)
-		return
-	}
-	if !targetAccess.Editor {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "cannot write to target address book"})
+	sourcePage := fmt.Sprintf("/addressbooks/%d", bookID)
+	if _, err := h.contacts.GetAddressBook(r.Context(), user, targetBookID); err != nil {
+		h.redirect(w, r, sourcePage, map[string]string{"error": "target address book not found"})
 		return
 	}
 
-	// Verify contact exists in source address book
-	contact, err := h.store.Contacts.GetByUID(r.Context(), bookID, uid)
-	if err != nil {
-		http.Error(w, "failed to load contact", http.StatusInternalServerError)
-		return
-	}
-	if contact == nil {
+	err = h.contacts.MoveContact(r.Context(), user, bookID, targetBookID, uid)
+	switch {
+	case err == nil:
+		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", targetBookID), map[string]string{"status": "contact_moved"})
+	case errors.Is(err, contacts.ErrDestinationForbidden):
+		h.redirect(w, r, sourcePage, map[string]string{"error": "cannot write to target address book"})
+	case errors.Is(err, contacts.ErrNotFound):
 		http.Error(w, "contact not found", http.StatusNotFound)
-		return
+	case errors.Is(err, contacts.ErrForbidden):
+		h.redirect(w, r, sourcePage, map[string]string{"error": "You may not move contacts out of this address book."})
+	case errors.Is(err, contacts.ErrChangedConcurrently):
+		h.redirect(w, r, sourcePage, map[string]string{"error": contactKeptChangingMessage("moved")})
+	case errors.Is(err, contacts.ErrConflict):
+		h.redirect(w, r, sourcePage, map[string]string{"error": "contact already exists in target address book"})
+	default:
+		httperrors.LogError(r, "failed to move contact", err)
+		h.redirect(w, r, sourcePage, map[string]string{"error": "failed to move contact"})
 	}
-
-	// Move the contact
-	destResourceName := contact.ResourceName
-	if destResourceName == "" {
-		destResourceName = contact.UID
-	}
-	if existingByUID, err := h.store.Contacts.GetByUID(r.Context(), targetBookID, uid); err != nil {
-		http.Error(w, "failed to check target address book", http.StatusInternalServerError)
-		return
-	} else if existingByUID != nil && targetBookID != bookID {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "contact already exists in target address book"})
-		return
-	}
-	if existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), targetBookID, destResourceName); err != nil {
-		http.Error(w, "failed to check target address book", http.StatusInternalServerError)
-		return
-	} else if existingByName != nil && (targetBookID != bookID || existingByName.UID != contact.UID) {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "contact already exists in target address book"})
-		return
-	}
-
-	if err := h.store.Contacts.MoveToAddressBook(r.Context(), bookID, targetBookID, uid, destResourceName); err != nil {
-		h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", bookID), map[string]string{"error": "failed to move contact"})
-		return
-	}
-
-	h.redirect(w, r, fmt.Sprintf("/addressbooks/%d", targetBookID), map[string]string{"status": "contact_moved"})
 }
 
 // ImportAddressBook imports contacts from a VCF file into an address book.

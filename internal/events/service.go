@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/calobject"
@@ -95,6 +96,19 @@ func (s *Service) GetCalendar(ctx context.Context, user *store.User, calendarID 
 }
 
 func (s *Service) loadCalendarForResource(ctx context.Context, user *store.User, calendarID int64, resourceName, privilege string) (*store.CalendarAccess, error) {
+	access, err := s.calendarForPrincipal(ctx, user, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireCalendarPrivilege(ctx, user, access, resourceName, privilege); err != nil {
+		return nil, err
+	}
+	return access, nil
+}
+
+// calendarForPrincipal is the calendar calendarID names, carrying the
+// privileges user holds on it.
+func (s *Service) calendarForPrincipal(ctx context.Context, user *store.User, calendarID int64) (*store.CalendarAccess, error) {
 	var legacy *store.CalendarAccess
 	if s != nil && s.store != nil && s.store.Calendars != nil && user != nil {
 		cal, err := s.store.Calendars.GetAccessible(ctx, calendarID, user.ID)
@@ -128,9 +142,11 @@ func (s *Service) loadCalendarForResource(ctx context.Context, user *store.User,
 		access.Privileges = legacy.EffectivePrivileges()
 		access.PrivilegesResolved = legacy.PrivilegesResolved || legacy.Privileges.HasAny()
 		access.Editor = access.Privileges.AllowsEventEditing()
-	}
-	if err := s.requireCalendarPrivilege(ctx, user, access, resourceName, privilege); err != nil {
-		return nil, err
+	} else {
+		// The user holds nothing on the calendar or any of its events, so
+		// only an ACE can grant a privilege. Left unresolved, the empty
+		// privileges would read as a read-only share.
+		access.PrivilegesResolved = true
 	}
 	return access, nil
 }
@@ -331,6 +347,13 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	if err != nil {
 		return nil, false, err
 	}
+	// DAV:bind is a privilege on the calendar (RFC 3744 §3.9), checked before
+	// the body is built and validated, as a DAV PUT checks it: a principal who
+	// may not add to the calendar cannot make the server spend that work. A
+	// create never lands on a stored object, so no object ACE bears on it.
+	if err := s.requireCalendarPrivilege(ctx, user, cal, "", "bind"); err != nil {
+		return nil, false, err
+	}
 
 	object, err := s.normalizeEventPayload(input, "", cal)
 	if err != nil {
@@ -352,16 +375,43 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	if existing != nil {
 		return nil, false, ErrConflict
 	}
-	if err := s.requireCalendarPrivilege(ctx, user, cal, uid, "bind"); err != nil {
-		return nil, false, err
-	}
 
-	event, created, err := s.saveEvent(ctx, calendarID, uid, uid, object, input.IfMatch, input.IfNoneMatch)
-	return event, created, err
+	// The store re-checks, inside its write transaction, that nothing holds
+	// the resource name or the UID, as it does for a DAV PUT that creates: a
+	// create that loses a race to another is refused rather than overwriting
+	// the event the other stored, which needs DAV:write-content.
+	write := store.CalendarObjectWrite{
+		CalendarID:    calendarID,
+		UID:           uid,
+		ResourceName:  uid,
+		RawICAL:       object.Body,
+		ETag:          fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body))),
+		Metadata:      &object.Metadata,
+		ExpectedState: &store.CalendarObjectResourceState{Exists: false},
+	}
+	result, err := s.store.PutCalendarObject(ctx, write)
+	switch {
+	case errors.Is(err, store.ErrResourceStateChanged):
+		if input.IfNoneMatch == "*" {
+			return nil, false, ErrPreconditionFailed
+		}
+		return nil, false, ErrConflict
+	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
+		return nil, false, ErrConflict
+	case err != nil:
+		return nil, false, err
+	case result == nil || result.Event == nil:
+		return nil, false, fmt.Errorf("calendar object write returned no event for %q in calendar %d", uid, calendarID)
+	}
+	return result.Event, true, nil
 }
 
 func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID int64, uid string, input UpsertInput) (*store.Event, bool, error) {
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
+	if err != nil {
+		return nil, false, err
+	}
+	cal, existing, err := s.authorizeEventWrite(ctx, user, calendarID, existing, "write-content")
 	if err != nil {
 		return nil, false, err
 	}
@@ -372,22 +422,11 @@ func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, false, ErrPreconditionFailed
 	}
 
-	resourceName := existing.ResourceName
-	if resourceName == "" {
-		resourceName = uid
-	}
-	cal, err := s.loadCalendarForResource(ctx, user, calendarID, resourceName, "write-content")
-	if err != nil {
-		return nil, false, err
-	}
-	if err := s.requireCalendarPrivilege(ctx, user, cal, resourceName, "write-content"); err != nil {
-		return nil, false, err
-	}
 	object, err := s.normalizeEventPayload(input, uid, cal)
 	if err != nil {
 		return nil, false, err
 	}
-	event, created, err := s.saveEvent(ctx, calendarID, uid, resourceName, object, input.IfMatch, input.IfNoneMatch)
+	event, created, err := s.saveEvent(ctx, calendarID, uid, eventResourceName(*existing), object, input.IfMatch, input.IfNoneMatch)
 	return event, created, err
 }
 
@@ -396,18 +435,17 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if err != nil {
 		return err
 	}
-	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
-		return ErrPreconditionFailed
+	if existing, err = s.authorizeEventDelete(ctx, user, calendarID, existing); err != nil {
+		return err
 	}
+	// RFC 9110 §13.2.1: a precondition is not evaluated where the request
+	// would otherwise answer neither 2xx nor 412, as it does for an event
+	// that is not there.
 	if existing == nil {
 		return ErrNotFound
 	}
-	cal, err := s.loadCalendarForResource(ctx, user, calendarID, eventResourceName(*existing), "unbind")
-	if err != nil {
-		return err
-	}
-	if err := s.requireCalendarPrivilege(ctx, user, cal, eventResourceName(*existing), "unbind"); err != nil {
-		return err
+	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
+		return ErrPreconditionFailed
 	}
 	resourcePaths := calendarACLResourcePaths(calendarID, eventResourceName(*existing))
 	if len(resourcePaths) == 0 {
@@ -421,6 +459,140 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 		return ErrConflict
 	}
 	return err
+}
+
+// authorizeEventDelete decides a delete of existing as DAV DELETE decides it
+// (internal/dav/delete.go), but for one difference: the principal needs some
+// privilege on the event and DAV:unbind on the calendar, a privilege of the
+// collection a member leaves (RFC 3744 §3.10). A principal holding no
+// privilege on the event, an event-level deny of every privilege included, is
+// answered as for a UID that names nothing, and gets existing back as nil. For
+// such a UID, a principal holding some privilege on the calendar but not
+// DAV:unbind gets ErrForbidden, and one holding none gets ErrNotFound. The
+// difference: where a principal's ACEs on the calendar grant none of its
+// privileges, or deny every one, DAV answers 403, which confirms the calendar
+// exists; this answers ErrNotFound, concealing the calendar from a principal
+// who holds nothing on it, as GetEvent does.
+func (s *Service) authorizeEventDelete(ctx context.Context, user *store.User, calendarID int64, existing *store.Event) (*store.Event, error) {
+	cal, err := s.calendarForPrincipal(ctx, user, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = eventResourceName(*existing)
+	}
+	entriesByPath, err := s.calendarACLEntries(ctx, cal.ID, resourceName)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil && !holdsAnyCalendarPrivilege(user, cal, resourceName, entriesByPath) {
+		existing = nil
+	}
+	if existing == nil && !holdsAnyCalendarPrivilege(user, cal, "", entriesByPath) {
+		return nil, ErrNotFound
+	}
+	if !calendarPrivilegeAllowed(user, cal, "", "unbind", entriesByPath) {
+		return nil, ErrForbidden
+	}
+	return existing, nil
+}
+
+// calendarACLEntries are the ACL entries on calendarID and, unless
+// resourceName is empty, on the event it names, keyed by resource path.
+func (s *Service) calendarACLEntries(ctx context.Context, calendarID int64, resourceName string) (map[string][]store.ACLEntry, error) {
+	entriesByPath := map[string][]store.ACLEntry{}
+	if s.store.ACLEntries == nil {
+		return entriesByPath, nil
+	}
+	for _, resourcePath := range append(calendarACLResourcePaths(calendarID, resourceName), calendarACLCollectionPath(calendarID)) {
+		entries, err := s.store.ACLEntries.ListByResource(ctx, resourcePath)
+		if err != nil {
+			return nil, err
+		}
+		entriesByPath[resourcePath] = entries
+	}
+	return entriesByPath, nil
+}
+
+// calendarPrivilegeAllowed is requireCalendarPrivilege's decision, made from
+// entriesByPath.
+func calendarPrivilegeAllowed(user *store.User, cal *store.CalendarAccess, resourceName, privilege string, entriesByPath map[string][]store.ACLEntry) bool {
+	allowed, denied := calendarPrivilegeDecisionFromEntries(user, cal, resourceName, privilege, entriesByPath)
+	if allowed || denied {
+		return allowed
+	}
+	return cal != nil && cal.EffectivePrivileges().Allows(privilege)
+}
+
+// holdsAnyCalendarPrivilege reports whether user holds any of
+// acl.CalendarPrivilegeNames on the event resourceName names, or on the
+// calendar when it is empty, each decided from entriesByPath as
+// requireCalendarPrivilege decides it. As in DAV's check, the calendar's
+// resolved privileges count only when no ACE applicable to the user decides
+// any of them.
+func holdsAnyCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
+	if cal == nil || user == nil {
+		return false
+	}
+	denied := false
+	for _, privilege := range acl.CalendarPrivilegeNames {
+		allowed, privilegeDenied := calendarPrivilegeDecisionFromEntries(user, cal, resourceName, privilege, entriesByPath)
+		if allowed {
+			return true
+		}
+		denied = denied || privilegeDenied
+	}
+	return !denied && cal.EffectivePrivileges().HasAny()
+}
+
+// authorizeEventWrite checks privilege on the target of a write to existing:
+// the event, or the calendar when the UID names none. It runs before anything
+// about the event is answered. A principal who can neither read the event nor
+// hold privilege on it is treated as for a UID that names nothing, and gets
+// existing back as nil, so the answer cannot reveal that the event exists.
+// For such a UID, a principal without privilege on the calendar gets
+// ErrForbidden when they read the calendar and ErrNotFound otherwise, as
+// GetEvent answers a principal who cannot read; one with it is authorized,
+// and the caller answers as for a missing event.
+func (s *Service) authorizeEventWrite(ctx context.Context, user *store.User, calendarID int64, existing *store.Event, privilege string) (*store.CalendarAccess, *store.Event, error) {
+	cal, err := s.calendarForPrincipal(ctx, user, calendarID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if existing != nil {
+		visible, err := s.authorizeCalendarResource(ctx, user, cal, eventResourceName(*existing), privilege)
+		if err != nil {
+			return nil, nil, err
+		}
+		if visible {
+			return cal, existing, nil
+		}
+	}
+	visible, err := s.authorizeCalendarResource(ctx, user, cal, "", privilege)
+	switch {
+	case err != nil:
+		return nil, nil, err
+	case !visible:
+		return nil, nil, ErrNotFound
+	}
+	return cal, nil, nil
+}
+
+// authorizeCalendarResource checks that user holds privilege on the event
+// resourceName names, or on the calendar when it is empty. visible reports
+// whether user may know of the resource at all, by reading it or by holding
+// privilege on it; a user who may but lacks privilege gets ErrForbidden.
+func (s *Service) authorizeCalendarResource(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) (visible bool, err error) {
+	err = s.requireCalendarPrivilege(ctx, user, cal, resourceName, privilege)
+	if !errors.Is(err, ErrForbidden) {
+		return err == nil, err
+	}
+	readable, err := s.canReadCalendarResource(ctx, user, cal, resourceName)
+	if err != nil || !readable {
+		return false, err
+	}
+	return true, ErrForbidden
 }
 
 func (s *Service) requireCalendarPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName, privilege string) error {
@@ -771,7 +943,13 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	if dtstart == "" || dtend == "" {
 		return "", "", fmt.Errorf("%w: start and end are required", ErrBadRequest)
 	}
-	if err := utils.ValidateEventDates(dtstart, dtend, input.AllDay, utils.EventZoneIn(input.Timezone, nil)); err != nil {
+	// A request carries no VTIMEZONE, so only the host can define the zone.
+	timezone := strings.TrimSpace(input.Timezone)
+	zone, known := utils.ResolveEventZone(timezone, nil)
+	if !known {
+		return "", "", fmt.Errorf("%w: timezone is not a zone the server's time zone database defines", ErrBadRequest)
+	}
+	if err := utils.ValidateEventDates(dtstart, dtend, input.AllDay, zone); err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
 
@@ -788,11 +966,17 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 
 	var recurrence *utils.RecurrenceOptions
 	if input.Recurrence != nil {
+		until := strings.TrimSpace(input.Recurrence.Until)
+		if until != "" {
+			if _, err := time.Parse(time.DateOnly, until); err != nil {
+				return "", "", fmt.Errorf("%w: recurrence until must be a YYYY-MM-DD date", ErrBadRequest)
+			}
+		}
 		recurrence = &utils.RecurrenceOptions{
 			Frequency: strings.TrimSpace(input.Recurrence.Frequency),
 			Interval:  input.Recurrence.Interval,
 			Count:     input.Recurrence.Count,
-			Until:     strings.TrimSpace(input.Recurrence.Until),
+			Until:     until,
 			ByDay:     input.Recurrence.ByDay,
 			ByMonth:   input.Recurrence.ByMonth,
 		}
@@ -802,7 +986,7 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	}
 
 	opts := &utils.EventOptions{
-		Timezone:     strings.TrimSpace(input.Timezone),
+		Timezone:     timezone,
 		URL:          strings.TrimSpace(input.URL),
 		Status:       strings.TrimSpace(input.Status),
 		Categories:   input.Categories,

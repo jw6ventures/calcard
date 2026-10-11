@@ -499,6 +499,55 @@ func TestFormatICalDateTimeInWritesTheEnteredWallClock(t *testing.T) {
 	}
 }
 
+// ResolveEventZone says whether a name named a zone, and reads a wall clock in
+// the zone it names, or in UTC for a name nothing defines.
+func TestResolveEventZoneSaysWhetherTheNameIsKnown(t *testing.T) {
+	if _, err := time.LoadLocation("America/New_York"); err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	const exchange = "(UTC-05:00) Eastern Time (US & Canada)"
+	// The object's definition keeps standard time all year.
+	object := UnfoldLines("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:" + exchange + "\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\n" +
+		"END:VTIMEZONE\r\nEND:VCALENDAR\r\n")
+	wall := time.Date(2024, time.July, 1, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		tzid   string
+		object []string
+		known  bool
+		// wantTZID is the TZID values are written with, "" for UTC.
+		wantTZID string
+		// wantInstant is the instant the wall clock 2024-07-01T10:00 names.
+		wantInstant string
+	}{
+		{"no name", "", nil, true, "", "2024-07-01T10:00:00Z"},
+		{"blank name", "  ", nil, true, "", "2024-07-01T10:00:00Z"},
+		{"UTC", "UTC", nil, true, "", "2024-07-01T10:00:00Z"},
+		{"host zone", "America/New_York", nil, true, "America/New_York", "2024-07-01T14:00:00Z"},
+		{"host zone with surrounding space", " America/New_York ", nil, true, "America/New_York", "2024-07-01T14:00:00Z"},
+		{"zone the object defines", exchange, object, true, exchange, "2024-07-01T15:00:00Z"},
+		{"that zone without the object", exchange, nil, false, "", "2024-07-01T10:00:00Z"},
+		{"name no one defines", "Nowhere/Zone", nil, false, "", "2024-07-01T10:00:00Z"},
+		{"the server's own zone", "Local", nil, false, "", "2024-07-01T10:00:00Z"},
+		{"name holding a quote", `America/"New_York`, nil, false, "", "2024-07-01T10:00:00Z"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			zone, known := ResolveEventZone(tt.tzid, tt.object)
+			if known != tt.known {
+				t.Errorf("ResolveEventZone(%q) known = %v, want %v", tt.tzid, known, tt.known)
+			}
+			if zone.tzid != tt.wantTZID {
+				t.Errorf("ResolveEventZone(%q) names zone %q, want %q", tt.tzid, zone.tzid, tt.wantTZID)
+			}
+			if got := zone.Instant(wall).Format(time.RFC3339); got != tt.wantInstant {
+				t.Errorf("ResolveEventZone(%q) reads 2024-07-01T10:00 as %s, want %s", tt.tzid, got, tt.wantInstant)
+			}
+		})
+	}
+}
+
 // WallClock reads an instant on the zone's clock as Instant reads a wall clock
 // back: through the object's definition, the host's zone, or UTC.
 func TestEventZoneWallClockIsTheWallClockInstantReads(t *testing.T) {

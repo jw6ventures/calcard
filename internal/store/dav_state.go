@@ -442,9 +442,11 @@ func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries
 
 // CreateLockAndState creates lock like LockRepository.Create and additionally
 // refuses it with ErrResourceStateChanged when the ACL entries acl pins have
-// changed since the request's privilege check. A store without a connection
-// pool checks acl and then delegates to its lock repository.
-func (s *Store) CreateLockAndState(ctx context.Context, lock Lock, acl *ACLGuard) (*Lock, error) {
+// changed since the request's privilege check, and with ErrLockConflict when
+// lockPreconditions fail, as a lock creating a member fails without its
+// collection's lock token. A store without a connection pool checks both and
+// then delegates to its lock repository.
+func (s *Store) CreateLockAndState(ctx context.Context, lock Lock, acl *ACLGuard, lockPreconditions []LockPrecondition) (*Lock, error) {
 	if s == nil || s.Locks == nil {
 		return nil, ErrNotFound
 	}
@@ -455,6 +457,9 @@ func (s *Store) CreateLockAndState(ctx context.Context, lock Lock, acl *ACLGuard
 		if err := validateACLGuardFallback(ctx, s.ACLEntries, acl); err != nil {
 			return nil, err
 		}
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return nil, err
+		}
 		return s.Locks.Create(ctx, lock)
 	}
 	tx, err := s.BeginTx(ctx, nil)
@@ -462,6 +467,14 @@ func (s *Store) CreateLockAndState(ctx context.Context, lock Lock, acl *ACLGuard
 		return nil, err
 	}
 	defer tx.Rollback()
+	if len(lockPreconditions) > 0 {
+		// The lock's own path joins this acquisition, so the transaction takes
+		// its whole exclusive set in one ordered pass, which createLockTx then
+		// finds already held.
+		if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, lock.ResourcePath); err != nil {
+			return nil, err
+		}
+	}
 	created, err := createLockTx(ctx, tx, lock, acl)
 	if err != nil {
 		return nil, err

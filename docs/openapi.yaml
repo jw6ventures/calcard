@@ -158,22 +158,30 @@ paths:
       tags:
         - Events
       operationId: createEvent
-      summary: Create or upsert an event
+      summary: Create an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The body is decoded: `400` for a body that is empty, too large, not
+           valid JSON, names an unknown field, or lacks the input its
+           `inputMode` needs. This comes before any privilege check.
+        2. `404` when the caller holds no grant on the calendar or on any of
+           its events, as when the calendar does not exist.
+        3. `403` when the caller lacks `DAV:bind` on the calendar, whatever
+           the body holds, the UID it names, or the conditional headers.
+        4. The event is built from the body and validated: `400`, `409` or
+           `415`.
+        5. The conditional headers are evaluated: `412`.
+        6. `409` when the calendar already holds an event with the UID. A
+           create never updates an existing event: one that another request
+           stores while this one runs is refused too, with `409`, or `412`
+           under `If-None-Match: *`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
       requestBody:
         $ref: "#/components/requestBodies/EventWrite"
       responses:
-        "200":
-          description: Existing event updated by the create request.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Event"
         "201":
           description: Event created.
           headers:
@@ -233,6 +241,26 @@ paths:
         - Events
       operationId: updateEvent
       summary: Update an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The body is decoded: `400` for a body that is empty, too large, not
+           valid JSON, names an unknown field, or lacks the input its
+           `inputMode` needs. This comes before any privilege check.
+        2. `DAV:write-content` is checked on the event, or on the calendar
+           when it holds no event with the UID. A caller who can neither read
+           the event nor hold the privilege on it is answered as though the
+           calendar held no event with the UID, so the answer does not reveal
+           that it exists. Without the privilege on the calendar, such a UID
+           gets `403` when the caller can read the calendar and `404`
+           otherwise; with it, the steps below go on.
+        3. `404` when the calendar holds no event with the UID.
+        4. The conditional headers are evaluated: `412`.
+        5. The event is built from the body and validated: `400`, `409` or
+           `415`.
+        6. The event is stored once the store has checked it again: `409`
+           when another event now holds its resource name or UID, and `412`
+           when the conditional headers no longer hold.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -269,6 +297,28 @@ paths:
         - Events
       operationId: deleteEvent
       summary: Delete an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The caller needs `DAV:unbind` on the calendar, a privilege of the
+           collection an event leaves (RFC 3744 §3.10), and some privilege on
+           the event. A caller holding no privilege on the event, an
+           event-level deny of every privilege included, is answered as
+           though the calendar held no event with the UID, so the answer does
+           not reveal that it exists. For such a UID, a caller holding no
+           privilege on the calendar gets `404`, and one holding some but not
+           `DAV:unbind` gets `403`. A caller holding privilege on the event
+           but not `DAV:unbind` on the calendar gets `403`, whatever they hold
+           on the event. DAV DELETE decides the same way but for one case: a
+           caller whose ACEs on the calendar grant none of its privileges, or
+           deny every one, gets `403` from DAV, which confirms the calendar
+           exists, and `404` here, as `GET` answers them.
+        2. `404` when the calendar holds no event with the UID, whatever the
+           conditional headers say (RFC 9110 §13.2.1).
+        3. The conditional headers are evaluated: `412`.
+        4. The event is removed if it has not changed since step 3: `412`
+           when it has and the request carried a conditional header, `409`
+           when it carried none.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -283,6 +333,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
         "500":
@@ -401,21 +453,19 @@ paths:
         - Contacts
       operationId: createContact
       summary: Create a contact
+      description: |
+        The caller needs `DAV:bind` on the address book. A caller who may not
+        see the address book gets `404`, and one who may see it but lacks
+        `DAV:bind` gets `403`. A contact the address book already holds under
+        the UID is never replaced: `409`, or `412` under `If-None-Match: *`.
+        A create that keeps losing to concurrent changes of the address book's
+        contacts or ACL gives up with `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
       requestBody:
         $ref: "#/components/requestBodies/ContactWrite"
       responses:
-        "200":
-          description: Existing contact updated by the create request.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Contact"
         "201":
           description: Contact created.
           headers:
@@ -429,6 +479,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -446,6 +498,12 @@ paths:
         - Contacts
       operationId: getContact
       summary: Get a contact
+      description: |
+        The caller needs `DAV:read` on the contact, which the contact's own
+        ACL decides ahead of the address book's. A contact the caller may not
+        read is answered `404`, as a contact the address book does not hold
+        is, so the answer does not reveal that it exists; CardDAV `GET`
+        answers it the same way.
       responses:
         "200":
           description: Contact details and raw vCard data.
@@ -469,6 +527,16 @@ paths:
         - Contacts
       operationId: updateContact
       summary: Update a contact
+      description: |
+        The caller needs `DAV:write-content` on the contact, which the
+        contact's own ACL decides ahead of the address book's. A caller
+        refused it who may read the contact gets `403`. One who may not read
+        it either is answered as for a UID the address book does not hold, so
+        the answer does not reveal that the contact exists: `403` when the
+        address book refuses them `DAV:write-content`, `404` otherwise. The
+        conditional headers are checked against the contact as each attempt
+        reads it, so `412` means the contact itself changed; an update that
+        keeps losing to concurrent changes gives up with `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -488,6 +556,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -501,6 +571,32 @@ paths:
         - Contacts
       operationId: deleteContact
       summary: Delete a contact
+      description: |
+        Decided and answered as CardDAV `DELETE` of the contact is. The
+        request is answered at the first of these steps that refuses it:
+
+        1. The caller needs `DAV:unbind` on the address book, a privilege of
+           the collection a contact leaves (RFC 3744 §3.10), and some
+           privilege on the contact, which the contact's own ACL decides ahead
+           of the address book's. The owner holds both. A grant on the
+           contact alone does not reach the address book.
+           - A caller holding some privilege on the contact but not
+             `DAV:unbind` gets `403`.
+           - A caller holding no privilege on the contact, and denied none,
+             gets `404`.
+           - A caller denied every privilege on the contact cannot read it,
+             and is answered as though the address book held no contact with
+             the UID, so the answer does not reveal that it exists.
+           - For such a UID, and for one the address book does not hold: a
+             caller denied every privilege by the address book's own ACL, or
+             holding some there but not `DAV:unbind`, gets `403`; one holding
+             none there and denied none gets `404`.
+        2. `404` when the address book holds no contact with the UID, whatever
+           the conditional headers say (RFC 9110 §13.2.1).
+        3. The conditional headers are evaluated: `412`.
+        4. The contact is removed if neither it nor its ACL has changed since
+           step 1. Otherwise the steps run again against the new state, up to
+           three times in all, and the request gives up with `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -511,8 +607,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
         "500":
@@ -858,22 +958,22 @@ components:
             `DTSTART;TZID=<timezone>:<wall clock>` exactly as given, and the
             server adds the `VTIMEZONE` defining the zone from its database.
 
-            When `timezone` is omitted, empty, `UTC`, or a name the server's
-            database does not define, the values are read as UTC wall clocks and
-            stored as UTC (`DTSTART:20260320T100000Z`); an unknown name is not
-            an error. Before 1.2.0 they were read in the time zone of the server
-            process, so a client of a server not running in UTC that omits
-            `timezone` now gets times that many hours from where it did. A
-            structured update replaces the whole event, so a zone a stored
-            event defines only by its own `VTIMEZONE`, such as Outlook's
-            `Eastern Standard Time`, is UTC here as well; send `rawIcal` to keep
-            it.
+            When `timezone` is omitted, empty or `UTC`, the values are read as
+            UTC wall clocks and stored as UTC (`DTSTART:20260320T100000Z`).
+            Before 1.2.0 they were read in the time zone of the server process,
+            so a client of a server not running in UTC that omits `timezone` now
+            gets times that many hours from where it did. Any other name the
+            server's database does not define is refused with `400`, all-day
+            events included. A structured update replaces the whole event, so a
+            zone a stored event defines only by its own `VTIMEZONE`, such as
+            Outlook's `Eastern Standard Time`, is refused here as well; send
+            `rawIcal` to keep it.
 
             A wall clock a daylight-saving change skips (02:30 on the morning
             New York springs forward) is stored as given and names the instant
             RFC 5545 §3.3.5 gives it, read with the offset before the change
             (02:30 EST, which is 03:30 EDT); a wall clock a change repeats names
-            its first occurrence. Ignored for all-day events.
+            its first occurrence. An all-day event's dates are not read in it.
           example: America/Chicago
         url:
           type: string
@@ -933,7 +1033,8 @@ components:
             (23:59:59) in the event's `timezone`, or in UTC under the same rules
             `timezone` describes, written as a UTC `UNTIL`. Ignored when
             `count` is greater than zero. A value that is not a `YYYY-MM-DD`
-            date is ignored too, leaving the series without an end.
+            calendar date is refused with `400`, whatever `count` or
+            `frequency` is.
           example: "2026-06-30"
         byDay:
           type: array

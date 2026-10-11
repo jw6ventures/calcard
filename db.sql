@@ -427,6 +427,13 @@ CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
 CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
     ON acl_entries (resource_path, principal_href);
 
+-- Serves a range over every path beneath a collection whatever the database's
+-- collation: text_pattern_ops compares byte-wise, which a range on a path
+-- prefix needs and the default btree on resource_path does not give under a
+-- linguistic collation.
+CREATE INDEX IF NOT EXISTS idx_acl_resource_path_pattern
+    ON acl_entries (resource_path text_pattern_ops);
+
 ALTER TABLE contacts
     ADD COLUMN IF NOT EXISTS object_acl_path TEXT
     GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;

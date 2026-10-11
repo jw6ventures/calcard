@@ -225,31 +225,27 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid Depth header", http.StatusBadRequest)
 		return
 	}
-	targetExists, err := h.lockTargetExists(r.Context(), user, cleanPath)
+	targetExists, targetState, err := h.lockTargetState(r.Context(), user, cleanPath)
 	if err != nil {
 		http.Error(w, "failed to resolve lock target", http.StatusInternalServerError)
 		return
-	}
-	requiredPrivilege := "bind"
-	requiredPrivilegePath := path.Dir(cleanPath)
-	if targetExists {
-		requiredPrivilege = "write-content"
-		requiredPrivilegePath = canonicalPath
 	}
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
 		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
 		return
 	}
-	allowed, err := h.canLockPath(r.Context(), user, cleanPath)
+	allowed, err := h.canLockPath(r.Context(), user, cleanPath, targetExists)
 	if err != nil {
 		http.Error(w, "failed to authorize lock", http.StatusInternalServerError)
 		return
 	}
 	if !allowed {
-		writeNeedPrivileges(w, requiredPrivilegePath, requiredPrivilege)
+		_ = writePrivilegeRequirementError(w, h.lockRefusal(r.Context(), user, cleanPath, targetExists))
 		return
 	}
+	target := parsedDAVTarget(r.Context(), cleanPath)
+	createsMember := !targetExists && target.Valid && target.Resource
 	timeout := parseLockTimeout(r.Header.Get("Timeout"))
 	expiresAt := time.Now().Add(time.Duration(timeout) * time.Second)
 
@@ -339,9 +335,20 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	}
 	expectedExists := targetExists
 	newLock.ExpectedTargetExists = &expectedExists
-	if err := h.populateLockExpectation(r.Context(), user, cleanPath, &newLock); err != nil {
+	if err := h.populateLockExpectation(r.Context(), user, cleanPath, targetState, &newLock); err != nil {
 		http.Error(w, "failed to resolve lock target state", http.StatusInternalServerError)
 		return
+	}
+	// RFC 4918 §9.10.4 has a LOCK of an unmapped URL create the resource, which
+	// changes its collection's membership and so needs the collection's lock
+	// (§7.5), held by this principal (§6.4), as a PUT creating it does. The
+	// store re-checks the collection's locks as it creates this one.
+	var membershipPreconditions []store.LockPrecondition
+	if createsMember {
+		if !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
+			return
+		}
+		membershipPreconditions = h.lockPreconditions(r, path.Dir(cleanPath))
 	}
 
 	status := http.StatusOK
@@ -350,7 +357,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer invalidateDAVRequestState(r.Context())
-	created, err := h.store.CreateLockAndState(r.Context(), newLock, aclGuard)
+	created, err := h.store.CreateLockAndState(r.Context(), newLock, aclGuard, membershipPreconditions)
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is already locked", http.StatusLocked)
@@ -371,7 +378,11 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	writeLockResponse(w, created, status)
 }
 
-func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.User, cleanPath string, lock *store.Lock) error {
+// populateLockExpectation records on lock the collection cleanPath is in and,
+// for an object resource, resourceState: the state lockTargetState read when
+// deciding the target's existence, so the lock is created only if that state
+// still holds.
+func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.User, cleanPath string, resourceState *store.DAVResourceState, lock *store.Lock) error {
 	if h == nil || h.store == nil || lock == nil {
 		return nil
 	}
@@ -393,16 +404,8 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 		}
 		lock.ExpectedCollection = "calendar"
 		lock.ExpectedCollectionID = calendarID
-		if target.Resource && h.store.Events != nil {
-			event, err := h.store.Events.GetByResourceName(ctx, calendarID, target.ResourceName)
-			if err != nil {
-				return err
-			}
-			state := store.EventDAVResourceState(event)
-			if event == nil {
-				state.ResourceName = target.ResourceName
-			}
-			lock.ExpectedResourceState = &state
+		if target.Resource {
+			lock.ExpectedResourceState = resourceState
 		}
 	case davPathAddressBook:
 		addressBookID, ok, err := h.resolveAddressBookID(ctx, user, target.CollectionSegment)
@@ -417,93 +420,136 @@ func (h *DavServer) populateLockExpectation(ctx context.Context, user *store.Use
 		}
 		lock.ExpectedCollection = "addressbook"
 		lock.ExpectedCollectionID = addressBookID
-		if target.Resource && h.store.Contacts != nil {
-			contact, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, target.ResourceName)
-			if err != nil {
-				return err
-			}
-			state := store.ContactDAVResourceState(contact)
-			if contact == nil {
-				state.ResourceName = target.ResourceName
-			}
-			lock.ExpectedResourceState = &state
+		if target.Resource {
+			lock.ExpectedResourceState = resourceState
 		}
 	}
 	return nil
 }
 
-func (h *DavServer) canLockPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+// canLockPath decides a LOCK on cleanPath. targetExists is lockTargetState's
+// answer for the same path, so the privilege checked and the one a refusal
+// names both follow from one resolution of the resource the path names.
+func (h *DavServer) canLockPath(ctx context.Context, user *store.User, cleanPath string, targetExists bool) (bool, error) {
 	switch {
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
-		return h.canLockAddressBookPath(ctx, user, cleanPath)
+		return h.canLockAddressBookPath(ctx, user, cleanPath, targetExists)
 	case strings.HasPrefix(cleanPath, "/dav/calendars/"):
-		return h.canLockCalendarPath(ctx, user, cleanPath)
+		return h.canLockCalendarPath(ctx, user, cleanPath, targetExists)
 	default:
 		return false, nil
 	}
 }
 
+// objectLockPrivilege names the privilege RFC 3744 Appendix B makes a LOCK on
+// an object resource need, and the path it is checked on: DAV:write-content on
+// an existing object and DAV:bind on the parent of an absent one.
+func objectLockPrivilege(cleanPath string, targetExists bool) (privilegePath, privilege string) {
+	if targetExists {
+		return cleanPath, "write-content"
+	}
+	return path.Dir(cleanPath), "bind"
+}
+
+// lockRefusal is the refusal a LOCK canLockPath refused answers with. Like a
+// PUT's, it names the resource by the request's own path.
+func (h *DavServer) lockRefusal(ctx context.Context, user *store.User, cleanPath string, targetExists bool) error {
+	absentRefusal := requirePrivilegeAt(errPrivilegeNotGranted, path.Dir(cleanPath), "bind")
+	if !targetExists {
+		return absentRefusal
+	}
+	refusal := requirePrivilegeAt(errPrivilegeNotGranted, cleanPath, "write-content")
+	if target := parsedDAVTarget(ctx, cleanPath); !target.Valid || !target.Resource {
+		return refusal
+	}
+	return h.existingObjectWriteRefusal(ctx, user, cleanPath, refusal, func() error {
+		lockableIfAbsent, err := h.canLockPath(ctx, user, cleanPath, false)
+		if err != nil {
+			return requirePrivilegeAt(err, path.Dir(cleanPath), "bind")
+		}
+		if lockableIfAbsent {
+			return nil
+		}
+		return absentRefusal
+	})
+}
+
 func (h *DavServer) lockTargetExists(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+	exists, _, err := h.lockTargetState(ctx, user, cleanPath)
+	return exists, err
+}
+
+// lockTargetState reports whether the resource cleanPath names exists and, for
+// an object resource, the state a lock taken on it expects, both from one read.
+func (h *DavServer) lockTargetState(ctx context.Context, user *store.User, cleanPath string) (bool, *store.DAVResourceState, error) {
 	switch {
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks/"):
 		if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				return false, nil
+				return false, nil, nil
 			}
-			return false, err
+			return false, nil, err
 		} else if matched {
 			if h == nil || h.store == nil || h.store.Contacts == nil {
-				return true, nil
+				return true, nil, nil
 			}
 			existing, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, resourceName)
 			if err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return existing != nil, nil
+			state := store.ContactDAVResourceState(existing)
+			if existing == nil {
+				state.ResourceName = resourceName
+			}
+			return existing != nil, &state, nil
 		}
 
 		segment := singleCollectionSegment(cleanPath, "/dav/addressbooks/")
 		if segment == "" {
-			return false, nil
+			return false, nil, nil
 		}
 		_, ok, err := h.resolveAddressBookID(ctx, user, segment)
 		if errors.Is(err, store.ErrNotFound) {
-			return false, nil
+			return false, nil, nil
 		}
-		return ok, err
+		return ok, nil, err
 	case strings.HasPrefix(cleanPath, "/dav/calendars/"):
 		if calendarID, resourceName, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				return false, nil
+				return false, nil, nil
 			}
-			return false, err
+			return false, nil, err
 		} else if matched {
 			if h == nil || h.store == nil || h.store.Events == nil {
-				return true, nil
+				return true, nil, nil
 			}
 			existing, err := h.store.Events.GetByResourceName(ctx, calendarID, resourceName)
 			if err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return existing != nil, nil
+			state := store.EventDAVResourceState(existing)
+			if existing == nil {
+				state.ResourceName = resourceName
+			}
+			return existing != nil, &state, nil
 		}
 
 		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
 		if segment == "" {
-			return false, nil
+			return false, nil, nil
 		}
 		_, ok, err := h.resolveCalendarID(ctx, user, segment)
 		if errors.Is(err, store.ErrNotFound) {
-			return false, nil
+			return false, nil, nil
 		}
-		return ok, err
+		return ok, nil, err
 	default:
-		return true, nil
+		return true, nil, nil
 	}
 }
 
-func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
-	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
+func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User, cleanPath string, targetExists bool) (bool, error) {
+	if addressBookID, _, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousAddressBook) {
 			return false, nil
 		}
@@ -516,21 +562,7 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 			}
 			return false, err
 		}
-		privilege := "bind"
-		privilegePath := path.Dir(cleanPath)
-		if h != nil && h.store != nil && h.store.Contacts != nil {
-			existing, err := h.store.Contacts.GetByResourceName(ctx, addressBookID, resourceName)
-			if err != nil {
-				return false, err
-			}
-			if existing != nil {
-				privilege = "write-content"
-				privilegePath = cleanPath
-			}
-		} else {
-			privilege = "write-content"
-			privilegePath = cleanPath
-		}
+		privilegePath, privilege := objectLockPrivilege(cleanPath, targetExists)
 		if err := h.requireAddressBookPrivilege(ctx, user, book, privilegePath, privilege); err != nil {
 			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				return false, nil
@@ -573,7 +605,7 @@ func (h *DavServer) canLockAddressBookPath(ctx context.Context, user *store.User
 	return true, nil
 }
 
-func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, cleanPath string, targetExists bool) (bool, error) {
 	if calendarID, _, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errAmbiguousCalendar) {
 			return false, nil
@@ -590,20 +622,7 @@ func (h *DavServer) canLockCalendarPath(ctx context.Context, user *store.User, c
 			}
 			return false, err
 		}
-		privilege := "bind"
-		privilegePath := path.Dir(cleanPath)
-		if h.store != nil && h.store.Events != nil {
-			existing, err := h.store.Events.GetByResourceName(ctx, calendarID, path.Base(normalizeDAVResourceIdentity(cleanPath)))
-			if err != nil {
-				return false, err
-			}
-			if existing != nil {
-				privilege = "write-content"
-				privilegePath = cleanPath
-			}
-		} else {
-			privilege = "write-content"
-		}
+		privilegePath, privilege := objectLockPrivilege(cleanPath, targetExists)
 		if err := h.requireCalendarPrivilege(ctx, user, cal, privilegePath, privilege); err != nil {
 			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				return false, nil

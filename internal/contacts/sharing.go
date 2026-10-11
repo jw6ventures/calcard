@@ -3,6 +3,7 @@ package contacts
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -126,27 +127,20 @@ func sharePrincipalHref(userID int64) string {
 	return acl.PrincipalHref(userID)
 }
 
+// addressBookACLResourcePaths lists the paths whose ACL entries make up the
+// ACL of the contact named resourceName, spelled as the DAV layer spells a
+// contact's identity: its canonical path, which drops a trailing .vcf in any
+// case, then the legacy path, the canonical one with .vcf. The canonical path
+// is also the store's contacts.object_acl_path. A blank name has no path.
 func addressBookACLResourcePaths(bookID int64, resourceName string) []string {
-	resourceName = strings.TrimSpace(resourceName)
-	if resourceName == "" {
+	if strings.TrimSpace(resourceName) == "" {
 		return nil
 	}
-	base := addressBookACLCollectionPath(bookID) + "/" + resourceName
-	paths := []string{base}
-	if strings.EqualFold(pathExt(resourceName), ".vcf") {
-		paths = append(paths, strings.TrimSuffix(base, pathExt(resourceName)))
-	} else {
-		paths = append(paths, base+".vcf")
+	canonical := addressBookACLCollectionPath(bookID) + "/" + resourceName
+	if ext := path.Ext(canonical); strings.EqualFold(ext, ".vcf") {
+		canonical = strings.TrimSuffix(canonical, ext)
 	}
-	return paths
-}
-
-func pathExt(resourceName string) string {
-	idx := strings.LastIndex(resourceName, ".")
-	if idx < 0 {
-		return ""
-	}
-	return resourceName[idx:]
+	return []string{canonical, canonical + ".vcf"}
 }
 
 func contactResourceName(c store.Contact) string {
@@ -258,41 +252,6 @@ func (s *Service) privilegeDecision(ctx context.Context, user *store.User, bookI
 		return false, false, err
 	}
 	return false, applicable, nil
-}
-
-// prefetchACLEntries loads, in a small fixed number of queries, every ACL entry
-// for the collection and the given contacts that applies to the user, keyed by
-// resource path. This avoids a per-contact query when filtering a list.
-func (s *Service) prefetchACLEntries(ctx context.Context, user *store.User, bookID int64, contacts []store.Contact) (map[string][]store.ACLEntry, error) {
-	if s == nil || s.store == nil || s.store.ACLEntries == nil || user == nil {
-		return nil, nil
-	}
-
-	relevant := map[string]struct{}{addressBookACLCollectionPath(bookID): {}}
-	for _, c := range contacts {
-		for _, p := range addressBookACLResourcePaths(bookID, contactResourceName(c)) {
-			relevant[p] = struct{}{}
-		}
-	}
-
-	result := make(map[string][]store.ACLEntry, len(relevant))
-	for _, principalHref := range acl.PrincipalHrefs(user) {
-		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
-		if err != nil {
-			return nil, err
-		}
-		for _, entry := range entries {
-			path := strings.TrimSpace(entry.ResourcePath)
-			if _, ok := relevant[path]; !ok {
-				continue
-			}
-			result[path] = append(result[path], entry)
-		}
-	}
-	for resourcePath := range result {
-		acl.SortEntries(result[resourcePath])
-	}
-	return result, nil
 }
 
 func canReadContactFromEntries(user *store.User, bookID, ownerID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {

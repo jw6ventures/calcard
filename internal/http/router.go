@@ -26,35 +26,30 @@ import (
 	"github.com/jw6ventures/calcard/internal/ui"
 )
 
-// trustedRealIP resolves the forwarded client address into r.RemoteAddr, the
-// job chi's middleware.RealIP does, but only when the immediate peer is a proxy
-// APP_TRUSTED_PROXIES names.
+// trustedRealIP resolves r.RemoteAddr to the client clientip.ClientIP
+// attributes the request to, so traffic capture records the same client the
+// rate limiter and the session record do; a request whose client is the peer
+// keeps the peer's address, port included. It does so only when the immediate
+// peer is a proxy APP_TRUSTED_PROXIES names: rewriting on any other peer's say-so
+// lets a client claim to be a trusted proxy, and a spoofed X-Forwarded-Proto:
+// https would then unlock HTTP Basic over cleartext -- the transport requirement
+// RFC 4791 §11 makes of it.
 //
-// chi's version rewrites unconditionally from True-Client-IP, X-Real-IP or the
-// first X-Forwarded-For hop. Because it runs ahead of every other middleware,
-// that turns each downstream trusted-proxy test into one the client answers for
-// itself: a spoofed X-Real-IP naming a trusted proxy alongside
-// X-Forwarded-Proto: https would unlock HTTP Basic over cleartext -- the
-// transport requirement RFC 4791 §11 makes of it.
-//
-// The peer address is recorded before the rewrite, because the rewrite costs
-// every later trust decision the address it needs. Once RemoteAddr carries the
-// client, a test of RemoteAddr against the proxy CIDRs asks whether the client
-// is a proxy, which it is not: that judged legitimate HTTPS requests insecure
-// and refused the Basic app passwords that have no Digest to fall back to.
-// After this, RemoteAddr answers "who is the client" and clientip.PeerAddr
-// answers "who connected", which is the question trust is decided on.
+// The peer address is recorded first, through clientip.WithPeerAddr. Trust is
+// decided on the connection, and once RemoteAddr carries the client, testing it
+// against the proxy CIDRs asks whether the client is a proxy. After this,
+// RemoteAddr answers "who is the client" and clientip.PeerAddr answers "who
+// connected".
 //
 // A deployment configuring no trusted proxies trusts every peer's forwarded
 // headers, which the configuration loader already warns about at startup.
 func trustedRealIP(trustedProxies []string) func(http.Handler) http.Handler {
 	trusted := clientip.NewTrustedProxies(trustedProxies)
 	return func(next http.Handler) http.Handler {
-		forwarded := middleware.RealIP(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if trusted.AllowsPeer(r.RemoteAddr) {
-				forwarded.ServeHTTP(w, r.WithContext(clientip.WithPeerAddr(r.Context(), r.RemoteAddr)))
-				return
+				r = r.WithContext(clientip.WithPeerAddr(r.Context(), r.RemoteAddr))
+				r.RemoteAddr = trusted.RemoteAddr(r)
 			}
 			next.ServeHTTP(w, r)
 		})

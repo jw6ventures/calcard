@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -4155,9 +4156,6 @@ func (f *fakeDeadPropertyRepo) ListByResources(_ context.Context, resourcePaths 
 func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
 	properties := f.properties[resourcePath]
 	for _, mutation := range mutations {
-		if !mutation.Remove {
-			continue
-		}
 		filtered := properties[:0]
 		for _, property := range properties {
 			if property.NamespaceURI != mutation.NamespaceURI || property.LocalName != mutation.LocalName {
@@ -4165,6 +4163,14 @@ func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mut
 			}
 		}
 		properties = filtered
+		if !mutation.Remove {
+			properties = append(properties, store.DeadProperty{
+				ResourcePath: resourcePath,
+				NamespaceURI: mutation.NamespaceURI,
+				LocalName:    mutation.LocalName,
+				InnerXML:     mutation.InnerXML,
+			})
+		}
 	}
 	f.properties[resourcePath] = properties
 	return nil
@@ -4179,6 +4185,7 @@ func (f *fakeContactRepo) Upsert(ctx context.Context, contact store.Contact) (*s
 }
 
 func (f *fakeContactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
+	delete(f.contacts, f.key(addressBookID, uid))
 	return nil
 }
 
@@ -4190,6 +4197,8 @@ func (f *fakeContactRepo) GetByUID(ctx context.Context, addressBookID int64, uid
 	return nil, nil
 }
 
+// ListForBook returns the book's contacts in the order the store lists them:
+// by display name, case-insensitively, then by ID.
 func (f *fakeContactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]store.Contact, error) {
 	var result []store.Contact
 	for _, c := range f.contacts {
@@ -4197,6 +4206,15 @@ func (f *fakeContactRepo) ListForBook(ctx context.Context, addressBookID int64) 
 			result = append(result, *c)
 		}
 	}
+	displayName := func(c store.Contact) string {
+		if c.DisplayName == nil {
+			return ""
+		}
+		return strings.ToLower(*c.DisplayName)
+	}
+	slices.SortFunc(result, func(a, b store.Contact) int {
+		return cmp.Or(strings.Compare(displayName(a), displayName(b)), cmp.Compare(a.ID, b.ID))
+	})
 	return result, nil
 }
 
@@ -4206,8 +4224,12 @@ func (f *fakeContactRepo) ListForBookFiltered(ctx context.Context, addressBookID
 
 func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*store.PaginatedResult[store.Contact], error) {
 	contacts, _ := f.ListForBook(ctx, addressBookID)
+	page := contacts[min(offset, len(contacts)):]
+	if limit > 0 && limit < len(page) {
+		page = page[:limit]
+	}
 	return &store.PaginatedResult[store.Contact]{
-		Items:      contacts,
+		Items:      page,
 		TotalCount: len(contacts),
 		Limit:      limit,
 		Offset:     offset,
@@ -4744,6 +4766,392 @@ func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
 	if !strings.Contains(location, "/addressbooks/1") {
 		t.Fatalf("expected redirect back to source book, got %q", location)
 	}
+}
+
+func contactRequest(method, target, bookID, uid string, form url.Values, user *store.User) *http.Request {
+	req := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", bookID)
+	rctx.URLParams.Add("uid", uid)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	return req.WithContext(auth.WithUser(req.Context(), user))
+}
+
+// Deleting or moving a contact is decided as a CardDAV DELETE or MOVE of it
+// is: DAV:unbind on the book, and some privilege on the contact itself. A
+// sharee with write on the book whose every privilege on one contact that
+// contact's own ACL denies cannot remove that contact, and is answered as for
+// a contact that is not there, so as not to learn it exists; the book's other
+// contacts are still deleted and moved.
+func TestContactDeleteAndMoveHonourTheContactsOwnACL(t *testing.T) {
+	const shareeHref = "/dav/principals/100/"
+	sharee := &store.User{ID: 100, PrimaryEmail: "sharee@example.com"}
+	card := func(uid string) string {
+		return "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + uid + "\r\nEND:VCARD\r\n"
+	}
+	newHandler := func() (*Handler, *fakeContactRepoWithMove) {
+		contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:guarded": {ID: 1, AddressBookID: 1, UID: "guarded", ResourceName: "guarded", ETag: "g", RawVCard: card("guarded")},
+			"1:open":    {ID: 2, AddressBookID: 1, UID: "open", ResourceName: "open", ETag: "o", RawVCard: card("open")},
+		}}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 200, Name: "Owner's book"},
+				2: {ID: 2, UserID: 100, Name: "Sharee's book"},
+			}},
+			Contacts: contactRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: "write"},
+				{ResourcePath: "/dav/addressbooks/1/guarded", PrincipalHref: shareeHref, IsGrant: false, Privilege: "all"},
+			}},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, contactRepo
+	}
+	moveForm := url.Values{"target_address_book_id": {"2"}}
+
+	t.Run("delete of the denied contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/guarded", "1", "guarded", nil, sharee))
+		if rr.Code != http.StatusFound || !strings.Contains(rr.Header().Get("Location"), "status=contact_deleted") {
+			t.Fatalf("DeleteContact() status = %d, location %q, want the redirect a missing contact gets", rr.Code, rr.Header().Get("Location"))
+		}
+		if contactRepo.contacts["1:guarded"] == nil {
+			t.Fatal("DeleteContact() deleted a contact its ACL denies the sharee")
+		}
+	})
+	t.Run("move of the denied contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/guarded/move", "1", "guarded", moveForm, sharee))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("MoveContact() status = %d, want %d as for a missing contact", rr.Code, http.StatusNotFound)
+		}
+		if contactRepo.moved || contactRepo.contacts["1:guarded"] == nil {
+			t.Fatal("MoveContact() moved a contact its ACL denies the sharee")
+		}
+	})
+	t.Run("delete of another contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/open", "1", "open", nil, sharee))
+		if rr.Code != http.StatusFound {
+			t.Fatalf("DeleteContact() status = %d, want %d", rr.Code, http.StatusFound)
+		}
+		if contactRepo.contacts["1:open"] != nil {
+			t.Fatal("DeleteContact() kept a contact the book's share lets the sharee delete")
+		}
+	})
+	t.Run("move of another contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/open/move", "1", "open", moveForm, sharee))
+		if rr.Code != http.StatusFound || !strings.Contains(rr.Header().Get("Location"), "/addressbooks/2") {
+			t.Fatalf("MoveContact() status = %d, location %q, want a redirect to the target book", rr.Code, rr.Header().Get("Location"))
+		}
+		if contactRepo.contacts["2:open"] == nil {
+			t.Fatal("MoveContact() did not move a contact the book's share lets the sharee move")
+		}
+	})
+}
+
+// A contact's dead properties and its own ACL belong to it rather than to the
+// path it left, so a move takes them to its new path (RFC 3744 section 7.3).
+func TestMoveContactCarriesItsDAVStateToTheNewPath(t *testing.T) {
+	const (
+		oldPath = "/dav/addressbooks/1/alice"
+		newPath = "/dav/addressbooks/2/alice"
+	)
+	contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "alice", ETag: "e", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Alice\r\nEND:VCARD\r\n"},
+	}}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: oldPath, PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+	}}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		oldPath: {{ResourcePath: oldPath, NamespaceURI: "urn:test", LocalName: "note", InnerXML: "kept"}},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+		}},
+		Contacts:       contactRepo,
+		ACLEntries:     aclRepo,
+		DeadProperties: deadProperties,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	rr := httptest.NewRecorder()
+	handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+		url.Values{"target_address_book_id": {"2"}}, &store.User{ID: 100}))
+
+	if rr.Code != http.StatusFound || !contactRepo.moved {
+		t.Fatalf("MoveContact() status = %d, moved = %v, want the contact moved", rr.Code, contactRepo.moved)
+	}
+	if len(aclRepo.entries) != 1 || aclRepo.entries[0].ResourcePath != newPath {
+		t.Fatalf("ACL entries after the move = %#v, want the contact's one entry at %q", aclRepo.entries, newPath)
+	}
+	if len(deadProperties.properties[oldPath]) != 0 {
+		t.Fatalf("dead properties left at the old path: %#v", deadProperties.properties[oldPath])
+	}
+	if moved := deadProperties.properties[newPath]; len(moved) != 1 || moved[0].InnerXML != "kept" {
+		t.Fatalf("dead properties at the new path = %#v, want the contact's note", moved)
+	}
+}
+
+// racingDestinationContactRepo commits another client's contact into the
+// destination book right after the first lookup there by resource name, which
+// is the move's check that the destination is free.
+type racingDestinationContactRepo struct {
+	*fakeContactRepoWithMove
+	destinationBookID int64
+	race              func()
+}
+
+func (r *racingDestinationContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	contact, err := r.fakeContactRepoWithMove.GetByResourceName(ctx, addressBookID, resourceName)
+	if addressBookID == r.destinationBookID && r.race != nil {
+		race := r.race
+		r.race = nil
+		race()
+	}
+	return contact, err
+}
+
+func TestMoveContactKeepsADestinationContactCreatedWhileItRuns(t *testing.T) {
+	const theirs = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Theirs\r\nEND:VCARD\r\n"
+	base := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "contact-1", ETag: "mine", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Mine\r\nEND:VCARD\r\n"},
+	}}}
+	contactRepo := &racingDestinationContactRepo{fakeContactRepoWithMove: base, destinationBookID: 2, race: func() {
+		base.contacts["2:contact-1"] = &store.Contact{ID: 2, AddressBookID: 2, UID: "contact-1", ResourceName: "contact-1", ETag: "theirs", RawVCard: theirs}
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	rr := httptest.NewRecorder()
+	handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+		url.Values{"target_address_book_id": {"2"}}, &store.User{ID: 100}))
+
+	if dest := base.contacts["2:contact-1"]; dest == nil || dest.RawVCard != theirs {
+		t.Fatalf("the destination contact created during the move was replaced: %#v", dest)
+	}
+	if base.contacts["1:contact-1"] == nil {
+		t.Fatal("the source contact was removed although the move could not complete")
+	}
+	location := rr.Header().Get("Location")
+	if rr.Code != http.StatusFound || !strings.Contains(location, "/addressbooks/1") || !strings.Contains(location, "already+exists") {
+		t.Fatalf("MoveContact() status = %d, location %q, want a redirect back reporting the conflict", rr.Code, location)
+	}
+}
+
+// Deleting and moving are decided on DAV:unbind and DAV:bind, not on the
+// write-content an edit needs, and a refusal of either comes back to the book
+// page with a message rather than as a bare error page.
+func TestContactRemovalRefusalsReturnToTheBookWithAMessage(t *testing.T) {
+	const shareeHref = "/dav/principals/100/"
+	sharee := &store.User{ID: 100}
+	newHandler := func(book []store.ACLEntry) (*Handler, *fakeContactRepoWithMove) {
+		contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:alice": {ID: 1, AddressBookID: 1, UID: "alice", ResourceName: "alice", ETag: "a", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"},
+		}}}
+		entries := append([]store.ACLEntry{}, book...)
+		entries = append(entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/3", PrincipalHref: shareeHref, IsGrant: true, Privilege: "read"})
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 200, Name: "Owner's book"},
+				2: {ID: 2, UserID: 100, Name: "Sharee's book"},
+				3: {ID: 3, UserID: 200, Name: "Read-only book"},
+			}},
+			Contacts:   contactRepo,
+			ACLEntries: &fakeACLRepo{entries: entries},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, contactRepo
+	}
+	grant := func(privileges ...string) []store.ACLEntry {
+		var entries []store.ACLEntry
+		for _, privilege := range privileges {
+			entries = append(entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: privilege})
+		}
+		return entries
+	}
+	for _, tc := range []struct {
+		name   string
+		book   []store.ACLEntry
+		target string
+		run    string
+		flash  string
+	}{
+		{"delete with write-content but not unbind", grant("read", "write-content"), "", "delete", "You may not delete contacts from this address book."},
+		{"delete with read alone", grant("read"), "", "delete", "You may not delete contacts from this address book."},
+		{"move with write-content but not unbind", grant("read", "write-content"), "2", "move", "You may not move contacts out of this address book."},
+		{"move into a book shared read-only", grant("read", "write"), "3", "move", "cannot write to target address book"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, contactRepo := newHandler(tc.book)
+			rr := httptest.NewRecorder()
+			if tc.run == "delete" {
+				handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/alice", "1", "alice", nil, sharee))
+			} else {
+				handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/alice/move", "1", "alice",
+					url.Values{"target_address_book_id": {tc.target}}, sharee))
+			}
+			location, err := url.QueryUnescape(rr.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != http.StatusFound || !strings.HasPrefix(location, "/addressbooks/1") || !strings.Contains(location, tc.flash) {
+				t.Fatalf("status = %d, location %q, want a redirect to the book saying %q", rr.Code, location, tc.flash)
+			}
+			if contactRepo.contacts["1:alice"] == nil || contactRepo.moved {
+				t.Fatal("the contact was removed from the book")
+			}
+		})
+	}
+}
+
+// changingContactRepo shows the store's re-check of a write a different card
+// from the one the write was decided on, every time, as if another client
+// kept editing the contact.
+type changingContactRepo struct {
+	*fakeContactRepoWithMove
+}
+
+func (r *changingContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	contact, err := r.fakeContactRepoWithMove.GetByResourceName(ctx, addressBookID, resourceName)
+	if contact != nil {
+		contact.RawVCard += "NOTE:changed\r\n"
+	}
+	return contact, err
+}
+
+// A delete or move given up because the contact kept changing under it says
+// so, rather than reporting a destination conflict or a bare failure.
+func TestContactRemovalReportsAContactThatKeepsChanging(t *testing.T) {
+	newHandler := func() (*Handler, *fakeContactRepoWithMove) {
+		base := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "contact-1", ETag: "e", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Alice\r\nEND:VCARD\r\n"},
+		}}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+				2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+			}},
+			Contacts: &changingContactRepo{base},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, base
+	}
+	owner := &store.User{ID: 100}
+	for _, tc := range []struct {
+		name string
+		run  func(*Handler, *httptest.ResponseRecorder)
+		want string
+	}{
+		{"delete", func(h *Handler, rr *httptest.ResponseRecorder) {
+			h.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/contact-1", "1", "contact-1", nil, owner))
+		}, "could not be deleted"},
+		{"move", func(h *Handler, rr *httptest.ResponseRecorder) {
+			h.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+				url.Values{"target_address_book_id": {"2"}}, owner))
+		}, "could not be moved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, base := newHandler()
+			rr := httptest.NewRecorder()
+			tc.run(handler, rr)
+			flash, err := url.QueryUnescape(rr.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != http.StatusFound || !strings.Contains(flash, "kept changing elsewhere and "+tc.want) {
+				t.Fatalf("status = %d, location %q, want a redirect saying the contact kept changing", rr.Code, flash)
+			}
+			if base.contacts["1:contact-1"] == nil {
+				t.Fatal("the contact was removed")
+			}
+		})
+	}
+}
+
+// The address book page shows a sharee only the contacts they may read: a
+// contact whose own ACL denies them read is left out of the page, its count
+// and its page numbers, as a CardDAV listing of the book leaves it out. The
+// owner still sees every contact.
+func TestAddressBookPageShowsOnlyTheContactsTheViewerMayRead(t *testing.T) {
+	name := func(s string) *string { return &s }
+	card := func(uid, fn, email string) string {
+		return "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + fn + "\r\nEMAIL:" + email + "\r\nEND:VCARD\r\n"
+	}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:alpha":  {ID: 1, AddressBookID: 1, UID: "alpha", ResourceName: "alpha", DisplayName: name("Alpha"), RawVCard: card("alpha", "Alpha", "alpha@example.com")},
+		"1:hidden": {ID: 2, AddressBookID: 1, UID: "hidden", ResourceName: "hidden", DisplayName: name("Secret Person"), PrimaryEmail: name("secret@example.com"), RawVCard: card("hidden", "Secret Person", "secret@example.com")},
+		"1:zulu":   {ID: 3, AddressBookID: 1, UID: "zulu", ResourceName: "zulu", DisplayName: name("Zulu"), RawVCard: card("zulu", "Zulu", "zulu@example.com")},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 200, Name: "Owner's book"},
+		}},
+		Contacts: contactRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/101/", IsGrant: true, Privilege: "read"},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+	page := func(t *testing.T, userID int64, number int) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/addressbooks/1?page=%d&limit=1", number), nil)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: userID}))
+		rr := httptest.NewRecorder()
+		handler.ViewAddressBook(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("ViewAddressBook() page %d status = %d, want %d", number, rr.Code, http.StatusOK)
+		}
+		return rr.Body.String()
+	}
+	hidden := []string{"Secret Person", "secret@example.com", `"UID":"hidden"`}
+
+	t.Run("sharee denied one contact", func(t *testing.T) {
+		want := map[int][]string{
+			1: {"Alpha", "Page 1 of 2 (2 contacts)", "?page=2&limit=1"},
+			2: {"Zulu", "Page 2 of 2 (2 contacts)"},
+			3: {"Page 3 of 2 (2 contacts)"},
+		}
+		for number := 1; number <= 3; number++ {
+			body := page(t, 100, number)
+			for _, leaked := range hidden {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("page %d shows %s, which the contact's ACL denies the sharee", number, leaked)
+				}
+			}
+			for _, text := range want[number] {
+				if !strings.Contains(body, text) {
+					t.Errorf("page %d lacks %q", number, text)
+				}
+			}
+			if strings.Contains(body, fmt.Sprintf("?page=%d&limit=1", number+1)) && number >= 2 {
+				t.Errorf("page %d links to a page past the readable contacts", number)
+			}
+		}
+	})
+	t.Run("sharee with read on the book", func(t *testing.T) {
+		if body := page(t, 101, 2); !strings.Contains(body, "Secret Person") || !strings.Contains(body, "Page 2 of 3 (3 contacts)") {
+			t.Fatal("a sharee the contact's ACL does not name does not see it")
+		}
+	})
+	t.Run("owner", func(t *testing.T) {
+		if body := page(t, 200, 2); !strings.Contains(body, "Secret Person") || !strings.Contains(body, "Page 2 of 3 (3 contacts)") {
+			t.Fatal("the owner does not see every contact")
+		}
+	})
 }
 
 // Contact UIDs routinely contain characters that must be percent-encoded in a

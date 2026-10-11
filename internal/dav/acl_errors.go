@@ -38,6 +38,14 @@ func requirePrivatePrivilegeAt(err error, resourcePath, privilege string) error 
 	return &privilegeRequirementError{cause: err, href: cleanDAVPath(resourcePath), privilege: privilege, concealNotFound: true}
 }
 
+// refusalNamesPrivilege reports whether writePrivilegeRequirementError answers
+// err with DAV:need-privileges, the answer that admits there is a resource to
+// refuse, rather than with 404 or 500.
+func refusalNamesPrivilege(err error) bool {
+	var requirement *privilegeRequirementError
+	return errors.As(err, &requirement) && isPrivilegeRefusal(requirement.cause) && !requirement.concealNotFound
+}
+
 func writePrivilegeRequirementError(w http.ResponseWriter, err error) bool {
 	var requirement *privilegeRequirementError
 	if !errors.As(err, &requirement) {

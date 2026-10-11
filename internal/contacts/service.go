@@ -30,6 +30,16 @@ var (
 	ErrBadRequest         = errors.New("bad request")
 	ErrConflict           = errors.New("conflict")
 	ErrPreconditionFailed = errors.New("precondition failed")
+
+	// ErrChangedConcurrently is a change to a contact given up because the
+	// contact or its access kept changing between each attempt's read and its
+	// write. It is a conflict.
+	ErrChangedConcurrently = fmt.Errorf("%w: the contact or its access kept changing", ErrConflict)
+
+	// ErrDestinationForbidden refuses a move for want of DAV:bind on the
+	// destination address book, or of a destination book the user can reach.
+	// It is ErrForbidden.
+	ErrDestinationForbidden = fmt.Errorf("%w: the destination address book does not admit the contact", ErrForbidden)
 )
 
 // FieldError is a refused structured payload field. Field is the
@@ -131,11 +141,27 @@ func (s *Service) ListContacts(ctx context.Context, user *store.User, bookID int
 	if user != nil && book.UserID == user.ID {
 		return s.store.Contacts.ListForBookFiltered(ctx, bookID, filter)
 	}
+	var selection store.ContactSelection
+	err = s.store.ReadContactListing(ctx, func(listing *store.ContactListing) error {
+		readable, err := newReadDecider(ctx, listing, user, *book)
+		if err != nil {
+			return err
+		}
+		selection, err = readable.selection(ctx, listing)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if selection.Except && len(selection.IDs) == 0 {
+		return s.store.Contacts.ListForBookFiltered(ctx, bookID, filter)
+	}
+	if !selection.Except && len(selection.IDs) == 0 {
+		return []store.Contact{}, nil
+	}
 
-	// Sharees may hold per-contact grants, so pagination is applied in Go after
-	// ACL filtering (mirroring events.Service.ListEvents) to keep page sizes
-	// correct.
-	limit, offset := filter.Limit, filter.Offset
+	// A contact's own ACL can hide it, so the filter's page is cut after the
+	// contacts the user may not read are left out.
 	dbFilter := filter
 	dbFilter.Limit = 0
 	dbFilter.Offset = 0
@@ -143,43 +169,144 @@ func (s *Service) ListContacts(ctx context.Context, user *store.User, bookID int
 	if err != nil {
 		return nil, err
 	}
-	entriesByPath, err := s.prefetchACLEntries(ctx, user, bookID, contacts)
-	if err != nil {
-		return nil, err
+	apart := make(map[int64]bool, len(selection.IDs))
+	for _, id := range selection.IDs {
+		apart[id] = true
 	}
 	visible := make([]store.Contact, 0, len(contacts))
+	skip := max(filter.Offset, 0)
 	for _, c := range contacts {
-		if canReadContactFromEntries(user, bookID, book.UserID, contactResourceName(c), entriesByPath) {
-			visible = append(visible, c)
+		if filter.Limit > 0 && len(visible) == filter.Limit {
+			break
 		}
-	}
-	if offset > 0 {
-		if offset >= len(visible) {
-			return []store.Contact{}, nil
+		if apart[c.ID] == selection.Except {
+			continue
 		}
-		visible = visible[offset:]
-	}
-	if limit > 0 && limit < len(visible) {
-		visible = visible[:limit]
+		if skip > 0 {
+			skip--
+			continue
+		}
+		visible = append(visible, c)
 	}
 	return visible, nil
 }
 
+// ListContactsPage returns one page of the contacts in book that the user may
+// read, in the store's display-name order, together with how many such
+// contacts there are. Each contact is decided as GetContact decides it, and
+// the decisions and the page are read from one snapshot. A page of no more
+// than zero contacts is empty, and still carries the count.
+func (s *Service) ListContactsPage(ctx context.Context, user *store.User, book store.AddressBook, limit, offset int) (*store.PaginatedResult[store.Contact], error) {
+	limit, offset = max(limit, 0), max(offset, 0)
+	if user != nil && book.UserID == user.ID {
+		return s.store.Contacts.ListForBookPaginated(ctx, book.ID, limit, offset)
+	}
+	var page *store.PaginatedResult[store.Contact]
+	err := s.store.ReadContactListing(ctx, func(listing *store.ContactListing) error {
+		readable, err := newReadDecider(ctx, listing, user, book)
+		if err != nil {
+			return err
+		}
+		selection, err := readable.selection(ctx, listing)
+		if err != nil {
+			return err
+		}
+		page, err = listing.Page(ctx, book.ID, selection, limit, offset)
+		return err
+	})
+	return page, err
+}
+
+// readDecider decides which contacts of one book a user who does not own it
+// may read, from the ACL entries naming the user on the book and on the book's
+// contacts, read in one query. A contact's own ACL decides ahead of the
+// book's, as GetContact decides it.
+type readDecider struct {
+	user          *store.User
+	book          store.AddressBook
+	entriesByPath map[string][]store.ACLEntry
+}
+
+func newReadDecider(ctx context.Context, listing *store.ContactListing, user *store.User, book store.AddressBook) (*readDecider, error) {
+	d := &readDecider{user: user, book: book, entriesByPath: map[string][]store.ACLEntry{}}
+	if user == nil {
+		return d, nil
+	}
+	entries, err := listing.CollectionACLEntries(ctx, addressBookACLCollectionPath(book.ID), acl.PrincipalHrefs(user))
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		d.entriesByPath[entry.ResourcePath] = append(d.entriesByPath[entry.ResourcePath], entry)
+	}
+	for resourcePath := range d.entriesByPath {
+		acl.SortEntries(d.entriesByPath[resourcePath])
+	}
+	return d, nil
+}
+
+func (d *readDecider) canRead(resourceName string) bool {
+	return d.user != nil && canReadContactFromEntries(d.user, d.book.ID, d.book.UserID, resourceName, d.entriesByPath)
+}
+
+// selection picks the contacts of the book the user may read. The book's ACL
+// decides every contact alike except those whose own ACL decides otherwise,
+// and only a contact some entry naming the user sits on can be one of those;
+// so only such contacts are read, by the paths the entries sit on, and decided
+// one by one.
+func (d *readDecider) selection(ctx context.Context, listing *store.ContactListing) (store.ContactSelection, error) {
+	collection := d.canRead("")
+	selection := store.ContactSelection{Except: collection}
+	memberPrefix := addressBookACLCollectionPath(d.book.ID) + "/"
+	var aclPaths []string
+	for resourcePath := range d.entriesByPath {
+		if !strings.HasPrefix(resourcePath, memberPrefix) {
+			continue
+		}
+		// A contact's entries sit on its ACL path and on that path with .vcf
+		// (addressBookACLResourcePaths), and the store finds the contact by
+		// its ACL path.
+		aclPaths = append(aclPaths, resourcePath, strings.TrimSuffix(resourcePath, ".vcf"))
+	}
+	if len(aclPaths) == 0 {
+		return selection, nil
+	}
+	names, err := listing.ContactNamesForACLPaths(ctx, d.book.ID, aclPaths)
+	if err != nil {
+		return store.ContactSelection{}, err
+	}
+	for _, name := range names {
+		resourceName := name.ResourceName
+		if resourceName == "" {
+			resourceName = name.UID
+		}
+		if d.canRead(resourceName) != collection {
+			selection.IDs = append(selection.IDs, name.ID)
+		}
+	}
+	return selection, nil
+}
+
 // GetContact returns a single readable contact in an accessible address book.
+// A contact the user may not read is answered as a contact that is not there,
+// as a CardDAV GET of it is, so the answer does not disclose that it exists.
 func (s *Service) GetContact(ctx context.Context, user *store.User, bookID int64, uid string) (*store.Contact, error) {
 	c, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
 	if err != nil {
 		return nil, err
 	}
-	if c == nil {
-		// Distinguish a missing contact in an accessible book from a hidden book.
-		if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "read"); err != nil {
-			return nil, err
-		}
-		return nil, ErrNotFound
+	resourceName := ""
+	if c != nil {
+		resourceName = contactResourceName(*c)
 	}
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, contactResourceName(*c), "read"); err != nil {
+	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, resourceName, "read"); err != nil {
+		if errors.Is(err, ErrForbidden) {
+			return nil, ErrNotFound
+		}
 		return nil, err
+	}
+	if c == nil {
+		return nil, ErrNotFound
 	}
 	return c, nil
 }
@@ -199,24 +326,20 @@ func (s *Service) CreateContact(ctx context.Context, user *store.User, bookID in
 		}
 		return nil, false, err
 	}
-	conditional := input.IfMatch != "" || input.IfNoneMatch != ""
 	for attempt := 1; ; attempt++ {
 		c, err := s.createContactOnce(ctx, user, bookID, uid, body, input)
 		if !errors.Is(err, store.ErrResourceStateChanged) {
 			return c, err == nil, err
 		}
-		if conditional {
-			return nil, false, ErrPreconditionFailed
-		}
 		if attempt == maxUpdateAttempts {
-			return nil, false, ErrConflict
+			return nil, false, ErrChangedConcurrently
 		}
 	}
 }
 
 func (s *Service) createContactOnce(ctx context.Context, user *store.User, bookID int64, uid, body string, input UpsertInput) (*store.Contact, error) {
 	resourceName := newContactResourceName(uid)
-	guard, err := s.writeGuard(ctx, user, bookID, resourceName)
+	guard, err := s.writeGuard(ctx, user, aclScope{bookID: bookID, resourceName: resourceName})
 	if err != nil {
 		return nil, err
 	}
@@ -253,71 +376,122 @@ func (s *Service) createContactOnce(ctx context.Context, user *store.User, bookI
 	return result.Contact, nil
 }
 
-// writeGuard pins the ACL entries a non-owner's write to one contact is
-// decided on: the book's and the contact's own. The store refuses the write if
-// they change before it commits, and the caller re-decides. An owner's access
-// does not come from the ACL, so it writes unguarded.
-func (s *Service) writeGuard(ctx context.Context, user *store.User, bookID int64, resourceName string) (*store.ACLGuard, error) {
-	if s.store.ACLEntries == nil || s.store.AddressBooks == nil {
-		return nil, nil
-	}
-	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
-	if err != nil {
-		return nil, err
-	}
-	if book == nil || (user != nil && book.UserID == user.ID) {
-		return nil, nil
-	}
-	paths := append([]string{addressBookACLCollectionPath(bookID)}, addressBookACLResourcePaths(bookID, resourceName)...)
-	entries, err := s.store.ACLEntries.ListByResources(ctx, paths)
-	if err != nil {
-		return nil, err
-	}
-	return store.NewACLGuard(paths, entries), nil
+// aclScope is what one access decision reads the ACL of: a book, and the
+// contact in it when resourceName is set. book is the book when the caller has
+// already read it.
+type aclScope struct {
+	bookID       int64
+	resourceName string
+	book         *store.AddressBook
 }
 
-// maxUpdateAttempts bounds how often an update is re-read and re-applied
-// when another writer changes the contact between the read and the write.
+// pinnedACL is the ACL entries a guard pinned, by resource path.
+type pinnedACL map[string][]store.ACLEntry
+
+// entries returns the pinned entries on paths, in ACL order.
+func (p pinnedACL) entries(paths ...string) []store.ACLEntry {
+	var result []store.ACLEntry
+	for _, resourcePath := range paths {
+		result = append(result, p[resourcePath]...)
+	}
+	acl.SortEntries(result)
+	return result
+}
+
+// pinACL pins the ACL entries a non-owner's write is decided on: in each scope,
+// the book's and the contact's own. The store refuses the write if they change
+// before it commits, and the caller re-decides; the entries are returned for
+// the decision to be made from. An owner's access does not come from the ACL,
+// so a book the user owns adds nothing.
+func (s *Service) pinACL(ctx context.Context, user *store.User, scopes ...aclScope) (*store.ACLGuard, pinnedACL, error) {
+	if s.store.ACLEntries == nil || s.store.AddressBooks == nil {
+		return nil, nil, nil
+	}
+	var paths []string
+	for _, scope := range scopes {
+		book := scope.book
+		if book == nil {
+			var err error
+			if book, err = s.store.AddressBooks.GetByID(ctx, scope.bookID); err != nil {
+				return nil, nil, err
+			}
+		}
+		if book == nil || (user != nil && book.UserID == user.ID) {
+			continue
+		}
+		paths = append(paths, addressBookACLCollectionPath(book.ID))
+		paths = append(paths, addressBookACLResourcePaths(book.ID, scope.resourceName)...)
+	}
+	if len(paths) == 0 {
+		return nil, nil, nil
+	}
+	entries, err := s.store.ACLEntries.ListByResources(ctx, paths)
+	if err != nil {
+		return nil, nil, err
+	}
+	pinned := pinnedACL{}
+	for _, entry := range entries {
+		pinned[entry.ResourcePath] = append(pinned[entry.ResourcePath], entry)
+	}
+	return store.NewACLGuard(paths, entries), pinned, nil
+}
+
+// writeGuard is pinACL for a write decided by reading the ACL afresh.
+func (s *Service) writeGuard(ctx context.Context, user *store.User, scopes ...aclScope) (*store.ACLGuard, error) {
+	guard, _, err := s.pinACL(ctx, user, scopes...)
+	return guard, err
+}
+
+// maxUpdateAttempts bounds how often a write is re-read and re-decided when
+// another writer changes the contact or its ACL between the read and the
+// write.
 const maxUpdateAttempts = 3
 
 // UpdateContact replaces an existing contact identified by uid. The write is
 // conditional on the version it was built from: a structured edit is merged
 // into that version, so a concurrent write is re-read and the edit re-applied
-// rather than overwritten. A caller's own If-Match or If-None-Match is honoured
-// instead of retrying.
+// rather than overwritten. A caller's own If-Match or If-None-Match is checked
+// again against the version each attempt reads, so it fails only when the
+// contact itself changed, not when only the ACL did. A user refused the write
+// who may not read the contact either is answered as for a UID that is not
+// there, as a CardDAV PUT over the contact is, so the refusal does not
+// disclose that it exists.
 func (s *Service) UpdateContact(ctx context.Context, user *store.User, bookID int64, uid string, input UpsertInput) (*store.Contact, bool, error) {
-	conditional := input.IfMatch != "" || input.IfNoneMatch != ""
 	for attempt := 1; ; attempt++ {
 		c, err := s.updateContactOnce(ctx, user, bookID, uid, input)
 		if !errors.Is(err, store.ErrResourceStateChanged) {
 			return c, false, err
 		}
-		if conditional {
-			return nil, false, ErrPreconditionFailed
-		}
 		if attempt == maxUpdateAttempts {
-			return nil, false, ErrConflict
+			return nil, false, ErrChangedConcurrently
 		}
 	}
 }
 
 func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookID int64, uid string, input UpsertInput) (*store.Contact, error) {
+	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return nil, ErrNotFound
+	}
 	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
 	if err != nil {
 		return nil, err
 	}
 	if existing == nil {
-		if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "write-content"); err != nil {
-			return nil, err
-		}
-		return nil, ErrNotFound
+		return nil, s.missingContactUpdate(ctx, user, book)
 	}
 	resourceName := contactResourceName(*existing)
-	guard, err := s.writeGuard(ctx, user, bookID, resourceName)
+	guard, err := s.writeGuard(ctx, user, aclScope{bookID: bookID, resourceName: resourceName, book: book})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, resourceName, "write-content"); err != nil {
+	if err := s.requireBookPrivilege(ctx, user, book, resourceName, "write-content"); err != nil {
+		if errors.Is(err, ErrForbidden) && s.requireBookPrivilege(ctx, user, book, resourceName, "read") != nil {
+			return nil, s.missingContactUpdate(ctx, user, book)
+		}
 		return nil, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
@@ -353,8 +527,43 @@ func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookI
 	return result.Contact, nil
 }
 
-// DeleteContact removes a contact, honoring If-Match/If-None-Match preconditions.
+// missingContactUpdate is the answer to an update of a UID book does not hold:
+// the book's refusal of write-content, or ErrNotFound.
+func (s *Service) missingContactUpdate(ctx context.Context, user *store.User, book *store.AddressBook) error {
+	if err := s.requireBookPrivilege(ctx, user, book, "", "write-content"); err != nil {
+		return err
+	}
+	return ErrNotFound
+}
+
+// DeleteContact removes a contact, honoring If-Match/If-None-Match
+// preconditions. It is decided and answered as a CardDAV DELETE of the contact
+// is: see requireDeletion. A contact that is not there, or that the user is
+// answered about as if it were not, is ErrNotFound whatever the preconditions,
+// which RFC 9110 section 13.2.1 has a server ignore when its answer without
+// them would be neither 2xx nor 412. A delete that loses to a concurrent
+// change of the contact or of the ACL is decided again, and the caller's
+// precondition is checked again against the contact as it then reads.
 func (s *Service) DeleteContact(ctx context.Context, user *store.User, bookID int64, uid, ifMatch, ifNoneMatch string) error {
+	for attempt := 1; ; attempt++ {
+		err := s.deleteContactOnce(ctx, user, bookID, uid, ifMatch, ifNoneMatch)
+		if !errors.Is(err, store.ErrResourceStateChanged) {
+			return err
+		}
+		if attempt == maxUpdateAttempts {
+			return ErrChangedConcurrently
+		}
+	}
+}
+
+func (s *Service) deleteContactOnce(ctx context.Context, user *store.User, bookID int64, uid, ifMatch, ifNoneMatch string) error {
+	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
+	if err != nil {
+		return err
+	}
+	if book == nil {
+		return ErrNotFound
+	}
 	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
 	if err != nil {
 		return err
@@ -363,27 +572,242 @@ func (s *Service) DeleteContact(ctx context.Context, user *store.User, bookID in
 	if existing != nil {
 		resourceName = contactResourceName(*existing)
 	}
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, resourceName, "unbind"); err != nil {
+	guard, pinned, err := s.pinACL(ctx, user, aclScope{bookID: bookID, resourceName: resourceName, book: book})
+	if err != nil {
 		return err
 	}
-	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
-		return ErrPreconditionFailed
+	if err := requireDeletion(user, book, resourceName, existing != nil, pinned); err != nil {
+		return err
 	}
 	if existing == nil {
 		return ErrNotFound
 	}
-	resourcePaths := addressBookACLResourcePaths(bookID, contactResourceName(*existing))
+	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
+		return ErrPreconditionFailed
+	}
+	resourcePaths := addressBookACLResourcePaths(bookID, resourceName)
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
-	err = s.store.DeleteContactAndState(ctx, bookID, store.ContactDAVResourceState(existing), resourcePaths[0], nil)
-	if errors.Is(err, store.ErrResourceStateChanged) {
-		if ifMatch != "" || ifNoneMatch != "" {
-			return ErrPreconditionFailed
+	expected := store.ContactDAVResourceState(existing)
+	expected.ACL = guard
+	return s.store.DeleteContactAndState(ctx, bookID, expected, resourcePaths[0], nil)
+}
+
+// MoveContact moves a contact into another address book under the resource
+// name it has. It is decided and answered as a CardDAV MOVE of the contact
+// is: the source side as requireMoveOut decides it, then DAV:bind on the
+// destination book, whose refusal, as the lack of a destination book the user
+// can reach, is ErrDestinationForbidden. The contact's dead properties and its
+// own ACL go with it to its new path, as RFC 3744 section 7.3 has a MOVE keep
+// the ACL, and locks on the path it leaves are dropped. A contact already in
+// the destination book under the same UID or resource name, including one
+// written while the move runs, is a conflict and is never replaced. A move
+// that loses to a concurrent change of the contact or of the ACL is decided
+// again.
+func (s *Service) MoveContact(ctx context.Context, user *store.User, fromBookID, toBookID int64, uid string) error {
+	for attempt := 1; ; attempt++ {
+		err := s.moveContactOnce(ctx, user, fromBookID, toBookID, uid)
+		if !errors.Is(err, store.ErrResourceStateChanged) {
+			return err
 		}
+		if attempt == maxUpdateAttempts {
+			return ErrChangedConcurrently
+		}
+	}
+}
+
+func (s *Service) moveContactOnce(ctx context.Context, user *store.User, fromBookID, toBookID int64, uid string) error {
+	fromBook, err := s.store.AddressBooks.GetByID(ctx, fromBookID)
+	if err != nil {
+		return err
+	}
+	if fromBook == nil {
+		return ErrNotFound
+	}
+	toBook := fromBook
+	if toBookID != fromBookID {
+		if toBook, err = s.store.AddressBooks.GetByID(ctx, toBookID); err != nil {
+			return err
+		}
+	}
+	existing, err := s.store.Contacts.GetByUID(ctx, fromBookID, uid)
+	if err != nil {
+		return err
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = contactResourceName(*existing)
+	}
+	scopes := []aclScope{{bookID: fromBookID, resourceName: resourceName, book: fromBook}}
+	if toBook != nil && toBook != fromBook {
+		scopes = append(scopes, aclScope{bookID: toBookID, book: toBook})
+	}
+	guard, pinned, err := s.pinACL(ctx, user, scopes...)
+	if err != nil {
+		return err
+	}
+	if err := requireMoveOut(user, fromBook, resourceName, pinned); err != nil {
+		return err
+	}
+	if existing == nil {
+		return ErrNotFound
+	}
+	if toBook == nil {
+		return ErrDestinationForbidden
+	}
+	if err := requireBind(user, toBook, pinned); err != nil {
+		return err
+	}
+	if fromBookID == toBookID {
+		return nil
+	}
+	fromPaths := addressBookACLResourcePaths(fromBookID, resourceName)
+	toPaths := addressBookACLResourcePaths(toBookID, resourceName)
+	if len(fromPaths) == 0 || len(toPaths) == 0 {
+		return ErrNotFound
+	}
+	if taken, err := s.store.Contacts.GetByUID(ctx, toBookID, uid); err != nil {
+		return err
+	} else if taken != nil {
+		return ErrConflict
+	}
+	if taken, err := s.store.Contacts.GetByResourceName(ctx, toBookID, resourceName); err != nil {
+		return err
+	} else if taken != nil {
+		return ErrConflict
+	}
+	// The destination is expected empty, so a contact written there after the
+	// checks above fails the move with ErrResourceStateChanged and the next
+	// attempt reports it; ErrConflict is a contact holding the UID under
+	// another resource name.
+	err = s.store.MoveContactAndState(ctx, fromBookID, toBookID, uid, resourceName, fromPaths[0], toPaths[0], "",
+		store.ContactTransferExpectation{Source: store.ContactDAVResourceState(existing), ACL: guard}, nil)
+	if errors.Is(err, store.ErrConflict) {
 		return ErrConflict
 	}
 	return err
+}
+
+// memberPrivileges are the privileges any one of which, held on a contact,
+// lets a CardDAV DELETE or MOVE of it go on to the book's DAV:unbind check.
+var memberPrivileges = []string{"read", "write", "write-content", "write-properties", "bind", "unbind"}
+
+// removalACL is what deciding the removal of one contact from a book reads:
+// the ACL entries on the contact and on the book, and the principals the user
+// counts as. RFC 3744 section 3.10 makes DAV:unbind a privilege on the
+// collection, so the book's ACL alone decides it; the contact's own ACL
+// decides, ahead of the book's, only whether the user holds any privilege on
+// the contact.
+type removalACL struct {
+	member, book []store.ACLEntry
+	principals   map[string]struct{}
+}
+
+func newRemovalACL(user *store.User, book *store.AddressBook, resourceName string, pinned pinnedACL) *removalACL {
+	return &removalACL{
+		member:     pinned.entries(addressBookACLResourcePaths(book.ID, resourceName)...),
+		book:       pinned.entries(addressBookACLCollectionPath(book.ID)),
+		principals: acl.ApplicablePrincipalsFor(user, acl.ResourcePrincipals{OwnerHref: acl.PrincipalHref(book.UserID)}),
+	}
+}
+
+// holdsAny reports whether the user holds some memberPrivilege on the contact,
+// or, with atMember false, on the book itself; and, when not, whether some was
+// denied rather than left undecided.
+func (a *removalACL) holdsAny(atMember bool) (held, denied bool) {
+	for _, privilege := range memberPrivileges {
+		granted, decided := false, false
+		if atMember {
+			granted, decided = acl.DecisionForPrivilege(a.member, a.principals, privilege)
+		}
+		if !decided {
+			granted, decided = acl.DecisionForPrivilege(a.book, a.principals, privilege)
+		}
+		if granted {
+			return true, false
+		}
+		denied = denied || decided
+	}
+	return false, denied
+}
+
+func (a *removalACL) granted(privilege string) bool {
+	granted, _ := acl.DecisionForPrivilege(a.book, a.principals, privilege)
+	return granted
+}
+
+// requireDeletion decides and answers a delete of the contact at resourceName,
+// which exists says is there, as a CardDAV DELETE of it is decided and
+// answered, from the ACL entries pinned for the delete. A user with no
+// privilege on the contact and none denied is told nothing is there. A user
+// denied every privilege on a contact that is there cannot read it, and would
+// learn from a refusal its own ACL caused that it exists, so is answered as for
+// a contact that is not there: the book's refusal, or ErrNotFound. A user
+// holding some privilege on the contact knows it is there, and is refused for
+// want of DAV:unbind on the book.
+func requireDeletion(user *store.User, book *store.AddressBook, resourceName string, exists bool, pinned pinnedACL) error {
+	if user != nil && book.UserID == user.ID {
+		return nil
+	}
+	if user == nil {
+		return ErrNotFound
+	}
+	decision := newRemovalACL(user, book, resourceName, pinned)
+	held, denied := decision.holdsAny(true)
+	switch {
+	case held && decision.granted("unbind"):
+		return nil
+	case held:
+		return ErrForbidden
+	case !denied:
+		return ErrNotFound
+	case !exists:
+		return ErrForbidden
+	}
+	if held, denied := decision.holdsAny(false); !held {
+		if denied {
+			return ErrForbidden
+		}
+		return ErrNotFound
+	}
+	if !decision.granted("unbind") {
+		return ErrForbidden
+	}
+	return ErrNotFound
+}
+
+// requireMoveOut decides and answers the source side of a move of the contact
+// at resourceName, as a CardDAV MOVE of it is, from the ACL entries pinned for
+// the move: a user holding no privilege on the contact is told nothing is
+// there, and one holding some is refused for want of DAV:unbind on the book.
+func requireMoveOut(user *store.User, book *store.AddressBook, resourceName string, pinned pinnedACL) error {
+	if user != nil && book.UserID == user.ID {
+		return nil
+	}
+	if user == nil {
+		return ErrNotFound
+	}
+	decision := newRemovalACL(user, book, resourceName, pinned)
+	if held, _ := decision.holdsAny(true); !held {
+		return ErrNotFound
+	}
+	if !decision.granted("unbind") {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// requireBind decides the destination side of a move, as a CardDAV MOVE does,
+// from the ACL entries pinned for the move: DAV:bind on the book.
+func requireBind(user *store.User, book *store.AddressBook, pinned pinnedACL) error {
+	if user != nil && book.UserID == user.ID {
+		return nil
+	}
+	if user == nil || !newRemovalACL(user, book, "", pinned).granted("bind") {
+		return ErrDestinationForbidden
+	}
+	return nil
 }
 
 func (s *Service) requireOwnedBook(ctx context.Context, user *store.User, bookID int64) (*store.AddressBook, error) {
@@ -411,20 +835,29 @@ func (s *Service) loadAddressBookWithPrivilege(ctx context.Context, user *store.
 	if book == nil {
 		return nil, ErrNotFound
 	}
-	if user != nil && book.UserID == user.ID {
-		return book, nil
-	}
-	granted, applicable, err := s.privilegeDecision(ctx, user, bookID, resourceName, privilege)
-	if err != nil {
+	if err := s.requireBookPrivilege(ctx, user, book, resourceName, privilege); err != nil {
 		return nil, err
 	}
+	return book, nil
+}
+
+// requireBookPrivilege is loadAddressBookWithPrivilege's decision over a book
+// the caller has read.
+func (s *Service) requireBookPrivilege(ctx context.Context, user *store.User, book *store.AddressBook, resourceName, privilege string) error {
+	if user != nil && book.UserID == user.ID {
+		return nil
+	}
+	granted, applicable, err := s.privilegeDecision(ctx, user, book.ID, resourceName, privilege)
+	if err != nil {
+		return err
+	}
 	if granted {
-		return book, nil
+		return nil
 	}
 	if applicable {
-		return nil, ErrForbidden
+		return ErrForbidden
 	}
-	return nil, ErrNotFound
+	return ErrNotFound
 }
 
 // ListAccessibleAddressBooks returns the books the user owns plus any shared

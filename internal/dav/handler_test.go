@@ -667,14 +667,15 @@ func TestCanLockCalendarPath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var (
-				got bool
-				err error
-			)
+			exists, err := h.lockTargetExists(context.Background(), tc.user, tc.path)
+			if err != nil {
+				t.Fatalf("lockTargetExists error = %v", err)
+			}
+			var got bool
 			if strings.HasPrefix(tc.path, "/dav/calendars/") {
-				got, err = h.canLockCalendarPath(context.Background(), tc.user, tc.path)
+				got, err = h.canLockCalendarPath(context.Background(), tc.user, tc.path, exists)
 			} else {
-				got, err = h.canLockPath(context.Background(), tc.user, tc.path)
+				got, err = h.canLockPath(context.Background(), tc.user, tc.path, exists)
 			}
 			if err != nil {
 				t.Fatalf("canLock path error = %v", err)
@@ -2273,7 +2274,10 @@ func TestPutUnsupportedPath(t *testing.T) {
 }
 
 func TestPutTooLarge(t *testing.T) {
-	h := &DavServer{}
+	h := &DavServer{store: &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 1, Name: "Home"}}},
+		Events:    &fakeEventRepo{},
+	}}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", nil)
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -7743,7 +7747,7 @@ func TestCanLockAddressBookCollectionRequiresMoreThanBind(t *testing.T) {
 		}},
 	}}
 
-	got, err := h.canLockAddressBookPath(context.Background(), user, "/dav/addressbooks/5/")
+	got, err := h.canLockAddressBookPath(context.Background(), user, "/dav/addressbooks/5/", true)
 	if err != nil {
 		t.Fatalf("canLockAddressBookPath() error = %v", err)
 	}

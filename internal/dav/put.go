@@ -110,47 +110,15 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Each write is authorized before the locks are consulted or the body is
+	// read, so a principal refused the write gets the same answer whatever
+	// locks are held and whatever it sent.
 	cleanPath := path.Clean(r.URL.Path)
 	target := parsedDAVTarget(r.Context(), cleanPath)
-	if !h.requireLock(w, r, cleanPath, "resource is locked") {
-		return
-	}
 	if target.Domain == davPathCalendar && !target.Resource {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	isCalendar := target.Valid && target.Domain == davPathCalendar && target.Resource
-	isAddressBook := target.Valid && target.Domain == davPathAddressBook && target.Resource
-	if r.ContentLength > maxDAVBodyBytes {
-		if isCalendar {
-			// §1.3: a body over the limit fails however often it is resubmitted.
-			writeCalDAVError(w, http.StatusForbidden, "max-resource-size")
-		} else if isAddressBook {
-			writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
-		} else {
-			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		}
-		return
-	}
-	limitedBody := http.MaxBytesReader(w, r.Body, maxDAVBodyBytes)
-	body, err := io.ReadAll(limitedBody)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			if isCalendar {
-				writeCalDAVError(w, http.StatusForbidden, "max-resource-size")
-			} else if isAddressBook {
-				writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
-			} else {
-				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-			}
-		} else {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
-		}
-		return
-	}
-	etag := fmt.Sprintf("%x", sha256.Sum256(body))
-	bodyText := string(body)
 
 	if calendarID, resourceUID, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -164,11 +132,11 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
 		return
 	} else if matched {
-		h.putCalendarObject(w, r, user, calendarID, resourceUID, cleanPath, body, bodyText, etag)
+		h.putCalendarObject(w, r, user, calendarID, resourceUID, cleanPath)
 		return
 	}
 
-	if addressBookID, _, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
+	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "address book not found", http.StatusNotFound)
 			return
@@ -180,14 +148,47 @@ func (h *DavServer) put(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load address book", http.StatusInternalServerError)
 		return
 	} else if matched {
-		h.putContact(w, r, user, addressBookID, cleanPath, body, bodyText, etag)
+		h.putContact(w, r, user, addressBookID, resourceName, cleanPath)
 		return
 	}
 
-	http.Error(w, "unsupported path", http.StatusBadRequest)
+	if _, ok := readPutBody(w, r, davPathUnknown); ok {
+		http.Error(w, "unsupported path", http.StatusBadRequest)
+	}
 }
 
-func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string, body []byte, bodyText, etag string) {
+// readPutBody reads a PUT body up to the resource size limit, answering the
+// request itself when it cannot. domain picks how an oversized body is refused.
+func readPutBody(w http.ResponseWriter, r *http.Request, domain davPathDomain) ([]byte, bool) {
+	writeTooLarge := func() {
+		switch domain {
+		case davPathCalendar:
+			// §1.3: a body over the limit fails however often it is resubmitted.
+			writeCalDAVError(w, http.StatusForbidden, "max-resource-size")
+		case davPathAddressBook:
+			writeCardDAVPrecondition(w, http.StatusRequestEntityTooLarge, "max-resource-size")
+		default:
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		}
+	}
+	if r.ContentLength > maxDAVBodyBytes {
+		writeTooLarge()
+		return nil, false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxDAVBodyBytes))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeTooLarge()
+		} else {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+		}
+		return nil, false
+	}
+	return body, true
+}
+
+func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, resourceUID, cleanPath string) {
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
@@ -197,6 +198,15 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	if !ok {
 		return
 	}
+	if !h.requireLock(w, r, cleanPath, "resource is locked") {
+		return
+	}
+	body, ok := readPutBody(w, r, davPathCalendar)
+	if !ok {
+		return
+	}
+	etag := fmt.Sprintf("%x", sha256.Sum256(body))
+	bodyText := string(body)
 
 	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
 	missingContentType := contentType == ""
@@ -266,7 +276,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		Precondition:      calendarObjectPrecondition(r),
 		ExpectedState:     &store.CalendarObjectResourceState{Exists: existingByResource != nil},
 		ExpectedACL:       aclGuard,
-		LockPreconditions: h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
+		LockPreconditions: h.lockPreconditions(r, putLockPaths(cleanPath, existingByResource == nil)...),
 	}
 	result, err := h.store.PutCalendarObject(r.Context(), write)
 	for attempt := 0; attempt < maxResourceStateRetries && errors.Is(err, store.ErrResourceStateChanged); attempt++ {
@@ -296,6 +306,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		// failed still answers 412 rather than being retried into a wrong result.
 		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
 		write.ExpectedACL = currentACL
+		write.LockPreconditions = h.lockPreconditions(r, putLockPaths(cleanPath, current == nil)...)
 		result, err = h.store.PutCalendarObject(r.Context(), write)
 	}
 	switch {
@@ -410,21 +421,101 @@ func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http
 	}
 	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, privilegePath, requiredPrivilege)
 	if err != nil {
-		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, requiredPrivilege))
+		refusal := requirePrivilegeAt(err, privilegePath, requiredPrivilege)
+		if existing != nil {
+			refusal = h.existingObjectWriteRefusal(r.Context(), user, cleanPath, refusal, func() error {
+				parentPath := path.Dir(cleanPath)
+				if _, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, parentPath, "bind"); err != nil {
+					return requirePrivilegeAt(err, parentPath, "bind")
+				}
+				return nil
+			})
+		}
+		_ = writePrivilegeRequirementError(w, refusal)
 		return nil, nil, false
 	}
 	return cal, existing, true
 }
 
-func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string) {
-	h.putContactWithRetry(w, r, user, addressBookID, cleanPath, body, bodyText, etag, maxResourceStateRetries)
+// putLockPaths names the resources whose locks a PUT to cleanPath must hold
+// the tokens for: the target, and its collection when the PUT creates a
+// member. RFC 4918 §7.5 has a depth 0 lock on a collection cover its
+// membership, not the content of its members.
+func putLockPaths(cleanPath string, createsMember bool) []string {
+	if createsMember {
+		return []string{cleanPath, path.Dir(cleanPath)}
+	}
+	return []string{cleanPath}
 }
 
-func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, cleanPath string, body []byte, bodyText, etag string, retries int) {
+// contactPutRequest is a contact PUT's target and body, read and checked once
+// however often the write is retried.
+type contactPutRequest struct {
+	addressBookID int64
+	resourceName  string
+	cleanPath     string
+	contentType   string
+	body          []byte
+	bodyText      string
+	etag          string
+	uid           string
+}
+
+func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, resourceName, cleanPath string) {
+	aclGuard, existingByName, ok := h.authorizeContactObjectTarget(w, r, user, addressBookID, resourceName, cleanPath)
+	if !ok {
+		return
+	}
+	if !h.requireLock(w, r, cleanPath, "resource is locked") {
+		return
+	}
+	body, ok := readPutBody(w, r, davPathAddressBook)
+	if !ok {
+		return
+	}
+	req := contactPutRequest{
+		addressBookID: addressBookID,
+		resourceName:  resourceName,
+		cleanPath:     cleanPath,
+		contentType:   strings.TrimSpace(r.Header.Get("Content-Type")),
+		body:          body,
+		bodyText:      string(body),
+		etag:          fmt.Sprintf("%x", sha256.Sum256(body)),
+	}
+	if req.contentType != "" && !mediaTypeAdvertised(req.contentType, "text/vcard", addressDataVersions) {
+		writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
+		return
+	}
+
+	if err := h.validateVCard(req.bodyText); err != nil {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
+
+	uid, err := extractUIDFromVCard(req.bodyText)
+	if err != nil {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
+	req.uid = uid
+
+	if len(resourceName) > store.MaxIdentifierOctets {
+		// A unique index key, which PostgreSQL bounds in size.
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
+	h.putContactWithRetry(w, r, user, req, aclGuard, existingByName, maxResourceStateRetries)
+}
+
+// authorizeContactObjectTarget decides whether user may write the contact at
+// cleanPath, answering the request itself when it may not. It returns the ACL
+// state the decision read, for the write to re-check, and the contact the
+// write would replace.
+func (h *DavServer) authorizeContactObjectTarget(w http.ResponseWriter, r *http.Request, user *store.User, addressBookID int64, resourceName, cleanPath string) (*store.ACLGuard, *store.Contact, bool) {
 	aclGuard, err := h.aclGuard(r.Context(), user, cleanPath)
 	if err != nil {
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
-		return
+		return nil, nil, false
 	}
 	book, err := h.getAddressBook(r.Context(), addressBookID)
 	if err != nil {
@@ -433,67 +524,55 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 			status = http.StatusNotFound
 		}
 		http.Error(w, "address book not found", status)
-		return
+		return nil, nil, false
 	}
-
-	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
-	if contentType != "" && !mediaTypeAdvertised(contentType, "text/vcard", addressDataVersions) {
-		writeCardDAVPrecondition(w, http.StatusUnsupportedMediaType, "supported-address-data")
-		return
-	}
-
-	if err := h.validateVCard(bodyText); err != nil {
-		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
-		return
-	}
-
-	uid, err := extractUIDFromVCard(bodyText)
-	if err != nil {
-		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
-		return
-	}
-
-	// UID conflict detection (RFC 6352 §5.1, §6.3.2.1)
-	resourceName := parsedDAVTarget(r.Context(), cleanPath).ResourceName
-	if len(resourceName) > store.MaxIdentifierOctets {
-		// A unique index key, which PostgreSQL bounds in size.
-		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
-		return
-	}
-
-	// Check if an existing resource at this path has a different UID
-	existingByName, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
+	existing, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
 		http.Error(w, "failed to load contact", http.StatusInternalServerError)
-		return
-	}
-	if existingByName == nil && !h.requireLock(w, r, path.Dir(cleanPath), "resource is locked") {
-		return
+		return nil, nil, false
 	}
 	requiredPrivilege := "bind"
 	privilegePath := path.Dir(cleanPath)
-	if existingByName != nil {
+	if existing != nil {
 		requiredPrivilege = "write-content"
 		privilegePath = cleanPath
 	}
 	if err := h.requireAddressBookPrivilege(r.Context(), user, book, privilegePath, requiredPrivilege); err != nil {
-		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, requiredPrivilege))
+		refusal := requirePrivilegeAt(err, privilegePath, requiredPrivilege)
+		if existing != nil {
+			refusal = h.existingObjectWriteRefusal(r.Context(), user, cleanPath, refusal, func() error {
+				parentPath := path.Dir(cleanPath)
+				if err := h.requireAddressBookPrivilege(r.Context(), user, book, parentPath, "bind"); err != nil {
+					return requirePrivilegeAt(err, parentPath, "bind")
+				}
+				return nil
+			})
+		}
+		_ = writePrivilegeRequirementError(w, refusal)
+		return nil, nil, false
+	}
+	return aclGuard, existing, true
+}
+
+func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, user *store.User, req contactPutRequest, aclGuard *store.ACLGuard, existingByName *store.Contact, retries int) {
+	if existingByName == nil && !h.requireLock(w, r, path.Dir(req.cleanPath), "resource is locked") {
 		return
 	}
-	if existingByName != nil && existingByName.UID != uid {
-		conflictHref := addressObjectConflictHref(addressBookID, contactResourceName(*existingByName))
+	// RFC 6352 §5.1 and §6.3.2.1: a UID names one resource per address book.
+	if existingByName != nil && existingByName.UID != req.uid {
+		conflictHref := addressObjectConflictHref(req.addressBookID, contactResourceName(*existingByName))
 		writeCardDAVUIDConflict(w, conflictHref)
 		return
 	}
 
 	// Check if another resource already uses this UID
-	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), addressBookID, uid)
+	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), req.addressBookID, req.uid)
 	if err != nil {
 		http.Error(w, "failed to load contact", http.StatusInternalServerError)
 		return
 	}
-	if existingByUID != nil && contactResourceName(*existingByUID) != resourceName {
-		conflictHref := addressObjectConflictHref(addressBookID, contactResourceName(*existingByUID))
+	if existingByUID != nil && contactResourceName(*existingByUID) != req.resourceName {
+		conflictHref := addressObjectConflictHref(req.addressBookID, contactResourceName(*existingByUID))
 		writeCardDAVUIDConflict(w, conflictHref)
 		return
 	}
@@ -509,18 +588,18 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		Context:      r.Context(),
 		User:         user,
 		Request:      r,
-		Path:         cleanPath,
+		Path:         req.cleanPath,
 		ResourceType: ResourceTypeAddressObject,
-		CollectionID: addressBookID,
-		ResourceName: resourceName,
-		ContentType:  contentType,
-		Body:         body,
-		ETag:         etag,
+		CollectionID: req.addressBookID,
+		ResourceName: req.resourceName,
+		ContentType:  req.contentType,
+		Body:         req.body,
+		ETag:         req.etag,
 	}); writeResponseError(w, err) {
 		return
 	}
 
-	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
+	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, req.cleanPath)
 	if err != nil {
 		http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 		return
@@ -528,15 +607,15 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 	expectedState := store.ContactDAVResourceState(existingByName)
 	expectedState.ACL = aclGuard
 	result, err := h.store.PutContactObject(r.Context(), store.ContactObjectWrite{
-		AddressBookID:     addressBookID,
-		UID:               uid,
-		ResourceName:      resourceName,
-		RawVCard:          bodyText,
-		ETag:              etag,
+		AddressBookID:     req.addressBookID,
+		UID:               req.uid,
+		ResourceName:      req.resourceName,
+		RawVCard:          req.bodyText,
+		ETag:              req.etag,
 		Precondition:      calendarObjectPrecondition(r),
 		ExpectedState:     expectedState,
 		StatePath:         canonicalPath,
-		LockPreconditions: h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)),
+		LockPreconditions: h.lockPreconditions(r, putLockPaths(req.cleanPath, existingByName == nil)...),
 	})
 	switch {
 	case errors.Is(err, store.ErrUIDConflict):
@@ -544,15 +623,19 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 			http.Error(w, "failed to save contact", http.StatusInternalServerError)
 			return
 		}
-		writeCardDAVUIDConflict(w, addressObjectConflictHref(addressBookID, contactResourceName(*result.Conflict)))
+		writeCardDAVUIDConflict(w, addressObjectConflictHref(req.addressBookID, contactResourceName(*result.Conflict)))
 		return
 	case errors.Is(err, store.ErrConflict):
-		writeCardDAVUIDConflict(w, cleanPath)
+		writeCardDAVUIDConflict(w, req.cleanPath)
 		return
 	case errors.Is(err, store.ErrResourceStateChanged):
 		if retries > 0 {
 			invalidateDAVRequestState(r.Context())
-			h.putContactWithRetry(w, r, user, addressBookID, cleanPath, body, bodyText, etag, retries-1)
+			currentACL, current, authorized := h.authorizeContactObjectTarget(w, r, user, req.addressBookID, req.resourceName, req.cleanPath)
+			if !authorized {
+				return
+			}
+			h.putContactWithRetry(w, r, user, req, currentACL, current, retries-1)
 			return
 		}
 		http.Error(w, "resource changed while writing; retry the request", http.StatusConflict)
@@ -564,16 +647,16 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "resource is locked", http.StatusLocked)
 		return
 	case err != nil:
-		h.logger().Error("Put", "failed to save contact %q in address book %d: %v", uid, addressBookID, err)
+		h.logger().Error("Put", "failed to save contact %q in address book %d: %v", req.uid, req.addressBookID, err)
 		http.Error(w, "failed to save contact", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", req.etag))
 	if result != nil && result.Created {
-		h.logger().Info("Put", "created contact %q in address book %d", uid, addressBookID)
+		h.logger().Info("Put", "created contact %q in address book %d", req.uid, req.addressBookID)
 		w.WriteHeader(http.StatusCreated)
 	} else {
-		h.logger().Info("Put", "updated contact %q in address book %d", uid, addressBookID)
+		h.logger().Info("Put", "updated contact %q in address book %d", req.uid, req.addressBookID)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

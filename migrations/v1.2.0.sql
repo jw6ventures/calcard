@@ -147,6 +147,13 @@ CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
 CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
     ON acl_entries (resource_path, principal_href);
 
+-- Serves a range over every path beneath a collection whatever the database's
+-- collation: text_pattern_ops compares byte-wise, which a range on a path
+-- prefix needs and the default btree on resource_path does not give under a
+-- linguistic collation.
+CREATE INDEX IF NOT EXISTS idx_acl_resource_path_pattern
+    ON acl_entries (resource_path text_pattern_ops);
+
 CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
 
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT;

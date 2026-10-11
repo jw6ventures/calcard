@@ -59,3 +59,45 @@ func TestContactPutRetryRechecksPreconditionsAndAuthorization(t *testing.T) {
 		})
 	}
 }
+
+// A refusal raised when a contact PUT is re-authorized after losing a race is
+// worded as the first decision's would be: a principal that can no longer read
+// the contact is answered as for a contact that is not there.
+func TestContactPutRetryRefusalNamesWhatTheRetryLacks(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		remaining []string
+		href      string
+		privilege string
+	}{
+		{name: "write-content revoked", remaining: []string{"read", "bind"}, href: "/dav/addressbooks/1/c.vcf", privilege: "write-content"},
+		{name: "every privilege revoked", href: "/dav/addressbooks/1", privilege: "bind"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			grant := func(privileges ...string) []store.ACLEntry {
+				var entries []store.ACLEntry
+				for _, privilege := range privileges {
+					entries = append(entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: privilege})
+				}
+				return entries
+			}
+			acl := &fakeACLRepo{entries: grant("read", "write-content", "bind")}
+			backend := &changingContactWriter{change: func() { acl.entries = grant(test.remaining...) }}
+			h := NewDavServer(Options{Store: &store.Store{
+				AddressBooks:   &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 1, Name: "Contacts"}}},
+				Contacts:       &fakeContactRepo{contacts: map[string]*store.Contact{"1:c": {ID: 1, AddressBookID: 1, UID: "c", ResourceName: "c", ETag: "original"}}},
+				ContactObjects: backend,
+				ACLEntries:     acl,
+			}})
+			req := newAddressBookPutRequest("/dav/addressbooks/1/c.vcf", strings.NewReader(buildVCard("3.0", "UID:c", "FN:Contact")))
+			rr := httptest.NewRecorder()
+
+			h.ServeHTTP(rr, req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2})))
+
+			if backend.calls != 1 {
+				t.Fatalf("write attempts = %d, want 1", backend.calls)
+			}
+			assertNeedPrivileges(t, rr, test.href, davQN(test.privilege))
+		})
+	}
+}

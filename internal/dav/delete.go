@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"path"
@@ -12,6 +13,67 @@ import (
 
 func (h *DavServer) delete(w http.ResponseWriter, r *http.Request) {
 	h.deleteWithRetry(w, r, maxResourceStateRetries)
+}
+
+// memberDeleteDecision decides a DELETE of a member, which needs some
+// privilege on the member and DAV:unbind on its collection (RFC 3744 Appendix
+// B). decide makes the decision as the ACL entries at the path it is given
+// have it: the member's own and its collection's at the member's path, the
+// collection's alone, as for a member that is not there, at the collection's.
+//
+// A principal holding no privilege on an existing member, and so unable to
+// read it, would learn from a refusal its own ACL entries caused that it
+// exists, so it gets the answer a member that is not there gets: the
+// collection's refusal, or answerAsAbsent=true for the request to go on as
+// for a missing member, to 404. A principal holding some privilege on
+// the member has been told it is there, and is refused as it stands.
+func memberDeleteDecision(memberPath, parentPath string, exists func() (bool, error), decide func(decisionPath string) (holdsNone bool, refusal error)) (refusal error, answerAsAbsent bool, err error) {
+	holdsNone, refusal := decide(memberPath)
+	if refusal == nil || !holdsNone || !refusalNamesPrivilege(refusal) {
+		return refusal, false, nil
+	}
+	existing, err := exists()
+	if err != nil || !existing {
+		return refusal, false, err
+	}
+	if _, absentRefusal := decide(parentPath); absentRefusal != nil {
+		return absentRefusal, false, nil
+	}
+	return nil, true, nil
+}
+
+// calendarMemberDeleteRefusal is memberDeleteDecision's decide for a member of
+// calendarID. holdsNone reports a refusal for want of any privilege on the
+// member, as opposed to one for want of DAV:unbind on the collection. A
+// principal holding no privilege at all is answered as for a missing
+// resource.
+func (h *DavServer) calendarMemberDeleteRefusal(ctx context.Context, user *store.User, calendarID int64, decisionPath, parentPath string) (holdsNone bool, refusal error) {
+	source, err := h.loadCalendarWithAnyPrivilege(ctx, user, calendarID, decisionPath)
+	if err != nil {
+		if errors.Is(err, errForbidden) {
+			return true, requirePrivilegeAt(err, parentPath, "unbind")
+		}
+		return true, requirePrivatePrivilegeAt(err, parentPath, "unbind")
+	}
+	if err := h.requireCalendarPrivilege(ctx, user, &source.Calendar, parentPath, "unbind"); err != nil {
+		return false, requirePrivilegeAt(err, parentPath, "unbind")
+	}
+	return false, nil
+}
+
+// addressBookMemberDeleteRefusal is calendarMemberDeleteRefusal for a member
+// of book.
+func (h *DavServer) addressBookMemberDeleteRefusal(ctx context.Context, user *store.User, book *store.AddressBook, decisionPath, parentPath string) (holdsNone bool, refusal error) {
+	if err := h.requireAnyAddressBookPrivilege(ctx, user, book, decisionPath); err != nil {
+		if errors.Is(err, errForbidden) {
+			return true, requirePrivilegeAt(err, parentPath, "unbind")
+		}
+		return true, requirePrivatePrivilegeAt(err, parentPath, "unbind")
+	}
+	if err := h.requireAddressBookPrivilege(ctx, user, book, parentPath, "unbind"); err != nil {
+		return false, requirePrivilegeAt(err, parentPath, "unbind")
+	}
+	return false, nil
 }
 
 func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retries int) {
@@ -45,30 +107,38 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			return
 		}
 		privilegePath := path.Dir(cleanPath)
-		source, accessErr := h.loadCalendarWithAnyPrivilege(r.Context(), user, calendarID, cleanPath)
-		if accessErr != nil {
-			if errors.Is(accessErr, errForbidden) {
-				_ = writePrivilegeRequirementError(w, requirePrivilegeAt(accessErr, privilegePath, "unbind"))
-			} else {
-				_ = writePrivilegeRequirementError(w, requirePrivatePrivilegeAt(accessErr, privilegePath, "unbind"))
-			}
-			return
-		}
-		if err := h.requireCalendarPrivilege(r.Context(), user, &source.Calendar, privilegePath, "unbind"); err != nil {
-			_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, "unbind"))
-			return
-		}
-		existing, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
+		refusal, answerAsAbsent, err := memberDeleteDecision(cleanPath, privilegePath,
+			func() (bool, error) {
+				event, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
+				return event != nil, err
+			},
+			func(decisionPath string) (bool, error) {
+				return h.calendarMemberDeleteRefusal(r.Context(), user, calendarID, decisionPath, privilegePath)
+			})
 		if err != nil {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
 			return
 		}
-		if !h.checkConditionalHeaders(r, existing) {
-			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		if refusal != nil {
+			_ = writePrivilegeRequirementError(w, refusal)
 			return
 		}
+		var existing *store.Event
+		if !answerAsAbsent {
+			existing, err = h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
+			if err != nil {
+				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				return
+			}
+		}
+		// RFC 9110 §13.2.1: preconditions are not evaluated when the request
+		// would otherwise fail, so a missing member answers 404 under If-Match.
 		if existing == nil {
 			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if !h.checkConditionalHeaders(r, existing) {
+			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
 		}
 		lockPaths := []string{cleanPath, path.Dir(cleanPath)}
@@ -137,17 +207,21 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			return
 		}
 		privilegePath := path.Dir(cleanPath)
-		if accessErr := h.requireAnyAddressBookPrivilege(r.Context(), user, book, cleanPath); accessErr != nil {
-			if errors.Is(accessErr, errForbidden) {
-				_ = writePrivilegeRequirementError(w, requirePrivilegeAt(accessErr, privilegePath, "unbind"))
-			} else {
-				_ = writePrivilegeRequirementError(w, requirePrivatePrivilegeAt(accessErr, privilegePath, "unbind"))
-			}
+		refusal, answerAsAbsent, err := memberDeleteDecision(cleanPath, privilegePath,
+			func() (bool, error) { return existing != nil, nil },
+			func(decisionPath string) (bool, error) {
+				return h.addressBookMemberDeleteRefusal(r.Context(), user, book, decisionPath, privilegePath)
+			})
+		if err != nil {
+			http.Error(w, "failed to load contact", http.StatusInternalServerError)
 			return
 		}
-		if err := h.requireAddressBookPrivilege(r.Context(), user, book, privilegePath, "unbind"); err != nil {
-			_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, privilegePath, "unbind"))
+		if refusal != nil {
+			_ = writePrivilegeRequirementError(w, refusal)
 			return
+		}
+		if answerAsAbsent {
+			existing = nil
 		}
 		if existing == nil {
 			http.Error(w, "not found", http.StatusNotFound)

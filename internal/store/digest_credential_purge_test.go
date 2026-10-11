@@ -113,6 +113,8 @@ func TestStartDigestCredentialPurgeRetriesAfterAFailure(t *testing.T) {
 			return 0, errors.New("database unreachable")
 		}
 		cancel()
+		// Outlast the interval so a tick is ready beside the cancellation.
+		time.Sleep(5 * time.Millisecond)
 		return 1, nil
 	}}
 

@@ -142,6 +142,11 @@ func isCanonicalPrincipalHref(raw string) bool {
 	return true
 }
 
+// CalendarPrivilegeNames is every privilege a calendar access decision can
+// resolve, in DAV:acl document order. Holding any of them on a calendar or
+// event is what DELETE's any-privilege check asks of a member.
+var CalendarPrivilegeNames = []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"}
+
 func PrivilegeMatches(granted, requested string) bool {
 	if granted == requested || granted == "all" {
 		return true

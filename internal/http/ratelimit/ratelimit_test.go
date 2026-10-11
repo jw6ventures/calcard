@@ -95,8 +95,8 @@ func TestGetClientIPReadsThePeerAndTheRightmostUntrustedHop(t *testing.T) {
 	limiter := NewIPRateLimiter(rate.Limit(1), 1, time.Hour, []string{"10.0.0.0/8"})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	// What middleware.RealIP leaves behind: the leftmost X-Forwarded-For entry,
-	// which here is the one the client wrote for itself.
+	// RemoteAddr names the address the client wrote for itself, so the limiter
+	// must read the peer and the forwarded hops rather than trust it.
 	req.RemoteAddr = "203.0.113.9"
 	req.Header.Set("X-Forwarded-For", "203.0.113.9, 198.51.100.7, 10.1.2.3")
 	req = req.WithContext(clientip.WithPeerAddr(req.Context(), "10.1.2.3:4567"))

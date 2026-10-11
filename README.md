@@ -121,7 +121,7 @@ Environment variables:
 | `APP_OAUTH_DISCOVERY_URL` | one of two | Provided from IDP. Overrides `APP_OAUTH_ISSUER_URL` when set. |
 | `APP_OAUTH_REDIRECT_PATH` | false | (Default `/auth/callback`) OAuth callback path, appended to `APP_BASE_URL`. Must match the redirect URI registered with the IDP. Must be a clean absolute path that no other CalCard route uses (not `/`, and not under `/auth`, `/dav`, `/api`, `/calendars` and so on); startup fails otherwise. |
 | `APP_SESSION_SECRET` | true | Must be at least 32 characters long (ex. openssl rand -base64 32) |
-| `APP_TRUSTED_PROXIES` | false | If none are specified, CalCard trusts all proxies - Not recommended for public environments |
+| `APP_TRUSTED_PROXIES` | false | Comma-separated IPs/CIDRs of the reverse proxies that connect to CalCard directly. See [Running behind a reverse proxy](#running-behind-a-reverse-proxy). If none are specified, CalCard trusts all proxies - Not recommended for public environments |
 | `APP_HTTP_READ_TIMEOUT` | false | (Default `15s`) Maximum duration for reading an entire request, including the body (Go duration). |
 | `APP_HTTP_WRITE_TIMEOUT` | false | (Default `15s`) Maximum duration before timing out writes of the response (Go duration). |
 | `APP_HTTP_IDLE_TIMEOUT` | false | (Default `60s`) Maximum time to wait for the next request on a keep-alive connection (Go duration). |
@@ -132,6 +132,13 @@ Environment variables:
 | `LOG_LEVEL` | false | (Default `Info`) Minimum log level: `Trace`, `Debug`, `Info`, `Warn`, `Error`, or `Fatal`. Case-sensitive; any other value falls back to `Info`. |
 
 Boolean variables accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`.
+
+### Running behind a reverse proxy
+A request from a peer listed in `APP_TRUSTED_PROXIES` is attributed to the rightmost `X-Forwarded-For` hop that no listed proxy wrote. Rate limiting, the address recorded for a session and the traffic capture all use that address. A request from any other peer is attributed to the peer, and its forwarded headers are ignored. Each trusted proxy must:
+- Append the address it received the request from to `X-Forwarded-For`. nginx does this with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, HAProxy with `option forwardfor`, and Traefik and Caddy by default. A proxy that passes the client's `X-Forwarded-For` through without appending lets the client choose its address, as does nginx's `proxy_set_header X-Real-IP $remote_addr;` on its own.
+- Overwrite or strip `X-Real-IP` and `True-Client-IP` from clients. CalCard reads `X-Real-IP` only when a request carries no `X-Forwarded-For` hop, so a proxy that writes neither header passes the client's own claim through. CalCard does not read `True-Client-IP`.
+
+A hop CalCard cannot read as an IP address, with or without a port, ends the walk: the request is attributed to the nearest trusted proxy, such as nginx writing `unix:` for a client on a socket. With `APP_TRUSTED_PROXIES` empty, every peer is trusted and the leftmost `X-Forwarded-For` entry, which any client can write, is used.
 
 CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a request past a limit is refused rather than answered with a partial result. Integer limits must be non-negative, and `0` turns that limit off.
 | Name | Required | Notes |

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/events"
@@ -799,6 +801,319 @@ func TestDeleteEventUnauthorizedAndNotFound(t *testing.T) {
 	handler.DeleteEvent(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("DeleteEvent() not found status = %d", rec.Code)
+	}
+}
+
+// A delegate who may read a calendar but not change it is answered 403 for
+// every write whose body decodes, whatever it holds: the request is refused
+// before the event is built from the body or validated, and nothing is stored.
+func TestEventWritesAnswer403BeforeBuildingTheEventForAPrincipalWhoCannotWrite(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	storedICS := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Old\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	methodICS := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:event-2\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	tests := map[string]struct {
+		method, uid, contentType, body string
+		header                         map[string]string
+	}{
+		"create structured in an unknown zone": {method: http.MethodPost, contentType: "application/json", body: `{"structured":{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00","timezone":"Nowhere/Zone"}}`},
+		"create structured without a summary":  {method: http.MethodPost, contentType: "application/json", body: `{"structured":{"dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00"}}`},
+		"create raw iCalendar":                 {method: http.MethodPost, contentType: "text/calendar", body: methodICS},
+		"create raw iCalendar in JSON":         {method: http.MethodPost, contentType: "application/json", body: `{"inputMode":"raw_ical","rawIcal":"BEGIN:VCALENDAR"}`},
+		"create over a stored UID":             {method: http.MethodPost, contentType: "text/calendar", body: storedICS, header: map[string]string{"If-None-Match": "*"}},
+		"update structured with a bad until":   {method: http.MethodPut, uid: "event-1", contentType: "application/json", body: `{"structured":{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00","recurrence":{"frequency":"DAILY","until":"June"}}}`},
+		"update raw iCalendar":                 {method: http.MethodPut, uid: "event-1", contentType: "text/calendar", body: storedICS, header: map[string]string{"If-Match": `"current"`}},
+		"delete":                               {method: http.MethodDelete, uid: "event-1", header: map[string]string{"If-Match": `"current"`}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			validations := 0
+			validate := func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+				validations++
+				return dav.ValidateCalendarObject(raw, cal)
+			}
+			eventRepo := &fakeEventRepo{events: map[string]store.Event{
+				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: storedICS, ETag: "current", LastModified: time.Now().UTC()},
+			}}
+			handler := NewHandler(&config.Config{}, &store.Store{
+				Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+					1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Shared"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true, ReadFreeBusy: true}},
+				}},
+				Events: eventRepo,
+				ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+					{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				}},
+			}, validate)
+
+			req := httptest.NewRequest(tt.method, "/api/calendars/1/events/"+tt.uid, strings.NewReader(tt.body))
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			for header, value := range tt.header {
+				req.Header.Set(header, value)
+			}
+			req = withUserAndRoute(req, "1", tt.uid)
+			req = req.WithContext(auth.WithUser(req.Context(), delegate))
+			rec := httptest.NewRecorder()
+			switch tt.method {
+			case http.MethodPost:
+				handler.CreateEvent(rec, req)
+			case http.MethodPut:
+				handler.UpdateEvent(rec, req)
+			case http.MethodDelete:
+				handler.DeleteEvent(rec, req)
+			}
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
+			}
+			if validations != 0 {
+				t.Fatalf("validator ran %d times for a principal who cannot write", validations)
+			}
+			if stored, ok := eventRepo.events["1:event-1"]; len(eventRepo.events) != 1 || !ok || stored.ETag != "current" {
+				t.Fatalf("stored events = %#v, want the stored event alone and unchanged", eventRepo.events)
+			}
+		})
+	}
+}
+
+// The body is decoded before any privilege is checked, so a body that does not
+// decode is answered 400 even for a principal who can see nothing of the
+// calendar; one that decodes is answered as that principal's access decides.
+// Decoding reveals nothing of the calendar, and costs far less than building
+// and validating the event, which comes after the privilege check.
+func TestEventWriteBodiesThatDoNotDecodeAnswer400BeforeAnyPrivilegeCheck(t *testing.T) {
+	stranger := &store.User{ID: 3}
+	valid := `{"structured":{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00"}}`
+	tests := map[string]struct {
+		body string
+		want int
+	}{
+		"empty body":                    {body: "", want: http.StatusBadRequest},
+		"not JSON":                      {body: "{", want: http.StatusBadRequest},
+		"unknown field":                 {body: `{"structured":{"summary":"x"},"extra":1}`, want: http.StatusBadRequest},
+		"unknown input mode":            {body: `{"inputMode":"vcard"}`, want: http.StatusBadRequest},
+		"raw mode without iCalendar":    {body: `{"inputMode":"raw_ical","rawIcal":" "}`, want: http.StatusBadRequest},
+		"structured mode without input": {body: `{"inputMode":"structured"}`, want: http.StatusBadRequest},
+		"a body that decodes":           {body: valid, want: http.StatusNotFound},
+	}
+	for name, tt := range tests {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			t.Run(name+" "+method, func(t *testing.T) {
+				handler := NewHandler(&config.Config{}, &store.Store{
+					Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+						1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Private"}},
+					}},
+					Events: &fakeEventRepo{events: map[string]store.Event{
+						"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", ETag: "current", LastModified: time.Now().UTC()},
+					}},
+					ACLEntries: &fakeACLRepo{},
+				}, dav.ValidateCalendarObject)
+				uid := ""
+				if method == http.MethodPut {
+					uid = "event-1"
+				}
+				req := httptest.NewRequest(method, "/api/calendars/1/events/"+uid, strings.NewReader(tt.body))
+				req.Header.Set("Content-Type", "application/json")
+				req = withUserAndRoute(req, "1", uid)
+				req = req.WithContext(auth.WithUser(req.Context(), stranger))
+				rec := httptest.NewRecorder()
+				if method == http.MethodPost {
+					handler.CreateEvent(rec, req)
+				} else {
+					handler.UpdateEvent(rec, req)
+				}
+				if rec.Code != tt.want {
+					t.Fatalf("status = %d, want %d, body=%s", rec.Code, tt.want, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+// Updates and deletes check the privileges first and the precondition after,
+// and a principal the event is hidden from gets the same status and body
+// whether or not the UID exists. The principals and the answers are those of
+// eventWriteAccessCases in internal/events/service_test.go, which says why
+// each answer is what it is and which of them DAV DELETE answers otherwise;
+// test packages cannot share it, so a change to one belongs in both.
+func TestEventUpdatesAndDeletesAnswerAPrincipalWhoCannotSeeTheEventAlikeWhetherOrNotItExists(t *testing.T) {
+	const (
+		ok          = http.StatusOK
+		noContent   = http.StatusNoContent
+		forbidden   = http.StatusForbidden
+		notFound    = http.StatusNotFound
+		failed      = http.StatusPreconditionFailed
+		collection  = "/dav/calendars/1"
+		eventObject = "/dav/calendars/1/stored.ics"
+	)
+	storedICS := func(uid string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	acl := []store.ACLEntry{
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/4/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/4/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/4/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/5/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/5/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/5/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/6/", IsGrant: false, Privilege: "all"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/6/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/7/", IsGrant: false, Privilege: "all"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/7/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/7/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/7/", IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/8/", IsGrant: false, Privilege: "unbind"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/8/", IsGrant: true, Privilege: "all"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/9/", IsGrant: false, Privilege: "all"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/10/", IsGrant: true, Privilege: "read-acl"},
+		{ResourcePath: eventObject, PrincipalHref: "/dav/principals/11/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: collection, PrincipalHref: "/dav/principals/11/", IsGrant: false, Privilege: "all"},
+	}
+	headers := []struct{ name, header, value string }{
+		{name: "unconditional"},
+		{name: "If-Match", header: "If-Match", value: `"etag"`},
+		{name: "If-None-Match *", header: "If-None-Match", value: "*"},
+	}
+	type statuses struct{ stored, missing int }
+	tests := []struct {
+		principal string
+		userID    int64
+		concealed bool
+		// update and delete list statuses in the order of headers.
+		update, delete [3]statuses
+	}{
+		{principal: "no access", userID: 3, concealed: true,
+			update: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}},
+			delete: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}}},
+		{principal: "read-only", userID: 2,
+			update: [3]statuses{{forbidden, forbidden}, {forbidden, forbidden}, {forbidden, forbidden}},
+			delete: [3]statuses{{forbidden, forbidden}, {forbidden, forbidden}, {forbidden, forbidden}}},
+		{principal: "calendar reader the event is hidden from", userID: 6, concealed: true,
+			update: [3]statuses{{forbidden, forbidden}, {forbidden, forbidden}, {forbidden, forbidden}},
+			delete: [3]statuses{{forbidden, forbidden}, {forbidden, forbidden}, {forbidden, forbidden}}},
+		{principal: "calendar writer the event is hidden from", userID: 7, concealed: true,
+			update: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}},
+			delete: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}}},
+		{principal: "event grant", userID: 4,
+			update: [3]statuses{{ok, notFound}, {ok, notFound}, {failed, notFound}},
+			delete: [3]statuses{{forbidden, notFound}, {forbidden, notFound}, {forbidden, notFound}}},
+		{principal: "write", userID: 5,
+			update: [3]statuses{{ok, notFound}, {ok, notFound}, {failed, notFound}},
+			delete: [3]statuses{{noContent, notFound}, {noContent, notFound}, {failed, notFound}}},
+		{principal: "calendar all, event unbind denied", userID: 8,
+			update: [3]statuses{{ok, notFound}, {ok, notFound}, {failed, notFound}},
+			delete: [3]statuses{{noContent, notFound}, {noContent, notFound}, {failed, notFound}}},
+		{principal: "calendar deny all", userID: 9, concealed: true,
+			update: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}},
+			delete: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}}},
+		{principal: "calendar read-acl only", userID: 10, concealed: true,
+			update: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}},
+			delete: [3]statuses{{notFound, notFound}, {notFound, notFound}, {notFound, notFound}}},
+		{principal: "event read, calendar deny all", userID: 11,
+			update: [3]statuses{{forbidden, notFound}, {forbidden, notFound}, {forbidden, notFound}},
+			delete: [3]statuses{{forbidden, notFound}, {forbidden, notFound}, {forbidden, notFound}}},
+	}
+	for _, tt := range tests {
+		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+			want := tt.update
+			if method == http.MethodDelete {
+				want = tt.delete
+			}
+			for i, header := range headers {
+				t.Run(tt.principal+"/"+method+"/"+header.name, func(t *testing.T) {
+					status := map[string]int{}
+					body := map[string]string{}
+					for _, uid := range []string{"stored", "missing"} {
+						eventRepo := &fakeEventRepo{events: map[string]store.Event{
+							"1:stored": {CalendarID: 1, UID: "stored", ResourceName: "stored", RawICAL: storedICS("stored"), ETag: "etag", LastModified: time.Now().UTC()},
+						}}
+						handler := NewHandler(&config.Config{}, &store.Store{
+							Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+								1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Private"}},
+							}},
+							Events:     eventRepo,
+							ACLEntries: &fakeACLRepo{entries: slices.Clone(acl)},
+						}, dav.ValidateCalendarObject)
+
+						var req *http.Request
+						if method == http.MethodPut {
+							req = httptest.NewRequest(method, "/api/calendars/1/events/"+uid, strings.NewReader(storedICS(uid)))
+							req.Header.Set("Content-Type", "text/calendar")
+						} else {
+							req = httptest.NewRequest(method, "/api/calendars/1/events/"+uid, nil)
+						}
+						if header.header != "" {
+							req.Header.Set(header.header, header.value)
+						}
+						req = withUserAndRoute(req, "1", uid)
+						req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: tt.userID}))
+						rec := httptest.NewRecorder()
+						if method == http.MethodPut {
+							handler.UpdateEvent(rec, req)
+						} else {
+							handler.DeleteEvent(rec, req)
+						}
+						status[uid], body[uid] = rec.Code, rec.Body.String()
+						if rec.Code >= 300 {
+							if stored, found := eventRepo.events["1:stored"]; !found || stored.ETag != "etag" || len(eventRepo.events) != 1 {
+								t.Errorf("%s %s answered %d but changed the calendar: %#v", method, uid, rec.Code, eventRepo.events)
+							}
+						}
+					}
+					if got := (statuses{status["stored"], status["missing"]}); got != want[i] {
+						t.Fatalf("statuses for the stored and a missing UID = %v, want %v; bodies %q", got, want[i], body)
+					}
+					if tt.concealed && body["stored"] != body["missing"] {
+						t.Fatalf("bodies differ by existence: %q for the stored UID, %q for a missing one", body["stored"], body["missing"])
+					}
+				})
+			}
+		}
+	}
+}
+
+// A structured write answers 400 for a timezone the server's database does not
+// define or a recurrence until that is not a YYYY-MM-DD date, rather than
+// storing the event in UTC or as a series without an end.
+func TestStructuredEventWritesAnswer400ForAZoneOrUntilTheServerCannotRead(t *testing.T) {
+	existing := store.Event{CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Old\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "current", LastModified: time.Now().UTC()}
+	for name, structured := range map[string]string{
+		"unknown timezone": `{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00","timezone":"Eastern Standard Time"}`,
+		"malformed until":  `{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00","recurrence":{"frequency":"WEEKLY","until":"2026-06-31"}}`,
+	} {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			t.Run(name+" "+method, func(t *testing.T) {
+				eventRepo := &fakeEventRepo{events: map[string]store.Event{"1:event-1": existing}}
+				handler := NewHandler(&config.Config{}, &store.Store{
+					Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+						1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+					}},
+					Events: eventRepo,
+				}, dav.ValidateCalendarObject)
+
+				uid := ""
+				if method == http.MethodPut {
+					uid = "event-1"
+				}
+				req := httptest.NewRequest(method, "/api/calendars/1/events/"+uid, strings.NewReader(`{"inputMode":"structured","structured":`+structured+`}`))
+				req.Header.Set("Content-Type", "application/json")
+				req = withUserAndRoute(req, "1", uid)
+				rec := httptest.NewRecorder()
+				if method == http.MethodPost {
+					handler.CreateEvent(rec, req)
+				} else {
+					handler.UpdateEvent(rec, req)
+				}
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+				}
+				if len(eventRepo.events) != 1 || eventRepo.events["1:event-1"].ETag != "current" {
+					t.Fatalf("stored events = %#v, want the stored event alone and unchanged", eventRepo.events)
+				}
+			})
+		}
 	}
 }
 

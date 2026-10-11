@@ -688,19 +688,23 @@ func (r *changedDeleteContactRepo) GetByResourceName(ctx context.Context, collec
 	}
 	return item, err
 }
+
+// A delete whose contact changes under every attempt gives up as a conflict.
+// The caller's If-Match is checked again on each attempt, and it still holds
+// here, so a conditional delete gives up the same way.
 func TestDeleteContactConcurrentChange(t *testing.T) {
 	for _, conditional := range []bool{false, true} {
 		t.Run(fmt.Sprint(conditional), func(t *testing.T) {
 			base := &fakeContacts{items: map[string]store.Contact{"1:changed": {AddressBookID: 1, UID: "changed", ResourceName: "changed", ETag: "old-etag"}}}
 			svc, _ := newTestService()
 			svc.store.Contacts = &changedDeleteContactRepo{base}
-			match, want := "", ErrConflict
+			match := ""
 			if conditional {
-				match, want = "old-etag", ErrPreconditionFailed
+				match = "old-etag"
 			}
 			err := svc.DeleteContact(context.Background(), owner, 1, "changed", match, "")
-			if !errors.Is(err, want) {
-				t.Fatalf("error = %v, want %v", err, want)
+			if !errors.Is(err, ErrChangedConcurrently) || !errors.Is(err, ErrConflict) {
+				t.Fatalf("error = %v, want ErrChangedConcurrently, a conflict", err)
 			}
 			if len(base.items) != 1 {
 				t.Fatal("concurrent update was deleted")

@@ -48,6 +48,11 @@ func StartDigestCredentialPurge(ctx context.Context, repo AppPasswordRepository,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// select picks at random among ready cases, so a tick can win
+			// against a cancellation that has already happened.
+			if ctx.Err() != nil {
+				return
+			}
 			purgeDigestCredentials(ctx, repo, queryLogger)
 		}
 	}

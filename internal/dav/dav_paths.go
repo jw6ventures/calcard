@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -78,4 +79,66 @@ func requirePrivilegeDecision(allowed, denied bool, err error) error {
 
 func isPrivilegeNotGranted(err error) bool {
 	return errors.Is(err, errPrivilegeNotGranted)
+}
+
+// isPrivilegeRefusal reports whether err refuses a privilege, as opposed to
+// failing to resolve the resource or to evaluate the privilege.
+func isPrivilegeRefusal(err error) bool {
+	return errors.Is(err, errForbidden) || isPrivilegeNotGranted(err)
+}
+
+// existingObjectWriteRefusal returns the answer to a request refused with
+// refusal on the existing object at cleanPath. A principal that may not read
+// the object is given answerAsAbsent's answer, the one the same request gets
+// when no object is at cleanPath, so the refusal does not disclose that the
+// object exists. answerAsAbsent returns nil when that request would succeed;
+// then, as when the principal may read the object, its existence is no secret
+// from the principal, and refusal stands. So does a refusal that already
+// answers as for a missing resource.
+func (h *DavServer) existingObjectWriteRefusal(ctx context.Context, user *store.User, cleanPath string, refusal error, answerAsAbsent func() error) error {
+	if !refusalNamesPrivilege(refusal) {
+		return refusal
+	}
+	readable, err := h.canReadObjectAt(ctx, user, cleanPath)
+	if err != nil {
+		return requirePrivilegeAt(err, cleanPath, "read")
+	}
+	if readable {
+		return refusal
+	}
+	if absent := answerAsAbsent(); absent != nil {
+		return absent
+	}
+	return refusal
+}
+
+// canReadObjectAt reports whether user may read the calendar or address object
+// resource cleanPath names, as GET decides it.
+func (h *DavServer) canReadObjectAt(ctx context.Context, user *store.User, cleanPath string) (bool, error) {
+	err := h.requireObjectRead(ctx, user, cleanPath)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, errForbidden),
+		errors.Is(err, errAmbiguousCalendar), errors.Is(err, errAmbiguousAddressBook):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func (h *DavServer) requireObjectRead(ctx context.Context, user *store.User, cleanPath string) error {
+	if calendarID, resourceName, matched, err := h.parseCalendarResourcePath(ctx, user, cleanPath); err != nil {
+		return err
+	} else if matched {
+		_, err := h.loadCalendarForObjectRead(ctx, user, calendarID, resourceName, cleanPath)
+		return err
+	}
+	if addressBookID, _, matched, err := h.parseAddressBookResourcePath(ctx, user, cleanPath); err != nil {
+		return err
+	} else if matched {
+		_, err := h.loadAddressBookWithPrivilege(ctx, user, addressBookID, cleanPath, "read")
+		return err
+	}
+	return store.ErrNotFound
 }

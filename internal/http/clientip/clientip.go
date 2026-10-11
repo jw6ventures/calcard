@@ -98,8 +98,8 @@ func (t TrustedProxies) ClientIP(r *http.Request) string {
 		return remoteHost
 	}
 
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if clientIP := forwardedClientIP(xff, t.nets); clientIP != nil {
+	if hops := forwardedHops(r.Header.Values("X-Forwarded-For")); len(hops) > 0 {
+		if clientIP := forwardedClientIP(hops, remoteIP, t.nets); clientIP != nil {
 			return clientIP.String()
 		}
 	}
@@ -116,38 +116,81 @@ func (t TrustedProxies) ClientIP(r *http.Request) string {
 	return remoteHost
 }
 
-func forwardedClientIP(xff string, trusted []*net.IPNet) net.IP {
-	parts := strings.Split(xff, ",")
+// forwardedHops lists the X-Forwarded-For entries in order, across every field
+// line. A proxy may append its hop as a line of its own; RFC 9110 §5.3 reads
+// the lines, in order, as one list, and Header.Get sees only the first, which
+// may be one the client sent. Empty elements carry nothing (RFC 9110 §5.6.1).
+func forwardedHops(lines []string) []string {
+	var hops []string
+	for _, line := range lines {
+		for _, hop := range strings.Split(line, ",") {
+			if hop = strings.TrimSpace(hop); hop != "" {
+				hops = append(hops, hop)
+			}
+		}
+	}
+	return hops
+}
 
+// RemoteAddr is the value r.RemoteAddr takes once the client is resolved: the
+// address ClientIP attributes the request to, or the peer's own address, port
+// included, when that client is the peer.
+func (t TrustedProxies) RemoteAddr(r *http.Request) string {
+	peer := PeerAddr(r)
+	_, peerHost := parseRemoteAddr(peer)
+	if client := t.ClientIP(r); client != peerHost {
+		return client
+	}
+	return peer
+}
+
+func forwardedClientIP(hops []string, peer net.IP, trusted []*net.IPNet) net.IP {
 	if len(trusted) == 0 {
-		for _, part := range parts {
-			if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
+		for _, hop := range hops {
+			if parsed := net.ParseIP(hop); parsed != nil {
 				return parsed
 			}
 		}
 		return nil
 	}
 
-	for i := len(parts) - 1; i >= 0; i-- {
-		candidate := strings.TrimSpace(parts[i])
-		if candidate == "" {
-			continue
+	// The trusted peer wrote the rightmost hop. If that hop is unreadable the
+	// peer is the nearest address a trusted proxy vouches for, and X-Real-IP is
+	// not consulted: a proxy that writes X-Forwarded-For need not overwrite it,
+	// so it may be whatever the client sent.
+	nearestTrusted := peer
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := parseForwardedHop(hops[i])
+		// A hop that cannot be read is not a trusted proxy, so nothing to its
+		// left is known to have been written by one: stepping past it would
+		// let the client pick the address by sending one ahead of it.
+		if ip == nil {
+			return nearestTrusted
 		}
-		parsed := net.ParseIP(candidate)
-		if parsed == nil {
-			continue
+		if !isTrustedProxy(ip, trusted) {
+			return ip
 		}
-		if !isTrustedProxy(parsed, trusted) {
-			return parsed
+		nearestTrusted = ip
+	}
+	return nearestTrusted
+}
+
+// parseForwardedHop reads one X-Forwarded-For entry in the forms proxies
+// write: an address, optionally with a port, and an IPv6 address optionally in
+// brackets. A host name, a zoned address, or a quoted or obfuscated RFC 7239
+// node reads as nil.
+func parseForwardedHop(hop string) net.IP {
+	if ip := net.ParseIP(hop); ip != nil {
+		return ip
+	}
+	if host, _, err := net.SplitHostPort(hop); err == nil {
+		return net.ParseIP(host)
+	}
+	if inner, ok := strings.CutPrefix(hop, "["); ok {
+		if inner, ok = strings.CutSuffix(inner, "]"); ok {
+			return net.ParseIP(inner)
 		}
 	}
-
-	for _, part := range parts {
-		if parsed := net.ParseIP(strings.TrimSpace(part)); parsed != nil {
-			return parsed
-		}
-	}
-
 	return nil
 }
 

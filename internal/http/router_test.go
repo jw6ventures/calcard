@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/dav"
+	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/http/ratelimit"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/time/rate"
@@ -327,10 +329,9 @@ func (f davExtensionFunc) RegisterDAV(r *dav.Registry) {
 	f(r)
 }
 
-// chi's middleware.RealIP rewrites r.RemoteAddr from client-supplied headers
-// with no trust check, and it runs ahead of everything that later reads that
-// field to decide whether the request is trustworthy. Once a deployment names
-// its trusted proxies, the rewrite must happen only for those peers.
+// The forwarded-address middleware runs ahead of everything that later reads
+// r.RemoteAddr to decide whether the request is trustworthy. Once a deployment
+// names its trusted proxies, the rewrite must happen only for those peers.
 func TestTrustedRealIPOnlyRewritesForConfiguredProxies(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -375,6 +376,142 @@ func TestTrustedRealIPOnlyRewritesForConfiguredProxies(t *testing.T) {
 				t.Fatalf("RemoteAddr = %q, want %q", seen, tt.want)
 			}
 		})
+	}
+}
+
+// RemoteAddr is what traffic capture records, so it has to name the client the
+// rate limiter and the session record attribute the request to: True-Client-IP,
+// X-Real-IP and the leftmost X-Forwarded-For entry are all the client's to
+// write, and none of them may outrank the hop the trusted proxy appended. When
+// the client is the peer itself, RemoteAddr keeps the port the connection came
+// from.
+func TestTrustedRealIPResolvesRemoteAddrAsClientIPDoes(t *testing.T) {
+	trusted := []string{"10.0.0.0/8"}
+	tests := []struct {
+		name           string
+		trustedProxies []string
+		peer           string
+		headers        map[string]string
+		want           string
+	}{
+		{
+			name:           "True-Client-IP is not read",
+			trustedProxies: trusted,
+			peer:           "10.1.2.3:4567",
+			headers:        map[string]string{"True-Client-IP": "192.0.2.66", "X-Forwarded-For": "198.51.100.7"},
+			want:           "198.51.100.7",
+		},
+		{
+			name:           "X-Real-IP does not outrank X-Forwarded-For",
+			trustedProxies: trusted,
+			peer:           "10.1.2.3:4567",
+			headers:        map[string]string{"X-Real-IP": "192.0.2.66", "X-Forwarded-For": "198.51.100.7"},
+			want:           "198.51.100.7",
+		},
+		{
+			name:           "the leftmost X-Forwarded-For entry is not the client",
+			trustedProxies: trusted,
+			peer:           "10.1.2.3:4567",
+			headers:        map[string]string{"X-Forwarded-For": "192.0.2.66, 198.51.100.7"},
+			want:           "198.51.100.7",
+		},
+		{
+			name:           "an unreadable proxy hop leaves the peer",
+			trustedProxies: trusted,
+			peer:           "10.1.2.3:4567",
+			headers:        map[string]string{"X-Real-IP": "192.0.2.66", "X-Forwarded-For": "192.0.2.66, unix:"},
+			want:           "10.1.2.3:4567",
+		},
+		{
+			name:           "no forwarding headers leaves the peer",
+			trustedProxies: trusted,
+			peer:           "10.1.2.3:4567",
+			want:           "10.1.2.3:4567",
+		},
+		// Unconfigured deployments trust every peer's forwarded headers; the
+		// config loader warns about it at startup.
+		{
+			name: "unconfigured: no forwarding headers leaves the peer",
+			peer: "203.0.113.9:4567",
+			want: "203.0.113.9:4567",
+		},
+		{
+			name:    "unconfigured: True-Client-IP is not read",
+			peer:    "203.0.113.9:4567",
+			headers: map[string]string{"True-Client-IP": "192.0.2.66"},
+			want:    "203.0.113.9:4567",
+		},
+		{
+			name:    "unconfigured: X-Real-IP without X-Forwarded-For",
+			peer:    "203.0.113.9:4567",
+			headers: map[string]string{"X-Real-IP": "198.51.100.8"},
+			want:    "198.51.100.8",
+		},
+		{
+			name:    "unconfigured: the leftmost X-Forwarded-For entry outranks X-Real-IP",
+			peer:    "203.0.113.9:4567",
+			headers: map[string]string{"X-Real-IP": "198.51.100.8", "X-Forwarded-For": "192.0.2.66, 198.51.100.7"},
+			want:    "192.0.2.66",
+		},
+		{
+			name:    "unconfigured: an unreadable X-Forwarded-For falls back to X-Real-IP",
+			peer:    "203.0.113.9:4567",
+			headers: map[string]string{"X-Real-IP": "198.51.100.8", "X-Forwarded-For": "not-an-ip"},
+			want:    "198.51.100.8",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var remoteAddr, peerAddr, clientIP string
+			handler := trustedRealIP(tt.trustedProxies)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				remoteAddr = r.RemoteAddr
+				peerAddr = clientip.PeerAddr(r)
+				clientIP = clientip.NewTrustedProxies(tt.trustedProxies).ClientIP(r)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.RemoteAddr = tt.peer
+			for name, value := range tt.headers {
+				req.Header.Set(name, value)
+			}
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			if remoteAddr != tt.want {
+				t.Fatalf("RemoteAddr = %q, want %q", remoteAddr, tt.want)
+			}
+			host := remoteAddr
+			if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+				host = h
+			}
+			if host != clientIP {
+				t.Fatalf("RemoteAddr = %q, but ClientIP = %q", remoteAddr, clientIP)
+			}
+			if peerAddr != tt.peer {
+				t.Fatalf("PeerAddr = %q, want the connecting peer %q", peerAddr, tt.peer)
+			}
+		})
+	}
+}
+
+func TestTrafficCaptureRecordsTheClientTheTrustedProxyForwardedFor(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	var capture bytes.Buffer
+	cfg := &config.Config{BaseURL: "http://localhost:8080", TrustedProxies: []string{"10.0.0.0/8"}}
+	r := NewRouterWithOptions(cfg, store.New(db), nil, RouterOptions{TrafficCaptureWriter: &capture})
+	req := httptest.NewRequest("PROPFIND", "/.well-known/caldav", strings.NewReader("<propfind/>"))
+	req.RemoteAddr = "10.1.2.3:4567"
+	req.Header.Set("True-Client-IP", "192.0.2.66")
+	req.Header.Set("X-Forwarded-For", "192.0.2.66, 198.51.100.7")
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got := capture.String(); !strings.Contains(got, `"ip":"198.51.100.7"`) {
+		t.Fatalf("traffic capture = %q, want the client the proxy forwarded for", got)
 	}
 }
 

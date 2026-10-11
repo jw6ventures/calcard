@@ -55,7 +55,7 @@ func (h *DavServer) accessibleCalendars(ctx context.Context, user *store.User) (
 
 // calendarPrivilegeNames is every privilege a calendar access decision can
 // resolve, in DAV:acl document order.
-var calendarPrivilegeNames = []string{"read", "read-free-busy", "write", "write-content", "write-properties", "bind", "unbind"}
+var calendarPrivilegeNames = acl.CalendarPrivilegeNames
 
 var calendarCurrentPrivilegeNames = []string{
 	"all", "read", "read-free-busy", "read-acl", "read-current-user-privilege-set",
@@ -236,6 +236,21 @@ func (h *DavServer) canAccessCalendarObject(ctx context.Context, user *store.Use
 		return false, err
 	}
 	return true, nil
+}
+
+// loadCalendarForObjectRead loads calendar calendarID for a read of its object
+// resourceName at cleanPath, refusing it unless user may read both the
+// calendar there and the object, whose own ACL can deny what the calendar
+// grants.
+func (h *DavServer) loadCalendarForObjectRead(ctx context.Context, user *store.User, calendarID int64, resourceName, cleanPath string) (*store.CalendarAccess, error) {
+	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, cleanPath, "read")
+	if err != nil {
+		return nil, err
+	}
+	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, objectResourcePath(calendarPrefix, cal.ID, resourceName), "read"); err != nil {
+		return nil, err
+	}
+	return cal, nil
 }
 
 func (h *DavServer) canReadCalendarObject(ctx context.Context, user *store.User, cal *store.CalendarAccess, resourceName string) (bool, error) {

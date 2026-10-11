@@ -312,6 +312,9 @@ func TestServiceEnforcesCalendarObjectACLs(t *testing.T) {
 	}
 }
 
+// Grants on one event let a principal with no access to its calendar read and
+// change that event, but not remove it: DAV:unbind is a privilege of the
+// calendar the event leaves (RFC 3744 §3.10), as DAV DELETE holds it.
 func TestServiceAllowsDirectObjectAccessWithoutCollectionAccess(t *testing.T) {
 	delegate := &store.User{ID: 2}
 	repo := &fakeEventRepo{events: map[string]store.Event{
@@ -343,11 +346,11 @@ func TestServiceAllowsDirectObjectAccessWithoutCollectionAccess(t *testing.T) {
 		t.Fatalf("UpdateEvent() err=%v updated=%#v", err, updated)
 	}
 
-	if err := svc.DeleteEvent(context.Background(), delegate, 1, "event-1", `"`+updated.ETag+`"`, ""); err != nil {
-		t.Fatalf("DeleteEvent() error = %v", err)
+	if err := svc.DeleteEvent(context.Background(), delegate, 1, "event-1", `"`+updated.ETag+`"`, ""); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("DeleteEvent() error = %v, want ErrForbidden for want of DAV:unbind on the calendar", err)
 	}
-	if got, _ := repo.GetByUID(context.Background(), 1, "event-1"); got != nil {
-		t.Fatalf("expected event deletion, got %#v", got)
+	if got, _ := repo.GetByUID(context.Background(), 1, "event-1"); got == nil {
+		t.Fatal("DeleteEvent() removed the event without DAV:unbind on the calendar")
 	}
 }
 
@@ -449,6 +452,537 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 			t.Fatalf("DeleteEvent() error = %v, want ErrForbidden", err)
 		}
 	})
+}
+
+// countingValidator is dav.ValidateCalendarObject, counting its calls.
+func countingValidator(calls *int) calobject.Validator {
+	return func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+		*calls++
+		return dav.ValidateCalendarObject(raw, cal)
+	}
+}
+
+// A create is refused for want of DAV:bind on the calendar before the event is
+// built from its body or validated, as a DAV PUT is: building and validating a calendar object spends the
+// recurrence and VTIMEZONE work a principal who may not add to the calendar
+// must not be able to make the server do, and whether the UID is taken or the
+// preconditions hold is no answer to give them either.
+func TestCreateEventRefusesAPrincipalWithoutBindBeforeBuildingTheEvent(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	readOnly := []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+	}
+	canBind := append(slices.Clone(readOnly), store.ACLEntry{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"})
+	structured := &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}
+	tests := map[string]struct {
+		acl            []store.ACLEntry
+		input          UpsertInput
+		want           error
+		wantValidation int
+	}{
+		"structured":                                    {acl: readOnly, input: UpsertInput{Structured: structured}, want: ErrForbidden},
+		"structured the builder refuses":                {acl: readOnly, input: UpsertInput{Structured: &StructuredInput{DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
+		"structured in a zone the server does not know": {acl: readOnly, input: UpsertInput{Structured: &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00", Timezone: "Nowhere/Zone"}}, want: ErrForbidden},
+		"raw iCalendar":                                 {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar"}, want: ErrForbidden},
+		"raw iCalendar the validator fails":             {acl: readOnly, input: UpsertInput{RawICS: methodICS("new"), ContentType: "text/calendar"}, want: ErrForbidden},
+		"raw body of an unsupported type":               {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "application/json"}, want: ErrForbidden},
+		"UID already stored":                            {acl: readOnly, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar"}, want: ErrForbidden},
+		"If-Match on a new UID":                         {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar", IfMatch: `"etag"`}, want: ErrForbidden},
+		"If-None-Match * on a stored UID":               {acl: readOnly, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar", IfNoneMatch: "*"}, want: ErrForbidden},
+		"with bind":                                     {acl: canBind, input: UpsertInput{Structured: structured}, wantValidation: 1},
+		"with bind, UID already stored":                 {acl: canBind, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar"}, want: ErrConflict, wantValidation: 1},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			validations := 0
+			repo := &fakeEventRepo{events: map[string]store.Event{
+				"1:taken": {CalendarID: 1, UID: "taken", ResourceName: "taken", RawICAL: validICS("taken"), ETag: "etag"},
+			}}
+			svc := NewService(&store.Store{
+				Calendars:  calendarSharedThrough(t, tt.acl),
+				Events:     repo,
+				ACLEntries: &fakeACLRepo{entries: tt.acl},
+			}, countingValidator(&validations))
+
+			_, _, err := svc.CreateEvent(context.Background(), delegate, 1, tt.input)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if validations != tt.wantValidation {
+				t.Fatalf("validator ran %d times, want %d", validations, tt.wantValidation)
+			}
+		})
+	}
+}
+
+// racingEventRepo stores competitor the first time GetByUID finds its UID
+// free, as a create running alongside would between that look and the write.
+type racingEventRepo struct {
+	*fakeEventRepo
+	competitor store.Event
+	raced      bool
+}
+
+func (r *racingEventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*store.Event, error) {
+	ev, err := r.fakeEventRepo.GetByUID(ctx, calendarID, uid)
+	if ev == nil && err == nil && !r.raced && uid == r.competitor.UID {
+		r.raced = true
+		r.events[key(r.competitor.CalendarID, r.competitor.UID)] = r.competitor
+	}
+	return ev, err
+}
+
+// A create only ever adds an event. One that finds the UID free but loses the
+// race to store it is refused rather than overwriting the winner, so a
+// principal holding DAV:bind but not DAV:write-content cannot replace an event
+// by racing its creator.
+func TestCreateEventDoesNotOverwriteAnEventStoredWhileItRan(t *testing.T) {
+	bindOnly := []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+	}
+	competitor := store.Event{CalendarID: 1, UID: "raced", ResourceName: "raced", RawICAL: validICS("raced"), ETag: "theirs"}
+	tests := map[string]struct {
+		ifNoneMatch string
+		want        error
+	}{
+		"unconditional":   {want: ErrConflict},
+		"If-None-Match *": {ifNoneMatch: "*", want: ErrPreconditionFailed},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			repo := &racingEventRepo{fakeEventRepo: &fakeEventRepo{events: map[string]store.Event{}}, competitor: competitor}
+			svc := NewService(&store.Store{
+				Calendars:  calendarSharedThrough(t, bindOnly),
+				Events:     repo,
+				ACLEntries: &fakeACLRepo{entries: bindOnly},
+			}, dav.ValidateCalendarObject)
+
+			body := strings.Replace(validICS("raced"), "SUMMARY:Planning", "SUMMARY:Mine", 1)
+			_, _, err := svc.CreateEvent(context.Background(), &store.User{ID: 2}, 1, UpsertInput{RawICS: body, ContentType: "text/calendar", IfNoneMatch: tt.ifNoneMatch})
+			if !repo.raced {
+				t.Fatal("the competing create never ran")
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if stored := repo.events[key(1, "raced")]; stored.ETag != "theirs" || stored.RawICAL != competitor.RawICAL {
+				t.Fatalf("the competing event was overwritten: %#v", stored)
+			}
+		})
+	}
+}
+
+// DAV:bind is a privilege on the collection (RFC 3744 §3.9), so a create needs
+// it on the calendar. An ACE on the path the new object would take belongs to
+// the object already stored there, under another UID, and neither grants nor
+// denies adding one.
+func TestCreateEventNeedsBindOnTheCalendarWhateverAnObjectACLSays(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	collectionRead := store.ACLEntry{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"}
+	collectionBind := store.ACLEntry{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"}
+	objectGrant := store.ACLEntry{ResourcePath: "/dav/calendars/1/new.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "all"}
+	objectDeny := store.ACLEntry{ResourcePath: "/dav/calendars/1/new.ics", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "all"}
+	tests := map[string]struct {
+		storedName string
+		acl        []store.ACLEntry
+		want       error
+	}{
+		"object grant without calendar bind":          {storedName: "new", acl: []store.ACLEntry{collectionRead, objectGrant}, want: ErrForbidden},
+		"object deny with calendar bind":              {storedName: "new", acl: []store.ACLEntry{collectionRead, collectionBind, objectDeny}, want: ErrConflict},
+		"grant on an object named with its extension": {storedName: "new.ics", acl: []store.ACLEntry{collectionRead, objectGrant}, want: ErrForbidden},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			repo := &fakeEventRepo{events: map[string]store.Event{
+				"1:other": {CalendarID: 1, UID: "other", ResourceName: tt.storedName, RawICAL: validICS("other"), ETag: "etag"},
+			}}
+			svc := NewService(&store.Store{
+				Calendars:  calendarSharedThrough(t, tt.acl),
+				Events:     repo,
+				ACLEntries: &fakeACLRepo{entries: tt.acl},
+			}, dav.ValidateCalendarObject)
+
+			_, _, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar"})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if _, stored := repo.events[key(1, "new")]; stored {
+				t.Fatal("stored the new event")
+			}
+		})
+	}
+}
+
+// An update is refused for want of DAV:write-content on the event before the
+// event is built from its body or validated, as a DAV PUT to a stored object
+// is.
+func TestUpdateEventRefusesAPrincipalWithoutWriteContentBeforeBuildingTheEvent(t *testing.T) {
+	delegate := &store.User{ID: 2}
+	cannotWrite := []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+	}
+	canWrite := append(slices.Clone(cannotWrite), store.ACLEntry{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"})
+	tests := map[string]struct {
+		acl            []store.ACLEntry
+		input          UpsertInput
+		want           error
+		wantValidation int
+	}{
+		"structured":                            {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{Summary: "Update", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
+		"structured the builder refuses":        {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
+		"structured with a malformed until":     {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{Summary: "Update", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00", Recurrence: &StructuredRecurrence{Frequency: "DAILY", Until: "June"}}}, want: ErrForbidden},
+		"raw iCalendar":                         {acl: cannotWrite, input: UpsertInput{RawICS: validICS("event-1"), ContentType: "text/calendar"}, want: ErrForbidden},
+		"raw iCalendar the validator fails":     {acl: cannotWrite, input: UpsertInput{RawICS: methodICS("event-1"), ContentType: "text/calendar"}, want: ErrForbidden},
+		"with write-content":                    {acl: canWrite, input: UpsertInput{RawICS: validICS("event-1"), ContentType: "text/calendar"}, wantValidation: 1},
+		"with write-content, validator refuses": {acl: canWrite, input: UpsertInput{RawICS: methodICS("event-1"), ContentType: "text/calendar"}, want: ErrConflict, wantValidation: 1},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			validations := 0
+			svc := NewService(&store.Store{
+				Calendars: calendarSharedThrough(t, tt.acl),
+				Events: &fakeEventRepo{events: map[string]store.Event{
+					"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: validICS("event-1"), ETag: "etag-1"},
+				}},
+				ACLEntries: &fakeACLRepo{entries: tt.acl},
+			}, countingValidator(&validations))
+
+			_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", tt.input)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("UpdateEvent() error = %v, want %v", err, tt.want)
+			}
+			if validations != tt.wantValidation {
+				t.Fatalf("validator ran %d times, want %d", validations, tt.wantValidation)
+			}
+		})
+	}
+}
+
+// targetOutcome is the error a request answers with when its UID names the
+// stored event and when it names none.
+type targetOutcome struct{ stored, missing error }
+
+// aceSpec is one ACE a principal holds, on the calendar or on the event
+// "stored".
+type aceSpec struct {
+	onEvent   bool
+	privilege string
+	deny      bool
+}
+
+func onCalendar(privilege string) aceSpec { return aceSpec{privilege: privilege} }
+func onEvent(privilege string) aceSpec    { return aceSpec{onEvent: true, privilege: privilege} }
+func deniedOnEvent(privilege string) aceSpec {
+	return aceSpec{onEvent: true, privilege: privilege, deny: true}
+}
+func deniedOnCalendar(privilege string) aceSpec { return aceSpec{privilege: privilege, deny: true} }
+
+// eventWriteAccessCase is a principal of a calendar holding the event
+// "stored", and what an update and a delete answer them with no conditional
+// header, with If-Match naming the stored ETag, and with If-None-Match: *.
+type eventWriteAccessCase struct {
+	principal string
+	aces      []aceSpec
+	// concealed principals get the same answer whether or not the UID exists.
+	concealed bool
+	update    [3]targetOutcome
+	delete    [3]targetOutcome
+	// davDelete, when set, is what a DAV DELETE answers where it differs from
+	// delete: a principal holding no privilege on the calendar, only ACEs
+	// granting none or denying every one, is answered 403 by DAV, while REST
+	// answers 404 so as not to confirm the calendar exists, as GetEvent does.
+	davDelete *[3]targetOutcome
+}
+
+// eventWriteAccessCases pins the order of the checks. An update needs
+// DAV:write-content on the event; a principal who can neither read it nor
+// hold that is answered as for a UID that names nothing. A delete follows DAV
+// DELETE (internal/dav/delete.go): it needs DAV:unbind on the calendar (RFC
+// 3744 §3.10) and some privilege on the event, so an event-level deny of
+// every privilege refuses it, and a principal holding no privilege on the
+// event is answered as for a UID that names nothing. For such a UID, a
+// principal holding no privilege on the calendar gets 404, as GetEvent
+// answers them, and one holding some but not the privilege the method needs
+// on the calendar gets 403. Where DAV answers 403 instead of that 404, the
+// case says so in davDelete. The precondition comes after the privileges,
+// and for a delete after the 404 too (RFC 9110 §13.2.1).
+// The HTTP test in internal/api/handler_test.go,
+// TestEventUpdatesAndDeletesAnswerAPrincipalWhoCannotSeeTheEventAlikeWhetherOrNotItExists,
+// repeats these cases; test packages cannot share them, so a change to one
+// belongs in both.
+var eventWriteAccessCases = []eventWriteAccessCase{
+	{
+		principal: "no access", concealed: true,
+		update: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		delete: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+	},
+	{
+		principal: "read-only", aces: []aceSpec{onCalendar("read")},
+		update: [3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+		delete: [3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+	},
+	{
+		principal: "calendar reader the event is hidden from", concealed: true,
+		aces:   []aceSpec{deniedOnEvent("all"), onCalendar("read")},
+		update: [3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+		delete: [3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+	},
+	{
+		principal: "calendar writer the event is hidden from", concealed: true,
+		aces:   []aceSpec{deniedOnEvent("all"), onCalendar("read"), onCalendar("write-content"), onCalendar("unbind")},
+		update: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		delete: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+	},
+	{
+		principal: "event grant", aces: []aceSpec{onEvent("read"), onEvent("write-content"), onEvent("unbind")},
+		update: [3]targetOutcome{{nil, ErrNotFound}, {nil, ErrNotFound}, {ErrPreconditionFailed, ErrNotFound}},
+		delete: [3]targetOutcome{{ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}},
+	},
+	{
+		principal: "write", aces: []aceSpec{onCalendar("read"), onCalendar("write-content"), onCalendar("unbind")},
+		update: [3]targetOutcome{{nil, ErrNotFound}, {nil, ErrNotFound}, {ErrPreconditionFailed, ErrNotFound}},
+		delete: [3]targetOutcome{{nil, ErrNotFound}, {nil, ErrNotFound}, {ErrPreconditionFailed, ErrNotFound}},
+	},
+	{
+		principal: "calendar all, event unbind denied", aces: []aceSpec{deniedOnEvent("unbind"), onCalendar("all")},
+		update: [3]targetOutcome{{nil, ErrNotFound}, {nil, ErrNotFound}, {ErrPreconditionFailed, ErrNotFound}},
+		delete: [3]targetOutcome{{nil, ErrNotFound}, {nil, ErrNotFound}, {ErrPreconditionFailed, ErrNotFound}},
+	},
+	{
+		principal: "calendar deny all", aces: []aceSpec{deniedOnCalendar("all")}, concealed: true,
+		update:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		delete:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		davDelete: &[3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+	},
+	{
+		principal: "calendar read-acl only", aces: []aceSpec{onCalendar("read-acl")}, concealed: true,
+		update:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		delete:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		davDelete: &[3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+	},
+	{
+		principal: "event read, calendar deny all", aces: []aceSpec{onEvent("read"), deniedOnCalendar("all")},
+		update:    [3]targetOutcome{{ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}},
+		delete:    [3]targetOutcome{{ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}, {ErrForbidden, ErrNotFound}},
+		davDelete: &[3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+	},
+}
+
+// eventWriteAccessHeaders are the conditional headers eventWriteAccessCases
+// lists outcomes for, in order.
+var eventWriteAccessHeaders = []struct{ name, ifMatch, ifNoneMatch string }{
+	{name: "unconditional"},
+	{name: "If-Match", ifMatch: `"etag"`},
+	{name: "If-None-Match *", ifNoneMatch: "*"},
+}
+
+// eventWriteAccessEntries are the ACEs the principal userID holds as
+// eventWriteAccessCases describes them, keyed by resource path.
+func eventWriteAccessEntries(calendarID, userID int64, aces []aceSpec) map[string][]store.ACLEntry {
+	collection := fmt.Sprintf("/dav/calendars/%d", calendarID)
+	entries := map[string][]store.ACLEntry{}
+	for _, ace := range aces {
+		path := collection
+		if ace.onEvent {
+			path += "/stored.ics"
+		}
+		entries[path] = append(entries[path], store.ACLEntry{ResourcePath: path, PrincipalHref: fmt.Sprintf("/dav/principals/%d/", userID), IsGrant: !ace.deny, Privilege: ace.privilege})
+	}
+	return entries
+}
+
+// getAccessiblePrivileges lists each privilege GetAccessible resolves and the
+// ACE privileges that decide it, the first applicable such ACE deciding, as
+// internal/store's calendar access SQL lists them.
+var getAccessiblePrivileges = []struct {
+	name      string
+	decidedBy []string
+}{
+	{"read", []string{"read", "all"}},
+	{"read-free-busy", []string{"read-free-busy", "read", "all"}},
+	{"write", []string{"write", "all"}},
+	{"write-content", []string{"write-content", "write", "all"}},
+	{"write-properties", []string{"write-properties", "write", "all"}},
+	{"bind", []string{"bind", "write", "all"}},
+	{"unbind", []string{"unbind", "write", "all"}},
+}
+
+// privilegesGetAccessibleIgnores are ACE privileges no calendar access
+// decision reads.
+var privilegesGetAccessibleIgnores = []string{"read-acl", "write-acl", "read-current-user-privilege-set", "unlock"}
+
+// accessibleAs is the calendar as GetAccessible returns it to a principal
+// whose ACEs are entries, keyed by path: nil when no ACE of theirs on the
+// calendar, nor on an event of it they hold a grant on, allows any of
+// getAccessiblePrivileges; otherwise shared, with the calendar's own ACEs
+// resolved. It fails on an ACE it does not model.
+func accessibleAs(t *testing.T, cal store.Calendar, entries map[string][]store.ACLEntry) *store.CalendarAccess {
+	t.Helper()
+	collection := fmt.Sprintf("/dav/calendars/%d", cal.ID)
+	for path, pathEntries := range entries {
+		if path != collection && !strings.HasPrefix(path, collection+"/") {
+			t.Fatalf("accessibleAs does not model an ACE on %s, outside calendar %d", path, cal.ID)
+		}
+		for _, entry := range pathEntries {
+			known := slices.Contains(privilegesGetAccessibleIgnores, entry.Privilege)
+			for _, privilege := range getAccessiblePrivileges {
+				known = known || slices.Contains(privilege.decidedBy, entry.Privilege)
+			}
+			if !known {
+				t.Fatalf("accessibleAs does not model the privilege %q", entry.Privilege)
+			}
+		}
+	}
+	allows := func(path string, decidedBy []string) bool {
+		for _, entry := range entries[path] {
+			if slices.Contains(decidedBy, entry.Privilege) {
+				return entry.IsGrant
+			}
+		}
+		return false
+	}
+	resolved := map[string]bool{}
+	reachable := false
+	for _, privilege := range getAccessiblePrivileges {
+		resolved[privilege.name] = allows(collection, privilege.decidedBy)
+		reachable = reachable || resolved[privilege.name]
+	}
+	for path, pathEntries := range entries {
+		if path == collection || !slices.ContainsFunc(pathEntries, func(entry store.ACLEntry) bool { return entry.IsGrant }) {
+			continue
+		}
+		for _, privilege := range getAccessiblePrivileges {
+			reachable = reachable || allows(path, privilege.decidedBy)
+		}
+	}
+	if !reachable {
+		return nil
+	}
+	privileges := store.CalendarPrivileges{
+		Read: resolved["read"], ReadFreeBusy: resolved["read-free-busy"], Write: resolved["write"],
+		WriteContent: resolved["write-content"], WriteProperties: resolved["write-properties"],
+		Bind: resolved["bind"], Unbind: resolved["unbind"],
+	}.Normalized()
+	return &store.CalendarAccess{Calendar: cal, Shared: true, PrivilegesResolved: true, Privileges: privileges, Editor: privileges.AllowsEventEditing()}
+}
+
+// eventWriteAccessUserID is the user eventWriteAccessStore gives the case at
+// index i; user 1 owns the calendar.
+func eventWriteAccessUserID(i int) int64 { return int64(i) + 2 }
+
+// eventWriteAccessStore is a calendar of user 1's holding the event "stored"
+// and shared with no one but through the ACEs eventWriteAccessCases names.
+func eventWriteAccessStore(t *testing.T) (*store.Store, *fakeEventRepo) {
+	t.Helper()
+	repo := &fakeEventRepo{events: map[string]store.Event{
+		"1:stored": {CalendarID: 1, UID: "stored", ResourceName: "stored", RawICAL: validICS("stored"), ETag: "etag"},
+	}}
+	acls := &fakeACLRepo{}
+	for i, tc := range eventWriteAccessCases {
+		for _, pathEntries := range eventWriteAccessEntries(1, eventWriteAccessUserID(i), tc.aces) {
+			acls.entries = append(acls.entries, pathEntries...)
+		}
+	}
+	return &store.Store{Calendars: calendarSharedThrough(t, acls.entries), Events: repo, ACLEntries: acls}, repo
+}
+
+// calendarSharedThrough is calendar 1, user 1's, as GetAccessible returns it
+// to each principal the ACEs entries name.
+func calendarSharedThrough(t *testing.T, entries []store.ACLEntry) *fakeCalendarRepo {
+	t.Helper()
+	cal := store.Calendar{ID: 1, UserID: 1, Name: "Shared"}
+	byUser := map[int64]map[string][]store.ACLEntry{}
+	for _, entry := range entries {
+		var userID int64
+		if _, err := fmt.Sscanf(entry.PrincipalHref, "/dav/principals/%d/", &userID); err != nil {
+			t.Fatalf("calendarSharedThrough does not model the principal %q", entry.PrincipalHref)
+		}
+		if byUser[userID] == nil {
+			byUser[userID] = map[string][]store.ACLEntry{}
+		}
+		byUser[userID][entry.ResourcePath] = append(byUser[userID][entry.ResourcePath], entry)
+	}
+	repo := &fakeCalendarRepo{
+		calendars:  map[int64]*store.CalendarAccess{1: {Calendar: cal}},
+		accessible: map[int64]*store.CalendarAccess{1: {Calendar: cal, PrivilegesResolved: true, Privileges: store.FullCalendarPrivileges()}},
+	}
+	for userID, userEntries := range byUser {
+		if access := accessibleAs(t, cal, userEntries); access != nil {
+			repo.accessible[userID] = access
+		}
+	}
+	return repo
+}
+
+func TestEventUpdatesAndDeletesRevealNothingToAPrincipalWhoCannotSeeTheEvent(t *testing.T) {
+	for i, tc := range eventWriteAccessCases {
+		user := &store.User{ID: eventWriteAccessUserID(i)}
+		for _, op := range []string{"update", "delete"} {
+			outcomes := tc.update
+			if op == "delete" {
+				outcomes = tc.delete
+			}
+			for h, header := range eventWriteAccessHeaders {
+				t.Run(tc.principal+"/"+op+"/"+header.name, func(t *testing.T) {
+					got := map[string]error{}
+					for _, uid := range []string{"stored", "missing"} {
+						st, repo := eventWriteAccessStore(t)
+						svc := NewService(st, dav.ValidateCalendarObject)
+						var err error
+						if op == "update" {
+							_, _, err = svc.UpdateEvent(context.Background(), user, 1, uid, UpsertInput{
+								RawICS: validICS(uid), ContentType: "text/calendar", IfMatch: header.ifMatch, IfNoneMatch: header.ifNoneMatch,
+							})
+						} else {
+							err = svc.DeleteEvent(context.Background(), user, 1, uid, header.ifMatch, header.ifNoneMatch)
+						}
+						got[uid] = err
+						if err != nil {
+							if stored, ok := repo.events["1:stored"]; !ok || stored.ETag != "etag" || len(repo.events) != 1 {
+								t.Errorf("%s of %q answered %v but changed the calendar: %#v", op, uid, err, repo.events)
+							}
+						}
+					}
+					assertEventWriteOutcome(t, tc, outcomes[h], got)
+				})
+			}
+		}
+	}
+}
+
+func assertEventWriteOutcome(t *testing.T, tc eventWriteAccessCase, want targetOutcome, got map[string]error) {
+	t.Helper()
+	if !errors.Is(got["stored"], want.stored) || !errors.Is(got["missing"], want.missing) {
+		t.Fatalf("stored UID: %v, missing UID: %v; want %v and %v", got["stored"], got["missing"], want.stored, want.missing)
+	}
+	if tc.concealed && fmt.Sprint(got["stored"]) != fmt.Sprint(got["missing"]) {
+		t.Fatalf("answers differ by existence: %v for the stored UID, %v for a missing one", got["stored"], got["missing"])
+	}
+}
+
+// A principal with no access to a calendar reads none of its events, even
+// knowing a UID, as an attendee of an invitation does.
+func TestGetEventHidesAnEventFromAPrincipalWithNoAccess(t *testing.T) {
+	st, _ := eventWriteAccessStore(t)
+	svc := NewService(st, dav.ValidateCalendarObject)
+	for i, tc := range eventWriteAccessCases {
+		user := &store.User{ID: eventWriteAccessUserID(i)}
+		switch tc.principal {
+		case "no access":
+			for _, uid := range []string{"stored", "missing"} {
+				if ev, err := svc.GetEvent(context.Background(), user, 1, uid); !errors.Is(err, ErrNotFound) || ev != nil {
+					t.Fatalf("GetEvent(%q) = %v, %v; want ErrNotFound", uid, ev != nil, err)
+				}
+			}
+		case "read-only", "event grant":
+			if _, err := svc.GetEvent(context.Background(), user, 1, "stored"); err != nil {
+				t.Fatalf("GetEvent() by the %s principal error = %v, want the event", tc.principal, err)
+			}
+		}
+	}
 }
 
 func TestServiceListEventsBatchesACLLookups(t *testing.T) {
@@ -719,6 +1253,9 @@ func methodICS(uid string) string {
 
 type fakeCalendarRepo struct {
 	calendars map[int64]*store.CalendarAccess
+	// accessible, when set, is what GetAccessible returns to each user,
+	// keyed by user ID, in place of the calendar for its owner or a share.
+	accessible map[int64]*store.CalendarAccess
 }
 
 type fakeDeadPropertyRepo struct {
@@ -779,6 +1316,13 @@ func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]
 	return out, nil
 }
 func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*store.CalendarAccess, error) {
+	if f.accessible != nil {
+		if cal, ok := f.accessible[userID]; ok && cal.ID == calendarID {
+			copy := *cal
+			return &copy, nil
+		}
+		return nil, nil
+	}
 	if cal, ok := f.calendars[calendarID]; ok && (cal.UserID == userID || cal.Shared) {
 		copy := *cal
 		return &copy, nil
@@ -1126,6 +1670,77 @@ func TestEventWritesStoreWhatTheValidatorAccepted(t *testing.T) {
 	_, _, err := todoOnly.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS("event"), ContentType: "text/calendar"})
 	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "supported-calendar-component") {
 		t.Fatalf("CreateEvent() into a VTODO collection error = %v, want supported-calendar-component", err)
+	}
+}
+
+// A structured event's timezone and recurrence until are refused when the
+// server cannot read them, rather than read as UTC or as no end: an unknown
+// zone would move the event by its offset from UTC, and an unreadable until
+// would leave the series without an end.
+func TestStructuredEventsRefuseAZoneOrUntilTheServerCannotRead(t *testing.T) {
+	user := &store.User{ID: 1}
+	timed := func(timezone string, recurrence *StructuredRecurrence) *StructuredInput {
+		return &StructuredInput{Summary: "x", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00", Timezone: timezone, Recurrence: recurrence}
+	}
+	daily := func(until string, count int) *StructuredRecurrence {
+		return &StructuredRecurrence{Frequency: "DAILY", Until: until, Count: count}
+	}
+	tests := map[string]struct {
+		input *StructuredInput
+		// zone is an IANA zone the case needs the host's time zone database for.
+		zone string
+		want error
+		// stored is a line the stored object must hold.
+		stored string
+	}{
+		"zone the database lacks":             {input: timed("Nowhere/Zone", nil), want: ErrBadRequest},
+		"Windows zone name":                   {input: timed("Eastern Standard Time", nil), want: ErrBadRequest},
+		"the server's own zone":               {input: timed("Local", nil), want: ErrBadRequest},
+		"zone with a quote":                   {input: timed(`America/"Chicago`, nil), want: ErrBadRequest},
+		"unknown zone on all-day event":       {input: &StructuredInput{Summary: "x", DTStart: "2026-03-20", DTEnd: "2026-03-20", AllDay: true, Timezone: "Nowhere/Zone"}, want: ErrBadRequest},
+		"no zone":                             {input: timed("", nil), stored: "DTSTART:20260320T100000Z"},
+		"blank zone":                          {input: timed("  ", nil), stored: "DTSTART:20260320T100000Z"},
+		"UTC":                                 {input: timed("UTC", nil), stored: "DTSTART:20260320T100000Z"},
+		"IANA zone":                           {input: timed("America/Chicago", nil), zone: "America/Chicago", stored: "DTSTART;TZID=America/Chicago:20260320T100000"},
+		"until not a date":                    {input: timed("", daily("June", 0)), want: ErrBadRequest},
+		"until in basic format":               {input: timed("", daily("20260630", 0)), want: ErrBadRequest},
+		"until with a time":                   {input: timed("", daily("2026-06-30T10:00", 0)), want: ErrBadRequest},
+		"until on no calendar day":            {input: timed("", daily("2026-02-30", 0)), want: ErrBadRequest},
+		"malformed until beside count":        {input: timed("", daily("June", 3)), want: ErrBadRequest},
+		"malformed until without a frequency": {input: timed("", &StructuredRecurrence{Until: "June"}), want: ErrBadRequest},
+		"until":                               {input: timed("", daily("2026-06-30", 0)), stored: "RRULE:FREQ=DAILY;UNTIL=20260630T235959Z"},
+		"no until":                            {input: timed("", daily("", 0)), stored: "RRULE:FREQ=DAILY\r\n"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tt.zone != "" {
+				if _, err := time.LoadLocation(tt.zone); err != nil {
+					t.Skipf("tzdata unavailable: %v", err)
+				}
+			}
+			repo := &fakeEventRepo{events: map[string]store.Event{}}
+			svc := newServiceWithRepos(true, repo)
+			created, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{Structured: tt.input})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
+			}
+			if tt.want != nil {
+				if len(repo.events) != 0 {
+					t.Fatalf("stored %d events after a refusal, want none", len(repo.events))
+				}
+				repo.events["1:stored"] = store.Event{CalendarID: 1, UID: "stored", ResourceName: "stored", RawICAL: validICS("stored"), ETag: "etag"}
+				if _, _, err := svc.UpdateEvent(context.Background(), user, 1, "stored", UpsertInput{Structured: tt.input}); !errors.Is(err, tt.want) {
+					t.Fatalf("UpdateEvent() error = %v, want %v", err, tt.want)
+				}
+				if repo.events["1:stored"].ETag != "etag" {
+					t.Fatal("UpdateEvent() rewrote the stored event after a refusal")
+				}
+				return
+			}
+			if !strings.Contains(created.RawICAL, tt.stored) {
+				t.Fatalf("stored\n%s\nwant it to hold %q", created.RawICAL, tt.stored)
+			}
+		})
 	}
 }
 

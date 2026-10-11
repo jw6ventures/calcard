@@ -75,13 +75,8 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "read")
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			if errors.Is(err, errForbidden) {
+		if _, err := h.loadCalendarForObjectRead(r.Context(), user, calendarID, uid, cleanPath); err != nil {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -95,15 +90,6 @@ func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if event == nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		allowed, err := h.canReadCalendarObject(r.Context(), user, cal, uid)
-		if err != nil {
-			http.Error(w, "failed to evaluate calendar access", http.StatusInternalServerError)
-			return
-		}
-		if !allowed {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
