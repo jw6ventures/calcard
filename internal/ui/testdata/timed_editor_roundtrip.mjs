@@ -23,15 +23,14 @@ function extract(name) {
     return html.slice(start, i + 1);
 }
 const aggregate = process.argv[2].includes('all_calendars');
-const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'rruleUntilDay', 'rruleUntilLimit',
-    'makeOccurrenceKey', 'recurrenceZoneClock', 'recurrenceCalendar', 'expandRecurringEvents',
-    'parseServerDate', 'normalizeServerEvent', 'formatRRule', 'formatDateTimeForInput', 'browserTimeZone'];
+const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'rruleUntilDay', 'overrideRecurrenceIdAllDay', 'expandRecurringEvents',
+    'parseServerDate', 'normalizeServerEvent', 'formatRRule', 'formatDateTimeForInput', 'browserTimeZone', 'showPartialRecurrence', 'refreshPartialRecurrence'];
 const names = shared.concat(aggregate
-    ? ['formatLocalDate', 'formatDateInput', 'formatRecurrenceInput', 'setEditorDateValues', 'inclusiveAllDayEnd', 'startOfDay', 'addDays', 'rruleForEvent', 'openEditEditor', 'openCreateEditor']
+    ? ['formatLocalDate', 'formatDateInput', 'formatRecurrenceInput', 'setEditorDateValues', 'inclusiveAllDayEnd', 'startOfDay', 'addDays', 'openEditEditor', 'openCreateEditor']
     : ['formatDateForInput', 'formatRecurrenceIdForInput', 'showEditEventModal', 'showCreateEventModal', 'setEditScope', 'toggleAllDay']);
 const elements = {};
 function element() {
-    return {value: '', style: {}, classList: {add() {}, remove() {}}, focus() {}};
+    return {value: '', style: {}, classList: {add() {}, remove() {}}, focus() {}, setAttribute() {}};
 }
 const document = {
     getElementById(id) { return elements[id] ||= element(); },
@@ -53,7 +52,8 @@ const stubs = `
     function parseICAL() { return {}; }
     function selectStoredValue(select, value) { select.value = value || ''; }
     window.selectStoredValue = selectStoredValue;
-    window.rruleUntilDay = rruleUntilDay;
+    window.showPartialRecurrence = showPartialRecurrence;
+    window.refreshPartialRecurrence = refreshPartialRecurrence;
     window.formatDateTimeForInput = formatDateTimeForInput;
     window.timeZoneClock = timeZoneClock;
     window.browserTimeZone = browserTimeZone;
@@ -81,7 +81,7 @@ function editorValues(event) {
 if (process.argv[3]) {
     const served = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
     const events = served.map(view.normalizeServerEvent);
-    const occurrences = view.expandRecurringEvents(events, new Date('2024-03-01T00:00:00Z'), new Date('2024-04-01T00:00:00Z'));
+    const occurrences = view.expandRecurringEvents(events);
     const stamp = date => date.toISOString().replace(/[-:]|\.\d{3}/g, '');
     const series = events.find(event => event.uid === 'outlook-standup');
     const occurrenceAt = (instant, uid = 'outlook-standup') => {
@@ -104,30 +104,26 @@ if (process.argv[3]) {
     process.exit(0);
 }
 
-function format(start, end, zone, until) {
-    const rrule = 'FREQ=WEEKLY;UNTIL=' + until;
+function format(start, end, zone) {
     return editorValues({uid: 'timed', calendarId: 1, canEdit: true, canDelete: true, isOccurrence: true,
         dtstart: start, dtend: end, timezone: zone, recurrenceId: start, recurrenceTimezone: zone || 'UTC',
-        rrule, rruleParsed: {FREQ: 'WEEKLY', UNTIL: until}});
+        rrule: 'FREQ=WEEKLY'});
 }
-// Each UNTIL is the one the server writes for a series ending on 31 July 2025:
-// that day's last second in the event's zone, or in UTC for an event with no
-// zone or one the server does not know.
 const cases = [
-    ['2025-07-24T09:00:00-04:00', '2025-07-24T10:00:00-04:00', 'America/New_York', '20250801T035959Z'],
-    ['2025-03-09T01:30:00-05:00', '2025-03-09T03:30:00-04:00', 'America/New_York', '20250801T035959Z'],
-    ['2025-07-24T09:00:00+05:30', '2025-07-24T10:00:00+05:30', 'Asia/Kolkata', '20250731T182959Z'],
-    ['2025-07-24T09:00:00Z', '2025-07-24T10:00:00Z', 'UTC', '20250731T235959Z'],
-    ['2025-07-24T09:00:15Z', '2025-07-24T10:00:25Z', '', '20250731T235959Z'],
-    ['2025-07-24T13:00:00Z', '2025-07-24T14:00:00Z', 'Eastern Standard Time', '20250731T235959Z'],
-    ['2025-07-24T23:30:00Z', '2025-07-25T00:30:00Z', 'Not/AZone', '20250731T235959Z'],
+    ['2025-07-24T09:00:00-04:00', '2025-07-24T10:00:00-04:00', 'America/New_York'],
+    ['2025-03-09T01:30:00-05:00', '2025-03-09T03:30:00-04:00', 'America/New_York'],
+    ['2025-07-24T09:00:00+05:30', '2025-07-24T10:00:00+05:30', 'Asia/Kolkata'],
+    ['2025-07-24T09:00:00Z', '2025-07-24T10:00:00Z', 'UTC'],
+    ['2025-07-24T09:00:15Z', '2025-07-24T10:00:25Z', ''],
+    ['2025-07-24T13:00:00Z', '2025-07-24T14:00:00Z', 'Eastern Standard Time'],
+    ['2025-07-24T23:30:00Z', '2025-07-25T00:30:00Z', 'Not/AZone'],
 ];
 
 // The create form prefills a slot picked on the browser's grid, so its times
 // are the browser's wall clock and the zone it submits has to be the browser's.
 // The aggregate view's create and edit forms are one form, which an edit
 // leaves holding the event's zone.
-const edited = cases.map(([start, end, zone, until]) => ({start, end, rruleUntil: until, ...format(new Date(start), new Date(end), zone, until)}));
+const edited = cases.map(([start, end, zone]) => ({start, end, ...format(new Date(start), new Date(end), zone)}));
 const slot = [new Date('2025-07-24T14:00:00Z'), new Date('2025-07-24T14:30:00Z')];
 view.create(slot[0], slot[1], false);
 const createPrefix = aggregate ? 'event' : 'create';

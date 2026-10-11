@@ -118,7 +118,7 @@ func TestSeriesEditKeepsDeletedOccurrencesDeleted(t *testing.T) {
 			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
 			s := &store.Store{Calendars: calRepo, Events: eventRepo}
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			user := &store.User{ID: 100}
 
 			w := httptest.NewRecorder()
@@ -170,7 +170,7 @@ func TestSeriesEditEndingTheSeriesDropsItsExclusions(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 
 	w := httptest.NewRecorder()
@@ -287,7 +287,7 @@ func TestSeriesEditKeepsWhatTheEditorDoesNotEdit(t *testing.T) {
 				"1:client-series": {ID: 1, CalendarID: 1, UID: "client-series", ResourceName: "client-series.ics", RawICAL: validated.Body, ETag: "e"},
 			}}}
 			s := &store.Store{Calendars: calRepo, Events: eventRepo}
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			user := &store.User{ID: 100}
 
 			edit := maps.Clone(clientSeriesForm)

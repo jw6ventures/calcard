@@ -515,7 +515,16 @@ func TestNewHandlerRequiresAValidator(t *testing.T) {
 			t.Fatal("NewHandler with a nil validator did not panic; the UI would store calendar data unvalidated")
 		}
 	}()
-	NewHandler(&config.Config{}, &store.Store{}, &auth.Service{}, nil)
+	NewHandler(&config.Config{}, &store.Store{}, &auth.Service{}, nil, dav.EventInstances)
+}
+
+func TestNewHandlerRequiresAnExpander(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewHandler with a nil expander did not panic; the views would show no instance of any series")
+		}
+	}()
+	NewHandler(&config.Config{}, &store.Store{}, &auth.Service{}, dav.ValidateCalendarObject, nil)
 }
 
 // Test handler creation
@@ -524,7 +533,7 @@ func TestNewHandler(t *testing.T) {
 	store := &store.Store{}
 	authService := &auth.Service{}
 
-	handler := NewHandler(cfg, store, authService, dav.ValidateCalendarObject)
+	handler := NewHandler(cfg, store, authService, dav.ValidateCalendarObject, dav.EventInstances)
 
 	if handler == nil {
 		t.Fatal("NewHandler() returned nil")

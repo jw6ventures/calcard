@@ -845,8 +845,10 @@
             : value;
     }
 
+    // Cards written by hand or by older clients may break lines with a bare
+    // LF or CR rather than CRLF; a fold after either is still a fold.
     function unfoldLines(vcard) {
-        return vcard.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n').split('\n');
+        return vcard.replace(/\r\n?/g, '\n').replace(/\n[ \t]/g, '').split('\n');
     }
     
     function getType(params) {
@@ -965,7 +967,7 @@
 
     // Parse all contacts
     var contacts = rawContacts.map(function(raw) {
-        var parsed = parseVCard(raw.RawVCard);
+        var parsed = parseVCard(raw.VCard);
         parsed.uid = raw.UID;
         parsed.etag = raw.ETag;
         parsed.lastMod = raw.LastModified;

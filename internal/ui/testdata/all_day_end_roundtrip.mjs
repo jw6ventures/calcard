@@ -24,7 +24,7 @@ function extract(name) {
 }
 const src = ['formatLocalDate','formatDateInput','listedOffsets','intlOffsets','timeZoneClock','formatDateTimeForInput','startOfDay','addDays',
              'inclusiveAllDayEnd','exclusiveAllDayEnd','setEditorDateValues',
-             'parseServerDate','normalizeServerEvent','makeOccurrenceKey']
+             'parseServerDate','normalizeServerEvent']
   .map(extract).join('\n');
 
 // Enough of a DOM for setEditorDateValues, which is the function that actually
@@ -41,7 +41,7 @@ const document = {getElementById: (id) => inputs[id]};
 const parseICAL = () => ({});
 const mod = new Function('document', 'parseICAL', src +
   '\nreturn {formatLocalDate, startOfDay, addDays, inclusiveAllDayEnd, exclusiveAllDayEnd,' +
-  ' setEditorDateValues, parseServerDate, normalizeServerEvent, makeOccurrenceKey};')(document, parseICAL);
+  ' setEditorDateValues, parseServerDate, normalizeServerEvent};')(document, parseICAL);
 
 // editorEnd runs the real form fill and reports the end date it wrote.
 const editorEnd = (start, exclusiveEnd) => {
@@ -149,20 +149,16 @@ mod.setEditorDateValues(ev.dtstart, ev.dtend, true);
 check('server payload multi-day: form start', inputs['event-dtstart'].value, '2025-07-24');
 check('server payload multi-day: form end', inputs['event-dtend'].value, '2025-07-26');
 
-// RECURRENCE-ID and EXDATE of an all-day series arrive the same way, and
-// expandRecurringEvents matches them against dtstart through makeOccurrenceKey.
-// A key built from a differently-shifted value never matches.
+// RECURRENCE-ID and EXDATE of an all-day series arrive the same way, and have
+// to land on their own days with the series' DTSTART.
 const series = mod.normalizeServerEvent(Object.assign(
   serverPayload('2025-07-24', '2025-07-25'),
   {rrule: 'FREQ=DAILY', exdates: ['2025-07-26T00:00:00Z'],
    recurrenceId: '2025-07-24T00:00:00Z', recurrenceIdAllDay: true}));
-check('all-day exdate lands on its own day',
-  mod.makeOccurrenceKey(series.exdates[0], true), '2025-07-26');
-check('all-day recurrence id lands on its own day',
-  mod.makeOccurrenceKey(series.recurrenceId, true), '2025-07-24');
-check('recurrence id keys with dtstart',
-  mod.makeOccurrenceKey(series.recurrenceId, true),
-  mod.makeOccurrenceKey(series.dtstart, true));
+const localDay = (date) => mod.formatLocalDate(date);
+check('all-day exdate lands on its own day', localDay(series.exdates[0]), '2025-07-26');
+check('all-day recurrence id lands on its own day', localDay(series.recurrenceId), '2025-07-24');
+check('recurrence id names the day of the DTSTART', localDay(series.recurrenceId), localDay(series.dtstart));
 
 // A timed event must keep its instant: normalizing it onto a local date would
 // move the event by the UTC offset.

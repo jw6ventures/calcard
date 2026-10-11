@@ -2,6 +2,7 @@ package ui
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,17 +73,26 @@ func binaryAttachment(keyPart string) bool {
 // from the editor's fields, merged with previous, the master it replaces, as
 // mergeEdit merges them; both are the content lines between BEGIN:VEVENT and
 // END:VEVENT. object is the unfolded calendar object the edit is stored as,
-// whose zones the series' times are read in.
+// whose zones the series' times are read in, and recurrence the repeat
+// fields the editor submitted, whose RRULE keeps what keptRule keeps of
+// previous'.
 //
 // EXDATE, RDATE and EXRULE add to or take from the series' instances: they are
 // dropped when the edit ends the series, and when it moves the series' start
 // to another time of day, zone or value type, each EXDATE and RDATE date is
 // restated to name the same day's instance of the moved series.
-func withUneditedProperties(edited, previous, object []string, form *utils.EventOptions) []string {
+func withUneditedProperties(edited, previous, object []string, form *utils.EventOptions, recurrence *utils.RecurrenceOptions) []string {
 	properties, _ := splitComponentBody(edited)
 	previousProperties, _ := splitComponentBody(previous)
 	endsSeries := firstPropertyLine(previousProperties, "RRULE") != "" && firstPropertyLine(properties, "RRULE") == ""
 	move, moved := newSeriesMove(previousProperties, properties, object)
+	if shown, _, ok := shownRecurrence(previousProperties, object); ok {
+		rule := firstPropertyLine(properties, "RRULE")
+		if i := slices.Index(edited, rule); rule != "" && i >= 0 {
+			edited = slices.Clone(edited)
+			edited[i] = keptRule(rule, firstPropertyLine(previousProperties, "RRULE"), recurrence, shown, moved)
+		}
+	}
 	return mergeEdit(edited, previous, form, func(name, line string) (string, bool) {
 		switch name {
 		case "EXDATE", "RDATE", "EXRULE":
@@ -792,4 +802,266 @@ func (m seriesMove) formerWallClock(keyPart, value string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return m.fromZone.WallClock(instant), true
+}
+
+// shownRecurrence is how the editor's repeat fields show the RRULE of a
+// series' master with properties, the content lines between its BEGIN and
+// END, in object, the unfolded calendar object holding it: its FREQ upper-cased,
+// INTERVAL, COUNT, the day its UNTIL ends the series on in the series' zone,
+// the weekday of each BYDAY entry, BYMONTHDAY, and a BYMONTH naming one month.
+// partial is true when the rule holds more than that: another part, such as
+// BYSETPOS, an ordinal BYDAY, several months, or a value the fields cannot
+// hold, or a part the fields hide at the rule's frequency: the weekdays,
+// shown for a weekly rule, the days of the month, for a monthly or yearly
+// one, and the month, for a yearly one. A WKST counts only where it decides
+// which instances there are (RFC 5545 §3.3.10): in a weekly rule naming
+// weekdays and repeating less than every week. Clients write one on most
+// weekly rules. An edit leaving the fields as shown keeps the rule as written
+// (see keptRule). ok is false when the master does not repeat by a rule.
+func shownRecurrence(properties, object []string) (shown utils.RecurrenceOptions, partial, ok bool) {
+	line := firstPropertyLine(properties, "RRULE")
+	if line == "" {
+		return utils.RecurrenceOptions{}, false, false
+	}
+	shown.Interval = 1
+	_, value, _ := ical.SplitContentLine(line)
+	seen := make(map[string]bool)
+	weekStart := false
+	for _, part := range ruleParts(value) {
+		if part.name == "" || seen[part.name] {
+			partial = true
+			continue
+		}
+		seen[part.name] = true
+		switch part.name {
+		case "FREQ":
+			shown.Frequency = strings.ToUpper(part.value)
+		case "INTERVAL":
+			if interval, err := strconv.Atoi(part.value); err == nil && interval > 0 {
+				shown.Interval = interval
+			} else {
+				partial = true
+			}
+		case "COUNT":
+			if count, err := strconv.Atoi(part.value); err == nil && count > 0 {
+				shown.Count = count
+			} else {
+				partial = true
+			}
+		case "UNTIL":
+			if day, ok := untilDay(part.value, properties, object); ok {
+				shown.Until = day
+			} else {
+				partial = true
+			}
+		case "BYDAY":
+			for _, entry := range strings.Split(part.value, ",") {
+				weekday, ordinal := byDayWeekday(entry)
+				if weekday == "" || ordinal {
+					partial = true
+				}
+				if weekday != "" && !slices.Contains(shown.ByDay, weekday) {
+					shown.ByDay = append(shown.ByDay, weekday)
+				}
+			}
+		case "BYMONTHDAY":
+			days, err := utils.ParseMonthDays(part.value)
+			if err != nil {
+				partial = true
+			}
+			shown.ByMonthDay = days
+		case "WKST":
+			weekStart = true
+		case "BYMONTH":
+			if month, err := strconv.Atoi(part.value); err == nil && month >= 1 && month <= 12 {
+				shown.ByMonth = month
+			} else {
+				partial = true
+			}
+		default:
+			partial = true
+		}
+	}
+	if shown.Count > 0 && shown.Until != "" {
+		shown.Until, partial = "", true
+	}
+	if weekStart && shown.Frequency == "WEEKLY" && shown.Interval > 1 && len(shown.ByDay) > 0 {
+		partial = true
+	}
+	monthly := shown.Frequency == "MONTHLY" || shown.Frequency == "YEARLY"
+	if len(shown.ByDay) > 0 && shown.Frequency != "WEEKLY" || len(shown.ByMonthDay) > 0 && !monthly ||
+		shown.ByMonth != 0 && shown.Frequency != "YEARLY" {
+		partial = true
+	}
+	return shown, partial, true
+}
+
+// rulePart is one part of an RRULE value: its name, upper-cased, or "" for a
+// part with no "=", and its value, both as ical.RRuleParam reads them, and the
+// part as written.
+type rulePart struct {
+	name, value, text string
+}
+
+func ruleParts(value string) []rulePart {
+	var parts []rulePart
+	for text := range strings.SplitSeq(value, ";") {
+		part := rulePart{text: text}
+		if name, value, ok := strings.Cut(text, "="); ok {
+			part.name, part.value = strings.ToUpper(strings.TrimSpace(name)), strings.TrimSpace(value)
+		}
+		parts = append(parts, part)
+	}
+	return parts
+}
+
+// byDayWeekday is the weekday a BYDAY entry names, upper-cased, and whether
+// the entry restricts it to an ordinal one of its period, such as 2MO or -1FR.
+// weekday is "" for an entry naming none.
+func byDayWeekday(entry string) (weekday string, ordinal bool) {
+	entry = strings.ToUpper(strings.TrimSpace(entry))
+	if len(entry) < 2 {
+		return "", false
+	}
+	weekday = entry[len(entry)-2:]
+	switch weekday {
+	case "MO", "TU", "WE", "TH", "FR", "SA", "SU":
+	default:
+		return "", false
+	}
+	if prefix := entry[:len(entry)-2]; prefix != "" {
+		if n, err := strconv.Atoi(prefix); err != nil || n == 0 || n < -53 || n > 53 {
+			return "", false
+		}
+		ordinal = true
+	}
+	return weekday, ordinal
+}
+
+// untilDay is the day, as YYYY-MM-DD, an UNTIL value ends the series of a
+// master with properties on: the date a DATE or a floating value names, and
+// the date a UTC value has in the series' zone, read in object as the editor
+// writes it (utils.EventZoneIn).
+func untilDay(value string, properties, object []string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) == len("20060102") {
+		day, err := time.Parse("20060102", value)
+		return day.Format("2006-01-02"), err == nil
+	}
+	wall, err := ical.ParseDateTime(value)
+	if err != nil {
+		return "", false
+	}
+	if strings.HasSuffix(strings.ToUpper(value), "Z") {
+		start, _ := readSeriesStart(properties)
+		wall = utils.EventZoneIn(start.tzid, object).WallClock(wall)
+	}
+	return wall.Format("2006-01-02"), true
+}
+
+// keptRule returns the RRULE line a series edit writes: edited, the line the
+// editor's fields build from submitted, merged with previous, the line the
+// series' master holds, which the fields showed as shown. An edit that keeps
+// the series' frequency keeps every part of previous the fields do not show,
+// such as BYSETPOS, WKST or an ordinal BYDAY, and each part whose field it
+// left as shown, as written. A field it changed writes its part as edited
+// does, except BYDAY: a weekday left checked keeps its entries, ordinal ones
+// included, and one newly checked is added plain. An UNTIL whose fields were
+// left as shown is restated from its day when the edit moves the series to
+// another time of day, zone or value type (moved), since it named an instant
+// of the series as it was. An edit changing the frequency, or ending the
+// series, writes edited, and so does one whose merge is a rule the server
+// cannot expand, such as a BYSETPOS left with no part to select from.
+func keptRule(edited, previous string, submitted *utils.RecurrenceOptions, shown utils.RecurrenceOptions, moved bool) string {
+	if edited == "" || previous == "" || submitted == nil || !strings.EqualFold(submitted.Frequency, shown.Frequency) {
+		return edited
+	}
+	_, previousValue, _ := ical.SplitContentLine(previous)
+	_, editedValue, _ := ical.SplitContentLine(edited)
+	parts := ruleParts(previousValue)
+	written := ical.RRuleParts(editedValue)
+	changed := false
+	set := func(name, value string) {
+		changed = true
+		kept := parts[:0:0]
+		placed := false
+		for _, part := range parts {
+			if part.name != name {
+				kept = append(kept, part)
+			} else if value != "" && !placed {
+				kept = append(kept, rulePart{name: name, value: value, text: name + "=" + value})
+				placed = true
+			}
+		}
+		if value != "" && !placed {
+			kept = append(kept, rulePart{name: name, value: value, text: name + "=" + value})
+		}
+		parts = kept
+	}
+	if submitted.Interval != shown.Interval {
+		set("INTERVAL", written["INTERVAL"])
+	}
+	if submitted.Count != shown.Count || submitted.Until != shown.Until {
+		set("COUNT", written["COUNT"])
+		set("UNTIL", written["UNTIL"])
+	} else if moved && written["UNTIL"] != "" && slices.ContainsFunc(parts, func(part rulePart) bool { return part.name == "UNTIL" }) {
+		set("UNTIL", written["UNTIL"])
+	}
+	if !sameWeekdays(submitted.ByDay, shown.ByDay) {
+		var byDay string
+		for _, part := range parts {
+			if part.name == "BYDAY" {
+				byDay = part.value
+				break
+			}
+		}
+		set("BYDAY", keptByDay(byDay, submitted.ByDay))
+	}
+	if !slices.Equal(submitted.ByMonthDay, shown.ByMonthDay) {
+		set("BYMONTHDAY", written["BYMONTHDAY"])
+	}
+	if submitted.ByMonth != shown.ByMonth {
+		set("BYMONTH", written["BYMONTH"])
+	}
+	if !changed {
+		return previous
+	}
+	texts := make([]string, len(parts))
+	for i, part := range parts {
+		texts[i] = part.text
+	}
+	merged := strings.Join(texts, ";")
+	if !ical.ValidRecurrenceRule(merged) {
+		return edited
+	}
+	return "RRULE:" + merged
+}
+
+// sameWeekdays reports whether two lists of weekdays name the same ones.
+func sameWeekdays(a, b []string) bool {
+	return !slices.ContainsFunc(a, func(day string) bool { return !slices.Contains(b, day) }) &&
+		!slices.ContainsFunc(b, func(day string) bool { return !slices.Contains(a, day) })
+}
+
+// keptByDay is the BYDAY value for the weekdays checked, given previous, the
+// BYDAY value the master held: each entry of previous on a checked weekday, as
+// written, then each checked weekday no entry names, plain.
+func keptByDay(previous string, checked []string) string {
+	var entries []string
+	named := make(map[string]bool)
+	if previous != "" {
+		for _, entry := range strings.Split(previous, ",") {
+			if weekday, _ := byDayWeekday(entry); weekday != "" && slices.Contains(checked, weekday) {
+				entries = append(entries, strings.TrimSpace(entry))
+				named[weekday] = true
+			}
+		}
+	}
+	for _, weekday := range checked {
+		if !named[weekday] {
+			entries = append(entries, weekday)
+			named[weekday] = true
+		}
+	}
+	return strings.Join(entries, ",")
 }

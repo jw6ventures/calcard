@@ -198,7 +198,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	// Redirect Apple-specific legacy path to /dav/
 	r.MethodFunc("PROPFIND", "/calendar/*", wellKnownHandler)
 
-	uiHandler := ui.NewHandler(cfg, store, authService, dav.ValidateCalendarObject)
+	uiHandler := ui.NewHandler(cfg, store, authService, dav.ValidateCalendarObject, dav.EventInstances)
 	uiHandler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
 	apiHandler := api.NewHandler(cfg, store, dav.ValidateCalendarObject)
 	r.Route("/auth", func(r chi.Router) {

@@ -456,7 +456,20 @@ func upgradeBinaryValue(line *vcardLine, name string) {
 		line.removeParamValues("TYPE", typeValue)
 	}
 	line.removeParams("VALUE")
-	line.value = "data:" + mediaType + ";base64," + strings.TrimSpace(line.value)
+	line.value = "data:" + mediaType + ";base64," + withoutBase64Whitespace(line.value)
+}
+
+// withoutBase64Whitespace drops the whitespace a folded inline base64 value
+// keeps after unfolding -- every indentation character past the first -- which
+// a data: URI may not hold (RFC 2397).
+func withoutBase64Whitespace(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		}
+		return r
+	}, value)
 }
 
 // downgradeBinaryValue unpacks a vCard 4.0 data: URI into the inline base64
@@ -480,12 +493,18 @@ func downgradeBinaryValue(line *vcardLine, name string) {
 		markVCardURIValue(line)
 		return
 	}
-	mediaType := header[:len(header)-len(";base64")]
+	// RFC 2397 lets parameters such as a file name follow the media type.
+	mediaType, _, _ := strings.Cut(header[:len(header)-len(";base64")], ";")
 	line.value = data
 	line.removeParams("VALUE", "MEDIATYPE")
 	line.setParamValues("ENCODING", []string{"b"})
-	if typeValue, ok := vcardBinaryTypeParams[strings.ToLower(strings.TrimSpace(mediaType))]; ok {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if typeValue, ok := vcardBinaryTypeParams[mediaType]; ok {
 		line.setParamValues("TYPE", append(line.paramValues("TYPE"), typeValue))
+	} else if vcardMediaType.MatchString(mediaType) {
+		// A format vCard 3.0 has no name for keeps its media type, which the
+		// upgrade reads back, rather than leaving the payload untyped.
+		line.setParamValues("TYPE", append(line.paramValues("TYPE"), mediaType))
 	}
 }
 
@@ -507,10 +526,26 @@ func markVCardURIValue(line *vcardLine) {
 
 // vcardMediaTypeFor resolves the media type of an inline vCard 3.0 binary
 // value, returning it with the TYPE value it came from so the caller can drop
-// that value from the converted line.
+// that value from the converted line. A TYPE naming a known format wins over
+// one that is a media type already, and both win over a guess from a bare
+// name, whatever order the TYPE values are written in.
 func vcardMediaTypeFor(line *vcardLine, name string) (mediaType, typeValue string) {
 	if values := line.paramValues("MEDIATYPE"); len(values) > 0 {
-		return values[0], ""
+		if candidate := strings.ToLower(strings.TrimSpace(values[0])); vcardMediaType.MatchString(candidate) {
+			return candidate, ""
+		}
+	}
+	types := line.paramValues("TYPE")
+	for _, value := range types {
+		if known, ok := vcardBinaryMediaTypes[strings.ToUpper(value)]; ok {
+			return known, value
+		}
+	}
+	// Some clients write the whole media type as the TYPE value.
+	for _, value := range types {
+		if candidate := strings.ToLower(value); strings.Contains(candidate, "/") && vcardMediaType.MatchString(candidate) {
+			return candidate, value
+		}
 	}
 	prefix := "application/"
 	switch name {
@@ -519,18 +554,22 @@ func vcardMediaTypeFor(line *vcardLine, name string) (mediaType, typeValue strin
 	case "SOUND":
 		prefix = "audio/"
 	}
-	for _, value := range line.paramValues("TYPE") {
-		upper := strings.ToUpper(value)
-		if known, ok := vcardBinaryMediaTypes[upper]; ok {
-			return known, value
-		}
+	for _, value := range types {
 		if strings.EqualFold(value, "HOME") || strings.EqualFold(value, "WORK") {
 			continue
 		}
-		return prefix + strings.ToLower(value), value
+		if candidate := prefix + strings.ToLower(value); vcardMediaType.MatchString(candidate) {
+			return candidate, value
+		}
 	}
 	return "application/octet-stream", ""
 }
+
+// vcardMediaType matches a media type without parameters (RFC 6838 Section
+// 4.2). A data: URI header may carry parameters (RFC 2397), but a TYPE or
+// MEDIATYPE value holding ";" or "," is a misread parameter list more often
+// than a media type, so only the bare form is written into one.
+var vcardMediaType = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$`)
 
 func compactVCardDateTime(value string) string {
 	date, timeOfDay, hasTime := strings.Cut(value, "T")

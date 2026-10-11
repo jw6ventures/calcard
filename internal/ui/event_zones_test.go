@@ -89,7 +89,7 @@ func TestCreateEventRefusesDatesOfTheWrongShape(t *testing.T) {
 			handler := NewHandler(&config.Config{}, &store.Store{
 				Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}},
 				Events:    eventRepo,
-			}, nil, dav.ValidateCalendarObject)
+			}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			req = withRouteID(req, "1")

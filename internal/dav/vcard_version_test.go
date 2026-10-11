@@ -164,6 +164,57 @@ func TestConvertVCardVersion(t *testing.T) {
 			want:   []string{"PHOTO:data:image/jpeg;base64,/9j/4AAQ"},
 		},
 		{
+			name:   "a vcard3 photo typed by its media type keeps that media type",
+			target: "4.0",
+			source: []string{"PHOTO;ENCODING=b;TYPE=image/jpeg:/9j/4AAQ", "LOGO;ENCODING=b;TYPE=IMAGE/PNG:iVBORw0K"},
+			want:   []string{"PHOTO:data:image/jpeg;base64,/9j/4AAQ", "LOGO:data:image/png;base64,iVBORw0K"},
+		},
+		{
+			// A data: URI may hold no whitespace (RFC 2397), while an inline
+			// base64 value folded with deeper indentation keeps all but the
+			// first space of each fold after unfolding.
+			name:   "inline base64 folded with extra indentation becomes a data URI without whitespace",
+			target: "4.0",
+			source: []string{"PHOTO;ENCODING=b;TYPE=JPEG:/9j/\r\n  4AAQ\r\n  SkZJ\r\n\tRg=="},
+			want:   []string{"PHOTO:data:image/jpeg;base64,/9j/4AAQSkZJRg=="},
+		},
+		{
+			name:   "a type that is not a media type is not made into one",
+			target: "4.0",
+			source: []string{`PHOTO;ENCODING=b;TYPE="x;y":/9j/4AAQ`},
+			want:   []string{`PHOTO;TYPE="x;y":data:application/octet-stream;base64,/9j/4AAQ`},
+		},
+		{
+			name:   "a known vcard3 photo type wins over a guessed one",
+			target: "4.0",
+			source: []string{"PHOTO;ENCODING=b;TYPE=X-ABC,JPEG:/9j/4AAQ"},
+			want:   []string{"PHOTO;TYPE=X-ABC:data:image/jpeg;base64,/9j/4AAQ"},
+		},
+		{
+			name:   "a media type parameter with parameters is not written into the data URI",
+			target: "4.0",
+			source: []string{`PHOTO;ENCODING=b;MEDIATYPE="image/png;x=y";TYPE=JPEG:/9j/4AAQ`},
+			want:   []string{"PHOTO:data:image/jpeg;base64,/9j/4AAQ"},
+		},
+		{
+			name:   "a vcard4 data URI of a format vcard3 has no name for keeps its media type",
+			target: "3.0",
+			source: []string{"PHOTO:data:image/heic;base64,AAAAGGZ0"},
+			want:   []string{"PHOTO;ENCODING=b;TYPE=image/heic:AAAAGGZ0"},
+		},
+		{
+			name:   "a vcard3 media type wins over a guessed bare name written before it",
+			target: "4.0",
+			source: []string{"PHOTO;ENCODING=b;TYPE=X-ABC,image/heic:AAAAGGZ0"},
+			want:   []string{"PHOTO;TYPE=X-ABC:data:image/heic;base64,AAAAGGZ0"},
+		},
+		{
+			name:   "a vcard4 data URI with header parameters keeps its media type",
+			target: "3.0",
+			source: []string{"PHOTO:data:image/png;name=a.png;base64,iVBORw0K"},
+			want:   []string{"PHOTO;ENCODING=b;TYPE=PNG:iVBORw0K"},
+		},
+		{
 			name:   "vcard4 data URIs become inline base64 values",
 			target: "3.0",
 			source: []string{"PHOTO:data:image/png;base64,iVBORw0K"},
@@ -293,6 +344,25 @@ func TestConvertVCardVersion(t *testing.T) {
 				t.Errorf("convertVCardVersion() =\n%q\nwant\n%q", got, want)
 			}
 		})
+	}
+}
+
+// A 3.0 client re-saving a photo a 4.0 client wrote must not lose its format,
+// whatever other TYPE values the photo carries.
+func TestConvertVCardVersionRoundTripsAnUnnamedMediaType(t *testing.T) {
+	for _, photo := range []string{
+		"PHOTO:data:image/heic;base64,AAAAGGZ0",
+		"PHOTO;TYPE=X-ABC:data:image/heic;base64,AAAAGGZ0",
+	} {
+		source := buildVCard("4.0", photo)
+		downgraded, ok := convertVCardVersion(source, "3.0")
+		if !ok {
+			t.Fatalf("the downgrade refused %q", photo)
+		}
+		upgraded, ok := convertVCardVersion(downgraded, "4.0")
+		if !ok || upgraded != source {
+			t.Errorf("round trip of %q = %q via %q", photo, upgraded, downgraded)
+		}
 	}
 }
 

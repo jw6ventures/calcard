@@ -45,7 +45,7 @@ function makeElement() {
   return {
     value: '', type: '', checked: false, action: '', textContent: '', innerHTML: '',
     style: {}, classList: { add() {}, remove() {} },
-    focus() {}, appendChild() {}, removeChild() {},
+    focus() {}, appendChild() {}, removeChild() {}, setAttribute() {},
   };
 }
 const elements = {};
@@ -81,6 +81,8 @@ window.timeZoneClock = mod.timeZoneClock;
 window.browserTimeZone = mod.browserTimeZone;
 // The status, visibility and availability selects play no part in the dates.
 window.selectStoredValue = (select, value) => { select.value = value || ''; };
+window.showPartialRecurrence = (element, rrule) => { element.hidden = !rrule; };
+window.refreshPartialRecurrence = () => {};
 
 let failures = 0;
 const check = (label, got, want) => {

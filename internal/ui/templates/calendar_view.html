@@ -836,7 +836,7 @@
                     <div class="form-group">
                         <label for="create-recurrence-interval">Every</label>
                         <div style="display: flex; align-items: center; gap: 0.5rem;">
-                            <input type="number" id="create-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99" style="width: 70px;">
+                            <input type="number" id="create-recurrence-interval" name="recurrence_interval" value="1" min="1" style="width: 70px;">
                             <span id="create-recurrence-unit">day(s)</span>
                         </div>
                     </div>
@@ -864,7 +864,7 @@
                 <div class="form-row" id="create-recurrence-monthly-group" style="display: none;">
                     <div class="form-group">
                         <label for="create-recurrence-bymonthday">Day of month</label>
-                        <input type="number" id="create-recurrence-bymonthday" name="recurrence_bymonthday" min="1" max="31">
+                        <input type="text" id="create-recurrence-bymonthday" name="recurrence_bymonthday" pattern="\s*-?(?:[1-9]|[12]\d|3[01])(?:\s*,\s*-?(?:[1-9]|[12]\d|3[01]))*\s*" placeholder="15, or 1,15, or -1" title="Days of the month, separated by commas; -1 is the last day">
                     </div>
                     <div class="form-group" id="create-recurrence-bymonth-group" style="display: none;">
                         <label for="create-recurrence-bymonth">Month</label>
@@ -888,7 +888,7 @@
                 <div id="create-recurrence-end-options" style="display: none;">
                     <div class="form-group" id="create-recurrence-count-group" style="display: none;">
                         <label for="create-recurrence-count">Number of occurrences</label>
-                        <input type="number" id="create-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                        <input type="number" id="create-recurrence-count" name="recurrence_count" value="10" min="1">
                     </div>
                     <div class="form-group" id="create-recurrence-until-group" style="display: none;">
                         <label for="create-recurrence-until">End date</label>
@@ -1023,13 +1023,14 @@
                     <option value="MONTHLY">Monthly</option>
                     <option value="YEARLY">Yearly</option>
                 </select>
+                <p id="edit-recurrence-partial" style="color: var(--gray-500); font-size: 0.85rem; margin-top: 0.35rem;" hidden></p>
             </div>
             <div id="edit-recurrence-options" style="display: none;">
                 <div class="form-row">
                     <div class="form-group">
                         <label for="edit-recurrence-interval">Every</label>
                         <div style="display: flex; align-items: center; gap: 0.5rem;">
-                            <input type="number" id="edit-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99" style="width: 70px;">
+                            <input type="number" id="edit-recurrence-interval" name="recurrence_interval" value="1" min="1" style="width: 70px;">
                             <span id="edit-recurrence-unit">day(s)</span>
                         </div>
                     </div>
@@ -1057,7 +1058,7 @@
                 <div class="form-row" id="edit-recurrence-monthly-group" style="display: none;">
                     <div class="form-group">
                         <label for="edit-recurrence-bymonthday">Day of month</label>
-                        <input type="number" id="edit-recurrence-bymonthday" name="recurrence_bymonthday" min="1" max="31">
+                        <input type="text" id="edit-recurrence-bymonthday" name="recurrence_bymonthday" pattern="\s*-?(?:[1-9]|[12]\d|3[01])(?:\s*,\s*-?(?:[1-9]|[12]\d|3[01]))*\s*" placeholder="15, or 1,15, or -1" title="Days of the month, separated by commas; -1 is the last day">
                     </div>
                     <div class="form-group" id="edit-recurrence-bymonth-group" style="display: none;">
                         <label for="edit-recurrence-bymonth">Month</label>
@@ -1081,7 +1082,7 @@
                 <div id="edit-recurrence-end-options" style="display: none;">
                     <div class="form-group" id="edit-recurrence-count-group" style="display: none;">
                         <label for="edit-recurrence-count">Number of occurrences</label>
-                        <input type="number" id="edit-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                        <input type="number" id="edit-recurrence-count" name="recurrence_count" value="10" min="1">
                     </div>
                     <div class="form-group" id="edit-recurrence-until-group" style="display: none;">
                         <label for="edit-recurrence-until">End date</label>
@@ -1614,8 +1615,8 @@
             }).join(', ');
             body += '<p><strong>Reminders:</strong> ' + escapeHtml(reminderText) + '</p>';
         }
-        if (event.rrule) {
-            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event)) + '</p>';
+        if (event.rrule || event.instances) {
+            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(recurrenceSummary(event.seriesEvent || event)) + '</p>';
         }
         if (event.htmlDescription) {
             // The sanitized description is appended below as a node. Serializing
@@ -1809,7 +1810,7 @@
         var rangeStart = currentView === 'week' ? startOfWeek(currentDate) : startOfDay(currentDate);
         var dayCount = currentView === 'week' ? 7 : 1;
         var rangeEnd = addDays(rangeStart, dayCount);
-        var visibleEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        var visibleEvents = expandRecurringEvents(baseEvents);
         var shell = document.getElementById('time-grid-shell');
         shell.style.setProperty('--day-count', dayCount);
 
@@ -1964,10 +1965,7 @@
         document.getElementById('month-title').textContent =
             currentDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
 
-        // Expand recurring events for this month's range (with some padding)
-        var rangeStart = new Date(year, month - 1, 1);
-        var rangeEnd = new Date(year, month + 2, 0);
-        expandedEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        expandedEvents = expandRecurringEvents(baseEvents);
 
         // Show/hide empty state
         var emptyState = document.getElementById('calendar-empty-state');
@@ -2133,12 +2131,10 @@
         var monthOpts = { month: 'long', year: 'numeric' };
         document.getElementById('list-month-title').textContent = currentListMonth.toLocaleDateString(undefined, monthOpts);
         
-        // Expand recurring events for the selected month (with some padding)
+        // The occurrences of the selected month
         var year = currentListMonth.getFullYear();
         var month = currentListMonth.getMonth();
-        var rangeStart = new Date(year, month - 1, 1);
-        var rangeEnd = new Date(year, month + 2, 0);
-        var expandedForList = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        var expandedForList = expandRecurringEvents(baseEvents);
         
         // Filter events for the selected month
         var monthEvents = expandedForList.filter(function(e) {
@@ -2267,7 +2263,8 @@
     // The create/edit modal functions below live outside this closure and need
     // the same date arithmetic it uses internally.
     window.startOfDay = startOfDay;
-    window.rruleUntilDay = rruleUntilDay;
+    window.showPartialRecurrence = showPartialRecurrence;
+    window.refreshPartialRecurrence = refreshPartialRecurrence;
     window.timeZoneClock = timeZoneClock;
     window.formatDateTimeForInput = formatDateTimeForInput;
     window.browserTimeZone = browserTimeZone;
@@ -2515,43 +2512,26 @@ function showEditEventModal(event, scope) {
     if (byMonthSelect) byMonthSelect.value = '';
     byDayCheckboxes.forEach(function(cb) { cb.checked = false; });
     
-    if (event.rruleParsed) {
-        var rr = event.rruleParsed;
-        
-        // Set frequency
-        if (rr.FREQ) {
-            // A frequency the select does not offer, such as HOURLY, is
-            // kept as an option of its own, so "Does not repeat" only
-            // shows for a series that does not repeat.
-            window.selectStoredValue(recurrenceSelect, String(rr.FREQ).toUpperCase());
-        }
-        
-        // Set interval
-        if (rr.INTERVAL) {
-            intervalInput.value = rr.INTERVAL;
-        }
-        
-        // Set end type and value
-        if (rr.COUNT) {
-            endTypeSelect.value = 'after';
-            countInput.value = rr.COUNT;
-        } else if (rr.UNTIL) {
-            endTypeSelect.value = 'on';
-            untilInput.value = formatDateForInput(window.rruleUntilDay(rr.UNTIL, event));
-        }
-        if (rr.BYDAY) {
-            var days = rr.BYDAY.split(',');
-            byDayCheckboxes.forEach(function(cb) {
-                cb.checked = days.indexOf(cb.value) !== -1;
-            });
-        }
-        if (rr.BYMONTHDAY && byMonthDayInput) {
-            byMonthDayInput.value = rr.BYMONTHDAY.split(',')[0];
-        }
-        if (rr.BYMONTH && byMonthSelect) {
-            byMonthSelect.value = rr.BYMONTH.split(',')[0];
-        }
+    // The server's view of the rule fills the fields, and an edit leaving
+    // them as it shows them keeps the rule as written.
+    var form = event.recurrenceForm;
+    recurrenceSelect.setAttribute('data-filled-frequency', form ? form.frequency : '');
+    if (form) {
+        // A frequency the select does not offer, such as HOURLY, is kept as
+        // an option of its own, so "Does not repeat" only shows for a series
+        // that does not repeat.
+        window.selectStoredValue(recurrenceSelect, form.frequency);
+        intervalInput.value = String(form.interval);
+        endTypeSelect.value = form.end;
+        if (form.end === 'after') countInput.value = String(form.count);
+        if (form.end === 'on') untilInput.value = form.until;
+        byDayCheckboxes.forEach(function(cb) {
+            cb.checked = form.byDay.indexOf(cb.value) !== -1;
+        });
+        if (byMonthDayInput) byMonthDayInput.value = form.byMonthDay;
+        if (byMonthSelect) byMonthSelect.value = form.byMonth ? String(form.byMonth) : '';
     }
+    window.showPartialRecurrence(document.getElementById('edit-recurrence-partial'), form && form.partial ? event.rrule : '', recurrenceSelect);
     
     // Update UI to show/hide recurrence options
     toggleRecurrenceOptions('edit');
@@ -2617,6 +2597,7 @@ function setEditScope(scope, event) {
     document.getElementById('edit-scope').value = scope;
     document.getElementById('delete-edit-scope').value = scope;
     recurrenceSelect.disabled = scope === 'occurrence';
+    window.refreshPartialRecurrence(document.getElementById('edit-recurrence-partial'), recurrenceSelect, false);
 
     seriesBtn.classList.remove('btn-primary');
     occBtn.classList.remove('btn-primary');
@@ -2627,7 +2608,7 @@ function setEditScope(scope, event) {
 
     if (scope === 'occurrence' && event) {
         var recDate = event.recurrenceId || event.dtstart;
-        var allDay = event.recurrenceIdAllDay || event.allDay;
+        var allDay = event.recurrenceIdAllDay !== undefined ? !!event.recurrenceIdAllDay : !!event.allDay;
         var recurrenceZone = event.recurrenceTimezone || event.timezone || 'UTC';
         var formatted = formatRecurrenceIdForInput(recDate, allDay, window.timeZoneClock(event, recurrenceZone));
         document.getElementById('edit-recurrence-timezone').value = recurrenceZone;
@@ -2719,6 +2700,9 @@ function formatDateForInput(date) {
 // Recurrence options
 function toggleRecurrenceOptions(prefix) {
     var select = document.getElementById(prefix + '-recurrence');
+    if (prefix === 'edit') {
+        window.refreshPartialRecurrence(document.getElementById('edit-recurrence-partial'), select, false);
+    }
     var optionsDiv = document.getElementById(prefix + '-recurrence-options');
     var unitSpan = document.getElementById(prefix + '-recurrence-unit');
     
@@ -2737,21 +2721,28 @@ function toggleRecurrenceOptions(prefix) {
     updateRecurrenceDetails(prefix);
 }
 
+// Shows the repeat fields the selected frequency offers. A hidden field
+// still holds what the editor filled it with from the stored rule, and is
+// submitted as it was shown while the frequency is the rule's, so the edit
+// keeps that part of the rule. At any other frequency, a new rule's, it is
+// not submitted: the rule written is the one the fields on screen state.
 function updateRecurrenceDetails(prefix) {
     var select = document.getElementById(prefix + '-recurrence');
     var byDayGroup = document.getElementById(prefix + '-recurrence-byday-group');
     var monthlyGroup = document.getElementById(prefix + '-recurrence-monthly-group');
     var byMonthGroup = document.getElementById(prefix + '-recurrence-bymonth-group');
     if (!select) return;
-    if (byDayGroup) {
-        byDayGroup.style.display = select.value === 'WEEKLY' ? 'block' : 'none';
+    var filled = select.value !== '' && select.value === select.getAttribute('data-filled-frequency');
+    function show(group, shown, display) {
+        if (!group) return;
+        group.style.display = shown ? display : 'none';
+        group.querySelectorAll('input, select').forEach(function(field) {
+            field.disabled = !shown && !filled;
+        });
     }
-    if (monthlyGroup) {
-        monthlyGroup.style.display = (select.value === 'MONTHLY' || select.value === 'YEARLY') ? 'flex' : 'none';
-    }
-    if (byMonthGroup) {
-        byMonthGroup.style.display = select.value === 'YEARLY' ? 'block' : 'none';
-    }
+    show(monthlyGroup, select.value === 'MONTHLY' || select.value === 'YEARLY', 'flex');
+    show(byMonthGroup, select.value === 'YEARLY', 'block');
+    show(byDayGroup, select.value === 'WEEKLY', 'block');
 }
 
 function toggleRecurrenceEnd(prefix) {

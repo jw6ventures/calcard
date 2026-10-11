@@ -1,7 +1,7 @@
 {{define "calendar_events_js"}}
     // How both calendar views read an event -- from the server's JSON or, failing
-    // that, the iCalendar it carries -- which occurrences a series has, how its
-    // rule is summarized, and how its times fill an edit form. Each view
+    // that, the iCalendar it carries -- which occurrences it shows, how a
+    // series' rule is summarized, and how its times fill an edit form. Each view
     // includes this inside its own script's function scope rather than as a
     // script of its own, so it adds no globals.
     // unescapeText comes from safe_html_js.
@@ -111,7 +111,6 @@
                         break;
                     case 'RRULE':
                         event.rrule = value;
-                        event.rruleParsed = parseRRule(value);
                         break;
                     case 'EXDATE':
                         // One EXDATE may list several dates.
@@ -181,6 +180,28 @@
             select.appendChild(option);
         }
         select.value = value;
+    }
+
+    // Notes in element, beside an editor's repeat fields, rrule, a series'
+    // rule those fields show only in part, which an edit keeps while select,
+    // the repeat select, holds its frequency; or clears the note when rrule
+    // is empty.
+    function showPartialRecurrence(element, rrule, select) {
+        element.partialRule = rrule || '';
+        element.partialFrequency = select ? select.value : '';
+        element.textContent = rrule
+            ? 'This series repeats by a rule the fields show only in part (' + rrule +
+              '). Fields you leave as they are keep their part of it.'
+            : '';
+        refreshPartialRecurrence(element, select, false);
+    }
+
+    // Shows element's note only while it holds: while select, the repeat
+    // select, is enabled and holds the frequency the note was made with, and
+    // the edit is not of one occurrence, which writes no rule.
+    function refreshPartialRecurrence(element, select, occurrence) {
+        element.hidden = !element.partialRule || occurrence || !select || select.disabled ||
+            select.value !== element.partialFrequency;
     }
 
     function unfoldLines(ical) {
@@ -300,74 +321,14 @@
     // which the server reads even where Intl knows the name. A zone it lists
     // none for is Intl's zone of that name, and no zone, or one Intl does not
     // know, is UTC, as the server reads a TZID its zone database lacks.
-    // place() reads a wall clock as RFC 5545 section 3.3.5 does -- a time the
-    // zone repeats as its first occurrence, a time it skips with the offset
-    // before the gap -- and reports whether it exists, since section 3.3.10
-    // leaves an instance on a skipped time out of a series.
     function timeZoneClock(event, tzid) {
         var offsetAt = listedOffsets(event, tzid) || intlOffsets(tzid);
         if (!offsetAt) {
-            return {
-                wallOf: function(instant) { return new Date(instant); },
-                place: function(wall) { return { instant: new Date(wall), exists: true }; }
-            };
+            return { wallOf: function(instant) { return new Date(instant); } };
         }
-        var day = 24 * 60 * 60 * 1000;
-        function wallOf(instant) {
-            return new Date(instant.getTime() + offsetAt(instant.getTime()));
-        }
-        function readsAs(time, offset) {
-            return offsetAt(time - offset) === offset;
-        }
-        // The offset the last reading placed was read with. A series places
-        // readings in ascending order and at least a day apart, so a reading
-        // that exists with it is no later occurrence of a repeated time, and
-        // only a reading next to a transition needs more lookups.
-        var lastOffset = null;
-        function place(wall) {
-            var reading = wall.getTime();
-            if (lastOffset !== null && readsAs(reading, lastOffset)) {
-                return { instant: new Date(reading - lastOffset), exists: true };
-            }
-            // No zone's offset reaches a day, so the offsets a day either
-            // side of the reading are the ones it can be read with.
-            var before = offsetAt(reading - day);
-            var candidates = [before, offsetAt(reading + day), offsetAt(reading - before)];
-            for (var i = 0; i < candidates.length; i++) {
-                if (readsAs(reading, candidates[i])) {
-                    lastOffset = candidates[i];
-                    return { instant: new Date(reading - candidates[i]), exists: true };
-                }
-            }
-            return { instant: new Date(reading - before), exists: false };
-        }
-        return { wallOf: wallOf, place: place };
-    }
-
-    // The latest instant an RRULE's UNTIL lets an occurrence of event start.
-    // A UTC value is that instant. RFC 5545 section 3.3.10 makes a DATE UNTIL
-    // inclusive of its day, which the server ends where the next day begins
-    // in the zone the DTSTART is read in, and reads a floating one, which the
-    // RFC does not allow beside a timed DTSTART, in that zone too. An all-day
-    // event's dates are the browser's local days, so its limit is the end of
-    // the day rruleUntilDay names. The limit gets a zone clock of its own
-    // because place() expects readings in ascending order.
-    function rruleUntilLimit(value, event) {
-        if (event.allDay) {
-            var lastDay = rruleUntilDay(value, event);
-            return new Date(lastDay.getFullYear(), lastDay.getMonth(), lastDay.getDate() + 1, 0, 0, 0, -1);
-        }
-        var text = String(value).trim();
-        var wall = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/.exec(text);
-        if (!wall) return parseICALDate(text, {});
-        var year = parseInt(wall[1], 10), month = parseInt(wall[2], 10) - 1, day = parseInt(wall[3], 10);
-        var zoneClock = recurrenceZoneClock(event);
-        if (!wall[4]) {
-            var nextDay = new Date(Date.UTC(year, month, day + 1));
-            return new Date(zoneClock.place(nextDay).instant.getTime() - 1);
-        }
-        var reading = new Date(Date.UTC(year, month, day, parseInt(wall[4], 10), parseInt(wall[5], 10), parseInt(wall[6], 10)));
-        return zoneClock.place(reading).instant;
+        return {
+            wallOf: function(instant) { return new Date(instant.getTime() + offsetAt(instant.getTime())); }
+        };
     }
 
     // The day a series whose RRULE ends at UNTIL value ends on, as local
@@ -388,210 +349,85 @@
         return new Date(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate());
     }
 
-    function parseRRule(rrule) {
-        var result = {};
-        rrule.split(';').forEach(function(part) {
-            var eq = part.indexOf('=');
-            if (eq !== -1) {
-                var key = part.substring(0, eq);
-                var value = part.substring(eq + 1);
-                result[key] = value;
-            }
-        });
-        return result;
-    }
-
-    function makeOccurrenceKey(date, allDay) {
-        if (!date) return '';
-        if (allDay) {
-            var y = date.getFullYear();
-            var m = String(date.getMonth() + 1).padStart(2, '0');
-            var d = String(date.getDate()).padStart(2, '0');
-            return y + '-' + m + '-' + d;
-        }
-        return String(date.getTime());
-    }
-
-    // The clock a timed series repeats on: the wall clock of its TZID's zone
-    // as the server reads it (timeZoneClock), wherever the browser is, which
-    // is how CalDAV clients and the server expand it. Null for an all-day
-    // event, which repeats on the browser's own calendar.
-    function recurrenceZoneClock(event) {
-        return event.allDay ? null : timeZoneClock(event, event.timezone);
-    }
-
-    // The calendar a series' cursor steps over: a zone clock's wall clock,
-    // held in UTC fields, or, for an all-day series, the browser's own.
-    function recurrenceCalendar(wallClock) {
-        if (wallClock) {
-            return {
-                weekday: function(d) { return d.getUTCDay(); },
-                monthDay: function(d) { return d.getUTCDate(); },
-                month: function(d) { return d.getUTCMonth(); },
-                addDays: function(d, n) { d.setUTCDate(d.getUTCDate() + n); },
-                addMonths: function(d, n) { d.setUTCMonth(d.getUTCMonth() + n); },
-                addYears: function(d, n) { d.setUTCFullYear(d.getUTCFullYear() + n); }
-            };
-        }
-        return {
-            weekday: function(d) { return d.getDay(); },
-            monthDay: function(d) { return d.getDate(); },
-            month: function(d) { return d.getMonth(); },
-            addDays: function(d, n) { d.setDate(d.getDate() + n); },
-            addMonths: function(d, n) { d.setMonth(d.getMonth() + n); },
-            addYears: function(d, n) { d.setFullYear(d.getFullYear() + n); }
-        };
-    }
-
-    function expandRecurringEvents(events, rangeStart, rangeEnd) {
+    // The occurrences the views show of events: an event that does not
+    // recur, a series' instances, and its overrides. The server lists a
+    // series' instances as CalDAV expands them (event.instances), so the views
+    // show a series on the days every CalDAV client does. Each instance
+    // carries its series' content, or that of the RANGE=THISANDFUTURE override
+    // governing it (RFC 5545 section 3.8.4.4), which the instances therefore
+    // show. Any other override replaces the instance it names, which the
+    // server leaves out, and stands for itself. The views place what they get
+    // on their own days.
+    function expandRecurringEvents(events) {
         var expanded = [];
-        var maxOccurrences = 500;
-
         events.forEach(function(event) {
             var overrides = event.overrides || [];
-            var overrideMap = {};
-            overrides.forEach(function(ov) {
-                if (!ov.recurrenceId) return;
-                var key = makeOccurrenceKey(ov.recurrenceId, ov.recurrenceIdAllDay || ov.allDay || event.allDay);
-                var merged = Object.assign({}, event, ov);
-                merged.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
-                overrideMap[key] = merged;
-            });
-
-            if (!event.rrule) {
+            if (!event.instances) {
                 expanded.push(event);
                 overrides.forEach(function(ov) {
                     var overrideEv = Object.assign({}, event, ov);
                     overrideEv.recurrenceId = ov.recurrenceId;
-                    overrideEv.recurrenceIdAllDay = ov.recurrenceIdAllDay || ov.allDay || event.allDay;
+                    overrideEv.recurrenceIdAllDay = overrideRecurrenceIdAllDay(ov, event);
                     expanded.push(overrideEv);
                 });
                 return;
             }
 
-            var rr = event.rruleParsed;
-            var freq = rr.FREQ;
-            var interval = parseInt(rr.INTERVAL || '1', 10);
-            var count = rr.COUNT ? parseInt(rr.COUNT, 10) : null;
-            var until = rr.UNTIL ? rruleUntilLimit(rr.UNTIL, event) : null;
-            var byDay = rr.BYDAY ? rr.BYDAY.split(',') : null;
-            var byMonthDay = rr.BYMONTHDAY ? rr.BYMONTHDAY.split(',').map(function(d) { return parseInt(d, 10); }) : null;
-            var byMonth = rr.BYMONTH ? rr.BYMONTH.split(',').map(function(m) { return parseInt(m, 10); }) : null;
-
-            var duration = 0;
-            if (event.dtend) {
-                duration = event.dtend.getTime() - event.dtstart.getTime();
-            }
-
-            var exdateSet = {};
-            if (event.exdates) {
-                event.exdates.forEach(function(d) {
-                    exdateSet[makeOccurrenceKey(d, event.allDay)] = true;
-                });
-            }
-
-            var zoneClock = recurrenceZoneClock(event);
-            var calendar = recurrenceCalendar(!!zoneClock);
-            var current = zoneClock ? zoneClock.wallOf(event.dtstart) : new Date(event.dtstart);
-            var firstWall = current.getTime();
-            var occurrences = 0;
-            var effectiveEnd = until || rangeEnd;
-
-            while (occurrences < maxOccurrences) {
-                if (count && occurrences >= count) break;
-                // The DTSTART is the first instance whatever local time it
-                // names (RFC 5545 section 3.8.5.3); a later instance on one the
-                // zone skips is no part of the series and does not count
-                // toward COUNT (section 3.3.10).
-                var start = new Date(current);
-                var exists = true;
-                if (zoneClock && current.getTime() === firstWall) {
-                    start = new Date(event.dtstart);
-                } else if (zoneClock) {
-                    var placed = zoneClock.place(current);
-                    start = placed.instant;
-                    exists = placed.exists;
+            // The server writes an instance's governing override as the
+            // override's RECURRENCE-ID, in the same form.
+            var governing = {};
+            overrides.forEach(function(ov) {
+                if (ov.recurrenceRange && ov.recurrenceIdText) governing[ov.recurrenceIdText] = ov;
+            });
+            event.instances.forEach(function(instance) {
+                var occurrence = Object.assign({}, event);
+                var override = instance.override && governing[instance.override];
+                if (override) {
+                    Object.assign(occurrence, override);
+                    occurrence.allDay = override.allDay !== undefined ? override.allDay : event.allDay;
                 }
-                if (start > effectiveEnd) break;
-
-                var matches = true;
-
-                if (byDay) {
-                    var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
-                    var currentDay = dayNames[calendar.weekday(current)];
-                    matches = byDay.some(function(d) { return d.endsWith(currentDay); });
-                }
-
-                if (byMonthDay) {
-                    matches = matches && byMonthDay.indexOf(calendar.monthDay(current)) !== -1;
-                }
-
-                if (byMonth) {
-                    matches = matches && byMonth.indexOf(calendar.month(current) + 1) !== -1;
-                }
-
-                matches = matches && exists;
-
-                // An EXDATE removes an instance from the set COUNT has already
-                // bounded (RFC 5545 section 3.8.5.1), so an excluded one counts.
-                var key = makeOccurrenceKey(start, event.allDay);
-                if (matches && !exdateSet[key] && start >= rangeStart) {
-                    var override = overrideMap[key];
-                    var occurrence;
-                    if (override) {
-                        occurrence = Object.assign({}, override);
-                        occurrence.recurrenceId = override.recurrenceId || new Date(start);
-                        occurrence.recurrenceIdAllDay = override.recurrenceIdAllDay || override.allDay || event.allDay;
-                    } else {
-                        occurrence = Object.assign({}, event);
-                        occurrence.dtstart = new Date(start);
-                        if (event.dtend) {
-                            occurrence.dtend = new Date(start.getTime() + duration);
-                        }
-                        occurrence.recurrenceId = new Date(start);
-                        occurrence.recurrenceIdAllDay = event.allDay;
-                    }
-                    occurrence.isOccurrence = true;
-                    occurrence.seriesEvent = event;
-                    expanded.push(occurrence);
-                }
-
-                if (matches) occurrences++;
-
-                switch (freq) {
-                    case 'DAILY':
-                        calendar.addDays(current, interval);
-                        break;
-                    case 'WEEKLY':
-                        if (byDay) {
-                            var found = false;
-                            for (var attempts = 0; attempts < 7 * interval + 1; attempts++) {
-                                calendar.addDays(current, 1);
-                                var dayNames = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
-                                var d = dayNames[calendar.weekday(current)];
-                                if (byDay.some(function(bd) { return bd.endsWith(d); })) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) break;
-                        } else {
-                            calendar.addDays(current, 7 * interval);
-                        }
-                        break;
-                    case 'MONTHLY':
-                        calendar.addMonths(current, interval);
-                        break;
-                    case 'YEARLY':
-                        calendar.addYears(current, interval);
-                        break;
-                    default:
-                        calendar.addDays(current, 1);
-                }
-            }
+                // The instance's times are of the value type of the content
+                // it carries, and its slot of the series': a wall clock of the
+                // series' zone, which names that slot again when read back.
+                occurrence.dtstart = parseServerDate(instance.start, occurrence.allDay);
+                occurrence.dtend = parseServerDate(instance.end, occurrence.allDay);
+                occurrence.recurrenceId = parseServerDate(instance.recurrenceId, event.allDay);
+                occurrence.recurrenceIdAllDay = !!event.allDay;
+                occurrence.recurrenceTimezone = event.allDay ? undefined : (event.timezone || 'UTC');
+                occurrence.recurrenceRange = undefined;
+                occurrence.isOccurrence = true;
+                occurrence.seriesEvent = event;
+                expanded.push(occurrence);
+            });
+            overrides.forEach(function(ov) {
+                if (ov.recurrenceRange) return;
+                var occurrence = Object.assign({}, event, ov);
+                occurrence.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
+                occurrence.recurrenceIdAllDay = overrideRecurrenceIdAllDay(ov, event);
+                occurrence.isOccurrence = true;
+                occurrence.seriesEvent = event;
+                expanded.push(occurrence);
+            });
         });
-
         return expanded;
+    }
+
+    // Whether override ov of event names its slot by a DATE: as the server
+    // says, which follows the RECURRENCE-ID rather than the override's DTSTART,
+    // and as the series' DTSTART does when an override of the iCalendar
+    // fallback says nothing.
+    function overrideRecurrenceIdAllDay(ov, event) {
+        return ov.recurrenceIdAllDay !== undefined ? !!ov.recurrenceIdAllDay : !!event.allDay;
+    }
+
+    // A summary of event's recurrence for its details: its rule, or that it
+    // repeats on dates its RDATEs list, and, when the view cannot show every
+    // instance of the series, that it does not.
+    function recurrenceSummary(event) {
+        var summary = event.rrule ? formatRRule(event) : 'On set dates';
+        if (!event.instances) return summary + ' (only its first instance is shown here)';
+        if (event.instancesComplete === false) return summary + ' (not every instance in this view is shown)';
+        return summary;
     }
 
     // An all-day value names a date, not an instant: the server parses the DATE
@@ -613,7 +449,9 @@
         var allDay = !!raw.allDay;
         parsed.dtstart = parseServerDate(raw.dtstart, allDay);
         parsed.dtend = parseServerDate(raw.dtend, allDay);
-        parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);
+        parsed.recurrenceId = parseServerDate(raw.recurrenceId,
+            raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay);
+        parsed.recurrenceIdText = raw.recurrenceId;
         // Passing parseServerDate to map directly would hand it the index as the
         // all-day flag.
         parsed.exdates = (raw.exdates || []).map(function(value) {

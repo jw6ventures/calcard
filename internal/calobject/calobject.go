@@ -7,6 +7,7 @@ package calobject
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -25,6 +26,38 @@ type Object struct {
 // data a CalDAV client writes. A nil cal stands for a collection with the
 // server's default supported components. A refusal is a *Error.
 type Validator func(raw string, cal *store.CalendarAccess) (*Object, error)
+
+// Instance is one instance of a recurring event: the slot of the recurrence
+// set it fills, which its RECURRENCE-ID names, and where it falls.
+type Instance struct {
+	RecurrenceID time.Time
+	Start        time.Time
+	End          time.Time
+	// Override is the RECURRENCE-ID of the RANGE=THISANDFUTURE override whose
+	// content the instance carries (RFC 5545 §3.8.4.4), or the zero time
+	// when it carries the series' own.
+	Override time.Time
+}
+
+// Expansion is what an Expander finds of a stored object's recurring event.
+type Expansion struct {
+	// Recurs is true when the object's VEVENT series has a recurrence set the
+	// server can expand. Otherwise its master stands for itself, as a
+	// CalDAV expansion returns it.
+	Recurs bool
+	// Instances are the instances in the range, by start.
+	Instances []Instance
+	// Complete is false when the range holds more instances than the
+	// expansion lists, so Instances are only some of them.
+	Complete bool
+}
+
+// Expander lists the instances of the recurring VEVENT of raw, a stored
+// calendar object, that RFC 4791 §9.9 places in [start, end): those a CalDAV
+// calendar-query with CALDAV:expand over that range returns for it (§9.6.5),
+// less each an override replaces, which stands for itself. Floating times are
+// read in UTC.
+type Expander func(raw string, start, end time.Time) Expansion
 
 // ErrUndefinedTimezone is the reason a calendar object is refused when it
 // names a TZID that neither one of its VTIMEZONE components nor the host's time

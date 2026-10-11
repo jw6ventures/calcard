@@ -146,6 +146,19 @@ func TestSplitCardsStartsANewCardAtATopLevelBEGIN(t *testing.T) {
 	}
 }
 
+// Windows tools often start a UTF-8 file with a byte order mark, and a file
+// concatenated from several exports carries one before each; none is part of
+// the BEGIN line it precedes.
+func TestSplitCardsReadsPastByteOrderMarks(t *testing.T) {
+	const bom = "\xef\xbb\xbf"
+	cardA := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:a\r\nEND:VCARD\r\n"
+	cardB := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:b\r\nEND:VCARD\r\n"
+	cards := SplitCards(bom + cardA + bom + cardB)
+	if len(cards) != 2 || cards[0] != cardA || cards[1] != cardB {
+		t.Fatalf("SplitCards = %q", cards)
+	}
+}
+
 func TestSplitCardsReadsCROnlyLineEndings(t *testing.T) {
 	cards := SplitCards("BEGIN:VCARD\rVERSION:3.0\rFN:a\rEND:VCARD\rBEGIN:VCARD\rVERSION:3.0\rFN:b\rEND:VCARD\r")
 	if len(cards) != 2 || ValidateEnvelope(cards[1]) != nil {

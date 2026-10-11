@@ -371,18 +371,27 @@ func newRecurrenceOverrideIndex(m calendarTimeRangeMatcher, root, master *icalNo
 // governing is the RANGE=THISANDFUTURE override with the latest RECURRENCE-ID
 // at or before slot, or nil.
 func (index recurrenceOverrideIndex) governing(slot time.Time) *icalNode {
+	if override, ok := index.governingOverride(slot); ok {
+		return override.node
+	}
+	return nil
+}
+
+// governingOverride is governing's override, with the slot its RECURRENCE-ID
+// names.
+func (index recurrenceOverrideIndex) governingOverride(slot time.Time) (recurrenceOverride, bool) {
 	overrides := index.thisAndFuture
 	after := sort.Search(len(overrides), func(i int) bool {
 		return overrides[i].recurrenceID.After(slot)
 	})
 	if after == 0 {
-		return nil
+		return recurrenceOverride{}, false
 	}
 	latest := overrides[after-1].recurrenceID
 	first := sort.Search(after, func(i int) bool {
 		return !overrides[i].recurrenceID.Before(latest)
 	})
-	return overrides[first].node
+	return overrides[first], true
 }
 
 // describing is the component that describes the slot: its exact override,

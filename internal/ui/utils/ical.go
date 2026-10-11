@@ -26,13 +26,15 @@ func GenerateETag(content string) string {
 
 // RecurrenceOptions holds recurrence rule parameters.
 type RecurrenceOptions struct {
-	Frequency  string // DAILY, WEEKLY, MONTHLY, YEARLY
-	Interval   int    // Every N days/weeks/months/years
-	Count      int    // Number of occurrences (0 = no limit)
-	Until      string // End date in YYYY-MM-DD format
-	ByDay      []string
-	ByMonth    int
-	ByMonthDay int
+	Frequency string // DAILY, WEEKLY, MONTHLY, YEARLY
+	Interval  int    // Every N days/weeks/months/years
+	Count     int    // Number of occurrences (0 = no limit)
+	Until     string // End date in YYYY-MM-DD format
+	ByDay     []string
+	ByMonth   int
+	// ByMonthDay lists days of the month: 1 to 31, or -31 to -1 counting
+	// back from the month's last day (RFC 5545 §3.3.10).
+	ByMonthDay []int
 }
 
 // EventOptions holds optional VEVENT properties.
@@ -53,11 +55,12 @@ type EventOptions struct {
 	Reminders    []int
 }
 
-// ParseRecurrenceOptions extracts recurrence options from form data.
-func ParseRecurrenceOptions(r *http.Request) *RecurrenceOptions {
+// ParseRecurrenceOptions extracts recurrence options from form data. It fails
+// when the days of the month are not a comma-separated list of them.
+func ParseRecurrenceOptions(r *http.Request) (*RecurrenceOptions, error) {
 	freq := strings.TrimSpace(r.FormValue("recurrence"))
 	if freq == "" {
-		return nil
+		return nil, nil
 	}
 
 	interval := 1
@@ -86,11 +89,15 @@ func ParseRecurrenceOptions(r *http.Request) *RecurrenceOptions {
 		}
 	}
 
-	var byMonthDay int
-	if v := strings.TrimSpace(r.FormValue("recurrence_bymonthday")); v != "" {
-		if md, err := strconv.Atoi(v); err == nil && md >= 1 && md <= 31 {
-			byMonthDay = md
-		}
+	byMonthDay, err := ParseMonthDays(r.FormValue("recurrence_bymonthday"))
+	if err != nil {
+		return nil, err
+	}
+	// The editors hide the days of the month for a weekly rule, which RFC
+	// 5545 §3.3.10 does not let hold them, but still submit what they last
+	// held.
+	if strings.EqualFold(freq, "WEEKLY") {
+		byMonthDay = nil
 	}
 
 	var byMonth int
@@ -108,7 +115,25 @@ func ParseRecurrenceOptions(r *http.Request) *RecurrenceOptions {
 		ByDay:      byDay,
 		ByMonth:    byMonth,
 		ByMonthDay: byMonthDay,
+	}, nil
+}
+
+// ParseMonthDays reads a comma-separated list of days of the month, each 1
+// to 31 or -31 to -1, as RecurrenceOptions.ByMonthDay holds them. An empty
+// list is none.
+func ParseMonthDays(value string) ([]int, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
 	}
+	var days []int
+	for _, field := range strings.Split(value, ",") {
+		day, err := strconv.Atoi(strings.TrimSpace(field))
+		if err != nil || day == 0 || day < -31 || day > 31 {
+			return nil, fmt.Errorf("invalid day of month %q", strings.TrimSpace(field))
+		}
+		days = append(days, day)
+	}
+	return days, nil
 }
 
 // FormatICalDateTime converts form inputs into iCalendar date/time strings,
@@ -390,8 +415,15 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 		if len(recurrence.ByDay) > 0 {
 			rrule += fmt.Sprintf(";BYDAY=%s", strings.Join(recurrence.ByDay, ","))
 		}
-		if recurrence.ByMonthDay > 0 {
-			rrule += fmt.Sprintf(";BYMONTHDAY=%d", recurrence.ByMonthDay)
+		if len(recurrence.ByMonthDay) > 0 {
+			days := make([]string, len(recurrence.ByMonthDay))
+			for i, day := range recurrence.ByMonthDay {
+				if day == 0 || day < -31 || day > 31 {
+					return nil, fmt.Errorf("invalid day of month %d", day)
+				}
+				days[i] = strconv.Itoa(day)
+			}
+			rrule += ";BYMONTHDAY=" + strings.Join(days, ",")
 		}
 		if recurrence.ByMonth > 0 {
 			rrule += fmt.Sprintf(";BYMONTH=%d", recurrence.ByMonth)

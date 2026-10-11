@@ -27,6 +27,9 @@ type Handler struct {
 	// validateCalendarObject is the validator every calendar object the UI
 	// stores must pass.
 	validateCalendarObject calobject.Validator
+	// expandEvent lists the instances of a series the calendar views show,
+	// as CalDAV expands them.
+	expandEvent calobject.Expander
 	// timezoneOnsets lists the observance rules of the VTIMEZONEs the
 	// calendar views read, or is nil for each object to list its own.
 	timezoneOnsets ical.ObservanceOnsets
@@ -37,14 +40,19 @@ const (
 	dashboardRecentEventFetchLimit   = 25
 )
 
-// NewHandler creates a new Handler instance. validate is required: a Handler
-// without one would store calendar data a CalDAV client could not have written,
-// so a nil validate panics.
-func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service, validate calobject.Validator) *Handler {
+// NewHandler creates a new Handler instance. validate and expand are required:
+// a Handler without validate would store calendar data a CalDAV client could
+// not have written, and one without expand would show a series on other days
+// than CalDAV clients do, so a nil validate or expand panics.
+func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service, validate calobject.Validator, expand calobject.Expander) *Handler {
 	if validate == nil {
 		panic("ui: NewHandler requires a calendar object validator")
 	}
-	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates, validateCalendarObject: validate}
+	if expand == nil {
+		panic("ui: NewHandler requires a recurrence expander")
+	}
+	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates,
+		validateCalendarObject: validate, expandEvent: expand}
 }
 
 // ShareTimezoneOnsets has the calendar views read the observance rules of

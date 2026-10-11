@@ -898,9 +898,10 @@
                         </div>
                         <div class="form-group">
                             <label for="event-recurrence-interval">Every</label>
-                            <input type="number" id="event-recurrence-interval" name="recurrence_interval" value="1" min="1" max="99">
+                            <input type="number" id="event-recurrence-interval" name="recurrence_interval" value="1" min="1">
                         </div>
                     </div>
+                    <p id="event-recurrence-partial" style="color: var(--gray-500); font-size: 0.85rem; margin-top: 0;" hidden></p>
                     <div class="form-group">
                         <label>Repeat on</label>
                         <div style="display:flex; flex-wrap:wrap; gap:0.65rem">
@@ -916,7 +917,7 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label for="event-recurrence-monthday">Day of month</label>
-                            <input type="number" id="event-recurrence-monthday" name="recurrence_bymonthday" min="1" max="31">
+                            <input type="text" id="event-recurrence-monthday" name="recurrence_bymonthday" pattern="\s*-?(?:[1-9]|[12]\d|3[01])(?:\s*,\s*-?(?:[1-9]|[12]\d|3[01]))*\s*" placeholder="15, or 1,15, or -1" title="Days of the month, separated by commas; -1 is the last day">
                         </div>
                         <div class="form-group">
                             <label for="event-recurrence-month">Month</label>
@@ -934,7 +935,7 @@
                         </div>
                         <div class="form-group">
                             <label for="event-recurrence-count">Occurrences</label>
-                            <input type="number" id="event-recurrence-count" name="recurrence_count" value="10" min="1" max="999">
+                            <input type="number" id="event-recurrence-count" name="recurrence_count" value="10" min="1">
                         </div>
                     </div>
                     <div class="form-group">
@@ -1369,6 +1370,7 @@
         document.getElementById('event-recurrence-interval').value = '1';
         document.getElementById('event-recurrence-end').value = 'never';
         document.getElementById('event-recurrence-count').value = '10';
+        showPartialRecurrence(document.getElementById('event-recurrence-partial'), '', null);
         document.getElementById('event-recurrence-id').value = '';
         document.getElementById('event-recurrence-all-day').value = '';
         document.getElementById('event-edit-scope').value = 'series';
@@ -1392,16 +1394,6 @@
         editorForm.action = '/calendars/' + encodeURIComponent(editorCalendar.value) + '/events';
         editorModal.classList.add('show');
         document.getElementById('event-summary').focus();
-    }
-
-    function rruleForEvent(event) {
-        if (event.rruleParsed) return event.rruleParsed;
-        var parsed = {};
-        (event.rrule || '').split(';').forEach(function(part) {
-            var separator = part.indexOf('=');
-            if (separator !== -1) parsed[part.slice(0, separator)] = part.slice(separator + 1);
-        });
-        return parsed;
     }
 
     function openEditEditor(event) {
@@ -1442,30 +1434,27 @@
         document.getElementById('event-edit-scope-group').style.display = event.isOccurrence ? 'block' : 'none';
         document.getElementById('event-edit-scope').value = event.isOccurrence ? 'occurrence' : 'series';
 
-        var rrule = rruleForEvent(event);
-        // A frequency the select does not offer, such as HOURLY, is kept as
-        // an option of its own, so "Does not repeat" only shows for a
-        // series that does not repeat.
-        selectStoredValue(document.getElementById('event-recurrence'), String(rrule.FREQ || '').toUpperCase());
-        document.getElementById('event-recurrence-interval').value = rrule.INTERVAL || '1';
-        document.getElementById('event-recurrence-monthday').value = rrule.BYMONTHDAY || '';
-        document.getElementById('event-recurrence-month').value = rrule.BYMONTH || '';
-        if (rrule.BYDAY) {
-            rrule.BYDAY.split(',').forEach(function(day) {
-                var checkbox = document.querySelector(
-                    '#event-editor-form input[name="recurrence_byday"][value="' + day.slice(-2) + '"]'
-                );
-                if (checkbox) checkbox.checked = true;
+        // The server's view of the rule fills the fields, and an edit
+        // leaving them as it shows them keeps the rule as written.
+        var form = event.recurrenceForm;
+        if (form) {
+            // A frequency the select does not offer, such as HOURLY, is kept
+            // as an option of its own, so "Does not repeat" only shows for a
+            // series that does not repeat.
+            selectStoredValue(document.getElementById('event-recurrence'), form.frequency);
+            document.getElementById('event-recurrence-interval').value = String(form.interval);
+            document.getElementById('event-recurrence-monthday').value = form.byMonthDay;
+            document.getElementById('event-recurrence-month').value = form.byMonth ? String(form.byMonth) : '';
+            document.querySelectorAll('#event-editor-form input[name="recurrence_byday"]').forEach(function(input) {
+                input.checked = form.byDay.indexOf(input.value) !== -1;
             });
+            document.getElementById('event-recurrence-end').value = form.end;
+            if (form.end === 'after') document.getElementById('event-recurrence-count').value = String(form.count);
+            if (form.end === 'on') document.getElementById('event-recurrence-until').value = form.until;
         }
-        if (rrule.COUNT) {
-            document.getElementById('event-recurrence-end').value = 'after';
-            document.getElementById('event-recurrence-count').value = rrule.COUNT;
-        } else if (rrule.UNTIL) {
-            document.getElementById('event-recurrence-end').value = 'on';
-            document.getElementById('event-recurrence-until').value =
-                formatDateInput(rruleUntilDay(rrule.UNTIL, event));
-        }
+        showPartialRecurrence(document.getElementById('event-recurrence-partial'), form && form.partial ? event.rrule : '',
+            document.getElementById('event-recurrence'));
+        refreshPartialRecurrence(document.getElementById('event-recurrence-partial'), document.getElementById('event-recurrence'), !!event.isOccurrence);
 
         var encodedUID = encodeURIComponent(event.uid);
         editorForm.action = '/calendars/' + event.calendarId + '/events/' + encodedUID;
@@ -1570,7 +1559,14 @@
     document.getElementById('event-edit-scope').addEventListener('change', function() {
         if (this.value === 'series' && currentEditorEvent && currentEditorEvent.isOccurrence && currentEditorEvent.seriesEvent) {
             openEditEditor(currentEditorEvent.seriesEvent);
+            return;
         }
+        refreshPartialRecurrence(document.getElementById('event-recurrence-partial'), document.getElementById('event-recurrence'),
+            this.value === 'occurrence');
+    });
+    document.getElementById('event-recurrence').addEventListener('change', function() {
+        refreshPartialRecurrence(document.getElementById('event-recurrence-partial'), this,
+            document.getElementById('event-edit-scope').value === 'occurrence');
     });
     editorForm.addEventListener('submit', function(e) {
         var dateError = createEventDateError(
@@ -1719,8 +1715,8 @@
             }).join(', ');
             body += '<p><strong>Reminders:</strong> ' + escapeHtml(reminderText) + '</p>';
         }
-        if (event.rrule) {
-            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(formatRRule(event)) + '</p>';
+        if (event.rrule || event.instances) {
+            body += '<p><strong>Recurrence:</strong> ' + escapeHtml(recurrenceSummary(event.seriesEvent || event)) + '</p>';
         }
         if (event.htmlDescription) {
             // The sanitized description is appended below as a node. Serializing
@@ -1774,7 +1770,7 @@
         var rangeStart = currentView === 'week' ? startOfWeek(currentDate) : startOfDay(currentDate);
         var dayCount = currentView === 'week' ? 7 : 1;
         var rangeEnd = addDays(rangeStart, dayCount);
-        var visibleEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd).filter(isEventVisible);
+        var visibleEvents = expandRecurringEvents(baseEvents).filter(isEventVisible);
         var shell = document.getElementById('time-grid-shell');
         shell.style.setProperty('--day-count', dayCount);
 
@@ -1929,9 +1925,7 @@
         document.getElementById('month-title').textContent =
             currentDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
 
-        var rangeStart = new Date(year, month - 1, 1);
-        var rangeEnd = new Date(year, month + 2, 0);
-        expandedEvents = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        expandedEvents = expandRecurringEvents(baseEvents);
 
         // Filter by visibility
         var visibleEvents = expandedEvents.filter(isEventVisible);
@@ -2210,9 +2204,7 @@
 
         var year = currentListMonth.getFullYear();
         var month = currentListMonth.getMonth();
-        var rangeStart = new Date(year, month - 1, 1);
-        var rangeEnd = new Date(year, month + 2, 0);
-        var expandedForList = expandRecurringEvents(baseEvents, rangeStart, rangeEnd);
+        var expandedForList = expandRecurringEvents(baseEvents);
 
         // Filter by visibility
         expandedForList = expandedForList.filter(isEventVisible);

@@ -1,0 +1,263 @@
+package dav
+
+import (
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/calobject"
+	"github.com/jw6ventures/calcard/internal/ical"
+)
+
+const instancesOutlookEastern = "BEGIN:VTIMEZONE\r\nTZID:Eastern Standard Time\r\n" +
+	"BEGIN:STANDARD\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11\r\nEND:STANDARD\r\n" +
+	"BEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3\r\nEND:DAYLIGHT\r\n" +
+	"END:VTIMEZONE\r\n"
+
+// instancesObject wraps components, each a VEVENT's lines between BEGIN and
+// END, in a VCALENDAR carrying timezones.
+func instancesObject(timezones string, components ...string) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" + timezones)
+	for _, component := range components {
+		b.WriteString("BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20240101T000000Z\r\n" + component + "END:VEVENT\r\n")
+	}
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+// expandedInstances is what a calendar-query's CALDAV:expand over [start, end)
+// returns for raw, read back as instances, less the components whose
+// RECURRENCE-ID is one of overridden: those are overrides, which stand for
+// themselves rather than for an instance of the series' pattern.
+func expandedInstances(t *testing.T, raw string, start, end time.Time, overridden ...string) []calobject.Instance {
+	t.Helper()
+	got, err := filterICalendarData(raw, newCalendarDataProjection(
+		&calendarDataEl{Expand: &calendarRange{Start: start, End: end}}, floatingZone{}))
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	root, err := parseICalendarObject(got)
+	if err != nil {
+		t.Fatalf("parse expanded output: %v\n%s", err, got)
+	}
+	m := newCalendarTimeRangeMatcher(got, root, floatingZone{})
+	var instances []calobject.Instance
+	for _, child := range root.children {
+		if child.name != "VEVENT" {
+			continue
+		}
+		id, ok := m.dateValue(child, "RECURRENCE-ID", noShift)
+		if !ok {
+			t.Fatalf("an expanded instance carries no RECURRENCE-ID:\n%s", got)
+		}
+		skip := false
+		for _, o := range overridden {
+			skip = skip || id.instant.Equal(mustUTC(t, o))
+		}
+		if skip {
+			continue
+		}
+		dtstart, _ := m.dateValue(child, "DTSTART", noShift)
+		instances = append(instances, calobject.Instance{
+			RecurrenceID: id.instant,
+			Start:        dtstart.instant,
+			End:          m.eventOccurrenceEnd(child, dtstart, noShift),
+		})
+	}
+	slices.SortFunc(instances, func(a, b calobject.Instance) int { return a.Start.Compare(b.Start) })
+	return instances
+}
+
+// The calendar views place a series' instances from EventInstances, so each
+// rule shape the views show has to give CalDAV's own expansion of it: ordinal
+// and set-position rules, a monthly rule on a day some months lack, RDATE and
+// EXDATE, a series started years before the range, instances on a local time
+// the zone skips, which COUNT does not count, and zones the object alone
+// defines.
+func TestEventInstancesAreTheInstancesCalDAVExpands(t *testing.T) {
+	october := []time.Time{time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
+	tests := []struct {
+		name       string
+		raw        string
+		start, end time.Time
+		want       int
+		overridden []string
+	}{
+		{
+			name:  "second Monday of each month",
+			raw:   instancesObject("", "DTSTART:20260112T090000Z\r\nDTEND:20260112T100000Z\r\nRRULE:FREQ=MONTHLY;BYDAY=2MO\r\n"),
+			start: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), end: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+			want: 7,
+		},
+		{
+			name:  "last weekday of each month",
+			raw:   instancesObject("", "DTSTART:20260130T090000Z\r\nDTEND:20260130T100000Z\r\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\r\n"),
+			start: october[0], end: october[1], want: 1,
+		},
+		{
+			name:  "the 31st, in months that have one",
+			raw:   instancesObject("", "DTSTART:20260131T090000Z\r\nDTEND:20260131T100000Z\r\nRRULE:FREQ=MONTHLY\r\n"),
+			start: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), end: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+			want: 7,
+		},
+		{
+			name: "RDATE and EXDATE",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n"+
+				"RDATE:20261008T150000Z\r\nEXDATE:20261012T090000Z\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name:  "a daily series started two years before",
+			raw:   instancesObject("", "DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\nRRULE:FREQ=DAILY\r\n"),
+			start: october[0], end: october[1], want: 31,
+		},
+		{
+			name:  "a weekly series started a decade before, in a host zone",
+			raw:   instancesObject("", "DTSTART;TZID=America/New_York:20150105T090000\r\nDTEND;TZID=America/New_York:20150105T100000\r\nRRULE:FREQ=WEEKLY\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name: "a counted series across the skipped hour",
+			raw: instancesObject("", "DTSTART;TZID=America/New_York:20260301T023000\r\nDTEND;TZID=America/New_York:20260301T033000\r\n"+
+				"RRULE:FREQ=DAILY;COUNT=20\r\n"),
+			start: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), end: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			want: 20,
+		},
+		{
+			name: "a zone only the object defines",
+			raw: instancesObject(instancesOutlookEastern, "DTSTART;TZID=\"Eastern Standard Time\":20240304T090000\r\n"+
+				"DTEND;TZID=\"Eastern Standard Time\":20240304T100000\r\nRRULE:FREQ=WEEKLY;UNTIL=20240326T035959Z;BYDAY=MO\r\n"),
+			start: time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC), end: time.Date(2024, 4, 1, 0, 0, 0, 0, time.UTC),
+			want: 4,
+		},
+		{
+			name:  "an all-day yearly series",
+			raw:   instancesObject("", "DTSTART;VALUE=DATE:20200229\r\nRRULE:FREQ=YEARLY\r\n"),
+			start: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), end: time.Date(2029, 1, 1, 0, 0, 0, 0, time.UTC),
+			want: 2,
+		},
+		{
+			name: "an override replacing one instance",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID:20261012T090000Z\r\nDTSTART:20261013T150000Z\r\nDTEND:20261013T160000Z\r\nSUMMARY:Moved\r\n"),
+			start: october[0], end: october[1], want: 3, overridden: []string{"20261012T090000Z"},
+		},
+		{
+			name:  "floating times",
+			raw:   instancesObject("", "DTSTART:20261005T090000\r\nDTEND:20261005T100000\r\nRRULE:FREQ=WEEKLY;UNTIL=20261026T090000\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name: "an all-day series with an override",
+			raw: instancesObject("", "DTSTART;VALUE=DATE:20261005\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID;VALUE=DATE:20261012\r\nDTSTART;VALUE=DATE:20261013\r\nSUMMARY:Moved\r\n"),
+			start: october[0], end: october[1], want: 3, overridden: []string{"20261012T000000Z"},
+		},
+		{
+			name: "an all-day override of every later instance of a timed series",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID;RANGE=THISANDFUTURE:20261019T090000Z\r\nDTSTART;VALUE=DATE:20261019\r\nDTEND;VALUE=DATE:20261020\r\nSUMMARY:Later\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name:  "a series lasting a DURATION",
+			raw:   instancesObject("", "DTSTART;TZID=Europe/Berlin:20261020T090000\r\nDURATION:PT90M\r\nRRULE:FREQ=DAILY;COUNT=12\r\n"),
+			start: october[0], end: october[1], want: 12,
+		},
+		{
+			name:  "an all-day series with no end",
+			raw:   instancesObject("", "DTSTART;VALUE=DATE:20261001\r\nRRULE:FREQ=WEEKLY\r\n"),
+			start: october[0], end: october[1], want: 5,
+		},
+		{
+			name: "an end in another zone than the start",
+			raw: instancesObject("", "DTSTART;TZID=America/New_York:20261020T090000\r\nDTEND;TZID=Europe/Berlin:20261020T160000\r\n"+
+				"RRULE:FREQ=DAILY;COUNT=14\r\n"),
+			start: october[0], end: october[1], want: 12,
+		},
+		{
+			name: "an override of every later instance that moves and lengthens them",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261013T080000Z\r\nDURATION:PT3H\r\nSUMMARY:Later\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name: "an override of every later instance that writes no end",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261012T130000Z\r\nSUMMARY:Later\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+		{
+			name: "an override of this and every later instance",
+			raw: instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+				"RECURRENCE-ID;RANGE=THISANDFUTURE:20261019T090000Z\r\nDTSTART:20261019T110000Z\r\nDTEND:20261019T130000Z\r\nSUMMARY:Later\r\n"),
+			start: october[0], end: october[1], want: 4,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EventInstances(tt.raw, tt.start, tt.end)
+			if !got.Recurs || !got.Complete {
+				t.Fatalf("EventInstances() recurs = %v, complete = %v, want both", got.Recurs, got.Complete)
+			}
+			want := expandedInstances(t, tt.raw, tt.start, tt.end, tt.overridden...)
+			if len(want) != tt.want {
+				t.Fatalf("CalDAV expands %d instances, the fixture expects %d: %v", len(want), tt.want, want)
+			}
+			if len(got.Instances) != len(want) {
+				t.Fatalf("EventInstances() lists %d instances, CalDAV expands %d:\n got %v\nwant %v", len(got.Instances), len(want), got.Instances, want)
+			}
+			for i := range want {
+				g, w := got.Instances[i], want[i]
+				if !g.RecurrenceID.Equal(w.RecurrenceID) || !g.Start.Equal(w.Start) || !g.End.Equal(w.End) {
+					t.Errorf("instance %d = %v, CalDAV expands %v", i, g, w)
+				}
+			}
+		})
+	}
+}
+
+// An instance a RANGE=THISANDFUTURE override governs carries that override's
+// content, which the views show it with, so it names the override.
+func TestEventInstancesNameTheOverrideGoverningThem(t *testing.T) {
+	raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+		"RECURRENCE-ID;RANGE=THISANDFUTURE:20261019T090000Z\r\nDTSTART:20261019T110000Z\r\nDTEND:20261019T130000Z\r\nSUMMARY:Later\r\n")
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	override := mustUTC(t, "20261019T090000Z")
+	for _, instance := range got.Instances {
+		governed := !instance.RecurrenceID.Before(override)
+		if governed != instance.Override.Equal(override) {
+			t.Errorf("instance %s names override %v, want governed = %v", instance.RecurrenceID, instance.Override, governed)
+		}
+	}
+}
+
+// A minutely series holds far more instances in a month than one expansion
+// returns. The listing stops at the expansion's limit and says it is partial.
+func TestEventInstancesStopAtTheExpansionLimit(t *testing.T) {
+	raw := instancesObject("", "DTSTART:20261001T000000Z\r\nDTEND:20261001T000030Z\r\nRRULE:FREQ=MINUTELY\r\n")
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	if !got.Recurs || got.Complete {
+		t.Fatalf("EventInstances() recurs = %v, complete = %v, want a partial listing", got.Recurs, got.Complete)
+	}
+	if len(got.Instances) != ical.MaxRecurrenceInstances {
+		t.Fatalf("EventInstances() lists %d instances, want %d", len(got.Instances), ical.MaxRecurrenceInstances)
+	}
+	if first := got.Instances[0].Start; !first.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("the first listed instance starts %s, want the series' start", first)
+	}
+}
+
+// Nothing to expand: a single event, and an object that cannot be read.
+func TestEventInstancesOfWhatDoesNotRecur(t *testing.T) {
+	for name, raw := range map[string]string{
+		"single":     instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\n"),
+		"unreadable": "not a calendar",
+	} {
+		if got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)); got.Recurs || len(got.Instances) != 0 {
+			t.Errorf("%s: EventInstances() = %+v, want nothing", name, got)
+		}
+	}
+}

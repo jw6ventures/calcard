@@ -206,7 +206,7 @@ func TestCalendarViewsNormalizeAllDayServerDates(t *testing.T) {
 		"function parseServerDate(value, allDay)",
 		"parsed.dtstart = parseServerDate(raw.dtstart, allDay);",
 		"parsed.dtend = parseServerDate(raw.dtend, allDay);",
-		"parsed.recurrenceId = parseServerDate(raw.recurrenceId, raw.recurrenceIdAllDay || allDay);",
+		"raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay);",
 	} {
 		if !strings.Contains(string(partial), want) {
 			t.Errorf("the shared event helpers are missing %q: an all-day date keeps the instant the server sent", want)
@@ -342,7 +342,6 @@ func TestTimedEditorTimezoneRoundTrip(t *testing.T) {
 					Cases []struct {
 						Start, End, Zone, RecurrenceZone string
 						Values                           []string
-						Until, RRuleUntil                string
 					}
 					Create struct {
 						Start, End, Zone string
@@ -363,15 +362,6 @@ func TestTimedEditorTimezoneRoundTrip(t *testing.T) {
 							original = c.End
 						}
 						assertSubmittedInstant(t, prop, c.Values[i], zone, original)
-					}
-					recurrence := &utils.RecurrenceOptions{Frequency: "WEEKLY", Interval: 1, Until: c.Until}
-					component, err := utils.BuildEventComponent("timed", "", c.Values[0], c.Values[1], false, "", "", recurrence, "", &utils.EventOptions{Timezone: c.Zone})
-					if err != nil {
-						t.Fatalf("BuildEventComponent() error = %v", err)
-					}
-					wantRRule := "RRULE:FREQ=WEEKLY;UNTIL=" + c.RRuleUntil
-					if !slices.Contains(component, wantRRule) {
-						t.Errorf("UNTIL=%s in zone %q shown as %q, which saves as %q, want %s", c.RRuleUntil, c.Zone, c.Until, component, wantRRule)
 					}
 				}
 				if result.Create.Zone != browserZone {
@@ -572,7 +562,7 @@ func servedOutlookHandler(t *testing.T) (*Handler, *store.Store, *fakeEventRepoW
 		},
 		Events: events,
 	}
-	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject), s, events
+	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances), s, events
 }
 
 // servedEventsJSON writes to a file the March 2024 events JSON the endpoint
@@ -614,7 +604,7 @@ func updateServedEvent(t *testing.T, handler *Handler, user *store.User, zone st
 
 // The event modal builds a markup string and assigns it to innerHTML, so every
 // value interpolated into it has to be escaped at the point of interpolation.
-// formatRRule reads its parts straight out of the stored RRULE, which arrives
+// The recurrence summary reads its parts straight out of the stored RRULE, which arrives
 // over CalDAV PUT or an ICS import and is never sanitized on the way in.
 func TestEventModalEscapesRecurrenceSummary(t *testing.T) {
 	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
@@ -622,8 +612,8 @@ func TestEventModalEscapesRecurrenceSummary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		if !strings.Contains(string(source), "escapeHtml(formatRRule(event))") {
-			t.Errorf("%s interpolates formatRRule output into the modal unescaped", name)
+		if !strings.Contains(string(source), "escapeHtml(recurrenceSummary(event.seriesEvent || event))") {
+			t.Errorf("%s interpolates the recurrence summary into the modal unescaped", name)
 		}
 	}
 }
@@ -791,10 +781,9 @@ func TestCalendarViewsShareOneCopyOfTheEventHelpers(t *testing.T) {
 		shared = append(shared, match[1])
 	}
 	for _, want := range []string{
-		"parseICAL", "parseICALDate", "parseRRule", "listedOffsets", "intlOffsets", "timeZoneClock",
-		"rruleUntilLimit", "rruleUntilDay", "makeOccurrenceKey", "recurrenceZoneClock", "recurrenceCalendar",
-		"expandRecurringEvents", "parseServerDate", "normalizeServerEvent", "formatRRule", "formatDateTimeForInput",
-		"browserTimeZone",
+		"parseICAL", "parseICALDate", "listedOffsets", "intlOffsets", "timeZoneClock",
+		"rruleUntilDay", "expandRecurringEvents", "overrideRecurrenceIdAllDay", "recurrenceSummary", "parseServerDate", "normalizeServerEvent", "formatRRule",
+		"formatDateTimeForInput", "browserTimeZone",
 	} {
 		if !slices.Contains(shared, want) {
 			t.Errorf("the shared event helpers have no %s", want)
@@ -912,89 +901,19 @@ func TestCalendarViewsReadUTCDateTimesAsUTC(t *testing.T) {
 }
 
 // A series ends on its UNTIL's day: a DATE UNTIL includes the day, which ends
-// in the zone the series' DTSTART is read in as the server's expansion ends
-// it, and the UTC UNTIL the server writes for a timed series is the picked
-// day's last second in the event's zone, or in UTC for an event with no zone
-// or one the browser does not know. The node script runs each view's own expansion and
-// reading of that day; the editors and the recurrence summary have to read the
-// day through it, or editing a series moves its end.
+// in the zone the series' DTSTART is read in, and the UTC UNTIL the server
+// writes for a timed series is the picked day's last second in the event's
+// zone, or in UTC for an event with no zone or one the browser does not know.
+// The node script runs each view's own reading of that day, which the
+// recurrence summary names. The editors show the day the server reads
+// (TestShownRecurrenceEndsOnTheDayTheEditorWrites).
 func TestCalendarViewsEndSeriesOnTheUntilDay(t *testing.T) {
-	prefills := map[string]string{
-		"calendar_view.html":      "untilInput.value = formatDateForInput(window.rruleUntilDay(rr.UNTIL, event));",
-		"all_calendars_view.html": "formatDateInput(rruleUntilDay(rrule.UNTIL, event));",
-	}
-	for name, prefill := range prefills {
-		source, err := templateFS.ReadFile("templates/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		if !strings.Contains(string(source), prefill) {
-			t.Errorf("%s is missing %q", name, prefill)
-		}
-	}
-	partial, err := templateFS.ReadFile(calendarEventsPartialFile)
-	if err != nil {
-		t.Fatalf("read the shared event helpers: %v", err)
-	}
-	for _, want := range []string{
-		"var until = rr.UNTIL ? rruleUntilLimit(rr.UNTIL, event) : null;",
-		"rruleUntilDay(rr.UNTIL, event).toLocaleDateString()",
-	} {
-		if !strings.Contains(string(partial), want) {
-			t.Errorf("the shared event helpers are missing %q", want)
-		}
-	}
-
 	node := requireNode(t)
-	for name := range prefills {
+	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
 		rendered := renderedPage(t, name)
 		for _, zone := range []string{"UTC", "America/New_York", "Europe/Berlin", "Asia/Kolkata", "Asia/Tokyo", "Pacific/Kiritimati"} {
 			t.Run(name+"/"+zone, func(t *testing.T) {
 				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_until.mjs"), rendered)
-				cmd.Env = append(os.Environ(), "TZ="+zone)
-				if output, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("%v\n%s", err, output)
-				}
-			})
-		}
-	}
-}
-
-// A series with a TZID repeats on its zone's wall clock, and RFC 5545 §3.3.10
-// leaves an instance on a local time that zone skips out of the series and
-// its COUNT, as the server's expansion does. One with no TZID, or one the
-// browser does not know, repeats on UTC's, as the server reads both. The node script runs each view's
-// own expansion under browser zones either side of the event's, which must all
-// show the same instants.
-func TestCalendarViewsLeaveOutInstancesOnSkippedLocalTimes(t *testing.T) {
-	node := requireNode(t)
-	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
-		rendered := renderedPage(t, name)
-		for _, zone := range []string{"UTC", "Europe/Berlin", "America/New_York", "Asia/Tokyo", "Australia/Lord_Howe"} {
-			t.Run(name+"/"+zone, func(t *testing.T) {
-				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_skipped_local_time.mjs"), rendered)
-				cmd.Env = append(os.Environ(), "TZ="+zone)
-				if output, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("%v\n%s", err, output)
-				}
-			})
-		}
-	}
-}
-
-// COUNT bounds the instances a series' RRULE generates before its EXDATEs
-// remove any (RFC 5545 §3.3.10 and §3.8.5.1), so an excluded instance still
-// counts while one on a local time the zone skips, which the rule never
-// generates, does not; the server's expansion counts both that way. The node
-// script runs each view's own expansion under browser zones either side of
-// the events' and expects the same instants in each.
-func TestCalendarViewsCountExcludedInstancesTowardCount(t *testing.T) {
-	node := requireNode(t)
-	for _, name := range []string{"calendar_view.html", "all_calendars_view.html"} {
-		rendered := renderedPage(t, name)
-		for _, zone := range []string{"UTC", "Europe/Berlin", "America/New_York", "Asia/Tokyo"} {
-			t.Run(name+"/"+zone, func(t *testing.T) {
-				cmd := exec.Command(node, filepath.Join("testdata", "recurrence_count.mjs"), rendered)
 				cmd.Env = append(os.Environ(), "TZ="+zone)
 				if output, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("%v\n%s", err, output)
@@ -1086,7 +1005,7 @@ func renderedPage(t *testing.T, name string) string {
 			1: {ID: 1, UserID: 100, Name: "Contacts"},
 		}},
 		Contacts: &fakeContactRepoWithBirthdays{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	var serve http.HandlerFunc
 	var req *http.Request

@@ -118,7 +118,10 @@ func TestParseRecurrenceOptions(t *testing.T) {
 			req := &http.Request{
 				Form: tt.formData,
 			}
-			got := ParseRecurrenceOptions(req)
+			got, err := ParseRecurrenceOptions(req)
+			if err != nil {
+				t.Fatalf("ParseRecurrenceOptions() error = %v", err)
+			}
 
 			if tt.want == nil && got != nil {
 				t.Errorf("Expected nil, got %+v", got)
@@ -144,7 +147,38 @@ func TestParseRecurrenceOptions(t *testing.T) {
 			if got.Until != tt.want.Until {
 				t.Errorf("Until: got %q, want %q", got.Until, tt.want.Until)
 			}
+			if !slices.Equal(got.ByMonthDay, tt.want.ByMonthDay) {
+				t.Errorf("ByMonthDay: got %v, want %v", got.ByMonthDay, tt.want.ByMonthDay)
+			}
 		})
+	}
+}
+
+// The days of the month field holds a list, and RFC 5545 §3.3.10 counts a
+// negative day back from the month's end. A list the rule cannot hold is
+// refused rather than stored short of what was typed.
+func TestParseRecurrenceOptionsReadsDaysOfTheMonth(t *testing.T) {
+	parse := func(days string) ([]int, error) {
+		got, err := ParseRecurrenceOptions(&http.Request{Form: url.Values{"recurrence": {"MONTHLY"}, "recurrence_bymonthday": {days}}})
+		if err != nil {
+			return nil, err
+		}
+		return got.ByMonthDay, nil
+	}
+	for days, want := range map[string][]int{"": nil, "15": {15}, " 1, 15 ,-1": {1, 15, -1}, "-31,31": {-31, 31}} {
+		if got, err := parse(days); err != nil || !slices.Equal(got, want) {
+			t.Errorf("days %q read as %v, %v; want %v", days, got, err, want)
+		}
+	}
+	for _, days := range []string{"0", "32", "-32", "1,,2", "1,x", "1.5"} {
+		if got, err := parse(days); err == nil {
+			t.Errorf("days %q read as %v, want an error", days, got)
+		}
+	}
+	component, err := BuildEventComponent("uid", "", "2026-01-01T09:00", "2026-01-01T10:00", false, "", "",
+		&RecurrenceOptions{Frequency: "MONTHLY", Interval: 1, ByMonthDay: []int{1, 15, -1}}, "", nil)
+	if err != nil || !slices.Contains(component, "RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15,-1") {
+		t.Errorf("BuildEventComponent() = %q, %v; want BYMONTHDAY=1,15,-1", component, err)
 	}
 }
 

@@ -16,9 +16,9 @@ import (
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/contacts"
 	httperrors "github.com/jw6ventures/calcard/internal/http/errors"
-	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
+	"github.com/jw6ventures/calcard/internal/vcard"
 )
 
 type addressBookShareView struct {
@@ -289,7 +289,7 @@ func (h *Handler) ViewAddressBook(w http.ResponseWriter, r *http.Request) {
 			"DisplayName":  displayName,
 			"Email":        email,
 			"LastModified": c.LastModified,
-			"RawVCard":     c.RawVCard,
+			"VCard":        contacts.EditableCard(c.RawVCard),
 			"ETag":         c.ETag,
 		})
 	}
@@ -439,23 +439,16 @@ func contactFieldMessage(err *contacts.FieldError) string {
 }
 
 // storedContactHasEmail reports whether the stored contact's card carries
-// email as one of its EMAIL values, as the page read it: the raw value, before
-// any unescaping. A contact that cannot be read carries none.
+// email as one of its EMAIL values, as the page read it: the raw value of the
+// card the page was served, unfolded as the page unfolds it and before any
+// unescaping. A contact that cannot be read carries none.
 func (h *Handler) storedContactHasEmail(ctx context.Context, user *store.User, bookID int64, uid, email string) bool {
 	contact, err := h.contacts.GetContact(ctx, user, bookID, uid)
 	if err != nil || contact == nil {
 		return false
 	}
-	for _, line := range utils.UnfoldLines(contact.RawVCard) {
-		keyPart, value, ok := ical.SplitContentLine(line)
-		if !ok {
-			continue
-		}
-		name, _, _ := strings.Cut(keyPart, ";")
-		if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
-			name = name[dot+1:]
-		}
-		if strings.EqualFold(strings.TrimSpace(name), "EMAIL") && strings.TrimSpace(value) == email {
+	for _, raw := range vcard.ContentLines(contacts.EditableCard(contact.RawVCard)) {
+		if line, ok := vcard.ParseLine(raw); ok && line.Is("EMAIL") && strings.TrimSpace(line.Value) == email {
 			return true
 		}
 	}

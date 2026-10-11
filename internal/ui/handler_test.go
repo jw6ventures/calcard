@@ -108,7 +108,7 @@ func TestViewCalendarHandler(t *testing.T) {
 				Events:    eventRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodGet, "/calendars/"+tc.calendarID, nil)
 			rctx := chi.NewRouteContext()
@@ -149,7 +149,7 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 					},
 				},
 			},
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
 		rctx := chi.NewRouteContext()
@@ -184,7 +184,7 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 					},
 				},
 			},
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
 		rctx := chi.NewRouteContext()
@@ -215,7 +215,7 @@ func TestViewCalendarRendersDayAndWeekViews(t *testing.T) {
 				1: {ID: 1, UserID: 100, Name: "Work"},
 			},
 		},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
 	rctx := chi.NewRouteContext()
@@ -317,7 +317,7 @@ func TestViewAddressBookHandler(t *testing.T) {
 				Contacts:     contactRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodGet, "/addressbooks/"+tc.bookID, nil)
 			rctx := chi.NewRouteContext()
@@ -374,7 +374,7 @@ func TestCreateEventHandler(t *testing.T) {
 		Events:    eventRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -475,7 +475,7 @@ func TestCreateEventReturnsToAllCalendars(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Work"},
 		}},
 		Events: eventRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"summary":   {"Planning"},
@@ -553,7 +553,7 @@ func TestDeleteEventHandler(t *testing.T) {
 		DeadProperties: deadProperties,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
 	rctx := chi.NewRouteContext()
@@ -589,7 +589,7 @@ func TestDeleteContactHandlerRemovesDAVState(t *testing.T) {
 		AddressBooks:   bookRepo,
 		Contacts:       contactRepo,
 		DeadProperties: deadProperties,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/contact-1", nil)
 	rctx := chi.NewRouteContext()
@@ -627,7 +627,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary": {"Test Event"},
@@ -678,7 +678,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary":    {"Updated Summary"},
@@ -734,7 +734,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary":    {"Updated Summary"},
@@ -782,7 +782,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
 		rctx := chi.NewRouteContext()
@@ -830,7 +830,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"edit_scope":         {"occurrence"},
@@ -873,7 +873,7 @@ func TestCreateContactHandler(t *testing.T) {
 		Contacts:     contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -952,7 +952,7 @@ func TestCreateContactStoresDAVResourceName(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 		}},
 		Contacts: contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"display_name": {"Johnny Appleseed"},
@@ -1080,7 +1080,7 @@ func TestUpdateContactTargetsTheRequestedIdentityNotItsDecodedTwin(t *testing.T)
 			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 		}},
 		Contacts: contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"display_name": {"Renamed By The Request"}}
 	// url.PathEscape(`literal%41`) is "literal%2541": the percent is escaped, so
@@ -1122,7 +1122,7 @@ func TestUpdateContactPreservesDAVResourceName(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 		}},
 		Contacts: contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"display_name": {"Alice Renamed"}}
 	req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
@@ -1179,7 +1179,7 @@ func TestImportAddressBookReportsSkippedCards(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 		}},
 		Contacts: contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1271,7 +1271,7 @@ func TestImportAddressBookStoresContactsThroughTheService(t *testing.T) {
 			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 		}},
 		Contacts: contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	importVCF := func(t *testing.T, displayName string) {
 		t.Helper()
@@ -1348,7 +1348,7 @@ func TestViewBirthdaysHandler(t *testing.T) {
 		Contacts: contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
 	user := &store.User{ID: 100, PrimaryEmail: "test@example.com"}
@@ -1387,7 +1387,7 @@ func TestViewBirthdaysKeepsLeapDayAndKnownYears(t *testing.T) {
 			{ID: 4, UID: "future", DisplayName: &names[3], Birthday: &future},
 		},
 	}
-	handler := NewHandler(&config.Config{}, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
@@ -1460,7 +1460,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
 		s := &store.Store{Calendars: calRepo, Events: eventRepo}
-		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nSUMMARY:Series\r\nDTSTART;TZID=America/Chicago:20250115T140000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nRECURRENCE-ID;TZID=America/Chicago:20250122T140000\r\nSUMMARY:Override\r\nDTSTART;TZID=America/Chicago:20250122T150000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:No UID\r\nDTSTART:20250116T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
@@ -1520,7 +1520,7 @@ func TestImportCalendarHandler(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
-		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		alarm := func(uid string) string {
 			return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
@@ -1565,7 +1565,7 @@ func TestImportCalendarHandler(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
-		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID;X-SOURCE=import:param@example.com\r\nSUMMARY:Param\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "param.ics", ics)
@@ -1597,7 +1597,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
 		s := &store.Store{Calendars: calRepo, Events: eventRepo}
-		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := newICSImportRequest(t, "/calendars/1/import", "bad.ics", "BEGIN:VEVENT\r\nEND:VEVENT\r\n")
 		req = withRouteID(req, "1")
@@ -1624,7 +1624,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			},
 		}
 		s := &store.Store{Calendars: calRepo, Events: &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
-		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
 		req = withRouteID(req, "1")
@@ -1665,7 +1665,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
@@ -1710,7 +1710,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new@example.com\r\nSUMMARY:New Event\r\nDTSTART:20250110T120000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated Existing\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
@@ -1752,7 +1752,7 @@ func TestDashboardHidesDeniedRecentEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -1795,7 +1795,7 @@ func newDashboardTestStore() *store.Store {
 }
 
 func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
-	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{
@@ -1820,7 +1820,7 @@ func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
 }
 
 func TestDashboardHidesWelcomeTourAfterOnboarding(t *testing.T) {
-	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	completed := time.Now()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1839,7 +1839,7 @@ func TestDashboardHidesWelcomeTourAfterOnboarding(t *testing.T) {
 
 func TestCompleteOnboardingMarksUser(t *testing.T) {
 	userRepo := &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Users: userRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Users: userRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/onboarding/complete", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -1857,7 +1857,7 @@ func TestCompleteOnboardingMarksUser(t *testing.T) {
 
 func TestCreateCalendarPersistsSelectedColor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{}
 	form.Set("name", "Work")
@@ -1883,7 +1883,7 @@ func TestRenameCalendarPersistsSelectedColor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
 		1: {ID: 1, UserID: 100, Name: "Work"},
 	}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{}
 	form.Set("name", "Personal")
@@ -1915,7 +1915,7 @@ func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
 		Calendars:  calRepo,
 		Users:      &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}},
 		ACLEntries: &fakeACLRepo{},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -1950,7 +1950,7 @@ func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
 func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
 	handler := NewHandler(&config.Config{BaseURL: "https://calcard.example/"}, &store.Store{
 		AppPasswords: &fakeAppPasswordRepo{},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -2030,7 +2030,7 @@ func TestAppPasswordsPageReportsDigestReadiness(t *testing.T) {
 					{ID: 4, Label: "expired-token", ExpiresAt: &past},
 					{ID: 5, Label: "revoked-token", RevokedAt: &past},
 				}},
-			}, nil, dav.ValidateCalendarObject)
+			}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
 			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -2082,7 +2082,7 @@ func appPasswordRowsByLabel(t *testing.T, body string) map[string]string {
 // is made even when no auth service is wired in, as the UI tests construct it.
 func TestRevokeAppPasswordRevokesAndNotifiesTheAuthService(t *testing.T) {
 	repo := &fakeAppPasswordRepo{list: []store.AppPassword{{ID: 7, UserID: 100, Label: "phone"}}}
-	handler := NewHandler(&config.Config{}, &store.Store{AppPasswords: repo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{AppPasswords: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/app-passwords/7", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -2136,7 +2136,7 @@ func TestDashboardBackfillsVisibleRecentEventsAfterFiltering(t *testing.T) {
 		Events:       &fakeEventRepo{recent: recent},
 		Contacts:     &fakeContactRepo{contacts: map[string]*store.Contact{}},
 		ACLEntries:   buildHiddenRecentEventACLs(25),
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -2178,7 +2178,7 @@ func TestDashboardShowsRecentEventsWithDirectObjectReadGrant(t *testing.T) {
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1/direct", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -2215,7 +2215,7 @@ func TestCalendarEventJSONHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -2244,7 +2244,7 @@ func TestCalendarEventJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -2275,7 +2275,7 @@ func TestCalendarEventJSONSupportsExplicitDateRange(t *testing.T) {
 			"1:in":  {CalendarID: 1, UID: "in", ResourceName: "in", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &inRange},
 			"1:out": {CalendarID: 1, UID: "out", ResourceName: "out", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &outOfRange},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-03-01&end=2026-04-01", nil)
 	req = withRouteID(req, "1")
@@ -2315,7 +2315,7 @@ func TestCalendarEventJSONReadsQuotedParameterColons(t *testing.T) {
 		Events: &fakeEventRepo{events: map[string]*store.Event{
 			"1:exchange": {CalendarID: 1, UID: "exchange", ResourceName: "exchange", RawICAL: raw},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2024-01-01&end=2024-02-01", nil)
 	req = withRouteID(req, "1")
@@ -2356,7 +2356,7 @@ func TestCalendarEventJSONRejectsInvalidDateRange(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-04-01&end=2026-03-01", nil)
 	req = withRouteID(req, "1")
@@ -2392,7 +2392,7 @@ func TestExportCalendarDownloadsReadableEventsAsICS(t *testing.T) {
 				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-2\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
 	req = withRouteID(req, "1")
@@ -2444,7 +2444,7 @@ func TestExportCalendarHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
 	req = withRouteID(req, "1")
@@ -2484,7 +2484,7 @@ func TestCalendarEventJSONIncludesImportedTimezoneEventForSourceMonth(t *testing
 				DTStart: &storedStart,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -2537,7 +2537,7 @@ func TestCalendarEventJSONIncludesAppleImportedCurrentMonthEvents(t *testing.T) 
 					"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -2581,7 +2581,7 @@ func TestCalendarEventJSONIgnoresTimezoneRRuleWhenFilteringMonth(t *testing.T) {
 					"DTSTART;TZID=America/Chicago:20260415T174500\r\nDTEND;TZID=America/Chicago:20260415T184500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -2678,7 +2678,7 @@ func TestCalendarEventJSONIncludesCrossMonthEventForEndMonth(t *testing.T) {
 				DTEnd:   &end,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -2718,7 +2718,7 @@ func TestCalendarEventJSONIncludesServerDateFields(t *testing.T) {
 				AllDay:       false,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -2767,7 +2767,7 @@ func TestCalendarEventJSONIncludesParsedICalMetadata(t *testing.T) {
 				DTEnd:   &end,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -2821,7 +2821,7 @@ func TestAllCalendarEventsJSONHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -2847,7 +2847,7 @@ func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Empty"}, Shared: false, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=4", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -2865,7 +2865,9 @@ func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 
 func TestAllCalendarEventsJSONSupportsDateRangeAndCapabilities(t *testing.T) {
 	inRange := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
-	outOfRange := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
+	// 09:00Z on 4 August is 3 August in the far west and 4 August further
+	// east, so no viewer sees it in a range ending with 2 August.
+	outOfRange := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}},
@@ -2882,11 +2884,11 @@ func TestAllCalendarEventsJSONSupportsDateRangeAndCapabilities(t *testing.T) {
 				CalendarID:   1,
 				UID:          "excluded",
 				ResourceName: "excluded",
-				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:excluded\r\nSUMMARY:Excluded\r\nDTSTART:20260803T090000Z\r\nDTEND:20260803T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:excluded\r\nSUMMARY:Excluded\r\nDTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 				DTStart:      &outOfRange,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-07-27&end=2026-08-03", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -2915,7 +2917,7 @@ func TestAllCalendarEventsJSONRejectsInvalidDateRange(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: &fakeCalendarRepo{},
 		Events:    &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-08-01&end=2026-07-31", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -2956,7 +2958,7 @@ func runAllCalendarEventsForCount(t *testing.T, eventCount int) (*fakeACLRepo, i
 		}},
 		Events:     &fakeEventRepo{events: events},
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -3019,7 +3021,7 @@ func TestAllCalendarEventsJSONOwnedCalendarSkipsACLLookups(t *testing.T) {
 		}},
 		Events:     &fakeEventRepo{events: events},
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -3062,7 +3064,7 @@ func TestAllCalendarEventsJSONWindowFilteringKeepsACLCallsConstant(t *testing.T)
 		}},
 		Events:     &fakeEventRepo{events: events},
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -3149,7 +3151,7 @@ func TestAllCalendarEventsJSONPerResourceCapabilities(t *testing.T) {
 		}},
 		Events:     &fakeEventRepo{events: events},
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -3223,7 +3225,7 @@ func TestViewAllCalendarsExcludesCalendarsThatDoNotAcceptEvents(t *testing.T) {
 				PrivilegesResolved: true,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -3262,7 +3264,7 @@ func TestViewAllCalendarsIncludesWritableCalendarMetadata(t *testing.T) {
 				PrivilegesResolved: true,
 			},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -3307,7 +3309,7 @@ func TestShareCalendarStoresACLEntries(t *testing.T) {
 		Users:      userRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"user_id": {"200"}}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
@@ -3362,7 +3364,7 @@ func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -3410,7 +3412,7 @@ func TestUnshareCalendarLeaveRevokesOwnGrantsAndKeepsOtherACLs(t *testing.T) {
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -3487,7 +3489,7 @@ func TestShareCalendarPreservesCustomPrincipalACLs(t *testing.T) {
 		Calendars:  calRepo,
 		Users:      userRepo,
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"user_id": {"200"}}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
@@ -3548,7 +3550,7 @@ func TestUnshareCalendarRemovesOnlyManagedCollectionGrants(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -3606,7 +3608,7 @@ func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -3647,7 +3649,7 @@ func TestCalendarShareViewsIncludePrincipalsWithCustomAccess(t *testing.T) {
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind"},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
 	if err != nil {
@@ -3670,7 +3672,7 @@ func TestCalendarShareViewsHonorsOrderedDeny(t *testing.T) {
 			{ID: 2, ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind", Position: 2},
 			{ID: 1, ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "all", Position: 1},
 		}},
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
 	if err != nil {
@@ -3756,7 +3758,7 @@ func TestUnshareCalendarLeaveSucceedsWithoutAnEffectiveCollectionShare(t *testin
 				},
 			}
 			aclRepo := &fakeACLRepo{entries: append([]store.ACLEntry(nil), tt.entries...)}
-			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, ACLEntries: aclRepo}, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, ACLEntries: aclRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 			rctx := chi.NewRouteContext()
@@ -4554,7 +4556,7 @@ func TestMoveContactHandler(t *testing.T) {
 		Contacts:     contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -4707,7 +4709,7 @@ func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     contactRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := make(url.Values)
 	form.Set("target_address_book_id", "2")
@@ -4779,7 +4781,7 @@ func TestContactHandlersDecodePercentEncodedUID(t *testing.T) {
 				2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
 			}},
 			Contacts: contactRepo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{"target_address_book_id": {"2"}}
 		req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts/"+encodedUID+"/move", strings.NewReader(form.Encode()))
@@ -4815,7 +4817,7 @@ func TestContactHandlersDecodePercentEncodedUID(t *testing.T) {
 				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
 			}},
 			DeadProperties: deadProperties,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/"+encodedUID, nil)
 		response := httptest.NewRecorder()
@@ -4838,7 +4840,7 @@ func TestContactHandlersDecodePercentEncodedUID(t *testing.T) {
 			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
 				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
 			}},
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{"display_name": {"Renamed Contact"}}
 		req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+encodedUID, strings.NewReader(form.Encode()))
@@ -4940,7 +4942,7 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 				Events:    eventRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			formData := url.Values{
 				"summary":    {"Updated Summary"},
@@ -5000,7 +5002,7 @@ func TestUpdateEventMovesSeriesToSelectedCalendar(t *testing.T) {
 			},
 		},
 		Events: eventRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"summary":                 {"Updated"},
@@ -5066,7 +5068,7 @@ func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
 			},
 		}},
 		Events: eventRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"summary":                 {"Updated"},
@@ -5125,7 +5127,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
 			}},
 		}
-		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary":                 {"Updated"},
@@ -5154,7 +5156,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 
 	t.Run("creating an event in a VTODO-only calendar is refused", func(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
-		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary": {"New"},
@@ -5179,7 +5181,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 
 	t.Run("a calendar with no restriction still accepts an event", func(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
-		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary": {"New"},
@@ -5201,7 +5203,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 
 	t.Run("importing events into a VTODO-only calendar is refused", func(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
-		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		var body bytes.Buffer
 		form := multipart.NewWriter(&body)
@@ -5247,7 +5249,7 @@ func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {
 			2: {ID: 2, UserID: 100, Name: "Destination"},
 		}},
 		Events: eventRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"summary":                 {"Updated"},
@@ -5299,7 +5301,7 @@ func TestUpdateAllDayEventAllowsSameStartAndEndDate(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
-	}, nil, dav.ValidateCalendarObject)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	formData := url.Values{
 		"summary":    {"Updated Summary"},
@@ -5358,7 +5360,7 @@ func TestUpdateEventRequiresDates(t *testing.T) {
 		Events:    eventRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	formData := url.Values{
 		"summary":    {"Updated Summary"},
@@ -5409,7 +5411,7 @@ func TestViewBirthdaysBoundsTheContactRead(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	cfg.DAV.MaxReportCandidateRows = 10
-	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
@@ -5445,7 +5447,7 @@ func TestViewBirthdaysInsideTheBudgetIsComplete(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	cfg.DAV.MaxReportCandidateRows = 10
-	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
@@ -5465,7 +5467,7 @@ func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
 		t.Run(method, func(t *testing.T) {
 			raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=America/New_York:20250724T090000\r\nDTEND;TZID=America/New_York:20250724T100000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 			repo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{"1:event": {ID: 1, CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: raw, ETag: "original"}}}}
-			h := NewHandler(&config.Config{}, &store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100}}}, Events: repo}, nil, dav.ValidateCalendarObject)
+			h := NewHandler(&config.Config{}, &store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100}}}, Events: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			form := url.Values{"summary": {"Changed"}, "dtstart": {"2025-07-25T09:00"}, "dtend": {"2025-07-25T10:00"}, "timezone": {"America/Los_Angeles"}, "edit_scope": {"occurrence"}, "recurrence_id": {"2025-07-25T09:00"}, "recurrence_timezone": {"America/New_York"}}
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event", strings.NewReader(form.Encode()))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5542,7 +5544,7 @@ func TestContactWriteRefusalNamesWhatWasWrong(t *testing.T) {
 						1: {ID: 1, UserID: 100, Name: "Test Contacts"},
 					}},
 					Contacts: contactRepo,
-				}, nil, dav.ValidateCalendarObject)
+				}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 				target := "/addressbooks/1/contacts"
 				if method == http.MethodPut {
@@ -5596,7 +5598,7 @@ func TestUpdateContactKeepsAStoredEmailTheFormWouldRefuse(t *testing.T) {
 		handler := NewHandler(&config.Config{}, &store.Store{
 			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Contacts"}}},
 			Contacts:     repo,
-		}, nil, dav.ValidateCalendarObject)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{"display_name": {"John Renamed"}, "email": {email}}
 		req := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
@@ -5742,7 +5744,7 @@ func TestUpdateContactRefusesAFormBuiltFromAnOlderVersion(t *testing.T) {
 			handler := NewHandler(&config.Config{}, &store.Store{
 				AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Test Contacts"}}},
 				Contacts:     contactRepo,
-			}, nil, dav.ValidateCalendarObject)
+			}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			form := url.Values{"display_name": {"Alice"}, "phone": {"+1 555 0199"}, "etag": {tt.etag}}
 			req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
@@ -5789,7 +5791,7 @@ func TestAddressBookPageCarriesContactETags(t *testing.T) {
 func TestImportCalendarAppliesTheCalDAVValidator(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	ics := "\xef\xbb\xbfBEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:Microsoft Exchange Server 2010\r\nMETHOD:PUBLISH\r\n" +
 		"BEGIN:VEVENT\r\nUID:kept\r\nSUMMARY:Standup\r\nDTSTART;TZID=Europe/Berlin:20260105T090000\r\nDTEND;TZID=Europe/Berlin:20260105T090000\r\nEND:VEVENT\r\n" +
@@ -5825,7 +5827,7 @@ func TestImportCalendarAppliesTheCalDAVValidator(t *testing.T) {
 func TestImportCalendarLeavesTheExportedCalendarsPropertiesBehind(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	calendarProperties := []string{
 		"NAME:Team calendar", "DESCRIPTION:Shared team events", "UID:5FC53010-1267-4F8E-BC28-1D7AE55A7C99",
@@ -5910,7 +5912,7 @@ func TestCreatedRepeatUntilEventPassesTheCalDAVValidator(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			form := url.Values{
 				"summary":             {"Standup"},
@@ -5989,7 +5991,7 @@ func TestUpdateEventRefusesDataTheCalDAVValidatorRefuses(t *testing.T) {
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
 		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series", RawICAL: seriesWithBackwardsOverride, ETag: "e"},
 	}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{
 		"summary": {"Renamed"}, "dtstart": {"2026-01-05T09:00"}, "dtend": {"2026-01-05T10:00"}, "edit_scope": {"series"},
@@ -6041,7 +6043,7 @@ func TestDeleteOccurrenceOfAStoredSeriesTheValidatorRefuses(t *testing.T) {
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
 		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: seriesWithBackwardsOverride, ETag: "e"},
 	}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	w := httptest.NewRecorder()
 	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
@@ -6076,7 +6078,7 @@ func TestDeleteOccurrenceRefusesToBreakAValidSeries(t *testing.T) {
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
 		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: original, ETag: "e"},
 	}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	w := httptest.NewRecorder()
 	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
@@ -6128,7 +6130,7 @@ func TestInvalidEventMessageSpeaksPlainly(t *testing.T) {
 func TestImportCalendarImportsConcatenatedCalendars(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	calendar := func(name, uid string) string {
 		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//" + name + "//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nX-WR-CALNAME:" + name + "\r\n" +
@@ -6171,7 +6173,7 @@ func TestImportCalendarWritesThroughTheHandlersValidator(t *testing.T) {
 		validated++
 		return nil, calobject.NewError(http.StatusForbidden, []string{"max-instances"}, nil)
 	}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, refuse)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, refuse, dav.EventInstances)
 
 	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
 		"BEGIN:VEVENT\r\nUID:refused@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
@@ -6210,7 +6212,7 @@ func TestImportCalendarRefusesAReadOnlyShareeBeforeValidating(t *testing.T) {
 		validated++
 		return dav.ValidateCalendarObject(raw, cal)
 	}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, validate)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, validate, dav.EventInstances)
 
 	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
 		"BEGIN:VEVENT\r\nUID:one@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nEND:VEVENT\r\n" +
@@ -6256,7 +6258,7 @@ func TestImportCalendarHonoursAResourceLevelGrant(t *testing.T) {
 		validated++
 		return dav.ValidateCalendarObject(raw, cal)
 	}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}, nil, validate)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}, nil, validate, dav.EventInstances)
 
 	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
 		"BEGIN:VEVENT\r\nUID:evt-1\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nSUMMARY:Updated\r\nEND:VEVENT\r\n" +
@@ -6303,7 +6305,7 @@ func (f *countingEventRepo) GetByUID(ctx context.Context, calendarID int64, uid 
 func TestImportCalendarCountsWhatItLeavesOut(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &countingEventRepo{fakeEventRepoWithUpsert: fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
 		"BEGIN:VTODO\r\nUID:task\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Task\r\nEND:VTODO\r\n" +

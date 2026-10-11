@@ -29,7 +29,6 @@ vm.runInNewContext(
     extract('unescapeText'),
     extract('unfoldLines'),
     extract('parseICALDate'),
-    extract('parseRRule'),
     extract('parseTriggerMinutes'),
     extract('formatEmailValue'),
     extract('parseICAL'),
@@ -64,7 +63,7 @@ assert.deepEqual(
   ['2025-07-25T13:00:00.000Z', '2025-07-26T13:00:00.000Z', '2025-07-27T13:00:00.000Z'],
   `EXDATE in ${zone}`,
 );
-assert.equal(iso(context._parseICALDate(event.rruleParsed.UNTIL, {})), '2025-07-30T13:00:00.000Z', `UNTIL in ${zone}`);
+assert.equal(iso(context._parseICALDate(/UNTIL=([^;]*)/.exec(event.rrule)[1], {})), '2025-07-30T13:00:00.000Z', `UNTIL in ${zone}`);
 
 // Floating and TZID values are wall-clock times, and a DATE is local midnight.
 const floating = context._parseICAL([

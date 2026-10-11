@@ -789,13 +789,15 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	var recurrence *utils.RecurrenceOptions
 	if input.Recurrence != nil {
 		recurrence = &utils.RecurrenceOptions{
-			Frequency:  strings.TrimSpace(input.Recurrence.Frequency),
-			Interval:   input.Recurrence.Interval,
-			Count:      input.Recurrence.Count,
-			Until:      strings.TrimSpace(input.Recurrence.Until),
-			ByDay:      input.Recurrence.ByDay,
-			ByMonth:    input.Recurrence.ByMonth,
-			ByMonthDay: input.Recurrence.ByMonthDay,
+			Frequency: strings.TrimSpace(input.Recurrence.Frequency),
+			Interval:  input.Recurrence.Interval,
+			Count:     input.Recurrence.Count,
+			Until:     strings.TrimSpace(input.Recurrence.Until),
+			ByDay:     input.Recurrence.ByDay,
+			ByMonth:   input.Recurrence.ByMonth,
+		}
+		if input.Recurrence.ByMonthDay > 0 {
+			recurrence.ByMonthDay = []int{input.Recurrence.ByMonthDay}
 		}
 	}
 

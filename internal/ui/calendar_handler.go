@@ -819,9 +819,12 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 	relevantEvents := filterEventsForMonth(allEvents, rangeStart, rangeEnd)
 
 	// Build JSON response
+	viewStart, viewEnd := eventViewWindow(rangeStart, rangeEndExclusive)
 	eventsJSONData := make([]map[string]any, 0, len(relevantEvents))
 	for _, ev := range relevantEvents {
-		eventsJSONData = append(eventsJSONData, unfoldedEventJSON(ev, rangeStart, rangeEndExclusive, h.timezoneOnsets))
+		payload := unfoldedEventJSON(ev, viewStart, viewEnd, h.timezoneOnsets)
+		h.addSeriesInstances(payload, ev, viewStart, viewEnd)
+		eventsJSONData = append(eventsJSONData, payload)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -894,6 +897,53 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 
 const maxAllCalendarRangeDays = 62
 
+// eventViewWindow is the span of instants a view showing the dates [start,
+// endExclusive) can show, each given as its UTC midnight: the browser shows
+// its own local dates, which begin up to maxUTCOffset either side of the UTC
+// midnight of the same date.
+func eventViewWindow(start, endExclusive time.Time) (time.Time, time.Time) {
+	return start.Add(-maxUTCOffset), endExclusive.Add(maxUTCOffset)
+}
+
+// calendarEventInstance is one instance of a series in the view model, as
+// calobject.Instance describes it.
+type calendarEventInstance struct {
+	RecurrenceID string `json:"recurrenceId"`
+	Start        string `json:"start"`
+	End          string `json:"end"`
+	Override     string `json:"override,omitempty"`
+}
+
+// addSeriesInstances adds to payload, the view model of unfolded, the
+// instances of its series from viewStart to viewEnd, as CalDAV expands them:
+// "instances", which the browser places the series by, and
+// "instancesComplete", false when the range holds more than it lists. An
+// event whose master does not recur, or whose recurrence the server cannot
+// expand, gets neither, and stands for itself.
+func (h *Handler) addSeriesInstances(payload map[string]any, unfolded unfoldedEvent, viewStart, viewEnd time.Time) {
+	if !unfolded.series.recurs() {
+		return
+	}
+	expansion := h.expandEvent(unfolded.event.RawICAL, viewStart, viewEnd)
+	if !expansion.Recurs {
+		return
+	}
+	instances := make([]calendarEventInstance, 0, len(expansion.Instances))
+	for _, instance := range expansion.Instances {
+		listed := calendarEventInstance{
+			RecurrenceID: instance.RecurrenceID.UTC().Format(time.RFC3339),
+			Start:        instance.Start.UTC().Format(time.RFC3339),
+			End:          instance.End.UTC().Format(time.RFC3339),
+		}
+		if !instance.Override.IsZero() {
+			listed.Override = instance.Override.UTC().Format(time.RFC3339)
+		}
+		instances = append(instances, listed)
+	}
+	payload["instances"] = instances
+	payload["instancesComplete"] = expansion.Complete
+}
+
 // calendarEventQueryRange resolves the [start, endExclusive) window an events.json
 // request targets. It accepts an explicit start/end date range (used by the day/week
 // views) and falls back to a whole-month window derived from year/month.
@@ -944,6 +994,7 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 	}
 
 	rangeEnd := rangeEndExclusive.Add(-time.Nanosecond)
+	viewStart, viewEnd := eventViewWindow(rangeStart, rangeEndExclusive)
 
 	var result = make([]map[string]any, 0)
 	for i, cal := range calendars {
@@ -977,7 +1028,8 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 				continue
 			}
 
-			payload := unfoldedEventJSON(unfoldedEv, rangeStart, rangeEndExclusive, h.timezoneOnsets)
+			payload := unfoldedEventJSON(unfoldedEv, viewStart, viewEnd, h.timezoneOnsets)
+			h.addSeriesInstances(payload, unfoldedEv, viewStart, viewEnd)
 			payload["calendarId"] = cal.ID
 			payload["calendarName"] = cal.Name
 			payload["calendarColor"] = color
@@ -1428,8 +1480,11 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
 
-	// Parse recurrence options
-	recurrence := utils.ParseRecurrenceOptions(r)
+	recurrence, err := utils.ParseRecurrenceOptions(r)
+	if err != nil {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
+		return
+	}
 
 	uid := utils.GenerateUID()
 	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, uid), "bind"); err != nil {
@@ -1594,8 +1649,11 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	location := strings.TrimSpace(r.FormValue("location"))
 	description := strings.TrimSpace(r.FormValue("description"))
 
-	// Parse recurrence options
-	recurrence := utils.ParseRecurrenceOptions(r)
+	recurrence, err := utils.ParseRecurrenceOptions(r)
+	if err != nil {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
+		return
+	}
 
 	header, components, footer := utils.SplitComponentLines(opts.Object)
 	ical := ""
@@ -1650,7 +1708,7 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		replaced := false
 		for i, comp := range components {
 			if utils.RecurrenceIDValue(comp) == "" && !replaced {
-				components[i] = withUneditedProperties(master, comp, opts.Object, opts)
+				components[i] = withUneditedProperties(master, comp, opts.Object, opts, recurrence)
 				components = overridesFollowingSeries(components, comp, components[i], opts.Object)
 				replaced = true
 				break
@@ -1936,6 +1994,8 @@ func parseReminderMinutes(values []string) []int {
 type unfoldedEvent struct {
 	event store.Event
 	lines []string
+	// series is what lines say about the event's recurrence.
+	series eventSeries
 }
 
 func unfoldedStoreEvents(events []unfoldedEvent) []store.Event {
@@ -1947,39 +2007,58 @@ func unfoldedStoreEvents(events []unfoldedEvent) []store.Event {
 }
 
 // filterEventsForMonth returns the events relevant to the given month range,
-// each with its unfolded lines. Each object is unfolded as it is read, and its
-// lines kept only when the event is relevant, so a request holds the lines of
-// the events it shows rather than of the whole calendar.
+// each with its unfolded lines. monthStart and monthEnd are UTC midnights that
+// stand for the dates a viewer asked for, wherever the viewer is. Each object
+// is unfolded as it is read, and its lines kept only when the event is
+// relevant, so a request holds the lines of the events it shows rather than of
+// the whole calendar.
 func filterEventsForMonth(allEvents []store.Event, monthStart, monthEnd time.Time) []unfoldedEvent {
 	var relevant []unfoldedEvent
 	for _, ev := range allEvents {
 		unfolded := unfoldedEvent{event: ev, lines: utils.UnfoldLines(ev.RawICAL)}
-		rules := eventSeriesRules(unfolded.lines)
-		hasRRule := len(rules) > 0
+		unfolded.series = readEventSeries(unfolded.lines)
+		series := unfolded.series
 		rangeStart, rangeEnd := monthFilterRange(unfolded.lines)
-		startDate := eventMonthFilterStart(ev, rangeStart)
+		start := eventMonthFilterStart(ev, rangeStart)
 
-		if hasRRule {
-			if startDate != nil && !startDate.After(monthEnd) {
-				hasEnded := false
-				for _, rule := range rules {
-					if rruleUntilEndsBefore(rruleUntil(rule.rrule), monthStart, rule.dtstart, unfolded.lines) {
-						hasEnded = true
-					}
-				}
-				if !hasEnded {
-					relevant = append(relevant, unfolded)
-				}
+		if series.recurs() {
+			if start != nil && !start.earliestViewedDate().After(monthEnd) && !series.endsBefore(monthStart, unfolded.lines) {
+				relevant = append(relevant, unfolded)
 			}
 		} else {
-			endDate := eventMonthFilterEnd(ev, startDate, rangeEnd)
-			if startDate != nil && endDate != nil && !startDate.After(monthEnd) && !endDate.Before(monthStart) {
+			end := eventMonthFilterEnd(ev, start, rangeEnd)
+			if start != nil && end != nil && !start.earliestViewedDate().After(monthEnd) && !end.latestViewedDate().Before(monthStart) {
 				relevant = append(relevant, unfolded)
 			}
 		}
 	}
 	return relevant
 }
+
+// filterDate is a date the month filter places an event on: the date part of
+// a DTSTART or DTEND as written, held as that date's UTC midnight. reach is
+// how many days from it the date a viewer sees the time on can lie. A DATE is
+// on the date every viewer sees. A UTC time is an instant a viewer sees within
+// a day of its date, and so is a floating time, which the views read in UTC
+// as the server does. A time in a TZID's zone is one whose date there is
+// itself within a day of its UTC date.
+type filterDate struct {
+	date  time.Time
+	reach int
+}
+
+// earliestViewedDate is the earliest date a viewer anywhere sees d on.
+func (d filterDate) earliestViewedDate() time.Time {
+	return d.date.AddDate(0, 0, -d.reach)
+}
+
+// latestViewedDate is the latest date a viewer anywhere sees d on.
+func (d filterDate) latestViewedDate() time.Time {
+	return d.date.AddDate(0, 0, d.reach)
+}
+
+// instantReach is the reach of an instant held as its UTC date.
+const instantReach = 1
 
 // maxUTCOffset is the furthest east of UTC any zone's clocks run.
 const maxUTCOffset = 14 * time.Hour
@@ -1989,12 +2068,13 @@ const maxUTCOffset = 14 * time.Hour
 // that date wherever the calendar is viewed. dtstart is the series' DTSTART
 // content line and object the unfolded object holding it. A UTC UNTIL is an
 // instant whose date a viewer east of UTC sees up to maxUTCOffset later. A
-// DATE UNTIL is inclusive of its day (RFC 5545 §3.3.10), and a floating one is
-// a wall clock on its date; either is read in the DTSTART's zone, as the DAV
-// layer reads it, so the series may have an instance until that day ends
-// there, which a viewer east of UTC sees up to maxUTCOffset later still. In a
-// series of dates or of floating times, the date is the one every viewer sees.
-// An UNTIL it cannot read, or a series without a DTSTART, ends nothing.
+// DATE UNTIL is inclusive of its day (RFC 5545 §3.3.10), and is read in the
+// DTSTART's zone, as the DAV layer reads it, so the series may have an
+// instance until that day ends there, which a viewer east of UTC sees up to
+// maxUTCOffset later still. A timed series with neither a TZID nor UTC times
+// is read in UTC, which the views show as instants too, and so is its
+// floating UNTIL. In a series of dates, the date is the one every viewer
+// sees. An UNTIL it cannot read, or a series without a DTSTART, ends nothing.
 func rruleUntilEndsBefore(until string, day time.Time, dtstart string, object []string) bool {
 	if instant, err := time.Parse("20060102T150405Z", until); err == nil {
 		return instant.Add(maxUTCOffset).Before(day)
@@ -2013,97 +2093,238 @@ func rruleUntilEndsBefore(until string, day time.Time, dtstart string, object []
 	value = strings.TrimSpace(value)
 	tzid, zoned := ical.PropertyParam(keyPart, "TZID")
 	utc := strings.HasSuffix(strings.ToUpper(value), "Z")
-	if ical.PropertyParamEquals(keyPart, "VALUE", "DATE") || len(value) == len("20060102") || (!utc && !zoned) {
+	if ical.PropertyParamEquals(keyPart, "VALUE", "DATE") || len(value) == len("20060102") {
 		return date.Before(day)
 	}
+	if !utc && !zoned {
+		if instant, err := time.Parse("20060102T150405", until); err == nil {
+			return instant.Add(maxUTCOffset).Before(day)
+		}
+	}
 	end := date.AddDate(0, 0, 1)
-	if !utc {
+	if zoned && !utc {
 		end = utils.EventZoneIn(tzid, object).Instant(end)
 	}
 	return !end.Add(maxUTCOffset).After(day)
 }
 
-// eventSeriesRule is an RRULE value of a VEVENT among an object's content
-// lines, with that VEVENT's first DTSTART line, or "" when it has none.
-type eventSeriesRule struct {
-	rrule, dtstart string
+// eventComponentTimes are a VEVENT's first DTSTART, DTEND and DURATION lines,
+// each "" when it has none.
+type eventComponentTimes struct {
+	dtstart, dtend, duration string
 }
 
-// eventSeriesRules lists the RRULEs of the VEVENTs among an object's unfolded
-// content lines, a VEVENT left open included.
-func eventSeriesRules(unfolded []string) []eventSeriesRule {
-	var rules []eventSeriesRule
-	var rrules []string
-	dtstart, inEvent := "", false
+// eventSeriesRule is an RRULE of a VEVENT among an object's content lines,
+// with that VEVENT's times.
+type eventSeriesRule struct {
+	eventComponentTimes
+	rrule string
+}
+
+// eventSeries is what an object's VEVENTs say about its recurrence: their
+// RRULEs, whether any adds instances by RDATE, and the last date anything
+// other than a rule places an instance on: an RDATE, an override, and a
+// series' DTSTART when no rule follows it.
+type eventSeries struct {
+	rules  []eventSeriesRule
+	rdates bool
+	// explicitEnds holds, for each instance an RDATE, an override or a
+	// rule-less DTSTART places, the date it ends on.
+	explicitEnds []filterDate
+}
+
+// readEventSeries reads the series of the VEVENTs among an object's unfolded
+// content lines, a VEVENT left open included. A VTIMEZONE's rules are not the
+// object's recurrence.
+func readEventSeries(unfolded []string) eventSeries {
+	type component struct {
+		times    eventComponentTimes
+		rrules   []string
+		rdates   []string
+		override bool
+	}
+	var components []component
+	var current *component
 	for _, line := range unfolded {
 		switch {
 		case strings.EqualFold(line, "BEGIN:VEVENT"):
-			inEvent, rrules, dtstart = true, rrules[:0], ""
+			components = append(components, component{})
+			current = &components[len(components)-1]
 			continue
 		case strings.EqualFold(line, "END:VEVENT"):
-			for _, rrule := range rrules {
-				rules = append(rules, eventSeriesRule{rrule: rrule, dtstart: dtstart})
-			}
-			inEvent, rrules = false, rrules[:0]
+			current = nil
 			continue
-		case !inEvent:
+		case current == nil:
 			continue
 		}
 		key, _, value, ok := parseICalProperty(line)
 		switch {
 		case !ok:
 		case key == "RRULE":
-			rrules = append(rrules, value)
-		case key == "DTSTART" && dtstart == "":
-			dtstart = line
+			current.rrules = append(current.rrules, value)
+		case key == "RDATE":
+			current.rdates = append(current.rdates, line)
+		case key == "RECURRENCE-ID":
+			current.override = true
+		case key == "DTSTART" && current.times.dtstart == "":
+			current.times.dtstart = line
+		case key == "DTEND" && current.times.dtend == "":
+			current.times.dtend = line
+		case key == "DURATION" && current.times.duration == "":
+			current.times.duration = line
 		}
 	}
-	for _, rrule := range rrules {
-		rules = append(rules, eventSeriesRule{rrule: rrule, dtstart: dtstart})
+
+	var series eventSeries
+	var seriesLength time.Duration
+	for _, c := range components {
+		if c.override {
+			continue
+		}
+		seriesLength = max(seriesLength, c.times.length())
+		for _, rrule := range c.rrules {
+			series.rules = append(series.rules, eventSeriesRule{eventComponentTimes: c.times, rrule: rrule})
+		}
 	}
-	return rules
+	for _, c := range components {
+		length := c.times.length()
+		if c.override && length == 0 {
+			length = seriesLength
+		}
+		if len(c.rdates) > 0 {
+			series.rdates = true
+		}
+		for _, line := range c.rdates {
+			_, params, value, _ := parseICalProperty(line)
+			for _, date := range strings.Split(value, ",") {
+				start, period, isPeriod := strings.Cut(date, "/")
+				periodLength := length
+				if isPeriod {
+					// A period (RFC 5545 §3.3.9) states its own end or length.
+					if duration, ok := ical.ParseDuration(strings.TrimSpace(period)); ok {
+						periodLength = max(duration, 0)
+					} else if end := rawICalCalendarDate(period, params, false); end != nil {
+						series.addExplicitEnd(end, 0)
+					}
+				}
+				series.addExplicitEnd(rawICalCalendarDate(start, params, false), periodLength)
+			}
+		}
+		if c.override || len(c.rrules) == 0 && len(c.rdates) > 0 {
+			if _, params, value, ok := parseICalProperty(c.times.dtstart); ok {
+				series.addExplicitEnd(rawICalCalendarDate(value, params, false), length)
+			}
+		}
+	}
+	return series
+}
+
+// addExplicitEnd records an instance starting on start, lasting length.
+// A start it cannot read places an instance it cannot date, which no view
+// may leave out, so it is recorded as ending at the latest date there is.
+func (s *eventSeries) addExplicitEnd(start *filterDate, length time.Duration) {
+	if start == nil {
+		_, latest := ical.DateLimits()
+		s.explicitEnds = append(s.explicitEnds, filterDate{date: latest})
+		return
+	}
+	end := *start
+	end.date = end.date.Add(length)
+	s.explicitEnds = append(s.explicitEnds, end)
+}
+
+// recurs reports whether the object's VEVENTs repeat by rule or by date.
+func (s eventSeries) recurs() bool {
+	return len(s.rules) > 0 || s.rdates
+}
+
+// endsBefore reports whether the series has no instance a viewer sees on
+// or after day, a UTC midnight standing for that date wherever the calendar
+// is viewed: no RDATE, override or rule-less DTSTART places one there, and,
+// for a series repeating by rule, some rule's UNTIL ends it before day,
+// counting the days an instance lasts. object is the unfolded object.
+func (s eventSeries) endsBefore(day time.Time, object []string) bool {
+	for _, end := range s.explicitEnds {
+		if !end.latestViewedDate().Before(day) {
+			return false
+		}
+	}
+	if len(s.rules) == 0 {
+		return len(s.explicitEnds) > 0
+	}
+	for _, rule := range s.rules {
+		if rruleUntilEndsBefore(rruleUntil(rule.rrule), day.Add(-rule.length()), rule.dtstart, object) {
+			return true
+		}
+	}
+	return false
+}
+
+// length is how much later than its start an instance of the VEVENT can end
+// on a viewer's calendar: its DURATION, or the days from its DTSTART's date
+// to its DTEND's.
+func (t eventComponentTimes) length() time.Duration {
+	if _, value, ok := ical.SplitContentLine(t.duration); ok {
+		if length, ok := ical.ParseDuration(strings.TrimSpace(value)); ok && length > 0 {
+			return length
+		}
+	}
+	_, startParams, startValue, okStart := parseICalProperty(t.dtstart)
+	_, endParams, endValue, okEnd := parseICalProperty(t.dtend)
+	if !okStart || !okEnd {
+		return 0
+	}
+	start, end := rawICalCalendarDate(startValue, startParams, false), rawICalCalendarDate(endValue, endParams, true)
+	if start == nil || end == nil || !end.date.After(start.date) {
+		return 0
+	}
+	return end.date.Sub(start.date)
 }
 
 // eventMonthFilterStart is the date the month filter starts ev on: start,
 // what monthFilterRange read from its object, else its stored dtstart.
-func eventMonthFilterStart(ev store.Event, start *time.Time) *time.Time {
+func eventMonthFilterStart(ev store.Event, start *filterDate) *filterDate {
 	if start != nil {
 		return start
 	}
 	if ev.DTStart == nil {
 		return nil
 	}
-	normalized := time.Date(ev.DTStart.Year(), ev.DTStart.Month(), ev.DTStart.Day(), 0, 0, 0, 0, time.UTC)
-	return &normalized
+	return &filterDate{date: time.Date(ev.DTStart.Year(), ev.DTStart.Month(), ev.DTStart.Day(), 0, 0, 0, 0, time.UTC), reach: storedDateReach(ev)}
 }
 
 // eventMonthFilterEnd is the date the month filter ends ev on: end, what
 // monthFilterRange read from its object, else its stored dtend, and never
 // before start.
-func eventMonthFilterEnd(ev store.Event, start, end *time.Time) *time.Time {
-	if end != nil {
-		if start != nil && end.Before(*start) {
-			return start
-		}
-		return end
+func eventMonthFilterEnd(ev store.Event, start, end *filterDate) *filterDate {
+	if end == nil && ev.DTEnd != nil {
+		end = &filterDate{date: time.Date(ev.DTEnd.Year(), ev.DTEnd.Month(), ev.DTEnd.Day(), 0, 0, 0, 0, time.UTC), reach: storedDateReach(ev)}
 	}
-	if ev.DTEnd != nil {
-		normalized := time.Date(ev.DTEnd.Year(), ev.DTEnd.Month(), ev.DTEnd.Day(), 0, 0, 0, 0, time.UTC)
-		if start != nil && normalized.Before(*start) {
-			return start
-		}
-		return &normalized
+	if end == nil {
+		return start
 	}
-	return start
+	if start != nil && end.date.Before(start.date) {
+		return start
+	}
+	return end
+}
+
+// storedDateReach is the reach of ev's stored dtstart and dtend columns: the
+// instants a timed event's times name, and the dates of an all-day one.
+func storedDateReach(ev store.Event) int {
+	if ev.AllDay {
+		return 0
+	}
+	return instantReach
 }
 
 // monthFilterRange reads the dates the month filter places an event on from
 // its object's unfolded content lines: the master VEVENT's DTSTART and DTEND,
 // else the first of an override's.
-func monthFilterRange(lines []string) (*time.Time, *time.Time) {
+func monthFilterRange(lines []string) (*filterDate, *filterDate) {
 	inEvent := false
 	componentHasRecurrenceID := false
-	var startFallback, endFallback *time.Time
+	var startFallback, endFallback *filterDate
 
 	for _, line := range lines {
 		switch line {
@@ -2164,25 +2385,32 @@ func monthFilterRange(lines []string) (*time.Time, *time.Time) {
 	return startFallback, endFallback
 }
 
-func rawICalCalendarDate(value string, params map[string]string, isEnd bool) *time.Time {
+func rawICalCalendarDate(value string, params map[string]string, isEnd bool) *filterDate {
 	value = strings.TrimSpace(value)
 	if len(value) < 8 {
 		return nil
 	}
-	datePart := value[:8]
-	parsed, err := time.Parse("20060102", datePart)
+	parsed, err := time.Parse("20060102", value[:8])
 	if err != nil {
 		return nil
 	}
-	start := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, time.UTC)
-	if isEnd && (strings.EqualFold(params["VALUE"], "DATE") || len(value) == 8) {
-		start = start.AddDate(0, 0, -1)
+	date := filterDate{date: parsed}
+	if strings.EqualFold(params["VALUE"], "DATE") || len(value) == 8 {
+		if isEnd {
+			date.date = date.date.AddDate(0, 0, -1)
+		}
+		return &date
 	}
-	return &start
+	if strings.TrimSpace(params["TZID"]) != "" && !strings.HasSuffix(strings.ToUpper(value), "Z") {
+		date.reach = instantReach + 1
+	} else {
+		date.reach = instantReach
+	}
+	return &date
 }
 
 // unfoldedEventJSON is the view model of an event shown from viewStart to
-// viewEnd, the range the browser asked for, reading the rules of the zones the
+// viewEnd, the instants the browser's view can show (eventViewWindow), reading the rules of the zones the
 // object defines through onsets, or through listings of its own when onsets is
 // nil.
 func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, onsets ical.ObservanceOnsets) map[string]any {
@@ -2196,10 +2424,78 @@ func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, ons
 	zones := calendarEventZones{times: ical.NewObjectTimesSharingOnsets(lines, onsets)}
 	parsed := parseCalendarEventMetadata(ev, lines, &zones)
 	parsed.addToPayload(payload)
+	if parsed.RRule != "" {
+		if form, ok := seriesRecurrenceForm(withoutServerZoneDefinitions(lines)); ok {
+			payload["recurrenceForm"] = form
+		}
+	}
 	if offsets := calendarEventTimezoneOffsets(parsed, viewStart, viewEnd, &zones); len(offsets) > 0 {
 		payload["timezoneOffsets"] = offsets
 	}
 	return payload
+}
+
+// recurrenceForm is the view model of the editor's repeat fields for a
+// series, which both editors fill them from, as shownRecurrence shows its
+// rule: an edit that submits them as they are keeps the rule as written.
+type recurrenceForm struct {
+	Frequency string   `json:"frequency"`
+	Interval  int      `json:"interval"`
+	ByDay     []string `json:"byDay"`
+	// ByMonthDay is the days of the month as the field holds them.
+	ByMonthDay string `json:"byMonthDay"`
+	// ByMonth is the month, or 0 for any.
+	ByMonth int `json:"byMonth"`
+	// End is the end field's value: "never", "after" Count instances, or
+	// "on" Until, a YYYY-MM-DD date.
+	End   string `json:"end"`
+	Count int    `json:"count"`
+	Until string `json:"until"`
+	// Partial is true when the rule holds more than the fields show.
+	Partial bool `json:"partial"`
+}
+
+// seriesRecurrenceForm is the view model of the repeat fields for the series
+// an object holds, its unfolded content lines less the zone definitions an
+// edit drops (withoutServerZoneDefinitions): the rule of its master, the
+// VEVENT a series edit replaces. ok is false when that master does not repeat
+// by a rule.
+func seriesRecurrenceForm(object []string) (recurrenceForm, bool) {
+	_, components, _ := utils.SplitComponentLines(object)
+	for _, component := range components {
+		if utils.RecurrenceIDValue(component) != "" {
+			continue
+		}
+		properties, _ := splitComponentBody(component)
+		shown, partial, ok := shownRecurrence(properties, object)
+		if !ok {
+			return recurrenceForm{}, false
+		}
+		form := recurrenceForm{
+			Frequency: shown.Frequency,
+			Interval:  shown.Interval,
+			ByDay:     shown.ByDay,
+			ByMonth:   shown.ByMonth,
+			End:       "never",
+			Partial:   partial,
+		}
+		if form.ByDay == nil {
+			form.ByDay = []string{}
+		}
+		days := make([]string, len(shown.ByMonthDay))
+		for i, day := range shown.ByMonthDay {
+			days[i] = strconv.Itoa(day)
+		}
+		form.ByMonthDay = strings.Join(days, ",")
+		switch {
+		case shown.Count > 0:
+			form.End, form.Count = "after", shown.Count
+		case shown.Until != "":
+			form.End, form.Until = "on", shown.Until
+		}
+		return form, true
+	}
+	return recurrenceForm{}, false
 }
 
 // calendarTimezoneOffset is one entry of a zone's offset listing in the view
@@ -2217,11 +2513,9 @@ type calendarTimezoneOffset struct {
 // host's database, which the browser shares, is left out.
 //
 // The browser reads the event's and its overrides' own times and UNTIL, and
-// places instances from viewStart to viewEnd; each is listed with two days
-// either side, more than any offset. Between them the browser reads the entry
-// before, which places only instances before the view. A counted series is
-// listed whole, since a skipped local time before the view changes which
-// instances its COUNT reaches.
+// the instances it shows from viewStart to viewEnd; each is listed with two
+// days either side, more than any offset. Between them the browser reads the
+// entry before, which no time it reads falls under.
 func calendarEventTimezoneOffsets(event calendarEventMetadata, viewStart, viewEnd time.Time, zones *calendarEventZones) map[string][]calendarTimezoneOffset {
 	tzids := make(map[string]struct{})
 	var points []time.Time
@@ -2255,13 +2549,6 @@ func calendarEventTimezoneOffsets(event calendarEventMetadata, viewStart, viewEn
 	}
 	if !viewEnd.IsZero() {
 		spans = append(spans, span{viewStart.Add(-reach), viewEnd.Add(reach)})
-	}
-	if event.RRuleParsed["COUNT"] != "" {
-		whole := spans[0]
-		for _, s := range spans[1:] {
-			whole.from, whole.through = minTime(whole.from, s.from), maxTime(whole.through, s.through)
-		}
-		spans = []span{whole}
 	}
 	slices.SortFunc(spans, func(a, b span) int { return a.from.Compare(b.from) })
 	merged := spans[:1]
@@ -2299,13 +2586,6 @@ func calendarEventTimezoneOffsets(event calendarEventMetadata, viewStart, viewEn
 	return listings
 }
 
-func minTime(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
-	}
-	return b
-}
-
 func maxTime(a, b time.Time) time.Time {
 	if a.After(b) {
 		return a
@@ -2339,7 +2619,10 @@ type calendarEventMetadata struct {
 	RecurrenceID       *time.Time
 	RecurrenceIDAllDay bool
 	RecurrenceTimezone string
-	Overrides          []calendarEventMetadata
+	// RecurrenceRange is "THISANDFUTURE" for an override of its instance and
+	// every later one (RFC 5545 §3.8.4.4), and "" for any other.
+	RecurrenceRange string
+	Overrides       []calendarEventMetadata
 }
 
 func (m calendarEventMetadata) addToPayload(payload map[string]any) {
@@ -2411,6 +2694,9 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 		payload["recurrenceId"] = m.RecurrenceID.Format(time.RFC3339)
 		payload["recurrenceIdAllDay"] = m.RecurrenceIDAllDay
 		payload["recurrenceTimezone"] = m.RecurrenceTimezone
+		if m.RecurrenceRange != "" {
+			payload["recurrenceRange"] = m.RecurrenceRange
+		}
 	}
 	if len(m.Overrides) > 0 {
 		overrides := make([]map[string]any, 0, len(m.Overrides))
@@ -2554,6 +2840,9 @@ func parseCalendarEventComponent(lines []string, zones *calendarEventZones) cale
 				event.RecurrenceTimezone = params["TZID"]
 				if event.RecurrenceTimezone == "" && !allDay {
 					event.RecurrenceTimezone = "UTC"
+				}
+				if strings.EqualFold(strings.TrimSpace(params["RANGE"]), "THISANDFUTURE") {
+					event.RecurrenceRange = "THISANDFUTURE"
 				}
 			}
 		case "X-ALT-DESC":

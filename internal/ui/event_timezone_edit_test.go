@@ -90,7 +90,7 @@ func TestUpdateEventKeepsTheZoneDefinitionCoveringTheEditedTimes(t *testing.T) {
 			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
 			s := &store.Store{Calendars: calRepo, Events: eventRepo}
-			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			user := &store.User{ID: 100, PrimaryEmail: "owner@example.com"}
 
 			w := httptest.NewRecorder()
@@ -203,7 +203,7 @@ func TestUpdateEventKeepsTheClientsDefinitions(t *testing.T) {
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
 		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: original, ETag: "e"},
 	}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 
 	w := httptest.NewRecorder()
@@ -261,7 +261,7 @@ func TestEventInAZoneOnlyTheObjectDefinesKeepsItsInstants(t *testing.T) {
 		"1:outlook-series": {ID: 1, CalendarID: 1, UID: "outlook-series", ResourceName: "outlook-series.ics", RawICAL: validated.Body, ETag: "e"},
 	}}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 	stored := func() *store.Event {
 		event := eventRepo.events["1:outlook-series"]
@@ -402,6 +402,7 @@ type calendarEventView struct {
 	RecurrenceID       string   `json:"recurrenceId"`
 	RecurrenceTimezone string   `json:"recurrenceTimezone"`
 	RRuleParsed        map[string]string
+	RecurrenceForm     *recurrenceForm                     `json:"recurrenceForm"`
 	TimezoneOffsets    map[string][]calendarTimezoneOffset `json:"timezoneOffsets"`
 	Overrides          []calendarEventView                 `json:"overrides"`
 }
@@ -489,7 +490,7 @@ func TestEventInASkippedLocalTimeKeepsTheEnteredWallClock(t *testing.T) {
 	}
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 
 	w := httptest.NewRecorder()
@@ -569,7 +570,7 @@ func TestCreatedEventDefinesItsZoneForEveryInstance(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			fields := url.Values{"dtstart": {"2025-01-15T14:00"}, "dtend": {"2025-01-15T15:00"}}
 			maps.Copy(fields, tt.recurrence)
 
@@ -639,7 +640,7 @@ func TestOccurrenceEditKeepsTheClientsDefinitionOfAHostZone(t *testing.T) {
 		"1:sp-series": {ID: 1, CalendarID: 1, UID: "sp-series", ResourceName: "sp-series.ics", RawICAL: validated.Body, ETag: "e"},
 	}}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 	freeBusy := func() []string {
 		eventRepo.events["1:sp-series"].ID = 1
@@ -711,7 +712,7 @@ func TestEditReplacesADefinitionTheV11EditorGenerated(t *testing.T) {
 		"1:legacy": {ID: 1, CalendarID: 1, UID: "legacy", ResourceName: "legacy.ics", RawICAL: original, ETag: "e"},
 	}}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 
 	w := httptest.NewRecorder()
@@ -876,7 +877,7 @@ func TestEditSplitsAStoredEventAsItsReadersDo(t *testing.T) {
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
 				"1:legacy": {ID: 1, CalendarID: 1, UID: "legacy", ResourceName: "legacy.ics", RawICAL: stored, ETag: "e"},
 			}}}
-			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			w := httptest.NewRecorder()
 			handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/legacy", "legacy", &store.User{ID: 100}, "UTC", url.Values{
@@ -920,7 +921,7 @@ func TestDeleteOccurrenceStoresTheZoneDefinitionsAnEditWould(t *testing.T) {
 			"1:legacy": {ID: 1, CalendarID: 1, UID: "legacy", ResourceName: "legacy.ics", RawICAL: original, ETag: "e"},
 		}}}
 		w := httptest.NewRecorder()
-		write(NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject), w)
+		write(NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances), w)
 		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=occurrence_") && !strings.Contains(location, "status=event_updated") {
 			t.Fatalf("status = %d location = %s", w.Code, location)
 		}

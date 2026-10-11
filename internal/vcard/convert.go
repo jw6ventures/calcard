@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/jw6ventures/calcard/internal/ical"
 )
 
 // ErrUnsupportedCharset reports a vCard 2.1 CHARSET this converter cannot decode.
@@ -58,11 +60,17 @@ func SplitCards(content string) []string {
 	return cards
 }
 
-// physicalLines splits content at CRLF, LF or a bare CR.
+// physicalLines splits content at CRLF, LF or a bare CR. A byte order mark
+// starting a line is dropped: files concatenated from several exports carry
+// one at the start of each, and no content line begins with one.
 func physicalLines(content string) []string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	content = strings.ReplaceAll(content, "\r", "\n")
-	return strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = ical.TrimByteOrderMark(line)
+	}
+	return lines
 }
 
 // isContinuationLine reports a folded continuation, which belongs to the value

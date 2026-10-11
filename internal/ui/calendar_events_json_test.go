@@ -65,7 +65,7 @@ func BenchmarkCalendarEventsJSONOutlookZone(b *testing.B) {
 	for _, n := range []int{50, 500} {
 		for _, shared := range []bool{false, true} {
 			b.Run(fmt.Sprintf("events=%d/shared=%t", n, shared), func(b *testing.B) {
-				handler := NewHandler(&config.Config{}, outlookSeriesCalendar(n), nil, dav.ValidateCalendarObject)
+				handler := NewHandler(&config.Config{}, outlookSeriesCalendar(n), nil, dav.ValidateCalendarObject, dav.EventInstances)
 				if shared {
 					handler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
 				}
@@ -106,7 +106,7 @@ func BenchmarkCalendarEventsJSONLargeCalendar(b *testing.B) {
 		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}},
 		Events:    &fakeEventRepo{events: events},
 	}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -122,7 +122,7 @@ func BenchmarkCalendarEventsJSONLargeCalendar(b *testing.B) {
 // started in 2000, whose zone offsets the view model lists around each series'
 // start and the month viewed.
 func BenchmarkCalendarEventsJSONSeriesSince2000(b *testing.B) {
-	handler := NewHandler(&config.Config{}, outlookSeriesCalendarFrom(500, 2000), nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, outlookSeriesCalendarFrom(500, 2000), nil, dav.ValidateCalendarObject, dav.EventInstances)
 	handler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
 	user := &store.User{ID: 100}
 	b.ReportAllocs()
@@ -166,7 +166,7 @@ func TestCalendarEventsJSONIsTheSameThroughSharedOnsets(t *testing.T) {
 	user := &store.User{ID: 100}
 	monthView := func(shared bool) []map[string]any {
 		t.Helper()
-		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 		if shared {
 			handler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
 		}
@@ -207,10 +207,11 @@ func TestCalendarEventsJSONIsTheSameThroughSharedOnsets(t *testing.T) {
 	}
 	// The client's Sao Paulo keeps -02 until the third Sunday of February,
 	// between the two days either side of the series' start and those before
-	// the view, which is listed from two days before it, at -03.
+	// the view, which is listed at -03 from two days before the first instant
+	// a browser shows in March: the far east's midnight, 14 hours before UTC's.
 	wantSaoPaulo := []any{
 		map[string]any{"from": "2024-02-03T12:00:00Z", "offset": float64(-2 * 3600)},
-		map[string]any{"from": "2024-02-28T00:00:00Z", "offset": float64(-3 * 3600)},
+		map[string]any{"from": "2024-02-27T10:00:00Z", "offset": float64(-3 * 3600)},
 	}
 	if got := offsets("sao-paulo", "America/Sao_Paulo"); !reflect.DeepEqual(got, wantSaoPaulo) {
 		t.Errorf("offsets of America/Sao_Paulo = %v, want %v", got, wantSaoPaulo)
@@ -245,7 +246,7 @@ func TestCalendarEventsJSONReadsAV11DefinitionAsTheHostZone(t *testing.T) {
 	rctx.URLParams.Add("id", "1")
 	req = req.WithContext(context.WithValue(auth.WithUser(req.Context(), user), chi.RouteCtxKey, rctx))
 	w := httptest.NewRecorder()
-	NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject).GetCalendarEventsJSON(w, req)
+	NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances).GetCalendarEventsJSON(w, req)
 	var payload []map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil || w.Code != http.StatusOK || len(payload) != 1 {
 		t.Fatalf("events JSON = %d %s (%v)", w.Code, w.Body.String(), err)

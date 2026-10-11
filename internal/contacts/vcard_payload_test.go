@@ -685,3 +685,23 @@ func TestNewStructuredContactUIDIsBounded(t *testing.T) {
 		t.Fatalf("error = %v, want a FieldError for uid", err)
 	}
 }
+
+// EditableCard hands a page the card the structured edit reads: only vCard
+// 2.1 is converted, and a card the conversion refuses is shown as stored for
+// the edit to refuse.
+func TestEditableCardConvertsOnlyVCard21(t *testing.T) {
+	for name, card := range map[string]string{
+		"vCard 3.0 with bare LF":          "BEGIN:VCARD\nVERSION:3.0\nUID:a\nFN:Ada\n Lovelace\nEND:VCARD\n",
+		"vCard 4.0":                       "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:b\r\nFN:Bea\r\nEND:VCARD\r\n",
+		"vCard 3.0 that mentions 2.1":     "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c\r\nFN:Cy\r\nTEL:555.212.1234\r\nNOTE:Firmware 2.1\r\nEND:VCARD\r\n",
+		"vCard 2.1 the converter refuses": "BEGIN:VCARD\r\nVERSION:2.1\r\nFN;CHARSET=KOI8-R;ENCODING=QUOTED-PRINTABLE:=F0=D2\r\nEND:VCARD\r\n",
+	} {
+		if got := EditableCard(card); got != card {
+			t.Errorf("%s: EditableCard = %q, want it as stored", name, got)
+		}
+	}
+	converted := EditableCard("BEGIN:VCARD\r\nVERSION:2.1\r\nUID:d\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Jos=C3=A9\r\nEND:VCARD\r\n")
+	if !strings.Contains(converted, "VERSION:3.0") || !strings.Contains(converted, "FN:José") {
+		t.Errorf("a vCard 2.1 card was not converted: %q", converted)
+	}
+}

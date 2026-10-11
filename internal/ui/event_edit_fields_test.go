@@ -99,7 +99,7 @@ func storedEventHandler(t *testing.T, uid, raw string) (*Handler, *store.Store, 
 		"1:" + uid: {ID: 1, CalendarID: 1, UID: uid, ResourceName: uid + ".ics", RawICAL: validated.Body, ETag: "e"},
 	}}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject), s, eventRepo, &store.User{ID: 100}
+	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances), s, eventRepo, &store.User{ID: 100}
 }
 
 // updateEvent submits form as an edit of uid in calendar 1, which must be
@@ -644,7 +644,7 @@ func TestAttendeeNamesRoundTripThroughTheEditor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 	user := &store.User{ID: 100}
 
 	w := httptest.NewRecorder()
@@ -731,7 +731,7 @@ func TestEventFormRefusesContentLineInjection(t *testing.T) {
 		t.Run(field, func(t *testing.T) {
 			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
-			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject)
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 			user := &store.User{ID: 100}
 
 			w := httptest.NewRecorder()

@@ -47,6 +47,31 @@ func TestImportSkipsUnstorableOctetsAndKeepsGoing(t *testing.T) {
 	}
 }
 
+// A file concatenated from Windows exports starts each card with a byte order
+// mark; every card is imported, and none is stored with the mark.
+func TestImportReadsCardsPastByteOrderMarks(t *testing.T) {
+	svc, _ := newTestService()
+	const bom = "\xef\xbb\xbf"
+	file := bom + "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:first\r\nFN:First\r\nEND:VCARD\r\n" +
+		bom + "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:second\r\nFN;ENCODING=QUOTED-PRINTABLE:Jos=C3=A9\r\nEND:VCARD\r\n"
+	result, err := svc.ImportVCards(context.Background(), owner, 1, file)
+	if err != nil {
+		t.Fatalf("ImportVCards: %v", err)
+	}
+	if result.Imported != 2 || len(result.Skipped) != 0 {
+		t.Fatalf("result = %+v, want both cards imported", result)
+	}
+	for _, uid := range []string{"first", "second"} {
+		c, err := svc.store.Contacts.GetByUID(context.Background(), 1, uid)
+		if err != nil || c == nil {
+			t.Fatalf("contact %q not stored: %v", uid, err)
+		}
+		if strings.Contains(c.RawVCard, bom) {
+			t.Errorf("contact %q was stored with a byte order mark: %q", uid, c.RawVCard)
+		}
+	}
+}
+
 // failingUpsertContacts fails the write of one UID the way PostgreSQL refuses
 // a value it cannot store.
 type failingUpsertContacts struct {

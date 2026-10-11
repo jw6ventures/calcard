@@ -76,16 +76,36 @@ func mergeStructuredContact(stored, uid string, form contactForm, now time.Time)
 	return body, nil
 }
 
+// EditableCard returns a stored card as the structured edit reads it: a vCard
+// 2.1 card is converted to vCard 3.0, with its quoted-printable and CHARSET
+// values decoded. A page filling the edit form must read this rather than the
+// stored octets, or a field it shows still encoded is saved as changed. A card
+// the conversion refuses is returned as stored, and the edit refuses it.
+func EditableCard(stored string) string {
+	card, err := editableCard(stored)
+	if err != nil {
+		return stored
+	}
+	return card
+}
+
+func editableCard(stored string) (string, error) {
+	// A page renders this for every contact it lists, and a card may carry a
+	// large photo. A vCard 2.1 card's VERSION line holds "2.1", which base64
+	// cannot, so most cards are answered without being read at all.
+	if !strings.Contains(stored, "2.1") || vcard.Version(stored) != "2.1" {
+		return stored, nil
+	}
+	return vcard.Convert21To30(stored)
+}
+
 func newCardMerge(stored, uid string) (*cardMerge, error) {
 	if vcard.ValidateEnvelope(stored) != nil {
 		return nil, ErrCardNotEditable
 	}
-	if vcard.Version(stored) == "2.1" {
-		converted, err := vcard.Convert21To30(stored)
-		if err != nil {
-			return nil, ErrCardNotEditable
-		}
-		stored = converted
+	stored, err := editableCard(stored)
+	if err != nil {
+		return nil, ErrCardNotEditable
 	}
 	structure := vcard.ReadStructure(stored)
 	version := "3.0"
