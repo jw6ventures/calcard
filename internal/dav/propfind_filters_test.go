@@ -109,8 +109,8 @@ func TestFilterReadableAddressBookContactsPrefetchesOnce(t *testing.T) {
 	if repo.listByResourceCalls != 0 {
 		t.Fatalf("expected no per-resource ACL lookups, got %d", repo.listByResourceCalls)
 	}
-	if repo.listScopedACLCalls != 1 {
-		t.Fatalf("expected one scoped ACL prefetch, got %d", repo.listScopedACLCalls)
+	if repo.listByResourcesCalls != 1 {
+		t.Fatalf("expected one batched ACL prefetch, got %d", repo.listByResourcesCalls)
 	}
 }
 

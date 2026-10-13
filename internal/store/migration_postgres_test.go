@@ -1122,9 +1122,11 @@ func TestPostgres_UpgradeRepairsFoldedRecurrenceBounds(t *testing.T) {
 // a DAILY or WEEKLY COUNT series in a zone whose transitions skip some of its
 // local times, which leave those instances out uncounted (§3.3.10) and so push
 // the COUNT-th instance a step later per skipped one, and a timed series whose
-// UNTIL is a date, which includes that whole day. The migration reopens those
-// bounds, or the time-range filter drops the instances past them, and leaves
-// every bound both readings agree on alone.
+// UNTIL is a date, which includes that whole day. A bound may also be UNTIL
+// plus the instance's length where UNTIL falls before the DTSTART, which is
+// still the series' first instance. The migration reopens those bounds, or the
+// time-range filter drops the instances past them, and leaves every bound both
+// readings agree on alone.
 func TestPostgres_V120MigrationReopensBoundsTheSeriesOutlast(t *testing.T) {
 	t.Run("database collation", func(t *testing.T) {
 		testV120MigrationReopensBoundsTheSeriesOutlast(t, "")
@@ -1132,6 +1134,13 @@ func TestPostgres_V120MigrationReopensBoundsTheSeriesOutlast(t *testing.T) {
 	t.Run("C collation", func(t *testing.T) {
 		testV120MigrationReopensBoundsTheSeriesOutlast(t, "C")
 	})
+}
+
+// storedColumns are the dtstart, dtend and recurrence_until of an events row,
+// the first two as RFC 3339 text; an empty dtend is stored as NULL.
+type storedColumns struct {
+	dtstart, dtend string
+	until          time.Time
 }
 
 func testV120MigrationReopensBoundsTheSeriesOutlast(t *testing.T, collation string) {
@@ -1164,6 +1173,9 @@ func testV120MigrationReopensBoundsTheSeriesOutlast(t *testing.T, collation stri
 		raw     string
 		bounded bool
 		reopen  bool
+		// columns, when set, are the dtstart, dtend and recurrence_until the
+		// row is stored with in place of the shared ones.
+		columns *storedColumns
 	}{
 		{uid: "count-weekly-tzid", bounded: true, reopen: true, raw: body("count-weekly-tzid", newYork,
 			"DTSTART;TZID=America/New_York:20260301T023000\r\nDTEND;TZID=America/New_York:20260301T033000\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\n")},
@@ -1199,16 +1211,58 @@ func testV120MigrationReopensBoundsTheSeriesOutlast(t *testing.T, collation stri
 			"DTSTART;VALUE=DATE:20260301\r\nRRULE:FREQ=WEEKLY;UNTIL=20260503\r\n")},
 		{uid: "plain", raw: body("plain", newYork,
 			"DTSTART;TZID=America/New_York:20260301T100000\r\nDTEND;TZID=America/New_York:20260301T110000\r\n")},
+
+		// RFC 5545 §3.8.5.3 makes the DTSTART the first instance even when
+		// UNTIL falls before it, and the bound stored as UNTIL plus the
+		// instance's length ends before it does.
+		{uid: "until-before-dtstart", bounded: true, reopen: true, raw: body("until-before-dtstart", "",
+			"DTSTART:20260601T100000Z\r\nDTEND:20260601T110000Z\r\nRRULE:FREQ=DAILY;UNTIL=20260301T000000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-01T10:00:00Z", dtend: "2026-06-01T11:00:00Z", until: time.Date(2026, 3, 1, 1, 0, 0, 0, time.UTC)}},
+		// A DURATION leaves dtend NULL, so dtstart alone shows the bound short.
+		{uid: "until-before-dtstart-duration", bounded: true, reopen: true, raw: body("until-before-dtstart-duration", "",
+			"DTSTART:20260601T100000Z\r\nDURATION:PT2H\r\nRRULE:FREQ=WEEKLY;UNTIL=20260301T000000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-01T10:00:00Z", until: time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)}},
+		// A DURATION longer than the gap from UNTIL to the DTSTART carries the
+		// short bound past dtstart, so only the DURATION shows it short.
+		{uid: "until-before-dtstart-long-duration", bounded: true, reopen: true, raw: body("until-before-dtstart-long-duration", "",
+			"DTSTART:20260610T100000Z\r\nDURATION:P7D\r\nRRULE:FREQ=DAILY;UNTIL=20260606T100000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-10T10:00:00Z", until: time.Date(2026, 6, 13, 10, 0, 0, 0, time.UTC)}},
+		{uid: "until-at-dtstart-long-duration", bounded: true, raw: body("until-at-dtstart-long-duration", "",
+			"DTSTART:20260610T100000Z\r\nDURATION:p1w\r\nRRULE:FREQ=DAILY;UNTIL=20260610T100000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-10T10:00:00Z", until: time.Date(2026, 6, 17, 10, 0, 0, 0, time.UTC)}},
+		// A DURATION too large to cast safely is not read, and leaves the
+		// bound open.
+		{uid: "duration-too-large-to-read", bounded: true, reopen: true, raw: body("duration-too-large-to-read", "",
+			"DTSTART:20260610T100000Z\r\nDURATION:PT99999999999H\r\nRRULE:FREQ=DAILY;UNTIL=20260610T100000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-10T10:00:00Z", until: time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)}},
+		// The bound of a series whose UNTIL is its DTSTART ends exactly when
+		// its one instance does.
+		{uid: "until-at-dtstart", bounded: true, raw: body("until-at-dtstart", "",
+			"DTSTART:20260601T100000Z\r\nDTEND:20260601T110000Z\r\nRRULE:FREQ=DAILY;UNTIL=20260601T100000Z\r\n"),
+			columns: &storedColumns{dtstart: "2026-06-01T10:00:00Z", dtend: "2026-06-01T11:00:00Z", until: time.Date(2026, 6, 1, 11, 0, 0, 0, time.UTC)}},
+	}
+	storedUntil := func(columns *storedColumns) time.Time {
+		if columns == nil {
+			return finiteUntil
+		}
+		return columns.until
 	}
 	for _, test := range cases {
 		var start, until any
 		if test.bounded {
-			start, until = finiteStart, finiteUntil
+			start, until = finiteStart, storedUntil(test.columns)
+		}
+		var dtstart, dtend any = "2026-03-01T07:30:00Z", "2026-03-01T08:30:00Z"
+		if test.columns != nil {
+			dtstart, dtend = test.columns.dtstart, nil
+			if test.columns.dtend != "" {
+				dtend = test.columns.dtend
+			}
 		}
 		if _, err := pool.Exec(`
 INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, dtstart, dtend, all_day, last_modified, recurrence_start, recurrence_until)
-VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-03-01T07:30:00Z', '2026-03-01T08:30:00Z', FALSE, NOW(), $4, $5)`,
-			calendarID, test.uid, test.raw, start, until); err != nil {
+VALUES ($1, $2, $2 || '.ics', $3, 'etag', $6, $7, FALSE, NOW(), $4, $5)`,
+			calendarID, test.uid, test.raw, start, until, dtstart, dtend); err != nil {
 			t.Fatalf("seed %s: %v", test.uid, err)
 		}
 	}
@@ -1237,8 +1291,8 @@ VALUES ($1, $2, $2 || '.ics', $3, 'etag', '2026-03-01T07:30:00Z', '2026-03-01T08
 					t.Errorf("run %d: %s recurrence_start = %v, want %s kept", run, test.uid, start, finiteStart)
 				}
 			default:
-				if start == nil || until == nil || !start.UTC().Equal(finiteStart) || !until.UTC().Equal(finiteUntil) {
-					t.Errorf("run %d: %s bounds = %v, %v, want %s, %s kept", run, test.uid, start, until, finiteStart, finiteUntil)
+				if want := storedUntil(test.columns); start == nil || until == nil || !start.UTC().Equal(finiteStart) || !until.UTC().Equal(want) {
+					t.Errorf("run %d: %s bounds = %v, %v, want %s, %s kept", run, test.uid, start, until, finiteStart, want)
 				}
 			}
 		}

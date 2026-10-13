@@ -1,10 +1,12 @@
 package dav
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -40,22 +42,61 @@ func collectionResourcePath(prefix string, id int64) string {
 	return path.Join(prefix, fmt.Sprint(id))
 }
 
-// objectResourcePath builds the canonical path of an object within a collection.
-func objectResourcePath(prefix string, id int64, resourceName string) string {
-	return path.Join(prefix, fmt.Sprint(id), resourceName)
+// objectRequestPath is the decoded path of the href naming the object
+// resourceName in collection id. Privilege checks canonicalize the path they
+// are given, which strips one extension from its last segment, so they must be
+// given this path rather than the object's canonical path: from that one they
+// would strip the object's own extension, as from "uid@example.com", and
+// decide for another object.
+func objectRequestPath(prefix string, id int64, resourceName, ext string) string {
+	return collectionResourcePath(prefix, id) + "/" + resourceName + ext
 }
 
-func appendObjectACLPaths(paths []string, collectionPath, resourceName, ext string) []string {
-	resourceName = strings.TrimSpace(resourceName)
-	if resourceName == "" {
-		return paths
+// requestPathForCanonical is the decoded path a request names the resource at
+// canonicalPath by, so that canonicalizing it gives canonicalPath back: an
+// object's path with its extension, and any other path unchanged. An object is
+// any member of a calendar or address book, a name such as ".hidden" with no
+// stem before its dot included.
+func requestPathForCanonical(canonicalPath string) string {
+	for _, candidate := range []struct{ prefix, ext string }{{calendarPrefix, ".ics"}, {addressBookPrefix, ".vcf"}} {
+		rest, ok := strings.CutPrefix(canonicalPath, candidate.prefix+"/")
+		if !ok {
+			continue
+		}
+		if collection, name, member := strings.Cut(rest, "/"); member && collection != "" && name != "" && !strings.Contains(name, "/") {
+			return canonicalPath + candidate.ext
+		}
 	}
-	base := strings.TrimSuffix(collectionPath, "/") + "/" + resourceName
-	paths = append(paths, base)
-	if strings.EqualFold(path.Ext(resourceName), ext) {
-		return append(paths, strings.TrimSuffix(base, path.Ext(resourceName)))
+	return canonicalPath
+}
+
+// objectACLPaths lists, in decision order, the stored spellings whose ACL
+// entries make up the ACL of the member resourceName of the canonical
+// collectionPath. The store's ACL writes replace exactly these.
+func objectACLPaths(collectionPath, resourceName string) []string {
+	return store.ObjectACLPaths(collectionPath, resourceName)
+}
+
+// orderACLEntries puts entries read from the spellings paths of one
+// resource's ACL in the order a decision reads them: by the spelling's place
+// in paths, so the resource's own path comes first, then by each spelling's
+// ACE order. The order then depends on what the spellings hold, not on the
+// order their rows were saved in.
+func orderACLEntries(entries []store.ACLEntry, paths []string) {
+	slices.SortStableFunc(entries, func(a, b store.ACLEntry) int {
+		return cmp.Or(
+			cmp.Compare(spellingRank(paths, a.ResourcePath), spellingRank(paths, b.ResourcePath)),
+			cmp.Compare(a.Position, b.Position),
+			cmp.Compare(a.ID, b.ID),
+		)
+	})
+}
+
+func spellingRank(paths []string, resourcePath string) int {
+	if rank := slices.Index(paths, resourcePath); rank >= 0 {
+		return rank
 	}
-	return append(paths, base+ext)
+	return len(paths)
 }
 
 // requirePrivilegeDecision turns the (allowed, denied) result of a privilege

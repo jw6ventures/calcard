@@ -172,7 +172,7 @@ func benchICSWithAttendees(uid string, attendees int) string {
 func BenchmarkNormalizeEventPayload(b *testing.B) {
 	svc := NewService(&store.Store{}, dav.ValidateCalendarObject)
 	b.Run("raw_ics", func(b *testing.B) {
-		input := UpsertInput{RawICS: benchICSWithAttendees("bench", 100), ContentType: "text/calendar"}
+		input := UpsertInput{RawICS: benchICSWithAttendees("bench", 100)}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			if _, err := svc.normalizeEventPayload(input, "", nil); err != nil {

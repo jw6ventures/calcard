@@ -18,10 +18,13 @@ import (
 
 // BusyPeriod is one concrete busy interval of an event occurrence.
 // RecurrenceID identifies its slot when the period came from a recurrence set.
+// RecurrenceDate is the date that slot names when its series starts on a
+// DATE, as RecurrenceInstance has it.
 type BusyPeriod struct {
-	RecurrenceID time.Time
-	Start        time.Time
-	End          time.Time
+	RecurrenceID   time.Time
+	RecurrenceDate time.Time
+	Start          time.Time
+	End            time.Time
 }
 
 // RecurrenceInstance is one generated occurrence of a recurrence set: the slot
@@ -31,23 +34,33 @@ type BusyPeriod struct {
 // The distinction is what RFC 5545 §3.8.4.4 needs: a RECURRENCE-ID names the
 // slot rather than the moved time, so a caller writing one out cannot derive it
 // from the occurrence's own DTSTART.
+//
+// An instance is identified and placed by its dates wherever it starts on a
+// DATE, since a zone skipping a date resolves that date and the next to one
+// instant: RecurrenceDate is the date its slot names when the series starts
+// on a DATE, and StartDate and Days the date the occurrence starts on and the
+// days it spans when what it carries starts on one. Each is zero otherwise.
 type RecurrenceInstance struct {
-	RecurrenceID time.Time
-	Start        time.Time
-	End          time.Time
+	RecurrenceID   time.Time
+	Start          time.Time
+	End            time.Time
+	RecurrenceDate time.Time
+	StartDate      time.Time
+	Days           int
 }
 
 // RecurrenceSlot is one identity in a master's recurrence pattern together
-// with its original and effective placement. GoverningRangeRecurrenceID names
-// the RANGE=THISANDFUTURE override that supplied the effective placement.
-// ExactOverride is true when a separate ordinary override replaces this slot.
+// with its original and effective placement. ExactOverride is true when a
+// separate ordinary override replaces this slot. RecurrenceDate is the date
+// the slot names when the series starts on a DATE, as RecurrenceInstance has
+// it.
 type RecurrenceSlot struct {
-	RecurrenceID               time.Time
-	Original                   BusyPeriod
-	Effective                  BusyPeriod
-	Suppressed                 bool
-	ExactOverride              bool
-	GoverningRangeRecurrenceID time.Time
+	RecurrenceID   time.Time
+	RecurrenceDate time.Time
+	Original       BusyPeriod
+	Effective      BusyPeriod
+	Suppressed     bool
+	ExactOverride  bool
 }
 
 // recurrenceOccurrence is the internal form: the slot paired with the period
@@ -56,9 +69,29 @@ type recurrenceOccurrence struct {
 	recurrenceID  time.Time
 	original      BusyPeriod
 	period        BusyPeriod
+	dates         occurrenceDays
+	seriesOnDate  bool
 	suppressed    bool
 	exactOverride bool
-	governing     time.Time
+}
+
+// occurrenceDays is where an occurrence falls in dates: slot, the date its
+// slot names -- a DATE's own, or a DATE-TIME's on the clock it is written in
+// -- and, when what it carries starts on a DATE, start, the date it starts
+// on, and days, the days it spans.
+type occurrenceDays struct {
+	slot  time.Time
+	start time.Time
+	days  int
+}
+
+// recurrenceDate is the date an occurrence's slot is identified by: its date
+// in a series starting on a DATE, and none in a timed one.
+func (o recurrenceOccurrence) recurrenceDate() time.Time {
+	if !o.seriesOnDate {
+		return time.Time{}
+	}
+	return o.dates.slot
 }
 
 // PropertyTimeResolver resolves one date-valued content line to the absolute
@@ -135,6 +168,90 @@ type LocalTimeGapLister interface {
 	LocalTimeGaps(tzid string, after, through time.Time) (gaps []LocalTimeGap, ok bool)
 }
 
+// LocalDateReader is implemented by a RecurrenceTimeResolver that can read
+// the date an instant falls on in a zone: the one the TZID tzid names, as
+// ResolvePropertyTime reads it, or, for an empty tzid, the one a DATE and a
+// floating value resolve in. A series starting on a DATE identifies each
+// instance by its date, which a DATE-TIME RDATE of it has only on that zone's
+// clock, and a timed series' slot falls on a date of its DTSTART's zone.
+type LocalDateReader interface {
+	LocalDate(tzid string, instant time.Time) time.Time
+}
+
+// localDateOf is the date instant falls on through resolver in the zone tzid
+// names, as its UTC midnight; for a resolver that cannot say, in the host's
+// zone of that name, else in UTC.
+func localDateOf(resolver RecurrenceTimeResolver, tzid string, instant time.Time) time.Time {
+	if reader, ok := resolver.(LocalDateReader); ok {
+		return reader.LocalDate(tzid, instant)
+	}
+	if tzid != "" {
+		if loc, ok := HostLocation(tzid); ok {
+			return CivilDate(instant.In(loc))
+		}
+	}
+	return CivilDate(instant.UTC())
+}
+
+// DateMidnightResolver is implemented by a RecurrenceTimeResolver that can
+// place a date's midnight from the date itself. DateMidnight is the instant
+// ResolvePropertyTime reads a DATE naming date as when its property carries
+// the TZID tzid, empty for none, or date itself when it cannot be read; an
+// expansion asks it for every date it places an all-day instance on.
+type DateMidnightResolver interface {
+	DateMidnight(tzid string, date time.Time) time.Time
+}
+
+// dateMidnights resolves dates to the instants their midnights fall on, each
+// date once per key part: an expansion asks for the same dates over and over,
+// one instance's end being the next one's start. direct places them when the
+// resolver can.
+type dateMidnights struct {
+	resolve PropertyTimeResolver
+	direct  DateMidnightResolver
+	byKey   map[string]*keyMidnights
+}
+
+// keyMidnights are the midnights placed for one key part, whose TZID tzid is.
+type keyMidnights struct {
+	tzid  string
+	dates map[int64]time.Time
+}
+
+func newDateMidnights(resolver RecurrenceTimeResolver) *dateMidnights {
+	midnights := &dateMidnights{resolve: propertyTimeResolver(resolver)}
+	midnights.direct, _ = resolver.(DateMidnightResolver)
+	return midnights
+}
+
+// at is the midnight starting date as a DATE property with keyPart resolves
+// it, or date's UTC midnight when it cannot be resolved.
+func (d *dateMidnights) at(keyPart string, date time.Time) time.Time {
+	placed, ok := d.byKey[keyPart]
+	if !ok {
+		placed = &keyMidnights{dates: make(map[int64]time.Time)}
+		placed.tzid, _ = PropertyParam(keyPart, "TZID")
+		if d.byKey == nil {
+			d.byKey = make(map[string]*keyMidnights, 1)
+		}
+		d.byKey[keyPart] = placed
+	}
+	key := date.Unix()
+	if instant, ok := placed.dates[key]; ok {
+		return instant
+	}
+	var instant time.Time
+	if d.direct != nil {
+		instant = d.direct.DateMidnight(placed.tzid, date)
+	} else if resolved, ok := d.resolve.or(keyPart, date.Format(DateLayout)); ok {
+		instant = resolved
+	} else {
+		instant = date
+	}
+	placed.dates[key] = instant
+	return instant
+}
+
 // localTimeExists is the existence half of resolver, defaulting as
 // PropertyTimeResolver(nil) does.
 func localTimeExists(resolver RecurrenceTimeResolver) func(tzid string, wall time.Time) bool {
@@ -176,6 +293,11 @@ type recurrenceExpansion struct {
 	// visit, when set, receives each occurrence in place of the returned
 	// slice and ends the expansion by returning true.
 	visit func(recurrenceOccurrence) bool
+	// work, when set, is the budget the rule is walked on, which then
+	// outlasts the expansion; a fresh one otherwise.
+	work *recurrenceWork
+	// walk, when set, records what the walk of the rule passes.
+	walk *rruleWalk
 }
 
 // RecurringBusyPeriods expands a recurring event (RRULE, RDATE, EXDATE and
@@ -183,6 +305,9 @@ type recurrenceExpansion struct {
 // busy periods that overlap [rangeStart, rangeEnd). dtstart and duration are
 // the event's resolved start and occurrence length; maxInstances caps the
 // expansion and resolve reads the recurrence dates, per RecurrenceTimeResolver.
+// A series starting on a DATE gives its length as whole days of 24 hours, and
+// each instance spans that many local days from its own date (seriesLength);
+// the same holds for VisitRecurrenceInstances and RecurrenceSlots.
 //
 // Exhausting maxInstances returns ErrRecurrenceExpansionLimit, and exhausting
 // the rule's scan work returns ErrRecurrenceScanLimit, which wraps it. Either
@@ -210,7 +335,7 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 	periods := make([]BusyPeriod, 0, len(occurrences))
 	for _, occurrence := range occurrences {
 		period := occurrence.period
-		period.RecurrenceID = occurrence.recurrenceID
+		period.RecurrenceID, period.RecurrenceDate = occurrence.recurrenceID, occurrence.recurrenceDate()
 		periods = append(periods, period)
 	}
 	return periods, err
@@ -240,7 +365,28 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 // answer from them; one that owes the complete set has to treat the error as
 // fatal.
 func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, visit func(RecurrenceInstance) bool) error {
-	_, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
+	_, err := VisitRecurrenceInstancesAndSlots(raw, componentName, dtstart, duration, rangeStart, rangeEnd, maxInstances, resolve, nil, nil, visit)
+	return err
+}
+
+// VisitRecurrenceInstancesAndSlots is VisitRecurrenceInstances, answering as
+// well, for each of ids, whether the set generates the slot it names, whatever
+// override then replaces or moves it: one its EXDATEs leave out, or a wall
+// clock its zone skips, it does not. A slot is matched to an id by where it
+// starts, never by how far its instance reaches, as the walk of the rule the
+// range asks for passes it, so an id that walk passes costs nothing more.
+//
+// needed is called only for an id the walk did not pass -- before where the
+// walk starts, for a rule it starts part way through, or past where it stops
+// -- and returns true to have the id looked up; a nil needed looks every such
+// id up. Each lookup is a walk of the rule on the work budget the range's walk
+// was given: for a rule that walk starts part way through, a walk over the
+// id's slot alone; otherwise one walk from the rule's start through the
+// furthest id looked up, which only that budget bounds. An id not looked up is
+// answered RecurrenceSlotNotLookedUp, and one still unanswered when the budget
+// is spent RecurrenceSlotUnanswered.
+func VisitRecurrenceInstancesAndSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, ids []RecurrenceSlotID, needed func(int) bool, visit func(RecurrenceInstance) bool) ([]RecurrenceSlotAnswer, error) {
+	expansion := recurrenceExpansion{
 		componentName:    componentName,
 		includeOverrides: false,
 		maxInstances:     maxInstances,
@@ -250,13 +396,27 @@ func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, dura
 		},
 		visit: func(occurrence recurrenceOccurrence) bool {
 			return visit(RecurrenceInstance{
-				RecurrenceID: occurrence.recurrenceID,
-				Start:        occurrence.period.Start,
-				End:          occurrence.period.End,
+				RecurrenceID:   occurrence.recurrenceID,
+				Start:          occurrence.period.Start,
+				End:            occurrence.period.End,
+				RecurrenceDate: occurrence.recurrenceDate(),
+				StartDate:      occurrence.dates.start,
+				Days:           occurrence.dates.days,
 			})
 		},
-	})
-	return err
+	}
+	set := readRecurrenceSet(raw, dtstart, duration, expansion)
+	if len(ids) == 0 {
+		_, err := set.expand(rangeStart, rangeEnd, expansion)
+		return nil, err
+	}
+	query := newSlotQuery(ids)
+	set.markListedSlots(query)
+	walk := &rruleWalk{slots: query, fromFirst: true, toLast: true}
+	expansion.work, expansion.walk = newRecurrenceWork(), walk
+	_, err := set.expand(rangeStart, rangeEnd, expansion)
+	set.lookUpUnpassedSlots(query, walk, needed, expansion)
+	return query.answers, err
 }
 
 // RecurrenceSlots expands only the identities generated by the master. It
@@ -281,61 +441,359 @@ func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time
 	slots := make([]RecurrenceSlot, 0, len(occurrences))
 	for _, occurrence := range occurrences {
 		slots = append(slots, RecurrenceSlot{
-			RecurrenceID:               occurrence.recurrenceID,
-			Original:                   occurrence.original,
-			Effective:                  occurrence.period,
-			Suppressed:                 occurrence.suppressed,
-			ExactOverride:              occurrence.exactOverride,
-			GoverningRangeRecurrenceID: occurrence.governing,
+			RecurrenceID:   occurrence.recurrenceID,
+			RecurrenceDate: occurrence.recurrenceDate(),
+			Original:       occurrence.original,
+			Effective:      occurrence.period,
+			Suppressed:     occurrence.suppressed,
+			ExactOverride:  occurrence.exactOverride,
 		})
 	}
 	return slots, nil
 }
 
+// RecurrenceIDNamesDate reports whether a RECURRENCE-ID names the slot it
+// overrides by its date: a DATE naming a slot of a series whose DTSTART,
+// seriesStart, is a DATE. Any other names the slot at the instant it resolves
+// to. Recurrence expansion matches an override to its slot so, and a reader
+// matching overrides to slots itself has to agree with it.
+func RecurrenceIDNamesDate(seriesStart, recurrenceID PropertyValue) bool {
+	return dateOnlyValue(seriesStart) && dateOnlyValue(recurrenceID)
+}
+
+// RecurrenceSlotID names a slot of a recurrence set as a RECURRENCE-ID does:
+// at the instant it resolves to, and, for one naming it by date
+// (RecurrenceIDNamesDate), by that date, held as its UTC midnight.
+type RecurrenceSlotID struct {
+	Instant time.Time
+	Date    time.Time
+}
+
+// RecurrenceSlotAnswer is what VisitRecurrenceInstancesAndSlots found of one
+// slot asked about.
+type RecurrenceSlotAnswer uint8
+
+const (
+	// RecurrenceSlotNotLookedUp is a slot the walk of the range did not pass
+	// and the caller did not have looked up: nothing is known of it.
+	RecurrenceSlotNotLookedUp RecurrenceSlotAnswer = iota
+	// RecurrenceSlotUnanswered is a slot looked up without an answer, the
+	// work budget being spent first.
+	RecurrenceSlotUnanswered
+	// RecurrenceSlotGenerated is a slot the set generates.
+	RecurrenceSlotGenerated
+	// RecurrenceSlotNotGenerated is a slot the set never generates.
+	RecurrenceSlotNotGenerated
+)
+
+// slotQuery holds the slots a caller asks whether a recurrence set generates,
+// and the answer found for each.
+type slotQuery struct {
+	ids       []RecurrenceSlotID
+	byInstant map[recurrenceInstant][]int
+	byDate    map[int64][]int
+	answers   []RecurrenceSlotAnswer
+}
+
+func newSlotQuery(ids []RecurrenceSlotID) *slotQuery {
+	q := &slotQuery{
+		ids:       ids,
+		byInstant: make(map[recurrenceInstant][]int, len(ids)),
+		answers:   make([]RecurrenceSlotAnswer, len(ids)),
+	}
+	for i, id := range ids {
+		if !id.Date.IsZero() {
+			if q.byDate == nil {
+				q.byDate = make(map[int64][]int)
+			}
+			q.byDate[id.Date.Unix()] = append(q.byDate[id.Date.Unix()], i)
+			continue
+		}
+		key := recurrenceInstant{seconds: id.Instant.Unix(), nanoseconds: id.Instant.Nanosecond()}
+		q.byInstant[key] = append(q.byInstant[key], i)
+	}
+	return q
+}
+
+// mark records that the set generates the slot starting at instant, which a
+// series starting on a DATE identifies by date; date is zero otherwise.
+func (q *slotQuery) mark(instant, date time.Time) {
+	if !date.IsZero() {
+		for _, i := range q.byDate[date.Unix()] {
+			q.answers[i] = RecurrenceSlotGenerated
+		}
+	}
+	for _, i := range q.byInstant[recurrenceInstant{seconds: instant.Unix(), nanoseconds: instant.Nanosecond()}] {
+		q.answers[i] = RecurrenceSlotGenerated
+	}
+}
+
+// settle answers each slot still open that walk passed: the walk generated
+// every slot it passed that the set has, so one left unmarked is not
+// generated.
+func (q *slotQuery) settle(walk *rruleWalk, open []int) {
+	for _, i := range open {
+		if q.answers[i] != RecurrenceSlotGenerated && walk.passed(q.ids[i]) {
+			q.answers[i] = RecurrenceSlotNotGenerated
+		}
+	}
+}
+
+// rruleWalk is what one walk of a rule passed: every candidate from the
+// rule's first, when fromFirst, else from the instant from on, through its
+// last, when toLast, else through the instant through. slots, when set, has
+// each candidate the walk generates marked.
+type rruleWalk struct {
+	slots     *slotQuery
+	fromFirst bool
+	from      time.Time
+	toLast    bool
+	through   time.Time
+}
+
+// passed reports whether the walk passed the slot id names. A slot named by
+// date is matched by that date, which the series' midnight and the instant
+// the id resolves to may place in different zones; a series starting on a
+// DATE is walked on its wall clocks a day past the instants asked for, which
+// passes the date wherever the walk passes that instant.
+func (w *rruleWalk) passed(id RecurrenceSlotID) bool {
+	return (w.fromFirst || !id.Instant.Before(w.from)) && (w.toLast || !id.Instant.After(w.through))
+}
+
+// markListedSlots marks the slots of q that the set lists rather than its
+// rule generating them: its RDATEs and, when it has an RRULE or an RDATE to
+// be a set at all, its DTSTART, each unless an EXDATE leaves it out.
+func (set *recurrenceSet) markListedSlots(q *slotQuery) {
+	if len(set.rdates) == 0 && componentPropertyValue(set.component, "RRULE") == "" {
+		return
+	}
+	period, dates := set.length.instance(set.dtstart, set.startDate)
+	set.markUnlessExcluded(q, period.Start, dates.slot)
+	for _, rdate := range set.rdates {
+		if set.length.onDate {
+			set.markUnlessExcluded(q, set.length.span(rdate.Date, 1).Start, rdate.Date)
+			continue
+		}
+		set.markUnlessExcluded(q, rdate.Start, rdate.Date)
+	}
+}
+
+func (set *recurrenceSet) markUnlessExcluded(q *slotQuery, instant, date time.Time) {
+	if set.exdates.excludes(instant, date) {
+		return
+	}
+	if !set.length.onDate {
+		date = time.Time{}
+	}
+	q.mark(instant, date)
+}
+
+// lookUpUnpassedSlots answers the slots of q the range's walk did not pass
+// and needed, when set, has looked up, on the budget that walk was given. A
+// rule the walk started part way through can be walked over one slot alone,
+// and each slot is. Any other rule is walked from its start, which a walk per
+// slot would repeat, so it is walked once, through the furthest slot looked
+// up. A slot that walk leaves unanswered, the budget being spent, is
+// RecurrenceSlotUnanswered.
+func (set *recurrenceSet) lookUpUnpassedSlots(q *slotQuery, walk *rruleWalk, needed func(int) bool, expansion recurrenceExpansion) {
+	var open []int
+	for i, id := range q.ids {
+		if q.answers[i] == RecurrenceSlotGenerated {
+			continue
+		}
+		if walk.passed(id) {
+			q.answers[i] = RecurrenceSlotNotGenerated
+			continue
+		}
+		if needed == nil || needed(i) {
+			open = append(open, i)
+		}
+	}
+	if len(open) == 0 {
+		return
+	}
+	rrule := componentPropertyValue(set.component, "RRULE")
+	lookUp := func(from, through time.Time, slots []int) {
+		lookup := expansion
+		lookup.walk = &rruleWalk{slots: q}
+		lookup.reaches = func(BusyPeriod, BusyPeriod, bool, time.Time, time.Time) bool { return false }
+		// A walk the budget cuts short still answers the slots it passed.
+		_, _ = rruleBusyPeriods(set.component, set.dtstart, set.length, rrule, set.exdates,
+			from, through, lookup, func(time.Time, BusyPeriod, occurrenceDays) bool { return false })
+		q.settle(lookup.walk, slots)
+		for _, i := range slots {
+			if q.answers[i] == RecurrenceSlotNotLookedUp {
+				q.answers[i] = RecurrenceSlotUnanswered
+			}
+		}
+	}
+	if !walk.fromFirst {
+		for _, i := range open {
+			if q.answers[i] == RecurrenceSlotNotLookedUp {
+				lookUp(q.ids[i].Instant, q.ids[i].Instant, []int{i})
+			}
+		}
+		return
+	}
+	first, last := q.ids[open[0]].Instant, q.ids[open[0]].Instant
+	for _, i := range open[1:] {
+		first, last = minTime(first, q.ids[i].Instant), maxTime(last, q.ids[i].Instant)
+	}
+	lookUp(first, last, open)
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
 func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) ([]recurrenceOccurrence, error) {
+	return readRecurrenceSet(raw, dtstart, duration, expansion).expand(rangeStart, rangeEnd, expansion)
+}
+
+// recurrenceSet is the recurrence set of one component of a resource, read
+// once: its master, overrides, exclusions and RDATEs, which expand places
+// over a range and can place over further ranges without reading the
+// resource again.
+type recurrenceSet struct {
+	dtstart       time.Time
+	duration      time.Duration
+	component     *Component
+	length        seriesLength
+	exdates       exclusions
+	overrides     []recurrenceOverride
+	overrideIndex recurrenceOverrideIndex
+	rdates        []rdatePeriod
+	periodEnds    map[time.Time]time.Time
+	startDate     time.Time
+	// shiftSeconds and longerSeconds are how far the RANGE=THISANDFUTURE
+	// overrides move an instance and lengthen it, which widen the scan of
+	// the rule by as much.
+	shiftSeconds  int64
+	longerSeconds int64
+}
+
+// readRecurrenceSet reads the recurrence set of expansion's component of
+// raw, whose dates expansion's resolver places.
+func readRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, expansion recurrenceExpansion) *recurrenceSet {
 	// One unfold serves the master, the overrides and the RDATEs. This runs once
 	// per candidate component of every resource a report considers, so a
 	// per-reader scan of the payload would be paid that many times over.
 	components := componentsNamedFromLines(UnfoldLines(raw), expansion.componentName)
 	component := primaryOf(components)
 	resolve := propertyTimeResolver(expansion.resolve)
-	exdates := eventExDates(component, resolve)
-	overrides := componentRecurrenceOverrides(components, resolve, expansion.componentName, duration)
-	overrideIndex := newRecurrenceOverrideIndex(overrides)
+	midnights := newDateMidnights(expansion.resolve)
+	length := newSeriesLength(component, duration, midnights)
+	exdates := eventExDates(component, resolve, length.onDate)
+	overrides := componentRecurrenceOverrides(components, resolve, midnights, expansion.componentName, length.onDate, duration)
+	overrideIndex := newRecurrenceOverrideIndex(overrides, length.onDate, midnights)
 	rdates := componentRDatePeriods(component, resolve)
 	periodEnds := make(map[time.Time]time.Time)
-	for _, rdate := range rdates {
+	// A RANGE=THISANDFUTURE override moving a timed series onto dates moves
+	// each slot by the date it falls on in the zone of the series' DTSTART,
+	// which an RDATE written in another form spells differently.
+	var slotDate func(instant time.Time) time.Time
+	if prop, ok := ComponentProperty(component, "DTSTART"); ok && !length.onDate && overrideIndex.thisAndFutureOnDate {
+		tzid, _ := PropertyParam(prop.KeyPart, "TZID")
+		utc := hasZoneSuffix(strings.TrimSpace(prop.Value))
+		slotDate = func(instant time.Time) time.Time {
+			if utc {
+				return CivilDate(instant.UTC())
+			}
+			return localDateOf(expansion.resolve, strings.TrimSpace(tzid), instant)
+		}
+	}
+	for i, rdate := range rdates {
+		if length.onDate {
+			// An instance of a DATE series is identified by its date, which a
+			// DATE-TIME RDATE has on the clock of the zone DATEs resolve in,
+			// and a PERIOD spans the days its hours reach into.
+			if !rdate.onDate {
+				rdates[i].Date = localDateOf(expansion.resolve, "", rdate.Start)
+			}
+			if !rdate.End.IsZero() {
+				length.setPeriodDays(rdates[i].Date, DurationDays(rdate.End.Sub(rdate.Start)))
+			}
+			continue
+		}
+		if slotDate != nil {
+			rdates[i].Date = slotDate(rdate.Start)
+		}
 		if !rdate.End.IsZero() {
 			periodEnds[rdate.Start.UTC()] = rdate.End
 		}
 	}
-	seen := make(map[string]struct{})
+	var startDate time.Time
+	if prop, ok := ComponentProperty(component, "DTSTART"); ok {
+		startDate, _ = DateOf(prop.Value)
+	}
+	return &recurrenceSet{
+		dtstart: dtstart, duration: duration, component: component, length: length,
+		exdates: exdates, overrides: overrides, overrideIndex: overrideIndex,
+		rdates: rdates, periodEnds: periodEnds, startDate: startDate,
+		shiftSeconds:  overrideIndex.maxThisAndFutureShiftSeconds(),
+		longerSeconds: overrideIndex.maxThisAndFutureLengthSeconds() - int64(duration/time.Second),
+	}
+}
+
+// expand is the occurrences of the set reaching [rangeStart, rangeEnd] as
+// expansion judges them; its resolver is the one the set was read with.
+func (set *recurrenceSet) expand(rangeStart, rangeEnd time.Time, expansion recurrenceExpansion) ([]recurrenceOccurrence, error) {
+	dtstart, duration, component, length := set.dtstart, set.duration, set.component, set.length
+	exdates, overrides, overrideIndex := set.exdates, set.overrides, set.overrideIndex
+	rdates, periodEnds, startDate := set.rdates, set.periodEnds, set.startDate
+	seen := make(map[occurrenceKey]struct{})
+	// The slots of a timed series falling on one instant are one instance,
+	// the first generated. A RANGE=THISANDFUTURE override starting on a DATE
+	// moves each slot by the date it is written on, which two such slots
+	// differ in where a floating time falls on a day its zone skips, so the
+	// first is settled before the range is asked rather than by which of
+	// them reaches it.
+	var timedSlots recurrenceInstantSet
+	if !length.onDate && overrideIndex.thisAndFutureOnDate {
+		timedSlots = make(recurrenceInstantSet)
+	}
 	var periods []recurrenceOccurrence
 	collected := 0
 	var limitErr error
 	stopped := false
 	// recurrenceID is the slot the occurrence belongs to, which a
 	// RANGE=THISANDFUTURE shift moves the period away from. EXDATE and an
-	// ordinary RECURRENCE-ID override both name that slot, not the shifted start.
-	addPeriod := func(recurrenceID time.Time, original BusyPeriod, generated, applyExDates bool) {
+	// ordinary RECURRENCE-ID override both name that slot, not the shifted
+	// start, and in a series starting on a DATE they name it by its date.
+	addPeriod := func(recurrenceID time.Time, original BusyPeriod, dates occurrenceDays, generated, applyExDates bool) {
 		if limitErr != nil || stopped {
 			return
 		}
-		if applyExDates && exdates.contains(recurrenceID) {
+		if applyExDates && exdates.excludes(recurrenceID, dates.slot) {
 			return
 		}
-		if generated {
+		if generated && timedSlots != nil {
+			if timedSlots.contains(recurrenceID) {
+				return
+			}
+			timedSlots.add(recurrenceID)
+		}
+		if generated && !length.onDate {
 			if end, ok := periodEnds[recurrenceID.UTC()]; ok {
 				original.End = end
 			}
 		}
-		effective := original
+		effective, effectiveDates := original, dates
 		suppressed := false
 		exactOverride := false
-		var governing time.Time
 		if generated {
-			effective, suppressed, governing = overrideIndex.applyThisAndFuture(original)
-			exactOverride = overrideIndex.replaces(recurrenceID)
+			effective, effectiveDates, suppressed = overrideIndex.applyThisAndFuture(original, dates)
+			exactOverride = overrideIndex.replaces(recurrenceID, dates.slot)
 			suppressed = suppressed || exactOverride
 		}
 		if suppressed && !expansion.includeSuppressed {
@@ -344,7 +802,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 		if !expansion.reaches(original, effective, suppressed, rangeStart, rangeEnd) {
 			return
 		}
-		key := recurrenceID.UTC().Format(time.RFC3339Nano)
+		key := occurrenceKey{instant: recurrenceInstant{seconds: recurrenceID.Unix(), nanoseconds: recurrenceID.Nanosecond()}}
+		if length.onDate && !dates.slot.IsZero() {
+			key = occurrenceKey{instant: recurrenceInstant{seconds: dates.slot.Unix()}, onDate: true}
+		}
 		if _, ok := seen[key]; ok {
 			return
 		}
@@ -358,9 +819,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			recurrenceID:  recurrenceID,
 			original:      original,
 			period:        effective,
+			dates:         effectiveDates,
+			seriesOnDate:  length.onDate,
 			suppressed:    suppressed,
 			exactOverride: exactOverride,
-			governing:     governing,
 		}
 		if expansion.visit == nil {
 			periods = append(periods, occurrence)
@@ -368,26 +830,40 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			stopped = true
 		}
 	}
+	// addStart adds the DTSTART as an instance, which it is whatever the rule
+	// generates (RFC 5545 §3.8.5.3).
+	addStart := func() {
+		period, dates := length.instance(dtstart, startDate)
+		addPeriod(period.Start, period, dates, true, true)
+	}
 
 	if rrule := componentPropertyValue(component, "RRULE"); rrule != "" {
 		scanStart, scanEnd := rangeStart, rangeEnd
 		if overrideIndex.hasThisAndFuture() {
-			if shift := overrideIndex.maxThisAndFutureShiftSeconds(); shift > 0 {
+			if shift := set.shiftSeconds; shift > 0 {
 				scanStart = addSeconds(scanStart, -shift)
 				scanEnd = addSeconds(scanEnd, shift)
 			}
 			// An instance the override lengthens reaches past where the
 			// series' length would end it.
-			if longer := overrideIndex.maxThisAndFutureLengthSeconds() - int64(duration/time.Second); longer > 0 {
+			if longer := set.longerSeconds; longer > 0 {
 				scanStart = addSeconds(scanStart, -longer)
+			}
+			// An override starting on a DATE moves its instances by dates,
+			// which a transition between an instance and where it lands
+			// makes further than the hours between the override's own dates
+			// measure, by as much as a day its zone skips or repeats.
+			if overrideIndex.thisAndFutureOnDate {
+				scanStart = scanStart.AddDate(0, 0, -1)
+				scanEnd = scanEnd.AddDate(0, 0, 1)
 			}
 		}
 		scanExpansion := expansion
 		scanExpansion.reaches = func(_ BusyPeriod, effective BusyPeriod, _ bool, rangeStart, rangeEnd time.Time) bool {
 			return periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
 		}
-		ok, err := rruleBusyPeriods(component, dtstart, duration, rrule, exdates, scanStart, scanEnd, scanExpansion, func(id time.Time, period BusyPeriod) bool {
-			addPeriod(id, period, true, true)
+		ok, err := rruleBusyPeriods(component, dtstart, length, rrule, exdates, scanStart, scanEnd, scanExpansion, func(id time.Time, period BusyPeriod, dates occurrenceDays) bool {
+			addPeriod(id, period, dates, true, true)
 			return limitErr != nil || stopped
 		})
 		if err != nil {
@@ -399,18 +875,27 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			return periods, err
 		}
 		if !ok {
-			addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
+			addStart()
 		}
 	} else if len(rdates) > 0 {
-		addPeriod(dtstart, BusyPeriod{Start: dtstart, End: dtstart.Add(duration)}, true, true)
+		addStart()
 	}
 
 	for _, rdate := range rdates {
+		if length.onDate {
+			days := length.days
+			if !rdate.End.IsZero() {
+				days = DurationDays(rdate.End.Sub(rdate.Start))
+			}
+			period := length.span(rdate.Date, days)
+			addPeriod(period.Start, period, occurrenceDays{slot: rdate.Date, start: rdate.Date, days: days}, true, true)
+			continue
+		}
 		end := rdate.End
 		if end.IsZero() {
 			end = rdate.Start.Add(duration)
 		}
-		addPeriod(rdate.Start, BusyPeriod{Start: rdate.Start, End: end}, true, true)
+		addPeriod(rdate.Start, BusyPeriod{Start: rdate.Start, End: end}, occurrenceDays{slot: rdate.Date}, true, true)
 	}
 
 	if expansion.includeOverrides {
@@ -418,7 +903,11 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 			if override.cancelled {
 				continue
 			}
-			addPeriod(override.recurrenceID, override.period, false, false)
+			dates := occurrenceDays{start: override.startDate, days: override.days}
+			if override.namesDate {
+				dates.slot = override.recurrenceIDDate
+			}
+			addPeriod(override.recurrenceID, override.period, dates, false, false)
 		}
 	}
 
@@ -433,6 +922,10 @@ func expandRecurrenceSet(raw string, dtstart time.Time, duration time.Duration, 
 type rdatePeriod struct {
 	Start time.Time
 	End   time.Time
+	// Date is the date the RDATE's start names, as DateOf reads it, and onDate
+	// reports a DATE value.
+	Date   time.Time
+	onDate bool
 }
 
 func EventHasRecurrence(ical string) bool {
@@ -561,31 +1054,29 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	dtstartProperty, hasDTStart := ComponentProperty(master, "DTSTART")
 	var dtstart time.Time
 	var zone tzidDefinition
+	// civil reports that the rule is followed on the wall clocks of the zone
+	// the DTSTART names, held as UTC fields, as the expansion follows it. A
+	// candidate on a local time that zone skips is then never generated or
+	// counted, as RFC 5545 §3.3.10 requires, and the rest are counted as the
+	// instants they resolve to, a repeated local time as its first occurrence
+	// (§3.3.5).
+	civil := false
 	if hasDTStart {
 		var ok bool
 		dtstart, ok = readTime(dtstartProperty.KeyPart, dtstartProperty.Value)
 		if !ok {
 			return false, false
 		}
-		// The rule is followed on the calendar of the zone the DTSTART names,
-		// so a candidate on a local time that zone skips is never generated or
-		// counted, as RFC 5545 §3.3.10 requires and the expansion does. In a
-		// host zone appendValidTime drops it as it drops an invalid date. In a
-		// zone the object defines the candidates are wall clocks, which the
-		// definition's gaps drop and which are counted as the instants they
-		// resolve to.
 		if tzid, zoned := localDateTimeTZID(dtstartProperty.KeyPart, dtstartProperty.Value); zoned {
 			zone = times.zone(strings.TrimSpace(tzid))
-			switch {
-			case zone.object != nil:
+			if zone.object != nil || zone.host != nil {
+				civil = true
 				dtstart, _ = ParseDateTime(strings.TrimSpace(dtstartProperty.Value))
-			case zone.host != nil:
-				dtstart = dtstart.In(zone.host)
 			}
 		}
 	}
 	instant := func(candidate time.Time) time.Time {
-		if zone.object == nil {
+		if !civil {
 			return candidate
 		}
 		return zone.instant(candidate)
@@ -619,40 +1110,35 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	if !hasDTStart {
 		return false, false
 	}
-	var readUntil PropertyTimeResolver
-	if zone.object != nil {
-		// RFC 5545 §3.3.10 admits no floating UNTIL beside a DTSTART with a
-		// TZID; one written anyway is read in the DTSTART's zone.
-		readUntil = func(_, value string) (time.Time, bool) {
-			wall, err := ParseDateTime(value)
-			return instant(wall), err == nil
-		}
-	}
-	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), readUntil, dtstartWallClock(dtstartProperty.KeyPart, dtstartProperty.Value, readTime))
+	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil, dtstartWallClock(dtstartProperty.KeyPart, dtstartProperty.Value, readTime))
 	if !ok {
 		return false, false
 	}
-	pastUntil := func(candidate time.Time) bool {
-		return rule.Until != nil && instant(candidate).After(*rule.Until)
+	pastUntil := func(resolved time.Time) bool {
+		return rule.Until != nil && resolved.After(*rule.Until)
 	}
-	// untilWall bounds the wall clocks a rule ending at UNTIL can generate. In
-	// a zone the object defines a wall clock is less than a day from the
-	// instant it names.
+	// untilWall bounds the wall clocks a rule ending at UNTIL can generate. A
+	// wall clock is less than a day from the instant it names.
 	var untilWall *time.Time
 	if rule.Until != nil {
 		bound := *rule.Until
-		if zone.object != nil {
+		if civil {
 			bound = bound.Add(recurrenceCivilScanPad)
 		}
 		untilWall = &bound
 	}
-	if zone.object != nil {
+	switch {
+	case zone.object != nil:
 		// A gap the definition cannot be followed to is not assumed: the
 		// candidate is counted.
 		rule.localTimeExists = existenceFromGaps(func(wall time.Time) bool {
 			skipped, known := zone.skips(wall)
 			return !known || !skipped
 		}, zone.object)
+	case civil:
+		rule.localTimeExists = existenceFromGaps(func(wall time.Time) bool {
+			return WallClockExists(zone.host, wall)
+		}, hostLocalTimeGaps(zone.host))
 	}
 	if add(instant(dtstart)) {
 		return true, true
@@ -694,7 +1180,8 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 			if current.Before(dtstart) {
 				return false
 			}
-			if pastUntil(current) {
+			resolved := instant(current)
+			if pastUntil(resolved) {
 				bounded = true
 				return true
 			}
@@ -707,7 +1194,7 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 				bounded = true
 				return true
 			}
-			if add(instant(current)) {
+			if add(resolved) {
 				exceeded = true
 				return true
 			}
@@ -747,7 +1234,8 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	countedRule.Count = countLimit
 	countedRule.Until = untilWall
 	addCandidate := func(candidate time.Time) bool {
-		return !pastUntil(candidate) && add(instant(candidate))
+		resolved := instant(candidate)
+		return !pastUntil(resolved) && add(resolved)
 	}
 	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &occurrences, addCandidate); handled {
 		return exceeds, true
@@ -1867,15 +2355,24 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // than 24 hours.
 const recurrenceCivilScanPad = 24 * time.Hour
 
-func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Duration, rrule string, exdates recurrenceInstantSet, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod) bool) (bool, error) {
+func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLength, rrule string, exdates exclusions, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod, occurrenceDays) bool) (bool, error) {
+	duration := length.duration
 	resolve := propertyTimeResolver(expansion.resolve)
 	recurrenceStart, resolveCandidate, candidateExists, gaps, civil := recurrenceGenerationStart(component, dtstart, expansion.resolve)
 	var startWall wallClockResolver
 	if property, ok := ComponentProperty(component, "DTSTART"); ok {
 		startWall = dtstartWallClock(property.KeyPart, property.Value, resolve)
 	}
+	// walk records what is passed: nothing yet, and every candidate when the
+	// rule is ended or cannot be read, generating nothing past the DTSTART.
+	walk := expansion.walk
+	if walk == nil {
+		walk = &rruleWalk{}
+	}
+	*walk = rruleWalk{slots: walk.slots, fromFirst: true}
 	rule, ok := parseRecurrenceRule(rrule, recurrenceStart.Location(), resolve, startWall)
 	if !ok {
+		walk.toLast = true
 		return false, nil
 	}
 	rule.localTimeExists = candidateExists
@@ -1884,41 +2381,83 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	}
 
 	occurrences := 0
+	// done ends the walk, when add asks it to or, ended, when the rule has no
+	// candidate left.
 	done := false
+	ended := func() bool {
+		done, walk.toLast = true, true
+		return true
+	}
 	visit := func(current time.Time) bool {
 		if current.Before(recurrenceStart) {
 			return false
 		}
-		resolvedCurrent, resolved := resolveCandidate(current)
-		if !resolved {
-			return false
+		// A DATE candidate is its date, placed through the expansion's
+		// midnights rather than resolved afresh.
+		var period BusyPeriod
+		var dates occurrenceDays
+		if length.onDate {
+			period, dates = length.instance(current, CivilDate(current))
+		} else {
+			resolvedCurrent, resolved := resolveCandidate(current)
+			if !resolved {
+				return false
+			}
+			period = BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
+			dates = occurrenceDays{slot: CivilDate(current)}
 		}
+		resolvedCurrent := period.Start
 		// The DTSTART is an instance even past UNTIL (RFC 5545 §3.8.5.3).
 		if rule.Until != nil && resolvedCurrent.After(*rule.Until) && !current.Equal(recurrenceStart) {
-			done = true
-			return true
+			return ended()
 		}
 		occurrences++
 		if rule.Count > 0 && occurrences > rule.Count {
-			done = true
-			return true
+			return ended()
 		}
-		period := BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
-		// resolvedCurrent is the slot the rule generated; the shared
-		// expansion applies any RANGE=THISANDFUTURE transform afterwards.
-		if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !exdates.contains(resolvedCurrent) {
-			if add(resolvedCurrent, period) {
+		// resolvedCurrent is the slot the rule generated, which is matched
+		// to the slots asked about by where it starts; the shared expansion
+		// applies any RANGE=THISANDFUTURE transform afterwards.
+		if walk.slots != nil && !exdates.excludes(resolvedCurrent, dates.slot) {
+			slotDate := dates.slot
+			if !length.onDate {
+				slotDate = time.Time{}
+			}
+			walk.slots.mark(resolvedCurrent, slotDate)
+		}
+		// Every candidate up to this one has been passed. A civil walk
+		// passes wall clocks in order but not the instants they resolve to,
+		// which a transition can move a day either way of the wall clock.
+		passed := resolvedCurrent
+		if civil {
+			passed = current.Add(-recurrenceCivilScanPad)
+		}
+		if passed.After(walk.through) {
+			walk.through = passed
+		}
+		if expansion.reaches(period, period, false, rangeStart, rangeEnd) && !exdates.excludes(resolvedCurrent, dates.slot) {
+			if add(resolvedCurrent, period, dates) {
 				done = true
 				return true
 			}
 		}
 		return false
 	}
+	// passedRange records a walk that went on past rangeEnd without being
+	// ended: every candidate up to it was passed, whatever its wall clock.
+	passedRange := func() {
+		if !done && rangeEnd.After(walk.through) {
+			walk.through = rangeEnd
+		}
+	}
 
 	// RFC 5545 §3.8.5.3 makes the DTSTART the first instance of the set, and
 	// the first toward COUNT, whether or not the rule generates it. A rule that
 	// does generate it visits it below like any other candidate.
-	work := newRecurrenceWork()
+	work := expansion.work
+	if work == nil {
+		work = newRecurrenceWork()
+	}
 	selects := recurrenceBySetPosMaySelect(recurrenceStart, rule)
 	generatesStart := false
 	if selects {
@@ -1942,6 +2481,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 	// own: scanning for it would burn the whole work budget on every report the
 	// resource appears in and still end with nothing to return.
 	if !selects {
+		walk.toLast = true
 		return true, nil
 	}
 
@@ -1953,12 +2493,19 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		scanStart = scanStart.Add(-recurrenceCivilScanPad)
 		scanEnd = scanEnd.Add(recurrenceCivilScanPad)
 	}
+	// A walk started part way through the rule passes every candidate from
+	// one occurrence before rangeStart on: a civil walk starts a day of wall
+	// clock earlier still, and a wall clock is less than a day from the
+	// instant it names.
 	periodStart := recurrencePeriodStart(recurrenceStart, rule)
 	if rule.Count == 0 {
 		threshold := scanStart.Add(-duration)
 		periodStart = rewindToPeriodReaching(fastForwardRecurrencePeriod(periodStart, threshold, rule), periodStart, threshold, rule)
+		walk.fromFirst, walk.from = false, rangeStart.Add(-duration)
 	} else if fastForwardedStart, skipped, ok := fastForwardCountedSubDailyRecurrence(periodStart, scanStart.Add(-duration), recurrenceStart, rule, rule.Count-occurrences, gaps); ok {
+		walk.fromFirst, walk.from = false, rangeStart.Add(-duration)
 		if occurrences+skipped >= rule.Count {
+			walk.toLast = true
 			return true, nil
 		}
 		periodStart = fastForwardedStart
@@ -1974,7 +2521,11 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		if overBudget {
 			return false, ErrRecurrenceScanLimit
 		}
-		if done || barren.settles(offered) {
+		if done {
+			return true, nil
+		}
+		if barren.settles(offered) {
+			walk.toLast = true
 			return true, nil
 		}
 		next := advanceRecurrencePeriod(periodStart, rule)
@@ -1982,7 +2533,12 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 			return false, ErrRecurrenceScanLimit
 		}
 		periodStart = next
-		if recurrencePeriodEarliestCandidate(periodStart, rule).After(scanEnd) || (rule.Count > 0 && occurrences >= rule.Count) {
+		if rule.Count > 0 && occurrences >= rule.Count {
+			walk.toLast = true
+			return true, nil
+		}
+		if recurrencePeriodEarliestCandidate(periodStart, rule).After(scanEnd) {
+			passedRange()
 			return true, nil
 		}
 	}
@@ -1992,10 +2548,12 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, duration time.Dur
 		// covers, so a rule that can never produce a candidate is recognized
 		// from the rule itself, before following it day by day to scanEnd.
 		if !recurrenceRuleMayProduceCandidate(recurrenceStart, rule) {
+			walk.toLast = true
 			return true, nil
 		}
 		_, overBudget := visitSparseRecurrence(periodStart, recurrenceStart, scanEnd, rule, work, visit)
 		if !overBudget {
+			passedRange()
 			return true, nil
 		}
 	}
@@ -2253,6 +2811,13 @@ type recurrenceInstant struct {
 	nanoseconds int
 }
 
+// occurrenceKey identifies an instance of a recurrence set: by the instant its
+// slot names, or, onDate, by the date it names, held as its UTC midnight.
+type occurrenceKey struct {
+	instant recurrenceInstant
+	onDate  bool
+}
+
 // recurrenceInstantSet answers the exclusion test the expansion applies once
 // per generated instance. RFC 5545 §3.8.5.1 puts no bound on how many EXDATEs a
 // component may carry, so scanning them would make one expansion cost the
@@ -2293,27 +2858,58 @@ func componentRDatePeriods(component *Component, resolve PropertyTimeResolver) [
 						end = parsedEnd
 					}
 				}
-				periods = append(periods, rdatePeriod{Start: start, End: end})
+				date, _ := DateOf(parts[0])
+				periods = append(periods, rdatePeriod{Start: start, End: end, Date: date})
 				continue
 			}
 			if start, ok := resolve.or(prop.KeyPart, value); ok {
-				periods = append(periods, rdatePeriod{Start: start})
+				date, _ := DateOf(value)
+				onDate := len(value) == len(DateLayout) || PropertyParamEquals(prop.KeyPart, "VALUE", "DATE")
+				periods = append(periods, rdatePeriod{Start: start, Date: date, onDate: onDate})
 			}
 		}
 	}
 	return periods
 }
 
-func eventExDates(component *Component, resolve PropertyTimeResolver) recurrenceInstantSet {
-	dates := make(recurrenceInstantSet)
+// exclusions are the slots a series' EXDATEs leave out: by date for a DATE in
+// a series starting on a DATE, whose slots are identified by their dates, and
+// by instant otherwise.
+type exclusions struct {
+	instants recurrenceInstantSet
+	dates    map[int64]struct{}
+}
+
+// excludes reports whether the slot at instant, on date when the series
+// starts on a DATE, is left out.
+func (x exclusions) excludes(instant, date time.Time) bool {
+	if _, ok := x.dates[date.Unix()]; ok && !date.IsZero() {
+		return true
+	}
+	return x.instants.contains(instant)
+}
+
+func eventExDates(component *Component, resolve PropertyTimeResolver, byDate bool) exclusions {
+	excluded := exclusions{instants: make(recurrenceInstantSet)}
 	for _, prop := range componentProperties(component, "EXDATE") {
+		propOnDate := PropertyParamEquals(prop.KeyPart, "VALUE", "DATE")
 		for _, value := range strings.Split(prop.Value, ",") {
-			if parsed, ok := resolve.or(prop.KeyPart, strings.TrimSpace(value)); ok {
-				dates.add(parsed)
+			value = strings.TrimSpace(value)
+			if byDate && (propOnDate || len(value) == len(DateLayout)) {
+				if date, ok := DateOf(value); ok {
+					if excluded.dates == nil {
+						excluded.dates = make(map[int64]struct{})
+					}
+					excluded.dates[date.Unix()] = struct{}{}
+				}
+				continue
+			}
+			if parsed, ok := resolve.or(prop.KeyPart, value); ok {
+				excluded.instants.add(parsed)
 			}
 		}
 	}
-	return dates
+	return excluded
 }
 
 type recurrenceOverride struct {
@@ -2321,15 +2917,37 @@ type recurrenceOverride struct {
 	period             BusyPeriod
 	cancelled          bool
 	rangeThisAndFuture bool
+	// recurrenceIDDate is the date its RECURRENCE-ID names, as DateOf reads
+	// it, when the override is placed or identified by dates: it names a DATE
+	// slot of a series starting on a DATE, or starts on a DATE itself.
+	recurrenceIDDate time.Time
+	// namesDate reports a RECURRENCE-ID naming its slot by that date, as
+	// RecurrenceIDNamesDate has it; any other names the slot at its instant.
+	namesDate bool
+	// startDate is the date an override starting on a DATE starts on, days
+	// the days it spans, and startKeyPart the DTSTART key part its dates
+	// resolve through; startDate is zero for one starting at a DATE-TIME.
+	startDate    time.Time
+	days         int
+	startKeyPart string
+}
+
+// onDate reports an override starting on a DATE.
+func (o recurrenceOverride) onDate() bool {
+	return !o.startDate.IsZero()
 }
 
 // componentRecurrenceOverrides reads each override of a componentName series
 // by the EventEnd rule, its end the one it writes: a VTODO's DUE, any other
-// component's DTEND, or its DURATION. A VEVENT override writing neither lasts
-// seriesLength, the length of an occurrence of its series; any other override
-// writing neither ends as RFC 4791 §9.9 places a component with a DTSTART
-// alone, at that start.
-func componentRecurrenceOverrides(components []Component, resolve PropertyTimeResolver, componentName string, seriesLength time.Duration) []recurrenceOverride {
+// component's DTEND, or its DURATION. A VEVENT override writing neither takes
+// seriesLength, the length of an occurrence of its series, when
+// EventEnd.InheritSeriesLength gives it that length -- when its DTSTART is a
+// DATE exactly when its series' is, as seriesStartIsDate reports -- and
+// otherwise lasts as its DTSTART alone has it last. Any other override writing
+// neither ends as RFC 4791 §9.9 places a component with a DTSTART alone, at
+// that start. One starting on a DATE spans its Days from that date, each
+// midnight placed through midnights.
+func componentRecurrenceOverrides(components []Component, resolve PropertyTimeResolver, midnights *dateMidnights, componentName string, seriesStartIsDate bool, seriesLength time.Duration) []recurrenceOverride {
 	endName := "DTEND"
 	if strings.EqualFold(componentName, "VTODO") {
 		endName = "DUE"
@@ -2358,30 +2976,40 @@ func componentRecurrenceOverrides(components []Component, resolve PropertyTimeRe
 		}
 
 		extent := EventEnd{Start: start, StartIsDate: dateOnlyValue(startProp)}
+		if extent.StartIsDate {
+			extent.StartDate, _ = DateOf(startProp.Value)
+		}
 		endProp, writesEnd := ComponentProperty(&component, endName)
 		if writesEnd {
 			extent.End, extent.HasEnd = resolve.or(endProp.KeyPart, endProp.Value)
+			if extent.StartIsDate && dateOnlyValue(endProp) {
+				extent.EndDate, _ = DateOf(endProp.Value)
+			}
 		}
 		duration, writesDuration := ComponentProperty(&component, "DURATION")
 		if writesDuration {
 			extent.Duration, extent.HasDuration = ParseDuration(duration.Value)
 		}
-		if strings.EqualFold(componentName, "VEVENT") {
-			extent.InheritsLength, extent.SeriesLength = !writesEnd && !writesDuration, seriesLength
+		if strings.EqualFold(componentName, "VEVENT") && !writesEnd && !writesDuration {
+			extent.InheritSeriesLength(seriesStartIsDate, seriesLength)
 		}
-		end := extent.OccurrenceEnd(func(dayStart time.Time) time.Time {
-			if dayEnd, ok := dayAfterDate(startProp, resolve); ok {
-				return dayEnd
-			}
-			return dayStart.AddDate(0, 0, 1)
-		})
 
-		overrides = append(overrides, recurrenceOverride{
+		override := recurrenceOverride{
 			recurrenceID:       recurrenceID,
-			period:             BusyPeriod{Start: start, End: end},
 			cancelled:          cancelled,
 			rangeThisAndFuture: PropertyParamEquals(recurrenceIDProp.KeyPart, "RANGE", "THISANDFUTURE"),
-		})
+		}
+		if extent.StartIsDate && !extent.StartDate.IsZero() {
+			override.startDate, override.days, override.startKeyPart = extent.StartDate, extent.Days(), startProp.KeyPart
+		}
+		override.namesDate = seriesStartIsDate && dateOnlyValue(recurrenceIDProp)
+		if override.namesDate || override.onDate() {
+			override.recurrenceIDDate, _ = DateOf(recurrenceIDProp.Value)
+		}
+		override.period = BusyPeriod{Start: start, End: extent.OccurrenceEnd(func(date time.Time) time.Time {
+			return midnights.at(startProp.KeyPart, date)
+		})}
+		overrides = append(overrides, override)
 	}
 	return overrides
 }
@@ -2389,18 +3017,57 @@ func componentRecurrenceOverrides(components []Component, resolve PropertyTimeRe
 // dateOnlyValue reports whether a date-valued property holds a DATE rather than
 // a DATE-TIME.
 func dateOnlyValue(property PropertyValue) bool {
-	return len(strings.TrimSpace(property.Value)) == len("20060102") || PropertyParamEquals(property.KeyPart, "VALUE", "DATE")
+	return len(strings.TrimSpace(property.Value)) == len(DateLayout) || PropertyParamEquals(property.KeyPart, "VALUE", "DATE")
 }
 
-// dayAfterDate resolves the date after the DATE property holds, through the
-// same resolver, so the day ends at the midnight the property's own zone
-// places.
-func dayAfterDate(property PropertyValue, resolve PropertyTimeResolver) (time.Time, bool) {
-	date, err := time.Parse("20060102", strings.TrimSpace(property.Value))
-	if err != nil {
-		return time.Time{}, false
+// seriesLength is how long each instance of a series lasts. One starting at a
+// DATE-TIME lasts duration. One starting on a DATE is identified by its date
+// and spans whole days, duration's NominalDays of them unless a PERIOD RDATE
+// on the same date gives it its own, from that date's midnight to the one
+// that many dates on, each placed in the series' zone through the DTSTART's
+// key part, however many hours those days hold.
+type seriesLength struct {
+	duration   time.Duration
+	onDate     bool
+	days       int
+	keyPart    string
+	midnights  *dateMidnights
+	periodDays map[int64]int
+}
+
+func newSeriesLength(component *Component, duration time.Duration, midnights *dateMidnights) seriesLength {
+	length := seriesLength{duration: duration, midnights: midnights}
+	if prop, ok := ComponentProperty(component, "DTSTART"); ok && dateOnlyValue(prop) {
+		length.onDate, length.days, length.keyPart = true, NominalDays(duration), prop.KeyPart
 	}
-	return resolve.or(property.KeyPart, date.AddDate(0, 0, 1).Format("20060102"))
+	return length
+}
+
+// setPeriodDays gives the instance on date the days a PERIOD RDATE naming it
+// spans.
+func (l *seriesLength) setPeriodDays(date time.Time, days int) {
+	if l.periodDays == nil {
+		l.periodDays = make(map[int64]int)
+	}
+	l.periodDays[date.Unix()] = days
+}
+
+// span is the period an instance on date spanning days days occupies.
+func (l seriesLength) span(date time.Time, days int) BusyPeriod {
+	return BusyPeriod{Start: l.midnights.at(l.keyPart, date), End: l.midnights.at(l.keyPart, date.AddDate(0, 0, days))}
+}
+
+// instance is the period the instance starting at start, on date for a
+// series starting on a DATE, occupies, and the dates it falls on.
+func (l seriesLength) instance(start, date time.Time) (BusyPeriod, occurrenceDays) {
+	if !l.onDate || date.IsZero() {
+		return BusyPeriod{Start: start, End: start.Add(l.duration)}, occurrenceDays{slot: date}
+	}
+	days := l.days
+	if periodDays, ok := l.periodDays[date.Unix()]; ok {
+		days = periodDays
+	}
+	return l.span(date, days), occurrenceDays{slot: date, start: date, days: days}
 }
 
 // recurrenceOverrideIndex answers the two override questions the expansion
@@ -2408,47 +3075,80 @@ func dayAfterDate(property PropertyValue, resolve PropertyTimeResolver) (time.Ti
 // slot, and which RANGE=THISANDFUTURE override governs it. RFC 5545 §3.8.4.4
 // bounds neither how many overrides a resource may carry, so both are lookups
 // rather than scans; otherwise one expansion would cost the product of the
-// instance and override counts.
+// instance and override counts. In a series starting on a DATE the overrides
+// naming DATE slots are matched to them by date.
 type recurrenceOverrideIndex struct {
-	exact recurrenceInstantSet
-	// thisAndFuture is ordered by RECURRENCE-ID. Among overrides naming the same
-	// slot the first in the resource comes first, and is the one that governs.
+	exact      recurrenceInstantSet
+	exactDates map[int64]struct{}
+	// thisAndFuture is ordered by RECURRENCE-ID, or by its date when byDate.
+	// Among overrides naming the same slot the first in the resource comes
+	// first, and is the one that governs.
 	thisAndFuture []recurrenceOverride
+	byDate        bool
+	// thisAndFutureOnDate reports a RANGE=THISANDFUTURE override starting on
+	// a DATE, whose instances move by dates, and midnights places them.
+	thisAndFutureOnDate bool
+	midnights           *dateMidnights
 }
 
-func newRecurrenceOverrideIndex(overrides []recurrenceOverride) recurrenceOverrideIndex {
-	index := recurrenceOverrideIndex{exact: make(recurrenceInstantSet)}
+func newRecurrenceOverrideIndex(overrides []recurrenceOverride, seriesOnDate bool, midnights *dateMidnights) recurrenceOverrideIndex {
+	index := recurrenceOverrideIndex{exact: make(recurrenceInstantSet), midnights: midnights, byDate: seriesOnDate}
 	for _, override := range overrides {
 		if override.rangeThisAndFuture {
 			index.thisAndFuture = append(index.thisAndFuture, override)
+			index.thisAndFutureOnDate = index.thisAndFutureOnDate || override.onDate()
+			index.byDate = index.byDate && override.namesDate
+			continue
+		}
+		if override.namesDate {
+			if index.exactDates == nil {
+				index.exactDates = make(map[int64]struct{})
+			}
+			index.exactDates[override.recurrenceIDDate.Unix()] = struct{}{}
 			continue
 		}
 		index.exact.add(override.recurrenceID)
 	}
 	sort.SliceStable(index.thisAndFuture, func(i, j int) bool {
-		return index.thisAndFuture[i].recurrenceID.Before(index.thisAndFuture[j].recurrenceID)
+		return index.slotOf(index.thisAndFuture[i]).Before(index.slotOf(index.thisAndFuture[j]))
 	})
 	return index
 }
 
-// replaces reports whether an ordinary override names the slot.
-func (index recurrenceOverrideIndex) replaces(recurrenceID time.Time) bool {
+// slotOf is what override's RECURRENCE-ID is ordered and matched by.
+func (index recurrenceOverrideIndex) slotOf(override recurrenceOverride) time.Time {
+	if index.byDate {
+		return override.recurrenceIDDate
+	}
+	return override.recurrenceID
+}
+
+// replaces reports whether an ordinary override names the slot at
+// recurrenceID, on date when its series starts on a DATE.
+func (index recurrenceOverrideIndex) replaces(recurrenceID, date time.Time) bool {
+	if _, ok := index.exactDates[date.Unix()]; ok && !date.IsZero() {
+		return true
+	}
 	return index.exact.contains(recurrenceID)
 }
 
 // governing returns the RANGE=THISANDFUTURE override with the latest
-// RECURRENCE-ID at or before start.
-func (index recurrenceOverrideIndex) governing(start time.Time) (recurrenceOverride, bool) {
+// RECURRENCE-ID at or before the slot at start, on date when its series
+// starts on a DATE.
+func (index recurrenceOverrideIndex) governing(start, date time.Time) (recurrenceOverride, bool) {
+	if index.byDate {
+		start = date
+	}
 	overrides := index.thisAndFuture
 	after := sort.Search(len(overrides), func(i int) bool {
-		return overrides[i].recurrenceID.After(start)
+		return index.slotOf(overrides[i]).After(start)
 	})
 	if after == 0 {
 		return recurrenceOverride{}, false
 	}
-	latest := overrides[after-1].recurrenceID
+	latest := index.slotOf(overrides[after-1])
 	first := sort.Search(after, func(i int) bool {
-		return !overrides[i].recurrenceID.Before(latest)
+		return !index.slotOf(overrides[i]).Before(latest)
 	})
 	return overrides[first], true
 }
@@ -2506,18 +3206,34 @@ func moveInstant(t, from, to time.Time) time.Time {
 		int64(t.Nanosecond())+int64(to.Nanosecond()-from.Nanosecond())).In(t.Location())
 }
 
-func (index recurrenceOverrideIndex) applyThisAndFuture(period BusyPeriod) (BusyPeriod, bool, time.Time) {
-	selected, ok := index.governing(period.Start)
+// applyThisAndFuture is where the RANGE=THISANDFUTURE override governing the
+// slot that period fills, on the dates dates holds, places it: moved as far
+// from the slot as the override is from the slot it names, and lasting as
+// long as the override. An override starting on a DATE moves it by the dates
+// between its RECURRENCE-ID and its DTSTART as written, and it spans the
+// override's days from the date it lands on; the hours between the two would
+// move it a day too far past a date its zone skips. It reports true for a
+// slot a cancelled override removes.
+func (index recurrenceOverrideIndex) applyThisAndFuture(period BusyPeriod, dates occurrenceDays) (BusyPeriod, occurrenceDays, bool) {
+	selected, ok := index.governing(period.Start, dates.slot)
 	if !ok {
-		return period, false, time.Time{}
+		return period, dates, false
 	}
 	if selected.cancelled {
-		return period, true, selected.recurrenceID
+		return period, dates, true
 	}
 
+	if selected.onDate() && !dates.slot.IsZero() && !selected.recurrenceIDDate.IsZero() {
+		date := dates.slot.AddDate(0, 0, CivilDaysBetween(selected.recurrenceIDDate, selected.startDate))
+		moved := BusyPeriod{
+			Start: index.midnights.at(selected.startKeyPart, date),
+			End:   index.midnights.at(selected.startKeyPart, date.AddDate(0, 0, selected.days)),
+		}
+		return moved, occurrenceDays{slot: dates.slot, start: date, days: selected.days}, false
+	}
 	shiftedStart := moveInstant(period.Start, selected.recurrenceID, selected.period.Start)
 	duration := selected.period.End.Sub(selected.period.Start)
-	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, false, selected.recurrenceID
+	return BusyPeriod{Start: shiftedStart, End: shiftedStart.Add(duration)}, occurrenceDays{slot: dates.slot}, false
 }
 
 // Component is one component block's parsed content lines, of whatever type the
@@ -2625,11 +3341,15 @@ func componentProperties(component *Component, name string) []PropertyValue {
 }
 
 func ComponentProperty(component *Component, name string) (PropertyValue, bool) {
-	values := componentProperties(component, name)
-	if len(values) == 0 {
+	if component == nil {
 		return PropertyValue{}, false
 	}
-	return values[0], true
+	for _, prop := range component.properties {
+		if strings.EqualFold(PropertyName(prop.KeyPart), name) {
+			return prop, true
+		}
+	}
+	return PropertyValue{}, false
 }
 
 func componentPropertyValue(component *Component, name string) string {
@@ -3025,10 +3745,14 @@ func knownRecurrenceRulePart(name string) bool {
 }
 
 // parseRecurrenceUntil reads the UNTIL rule part. RFC 5545 §3.3.10 requires a
-// floating UNTIL exactly where DTSTART is floating, so a value carrying no zone
-// of its own belongs to whatever zone resolved DTSTART: the caller's resolver
-// first, since that is the only thing holding a zone the observances of the
-// resource itself define, then the DTSTART location.
+// floating UNTIL exactly where DTSTART is floating, and a UTC one beside a
+// DTSTART with a TZID, so a value carrying no zone of its own belongs to
+// whatever zone resolved DTSTART. Beside a DATE-TIME DTSTART it is read on the
+// DTSTART's wall clock, through startWall: in the zone the DTSTART's TZID
+// names, which reading it as a floating value would lose, and for a floating
+// DTSTART wherever that is read. Beside a DATE DTSTART it is read by the
+// caller's resolver first, since that is the only thing holding a zone the
+// observances of the resource itself define, then in loc.
 //
 // UNTIL is inclusive, so a DATE bounding a DATE-TIME DTSTART admits every
 // instance on that day: it is read as the day's last instant in the DTSTART's
@@ -3040,6 +3764,13 @@ func parseRecurrenceUntil(value string, loc *time.Location, resolve PropertyTime
 			return time.Time{}, false
 		}
 		return endOfWallClockDay(day, startWall)
+	}
+	if startWall != nil && !hasZoneSuffix(value) {
+		wall, err := ParseDateTime(value)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return startWall(wall)
 	}
 	if !hasZoneSuffix(value) {
 		if resolve != nil {
@@ -3202,10 +3933,35 @@ func recurrencePeriodStart(dtstart time.Time, rule recurrenceRule) time.Time {
 	case "MONTHLY":
 		return time.Date(dtstart.Year(), dtstart.Month(), 1, 0, 0, 0, 0, dtstart.Location())
 	case "YEARLY":
-		return time.Date(dtstart.Year(), 1, 1, 0, 0, 0, 0, dtstart.Location())
+		return time.Date(weekNumberedPeriodYear(dtstart, rule), 1, 1, 0, 0, 0, 0, dtstart.Location())
 	default:
 		return dtstart
 	}
+}
+
+// weekNumberedPeriodYear is the year of the yearly period a series begins
+// with. A BYWEEKNO period generates its year's numbered weeks, which can begin
+// up to three days before January 1 and end up to three days after December
+// 31, so the year whose weeks hold a DTSTART near the turn of the year can be
+// the one before or after its calendar year. With an INTERVAL of one every year
+// is a period of the series, and the series begins with that week-numbering
+// year: begun with the calendar year, the period after it would generate the
+// DTSTART a second time, counted against COUNT, and the period before it,
+// never visited, would leave out the days its last week holds after the
+// DTSTART. A longer INTERVAL counts from the DTSTART's calendar year, whose
+// neighbours are not periods of the series.
+func weekNumberedPeriodYear(dtstart time.Time, rule recurrenceRule) int {
+	year := dtstart.Year()
+	if len(rule.ByWeekNo) == 0 || rule.Interval > 1 {
+		return year
+	}
+	switch {
+	case !dtstart.Before(firstWeekStart(year+1, rule.WKST, dtstart.Location())):
+		return year + 1
+	case dtstart.Before(firstWeekStart(year, rule.WKST, dtstart.Location())):
+		return year - 1
+	}
+	return year
 }
 
 func fastForwardRecurrencePeriod(periodStart, threshold time.Time, rule recurrenceRule) time.Time {

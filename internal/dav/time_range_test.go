@@ -1192,7 +1192,9 @@ func TestTimeRangeAllDayValueSpansItsNominalDayAcrossAZoneTransition(t *testing.
 			if err != nil {
 				t.Fatalf("ParseInLocation() = %v", err)
 			}
-			if got := zone.addDays(day.UTC(), 1).Sub(day.UTC()); got != tt.nominalDay {
+			m := newCalendarTimeRangeMatcher("", nil, zone)
+			date := ical.CivilDate(day)
+			if got := m.dateMidnight(icalTimeValue{}, date.AddDate(0, 0, 1)).Sub(m.dateMidnight(icalTimeValue{}, date)); got != tt.nominalDay {
 				t.Fatalf("nominal day = %v, want %v", got, tt.nominalDay)
 			}
 
@@ -1310,11 +1312,11 @@ func TestFloatingZonePrefersSubmittedObservancesOverTheHostDatabase(t *testing.T
 	}
 }
 
-// addDays advances a nominal day, which is the same wall clock on the next date
-// rather than a fixed 24 hours. It is what the DATE-valued Section 9.9 rows are
-// tested with, so it has to read the submitted observances too -- otherwise
-// preferring them above would move the offset off the arithmetic that uses it.
-func TestFloatingZoneAddDaysFollowsSubmittedTransitions(t *testing.T) {
+// A DATE-valued Section 9.9 row spans its day to the next date's midnight,
+// rather than a fixed 24 hours, and that midnight has to be read in the
+// submitted observances too -- otherwise preferring them above would move the
+// offset off the day it ends.
+func TestDateMidnightFollowsSubmittedTransitions(t *testing.T) {
 	// A zone that falls back one hour at 02:00 local on 2026-11-01.
 	submitted := strings.Join([]string{
 		"BEGIN:VCALENDAR",
@@ -1349,9 +1351,10 @@ func TestFloatingZoneAddDaysFollowsSubmittedTransitions(t *testing.T) {
 
 	// The next midnight is 25 hours later, not 24: the zone fell back in
 	// between, and a nominal day is a wall clock rather than a duration.
-	got := zone.addDays(start, 1)
+	m := newCalendarTimeRangeMatcher("", nil, zone)
+	got := m.dateMidnight(icalTimeValue{}, time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC))
 	if want := time.Date(2026, 11, 2, 5, 0, 0, 0, time.UTC); !got.Equal(want) {
-		t.Errorf("addDays across the submitted fall back = %s, want %s", got.UTC(), want)
+		t.Errorf("the midnight after the submitted fall back = %s, want %s", got.UTC(), want)
 	}
 }
 

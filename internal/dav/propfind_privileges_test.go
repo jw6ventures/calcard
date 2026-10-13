@@ -483,7 +483,7 @@ func TestDecoratePrivilegeSetPropagatesRepositoryFailure(t *testing.T) {
 	failure := errors.New("calendar repository unavailable")
 	h := &DavServer{store: &store.Store{Calendars: unavailablePrivilegeCalendarRepo{err: failure}}}
 	p := &prop{}
-	err := h.decorateDAVProp(context.Background(), &store.User{ID: 1}, "/dav/calendars/5", p, propDecorationMask{currentUserPrivilegeSet: true})
+	err := h.decorateDAVProp(context.Background(), &store.User{ID: 1}, "/dav/calendars/5", "/dav/calendars/5/", p, propDecorationMask{currentUserPrivilegeSet: true})
 	if !errors.Is(err, failure) {
 		t.Fatalf("error = %v, want repository error instead of an absent property", err)
 	}

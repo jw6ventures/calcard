@@ -21,7 +21,7 @@ func TestACLEntriesForResourceMemoizesWithinRequest(t *testing.T) {
 	if _, err := h.aclEntriesForResource(ctx, "/dav/calendars/3"); err != nil {
 		t.Fatalf("aclEntriesForResource() error = %v", err)
 	}
-	firstCalls := aclRepo.listByResourceCalls
+	firstCalls := aclRepo.listByResourcesCalls
 	if firstCalls == 0 {
 		t.Fatal("expected the first lookup to query the store")
 	}
@@ -30,20 +30,20 @@ func TestACLEntriesForResourceMemoizesWithinRequest(t *testing.T) {
 			t.Fatalf("aclEntriesForResource() error = %v", err)
 		}
 	}
-	if aclRepo.listByResourceCalls != firstCalls {
-		t.Fatalf("cached lookups queried the store again: calls = %d, want %d", aclRepo.listByResourceCalls, firstCalls)
+	if aclRepo.listByResourcesCalls != firstCalls {
+		t.Fatalf("cached lookups queried the store again: calls = %d, want %d", aclRepo.listByResourcesCalls, firstCalls)
 	}
 
 	// Without a cache in the context (e.g. direct handler calls in tests),
 	// every call reads fresh.
-	aclRepo.listByResourceCalls = 0
+	aclRepo.listByResourcesCalls = 0
 	for i := 0; i < 3; i++ {
 		if _, err := h.aclEntriesForResource(context.Background(), "/dav/calendars/3"); err != nil {
 			t.Fatalf("aclEntriesForResource() error = %v", err)
 		}
 	}
-	if aclRepo.listByResourceCalls < 3 {
-		t.Fatalf("uncached lookups should each hit the store: calls = %d, want >= 3", aclRepo.listByResourceCalls)
+	if aclRepo.listByResourcesCalls < 3 {
+		t.Fatalf("uncached lookups should each hit the store: calls = %d, want >= 3", aclRepo.listByResourcesCalls)
 	}
 }
 
@@ -69,6 +69,8 @@ func TestInvalidateDAVRequestStateInvalidatesEveryRequestCache(t *testing.T) {
 	state := davRequestStateFromContext(req.Context())
 	resolutionKey := collectionResolutionKey{userID: 1, prefix: calendarPrefix, segment: "work"}
 	state.putCollectionResolution(resolutionKey, collectionResolutionResult{id: 2, ok: true})
+	accessKey := calendarAccessKey{calendarID: 2, userID: 1}
+	state.memoizeCalendarAccess(accessKey, &store.CalendarAccess{Calendar: store.Calendar{ID: 2}})
 	lockIndex := &lockBatchIndex{byPath: map[string][]store.Lock{"/dav/calendars/2/event": nil}}
 	ctx := withLockBatchIndex(req.Context(), lockIndex)
 
@@ -79,6 +81,9 @@ func TestInvalidateDAVRequestStateInvalidatesEveryRequestCache(t *testing.T) {
 	}
 	if _, ok := state.collectionResolution(resolutionKey); ok {
 		t.Fatal("collection resolution survived request-state invalidation")
+	}
+	if _, ok := state.memoizedCalendarAccess(accessKey); ok {
+		t.Fatal("stored calendar access survived request-state invalidation")
 	}
 	if !lockIndex.isStale() {
 		t.Fatal("lock batch index was not marked stale")

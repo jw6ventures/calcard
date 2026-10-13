@@ -310,7 +310,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 	}
 	lockPaths := []string{cleanPath, path.Dir(cleanPath)}
 	for i := range members {
-		lockPaths = append(lockPaths, strings.TrimSuffix(cleanPath, "/")+"/"+members[i].ResourceName)
+		lockPaths = append(lockPaths, strings.TrimSuffix(cleanPath, "/")+"/"+members[i].ResourceName+".ics")
 	}
 	if !h.requireLocks(w, r, "resource is locked", lockPaths...) {
 		return

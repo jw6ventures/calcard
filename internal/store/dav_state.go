@@ -272,12 +272,7 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	if len(preconditions) == 0 && len(alsoSerialize) == 0 {
 		return nil
 	}
-	serializationTargets := slices.Clone(alsoSerialize)
-	for _, precondition := range preconditions {
-		if !lockPreconditionObservesDescendant(precondition.ResourcePath, preconditions) {
-			serializationTargets = append(serializationTargets, precondition.ResourcePath)
-		}
-	}
+	serializationTargets := append(slices.Clone(alsoSerialize), lockPreconditionTargets(preconditions)...)
 	if err := acquireDAVPathLocks(ctx, tx, serializationTargets...); err != nil {
 		return err
 	}
@@ -328,17 +323,27 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	return nil
 }
 
-// lockPreconditionObservesDescendant reports whether resourcePath is a strict
-// ancestor of another precondition's path, which davPathLocks already covers
-// as that path's ancestor.
-func lockPreconditionObservesDescendant(resourcePath string, preconditions []LockPrecondition) bool {
-	prefix := strings.TrimSuffix(path.Clean(resourcePath), "/") + "/"
-	for _, other := range preconditions {
-		if strings.HasPrefix(path.Clean(other.ResourcePath), prefix) {
-			return true
-		}
+// lockPreconditionTargets returns the paths of the preconditions that are no
+// strict ancestor of another precondition's path; davPathLocks already covers
+// such an ancestor as the other path's. Every path that has a given prefix
+// sorts directly at or after it, so one search per path finds whether any has.
+func lockPreconditionTargets(preconditions []LockPrecondition) []string {
+	cleaned := make([]string, len(preconditions))
+	for i, precondition := range preconditions {
+		cleaned[i] = path.Clean(precondition.ResourcePath)
 	}
-	return false
+	sorted := slices.Clone(cleaned)
+	slices.Sort(sorted)
+	targets := make([]string, 0, len(preconditions))
+	for i, precondition := range preconditions {
+		prefix := strings.TrimSuffix(cleaned[i], "/") + "/"
+		next, _ := slices.BinarySearch(sorted, prefix)
+		if next < len(sorted) && strings.HasPrefix(sorted[next], prefix) {
+			continue
+		}
+		targets = append(targets, precondition.ResourcePath)
+	}
+	return targets
 }
 
 func validateLockPreconditionsFallback(ctx context.Context, locks LockRepository, preconditions []LockPrecondition) error {
@@ -425,7 +430,7 @@ func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, davStatePaths(resourcePath)...); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, ACLPaths(resourcePath)...); err != nil {
 		return err
 	}
 	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
@@ -809,6 +814,61 @@ func (s *Store) deleteDAVStateFallback(ctx context.Context, resourcePath string,
 		}
 	}
 	return nil
+}
+
+// ObjectACLPaths lists the stored spellings whose ACL entries make up the ACL
+// of the member resourceName of collectionPath, a calendar or address book
+// path, in the order a decision reads them: the member's own path, which the
+// ACL method writes, then, for a name ending in the collection kind's
+// extension in any case, the path without it and that path with the extension
+// in lower case, and otherwise the path with the extension added. Decisions
+// read exactly these, and a write of the member's ACL replaces exactly these.
+// The name is joined as it is stored, without cleaning, so a name holding path
+// segments cannot reach another resource's ACL.
+func ObjectACLPaths(collectionPath, resourceName string) []string {
+	if resourceName == "" {
+		return nil
+	}
+	collectionPath = strings.TrimSuffix(collectionPath, "/")
+	ext := ".ics"
+	if strings.HasPrefix(collectionPath, "/dav/addressbooks/") {
+		ext = ".vcf"
+	}
+	own := collectionPath + "/" + resourceName
+	base := resourceName
+	if strings.EqualFold(path.Ext(resourceName), ext) {
+		base = strings.TrimSuffix(resourceName, path.Ext(resourceName))
+	}
+	if base == "" {
+		return []string{own}
+	}
+	identity := collectionPath + "/" + base
+	paths := []string{own}
+	for _, spelling := range []string{identity, identity + ext} {
+		if !slices.Contains(paths, spelling) {
+			paths = append(paths, spelling)
+		}
+	}
+	return paths
+}
+
+// ACLPaths lists the stored spellings whose ACL entries make up the ACL of
+// the resource at the canonical resourcePath: ObjectACLPaths for a member of a
+// calendar or address book, and the path alone for any other resource.
+func ACLPaths(resourcePath string) []string {
+	if resourcePath == "" {
+		return nil
+	}
+	for _, prefix := range []string{"/dav/calendars/", "/dav/addressbooks/"} {
+		rest, ok := strings.CutPrefix(resourcePath, prefix)
+		if !ok {
+			continue
+		}
+		if collection, name, member := strings.Cut(rest, "/"); member && collection != "" && name != "" && !strings.Contains(name, "/") {
+			return ObjectACLPaths(prefix+collection, name)
+		}
+	}
+	return []string{resourcePath}
 }
 
 func davStatePaths(resourcePath string) []string {

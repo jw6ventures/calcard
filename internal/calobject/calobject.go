@@ -47,6 +47,12 @@ type Expansion struct {
 	Recurs bool
 	// Instances are the instances in the range, by start.
 	Instances []Instance
+	// Overrides are the overrides in the range the expansion writes as
+	// themselves -- each replacing one instance, and each RANGE=THISANDFUTURE
+	// one naming a slot the series never generates -- by start, placed where
+	// the expansion places them, whatever they write of their end. Their
+	// Override is the zero time.
+	Overrides []Instance
 	// Complete is false when the range holds more instances than the
 	// expansion lists, so Instances are only some of them.
 	Complete bool
@@ -55,8 +61,8 @@ type Expansion struct {
 // Expander lists the instances of the recurring VEVENT of raw, a stored
 // calendar object, that RFC 4791 §9.9 places in [start, end): those a CalDAV
 // calendar-query with CALDAV:expand over that range returns for it (§9.6.5),
-// less each an override replaces, which stands for itself. Floating times are
-// read in UTC.
+// less each an override replaces, which stands for itself and is placed among
+// the expansion's Overrides. Floating times are read in UTC.
 type Expander func(raw string, start, end time.Time) Expansion
 
 // ErrUndefinedTimezone is the reason a calendar object is refused when it

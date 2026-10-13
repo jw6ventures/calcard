@@ -151,6 +151,45 @@ func TestDateUntilOnATimedSeriesIncludesTheWholeDay(t *testing.T) {
 	}
 }
 
+// RFC 5545 §3.3.10 requires a UTC UNTIL beside a DTSTART with a TZID. One
+// written as a floating time anyway is read on the DTSTART's wall clock by
+// every reader of the series -- the expansion, whatever zone its caller reads
+// floating values in, the instance count and the stored bounds -- so all of
+// them end the series at the same instance.
+func TestFloatingUntilBesideAZonedDTStartIsReadInTheDTStartsZone(t *testing.T) {
+	newYork := requireHostZone(t, "America/New_York")
+	tokyo := requireHostZone(t, "Asia/Tokyo")
+	// 02:30 on 12 March is 06:30Z in New York; read as UTC, or in Tokyo, it is
+	// earlier and would end the series an instance sooner.
+	raw := untilEvent("DTSTART;TZID=America/New_York:20240308T023000", "FREQ=DAILY;UNTIL=20240312T023000")
+	want := []time.Time{utc(2024, 3, 8, 7, 30), utc(2024, 3, 9, 7, 30), utc(2024, 3, 11, 6, 30), utc(2024, 3, 12, 6, 30)}
+	dtstart := WallClockIn(newYork, utc(2024, 3, 8, 2, 30))
+	floatingInTokyo := PropertyTimeResolver(func(keyPart, value string) (time.Time, bool) {
+		if _, zoned := PropertyParam(keyPart, "TZID"); zoned || hasZoneSuffix(value) {
+			return ParsePropertyDateTimeLocal(keyPart, value)
+		}
+		wall, err := ParseDateTime(value)
+		return WallClockIn(tokyo, wall).UTC(), err == nil
+	})
+	for name, resolve := range map[string]RecurrenceTimeResolver{"floating read as UTC": nil, "floating read in the caller's zone": floatingInTokyo} {
+		starts := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(
+			collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, dtstart.AddDate(0, 0, -1), dtstart.AddDate(0, 1, 0), 1000, resolve)))
+		if !sameInstants(starts, want) {
+			t.Errorf("%s: expansion = %v, want %v", name, utcStrings(starts), utcStrings(want))
+		}
+	}
+	if exceeds, ok := RecurrenceSetExceedsLimit(raw, len(want)); !ok || exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(limit %d) = %v, %v; want false, true", len(want), exceeds, ok)
+	}
+	if exceeds, ok := RecurrenceSetExceedsLimit(raw, len(want)-1); !ok || !exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(limit %d) = %v, %v; want true, true", len(want)-1, exceeds, ok)
+	}
+	bounds := ConservativeRecurrenceBounds(raw)
+	if lastEnd := want[len(want)-1].Add(time.Hour); bounds.UntilUnknown || bounds.Until == nil || bounds.Until.Before(lastEnd) {
+		t.Errorf("bounds = %+v, want an until at or after the last instance's end %v", bounds, lastEnd)
+	}
+}
+
 // An observance's UNTIL is a UTC DATE-TIME (RFC 5545 §3.6.5), never a DATE, so
 // reading a DATE as its whole day leaves the observance onsets alone.
 func TestObservanceUntilStopsAtTheOnsetItNames(t *testing.T) {

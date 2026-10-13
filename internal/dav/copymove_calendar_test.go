@@ -266,7 +266,7 @@ func TestCalendarCollectionCopyMoveAdvertisedAndValidateHeaders(t *testing.T) {
 		{name: "invalid Overwrite", method: "COPY", overwrite: "yes", destination: "/dav/calendars/copied", wantStatus: http.StatusBadRequest},
 		{name: "cross authority", method: "COPY", destination: "https://other.example/dav/calendars/copied", wantStatus: http.StatusBadGateway},
 		// A protocol-relative Destination names another server just as an
-		// absolute URL does, and RFC 4918 §9.8.6 makes that a 502 rather than a
+		// absolute URL does, and RFC 4918 §9.8.5 makes that a 502 rather than a
 		// local path with the authority ignored.
 		{name: "protocol-relative cross authority", method: "COPY", destination: "//other.example/dav/calendars/copied", wantStatus: http.StatusBadGateway},
 		// The same-authority form is local, so it gets past the authority check
@@ -274,6 +274,10 @@ func TestCalendarCollectionCopyMoveAdvertisedAndValidateHeaders(t *testing.T) {
 		// here a 404, because this fixture's store holds no source calendar.
 		{name: "protocol-relative same authority", method: "MOVE", destination: "//calcard.example/dav/calendars/moved", wantStatus: http.StatusNotFound},
 		{name: "relative destination for comparison", method: "MOVE", destination: "/dav/calendars/moved", wantStatus: http.StatusNotFound},
+		{name: "same authority with the default port", method: "MOVE", destination: "https://calcard.example:443/dav/calendars/moved", wantStatus: http.StatusNotFound},
+		{name: "same host over another scheme", method: "MOVE", destination: "http://calcard.example/dav/calendars/moved", wantStatus: http.StatusNotFound},
+		{name: "empty authority", method: "MOVE", destination: "https:///dav/calendars/moved", wantStatus: http.StatusBadRequest},
+		{name: "lower-case Overwrite", method: "MOVE", overwrite: "f", destination: "/dav/calendars/moved", wantStatus: http.StatusNotFound},
 		{name: "non-http scheme", method: "COPY", destination: "ftp://calcard.example/dav/calendars/copied", wantStatus: http.StatusBadGateway},
 	}
 	for _, tt := range tests {

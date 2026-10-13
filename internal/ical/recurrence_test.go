@@ -675,19 +675,27 @@ func TestRecurrenceSlotsExposeOverridePrecedence(t *testing.T) {
 	if len(slots) != 4 {
 		t.Fatalf("slots = %d, want 4: %#v", len(slots), slots)
 	}
-	firstRange := time.Date(2025, 1, 7, 10, 0, 0, 0, time.UTC)
-	cancelRange := time.Date(2025, 1, 9, 10, 0, 0, 0, time.UTC)
-	if !slots[1].GoverningRangeRecurrenceID.Equal(firstRange) || slots[1].Suppressed || slots[1].ExactOverride {
+	if slots[1].Suppressed || slots[1].ExactOverride {
 		t.Errorf("first shifted slot metadata = %#v", slots[1])
 	}
 	if want := time.Date(2025, 1, 7, 12, 0, 0, 0, time.UTC); !slots[1].Effective.Start.Equal(want) {
 		t.Errorf("first shifted slot starts %v, want %v", slots[1].Effective.Start, want)
 	}
-	if !slots[2].ExactOverride || !slots[2].Suppressed || !slots[2].GoverningRangeRecurrenceID.Equal(firstRange) {
+	if !slots[2].ExactOverride || !slots[2].Suppressed {
 		t.Errorf("ordinary override slot metadata = %#v", slots[2])
 	}
-	if slots[3].ExactOverride || !slots[3].Suppressed || !slots[3].GoverningRangeRecurrenceID.Equal(cancelRange) {
+	// The first RANGE=THISANDFUTURE override still governs the slot an
+	// ordinary override replaces, and moves it two hours on.
+	if want := time.Date(2025, 1, 8, 12, 0, 0, 0, time.UTC); !slots[2].Effective.Start.Equal(want) {
+		t.Errorf("ordinary override slot starts %v, want %v", slots[2].Effective.Start, want)
+	}
+	if slots[3].ExactOverride || !slots[3].Suppressed {
 		t.Errorf("cancelled range slot metadata = %#v", slots[3])
+	}
+	// The cancelled override governs its own slot, which the first no
+	// longer moves.
+	if want := time.Date(2025, 1, 9, 10, 0, 0, 0, time.UTC); !slots[3].Effective.Start.Equal(want) {
+		t.Errorf("cancelled range slot starts %v, want %v", slots[3].Effective.Start, want)
 	}
 }
 
@@ -2784,6 +2792,179 @@ func TestRecurrenceSetExceedsLimitCountsWeeksBegunInThePreviousYear(t *testing.T
 				t.Errorf("RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances within it", tt.count, exceeds, ok, tt.count)
 			}
 		})
+	}
+}
+
+// A yearly BYWEEKNO period generates its year's numbered weeks, which overhang
+// the calendar year by up to three days at either end, so a DTSTART near
+// January 1 can lie in a week of the year before or after its own. The series
+// is the DTSTART, counted once, followed by every later day the rule selects in
+// the week-numbering years it steps through, as walking each such year's days
+// one at a time finds them, and every reader of the rule lists that set. With
+// an INTERVAL of one every year is stepped through; with a longer one INTERVAL
+// counts from the DTSTART's calendar year.
+func TestWeekNumberedSeriesNearNewYearAgreesWithADayByDayWalk(t *testing.T) {
+	type weekRule struct {
+		rrule    string
+		interval int
+		wkst     time.Weekday
+		weeks    []int
+		// days is every day of the week when empty.
+		days     []time.Weekday
+		months   []int
+		yearDays []int
+		setPos   []int
+	}
+	mo, tu, we, th, fr, sa, su := time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday, time.Saturday, time.Sunday
+	rules := []weekRule{
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO", weeks: []int{1}, days: []time.Weekday{mo}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU", weeks: []int{1}, days: []time.Weekday{mo, tu}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=-1;BYDAY=SA,SU", weeks: []int{-1}, days: []time.Weekday{sa, su}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1,-1;BYDAY=MO,SU", weeks: []int{1, -1}, days: []time.Weekday{mo, su}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=53;BYDAY=FR,SA,SU", weeks: []int{53}, days: []time.Weekday{fr, sa, su}},
+		{rrule: "FREQ=YEARLY;INTERVAL=2;BYWEEKNO=1;BYDAY=MO", interval: 2, weeks: []int{1}, days: []time.Weekday{mo}},
+		{rrule: "FREQ=YEARLY;INTERVAL=2;BYWEEKNO=-1;BYDAY=SA,SU", interval: 2, weeks: []int{-1}, days: []time.Weekday{sa, su}},
+		{rrule: "FREQ=YEARLY;INTERVAL=2;BYWEEKNO=53;BYDAY=SA", interval: 2, weeks: []int{53}, days: []time.Weekday{sa}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=SA,SU;WKST=SU", wkst: su, weeks: []int{1}, days: []time.Weekday{sa, su}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=-1;BYDAY=SA;WKST=SU", wkst: su, weeks: []int{-1}, days: []time.Weekday{sa}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=WE,TH;WKST=TH", wkst: th, weeks: []int{1}, days: []time.Weekday{we, th}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYMONTH=12", weeks: []int{1}, months: []int{12}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYYEARDAY=1,-1,-2", weeks: []int{1}, yearDays: []int{1, -1, -2}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1,-1;BYDAY=MO;BYSETPOS=-1", weeks: []int{1, -1}, days: []time.Weekday{mo}, setPos: []int{-1}},
+		{rrule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU,WE;BYSETPOS=2", weeks: []int{1}, days: []time.Weekday{mo, tu, we}, setPos: []int{2}},
+	}
+	for i := range rules {
+		if rules[i].interval == 0 {
+			rules[i].interval = 1
+		}
+		if !strings.Contains(rules[i].rrule, "WKST=") {
+			rules[i].wkst = mo
+		}
+	}
+	// weekOf numbers day's week as RFC 5545 §3.3.10 does: a week starting on
+	// wkst belongs to the year holding at least four of its days, which is the
+	// year of its fourth day.
+	weekOf := func(day time.Time, wkst time.Weekday) (year, week int) {
+		fourth := day.AddDate(0, 0, 3-(int(day.Weekday())-int(wkst)+7)%7)
+		return fourth.Year(), (fourth.YearDay()-1)/7 + 1
+	}
+	// weeksIn is the number of the year's last week, the one whose fourth day
+	// is the last of the year's days to fall on that weekday.
+	weeksIn := func(year int, wkst time.Weekday) int {
+		day := time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC)
+		for day.Weekday() != (wkst+3)%7 {
+			day = day.AddDate(0, 0, -1)
+		}
+		_, week := weekOf(day, wkst)
+		return week
+	}
+	numbered := func(position, length int, allowed []int) bool {
+		return slices.Contains(allowed, position) || slices.Contains(allowed, position-length-1)
+	}
+	selects := func(rule weekRule, day time.Time) bool {
+		year, week := weekOf(day, rule.wkst)
+		lastYearDay := time.Date(day.Year(), 12, 31, 0, 0, 0, 0, time.UTC).YearDay()
+		return numbered(week, weeksIn(year, rule.wkst), rule.weeks) &&
+			(len(rule.days) == 0 || slices.Contains(rule.days, day.Weekday())) &&
+			(len(rule.months) == 0 || slices.Contains(rule.months, int(day.Month()))) &&
+			(len(rule.yearDays) == 0 || numbered(day.YearDay(), lastYearDay, rule.yearDays))
+	}
+	const count = 6
+	walk := func(dtstart time.Time, rule weekRule) []time.Time {
+		starts := []time.Time{dtstart}
+		first := dtstart.Year()
+		if rule.interval == 1 {
+			first, _ = weekOf(dtstart, rule.wkst)
+		}
+		for year := first; len(starts) < count; year += rule.interval {
+			var period []time.Time
+			for day := time.Date(year-1, 12, 20, dtstart.Hour(), 0, 0, 0, time.UTC); day.Before(time.Date(year+1, 1, 12, 0, 0, 0, 0, time.UTC)); day = day.AddDate(0, 0, 1) {
+				if numberingYear, _ := weekOf(day, rule.wkst); numberingYear == year && selects(rule, day) {
+					period = append(period, day)
+				}
+			}
+			if len(rule.setPos) > 0 {
+				var selected []time.Time
+				for i, day := range period {
+					if numbered(i+1, len(period), rule.setPos) {
+						selected = append(selected, day)
+					}
+				}
+				period = selected
+			}
+			for _, day := range period {
+				if day.After(dtstart) && len(starts) < count {
+					starts = append(starts, day)
+				}
+			}
+		}
+		return starts
+	}
+	event := func(dtstart time.Time, rrule string) string {
+		return "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weeks\r\nDTSTART:" + dtstart.Format("20060102T150405Z") + "\r\nRRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	}
+	expanded := func(t *testing.T, raw string, dtstart, rangeStart, rangeEnd time.Time) []time.Time {
+		t.Helper()
+		return instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)))
+	}
+
+	for _, year := range []int{2020, 2024, 2026} {
+		for dtstart := time.Date(year, 12, 26, 10, 0, 0, 0, time.UTC); dtstart.Before(time.Date(year+1, 1, 7, 0, 0, 0, 0, time.UTC)); dtstart = dtstart.AddDate(0, 0, 1) {
+			for _, rule := range rules {
+				want := walk(dtstart, rule)
+				last := want[count-1]
+				counted := fmt.Sprintf("%s;COUNT=%d", rule.rrule, count)
+				until := rule.rrule + ";UNTIL=" + last.Format("20060102T150405Z")
+				t.Run(dtstart.Format("20060102")+"/"+rule.rrule, func(t *testing.T) {
+					for _, rrule := range []string{counted, until} {
+						if got := expanded(t, event(dtstart, rrule), dtstart, dtstart.AddDate(-1, 0, 0), last.AddDate(1, 0, 0)); !slices.EqualFunc(got, want, time.Time.Equal) {
+							t.Errorf("%s: expansion = %v, want %v", rrule, got, want)
+						}
+						periods, err := RecurringBusyPeriods(event(dtstart, rrule), dtstart, time.Hour, dtstart.AddDate(-1, 0, 0), last.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+						if err != nil {
+							t.Fatalf("%s: RecurringBusyPeriods() err = %v", rrule, err)
+						}
+						var busy []time.Time
+						for _, period := range periods {
+							busy = append(busy, period.Start)
+						}
+						if !slices.EqualFunc(busy, want, time.Time.Equal) {
+							t.Errorf("%s: busy periods start at %v, want %v", rrule, busy, want)
+						}
+						if exceeds, ok := RecurrenceSetExceedsLimit(event(dtstart, rrule), count-1); !ok || !exceeds {
+							t.Errorf("%s: RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances to exceed it", rrule, count-1, exceeds, ok, count)
+						}
+						if exceeds, ok := RecurrenceSetExceedsLimit(event(dtstart, rrule), count); !ok || exceeds {
+							t.Errorf("%s: RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances within it", rrule, count, exceeds, ok, count)
+						}
+						lister := NewRecurrenceStartLister(dtstart, rrule)
+						if !lister.ListThrough(last.AddDate(1, 0, 0), 4096) || !slices.EqualFunc(lister.starts, want, time.Time.Equal) {
+							t.Errorf("%s: listed %v, want %v", rrule, lister.starts, want)
+						}
+						if between, ok := recurrenceStartsBetween(dtstart, rrule, dtstart, last, 4096, newRecurrenceWork()); !ok || !slices.EqualFunc(between, want[1:], time.Time.Equal) {
+							t.Errorf("%s: starts after the DTSTART = %v, %t, want %v", rrule, between, ok, want[1:])
+						}
+					}
+					// A range past the DTSTART is reached by jumping to it.
+					if got := expanded(t, event(dtstart, rule.rrule), dtstart, want[1], last.Add(time.Minute)); !slices.EqualFunc(got, want[1:], time.Time.Equal) {
+						t.Errorf("%s: expansion from %v = %v, want %v", rule.rrule, want[1], got, want[1:])
+					}
+					for _, rrule := range []string{rule.rrule, counted} {
+						for i, start := range want {
+							if latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, start.Add(time.Minute), rrule); !found || !complete || !latest.Equal(start) {
+								t.Errorf("%s: LatestRecurrenceOnOrBefore(%v) = %v, %t, %t, want %v", rrule, start.Add(time.Minute), latest, found, complete, start)
+							}
+							if i == 0 {
+								continue
+							}
+							if latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, start.Add(-time.Minute), rrule); !found || !complete || !latest.Equal(want[i-1]) {
+								t.Errorf("%s: LatestRecurrenceOnOrBefore(%v) = %v, %t, %t, want %v", rrule, start.Add(-time.Minute), latest, found, complete, want[i-1])
+							}
+						}
+					}
+				})
+			}
+		}
 	}
 }
 

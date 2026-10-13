@@ -76,7 +76,12 @@ type ifHeaderState struct {
 	untagged []string
 }
 
-func parseIfHeaderState(header string) ifHeaderState {
+// parseIfHeaderState collects the lock tokens an If header submits. tagPath
+// turns a resource tag into the decoded path it names on this server, and
+// reports false for a tag that names nothing here. RFC 4918 §10.4.2 applies a
+// tagged list only to the resource its tag names, so the lists after such a
+// tag are dropped rather than read as untagged ones.
+func parseIfHeaderState(header string, tagPath func(string) (string, bool)) ifHeaderState {
 	state := ifHeaderState{tagged: make(map[string][]string)}
 	header = strings.TrimSpace(header)
 	if header == "" {
@@ -117,7 +122,7 @@ func parseIfHeaderState(header string) ifHeaderState {
 		return tokens
 	}
 
-	currentTag := ""
+	tagged, currentTag := false, ""
 	for i := 0; i < len(header); {
 		switch header[i] {
 		case ' ', '\t', '\r', '\n':
@@ -134,7 +139,8 @@ func parseIfHeaderState(header string) ifHeaderState {
 				j++
 			}
 			if j < len(header) && header[j] == '(' {
-				currentTag = normalizeDAVHref(token)
+				tagged = true
+				currentTag, _ = tagPath(token)
 			}
 			i = j
 		case '(':
@@ -143,13 +149,14 @@ func parseIfHeaderState(header string) ifHeaderState {
 				return state
 			}
 			tokens := extractTokens(header[i+1 : i+1+end])
-			if currentTag != "" {
-				for _, token := range tokens {
-					state.tagged[currentTag] = addToken(state.tagged[currentTag], token)
-				}
-			} else {
+			switch {
+			case !tagged:
 				for _, token := range tokens {
 					state.untagged = addToken(state.untagged, token)
+				}
+			case currentTag != "":
+				for _, token := range tokens {
+					state.tagged[currentTag] = addToken(state.tagged[currentTag], token)
 				}
 			}
 			i += end + 2
@@ -161,8 +168,27 @@ func parseIfHeaderState(header string) ifHeaderState {
 	return state
 }
 
-func ifLockTokensForPaths(header string, resourcePaths ...string) []string {
-	state := parseIfHeaderState(header)
+// ifResourceTagPath resolves an If header resource tag to the path it names,
+// so a tag naming another server names no resource here. A relative tag
+// resolves against the Request-URI as a DAV:href does, but the tag's path alone
+// names the resource; the Request-URI's query has no bearing on it.
+func (h *DavServer) ifResourceTagPath(r *http.Request) func(string) (string, bool) {
+	return func(tag string) (string, bool) {
+		resolved, ok := h.resolveLocalReference(tag, davHrefReferenceBase(r.URL.Path), r)
+		if !ok {
+			return "", false
+		}
+		return normalizeDAVHref(resolved.EscapedPath()), true
+	}
+}
+
+func (h *DavServer) parseIfHeader(r *http.Request) ifHeaderState {
+	return parseIfHeaderState(r.Header.Get("If"), h.ifResourceTagPath(r))
+}
+
+// lockTokensForPaths lists the tokens submitted for any of resourcePaths, then
+// the untagged ones, each once.
+func (state ifHeaderState) lockTokensForPaths(resourcePaths ...string) []string {
 	seen := make(map[string]struct{})
 	var tokens []string
 	for _, resourcePath := range resourcePaths {
@@ -190,8 +216,8 @@ func ifLockTokensForPaths(header string, resourcePaths ...string) []string {
 	return tokens
 }
 
-func firstIfLockToken(header string, resourcePaths ...string) string {
-	tokens := ifLockTokensForPaths(header, resourcePaths...)
+func (state ifHeaderState) firstLockToken(resourcePaths ...string) string {
+	tokens := state.lockTokensForPaths(resourcePaths...)
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -250,8 +276,7 @@ func (h *DavServer) lock(w http.ResponseWriter, r *http.Request) {
 	expiresAt := time.Now().Add(time.Duration(timeout) * time.Second)
 
 	// Check for lock refresh (If header with existing token)
-	ifHeader := r.Header.Get("If")
-	if ifToken := firstIfLockToken(ifHeader, cleanPath, canonicalPath); ifToken != "" {
+	if ifToken := h.parseIfHeader(r).firstLockToken(cleanPath, canonicalPath); ifToken != "" {
 		existing, err := h.store.Locks.GetByToken(r.Context(), ifToken)
 		if err != nil || existing == nil {
 			// RFC 4918 §9.10.6 gives a lock refresh whose token has disappeared
@@ -737,7 +762,7 @@ func (h *DavServer) unlock(w http.ResponseWriter, r *http.Request) {
 			writeNeedPrivileges(w, canonicalPath, "unlock")
 			return
 		}
-		if err := h.requireACLPrivilege(r.Context(), user, canonicalPath, "unlock"); err != nil {
+		if err := h.requireACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "unlock"); err != nil {
 			_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, canonicalPath, "unlock"))
 			return
 		}
@@ -775,12 +800,12 @@ func (h *DavServer) resolveLockTarget(r *http.Request, resourcePath string) reso
 // could apply to the target: active locks on the resource itself and
 // depth-infinity locks on its ancestors block the write unless the request's
 // If header carries a matching token.
-func lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.Lock) bool {
+func (h *DavServer) lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.Lock) bool {
 	if len(locks) == 0 {
 		return true
 	}
 	now := time.Now()
-	ifHeader := r.Header.Get("If")
+	ifHeader := h.parseIfHeader(r)
 	// RFC 4918 Section 6.4 requires the authenticated principal to match the
 	// lock creator as well as the token to be submitted. Token possession alone
 	// cannot carry the decision: DAV:lockdiscovery reports a lock to every
@@ -802,7 +827,7 @@ func lockAllowsWrite(r *http.Request, target resolvedLockTarget, locks []store.L
 		if user == nil || lock.UserID != user.ID {
 			continue
 		}
-		for _, token := range ifLockTokensForPaths(ifHeader, target.requestPath, target.canonicalPath, lock.ResourcePath, lockPath) {
+		for _, token := range ifHeader.lockTokensForPaths(target.requestPath, target.canonicalPath, lock.ResourcePath, lockPath) {
 			if lock.Token == token {
 				return true
 			}
@@ -825,7 +850,7 @@ func (h *DavServer) checkLock(r *http.Request, resourcePath string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	return lockAllowsWrite(r, target, locks), nil
+	return h.lockAllowsWrite(r, target, locks), nil
 }
 
 // checkLocks verifies several write targets at once, fetching the union of
@@ -875,7 +900,7 @@ func (h *DavServer) checkLocks(r *http.Request, resourcePaths ...string) (bool, 
 		for _, p := range target.lookupPaths {
 			targetLocks = append(targetLocks, byPath[p]...)
 		}
-		if !lockAllowsWrite(r, target, targetLocks) {
+		if !h.lockAllowsWrite(r, target, targetLocks) {
 			return false, nil
 		}
 	}
@@ -886,6 +911,7 @@ func (h *DavServer) lockPreconditions(r *http.Request, resourcePaths ...string) 
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return nil
 	}
+	ifHeader := h.parseIfHeader(r)
 	seen := make(map[string]struct{}, len(resourcePaths))
 	preconditions := make([]store.LockPrecondition, 0, len(resourcePaths))
 	for _, resourcePath := range resourcePaths {
@@ -902,7 +928,7 @@ func (h *DavServer) lockPreconditions(r *http.Request, resourcePaths ...string) 
 		preconditions = append(preconditions, store.LockPrecondition{
 			ResourcePath: target.canonicalPath,
 			LookupPaths:  append([]string(nil), target.lookupPaths...),
-			Tokens:       ifLockTokensForPaths(r.Header.Get("If"), tokenPaths...),
+			Tokens:       ifHeader.lockTokensForPaths(tokenPaths...),
 		})
 	}
 	return preconditions

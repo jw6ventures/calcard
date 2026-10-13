@@ -448,7 +448,7 @@ func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, range
 		if recurrenceID.IsZero() {
 			recurrenceID = period.Start
 		}
-		describing := overrides.describing(master, recurrenceID)
+		describing := overrides.describing(master, recurrenceID, period.RecurrenceDate)
 		fbType, publishes := freeBusyEventType(describing)
 		if !publishes {
 			continue
@@ -463,7 +463,7 @@ func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode
 	if !ok {
 		return freeBusyInterval{}, false
 	}
-	end := dtstart.instant.Add(freeBusyOccurrenceLength(candidate.matcher, node, dtstart))
+	end := candidate.matcher.eventOccurrenceEnd(node, dtstart, noShift)
 	if !periodInTimeRange(dtstart.instant, end, rangeStart, rangeEnd) {
 		return freeBusyInterval{}, false
 	}
@@ -594,7 +594,7 @@ func (c freeBusyCandidate) extent(master *icalNode) (freeBusyExtent, bool) {
 	if dtstart, ok := c.matcher.dateValue(master, "DTSTART", noShift); ok {
 		return freeBusyExtent{
 			start:   dtstart.instant,
-			length:  freeBusyOccurrenceLength(c.matcher, master, dtstart),
+			length:  c.matcher.occurrenceWindow(master, dtstart),
 			resolve: c.matcher,
 		}, true
 	}
@@ -620,13 +620,6 @@ func freeBusyMasterComponent(root *icalNode) *icalNode {
 		}
 	}
 	return nil
-}
-
-// freeBusyOccurrenceLength is how long an occurrence of master lasts, by the
-// same reading calendar-query gives it. A zero length occupies no time and is
-// removed before the report serializes its intervals.
-func freeBusyOccurrenceLength(matcher calendarTimeRangeMatcher, master *icalNode, dtstart icalTimeValue) time.Duration {
-	return matcher.eventOccurrenceEnd(master, dtstart, noShift).Sub(dtstart.instant)
 }
 
 // freeBusyColumnLength reads the length off the denormalized columns, for an

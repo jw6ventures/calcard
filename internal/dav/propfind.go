@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"strings"
@@ -17,7 +18,7 @@ func (h *DavServer) propfindInfinityEnabled() bool {
 }
 
 func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
-	depth := strings.TrimSpace(r.Header.Get("Depth"))
+	depth := strings.ToLower(strings.TrimSpace(r.Header.Get("Depth")))
 	if depth == "" {
 		// RFC 4918 §9.1: a missing Depth header means Depth: infinity.
 		depth = "infinity"
@@ -44,9 +45,10 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var propfindReq propfindRequest
-	if r.Body != http.NoBody {
-		body, err := readDAVBody(w, r, maxDAVBodyBytes)
+	var body []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		body, err = readDAVBody(w, r, maxDAVBodyBytes)
 		if err != nil {
 			if errors.Is(err, errRequestTooLarge) {
 				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
@@ -55,6 +57,12 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+	}
+	var propfindReq propfindRequest
+	// RFC 4918 §9.1: an empty body is an allprop request. A chunked request
+	// carries no length to announce that, so emptiness is judged by what was
+	// read, and XML whitespace alone is no document either.
+	if len(bytes.Trim(body, xmlWhitespace)) != 0 {
 		if h.propfindBodyExceedsPropertyLimit(body) {
 			h.logger().Trace("Propfind", "rejected %s: requests more than %d distinct properties", r.URL.Path, h.requestedPropertyLimit())
 			http.Error(w, "PROPFIND requests too many properties", http.StatusRequestEntityTooLarge)

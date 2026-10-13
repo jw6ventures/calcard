@@ -15,7 +15,15 @@ type davRequestState struct {
 	collectionResolutions map[collectionResolutionKey]collectionResolutionResult
 	calendars             map[int64]*store.Calendar
 	addressBooks          map[int64]*store.AddressBook
+	calendarAccess        map[calendarAccessKey]*store.CalendarAccess
 	primaryTarget         *davTarget
+}
+
+// calendarAccessKey names one store-side resolution of a user's access to a
+// calendar, which depends on nothing else.
+type calendarAccessKey struct {
+	calendarID int64
+	userID     int64
 }
 
 type collectionResolutionKey struct {
@@ -43,6 +51,7 @@ func withDAVRequestState(ctx context.Context) context.Context {
 		collectionResolutions: make(map[collectionResolutionKey]collectionResolutionResult),
 		calendars:             make(map[int64]*store.Calendar),
 		addressBooks:          make(map[int64]*store.AddressBook),
+		calendarAccess:        make(map[calendarAccessKey]*store.CalendarAccess),
 	})
 }
 
@@ -64,6 +73,36 @@ func (s *davRequestState) putCalendar(calendar *store.Calendar) {
 	defer s.mu.Unlock()
 	copy := *calendar
 	s.calendars[calendar.ID] = &copy
+}
+
+// memoizedCalendarAccess returns the memoized resolution for key; a nil access
+// with ok set records that the user has none.
+func (s *davRequestState) memoizedCalendarAccess(key calendarAccessKey) (*store.CalendarAccess, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	access, ok := s.calendarAccess[key]
+	if access == nil {
+		return nil, ok
+	}
+	copy := *access
+	return &copy, ok
+}
+
+func (s *davRequestState) memoizeCalendarAccess(key calendarAccessKey, access *store.CalendarAccess) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if access == nil {
+		s.calendarAccess[key] = nil
+		return
+	}
+	copy := *access
+	s.calendarAccess[key] = &copy
 }
 
 func (s *davRequestState) addressBook(id int64) (*store.AddressBook, bool) {
@@ -169,6 +208,7 @@ func invalidateDAVRequestState(ctx context.Context) {
 	state.mu.Lock()
 	state.calendars = make(map[int64]*store.Calendar)
 	state.addressBooks = make(map[int64]*store.AddressBook)
+	state.calendarAccess = make(map[calendarAccessKey]*store.CalendarAccess)
 	state.mu.Unlock()
 	if index := state.currentLockIndex(); index != nil {
 		index.markStale()

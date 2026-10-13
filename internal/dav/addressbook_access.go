@@ -207,7 +207,7 @@ func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.Addre
 		return false, false
 	}
 	decider := newBatchedObjectACLDecider(user, book.UserID, addressBookCollectionResourcePath(book.ID), entriesByPath)
-	granted, denied, _ := decider.decide(resourceName, ".vcf", privilege)
+	granted, denied, _ := decider.decide(resourceName, privilege)
 	return granted, denied
 }
 
@@ -221,13 +221,13 @@ func (h *DavServer) prefetchAddressBookACLEntries(ctx context.Context, user *sto
 	relevantPaths := make([]string, 0, 1+2*len(resourceNames))
 	relevantPaths = append(relevantPaths, collectionPath)
 	for _, resourceName := range resourceNames {
-		relevantPaths = appendObjectACLPaths(relevantPaths, collectionPath, resourceName, ".vcf")
+		relevantPaths = append(relevantPaths, objectACLPaths(collectionPath, resourceName)...)
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
 
 func canReadAddressBookContactWithDecider(resourceName string, decider *batchedObjectACLDecider) bool {
-	allowed, _, _ := decider.decide(resourceName, ".vcf", "read")
+	allowed, _, _ := decider.decide(resourceName, "read")
 	return allowed
 }
 

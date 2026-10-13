@@ -109,6 +109,8 @@ func StoredEventEnd(start *time.Time, startIsDate bool, end *time.Time, hasDurat
 	if hasDuration {
 		return nil
 	}
-	stored := extent.OccurrenceEnd(func(dayStart time.Time) time.Time { return dayStart.AddDate(0, 0, 1) })
+	stored := extent.OccurrenceEnd(func(date time.Time) time.Time {
+		return start.AddDate(0, 0, CivilDaysBetween(CivilDate(*start), date))
+	})
 	return &stored
 }

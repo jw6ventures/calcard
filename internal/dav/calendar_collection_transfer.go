@@ -127,13 +127,13 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			return
 		}
 		for i := range destinationMembers {
-			lockPaths = append(lockPaths, strings.TrimSuffix(destinationPath, "/")+"/"+eventResourceName(destinationMembers[i]))
+			lockPaths = append(lockPaths, strings.TrimSuffix(destinationPath, "/")+"/"+eventResourceName(destinationMembers[i])+".ics")
 		}
 	}
 	if operation == store.CalendarCollectionMove {
 		lockPaths = append(lockPaths, sourcePath, path.Dir(sourcePath))
 		for i := range members {
-			lockPaths = append(lockPaths, strings.TrimSuffix(sourcePath, "/")+"/"+members[i].ResourceName)
+			lockPaths = append(lockPaths, strings.TrimSuffix(sourcePath, "/")+"/"+members[i].ResourceName+".ics")
 		}
 	}
 	if !h.requireLocks(w, r, "resource is locked", lockPaths...) {
@@ -251,15 +251,20 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 	if err != nil {
 		return nil, nil, err
 	}
+	var readDecider *batchedObjectACLDecider
+	if operation == store.CalendarCollectionCopy {
+		entries, err := h.prefetchCalendarACLEntries(r.Context(), user, source.ID, events)
+		if err != nil {
+			return nil, nil, err
+		}
+		readDecider = newBatchedObjectACLDecider(user, source.UserID, calendarCollectionResourcePath(source.ID), entries)
+	}
 	members := make([]store.CalendarCollectionMember, 0, len(events))
 	var failures []calendarCollectionMemberFailure
 	for i := range events {
 		event := &events[i]
 		if operation == store.CalendarCollectionCopy {
-			allowed, denied, err := h.calendarPrivilegeDecision(r.Context(), user, &source.Calendar, calendarObjectConflictHref(source.ID, event), "read")
-			if err != nil {
-				return nil, nil, err
-			}
+			allowed, denied := calendarPrivilegeDecisionWithDecider(source, eventResourceName(*event), "read", readDecider)
 			if !allowed && !denied {
 				allowed = source.EffectivePrivileges().Allows("read")
 			}

@@ -3,6 +3,7 @@ package dav
 import (
 	"net/http"
 	"path"
+	"sync"
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
@@ -29,6 +30,10 @@ type DavServer struct {
 	store    *store.Store
 	registry *Registry
 	log      *logging.Logger
+
+	publishedOnce sync.Once
+	published     authority
+	publishedOK   bool
 }
 
 // NewDavServer creates a DAV server with the Community DAV modules and any

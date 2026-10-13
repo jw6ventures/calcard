@@ -234,10 +234,16 @@ func transferCalendarCollectionTx(ctx context.Context, tx *sql.Tx, transfer Cale
 		// Members move with their octets and ETags, and with their columns set
 		// to what their bodies read as, as a MOVE of one object sets them. Each
 		// row is written once, so its triggers fire as for one write of it.
-		if err := moveEventsWithColumnsTx(ctx, tx, source.ID, moved.ID, transfer.Members); err != nil {
+		if err := deferCalendarCTagTx(ctx, tx, moved.ID, func() error {
+			if err := moveEventsWithColumnsTx(ctx, tx, source.ID, moved.ID, transfer.Members); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `UPDATE events SET calendar_id=$1, last_modified=NOW() WHERE calendar_id=$2`, moved.ID, source.ID)
+			return err
+		}); err != nil {
 			return nil, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE events SET calendar_id=$1, last_modified=NOW() WHERE calendar_id=$2`, moved.ID, source.ID); err != nil {
+		if err := moveTransferredCalendarCTagTx(ctx, tx, moved.ID, len(transfer.Members), destination); err != nil {
 			return nil, err
 		}
 		if err := moveCalendarTreeStateTx(ctx, tx, transfer.SourceStatePath, calendarCollectionStatePath(moved.ID)); err != nil {
@@ -275,23 +281,24 @@ func transferCalendarCollectionTx(ctx context.Context, tx *sql.Tx, transfer Cale
 		if err := moveLockTreeTx(ctx, tx, transfer.DestinationLockPath, calendarCollectionStatePath(copied.ID)); err != nil {
 			return nil, err
 		}
+		written := 0
 		if transfer.Depth == "infinity" {
-			for _, member := range transfer.Members {
-				metadata := calendarCollectionMemberMetadata(member)
-				const insert = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`
-				if _, err := tx.ExecContext(ctx, insert, copied.ID, member.UID, member.ResourceName, member.RawICAL, member.NewETag,
-					metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd,
-					metadata.AllDay, metadata.RecurrenceStart, metadata.RecurrenceUntil); err != nil {
-					return nil, err
-				}
-				if err := copyCalendarDeadPropertiesTx(ctx, tx,
-					calendarCollectionMemberStatePath(transfer.SourceStatePath, member.ResourceName),
-					calendarCollectionMemberStatePath(calendarCollectionStatePath(copied.ID), member.ResourceName)); err != nil {
-					return nil, err
-				}
+			if err := deferCalendarCTagTx(ctx, tx, copied.ID, func() error {
+				return copyEventsTx(ctx, tx, source.ID, copied.ID, transfer.Members)
+			}); err != nil {
+				return nil, err
 			}
+			if err := copyCalendarMemberDeadPropertiesTx(ctx, tx, transfer.SourceStatePath, calendarCollectionStatePath(copied.ID), transfer.Members); err != nil {
+				return nil, err
+			}
+			written = len(transfer.Members)
+		}
+		if err := moveTransferredCalendarCTagTx(ctx, tx, copied.ID, written, destination); err != nil {
+			return nil, err
+		}
+		copied, err = selectCalendarForUpdate(ctx, tx, copied.ID)
+		if err != nil {
+			return nil, err
 		}
 		return &CalendarCollectionTransferResult{Calendar: copied, Created: created}, nil
 	}
@@ -306,35 +313,7 @@ func moveEventsWithColumnsTx(ctx context.Context, tx *sql.Tx, from, to int64, me
 	if len(members) == 0 {
 		return nil
 	}
-	ids := make([]int64, len(members))
-	allDay := make([]bool, len(members))
-	texts := make([][]sql.NullString, 3)
-	times := make([][]sql.NullString, 4)
-	for i := range texts {
-		texts[i] = make([]sql.NullString, len(members))
-	}
-	for i := range times {
-		times[i] = make([]sql.NullString, len(members))
-	}
-	text := func(value *string) sql.NullString {
-		if value == nil {
-			return sql.NullString{}
-		}
-		return sql.NullString{String: *value, Valid: true}
-	}
-	instant := func(value *time.Time) sql.NullString {
-		if value == nil {
-			return sql.NullString{}
-		}
-		return sql.NullString{String: value.UTC().Format(time.RFC3339Nano), Valid: true}
-	}
-	for i, member := range members {
-		metadata := calendarCollectionMemberMetadata(member)
-		ids[i], allDay[i] = member.ID, metadata.AllDay
-		texts[0][i], texts[1][i], texts[2][i] = text(metadata.Summary), text(metadata.Description), text(metadata.Location)
-		times[0][i], times[1][i] = instant(metadata.DTStart), instant(metadata.DTEnd)
-		times[2][i], times[3][i] = instant(metadata.RecurrenceStart), instant(metadata.RecurrenceUntil)
-	}
+	columns := newMemberColumns(members)
 	const update = `
 UPDATE events AS e
 SET calendar_id = $11, summary = m.summary, description = m.description, location = m.location,
@@ -348,10 +327,156 @@ WHERE e.id = m.id AND e.calendar_id = $1
     OR e.dtend IS DISTINCT FROM m.dtend::timestamptz OR e.all_day IS DISTINCT FROM m.all_day
     OR e.recurrence_start IS DISTINCT FROM m.recurrence_start::timestamptz
     OR e.recurrence_until IS DISTINCT FROM m.recurrence_until::timestamptz)`
-	_, err := tx.ExecContext(ctx, update, from, pq.Array(ids),
-		pq.Array(texts[0]), pq.Array(texts[1]), pq.Array(texts[2]), pq.Array(times[0]), pq.Array(times[1]),
-		pq.Array(allDay), pq.Array(times[2]), pq.Array(times[3]), to)
+	_, err := tx.ExecContext(ctx, update, from, pq.Array(columns.ids),
+		pq.Array(columns.summary), pq.Array(columns.description), pq.Array(columns.location), pq.Array(columns.dtstart), pq.Array(columns.dtend),
+		pq.Array(columns.allDay), pq.Array(columns.recurrenceStart), pq.Array(columns.recurrenceUntil), to)
 	return err
+}
+
+// deferCalendarCTagTx runs write, which writes members of calendar calendarID,
+// with their triggers leaving that calendar's CTag alone. The caller moves the
+// CTag itself once write is done, which keeps a write of many members of one
+// calendar linear in their number.
+func deferCalendarCTagTx(ctx context.Context, tx *sql.Tx, calendarID int64, write func() error) error {
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('calcard.defer_calendar_ctag', $1::bigint::text, true)`, calendarID); err != nil {
+		return err
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `SELECT set_config('calcard.defer_calendar_ctag', '', true)`)
+	return err
+}
+
+// moveTransferredCalendarCTagTx moves the CTag of calendar calendarID, which a
+// transfer created and wrote written members into, as far as those member
+// writes would have one by one, and past the CTag of the calendar it replaced
+// at the same location, if any: a client polling that location would otherwise
+// be shown a value it already holds. The update also moves the calendar's sync
+// token past every member stamp, each of which was read from the clock before
+// it.
+func moveTransferredCalendarCTagTx(ctx context.Context, tx *sql.Tx, calendarID int64, written int, replaced *Calendar) error {
+	floor := int64(0)
+	if replaced != nil {
+		floor = replaced.CTag + 1
+	}
+	if written == 0 && floor == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE calendars SET ctag = GREATEST(ctag + $2, $3) WHERE id = $1`, calendarID, written, floor)
+	return err
+}
+
+// copyEventsTx inserts, in one statement, a copy of each of members into
+// calendar to, under its new ETag and with its columns set to what its body
+// reads as. The body is read from the member's row in from, which the caller
+// has locked and checked against the member.
+func copyEventsTx(ctx context.Context, tx *sql.Tx, from, to int64, members []CalendarCollectionMember) error {
+	if len(members) == 0 {
+		return nil
+	}
+	columns := newMemberColumns(members)
+	uids := make([]string, len(members))
+	names := make([]string, len(members))
+	etags := make([]string, len(members))
+	for i, member := range members {
+		uids[i], names[i], etags[i] = member.UID, member.ResourceName, member.NewETag
+	}
+	const insert = `
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+SELECT $1, m.uid, m.resource_name, e.raw_ical, m.etag, m.summary, m.description, m.location,
+       m.dtstart::timestamptz, m.dtend::timestamptz, m.all_day, m.recurrence_start::timestamptz, m.recurrence_until::timestamptz, NOW()
+FROM unnest($3::bigint[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::boolean[], $13::text[], $14::text[])
+    WITH ORDINALITY AS m(id, uid, resource_name, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, position)
+JOIN events e ON e.id = m.id AND e.calendar_id = $2
+ORDER BY m.position`
+	result, err := tx.ExecContext(ctx, insert, to, from, pq.Array(columns.ids), pq.Array(uids), pq.Array(names), pq.Array(etags),
+		pq.Array(columns.summary), pq.Array(columns.description), pq.Array(columns.location), pq.Array(columns.dtstart), pq.Array(columns.dtend),
+		pq.Array(columns.allDay), pq.Array(columns.recurrenceStart), pq.Array(columns.recurrenceUntil))
+	if err != nil {
+		return err
+	}
+	copied, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if copied != int64(len(members)) {
+		return ErrResourceStateChanged
+	}
+	return nil
+}
+
+// copyCalendarMemberDeadPropertiesTx copies, in one statement, each member's
+// dead properties from beneath fromRoot to the same name beneath toRoot, as
+// copyCalendarDeadPropertiesTx copies one resource's.
+func copyCalendarMemberDeadPropertiesTx(ctx context.Context, tx *sql.Tx, fromRoot, toRoot string, members []CalendarCollectionMember) error {
+	var toPaths, fromPaths, exactPaths []string
+	for _, member := range members {
+		fromPath := calendarCollectionMemberStatePath(fromRoot, member.ResourceName)
+		toPath := calendarCollectionMemberStatePath(toRoot, member.ResourceName)
+		for _, spelling := range davStatePaths(fromPath) {
+			toPaths = append(toPaths, toPath)
+			fromPaths = append(fromPaths, spelling)
+			exactPaths = append(exactPaths, fromPath)
+		}
+	}
+	if len(toPaths) == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at)
+SELECT DISTINCT ON (m.to_path, d.namespace_uri, d.local_name) m.to_path, d.namespace_uri, d.local_name, d.inner_xml, NOW(), NOW()
+FROM unnest($1::text[], $2::text[], $3::text[]) AS m(to_path, from_path, exact_path)
+JOIN dav_dead_properties d ON d.resource_path = m.from_path
+ORDER BY m.to_path, d.namespace_uri, d.local_name, CASE WHEN d.resource_path = m.exact_path THEN 0 ELSE 1 END, d.updated_at DESC`,
+		pq.Array(toPaths), pq.Array(fromPaths), pq.Array(exactPaths))
+	return err
+}
+
+// memberColumns holds, one array per column, the row ids of members and the
+// columns their bodies read as, for a statement that writes them all at once.
+type memberColumns struct {
+	ids                              []int64
+	allDay                           []bool
+	summary, description, location   []sql.NullString
+	dtstart, dtend                   []sql.NullString
+	recurrenceStart, recurrenceUntil []sql.NullString
+}
+
+func newMemberColumns(members []CalendarCollectionMember) memberColumns {
+	columns := memberColumns{
+		ids:             make([]int64, len(members)),
+		allDay:          make([]bool, len(members)),
+		summary:         make([]sql.NullString, len(members)),
+		description:     make([]sql.NullString, len(members)),
+		location:        make([]sql.NullString, len(members)),
+		dtstart:         make([]sql.NullString, len(members)),
+		dtend:           make([]sql.NullString, len(members)),
+		recurrenceStart: make([]sql.NullString, len(members)),
+		recurrenceUntil: make([]sql.NullString, len(members)),
+	}
+	for i, member := range members {
+		metadata := calendarCollectionMemberMetadata(member)
+		columns.ids[i], columns.allDay[i] = member.ID, metadata.AllDay
+		columns.summary[i], columns.description[i], columns.location[i] = nullableText(metadata.Summary), nullableText(metadata.Description), nullableText(metadata.Location)
+		columns.dtstart[i], columns.dtend[i] = nullableInstant(metadata.DTStart), nullableInstant(metadata.DTEnd)
+		columns.recurrenceStart[i], columns.recurrenceUntil[i] = nullableInstant(metadata.RecurrenceStart), nullableInstant(metadata.RecurrenceUntil)
+	}
+	return columns
+}
+
+func nullableText(value *string) sql.NullString {
+	if value == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *value, Valid: true}
+}
+
+func nullableInstant(value *time.Time) sql.NullString {
+	if value == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: value.UTC().Format(time.RFC3339Nano), Valid: true}
 }
 
 func selectCalendarForUpdate(ctx context.Context, tx *sql.Tx, id int64) (*Calendar, error) {

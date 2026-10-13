@@ -234,7 +234,7 @@ func applyEventMetadataProperty(metadata *store.EventWriteMetadata, times *ical.
 				return
 			}
 			metadata.DTStart = &parsed
-			metadata.AllDay = len(strings.TrimSpace(value)) == len("20060102") || ical.PropertyParamEquals(keyPart, "VALUE", "DATE")
+			metadata.AllDay = len(strings.TrimSpace(value)) == len(ical.DateLayout) || ical.PropertyParamEquals(keyPart, "VALUE", "DATE")
 		}
 	case "DTEND":
 		if metadata.DTEnd == nil {

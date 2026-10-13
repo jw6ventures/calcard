@@ -226,7 +226,7 @@ func (h *DavServer) reportACLPrincipalPropSet(w http.ResponseWriter, r *http.Req
 		}
 		return
 	}
-	allowed, err := h.checkACLPrivilege(r.Context(), user, canonicalPath, "read-acl")
+	allowed, err := h.checkACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "read-acl")
 	if err != nil {
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 		return

@@ -6442,35 +6442,101 @@ func deleteOccurrenceRequest(t *testing.T, uid string, form url.Values) *http.Re
 	return req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100}), chi.RouteCtxKey, rctx))
 }
 
-// A stored series the validator already refuses can still lose an occurrence:
-// the edit form refuses every change to it, and removing an occurrence leaves
-// the data no worse than it was, so without this the only way out would be
-// deleting the whole series.
-func TestDeleteOccurrenceOfAStoredSeriesTheValidatorRefuses(t *testing.T) {
+// zonedSeries is a weekly series at 09:00 in New York as the validator stores
+// it, with the definition of America/New_York the server writes.
+func zonedSeries(t *testing.T) string {
+	t.Helper()
+	object, err := dav.ValidateCalendarObject("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n"+
+		"BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Series\r\n"+
+		"DTSTART;TZID=America/New_York:20260105T090000\r\nDTEND;TZID=America/New_York:20260105T100000\r\n"+
+		"RRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", nil)
+	if err != nil {
+		t.Fatalf("the zoned series should pass the validator: %v", err)
+	}
+	if !strings.Contains(object.Body, "TZID:America/New_York") {
+		t.Fatalf("the validator wrote no definition of America/New_York:\n%s", object.Body)
+	}
+	return object.Body
+}
+
+// Removing an occurrence is a write like any other: the result goes through
+// the validator, which stores the definitions of the zones it uses and the
+// metadata it derives.
+func TestDeleteOccurrenceStoresTheValidatedResult(t *testing.T) {
+	original := zonedSeries(t)
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
 	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
-		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: seriesWithBackwardsOverride, ETag: "e"},
+		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: original, ETag: "e"},
 	}}}
 	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	w := httptest.NewRecorder()
 	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
 		"recurrence_id":       {"2026-01-19T09:00"},
-		"recurrence_timezone": {"UTC"},
+		"recurrence_timezone": {"America/New_York"},
 	}))
 
 	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=occurrence_deleted") {
 		t.Fatalf("DeleteEvent() status = %d location = %s", w.Code, location)
 	}
 	stored := eventRepo.events["1:series"]
-	if !strings.Contains(stored.RawICAL, "EXDATE:20260119T090000Z\r\n") {
+	if !strings.Contains(stored.RawICAL, "EXDATE;TZID=America/New_York:20260119T090000\r\n") {
 		t.Fatalf("the occurrence was not removed:\n%s", stored.RawICAL)
 	}
-	if stored.ResourceName != "series.ics" || stored.ETag != utils.GenerateETag(stored.RawICAL) {
-		t.Errorf("stored resource name %q etag %q, want the existing name and the new data's etag", stored.ResourceName, stored.ETag)
+	if !strings.Contains(stored.RawICAL, "TZID:America/New_York") {
+		t.Errorf("the stored result lacks the definition of the zone it uses:\n%s", stored.RawICAL)
 	}
-	if stored.WriteMetadata != nil {
-		t.Errorf("stored metadata %+v for data the validator did not analyse, want the store to derive it", stored.WriteMetadata)
+	if _, err := dav.ValidateCalendarObject(stored.RawICAL, nil); err != nil {
+		t.Errorf("the stored result fails the validator: %v\n%s", err, stored.RawICAL)
+	}
+	if stored.ResourceName != "series.ics" || stored.ETag != utils.GenerateETag(stored.RawICAL) || stored.WriteMetadata == nil {
+		t.Errorf("stored resource name %q etag %q metadata %+v, want the existing name, the new data's etag and the validator's metadata",
+			stored.ResourceName, stored.ETag, stored.WriteMetadata)
+	}
+}
+
+// A stored series the validator refuses cannot lose an occurrence either,
+// since that would store data no CalDAV client could have written: the user is
+// told why, as an edit of it is, and what can still be done, and the series is
+// left as it is.
+func TestDeleteOccurrenceOfAStoredSeriesTheValidatorRefusesIsRefused(t *testing.T) {
+	tests := map[string]struct {
+		raw, recurrenceID, timezone string
+	}{
+		"override ending before it starts": {seriesWithBackwardsOverride, "2026-01-19T09:00", "UTC"},
+		"zoned series with a line that is not a content line": {
+			strings.Replace(zonedSeries(t), "SUMMARY:Series\r\n", "SUMMARY:Series\r\nNotes pasted without a property name\r\n", 1),
+			"2026-01-19T09:00", "America/New_York",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := dav.ValidateCalendarObject(tt.raw, nil); err == nil {
+				t.Fatal("the validator accepts the stored series, so it does not exercise a refused one")
+			}
+			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+				"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: tt.raw, ETag: "e"},
+			}}}
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			w := httptest.NewRecorder()
+			handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
+				"recurrence_id":       {tt.recurrenceID},
+				"recurrence_timezone": {tt.timezone},
+			}))
+
+			location, err := url.Parse(w.Header().Get("Location"))
+			if err != nil {
+				t.Fatalf("DeleteEvent() Location: %v", err)
+			}
+			if got, want := location.Query().Get("error"), "the occurrence could not be deleted: its calendar data is not valid iCalendar; the whole series can still be deleted"; got != want {
+				t.Fatalf("DeleteEvent() error = %q, want %q", got, want)
+			}
+			if stored := eventRepo.events["1:series"]; stored.RawICAL != tt.raw || stored.ETag != "e" {
+				t.Errorf("the refused result was stored:\n%s", stored.RawICAL)
+			}
+		})
 	}
 }
 

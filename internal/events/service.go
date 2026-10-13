@@ -18,12 +18,11 @@ import (
 const MaxBodyBytes int64 = 10 * 1024 * 1024
 
 var (
-	ErrNotFound             = errors.New("not found")
-	ErrForbidden            = errors.New("forbidden")
-	ErrBadRequest           = errors.New("bad request")
-	ErrConflict             = errors.New("conflict")
-	ErrPreconditionFailed   = errors.New("precondition failed")
-	ErrUnsupportedMediaType = errors.New("unsupported media type")
+	ErrNotFound           = errors.New("not found")
+	ErrForbidden          = errors.New("forbidden")
+	ErrBadRequest         = errors.New("bad request")
+	ErrConflict           = errors.New("conflict")
+	ErrPreconditionFailed = errors.New("precondition failed")
 )
 
 type Service struct {
@@ -75,7 +74,6 @@ type StructuredInput struct {
 type UpsertInput struct {
 	Structured  *StructuredInput
 	RawICS      string
-	ContentType string
 	IfMatch     string
 	IfNoneMatch string
 }
@@ -342,38 +340,38 @@ func (s *Service) GetEvent(ctx context.Context, user *store.User, calendarID int
 	return ev, nil
 }
 
-func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID int64, input UpsertInput) (*store.Event, bool, error) {
+func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID int64, input UpsertInput) (*store.Event, error) {
 	cal, err := s.GetCalendar(ctx, user, calendarID)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	// DAV:bind is a privilege on the calendar (RFC 3744 §3.9), checked before
 	// the body is built and validated, as a DAV PUT checks it: a principal who
 	// may not add to the calendar cannot make the server spend that work. A
 	// create never lands on a stored object, so no object ACE bears on it.
 	if err := s.requireCalendarPrivilege(ctx, user, cal, "", "bind"); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	object, err := s.normalizeEventPayload(input, "", cal)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	uid := object.UID
 	// The UID is also the resource name; both are unique index keys, whose
 	// entries PostgreSQL bounds in size.
 	if len(uid) > store.MaxIdentifierOctets {
-		return nil, false, fmt.Errorf("%w: uid must be at most %d octets", ErrBadRequest, store.MaxIdentifierOctets)
+		return nil, fmt.Errorf("%w: uid must be at most %d octets", ErrBadRequest, store.MaxIdentifierOctets)
 	}
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
+		return nil, ErrPreconditionFailed
 	}
 	if existing != nil {
-		return nil, false, ErrConflict
+		return nil, ErrConflict
 	}
 
 	// The store re-checks, inside its write transaction, that nothing holds
@@ -393,17 +391,17 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	switch {
 	case errors.Is(err, store.ErrResourceStateChanged):
 		if input.IfNoneMatch == "*" {
-			return nil, false, ErrPreconditionFailed
+			return nil, ErrPreconditionFailed
 		}
-		return nil, false, ErrConflict
+		return nil, ErrConflict
 	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
-		return nil, false, ErrConflict
+		return nil, ErrConflict
 	case err != nil:
-		return nil, false, err
+		return nil, err
 	case result == nil || result.Event == nil:
-		return nil, false, fmt.Errorf("calendar object write returned no event for %q in calendar %d", uid, calendarID)
+		return nil, fmt.Errorf("calendar object write returned no event for %q in calendar %d", uid, calendarID)
 	}
-	return result.Event, true, nil
+	return result.Event, nil
 }
 
 func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID int64, uid string, input UpsertInput) (*store.Event, bool, error) {
@@ -850,9 +848,6 @@ func (s *Service) normalizeEventPayload(input UpsertInput, expectedUID string, c
 	var body string
 	switch {
 	case strings.TrimSpace(input.RawICS) != "":
-		if err := validateCalendarContentType(input.ContentType); err != nil {
-			return nil, err
-		}
 		body = ensureCRLF(strings.TrimSpace(input.RawICS))
 	case input.Structured != nil:
 		built, _, err := buildStructuredEvent(input.Structured, expectedUID)
@@ -1015,17 +1010,6 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	return body, uid, nil
 }
 
-func validateCalendarContentType(contentType string) error {
-	contentType = strings.ToLower(strings.TrimSpace(contentType))
-	if contentType == "" {
-		return fmt.Errorf("%w: missing content type", ErrUnsupportedMediaType)
-	}
-	if strings.HasPrefix(contentType, "text/calendar") || strings.HasPrefix(contentType, "application/ical") || strings.HasPrefix(contentType, "application/ics") {
-		return nil
-	}
-	return fmt.Errorf("%w: unsupported content type", ErrUnsupportedMediaType)
-}
-
 func checkConditionalHeaders(ifMatch, ifNoneMatch string, existing *store.Event) bool {
 	if ifNoneMatch == "*" {
 		return existing == nil
@@ -1062,8 +1046,6 @@ func StatusCode(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, ErrPreconditionFailed):
 		return http.StatusPreconditionFailed
-	case errors.Is(err, ErrUnsupportedMediaType):
-		return http.StatusUnsupportedMediaType
 	case errors.Is(err, ErrBadRequest):
 		return http.StatusBadRequest
 	default:

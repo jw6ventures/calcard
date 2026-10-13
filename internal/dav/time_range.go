@@ -94,28 +94,19 @@ func (z floatingZone) resolve(value string) (time.Time, bool) {
 	return wall, true
 }
 
-// addDays advances by a nominal number of days: the same wall-clock time on a
-// later date rather than a fixed multiple of 24 hours, which is what the +P1D
-// the §9.9 tables imply for a DATE value means across a zone transition.
-//
-// The submitted observances answer here for the same reason they answer in
-// resolve. Reading them for the offset and then doing the arithmetic in UTC
-// would put the two on different zones, and the day that spans a transition --
-// the only day whose length this function exists to get right -- is exactly
-// where they would disagree.
-func (z floatingZone) addDays(instant time.Time, days int) time.Time {
-	if offset, ok := observanceOffsetAtInstant(z.observances, instant); ok {
-		wall := instant.Add(offset).UTC().AddDate(0, 0, days)
-		if shifted, ok := observanceOffsetAtWall(z.observances, wall); ok {
-			return wall.Add(-shifted).UTC()
+// resolveWall is resolve for a floating wall clock already read, held as the
+// UTC time with the same fields.
+func (z floatingZone) resolveWall(wall time.Time) time.Time {
+	if z.loc != nil {
+		if z.loc == time.UTC {
+			return wall
 		}
+		return ical.WallClockIn(z.loc, wall).UTC()
 	}
-	if z.loc == nil {
-		return instant.AddDate(0, 0, days)
+	if offset, ok := observanceOffsetAtWall(z.observances, wall); ok {
+		return wall.Add(-offset).UTC()
 	}
-	local := instant.In(z.loc)
-	wall := time.Date(local.Year(), local.Month(), local.Day()+days, local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), time.UTC)
-	return ical.WallClockIn(z.loc, wall).UTC()
+	return wall
 }
 
 // wallClock renders an instant as the wall-clock reading in the zone, which is
@@ -135,6 +126,10 @@ func (z floatingZone) wallClock(instant time.Time) time.Time {
 type icalTimeValue struct {
 	instant time.Time
 	isDate  bool
+	// date is the date a DATE value names, as its UTC midnight; tzid the
+	// zone its property names, which resolves it.
+	date time.Time
+	tzid string
 }
 
 // calendarTimeRangeMatcher evaluates RFC 4791 §9.9 against one calendar object
@@ -165,6 +160,9 @@ type calendarTimeRangeMatcher struct {
 type matcherIndexes struct {
 	overrides map[recurrenceOverrideIndexKey]recurrenceOverrideIndex
 	masters   map[*icalNode]map[string]*icalNode
+	// series holds each recurrence set expanded over a range, with what the
+	// expansion found of its RANGE=THISANDFUTURE overrides.
+	series map[seriesRangeKey]*seriesExpansion
 	// observances is the definition the resource ships for each TZID asked
 	// about, nil for one it ships none of. A matcher serves one request on
 	// one goroutine, so it needs none of the locking the parsed tree's own
@@ -231,11 +229,66 @@ func (m calendarTimeRangeMatcher) dateValue(node *icalNode, name string, shift i
 	if !ok {
 		return icalTimeValue{}, false
 	}
-	instant, ok := m.resolveInstant(property.parameters["TZID"], value, form)
+	tzid := property.parameters["TZID"]
+	instant, ok := m.resolveInstant(tzid, value, form)
 	if !ok {
 		return icalTimeValue{}, false
 	}
-	return icalTimeValue{instant: shift.apply(instant), isDate: form == icalDateOnly}, true
+	resolved := icalTimeValue{instant: shift.apply(instant), isDate: form == icalDateOnly, tzid: tzid}
+	if resolved.isDate {
+		resolved.date, _ = ical.DateOf(value)
+		if shift != noShift {
+			resolved.date = m.LocalDate(tzid, resolved.instant)
+		}
+	}
+	return resolved, true
+}
+
+// dateMidnight is the instant date begins where value, a DATE, is read: the
+// midnight a DATE naming date resolves to in the zone value's TZID names, else
+// the matcher's, as RFC 4791 §9.9 places one. An all-day occurrence spans the
+// dates from its own to the one its length counts on, each placed here,
+// however many hours they hold -- 23 or 25 where the zone changes offset, none
+// for a date it skips -- and wherever the zone's day begins on a date whose
+// clocks change at midnight.
+func (m calendarTimeRangeMatcher) dateMidnight(value icalTimeValue, date time.Time) time.Time {
+	return m.midnight(value.tzid, date)
+}
+
+// DateMidnight is the instant date begins where a DATE property carrying the
+// TZID tzid is read, as ResolvePropertyTime reads one naming date. It is the
+// ical.DateMidnightResolver a recurrence expansion places the days of an
+// all-day series through, once for each date it reaches.
+func (m calendarTimeRangeMatcher) DateMidnight(tzid string, date time.Time) time.Time {
+	return m.midnight(tzid, date)
+}
+
+// midnight is resolveInstant for a DATE naming date in the zone tzid names,
+// read from its fields rather than its spelling.
+func (m calendarTimeRangeMatcher) midnight(tzid string, date time.Time) time.Time {
+	if tzid = strings.TrimSpace(tzid); tzid != "" {
+		if instant, ok := zonedWallInstant(m.timezoneObservances(tzid), tzid, date); ok {
+			return instant
+		}
+	}
+	return m.zone.resolveWall(date)
+}
+
+// LocalDate is the date instant falls on, as its UTC midnight: its wall
+// clock's date in the zone resolveInstant reads the TZID tzid through -- the
+// definition the resource ships, else the host's -- and in the matcher's zone
+// for an empty tzid or one neither defines. It is the ical.LocalDateReader a
+// recurrence expansion dates its slots by.
+func (m calendarTimeRangeMatcher) LocalDate(tzid string, instant time.Time) time.Time {
+	if tzid = strings.TrimSpace(tzid); tzid != "" {
+		if offset, ok := observanceOffsetAtInstant(m.timezoneObservances(tzid), instant); ok {
+			return ical.CivilDate(instant.Add(offset).UTC())
+		}
+		if loc, ok := ical.HostLocation(tzid); ok {
+			return ical.CivilDate(instant.In(loc))
+		}
+	}
+	return ical.CivilDate(m.zone.wallClock(instant))
 }
 
 func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDateForm) (time.Time, bool) {
@@ -393,11 +446,17 @@ func (m calendarTimeRangeMatcher) recurrenceMaster(node, parent *icalNode) *ical
 // master's DTSTART: where the occurrence falls, and which slot of the pattern it
 // belongs to. The two differ only when a RANGE=THISANDFUTURE override moved it,
 // and a caller writing a RECURRENCE-ID out needs the slot rather than the
-// occurrence (RFC 5545 §3.8.4.4).
+// occurrence (RFC 5545 §3.8.4.4). Where either starts on a DATE, it is named
+// by its date instead, as ical.RecurrenceInstance has it: slotDate is the date
+// a slot of a DATE series names, and startDate and days the date an
+// occurrence of DATE content starts on and the days it spans.
 type recurrenceInstance struct {
 	shift     instantShift
 	slotShift instantShift
 	duration  time.Duration
+	slotDate  time.Time
+	startDate time.Time
+	days      int
 }
 
 // openTimeRangeEnd reports whether the end of a range is the +infinity RFC 4791
@@ -411,18 +470,128 @@ func openTimeRangeEnd(end time.Time) bool {
 	return end.After(maxTime)
 }
 
-// recurrenceInstances collects every instance visitRecurrenceInstances visits,
-// for a caller that owes the whole set rather than one instance of it.
-func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, start, end time.Time) (_ []recurrenceInstance, expandable, settled bool) {
-	var instances []recurrenceInstance
-	expandable, settled = m.visitRecurrenceInstances(node, master, start, end, func(instance recurrenceInstance) bool {
-		instances = append(instances, instance)
+// seriesRangeKey names one recurrence set expanded over one range.
+type seriesRangeKey struct {
+	master     *icalNode
+	start, end time.Time
+}
+
+// seriesExpansion is every instance of a recurrence set over [start, end], as
+// visitRecurrenceInstances reports them, for a caller that owes the whole set
+// rather than one instance of it, and what the expansion found of each of the
+// set's RANGE=THISANDFUTURE overrides. settled is false as well when the slot
+// of an override the range places is left unanswered, since the set may then
+// leave that override standing for itself, which a caller owing the whole set
+// cannot rule out.
+type seriesExpansion struct {
+	start, end          time.Time
+	instances           []recurrenceInstance
+	expandable, settled bool
+	thisAndFuture       map[*icalNode]*thisAndFutureSlot
+}
+
+// thisAndFutureSlot is what an expansion over a range found of one
+// RANGE=THISANDFUTURE override: whether the set generates the slot its
+// RECURRENCE-ID names, which carries the override, and, once read, whether
+// the range places it. An answer of ical.RecurrenceSlotNotGenerated alone
+// says the set carries no instance of it; every other answer is read as
+// carried.
+type thisAndFutureSlot struct {
+	override          recurrenceOverride
+	answer            ical.RecurrenceSlotAnswer
+	placed, readPlace bool
+}
+
+// standsAlone reports whether override is a RANGE=THISANDFUTURE override of
+// series that stands for itself in the range series was expanded over: the
+// range places it, by the §9.9 test of its own component, and the set does
+// not carry it. One naming a slot the set never generates -- a wall clock its
+// zone skips, or a date its EXDATEs leave out -- is carried by no instance,
+// and stands for itself as calendar-query and free-busy read it.
+func (m calendarTimeRangeMatcher) standsAlone(root *icalNode, series *seriesExpansion, override *icalNode) bool {
+	slot, ok := series.thisAndFuture[override]
+	return ok && slot.answer == ical.RecurrenceSlotNotGenerated && m.slotPlaced(root, series, slot)
+}
+
+// slotPlaced reports whether the §9.9 test of the override's own component
+// places it in the range series was expanded over, reading it once; one of a
+// component §9.9 defines no test for is placed in every range. A VEVENT
+// starting at or after the range's end is passed over before its end is read.
+func (m calendarTimeRangeMatcher) slotPlaced(root *icalNode, series *seriesExpansion, slot *thisAndFutureSlot) bool {
+	if slot.readPlace {
+		return slot.placed
+	}
+	slot.readPlace = true
+	start, end := series.start, series.end
+	switch override := slot.override; {
+	case !calendarTimeRangeComponents.contains(override.node.name):
+		slot.placed = true
+	case override.node.name != "VEVENT":
+		slot.placed = m.componentInTimeRange(override.node, root, start, end, noShift)
+	default:
+		if dtstart, ok := overrideStart(m, override); ok && dtstart.instant.Before(end) {
+			slot.placed = periodInTimeRange(dtstart.instant, m.eventOccurrenceEnd(override.node, dtstart, noShift), start, end)
+		}
+	}
+	return slot.placed
+}
+
+// expandSeries is master's recurrence set, root's master of its type,
+// expanded over [start, end], once per matcher however many components ask.
+// The expansion's walk is widened by as far as the RANGE=THISANDFUTURE
+// overrides move their instances, so it passes the slot every override it
+// places in the range names and answers whether the set carries it. One it
+// does not pass is looked up, on the walk's work budget, only when the range
+// places it, the one case a caller writing it out has to know; the slot of
+// one the walk passes is matched without the override's own dates being read.
+func (m calendarTimeRangeMatcher) expandSeries(root, master *icalNode, start, end time.Time) *seriesExpansion {
+	key := seriesRangeKey{master: master, start: start, end: end}
+	if m.indexes != nil {
+		if expanded, ok := m.indexes.series[key]; ok {
+			return expanded
+		}
+	}
+	// The override index reads every override's RECURRENCE-ID, which a set
+	// carrying none of RANGE=THISANDFUTURE has no question to spend on.
+	var overrides []recurrenceOverride
+	for _, child := range root.children {
+		if child.name == master.name && thisAndFutureOverride(child) {
+			overrides = m.overrideIndex(root, master).thisAndFuture
+			break
+		}
+	}
+	expanded := &seriesExpansion{start: start, end: end, thisAndFuture: make(map[*icalNode]*thisAndFutureSlot, len(overrides))}
+	slots := make([]*thisAndFutureSlot, len(overrides))
+	ids := make([]ical.RecurrenceSlotID, len(overrides))
+	for i, override := range overrides {
+		slots[i] = &thisAndFutureSlot{override: override}
+		ids[i] = ical.RecurrenceSlotID{Instant: override.recurrenceID, Date: override.date}
+		if _, seen := expanded.thisAndFuture[override.node]; !seen {
+			expanded.thisAndFuture[override.node] = slots[i]
+		}
+	}
+	placed := func(i int) bool { return m.slotPlaced(root, expanded, slots[i]) }
+	var answers []ical.RecurrenceSlotAnswer
+	answers, expanded.expandable, expanded.settled = m.visitRecurrenceSet(master, master, start, end, ids, placed, func(instance recurrenceInstance) bool {
+		expanded.instances = append(expanded.instances, instance)
 		return false
 	})
-	if !expandable {
-		return nil, false, false
+	if !expanded.expandable {
+		expanded.instances, expanded.settled = nil, false
 	}
-	return instances, true, settled
+	for i, answer := range answers {
+		slots[i].answer = answer
+		if answer == ical.RecurrenceSlotUnanswered {
+			expanded.settled = false
+		}
+	}
+	if m.indexes != nil {
+		if m.indexes.series == nil {
+			m.indexes.series = make(map[seriesRangeKey]*seriesExpansion)
+		}
+		m.indexes.series[key] = expanded
+	}
+	return expanded
 }
 
 // visitRecurrenceInstances hands visit each instance of the recurrence set that
@@ -432,17 +601,32 @@ func (m calendarTimeRangeMatcher) recurrenceInstances(node, master *icalNode, st
 // part of the set and none of them ended the visit, which a caller deciding a
 // §9.9 match has to read as "no answer" rather than "no match".
 func (m calendarTimeRangeMatcher) visitRecurrenceInstances(node, master *icalNode, start, end time.Time, visit func(recurrenceInstance) bool) (expandable, settled bool) {
+	_, expandable, settled = m.visitRecurrenceSet(node, master, start, end, nil, nil, visit)
+	return expandable, settled
+}
+
+// visitRecurrenceSet is visitRecurrenceInstances, answering as well, per
+// ical.VisitRecurrenceInstancesAndSlots, whether master's recurrence set
+// generates the slot each of ids names, looking up one its walk does not pass
+// only when needed has it. A set this server cannot enumerate is read as the
+// expansion reads one, as its DTSTART and RDATEs alone, and one without a
+// start answers nothing, leaving answers short of ids.
+func (m calendarTimeRangeMatcher) visitRecurrenceSet(node, master *icalNode, start, end time.Time, ids []ical.RecurrenceSlotID, needed func(int) bool, visit func(recurrenceInstance) bool) (answers []ical.RecurrenceSlotAnswer, expandable, settled bool) {
 	if master == nil {
 		visit(recurrenceInstance{})
-		return true, true
-	}
-	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
-		return false, false
+		return nil, true, true
 	}
 	dtstart, ok := m.dateValue(master, "DTSTART", noShift)
+	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
+		if ok && len(ids) > 0 {
+			answers, _ = ical.VisitRecurrenceInstancesAndSlots(m.raw, master.name, dtstart.instant, m.occurrenceWindow(master, dtstart),
+				start, end, ical.MaxRecurrenceInstances+2, m, ids, needed, func(ical.RecurrenceInstance) bool { return false })
+		}
+		return answers, false, false
+	}
 	if !ok {
 		visit(recurrenceInstance{})
-		return true, true
+		return nil, true, true
 	}
 	window := m.occurrenceWindow(master, dtstart)
 	scanStart, scanEnd := start, end
@@ -451,13 +635,16 @@ func (m calendarTimeRangeMatcher) visitRecurrenceInstances(node, master *icalNod
 	}
 	// Inclusive candidate bounds can add an instance at each endpoint that the
 	// component-specific test excludes. The output budget is checked after that test.
-	err := ical.VisitRecurrenceInstances(m.raw, master.name, dtstart.instant, window,
-		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m,
+	answers, err := ical.VisitRecurrenceInstancesAndSlots(m.raw, master.name, dtstart.instant, window,
+		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m, ids, needed,
 		func(instance ical.RecurrenceInstance) bool {
 			return visit(recurrenceInstance{
 				shift:     shiftBetween(dtstart.instant, instance.Start),
 				slotShift: shiftBetween(dtstart.instant, instance.RecurrenceID),
 				duration:  instance.End.Sub(instance.Start),
+				slotDate:  instance.RecurrenceDate,
+				startDate: instance.StartDate,
+				days:      instance.Days,
 			})
 		})
 	// Exhausting the budget is not a failure of the report. The instances
@@ -472,13 +659,13 @@ func (m calendarTimeRangeMatcher) visitRecurrenceInstances(node, master *icalNod
 	truncated := errors.Is(err, ical.ErrRecurrenceExpansionLimit)
 	if err != nil && !truncated {
 		*m.expansionError = err
-		return false, false
+		return answers, false, false
 	}
 	// A truncated set settles a match it contains. Whether it settles the
 	// absence of one is the caller's question, and truncated is what tells it
 	// apart: §9.9 needs only one instance, while the §9.6.5 expansion owes the
 	// whole set and refuses the resource on the same signal.
-	return true, !truncated
+	return answers, true, !truncated
 }
 
 // alarmScanLead is how far outside the requested range an instance can start
@@ -538,7 +725,27 @@ func (m calendarTimeRangeMatcher) hasRecurrenceSet(node *icalNode) bool {
 // recurrence scan. It is deliberately the widest reading each component admits,
 // because the exact §9.9 condition is applied to every candidate afterwards.
 // A VEVENT's is the extent eventOccurrenceEnd gives it.
+//
+// An occurrence starting on a DATE spans whole days, and its window is those
+// days at 24 hours each: ical's recurrence expansion reads the count from it
+// and spans each instance of a DATE series that many dates from its own. A
+// VTODO counts them to the date of its DUE, else in the days its DURATION
+// reaches into, as an event does.
 func (m calendarTimeRangeMatcher) occurrenceWindow(node *icalNode, dtstart icalTimeValue) time.Duration {
+	if dtstart.isDate {
+		days := 1
+		switch node.name {
+		case "VEVENT":
+			days = m.eventEnd(node, dtstart, noShift).Days()
+		case "VTODO":
+			if due, ok := m.dateValue(node, "DUE", noShift); ok && due.isDate && !due.date.Before(dtstart.date) {
+				days = ical.CivilDaysBetween(dtstart.date, due.date)
+			} else if d, ok := componentDuration(node, "DURATION"); ok && d >= 0 {
+				days = ical.DurationDays(d)
+			}
+		}
+		return time.Duration(days) * 24 * time.Hour
+	}
 	switch node.name {
 	case "VEVENT":
 		return m.eventOccurrenceEnd(node, dtstart, noShift).Sub(dtstart.instant)
@@ -552,12 +759,8 @@ func (m calendarTimeRangeMatcher) occurrenceWindow(node *icalNode, dtstart icalT
 	if d, ok := componentDuration(node, "DURATION"); ok && d >= 0 {
 		return d
 	}
-	if dtstart.isDate {
-		return m.zone.addDays(dtstart.instant, 1).Sub(dtstart.instant)
-	}
 	return 0
 }
-
 func (m calendarTimeRangeMatcher) componentInTimeRange(node, parent *icalNode, start, end time.Time, shift instantShift) bool {
 	switch node.name {
 	case "VEVENT":
@@ -588,17 +791,18 @@ func (m calendarTimeRangeMatcher) eventInTimeRange(node *icalNode, start, end ti
 // eventEnd is what a VEVENT starting at dtstart writes about where it ends,
 // its DTEND moved by shift, for ical.EventEnd to read. An override writing
 // neither DTEND nor DURATION lasts as long as an occurrence of its series,
-// read from the resource's master as the recurrence expansion reads it.
+// read from the resource's master as the recurrence expansion reads it, when
+// ical.EventEnd.InheritSeriesLength gives it that length.
 func (m calendarTimeRangeMatcher) eventEnd(node *icalNode, dtstart icalTimeValue, shift instantShift) ical.EventEnd {
-	extent := ical.EventEnd{Start: dtstart.instant, StartIsDate: dtstart.isDate}
+	extent := ical.EventEnd{Start: dtstart.instant, StartIsDate: dtstart.isDate, StartDate: dtstart.date}
 	if dtend, ok := m.dateValue(node, "DTEND", shift); ok {
-		extent.End, extent.HasEnd = dtend.instant, true
+		extent.End, extent.HasEnd, extent.EndDate = dtend.instant, true, dtend.date
 	}
 	extent.Duration, extent.HasDuration = componentDuration(node, "DURATION")
 	if node.name == "VEVENT" && node.count("RECURRENCE-ID") > 0 && node.count("DTEND") == 0 && node.count("DURATION") == 0 {
 		if master := m.seriesMaster(node); master != nil {
 			if start, ok := m.dateValue(master, "DTSTART", noShift); ok {
-				extent.InheritsLength, extent.SeriesLength = true, m.occurrenceWindow(master, start)
+				extent.InheritSeriesLength(start.isDate, m.occurrenceWindow(master, start))
 			}
 		}
 	}
@@ -611,20 +815,15 @@ func (m calendarTimeRangeMatcher) seriesMaster(node *icalNode) *icalNode {
 	if m.root == nil {
 		return nil
 	}
-	for _, child := range m.root.children {
-		if child.name == node.name && child.count("RECURRENCE-ID") == 0 {
-			return child
-		}
-	}
-	return nil
+	return m.recurrenceSetMaster(m.root, node)
 }
 
 // eventOccurrenceEnd is where an occurrence of a VEVENT starting at dtstart
 // ends, by the ical.EventEnd rule every reader of an occurrence shares, with a
-// DATE start's day ended in the matcher's zone.
+// DATE start's dates placed in the matcher's zone.
 func (m calendarTimeRangeMatcher) eventOccurrenceEnd(node *icalNode, dtstart icalTimeValue, shift instantShift) time.Time {
-	return m.eventEnd(node, dtstart, shift).OccurrenceEnd(func(dayStart time.Time) time.Time {
-		return m.zone.addDays(dayStart, 1)
+	return m.eventEnd(node, dtstart, shift).OccurrenceEnd(func(date time.Time) time.Time {
+		return m.dateMidnight(dtstart, date)
 	})
 }
 
@@ -650,6 +849,12 @@ func (m calendarTimeRangeMatcher) todoInTimeRange(node *icalNode, start, end tim
 
 	if hasStart && hasDuration && !hasDue {
 		effectiveDue := dtstart.instant.Add(duration)
+		if dtstart.isDate {
+			// RFC 5545 §3.8.2.5 has a DURATION beside a DATE count days, and
+			// one counting hours is read as the days it reaches into, as an
+			// event's is and the task's recurrence set is.
+			effectiveDue = m.dateMidnight(dtstart, dtstart.date.AddDate(0, 0, ical.DurationDays(duration)))
+		}
 		return !start.After(effectiveDue) && (end.After(dtstart.instant) || !end.Before(effectiveDue))
 	}
 	if hasStart && !hasDuration && hasDue {
@@ -685,7 +890,7 @@ func (m calendarTimeRangeMatcher) journalInTimeRange(node *icalNode, start, end 
 		return false
 	}
 	if dtstart.isDate {
-		return start.Before(m.zone.addDays(dtstart.instant, 1)) && end.After(dtstart.instant)
+		return start.Before(m.dateMidnight(dtstart, dtstart.date.AddDate(0, 0, 1))) && end.After(dtstart.instant)
 	}
 	return !start.After(dtstart.instant) && end.After(dtstart.instant)
 }

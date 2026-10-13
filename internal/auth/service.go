@@ -430,9 +430,9 @@ func (s *Service) trustedProxySet() clientip.TrustedProxies {
 // middleware resolves the client into RemoteAddr, and the client is not the
 // proxy this is asking about.
 //
-// It is exported because the DAV href resolver needs the same answer: a
-// DAV:href naming an absolute URI is compared against the Request-URI scheme,
-// and behind a TLS-terminating proxy only this rule can supply it.
+// It is exported for internal/http, whose forwarded-address middleware runs
+// ahead of authentication and rewrites RemoteAddr: that package's tests hold
+// the middleware to leaving this answer unchanged.
 func RequestIsSecure(r *http.Request, trustedProxies []string) bool {
 	return requestIsSecure(r, clientip.NewTrustedProxies(trustedProxies))
 }

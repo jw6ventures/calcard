@@ -45,7 +45,7 @@ func TestServiceWritesThroughItsValidator(t *testing.T) {
 		Events: repo,
 	}, refuse)
 
-	_, _, err := svc.CreateEvent(context.Background(), &store.User{ID: 1}, 1, UpsertInput{RawICS: validICS("refused"), ContentType: "text/calendar"})
+	_, err := svc.CreateEvent(context.Background(), &store.User{ID: 1}, 1, UpsertInput{RawICS: validICS("refused")})
 	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "max-instances") {
 		t.Fatalf("CreateEvent() error = %v, want the validator's max-instances refusal as ErrBadRequest", err)
 	}
@@ -93,12 +93,11 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	t.Run("create raw ics success", func(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{}}
 		svc := newServiceWithRepos(true, repo)
-		ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
-			RawICS:      validICS("raw-1"),
-			ContentType: "text/calendar",
+		ev, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+			RawICS: validICS("raw-1"),
 		})
-		if err != nil || !created || ev == nil || ev.UID != "raw-1" {
-			t.Fatalf("CreateEvent() err=%v created=%v ev=%+v", err, created, ev)
+		if err != nil || ev == nil || ev.UID != "raw-1" {
+			t.Fatalf("CreateEvent() err=%v ev=%+v", err, ev)
 		}
 		got, err := svc.GetEvent(context.Background(), user, 1, "raw-1")
 		if err != nil || got == nil {
@@ -114,7 +113,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 			Events: &fakeEventRepo{events: map[string]store.Event{}},
 		}, dav.ValidateCalendarObject)
 
-		_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
 			Structured: &StructuredInput{Summary: "x", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
 		})
 		if !errors.Is(err, ErrForbidden) {
@@ -125,9 +124,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	t.Run("create conflict existing uid", func(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{"1:dup": {CalendarID: 1, UID: "dup", ResourceName: "dup", ETag: "e1"}}}
 		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
-			RawICS:      validICS("dup"),
-			ContentType: "text/calendar",
+		_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+			RawICS: validICS("dup"),
 		})
 		if !errors.Is(err, ErrConflict) {
 			t.Fatalf("expected ErrConflict, got %v", err)
@@ -137,9 +135,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 	t.Run("create if none match fails", func(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{"1:dup": {CalendarID: 1, UID: "dup", ResourceName: "dup", ETag: "e1"}}}
 		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
 			RawICS:      validICS("dup"),
-			ContentType: "text/calendar",
 			IfNoneMatch: "*",
 		})
 		if !errors.Is(err, ErrPreconditionFailed) {
@@ -163,9 +160,8 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		}}
 		svc := newServiceWithRepos(true, repo)
 		ev, _, err := svc.UpdateEvent(context.Background(), user, 1, "uid-1", UpsertInput{
-			RawICS:      validICS("uid-1"),
-			ContentType: "text/calendar",
-			IfMatch:     `"etag-old"`,
+			RawICS:  validICS("uid-1"),
+			IfMatch: `"etag-old"`,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -265,10 +261,7 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		if _, err := svc.normalizeEventPayload(UpsertInput{}, "", nil); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("expected ErrBadRequest, got %v", err)
 		}
-		if _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: ""}, "", nil); !errors.Is(err, ErrUnsupportedMediaType) {
-			t.Fatalf("expected ErrUnsupportedMediaType, got %v", err)
-		}
-		if _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1"), ContentType: "text/calendar"}, "other", nil); !errors.Is(err, ErrBadRequest) {
+		if _, err := svc.normalizeEventPayload(UpsertInput{RawICS: validICS("u1")}, "other", nil); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("expected ErrBadRequest, got %v", err)
 		}
 	})
@@ -338,9 +331,8 @@ func TestServiceAllowsDirectObjectAccessWithoutCollectionAccess(t *testing.T) {
 	}
 
 	updated, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
-		RawICS:      validICS("event-1"),
-		ContentType: "text/calendar",
-		IfMatch:     `"etag-1"`,
+		RawICS:  validICS("event-1"),
+		IfMatch: `"etag-1"`,
 	})
 	if err != nil || updated == nil || updated.UID != "event-1" {
 		t.Fatalf("UpdateEvent() err=%v updated=%#v", err, updated)
@@ -370,7 +362,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 			}},
 		}, dav.ValidateCalendarObject)
 
-		_, _, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{
+		_, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{
 			Structured: &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"},
 		})
 		if !errors.Is(err, ErrForbidden) {
@@ -397,9 +389,8 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 		}, dav.ValidateCalendarObject)
 
 		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
-			RawICS:      validICS("event-1"),
-			ContentType: "text/calendar",
-			IfMatch:     `"etag-1"`,
+			RawICS:  validICS("event-1"),
+			IfMatch: `"etag-1"`,
 		})
 		if !errors.Is(err, ErrForbidden) {
 			t.Fatalf("UpdateEvent() error = %v, want ErrForbidden", err)
@@ -423,9 +414,8 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 		}, dav.ValidateCalendarObject)
 
 		_, _, err := svc.UpdateEvent(context.Background(), delegate, 1, "event-1", UpsertInput{
-			RawICS:      validICS("event-1"),
-			ContentType: "text/calendar",
-			IfMatch:     `"etag-1"`,
+			RawICS:  validICS("event-1"),
+			IfMatch: `"etag-1"`,
 		})
 		if !errors.Is(err, ErrForbidden) {
 			t.Fatalf("UpdateEvent() error = %v, want ErrForbidden", err)
@@ -484,14 +474,13 @@ func TestCreateEventRefusesAPrincipalWithoutBindBeforeBuildingTheEvent(t *testin
 		"structured":                                    {acl: readOnly, input: UpsertInput{Structured: structured}, want: ErrForbidden},
 		"structured the builder refuses":                {acl: readOnly, input: UpsertInput{Structured: &StructuredInput{DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
 		"structured in a zone the server does not know": {acl: readOnly, input: UpsertInput{Structured: &StructuredInput{Summary: "Create", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00", Timezone: "Nowhere/Zone"}}, want: ErrForbidden},
-		"raw iCalendar":                                 {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar"}, want: ErrForbidden},
-		"raw iCalendar the validator fails":             {acl: readOnly, input: UpsertInput{RawICS: methodICS("new"), ContentType: "text/calendar"}, want: ErrForbidden},
-		"raw body of an unsupported type":               {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "application/json"}, want: ErrForbidden},
-		"UID already stored":                            {acl: readOnly, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar"}, want: ErrForbidden},
-		"If-Match on a new UID":                         {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar", IfMatch: `"etag"`}, want: ErrForbidden},
-		"If-None-Match * on a stored UID":               {acl: readOnly, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar", IfNoneMatch: "*"}, want: ErrForbidden},
+		"raw iCalendar":                                 {acl: readOnly, input: UpsertInput{RawICS: validICS("new")}, want: ErrForbidden},
+		"raw iCalendar the validator fails":             {acl: readOnly, input: UpsertInput{RawICS: methodICS("new")}, want: ErrForbidden},
+		"UID already stored":                            {acl: readOnly, input: UpsertInput{RawICS: validICS("taken")}, want: ErrForbidden},
+		"If-Match on a new UID":                         {acl: readOnly, input: UpsertInput{RawICS: validICS("new"), IfMatch: `"etag"`}, want: ErrForbidden},
+		"If-None-Match * on a stored UID":               {acl: readOnly, input: UpsertInput{RawICS: validICS("taken"), IfNoneMatch: "*"}, want: ErrForbidden},
 		"with bind":                                     {acl: canBind, input: UpsertInput{Structured: structured}, wantValidation: 1},
-		"with bind, UID already stored":                 {acl: canBind, input: UpsertInput{RawICS: validICS("taken"), ContentType: "text/calendar"}, want: ErrConflict, wantValidation: 1},
+		"with bind, UID already stored":                 {acl: canBind, input: UpsertInput{RawICS: validICS("taken")}, want: ErrConflict, wantValidation: 1},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -505,7 +494,7 @@ func TestCreateEventRefusesAPrincipalWithoutBindBeforeBuildingTheEvent(t *testin
 				ACLEntries: &fakeACLRepo{entries: tt.acl},
 			}, countingValidator(&validations))
 
-			_, _, err := svc.CreateEvent(context.Background(), delegate, 1, tt.input)
+			_, err := svc.CreateEvent(context.Background(), delegate, 1, tt.input)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
 			}
@@ -560,7 +549,7 @@ func TestCreateEventDoesNotOverwriteAnEventStoredWhileItRan(t *testing.T) {
 			}, dav.ValidateCalendarObject)
 
 			body := strings.Replace(validICS("raced"), "SUMMARY:Planning", "SUMMARY:Mine", 1)
-			_, _, err := svc.CreateEvent(context.Background(), &store.User{ID: 2}, 1, UpsertInput{RawICS: body, ContentType: "text/calendar", IfNoneMatch: tt.ifNoneMatch})
+			_, err := svc.CreateEvent(context.Background(), &store.User{ID: 2}, 1, UpsertInput{RawICS: body, IfNoneMatch: tt.ifNoneMatch})
 			if !repo.raced {
 				t.Fatal("the competing create never ran")
 			}
@@ -604,7 +593,7 @@ func TestCreateEventNeedsBindOnTheCalendarWhateverAnObjectACLSays(t *testing.T) 
 				ACLEntries: &fakeACLRepo{entries: tt.acl},
 			}, dav.ValidateCalendarObject)
 
-			_, _, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar"})
+			_, err := svc.CreateEvent(context.Background(), delegate, 1, UpsertInput{RawICS: validICS("new")})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
 			}
@@ -634,10 +623,10 @@ func TestUpdateEventRefusesAPrincipalWithoutWriteContentBeforeBuildingTheEvent(t
 		"structured":                            {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{Summary: "Update", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
 		"structured the builder refuses":        {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00"}}, want: ErrForbidden},
 		"structured with a malformed until":     {acl: cannotWrite, input: UpsertInput{Structured: &StructuredInput{Summary: "Update", DTStart: "2026-03-20T10:00", DTEnd: "2026-03-20T11:00", Recurrence: &StructuredRecurrence{Frequency: "DAILY", Until: "June"}}}, want: ErrForbidden},
-		"raw iCalendar":                         {acl: cannotWrite, input: UpsertInput{RawICS: validICS("event-1"), ContentType: "text/calendar"}, want: ErrForbidden},
-		"raw iCalendar the validator fails":     {acl: cannotWrite, input: UpsertInput{RawICS: methodICS("event-1"), ContentType: "text/calendar"}, want: ErrForbidden},
-		"with write-content":                    {acl: canWrite, input: UpsertInput{RawICS: validICS("event-1"), ContentType: "text/calendar"}, wantValidation: 1},
-		"with write-content, validator refuses": {acl: canWrite, input: UpsertInput{RawICS: methodICS("event-1"), ContentType: "text/calendar"}, want: ErrConflict, wantValidation: 1},
+		"raw iCalendar":                         {acl: cannotWrite, input: UpsertInput{RawICS: validICS("event-1")}, want: ErrForbidden},
+		"raw iCalendar the validator fails":     {acl: cannotWrite, input: UpsertInput{RawICS: methodICS("event-1")}, want: ErrForbidden},
+		"with write-content":                    {acl: canWrite, input: UpsertInput{RawICS: validICS("event-1")}, wantValidation: 1},
+		"with write-content, validator refuses": {acl: canWrite, input: UpsertInput{RawICS: methodICS("event-1")}, want: ErrConflict, wantValidation: 1},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -934,7 +923,7 @@ func TestEventUpdatesAndDeletesRevealNothingToAPrincipalWhoCannotSeeTheEvent(t *
 						var err error
 						if op == "update" {
 							_, _, err = svc.UpdateEvent(context.Background(), user, 1, uid, UpsertInput{
-								RawICS: validICS(uid), ContentType: "text/calendar", IfMatch: header.ifMatch, IfNoneMatch: header.ifNoneMatch,
+								RawICS: validICS(uid), IfMatch: header.ifMatch, IfNoneMatch: header.ifNoneMatch,
 							})
 						} else {
 							err = svc.DeleteEvent(context.Background(), user, 1, uid, header.ifMatch, header.ifNoneMatch)
@@ -1169,18 +1158,6 @@ func TestHelpersAndValidators(t *testing.T) {
 		}
 	})
 
-	t.Run("content type validation", func(t *testing.T) {
-		if !errors.Is(validateCalendarContentType(""), ErrUnsupportedMediaType) {
-			t.Fatal("expected unsupported media type")
-		}
-		if !errors.Is(validateCalendarContentType("application/json"), ErrUnsupportedMediaType) {
-			t.Fatal("expected unsupported media type")
-		}
-		if err := validateCalendarContentType("text/calendar; charset=utf-8"); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
 	t.Run("conditional headers", func(t *testing.T) {
 		ev := &store.Event{ETag: "current"}
 		if !checkConditionalHeaders("", "", nil) {
@@ -1225,7 +1202,6 @@ func TestHelpersAndValidators(t *testing.T) {
 			StatusCode(ErrForbidden) != http.StatusForbidden ||
 			StatusCode(ErrConflict) != http.StatusConflict ||
 			StatusCode(ErrPreconditionFailed) != http.StatusPreconditionFailed ||
-			StatusCode(ErrUnsupportedMediaType) != http.StatusUnsupportedMediaType ||
 			StatusCode(ErrBadRequest) != http.StatusBadRequest ||
 			StatusCode(errors.New("x")) != http.StatusInternalServerError {
 			t.Fatal("unexpected status code mapping")
@@ -1623,7 +1599,7 @@ func TestEventWritesApplyTheCalDAVValidator(t *testing.T) {
 			}
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics})
 			if tt.want == nil && err != nil {
 				t.Fatalf("CreateEvent() error = %v, want it stored", err)
 			}
@@ -1649,7 +1625,7 @@ func TestEventWritesStoreWhatTheValidatorAccepted(t *testing.T) {
 	user := &store.User{ID: 1}
 	repo := &fakeEventRepo{events: map[string]store.Event{}}
 	svc := newServiceWithRepos(true, repo)
-	if _, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: "\xef\xbb\xbf" + validICS("bom"), ContentType: "text/calendar"}); err != nil {
+	if _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: "\xef\xbb\xbf" + validICS("bom")}); err != nil {
 		t.Fatalf("CreateEvent() error = %v", err)
 	}
 	stored := repo.events[key(1, "bom")]
@@ -1667,7 +1643,7 @@ func TestEventWritesStoreWhatTheValidatorAccepted(t *testing.T) {
 		Events: &fakeEventRepo{events: map[string]store.Event{}},
 	}, dav.ValidateCalendarObject)
 
-	_, _, err := todoOnly.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS("event"), ContentType: "text/calendar"})
+	_, err := todoOnly.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS("event")})
 	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "supported-calendar-component") {
 		t.Fatalf("CreateEvent() into a VTODO collection error = %v, want supported-calendar-component", err)
 	}
@@ -1720,7 +1696,7 @@ func TestStructuredEventsRefuseAZoneOrUntilTheServerCannotRead(t *testing.T) {
 			}
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			created, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{Structured: tt.input})
+			created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{Structured: tt.input})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
 			}
@@ -1790,9 +1766,8 @@ func TestCreateEventBoundsTheUID(t *testing.T) {
 	user := &store.User{ID: 1}
 	repo := &fakeEventRepo{events: map[string]store.Event{}}
 	svc := newServiceWithRepos(true, repo)
-	_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
-		RawICS:      validICS(strings.Repeat("u", store.MaxIdentifierOctets+1)),
-		ContentType: "text/calendar",
+	_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		RawICS: validICS(strings.Repeat("u", store.MaxIdentifierOctets+1)),
 	})
 	if !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("CreateEvent() error = %v, want ErrBadRequest", err)
@@ -1800,11 +1775,10 @@ func TestCreateEventBoundsTheUID(t *testing.T) {
 	if len(repo.events) != 0 {
 		t.Fatal("the event was stored")
 	}
-	if _, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
-		RawICS:      validICS(strings.Repeat("u", store.MaxIdentifierOctets)),
-		ContentType: "text/calendar",
-	}); err != nil || !created {
-		t.Fatalf("UID at the limit: created=%v err=%v", created, err)
+	if _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
+		RawICS: validICS(strings.Repeat("u", store.MaxIdentifierOctets)),
+	}); err != nil {
+		t.Fatalf("UID at the limit: err=%v", err)
 	}
 }
 
@@ -1850,11 +1824,11 @@ func TestRawICSIdentifiesTheObjectByTopLevelComponentUIDs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
-			if err != nil || !created || ev == nil || ev.UID != appleEventUID {
-				t.Fatalf("CreateEvent() ev=%+v created=%v err=%v", ev, created, err)
+			ev, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics})
+			if err != nil || ev == nil || ev.UID != appleEventUID {
+				t.Fatalf("CreateEvent() ev=%+v err=%v", ev, err)
 			}
-			ev, created, err = svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			ev, created, err := svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics})
 			if err != nil || created || ev == nil || ev.UID != appleEventUID {
 				t.Fatalf("UpdateEvent() ev=%+v created=%v err=%v", ev, created, err)
 			}
@@ -1885,7 +1859,7 @@ func TestRawICSIdentifiesTheObjectByTopLevelComponentUIDs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
 			}
@@ -1918,11 +1892,11 @@ func TestRawICSReadsUIDWithParameters(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			ev, created, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
-			if err != nil || !created || ev == nil || ev.UID != appleEventUID {
-				t.Fatalf("CreateEvent() ev=%+v created=%v err=%v", ev, created, err)
+			ev, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics})
+			if err != nil || ev == nil || ev.UID != appleEventUID {
+				t.Fatalf("CreateEvent() ev=%+v err=%v", ev, err)
 			}
-			if _, _, err := svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"}); err != nil {
+			if _, _, err := svc.UpdateEvent(context.Background(), user, 1, appleEventUID, UpsertInput{RawICS: tt.ics}); err != nil {
 				t.Fatalf("UpdateEvent() err=%v", err)
 			}
 		})
@@ -1944,7 +1918,7 @@ func TestRawICSReadsUIDWithParameters(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeEventRepo{events: map[string]store.Event{}}
 			svc := newServiceWithRepos(true, repo)
-			_, _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics, ContentType: "text/calendar"})
+			_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: tt.ics})
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("CreateEvent() error = %v, want %v", err, tt.want)
 			}

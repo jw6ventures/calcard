@@ -452,29 +452,6 @@ func (h *Handler) validatedEvent(cal *store.CalendarAccess, resourceName, raw st
 	}, nil
 }
 
-// occurrenceRemovedEvent is the event to store once an occurrence is removed
-// from existing, leaving raw. Data stored before the validator existed may fail
-// it, and the editor refuses every change to such a series; removing an
-// occurrence leaves that data no worse than it was, so it is still allowed,
-// as the only way to drop one short of deleting the series. That result is
-// stored as it is, and the store derives its metadata.
-func (h *Handler) occurrenceRemovedEvent(cal *store.CalendarAccess, existing *store.Event, resourceName, raw string) (store.Event, error) {
-	event, err := h.validatedEvent(cal, resourceName, raw)
-	if err == nil {
-		return event, nil
-	}
-	if _, storedErr := h.validateCalendarObject(existing.RawICAL, cal); storedErr == nil {
-		return store.Event{}, err
-	}
-	return store.Event{
-		CalendarID:   cal.ID,
-		UID:          existing.UID,
-		ResourceName: resourceName,
-		RawICAL:      raw,
-		ETag:         utils.GenerateETag(raw),
-	}, nil
-}
-
 // invalidEventMessage is the flash message for calendar data the validator
 // refused: what did not happen, then why, in words for the user rather than
 // the RFC 4791 precondition names a DAV client is answered with.
@@ -916,10 +893,11 @@ type calendarEventInstance struct {
 
 // addSeriesInstances adds to payload, the view model of unfolded, the
 // instances of its series from viewStart to viewEnd, as CalDAV expands them:
-// "instances", which the browser places the series by, and
-// "instancesComplete", false when the range holds more than it lists. An
-// event whose master does not recur, or whose recurrence the server cannot
-// expand, gets neither, and stands for itself.
+// "instances", which the browser places the series by, "instancesComplete",
+// false when the range holds more than it lists, and "overrideInstances",
+// where each override replacing one instance falls. An event whose master
+// does not recur, or whose recurrence the server cannot expand, gets none of
+// them, and stands for itself.
 func (h *Handler) addSeriesInstances(payload map[string]any, unfolded unfoldedEvent, viewStart, viewEnd time.Time) {
 	if !unfolded.series.recurs() {
 		return
@@ -928,20 +906,27 @@ func (h *Handler) addSeriesInstances(payload map[string]any, unfolded unfoldedEv
 	if !expansion.Recurs {
 		return
 	}
-	instances := make([]calendarEventInstance, 0, len(expansion.Instances))
-	for _, instance := range expansion.Instances {
-		listed := calendarEventInstance{
+	payload["instances"] = viewInstances(expansion.Instances)
+	payload["instancesComplete"] = expansion.Complete
+	if len(expansion.Overrides) > 0 {
+		payload["overrideInstances"] = viewInstances(expansion.Overrides)
+	}
+}
+
+func viewInstances(instances []calobject.Instance) []calendarEventInstance {
+	listed := make([]calendarEventInstance, 0, len(instances))
+	for _, instance := range instances {
+		view := calendarEventInstance{
 			RecurrenceID: instance.RecurrenceID.UTC().Format(time.RFC3339),
 			Start:        instance.Start.UTC().Format(time.RFC3339),
 			End:          instance.End.UTC().Format(time.RFC3339),
 		}
 		if !instance.Override.IsZero() {
-			listed.Override = instance.Override.UTC().Format(time.RFC3339)
+			view.Override = instance.Override.UTC().Format(time.RFC3339)
 		}
-		instances = append(instances, listed)
+		listed = append(listed, view)
 	}
-	payload["instances"] = instances
-	payload["instancesComplete"] = expansion.Complete
+	return listed
 }
 
 // calendarEventQueryRange resolves the [start, endExclusive) window an events.json
@@ -1842,9 +1827,13 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		if existing.ResourceName != "" {
 			resourceName = existing.ResourceName
 		}
-		updatedEvent, err := h.occurrenceRemovedEvent(cal, existing, resourceName, utils.BuildFromComponents(header, newComponents, footer))
+		updatedEvent, err := h.validatedEvent(cal, resourceName, utils.BuildFromComponents(header, newComponents, footer))
 		if err != nil {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage("the occurrence could not be deleted", err)})
+			message := invalidEventMessage("the occurrence could not be deleted", err)
+			if _, storedErr := h.validateCalendarObject(existing.RawICAL, cal); storedErr != nil {
+				message += "; the whole series can still be deleted"
+			}
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": message})
 			return
 		}
 		if _, err := h.store.Events.Upsert(r.Context(), updatedEvent); err != nil {

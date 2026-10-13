@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -336,6 +337,17 @@ type aclReadMutation struct {
 func (r *aclReadMutation) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
 	entries, err := r.ACLRepository.ListByResource(ctx, resourcePath)
 	if err == nil && resourcePath == r.path && !r.done {
+		r.done = true
+		if err := r.mutate(); err != nil {
+			return nil, err
+		}
+	}
+	return entries, err
+}
+
+func (r *aclReadMutation) ListByResources(ctx context.Context, resourcePaths []string) ([]store.ACLEntry, error) {
+	entries, err := r.ACLRepository.ListByResources(ctx, resourcePaths)
+	if err == nil && slices.Contains(resourcePaths, r.path) && !r.done {
 		r.done = true
 		if err := r.mutate(); err != nil {
 			return nil, err

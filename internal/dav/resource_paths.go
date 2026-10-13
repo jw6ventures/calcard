@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
 
-	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -280,30 +280,136 @@ func escapeDAVPath(decoded string) string {
 	return strings.Join(segments, "/")
 }
 
-// requestScheme is the scheme the client used to reach this server, which an
-// absolute DAV:href has to match to name the same resource (RFC 3986 §6.2.1).
-// http.Server leaves URL.Scheme empty and a TLS-terminating proxy leaves r.TLS
-// nil, so behind one the only truthful answer comes from X-Forwarded-Proto,
-// trusted on the terms internal/auth already sets for it. The configured base
-// URL is the last resort, for a proxy that forwards no such header.
-func (h *DavServer) requestScheme(r *http.Request) string {
-	if r.URL.Scheme != "" {
-		return strings.ToLower(r.URL.Scheme)
+// isLocalOrigin reports whether an absolute URI or network-path reference with
+// this scheme and authority names this server. Every URI reference a client
+// sends to name a resource here -- a Destination, a DAV:href in a request body,
+// an If header resource tag, an ACE principal -- is judged by it.
+//
+// Two authorities are local: the Host the request reached, and the one the
+// configured base URL publishes. A reverse proxy commonly rewrites Host to the
+// name it reaches CalCard by, while the client goes on writing the public name
+// into the URIs it sends; the base URL is how this server knows that name.
+//
+// The scheme is not compared. Without TLS or a trusted X-Forwarded-Proto the
+// server cannot tell which scheme the client used, and no property of this
+// server depends on it, so the scheme serves only to supply a missing port. For
+// the same reason a Host that names no port stands for either default port.
+func (h *DavServer) isLocalOrigin(r *http.Request, scheme, rawAuthority string) bool {
+	port := ""
+	switch strings.ToLower(scheme) {
+	case "":
+	case "http":
+		port = "80"
+	case "https":
+		port = "443"
+	default:
+		return false
 	}
-	var trustedProxies []string
-	if h != nil && h.cfg != nil {
-		trustedProxies = h.cfg.TrustedProxies
+	candidate, ok := parseAuthority(rawAuthority)
+	if !ok {
+		return false
 	}
-	if auth.RequestIsSecure(r, trustedProxies) {
-		return "https"
+	if candidate.port == "" {
+		candidate.port = port
 	}
-	if h != nil && h.cfg != nil {
-		if baseURL, err := url.Parse(h.cfg.BaseURL); err == nil &&
-			(strings.EqualFold(baseURL.Scheme, "http") || strings.EqualFold(baseURL.Scheme, "https")) {
-			return strings.ToLower(baseURL.Scheme)
+	if requested, ok := parseAuthority(r.Host); ok && candidate.matches(requested) {
+		return true
+	}
+	published, ok := h.publishedAuthority()
+	return ok && candidate.matches(published)
+}
+
+// authority is a host and port in the normal form RFC 3986 §6.2.2 and §6.2.3
+// give them, so that equal authorities compare equal however they were
+// spelled. An empty port is one the URI left to its scheme's default.
+type authority struct {
+	host string
+	port string
+}
+
+// matches compares two authorities, reading an empty port on either side as
+// whichever of the two default ports the other names.
+func (a authority) matches(b authority) bool {
+	if a.host != b.host {
+		return false
+	}
+	switch {
+	case a.port == b.port:
+		return true
+	case a.port == "":
+		return b.port == "80" || b.port == "443"
+	case b.port == "":
+		return a.port == "80" || a.port == "443"
+	}
+	return false
+}
+
+// parseAuthority normalizes a URI authority or Host header: the host is
+// lower-cased and loses one trailing dot, an IP literal takes its canonical
+// spelling without a zone, and the port loses its leading zeros. An authority
+// carrying userinfo, naming no host, or with a port that is not a number names
+// no server.
+func parseAuthority(raw string) (authority, bool) {
+	if raw == "" || strings.Contains(raw, "@") {
+		return authority{}, false
+	}
+	host, port := raw, ""
+	if colon := strings.LastIndexByte(raw, ':'); colon >= 0 && !strings.Contains(raw[colon:], "]") {
+		host, port = raw[:colon], raw[colon+1:]
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		addr, err := netip.ParseAddr(host[1 : len(host)-1])
+		if err != nil || !addr.Is6() {
+			return authority{}, false
 		}
+		host = addr.WithZone("").String()
+	} else {
+		if strings.ContainsAny(host, ":[]") {
+			return authority{}, false
+		}
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
 	}
-	return "http"
+	if host == "" {
+		return authority{}, false
+	}
+	if port != "" {
+		number, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return authority{}, false
+		}
+		port = strconv.FormatUint(number, 10)
+	}
+	return authority{host: host, port: port}, true
+}
+
+// publishedAuthority is the authority of the configured base URL, with its
+// scheme's default port filled in. It is parsed once per server.
+func (h *DavServer) publishedAuthority() (authority, bool) {
+	if h == nil || h.cfg == nil {
+		return authority{}, false
+	}
+	h.publishedOnce.Do(func() {
+		base, err := url.Parse(h.cfg.BaseURL)
+		if err != nil || base.User != nil {
+			return
+		}
+		published, ok := parseAuthority(base.Host)
+		if !ok {
+			return
+		}
+		if published.port == "" {
+			switch strings.ToLower(base.Scheme) {
+			case "http":
+				published.port = "80"
+			case "https":
+				published.port = "443"
+			default:
+				return
+			}
+		}
+		h.published, h.publishedOK = published, true
+	})
+	return h.published, h.publishedOK
 }
 
 // xmlWhitespace is what XML 1.0 §2.3 defines whitespace to be. It is the exact
@@ -325,25 +431,35 @@ func trimHrefFraming(raw string) string {
 	return strings.Trim(raw, xmlWhitespace)
 }
 
+// resolveDAVHrefReference resolves a DAV:href from a request body against
+// basePath, or against the Request-URI when basePath is empty. An href naming
+// another server, or a query other than the Request-URI's, names nothing here.
 func (h *DavServer) resolveDAVHrefReference(rawHref, basePath string, r *http.Request) (*url.URL, bool) {
-	rawHref = trimHrefFraming(rawHref)
-	if r == nil || r.URL == nil || rawHref == "" {
+	resolved, ok := h.resolveLocalReference(rawHref, basePath, r)
+	if !ok || resolved.RawQuery != r.URL.RawQuery || resolved.ForceQuery != r.URL.ForceQuery {
 		return nil, false
 	}
-	reference, err := url.Parse(rawHref)
+	return resolved, true
+}
+
+// resolveLocalReference resolves a URI reference a client sent to name a
+// resource here (RFC 4918 §8.3), against basePath or, when that is empty, the
+// Request-URI. It refuses userinfo, a fragment, and an authority naming another
+// server, and leaves the query to the caller. Only the path and query of the
+// result are meaningful: a relative reference keeps no scheme or authority.
+func (h *DavServer) resolveLocalReference(rawRef, basePath string, r *http.Request) (*url.URL, bool) {
+	rawRef = trimHrefFraming(rawRef)
+	if r == nil || r.URL == nil || rawRef == "" {
+		return nil, false
+	}
+	reference, err := url.Parse(rawRef)
 	if err != nil || reference.User != nil || reference.Fragment != "" {
 		return nil, false
 	}
-
-	requestURI := &url.URL{
-		Scheme:     h.requestScheme(r),
-		Host:       r.Host,
-		Path:       r.URL.Path,
-		RawPath:    r.URL.RawPath,
-		RawQuery:   r.URL.RawQuery,
-		ForceQuery: r.URL.ForceQuery,
+	if (reference.Scheme != "" || reference.Host != "") && !h.isLocalOrigin(r, reference.Scheme, reference.Host) {
+		return nil, false
 	}
-	baseURI := *requestURI
+	baseURI := url.URL{Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
 	if basePath != "" {
 		base, parseErr := url.Parse(basePath)
 		if parseErr != nil || base.Scheme != "" || base.Host != "" || base.User != nil || base.Fragment != "" {
@@ -352,13 +468,7 @@ func (h *DavServer) resolveDAVHrefReference(rawHref, basePath string, r *http.Re
 		baseURI.Path = base.Path
 		baseURI.RawPath = base.RawPath
 	}
-	resolved := baseURI.ResolveReference(reference)
-	if resolved.User != nil || !strings.EqualFold(resolved.Scheme, requestURI.Scheme) ||
-		!strings.EqualFold(resolved.Host, requestURI.Host) || resolved.RawQuery != requestURI.RawQuery ||
-		resolved.ForceQuery != requestURI.ForceQuery || resolved.Fragment != "" {
-		return nil, false
-	}
-	return resolved, true
+	return baseURI.ResolveReference(reference), true
 }
 
 // davHrefReferenceBase is the base a DAV:href in a request body resolves

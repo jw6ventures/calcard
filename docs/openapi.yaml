@@ -10,6 +10,7 @@ servers:
   - url: /
 security:
   - basicAuth: []
+  - digestAuth: []
 tags:
   - name: Calendars
     description: Calendar metadata visible to the authenticated user.
@@ -162,15 +163,21 @@ paths:
       description: |
         The request is answered at the first of these steps that refuses it:
 
-        1. The body is decoded: `400` for a body that is empty, too large, not
-           valid JSON, names an unknown field, or lacks the input its
-           `inputMode` needs. This comes before any privilege check.
+        1. The body is decoded, before any privilege check. A `text/calendar`,
+           `application/ical` or `application/ics` body gets `400` here only
+           when it is over 10 MiB. Any other body is read as an
+           `EventWriteRequest` and gets `400` when it is empty, over 10 MiB
+           (the limit applies to the whole JSON document), not valid JSON,
+           names an unknown field, or lacks the input its `inputMode` needs,
+           such as a blank `rawIcal`.
         2. `404` when the caller holds no grant on the calendar or on any of
            its events, as when the calendar does not exist.
         3. `403` when the caller lacks `DAV:bind` on the calendar, whatever
            the body holds, the UID it names, or the conditional headers.
-        4. The event is built from the body and validated: `400`, `409` or
-           `415`.
+        4. The event is built from the body and validated: `400` or `409`.
+           An empty or blank `text/calendar` body gets `400` here. `rawIcal`
+           under `inputMode` `raw_ical` is validated and stored by the same
+           rules as a `text/calendar` body.
         5. The conditional headers are evaluated: `412`.
         6. `409` when the calendar already holds an event with the UID. A
            create never updates an existing event: one that another request
@@ -203,8 +210,6 @@ paths:
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/calendars/{id}/events/{uid}:
@@ -244,9 +249,13 @@ paths:
       description: |
         The request is answered at the first of these steps that refuses it:
 
-        1. The body is decoded: `400` for a body that is empty, too large, not
-           valid JSON, names an unknown field, or lacks the input its
-           `inputMode` needs. This comes before any privilege check.
+        1. The body is decoded, before any privilege check. A `text/calendar`,
+           `application/ical` or `application/ics` body gets `400` here only
+           when it is over 10 MiB. Any other body is read as an
+           `EventWriteRequest` and gets `400` when it is empty, over 10 MiB
+           (the limit applies to the whole JSON document), not valid JSON,
+           names an unknown field, or lacks the input its `inputMode` needs,
+           such as a blank `rawIcal`.
         2. `DAV:write-content` is checked on the event, or on the calendar
            when it holds no event with the UID. A caller who can neither read
            the event nor hold the privilege on it is answered as though the
@@ -256,8 +265,10 @@ paths:
            otherwise; with it, the steps below go on.
         3. `404` when the calendar holds no event with the UID.
         4. The conditional headers are evaluated: `412`.
-        5. The event is built from the body and validated: `400`, `409` or
-           `415`.
+        5. The event is built from the body and validated: `400` or `409`.
+           An empty or blank `text/calendar` body gets `400` here. `rawIcal`
+           under `inputMode` `raw_ical` is validated and stored by the same
+           rules as a `text/calendar` body.
         6. The event is stored once the store has checked it again: `409`
            when another event now holds its resource name or UID, and `412`
            when the conditional headers no longer hold.
@@ -288,8 +299,6 @@ paths:
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:
@@ -622,7 +631,20 @@ components:
     basicAuth:
       type: http
       scheme: basic
-      description: DAV Basic authentication using the user's email and an app password.
+      description: |
+        HTTP Basic with the user's primary email address and an app password.
+        Accepted over HTTPS only: the request must reach CalCard over TLS, or
+        through a proxy listed in `APP_TRUSTED_PROXIES` that sends
+        `X-Forwarded-Proto: https`. Basic credentials sent over plain HTTP are
+        refused with `401`.
+    digestAuth:
+      type: http
+      scheme: digest
+      description: |
+        HTTP Digest (SHA-256 or MD5) with the user's primary email address and
+        an app password, accepted when `APP_DAV_DIGEST_ENABLED` is true. An app
+        password can answer Digest only once it is Digest ready: one issued
+        while Digest is enabled, or one that has since authenticated over Basic.
   parameters:
     CalendarID:
       name: id
@@ -716,10 +738,16 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorText"
     Unauthorized:
-      description: Missing or invalid DAV Basic authentication.
+      description: |
+        Missing or invalid credentials, or Basic credentials sent over plain
+        HTTP.
       headers:
         WWW-Authenticate:
-          description: Basic authentication challenge.
+          description: |
+            A challenge for each scheme the request could use: `Basic` over
+            HTTPS, and `Digest` with SHA-256 and with MD5 when Digest is enabled.
+            Over plain HTTP with Digest disabled, the response carries no
+            challenge.
           schema:
             type: string
           example: Basic realm="CalCard DAV"
@@ -752,12 +780,6 @@ components:
             $ref: "#/components/schemas/ErrorText"
     PreconditionFailed:
       description: Conditional request headers were not satisfied.
-      content:
-        text/plain; charset=utf-8:
-          schema:
-            $ref: "#/components/schemas/ErrorText"
-    UnsupportedMediaType:
-      description: The request content type is unsupported for event writes.
       content:
         text/plain; charset=utf-8:
           schema:
@@ -890,7 +912,10 @@ components:
           description: Defaults to `structured` when omitted.
         rawIcal:
           type: string
-          description: Required when `inputMode` is `raw_ical`.
+          description: |
+            Required when `inputMode` is `raw_ical`. An iCalendar object,
+            validated and stored by the same rules as a `text/calendar` request
+            body.
         structured:
           $ref: "#/components/schemas/StructuredEventInput"
       oneOf:

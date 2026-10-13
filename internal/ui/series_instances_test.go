@@ -398,6 +398,39 @@ func TestEventsJSONGivesOnlyThisAndFutureOverridesARange(t *testing.T) {
 	}
 }
 
+// overridesWritingTheirEndsApart is a timed series whose overrides each end
+// another way: one writes no end and takes its series' hour, one moves to a
+// date and writes no end, so lasts that day, and one writes a DURATION.
+var overridesWritingTheirEndsApart = seriesObject("",
+	"DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+	"RECURRENCE-ID:20261012T090000Z\r\nDTSTART:20261013T150000Z\r\nSUMMARY:Moved\r\n",
+	"RECURRENCE-ID:20261019T090000Z\r\nDTSTART;VALUE=DATE:20261020\r\nSUMMARY:All day\r\n",
+	"RECURRENCE-ID:20261026T090000Z\r\nDTSTART:20261026T110000Z\r\nDURATION:PT2H\r\nSUMMARY:Longer\r\n")
+
+// The view model places each override replacing one instance where CalDAV's
+// expansion places it, whatever it writes of its end, so the browser need not
+// read an end the override leaves to its series or to RFC 5545.
+func TestEventsJSONPlacesEachOverrideWhereCalDAVExpandsIt(t *testing.T) {
+	_, payload := servedSeries(t, overridesWritingTheirEndsApart, "2026-10-01", "2026-11-01")
+	listed, ok := payload["overrideInstances"].([]any)
+	if !ok {
+		t.Fatalf("the series' view model places no overrides: %v", payload)
+	}
+	var got []string
+	for _, override := range listed {
+		placed := override.(map[string]any)
+		got = append(got, placed["recurrenceId"].(string)+" "+placed["start"].(string)+".."+placed["end"].(string))
+	}
+	want := []string{
+		"2026-10-12T09:00:00Z 2026-10-13T15:00:00Z..2026-10-13T16:00:00Z",
+		"2026-10-19T09:00:00Z 2026-10-20T00:00:00Z..2026-10-21T00:00:00Z",
+		"2026-10-26T09:00:00Z 2026-10-26T11:00:00Z..2026-10-26T13:00:00Z",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("overrides placed at %v, want %v", got, want)
+	}
+}
+
 // The browser places a series by the instances the server lists and its
 // overrides as themselves, whatever its own zone: an override stands for the
 // instance it replaces, which the server leaves out, and an instance a
@@ -421,6 +454,27 @@ func TestCalendarViewsShowTheInstancesTheServerLists(t *testing.T) {
 				`{"summary":"Moved","allDay":false,"start":"2026-10-13T15:00:00.000Z","end":"2026-10-13T16:00:00.000Z","recurrenceId":"2026-10-12T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
 				`{"summary":"Later","allDay":false,"start":"2026-10-19T11:00:00.000Z","end":"2026-10-19T13:00:00.000Z","recurrenceId":"2026-10-19T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
 				`{"summary":"Later","allDay":false,"start":"2026-10-26T11:00:00.000Z","end":"2026-10-26T13:00:00.000Z","recurrenceId":"2026-10-26T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"}]`,
+		},
+		{
+			name: "a timed series with an override of every later instance naming a slot it leaves out",
+			raw: seriesObject("",
+				"DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEXDATE:20261012T090000Z\r\n",
+				"RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261012T110000Z\r\nDTEND:20261012T130000Z\r\nSUMMARY:Later\r\n"),
+			start: "2026-10-01", end: "2026-11-01",
+			want: `[` +
+				`{"summary":"Series","allDay":false,"start":"2026-10-05T09:00:00.000Z","end":"2026-10-05T10:00:00.000Z","recurrenceId":"2026-10-05T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
+				`{"summary":"Later","allDay":false,"start":"2026-10-12T11:00:00.000Z","end":"2026-10-12T13:00:00.000Z","recurrenceId":"2026-10-12T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
+				`{"summary":"Later","allDay":false,"start":"2026-10-19T11:00:00.000Z","end":"2026-10-19T13:00:00.000Z","recurrenceId":"2026-10-19T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"}]`,
+		},
+		{
+			name:  "a timed series with overrides ending where CalDAV expands them",
+			raw:   overridesWritingTheirEndsApart,
+			start: "2026-10-01", end: "2026-11-01",
+			want: `[` +
+				`{"summary":"Series","allDay":false,"start":"2026-10-05T09:00:00.000Z","end":"2026-10-05T10:00:00.000Z","recurrenceId":"2026-10-05T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
+				`{"summary":"Moved","allDay":false,"start":"2026-10-13T15:00:00.000Z","end":"2026-10-13T16:00:00.000Z","recurrenceId":"2026-10-12T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
+				`{"summary":"All day","allDay":true,"start":"2026-10-20","end":"2026-10-21","recurrenceId":"2026-10-19T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"},` +
+				`{"summary":"Longer","allDay":false,"start":"2026-10-26T11:00:00.000Z","end":"2026-10-26T13:00:00.000Z","recurrenceId":"2026-10-26T09:00:00.000Z","recurrenceIdAllDay":false,"recurrenceTimezone":"UTC"}]`,
 		},
 		{
 			name:  "an all-day series",

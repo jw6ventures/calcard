@@ -619,6 +619,7 @@ func TestRFC4791_CalendarQueryDepthScopesTheTargetSet(t *testing.T) {
 		{depth: "0", set: true, hrefs: nil},
 		{depth: "1", set: true, hrefs: []string{"/dav/calendars/1/standup.ics"}},
 		{depth: "infinity", set: true, hrefs: []string{"/dav/calendars/1/standup.ics"}},
+		{depth: "Infinity", set: true, hrefs: []string{"/dav/calendars/1/standup.ics"}},
 	}
 
 	for _, tt := range tests {
@@ -810,7 +811,8 @@ func TestRFC4791_CalendarMultigetUsesRequestURIEquivalenceForCollectionHrefs(t *
 	}{
 		"same absolute URI": {href: "http://example.com/dav/calendars/1/standup.ics", status: http.StatusOK},
 		"foreign authority": {href: "https://other.example/dav/calendars/1/standup.ics", status: http.StatusNotFound},
-		"different scheme":  {href: "https://example.com/dav/calendars/1/standup.ics", status: http.StatusNotFound},
+		"different scheme":  {href: "https://example.com/dav/calendars/1/standup.ics", status: http.StatusOK},
+		"another port":      {href: "http://example.com:8080/dav/calendars/1/standup.ics", status: http.StatusNotFound},
 		"query component":   {href: "http://example.com/dav/calendars/1/standup.ics?view=full", status: http.StatusNotFound},
 		"fragment":          {href: "/dav/calendars/1/standup.ics#vevent", status: http.StatusNotFound},
 		// A URI carries no surrounding whitespace, so padding is not part of the
@@ -852,12 +854,11 @@ func TestRFC4791_CalendarMultigetUsesRequestURIEquivalenceForCollectionHrefs(t *
 	}
 }
 
-// An absolute DAV:href has to match the Request-URI scheme to name the same
-// resource, and behind a TLS-terminating proxy the request itself carries no
-// trace of the https leg: net/http leaves URL.Scheme empty and r.TLS nil. The
-// scheme therefore comes from X-Forwarded-Proto on the same trust terms
-// internal/auth applies to it, or from the configured base URL when the proxy
-// forwards no such header.
+// Behind a TLS-terminating proxy the request carries no trace of the https
+// leg: net/http leaves URL.Scheme empty and r.TLS nil, the proxy has rewritten
+// Host to the name it reaches CalCard by, and an X-Forwarded-Proto from a peer
+// that is not a trusted proxy attests nothing. An absolute DAV:href written
+// with the public name the base URL publishes still names the resource.
 func TestRFC4791_CalendarMultigetResolvesAbsoluteHrefsBehindATLSProxy(t *testing.T) {
 	const body = `<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -865,59 +866,24 @@ func TestRFC4791_CalendarMultigetResolvesAbsoluteHrefsBehindATLSProxy(t *testing
   <D:href>https://cal.example.com/dav/calendars/1/standup.ics</D:href>
 </C:calendar-multiget>`
 
-	tests := map[string]struct {
-		baseURL        string
-		trustedProxies []string
-		remoteAddr     string
-		forwardedProto string
-		status         int
-	}{
-		"trusted proxy forwards https": {
-			baseURL: "http://localhost:8080", trustedProxies: []string{"192.0.2.0/24"},
-			remoteAddr: "192.0.2.7:41234", forwardedProto: "https", status: http.StatusOK,
-		},
-		"untrusted peer cannot assert https": {
-			baseURL: "http://localhost:8080", trustedProxies: []string{"192.0.2.0/24"},
-			remoteAddr: "198.51.100.9:41234", forwardedProto: "https", status: http.StatusNotFound,
-		},
-		"no header, https base URL": {
-			baseURL: "https://cal.example.com", status: http.StatusOK,
-		},
-		"no header, http base URL": {
-			baseURL: "http://cal.example.com", status: http.StatusNotFound,
-		},
+	server := grammarTestServer()
+	server.cfg = &config.Config{BaseURL: "https://cal.example.com", TrustedProxies: []string{"192.0.2.0/24"}}
+
+	// A path-only target leaves URL.Scheme empty, as net/http does for every
+	// origin-form request a real client sends.
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Host = "calcard.internal:8080"
+	req.RemoteAddr = "198.51.100.9:41234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	server.Report(rr, req)
+
+	ms := decodeMultistatus(t, rr)
+	if len(ms.Responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(ms.Responses))
 	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			server := grammarTestServer()
-			server.cfg = &config.Config{BaseURL: tt.baseURL, TrustedProxies: tt.trustedProxies}
-
-			// A path-only target leaves URL.Scheme empty, as net/http does for
-			// every origin-form request a real client sends.
-			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
-			req.Host = "cal.example.com"
-			if tt.remoteAddr != "" {
-				req.RemoteAddr = tt.remoteAddr
-			}
-			if tt.forwardedProto != "" {
-				req.Header.Set("X-Forwarded-Proto", tt.forwardedProto)
-			}
-			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
-			rr := httptest.NewRecorder()
-			server.Report(rr, req)
-
-			ms := decodeMultistatus(t, rr)
-			if len(ms.Responses) != 1 {
-				t.Fatalf("responses = %d, want 1", len(ms.Responses))
-			}
-			if tt.status == http.StatusOK {
-				ms.Responses[0].assertPropstatNames(t, http.StatusOK, davQN("getetag"))
-				return
-			}
-			ms.Responses[0].assertResponseStatus(t, tt.status)
-		})
-	}
+	ms.Responses[0].assertPropstatNames(t, http.StatusOK, davQN("getetag"))
 }
 
 // RFC 4791 §7.8 and §7.9 make a CALDAV:calendar-data naming an unsupported

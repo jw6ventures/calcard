@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -84,6 +85,81 @@ func TestCreateEventRawICSRejectsMethod(t *testing.T) {
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("CreateEvent() status = %d, want %d, body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+}
+
+// The iCalendar a JSON body carries in rawIcal under inputMode raw_ical is the
+// same payload a text/calendar body is: it meets the same validator, is
+// refused with the same status, and is stored the same way.
+func TestRawICalJSONIsAnsweredAsATextCalendarBody(t *testing.T) {
+	ics := func(uid string, extra ...string) string {
+		lines := []string{"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//test//EN"}
+		lines = append(lines, extra...)
+		lines = append(lines, "BEGIN:VEVENT")
+		if uid != "" {
+			lines = append(lines, "UID:"+uid)
+		}
+		lines = append(lines, "DTSTAMP:20260101T000000Z", "SUMMARY:New", "DTSTART:20260320T100000Z", "DTEND:20260320T110000Z", "END:VEVENT", "END:VCALENDAR")
+		return strings.Join(lines, "\r\n") + "\r\n"
+	}
+	tests := []struct {
+		name   string
+		method string
+		uid    string
+		ics    string
+		want   int
+	}{
+		{name: "create", method: http.MethodPost, ics: ics("new-1"), want: http.StatusCreated},
+		{name: "create a scheduling message", method: http.MethodPost, ics: ics("new-1", "METHOD:REQUEST"), want: http.StatusConflict},
+		{name: "create without a UID", method: http.MethodPost, ics: ics(""), want: http.StatusBadRequest},
+		{name: "update", method: http.MethodPut, uid: "event-1", ics: ics("event-1"), want: http.StatusOK},
+		{name: "update a scheduling message", method: http.MethodPut, uid: "event-1", ics: ics("event-1", "METHOD:REQUEST"), want: http.StatusConflict},
+		{name: "update naming another UID", method: http.MethodPut, uid: "event-1", ics: ics("event-2"), want: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		jsonBody, err := json.Marshal(map[string]string{"inputMode": "raw_ical", "rawIcal": tt.ics})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored := map[string]string{}
+		for _, mode := range []struct{ contentType, body string }{
+			{contentType: "text/calendar", body: tt.ics},
+			{contentType: "application/json", body: string(jsonBody)},
+		} {
+			t.Run(tt.name+" "+mode.contentType, func(t *testing.T) {
+				eventRepo := &fakeEventRepo{events: map[string]store.Event{
+					"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: ics("event-1"), ETag: "current", LastModified: time.Now().UTC()},
+				}}
+				handler := NewHandler(&config.Config{}, &store.Store{
+					Calendars: &fakeCalendarRepo{calendars: map[int64]*store.CalendarAccess{
+						1: {Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
+					}},
+					Events: eventRepo,
+				}, dav.ValidateCalendarObject)
+
+				req := httptest.NewRequest(tt.method, "/api/calendars/1/events/"+tt.uid, strings.NewReader(mode.body))
+				req.Header.Set("Content-Type", mode.contentType)
+				req = withUserAndRoute(req, "1", tt.uid)
+				rec := httptest.NewRecorder()
+				if tt.method == http.MethodPost {
+					handler.CreateEvent(rec, req)
+				} else {
+					handler.UpdateEvent(rec, req)
+				}
+
+				if rec.Code != tt.want {
+					t.Fatalf("status = %d, want %d, body=%s", rec.Code, tt.want, rec.Body.String())
+				}
+				var bodies []string
+				for _, key := range slices.Sorted(maps.Keys(eventRepo.events)) {
+					bodies = append(bodies, key+"="+eventRepo.events[key].RawICAL)
+				}
+				stored[mode.contentType] = strings.Join(bodies, "\n")
+			})
+		}
+		if stored["text/calendar"] != stored["application/json"] {
+			t.Errorf("%s: stored events differ between the modes:\ntext/calendar:\n%s\napplication/json:\n%s", tt.name, stored["text/calendar"], stored["application/json"])
+		}
 	}
 }
 
@@ -822,6 +898,7 @@ func TestEventWritesAnswer403BeforeBuildingTheEventForAPrincipalWhoCannotWrite(t
 		"create over a stored UID":             {method: http.MethodPost, contentType: "text/calendar", body: storedICS, header: map[string]string{"If-None-Match": "*"}},
 		"update structured with a bad until":   {method: http.MethodPut, uid: "event-1", contentType: "application/json", body: `{"structured":{"summary":"x","dtstart":"2026-03-20T10:00","dtend":"2026-03-20T11:00","recurrence":{"frequency":"DAILY","until":"June"}}}`},
 		"update raw iCalendar":                 {method: http.MethodPut, uid: "event-1", contentType: "text/calendar", body: storedICS, header: map[string]string{"If-Match": `"current"`}},
+		"update raw iCalendar in JSON":         {method: http.MethodPut, uid: "event-1", contentType: "application/json", body: `{"inputMode":"raw_ical","rawIcal":"BEGIN:VCALENDAR"}`, header: map[string]string{"If-Match": `"current"`}},
 		"delete":                               {method: http.MethodDelete, uid: "event-1", header: map[string]string{"If-Match": `"current"`}},
 	}
 	for name, tt := range tests {

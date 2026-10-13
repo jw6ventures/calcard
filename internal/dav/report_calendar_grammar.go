@@ -116,10 +116,11 @@ func applyCalendarReportGrammar(report *reportRequest, body []byte) *reportGramm
 // reportDepth reads the Depth a calendaring REPORT is scoped by. RFC 4791 §7.8
 // and §7.10 both process a request carrying no Depth header as Depth: 0, which
 // is the opposite of the RFC 4918 §9.1 PROPFIND default and reaches the
-// Request-URI alone. RFC 4918 §10.2 fixes the three legal values, so anything
+// Request-URI alone. RFC 4918 §10.2 fixes the three legal values, matched
+// without regard to case as RFC 5234 §2.3 reads a quoted string, so anything
 // else is a malformed request rather than a value to guess at.
 func reportDepth(r *http.Request) (string, bool) {
-	depth := strings.TrimSpace(r.Header.Get("Depth"))
+	depth := strings.ToLower(strings.TrimSpace(r.Header.Get("Depth")))
 	switch depth {
 	case "":
 		return "0", true

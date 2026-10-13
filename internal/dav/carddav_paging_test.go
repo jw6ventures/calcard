@@ -94,8 +94,8 @@ func TestAddressBookQuerySkipsDeniedMatchesAcrossPages(t *testing.T) {
 	if len(responses) != 1 || responses[0].Href != "/dav/addressbooks/5/contact-270.vcf" {
 		t.Fatalf("filtered responses = %#v", responses)
 	}
-	if repo.pageLookupCount != 2 || acls.listScopedACLCalls != 2 {
-		t.Fatalf("page calls = %d, scoped ACL calls = %d; want 2 each", repo.pageLookupCount, acls.listScopedACLCalls)
+	if repo.pageLookupCount != 2 || acls.listByResourcesCalls != 2 {
+		t.Fatalf("page calls = %d, batched ACL calls = %d; want 2 each", repo.pageLookupCount, acls.listByResourcesCalls)
 	}
 }
 

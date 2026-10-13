@@ -2636,8 +2636,8 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 	if aclRepo.listByResourceCalls != 0 {
 		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
 	}
-	if aclRepo.listScopedACLCalls != 1 {
-		t.Fatalf("expected one scoped ACL batch lookup, got %d", aclRepo.listScopedACLCalls)
+	if aclRepo.listByResourcesCalls != 1 {
+		t.Fatalf("expected one batched ACL lookup, got %d", aclRepo.listByResourcesCalls)
 	}
 }
 
@@ -11410,7 +11410,10 @@ func TestPropfindDepthHandling(t *testing.T) {
 		{name: "explicit infinity served when enabled", cfg: enabledCfg, depth: "infinity", setDepth: true, want: http.StatusMultiStatus},
 		{name: "explicit infinity refused when disabled", cfg: disabledCfg, depth: "infinity", setDepth: true, want: http.StatusForbidden},
 		{name: "missing depth refused when disabled", cfg: disabledCfg, setDepth: false, want: http.StatusForbidden},
+		{name: "capitalised infinity served by default", depth: "Infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "upper-case infinity refused when disabled", cfg: disabledCfg, depth: "INFINITY", setDepth: true, want: http.StatusForbidden},
 		{name: "invalid depth", depth: "2", setDepth: true, want: http.StatusBadRequest},
+		{name: "misspelt infinity", depth: "infinite", setDepth: true, want: http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

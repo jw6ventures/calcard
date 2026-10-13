@@ -1,7 +1,9 @@
 package dav
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -49,11 +51,18 @@ func lockBatchIndexFromContext(ctx context.Context) *lockBatchIndex {
 }
 
 // locksForPaths returns the locks whose resource path matches one of paths,
-// reproducing store.Locks.ListByResources from the prefetched batch.
+// reproducing store.Locks.ListByResources from the prefetched batch, order
+// included.
 func (idx *lockBatchIndex) locksForPaths(paths []string) []store.Lock {
 	var result []store.Lock
 	for _, p := range paths {
 		result = append(result, idx.byPath[p]...)
 	}
+	slices.SortFunc(result, func(a, b store.Lock) int {
+		if order := a.CreatedAt.Compare(b.CreatedAt); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
 	return result
 }

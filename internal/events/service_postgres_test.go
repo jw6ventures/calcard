@@ -86,7 +86,7 @@ func TestPostgres_EventsAreHiddenFromAUserWithNoAccessToTheirCalendar(t *testing
 		t.Fatalf("create calendar: %v", err)
 	}
 	svc := NewService(database, dav.ValidateCalendarObject)
-	if _, _, err := svc.CreateEvent(ctx, owner, cal.ID, UpsertInput{RawICS: validICS("stored"), ContentType: "text/calendar"}); err != nil {
+	if _, err := svc.CreateEvent(ctx, owner, cal.ID, UpsertInput{RawICS: validICS("stored")}); err != nil {
 		t.Fatalf("CreateEvent() by the owner: %v", err)
 	}
 	collection := fmt.Sprintf("/dav/calendars/%d", cal.ID)
@@ -101,7 +101,7 @@ func TestPostgres_EventsAreHiddenFromAUserWithNoAccessToTheirCalendar(t *testing
 		if ev, err := svc.GetEvent(ctx, stranger, cal.ID, uid); !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetEvent(%q) by a stranger = %v, %v; want ErrNotFound", uid, ev != nil, err)
 		}
-		if _, _, err := svc.UpdateEvent(ctx, stranger, cal.ID, uid, UpsertInput{RawICS: validICS(uid), ContentType: "text/calendar", IfNoneMatch: "*"}); !errors.Is(err, ErrNotFound) {
+		if _, _, err := svc.UpdateEvent(ctx, stranger, cal.ID, uid, UpsertInput{RawICS: validICS(uid), IfNoneMatch: "*"}); !errors.Is(err, ErrNotFound) {
 			t.Errorf("UpdateEvent(%q) by a stranger error = %v, want ErrNotFound", uid, err)
 		}
 		if err := svc.DeleteEvent(ctx, stranger, cal.ID, uid, `"etag"`, ""); !errors.Is(err, ErrNotFound) {
@@ -126,7 +126,7 @@ func TestPostgres_EventsAreHiddenFromAUserWithNoAccessToTheirCalendar(t *testing
 		user *store.User
 		want error
 	}{{stranger, ErrNotFound}, {reader, ErrForbidden}, {objectReader, ErrForbidden}} {
-		if _, _, err := counted.CreateEvent(ctx, tc.user, cal.ID, UpsertInput{RawICS: validICS("new"), ContentType: "text/calendar"}); !errors.Is(err, tc.want) {
+		if _, err := counted.CreateEvent(ctx, tc.user, cal.ID, UpsertInput{RawICS: validICS("new")}); !errors.Is(err, tc.want) {
 			t.Errorf("CreateEvent() by %s error = %v, want %v", tc.user.PrimaryEmail, err, tc.want)
 		}
 	}
@@ -164,7 +164,7 @@ func TestPostgres_ConcurrentCreatesOfAUIDStoreOneEvent(t *testing.T) {
 			defer wg.Done()
 			<-start
 			body := strings.Replace(validICS("raced"), "SUMMARY:Planning", fmt.Sprintf("SUMMARY:Writer %d", i), 1)
-			event, _, err := svc.CreateEvent(ctx, owner, cal.ID, UpsertInput{RawICS: body, ContentType: "text/calendar"})
+			event, err := svc.CreateEvent(ctx, owner, cal.ID, UpsertInput{RawICS: body})
 			outcomes[i] = outcome{event, err}
 		}(i)
 	}
@@ -245,7 +245,7 @@ func (f *eventWriteAccessFixture) reset(t *testing.T) {
 	}
 	if stored == nil {
 		svc := NewService(f.database, dav.ValidateCalendarObject)
-		if stored, _, err = svc.CreateEvent(ctx, f.owner, f.calendar.ID, UpsertInput{RawICS: validICS("stored"), ContentType: "text/calendar"}); err != nil {
+		if stored, err = svc.CreateEvent(ctx, f.owner, f.calendar.ID, UpsertInput{RawICS: validICS("stored")}); err != nil {
 			t.Fatalf("restore the stored event: %v", err)
 		}
 	}
@@ -290,7 +290,7 @@ func TestPostgres_EventUpdatesAndDeletesFollowTheAccessRules(t *testing.T) {
 						var err error
 						if op == "update" {
 							_, _, err = svc.UpdateEvent(t.Context(), f.users[i], f.calendar.ID, uid, UpsertInput{
-								RawICS: validICS(uid), ContentType: "text/calendar", IfMatch: ifMatch, IfNoneMatch: header.ifNoneMatch,
+								RawICS: validICS(uid), IfMatch: ifMatch, IfNoneMatch: header.ifNoneMatch,
 							})
 						} else {
 							err = svc.DeleteEvent(t.Context(), f.users[i], f.calendar.ID, uid, ifMatch, header.ifNoneMatch)

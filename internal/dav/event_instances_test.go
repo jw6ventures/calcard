@@ -234,6 +234,136 @@ func TestEventInstancesNameTheOverrideGoverningThem(t *testing.T) {
 	}
 }
 
+// A RANGE=THISANDFUTURE override naming a slot its series never generates --
+// here one its EXDATE leaves out -- is carried by no instance, so expansion
+// writes it as itself and EventInstances places it there; one naming a slot
+// the series generates is carried by the instances it governs, and placed as
+// none of its own.
+func TestEventInstancesPlaceAThisAndFutureOverrideOnlyWhereNoInstanceCarriesIt(t *testing.T) {
+	october := []time.Time{time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
+	later := "RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261012T110000Z\r\nDTEND:20261012T130000Z\r\nSUMMARY:Later\r\n"
+	for _, tt := range []struct {
+		name       string
+		exdate     string
+		instances  []string
+		placed     []string
+		overridden []string
+	}{
+		{
+			name: "a slot the series generates", instances: []string{"20261005T090000Z", "20261012T110000Z", "20261019T110000Z"},
+		},
+		{
+			name: "a slot its EXDATE leaves out", exdate: "EXDATE:20261012T090000Z\r\n",
+			instances: []string{"20261005T090000Z", "20261019T110000Z"}, placed: []string{"20261012T110000Z"},
+			overridden: []string{"20261012T090000Z"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n"+tt.exdate, later)
+			got := EventInstances(raw, october[0], october[1])
+			var starts, placed []string
+			for _, instance := range got.Instances {
+				starts = append(starts, instance.Start.Format("20060102T150405Z"))
+			}
+			for _, override := range got.Overrides {
+				if override.End.Sub(override.Start) != 2*time.Hour || !override.RecurrenceID.Equal(mustUTC(t, "20261012T090000Z")) {
+					t.Errorf("override placed as %+v, want its own two hours, naming the slot it names", override)
+				}
+				placed = append(placed, override.Start.Format("20060102T150405Z"))
+			}
+			if !slices.Equal(starts, tt.instances) || !slices.Equal(placed, tt.placed) {
+				t.Errorf("EventInstances() lists instances at %v and places overrides at %v, want %v and %v", starts, placed, tt.instances, tt.placed)
+			}
+			expanded := expandedInstances(t, raw, october[0], october[1], tt.overridden...)
+			if len(expanded) != len(tt.instances) {
+				t.Errorf("CalDAV expands %d instances of the series, EventInstances lists %d", len(expanded), len(tt.instances))
+			}
+			code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="20261001T000000Z" end="20261101T000000Z"/>`))
+			if code != 207 {
+				t.Fatalf("expand status = %d, body %s", code, body)
+			}
+			if got, want := strings.Count(body, "DTSTART:20261012T110000Z"), 1; got != want {
+				t.Errorf("expansion writes the override's start %d times, want %d:\n%s", got, want, body)
+			}
+		})
+	}
+}
+
+// RANGE=THISANDFUTURE overrides a decade apart on a series of every minute
+// have millions of slots between them, more than one pass over the series may
+// generate, yet each is still found to name a slot the series generates, and
+// none stands for itself; one naming no minute stands for itself.
+func TestThisAndFutureOverridesFarApartOnADenseSeriesAreEachMatchedToTheirSlot(t *testing.T) {
+	raw := instancesObject("", "DTSTART:20200101T000000Z\r\nDURATION:PT30S\r\nRRULE:FREQ=MINUTELY\r\n",
+		"RECURRENCE-ID;RANGE=THISANDFUTURE:20200101T001000Z\r\nDTSTART:20200101T001000Z\r\nDURATION:PT30S\r\nSUMMARY:Early\r\n",
+		"RECURRENCE-ID;RANGE=THISANDFUTURE:20300101T000000Z\r\nDTSTART:20300101T000000Z\r\nDURATION:PT30S\r\nSUMMARY:Late\r\n",
+		"RECURRENCE-ID;RANGE=THISANDFUTURE:20300101T001030Z\r\nDTSTART:20300101T001030Z\r\nDURATION:PT15S\r\nSUMMARY:Between\r\n")
+	from, to := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 2, 0, 0, time.UTC)
+	got := EventInstances(raw, from, to)
+	if len(got.Instances) != 2 || len(got.Overrides) != 0 {
+		t.Errorf("EventInstances() lists %+v and places %+v, want the two minutes alone", got.Instances, got.Overrides)
+	}
+	between := EventInstances(raw, time.Date(2030, 1, 1, 0, 10, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 11, 0, 0, time.UTC))
+	if len(between.Overrides) != 1 || !between.Overrides[0].Start.Equal(mustUTC(t, "20300101T001030Z")) {
+		t.Errorf("EventInstances() places %+v, want the override naming no minute", between.Overrides)
+	}
+	code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="20300101T000000Z" end="20300101T000200Z"/>`))
+	if code != 207 {
+		t.Fatalf("expand status = %d, body %s", code, body)
+	}
+	if strings.Count(body, "BEGIN:VEVENT") != 2 || strings.Count(body, "DTSTART:20300101T000000Z") != 1 {
+		t.Errorf("expansion writes other than the two minutes:\n%s", body)
+	}
+}
+
+// A cancelled RANGE=THISANDFUTURE override removes the slot it names and every
+// later one, which expansion leaves out, so it is placed as no instance of
+// its own either.
+func TestEventInstancesPlaceNoCancelledThisAndFutureOverride(t *testing.T) {
+	raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
+		"RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261012T090000Z\r\nDTEND:20261012T100000Z\r\nSTATUS:CANCELLED\r\n")
+	october := []time.Time{time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
+	got := EventInstances(raw, october[0], october[1])
+	if len(got.Instances) != 1 || !got.Instances[0].Start.Equal(mustUTC(t, "20261005T090000Z")) || len(got.Overrides) != 0 {
+		t.Errorf("EventInstances() lists %+v and places %+v, want the first instance alone", got.Instances, got.Overrides)
+	}
+	code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="20261001T000000Z" end="20261101T000000Z"/>`))
+	if code != 207 {
+		t.Fatalf("expand status = %d, body %s", code, body)
+	}
+	if strings.Count(body, "BEGIN:VEVENT") != 1 {
+		t.Errorf("expansion writes other than the first instance:\n%s", body)
+	}
+}
+
+// An all-day override repeating its RECURRENCE-ID as its DTSTART and writing
+// no end lasts the day its series gives it, as expansion writes it.
+func TestEventInstancesPlaceAnAllDayOverrideOverItsDay(t *testing.T) {
+	raw := instancesObject("", "DTSTART;VALUE=DATE:20261005\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
+		"RECURRENCE-ID;VALUE=DATE:20261012\r\nDTSTART;VALUE=DATE:20261012\r\nSUMMARY:Renamed\r\n")
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	want := []calobject.Instance{{RecurrenceID: mustUTC(t, "20261012T000000Z"), Start: mustUTC(t, "20261012T000000Z"), End: mustUTC(t, "20261013T000000Z")}}
+	if !slices.EqualFunc(got.Overrides, want, func(a, b calobject.Instance) bool {
+		return a.RecurrenceID.Equal(b.RecurrenceID) && a.Start.Equal(b.Start) && a.End.Equal(b.End)
+	}) {
+		t.Errorf("EventInstances() places overrides at %+v, want %+v", got.Overrides, want)
+	}
+}
+
+// An override whose DTSTART repeats the wall clock of its RECURRENCE-ID in
+// another zone starts at that zone's reading of it.
+func TestEventInstancesPlaceAnOverrideInItsOwnStartsZone(t *testing.T) {
+	raw := instancesObject("", "DTSTART;TZID=America/New_York:20261005T090000\r\nDTEND;TZID=America/New_York:20261005T100000\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
+		"RECURRENCE-ID;TZID=America/New_York:20261012T090000\r\nDTSTART;TZID=Europe/Berlin:20261012T090000\r\nDTEND;TZID=Europe/Berlin:20261012T100000\r\nSUMMARY:Moved\r\n")
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	want := []calobject.Instance{{RecurrenceID: mustUTC(t, "20261012T130000Z"), Start: mustUTC(t, "20261012T070000Z"), End: mustUTC(t, "20261012T080000Z")}}
+	if !slices.EqualFunc(got.Overrides, want, func(a, b calobject.Instance) bool {
+		return a.RecurrenceID.Equal(b.RecurrenceID) && a.Start.Equal(b.Start) && a.End.Equal(b.End)
+	}) {
+		t.Errorf("EventInstances() places overrides at %+v, want %+v", got.Overrides, want)
+	}
+}
+
 // A minutely series holds far more instances in a month than one expansion
 // returns. The listing stops at the expansion's limit and says it is partial.
 func TestEventInstancesStopAtTheExpansionLimit(t *testing.T) {

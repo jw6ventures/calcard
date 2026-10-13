@@ -3,7 +3,6 @@ package dav
 import (
 	"context"
 	"errors"
-	"path"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/acl"
@@ -195,14 +194,30 @@ func (h *DavServer) calendarAccessForPath(ctx context.Context, user *store.User,
 	}, nil
 }
 
+// storedCalendarAccess returns the store's resolution of user's access to
+// calendar id. It depends on neither the path nor the privilege being decided,
+// so a request reads it once however many members it decides.
+func (h *DavServer) storedCalendarAccess(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {
+	if user == nil || h == nil || h.store == nil || h.store.Calendars == nil {
+		return nil, nil
+	}
+	state := davRequestStateFromContext(ctx)
+	key := calendarAccessKey{calendarID: id, userID: user.ID}
+	if access, ok := state.memoizedCalendarAccess(key); ok {
+		return access, nil
+	}
+	access, err := h.store.Calendars.GetAccessible(ctx, id, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	state.memoizeCalendarAccess(key, access)
+	return access, nil
+}
+
 func (h *DavServer) loadCalendarWithPrivilege(ctx context.Context, user *store.User, id int64, cleanPath, privilege string) (*store.CalendarAccess, error) {
-	var legacy *store.CalendarAccess
-	if user != nil && h != nil && h.store != nil && h.store.Calendars != nil {
-		legacyAccess, legacyErr := h.store.Calendars.GetAccessible(ctx, id, user.ID)
-		if legacyErr != nil {
-			return nil, legacyErr
-		}
-		legacy = legacyAccess
+	legacy, err := h.storedCalendarAccess(ctx, user, id)
+	if err != nil {
+		return nil, err
 	}
 	cal, err := h.getCalendar(ctx, id)
 	if err != nil {
@@ -228,7 +243,7 @@ func (h *DavServer) canAccessCalendarObject(ctx context.Context, user *store.Use
 	if cal == nil {
 		return false, nil
 	}
-	resourcePath := objectResourcePath(calendarPrefix, cal.ID, resourceName)
+	resourcePath := objectRequestPath(calendarPrefix, cal.ID, resourceName, ".ics")
 	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, resourcePath, privilege); err != nil {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 			return false, nil
@@ -247,7 +262,7 @@ func (h *DavServer) loadCalendarForObjectRead(ctx context.Context, user *store.U
 	if err != nil {
 		return nil, err
 	}
-	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, objectResourcePath(calendarPrefix, cal.ID, resourceName), "read"); err != nil {
+	if err := h.requireCalendarPrivilege(ctx, user, &cal.Calendar, objectRequestPath(calendarPrefix, cal.ID, resourceName, ".ics"), "read"); err != nil {
 		return nil, err
 	}
 	return cal, nil
@@ -262,7 +277,7 @@ func (h *DavServer) prefetchCalendarACLEntries(ctx context.Context, user *store.
 	relevantPaths := make([]string, 0, 1+2*len(events))
 	relevantPaths = append(relevantPaths, collectionPath)
 	for _, event := range events {
-		relevantPaths = appendObjectACLPaths(relevantPaths, collectionPath, eventResourceName(event), ".ics")
+		relevantPaths = append(relevantPaths, objectACLPaths(collectionPath, eventResourceName(event))...)
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
@@ -291,13 +306,9 @@ func (h *DavServer) filterReadableCalendarEvents(ctx context.Context, user *stor
 }
 
 func (h *DavServer) loadCalendarWithAnyPrivilege(ctx context.Context, user *store.User, id int64, cleanPath string) (*store.CalendarAccess, error) {
-	var legacy *store.CalendarAccess
-	if user != nil && h != nil && h.store != nil && h.store.Calendars != nil {
-		legacyAccess, legacyErr := h.store.Calendars.GetAccessible(ctx, id, user.ID)
-		if legacyErr != nil {
-			return nil, legacyErr
-		}
-		legacy = legacyAccess
+	legacy, err := h.storedCalendarAccess(ctx, user, id)
+	if err != nil {
+		return nil, err
 	}
 
 	cal, err := h.getCalendar(ctx, id)
@@ -377,26 +388,27 @@ func calendarPrivilegeDecisionWithDecider(cal *store.CalendarAccess, resourceNam
 	if cal == nil || decider == nil {
 		return false, false
 	}
-	if granted, denied, decided := decider.decide(resourceName, ".ics", privilege); decided {
+	if granted, denied, decided := decider.decide(resourceName, privilege); decided {
 		return granted, denied
 	}
-	return false, decider.hasApplicable(resourceName, ".ics")
+	return false, decider.hasApplicable(resourceName)
 }
 
-// prefetchACLEntries loads the request's relevant resource/principal pairs in
-// one scoped query and keys the result by normalized resource path.
+// prefetchACLEntries loads every entry stored under relevantPaths in one query
+// and keys them by the path they are stored under. It reads the entries of
+// every principal, as a decision for one resource does: an ACE may name the
+// user by any href that denotes it, which only NormalizePrincipalHref matches.
 func (h *DavServer) prefetchACLEntries(ctx context.Context, user *store.User, relevantPaths []string) (map[string][]store.ACLEntry, error) {
 	if h == nil || h.store == nil || h.store.ACLEntries == nil || user == nil {
 		return nil, nil
 	}
-	entries, err := h.store.ACLEntries.ListByResourcesAndPrincipals(ctx, relevantPaths, acl.PrincipalHrefs(user))
+	entries, err := h.store.ACLEntries.ListByResources(ctx, relevantPaths)
 	if err != nil {
 		return nil, err
 	}
 	result := make(map[string][]store.ACLEntry, len(relevantPaths))
 	for _, entry := range entries {
-		resourcePath := cleanDAVPath(entry.ResourcePath)
-		result[resourcePath] = append(result[resourcePath], entry)
+		result[entry.ResourcePath] = append(result[entry.ResourcePath], entry)
 	}
 	return result, nil
 }
@@ -441,7 +453,7 @@ func newBatchedObjectACLDecider(user *store.User, ownerID int64, collectionPath 
 	return decider
 }
 
-func (d *batchedObjectACLDecider) decide(resourceName, extension, privilege string) (granted, denied, decided bool) {
+func (d *batchedObjectACLDecider) decide(resourceName, privilege string) (granted, denied, decided bool) {
 	if d == nil {
 		return false, false, false
 	}
@@ -449,8 +461,7 @@ func (d *batchedObjectACLDecider) decide(resourceName, extension, privilege stri
 		return true, false, true
 	}
 	if d.hasObjectEntries {
-		primary, alternate := d.objectEntries(resourceName, extension)
-		if granted, applicable := decisionForEntrySets(primary, alternate, d.principals, privilege); applicable {
+		if granted, applicable := acl.DecisionForPrivilege(d.objectEntries(resourceName), d.principals, privilege); applicable {
 			return granted, !granted, true
 		}
 	}
@@ -464,17 +475,14 @@ func (d *batchedObjectACLDecider) decide(resourceName, extension, privilege stri
 	return false, false, false
 }
 
-func (d *batchedObjectACLDecider) hasApplicable(resourceName, extension string) bool {
+func (d *batchedObjectACLDecider) hasApplicable(resourceName string) bool {
 	if d == nil {
 		return false
 	}
 	if !d.hasObjectEntries {
 		return d.collectionHasApplicable
 	}
-	primary, alternate := d.objectEntries(resourceName, extension)
-	return acl.HasApplicablePrincipal(primary, d.principals) ||
-		acl.HasApplicablePrincipal(alternate, d.principals) ||
-		d.collectionHasApplicable
+	return acl.HasApplicablePrincipal(d.objectEntries(resourceName), d.principals) || d.collectionHasApplicable
 }
 
 func (d *batchedObjectACLDecider) collectionDecision(privilege string) (batchedACLDecision, bool) {
@@ -500,25 +508,16 @@ func (d *batchedObjectACLDecider) collectionDecision(privilege string) (batchedA
 	return d.collectionDecisions[index], true
 }
 
-func (d *batchedObjectACLDecider) objectEntries(resourceName, extension string) ([]store.ACLEntry, []store.ACLEntry) {
-	resourceName = strings.TrimSpace(resourceName)
-	if d == nil || resourceName == "" {
-		return nil, nil
+// objectEntries returns the ACL of the member resourceName in ACE order, read
+// from the spellings a request naming that member reads.
+func (d *batchedObjectACLDecider) objectEntries(resourceName string) []store.ACLEntry {
+	paths := objectACLPaths(d.collectionPath, resourceName)
+	var entries []store.ACLEntry
+	for _, resourcePath := range paths {
+		entries = append(entries, d.entriesByPath[resourcePath]...)
 	}
-	primaryPath := strings.TrimSuffix(d.collectionPath, "/") + "/" + resourceName
-	alternatePath := primaryPath + extension
-	if strings.EqualFold(path.Ext(resourceName), extension) {
-		alternatePath = strings.TrimSuffix(primaryPath, path.Ext(resourceName))
-	}
-	return d.entriesByPath[primaryPath], d.entriesByPath[alternatePath]
-}
-
-func decisionForEntrySets(first, second []store.ACLEntry, principals map[string]struct{}, privilege string) (bool, bool) {
-	entries := make([]store.ACLEntry, 0, len(first)+len(second))
-	entries = append(entries, first...)
-	entries = append(entries, second...)
-	acl.SortEntries(entries)
-	return acl.DecisionForPrivilege(entries, principals, privilege)
+	orderACLEntries(entries, paths)
+	return entries
 }
 
 func (h *DavServer) loadCalendar(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {

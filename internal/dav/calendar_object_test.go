@@ -890,3 +890,192 @@ func TestParsedTreeIsSafeForConcurrentReaders(t *testing.T) {
 		}
 	}
 }
+
+// calendarWithProperties is an object whose VCALENDAR carries properties
+// beside its VERSION and PRODID, holding one VEVENT whose UID is uid.
+func calendarWithProperties(uid string, properties ...string) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + testProdID + "\r\n")
+	for _, property := range properties {
+		b.WriteString(property + "\r\n")
+	}
+	b.WriteString(buildVEvent(uid))
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+// RFC 7986 §5 defines properties of a calendar as a whole, which an exported
+// or shared calendar carries on its VCALENDAR, each of NAME, DESCRIPTION,
+// CATEGORIES and IMAGE as often as it likes. Each is accepted there, and the
+// object is stored as written under the UID of its VEVENT: RFC 4791 §4.1 binds
+// the UID of a resource's components, which a calendar UID is not.
+func TestRFC7986_CalendarPropertiesAreAcceptedOnTheVCalendar(t *testing.T) {
+	tests := map[string][]string{
+		"NAME":             {"NAME:Team", "NAME;LANGUAGE=de:Mannschaft"},
+		"DESCRIPTION":      {"DESCRIPTION:Shared team calendar", "DESCRIPTION;LANGUAGE=de:Gemeinsamer Kalender"},
+		"UID":              {"UID:5FC53010-1267-4F8E-BC28-1D7AE55A7C99"},
+		"URL":              {"URL:https://example.com/calendars/team.ics"},
+		"LAST-MODIFIED":    {"LAST-MODIFIED:20240601T000000Z"},
+		"CATEGORIES":       {"CATEGORIES:WORK,TEAM", "CATEGORIES:SHARED"},
+		"REFRESH-INTERVAL": {"REFRESH-INTERVAL;VALUE=DURATION:P1W"},
+		"SOURCE":           {"SOURCE;VALUE=URI:https://example.com/calendars/team.ics"},
+		"COLOR":            {"COLOR:turquoise"},
+		"IMAGE": {"IMAGE;VALUE=URI;DISPLAY=BADGE;FMTTYPE=image/png:https://example.com/badge.png",
+			"IMAGE;VALUE=URI;DISPLAY=THUMBNAIL;FMTTYPE=image/png:https://example.com/thumbnail.png"},
+	}
+	for name, properties := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+			uid := "calendar-" + strings.ToLower(name)
+			body := calendarWithProperties(uid, properties...)
+
+			rr := putCalendarObject(t, h, uid+".ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT with a VCALENDAR %s = %d, want 201; body: %s", name, rr.Code, rr.Body.String())
+			}
+			stored := eventRepo.events[eventRepo.key(1, uid)]
+			if stored == nil {
+				t.Fatalf("object was not stored under its VEVENT's UID %q: %#v", uid, eventRepo.events)
+			}
+			if stored.UID != uid || stored.RawICAL != body {
+				t.Fatalf("stored UID %q and octets %q, want %q and the submitted %q", stored.UID, stored.RawICAL, uid, body)
+			}
+			object, err := ValidateCalendarObject(body, nil)
+			if err != nil {
+				t.Fatalf("ValidateCalendarObject() = %v", err)
+			}
+			if object.UID != uid {
+				t.Errorf("ValidateCalendarObject() UID = %q, want the VEVENT's %q", object.UID, uid)
+			}
+		})
+	}
+}
+
+// RFC 7986 §4 lets a VCALENDAR carry at most one each of UID, URL and
+// LAST-MODIFIED, which RFC 5545 defines for components and this server reads
+// the same way wherever they appear.
+func TestRFC7986_CalendarPropertiesThatMayNotRepeatAreRefusedTwice(t *testing.T) {
+	tests := map[string][]string{
+		"UID":           {"UID:calendar-one", "UID:calendar-two"},
+		"URL":           {"URL:https://example.com/one.ics", "URL:https://example.com/two.ics"},
+		"LAST-MODIFIED": {"LAST-MODIFIED:20240601T000000Z", "LAST-MODIFIED:20240602T000000Z"},
+	}
+	for name, properties := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "repeated.ics", calendarWithProperties("repeated", properties...))
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+// A VCALENDAR's UID (RFC 7986 §5.3) names the calendar the object came from,
+// which an empty one names no more than a component's does.
+func TestRFC7986_EmptyCalendarUIDIsRefused(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+
+	rr := putCalendarObject(t, h, "empty-uid.ics", calendarWithProperties("empty-uid", "UID:"))
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+	}
+}
+
+// NAME, COLOR, SOURCE, REFRESH-INTERVAL and IMAGE are names RFC 5545 does not
+// define, so a VCALENDAR carries them as written: repeated, and with whatever
+// value and parameters a client gave them. Holding them to RFC 7986 would
+// strand the stored objects that carry them, which every later write -- a PUT
+// of them back, a COPY or MOVE, an edit -- would refuse.
+func TestRFC7986_CalendarPropertiesOutsideRFC5545AreKeptAsWritten(t *testing.T) {
+	properties := []string{
+		"NAME:Team", "NAME:Team again",
+		"COLOR:red", "COLOR:blue",
+		"SOURCE:not a uri", "SOURCE;VALUE=URI:https://example.com/two.ics",
+		"REFRESH-INTERVAL:PT1H", "REFRESH-INTERVAL;VALUE=DURATION:-P1W",
+		"IMAGE:https://example.com/badge.png", "IMAGE;VALUE=BINARY:@@@",
+	}
+	raw := calendarWithProperties("kept", properties...)
+	h, eventRepo := writableCalendarServer()
+	if rr := putCalendarObject(t, h, "kept.ics", raw); rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	if stored := eventRepo.events[eventRepo.key(1, "kept")]; stored == nil || stored.RawICAL != raw {
+		t.Fatalf("stored %#v, want the submitted octets", stored)
+	}
+	if _, fault := validateTransferredCalendarObject(raw, nil); fault != nil {
+		t.Errorf("transfer refused the object: %+v", fault)
+	}
+}
+
+// A submitted VCALENDAR's LAST-MODIFIED is held to what RFC 5545 §3.8.7.3
+// makes it on a component: a UTC DATE-TIME within the dates the server
+// accepts.
+func TestRFC7986_CalendarLastModifiedIsChecked(t *testing.T) {
+	refused := map[string]struct {
+		property  string
+		condition string
+	}{
+		"no date":                  {"LAST-MODIFIED:not-a-date", "valid-calendar-data"},
+		"a DATE":                   {"LAST-MODIFIED;VALUE=DATE:20240101", "valid-calendar-data"},
+		"floating time":            {"LAST-MODIFIED:20240101T000000", "valid-calendar-data"},
+		"before the earliest date": {"LAST-MODIFIED:18000101T000000Z", "min-date-time"},
+	}
+	for name, tt := range refused {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "checked.ics", calendarWithProperties("checked", tt.property))
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN(tt.condition))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+// An object the store holds may carry a VCALENDAR property PUT refuses, a
+// LAST-MODIFIED that is no date or an empty UID, and COPY or MOVE writes it
+// as it is.
+func TestRFC7986_StoredCalendarPropertiesAreTransferredAsTheyAre(t *testing.T) {
+	for _, property := range []string{"LAST-MODIFIED:not-a-date", "UID:"} {
+		t.Run(property, func(t *testing.T) {
+			raw := calendarWithProperties("stored", property)
+			if _, fault := validateCalendarObjectForStorage(raw, nil); fault == nil {
+				t.Fatal("PUT accepts the fixture, so it does not exercise a stored object")
+			}
+			validated, fault := validateTransferredCalendarObject(raw, nil)
+			if fault != nil {
+				t.Fatalf("transfer refused the stored object: %+v", fault)
+			}
+			if validated.Body != raw {
+				t.Errorf("transferred body = %q, want the stored %q", validated.Body, raw)
+			}
+		})
+	}
+}
+
+// A calendar UID names the calendar an object was exported from, so every
+// object of one export carries the same one. It is no resource's UID, and two
+// resources carrying it are no UID conflict.
+func TestRFC7986_SharedCalendarUIDIsNoUIDConflict(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	for _, uid := range []string{"first-event", "second-event"} {
+		rr := putCalendarObject(t, h, uid+".ics", calendarWithProperties(uid, "UID:exported-calendar"))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("PUT %s = %d, want 201; body: %s", uid, rr.Code, rr.Body.String())
+		}
+	}
+	for _, uid := range []string{"first-event", "second-event"} {
+		if stored := eventRepo.events[eventRepo.key(1, uid)]; stored == nil || stored.UID != uid {
+			t.Errorf("stored %s = %#v, want it under its VEVENT's UID", uid, stored)
+		}
+	}
+}

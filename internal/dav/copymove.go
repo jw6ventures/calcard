@@ -18,7 +18,7 @@ import (
 
 var errCrossAuthorityDestination = errors.New("destination is on another server")
 
-func parseDestinationHeader(r *http.Request) (string, bool, error) {
+func (h *DavServer) parseDestinationHeader(r *http.Request) (string, bool, error) {
 	dest := r.Header.Get("Destination")
 	if dest == "" {
 		return "", false, fmt.Errorf("missing Destination header")
@@ -33,21 +33,30 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 	}
 	// The authority is checked whether or not a scheme is present. A
 	// protocol-relative "//authority/path" names another server just as an
-	// absolute URL does, and RFC 4918 §9.8.6 makes a destination on another
+	// absolute URL does, and RFC 4918 §9.8.5 makes a destination on another
 	// server a 502 rather than something to answer locally. url.ParseRequestURI
 	// leaves that form entirely in Path, so the authority is split off here
-	// instead of being read from Host.
-	if u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https" {
-		return "", false, errCrossAuthorityDestination
-	}
-	authority, rawPath := u.Host, u.EscapedPath()
-	if authority == "" && strings.HasPrefix(rawPath, "//") {
+	// instead of being read from Host. An empty authority names no server and
+	// is malformed rather than foreign.
+	scheme, rawAuthority, rawPath := u.Scheme, u.Host, u.EscapedPath()
+	hasAuthority := scheme != ""
+	if scheme == "" && strings.HasPrefix(rawPath, "//") {
 		var rest string
-		authority, rest, _ = strings.Cut(strings.TrimPrefix(rawPath, "//"), "/")
+		rawAuthority, rest, _ = strings.Cut(strings.TrimPrefix(rawPath, "//"), "/")
 		rawPath = "/" + rest
+		hasAuthority = true
 	}
-	if authority != "" && !strings.EqualFold(authority, r.Host) {
-		return "", false, errCrossAuthorityDestination
+	if hasAuthority {
+		lowerScheme := strings.ToLower(scheme)
+		if lowerScheme != "" && lowerScheme != "http" && lowerScheme != "https" {
+			return "", false, errCrossAuthorityDestination
+		}
+		if rawAuthority == "" {
+			return "", false, fmt.Errorf("invalid Destination URL")
+		}
+		if !h.isLocalOrigin(r, scheme, rawAuthority) {
+			return "", false, errCrossAuthorityDestination
+		}
 	}
 	for _, segment := range strings.Split(rawPath, "/") {
 		if segment == "." || segment == ".." || strings.Contains(strings.ToLower(segment), "%2f") || strings.Contains(strings.ToLower(segment), "%5c") {
@@ -65,7 +74,7 @@ func parseDestinationHeader(r *http.Request) (string, bool, error) {
 	}
 
 	overwrite := true
-	switch overwriteHeader := strings.TrimSpace(r.Header.Get("Overwrite")); overwriteHeader {
+	switch overwriteHeader := strings.ToUpper(strings.TrimSpace(r.Header.Get("Overwrite"))); overwriteHeader {
 	case "", "T":
 	case "F":
 		overwrite = false
@@ -138,7 +147,7 @@ func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srcPath := path.Clean(r.URL.Path)
-	destPath, overwrite, err := parseDestinationHeader(r)
+	destPath, overwrite, err := h.parseDestinationHeader(r)
 	if err != nil {
 		if errors.Is(err, errCrossAuthorityDestination) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -479,7 +488,7 @@ func (h *DavServer) move(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srcPath := path.Clean(r.URL.Path)
-	destPath, overwrite, err := parseDestinationHeader(r)
+	destPath, overwrite, err := h.parseDestinationHeader(r)
 	if err != nil {
 		if errors.Is(err, errCrossAuthorityDestination) {
 			http.Error(w, err.Error(), http.StatusBadGateway)

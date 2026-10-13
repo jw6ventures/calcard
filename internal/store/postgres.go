@@ -2441,7 +2441,7 @@ func (r *lockRepo) ListByResources(ctx context.Context, paths []string) ([]Lock,
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`
+	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at, id`
 	defer observeDB(ctx, "locks.list_by_resources")()
 	rows, err := r.pool.QueryContext(ctx, q, pq.Array(paths))
 	if err != nil {
@@ -2560,7 +2560,7 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 	defer tx.Rollback()
-	if err := lockACLPathsTx(ctx, tx, davStatePaths(resourcePath)...); err != nil {
+	if err := lockACLPathsTx(ctx, tx, ACLPaths(resourcePath)...); err != nil {
 		return err
 	}
 	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
@@ -2583,14 +2583,14 @@ func (r *aclRepo) UpdateACL(ctx context.Context, resourcePath string, mutate fun
 	// Locking before the snapshot read is the whole point: mutate derives the new
 	// ACL from that read, so a hold that only starts at the write lets a caller
 	// write back a stale ACL.
-	if err := lockACLPathsTx(ctx, tx, davStatePaths(resourcePath)...); err != nil {
+	if err := lockACLPathsTx(ctx, tx, ACLPaths(resourcePath)...); err != nil {
 		return err
 	}
 
 	// setACLTx replaces every stored spelling of the resource, so mutate has to
 	// see the entries of all of them: one it was not shown would be dropped.
 	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`
-	rows, err := tx.QueryContext(ctx, q, pq.Array(davStatePaths(resourcePath)))
+	rows, err := tx.QueryContext(ctx, q, pq.Array(ACLPaths(resourcePath)))
 	if err != nil {
 		return err
 	}
@@ -2700,7 +2700,7 @@ func lockACLPathsTx(ctx context.Context, tx *sql.Tx, resourcePaths ...string) er
 // anything the caller read to derive these entries needs the hold to have
 // started before the read.
 func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []ACLEntry) error {
-	statePaths := davStatePaths(resourcePath)
+	statePaths := ACLPaths(resourcePath)
 
 	type aclIdentity struct {
 		principalHref string
@@ -2808,12 +2808,13 @@ func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []st
 			entry.whole = true
 			continue
 		}
-		ext := ".ics"
+		collectionPath := calendarCollectionLockPath(id)
 		if kind == "addressbook" {
-			ext = ".vcf"
+			collectionPath = addressBookCollectionLockPath(id)
 		}
-		canonical, alternate := aclResourceNameCandidates(resourceName, ext)
-		entry.names = append(entry.names, canonical, alternate)
+		for _, spelling := range ObjectACLPaths(collectionPath, resourceName) {
+			entry.names = append(entry.names, strings.TrimPrefix(spelling, collectionPath+"/"))
+		}
 	}
 
 	for _, key := range order {
@@ -2871,14 +2872,6 @@ func aclResourceIdentity(resourcePath string) (string, int64, string, bool, bool
 		return candidate.kind, id, resourceName, false, true
 	}
 	return "", 0, "", false, false
-}
-
-func aclResourceNameCandidates(resourceName, ext string) (string, string) {
-	resourceName = strings.TrimSpace(resourceName)
-	if strings.EqualFold(path.Ext(resourceName), ext) {
-		return resourceName, strings.TrimSuffix(resourceName, path.Ext(resourceName))
-	}
-	return resourceName, resourceName + ext
 }
 
 func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error) {

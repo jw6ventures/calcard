@@ -5141,7 +5141,7 @@ func TestRFC4791_CalendarMultigetOnObjectResourceIsScopedToIt(t *testing.T) {
 		"multiple hrefs":    bodyForHrefs("/dav/calendars/1/one.ics", "/dav/calendars/1/two.ics"),
 		"different object":  bodyForHrefs("/dav/calendars/1/two.ics"),
 		"foreign authority": bodyForHrefs("http://other.example/dav/calendars/1/one.ics"),
-		"different scheme":  bodyForHrefs("https://example.com/dav/calendars/1/one.ics"),
+		"another port":      bodyForHrefs("http://example.com:8080/dav/calendars/1/one.ics"),
 		"query component":   bodyForHrefs("http://example.com/dav/calendars/1/one.ics?view=full"),
 	} {
 		t.Run(name, func(t *testing.T) {

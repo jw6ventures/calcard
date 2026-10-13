@@ -195,10 +195,16 @@ var icalObjectComponentRules = map[string]icalComponentRules{
 	// Nothing the server answers reads PRODID, so like DTSTAMP it is not
 	// required, and validateCalendarObject decides VERSION itself;
 	// withRequiredCalendarProperties adds either to an accepted object that
-	// lacks it.
+	// lacks it. RFC 7986 §4 adds the properties of the calendar as a whole.
+	// Those RFC 5545 defines are admitted here: UID, which names the calendar
+	// an object came from rather than the resource -- the RFC 4791 §4.1 UID of
+	// a resource is its components' -- URL and LAST-MODIFIED once each, and
+	// DESCRIPTION and CATEGORIES. NAME, COLOR, SOURCE, REFRESH-INTERVAL and
+	// IMAGE are names RFC 5545 leaves to extensions, which pass as written.
 	"VCALENDAR": {
-		once:     []string{"PRODID", "VERSION", "CALSCALE", "METHOD"},
-		allowed:  nameSet("PRODID", "VERSION", "CALSCALE", "METHOD"),
+		once: []string{"PRODID", "VERSION", "CALSCALE", "METHOD", "UID", "LAST-MODIFIED", "URL"},
+		allowed: nameSet("PRODID", "VERSION", "CALSCALE", "METHOD", "UID", "LAST-MODIFIED", "URL",
+			"DESCRIPTION", "CATEGORIES"),
 		children: nameSet("VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY", "VTIMEZONE"),
 	},
 	// §3.6.1: DTSTART is required because a calendar object resource may not
@@ -725,7 +731,7 @@ func oneDayDateEndEdits(raw string, lines []string, offsets []int) []bodyEdit {
 					startForm == icalDateOnly && endForm == icalDateOnly && start.value == end.value {
 					begin, finish := offsets[end.index], offsets[end.index+1]
 					edits = append(edits, bodyEdit{start: begin, end: finish,
-						text: end.keyPart + ":" + day.AddDate(0, 0, 1).Format("20060102") + lineEndingBefore(raw, finish)})
+						text: end.keyPart + ":" + day.AddDate(0, 0, 1).Format(ical.DateLayout) + lineEndingBefore(raw, finish)})
 				}
 			}
 			if depth == 2 {
@@ -1255,7 +1261,7 @@ const (
 
 func parseICalDateForm(value string) (icalDateForm, bool) {
 	switch {
-	case len(value) == len("20060102"):
+	case len(value) == len(ical.DateLayout):
 		_, err := ical.ParseDateTime(value)
 		return icalDateOnly, err == nil
 	case len(value) == len("20060102T150405"):
@@ -1304,17 +1310,50 @@ func validateCalendarObjectDateValues(root *icalNode) *calendarObjectFault {
 					}
 					return
 				}
-				for _, value := range values {
-					if value.Before(minDate) && fault == nil {
-						fault = &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"min-date-time"}}
-					}
-					if value.After(maxDate) && fault == nil {
-						fault = &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-date-time"}}
-					}
+				if fault == nil {
+					fault = dateLimitFault(values, minDate, maxDate)
 				}
 			}
 		})
 		if fault != nil {
+			return fault
+		}
+	}
+	return nil
+}
+
+// dateLimitFault is the precondition the first of values outside
+// [minDate, maxDate] fails, or nil when none is.
+func dateLimitFault(values []time.Time, minDate, maxDate time.Time) *calendarObjectFault {
+	for _, value := range values {
+		if value.Before(minDate) {
+			return &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"min-date-time"}}
+		}
+		if value.After(maxDate) {
+			return &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-date-time"}}
+		}
+	}
+	return nil
+}
+
+// validateSubmittedCalendarProperties holds a submitted VCALENDAR's UID (RFC
+// 7986 §5.3) to naming something, as a component's is, and its LAST-MODIFIED
+// (§5.4) to the UTC DATE-TIME within the date limits a component's is held
+// to. COPY/MOVE of stored objects is not held to either.
+func validateSubmittedCalendarProperties(root *icalNode) *calendarObjectFault {
+	for _, property := range root.properties {
+		if property.name == "UID" && strings.TrimSpace(property.value) == "" {
+			return invalidCalendarData()
+		}
+		if property.name != "LAST-MODIFIED" {
+			continue
+		}
+		values, ok := icalPropertyDateValues(root, root, property)
+		if !ok {
+			return invalidCalendarData()
+		}
+		minDate, maxDate := ical.DateLimits()
+		if fault := dateLimitFault(values, minDate, maxDate); fault != nil {
 			return fault
 		}
 	}

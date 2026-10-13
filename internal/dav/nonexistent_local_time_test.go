@@ -1,12 +1,16 @@
 package dav
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -184,6 +188,83 @@ func TestMaxInstancesDoesNotCountSkippedLocalTimes(t *testing.T) {
 				t.Errorf("a set of 1001 instances got %+v, want max-instances", fault)
 			}
 		})
+	}
+}
+
+// A series in a zone the host defines is counted toward CALDAV:max-instances
+// on the wall clocks its expansion generates, resolved to the instants the
+// expansion resolves them to. A series of exactly the limit is stored, an
+// override of one of its instances replaces that instance rather than adding
+// one, and one instance more is refused -- whether the series starts on a
+// local time a spring change skips or runs through one a fall change repeats.
+func TestValidateCalendarObjectCountsAZonedSeriesAsItsExpansion(t *testing.T) {
+	requireHostZones(t, "America/New_York", "Europe/Berlin")
+	tests := []struct {
+		name     string
+		tzid     string
+		dtstart  string
+		override string
+	}{
+		{
+			name:     "DTSTART on a skipped local time, one instance moved",
+			tzid:     "America/New_York",
+			dtstart:  "20240310T023000",
+			override: "20240315T023000",
+		},
+		{
+			name:     "an instance on a repeated local time moved",
+			tzid:     "Europe/Berlin",
+			dtstart:  "20241025T023000",
+			override: "20241027T023000",
+		},
+		{
+			name:    "DTSTART on a repeated local time",
+			tzid:    "Europe/Berlin",
+			dtstart: "20241027T023000",
+		},
+	}
+	object := func(tzid, dtstart, override string, count int) string {
+		master := buildComponent("VEVENT", "UID:series", "DTSTAMP:20240101T000000Z",
+			"DTSTART;TZID="+tzid+":"+dtstart, "DURATION:PT1H", fmt.Sprintf("RRULE:FREQ=DAILY;COUNT=%d", count))
+		if override == "" {
+			return buildCalendarObject(master)
+		}
+		moved := buildComponent("VEVENT", "UID:series", "DTSTAMP:20240101T000000Z",
+			"RECURRENCE-ID;TZID="+tzid+":"+override, "DTSTART;TZID="+tzid+":"+override[:9]+"120000", "DURATION:PT1H")
+		return buildCalendarObject(master, moved)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ValidateCalendarObject(object(tt.tzid, tt.dtstart, tt.override, ical.MaxRecurrenceInstances), nil); err != nil {
+				t.Errorf("a series of %d instances refused: %v", ical.MaxRecurrenceInstances, err)
+			}
+			_, err := ValidateCalendarObject(object(tt.tzid, tt.dtstart, tt.override, ical.MaxRecurrenceInstances+1), nil)
+			want := calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-instances"}}
+			var refusal *calobject.Error
+			if !errors.As(err, &refusal) || refusal.Status != want.Status || !reflect.DeepEqual(refusal.Conditions, want.Conditions) {
+				t.Errorf("a series of %d instances: error = %v, want %d %v", ical.MaxRecurrenceInstances+1, err, want.Status, want.Conditions)
+			}
+		})
+	}
+}
+
+// RFC 5545 §3.3.10 requires a UTC UNTIL beside a DTSTART with a TZID, and the
+// validator refuses a floating one, but a series stored with one is still read
+// with that UNTIL on the DTSTART's wall clock, whatever zone the request reads
+// floating values in, so its last instance is reported and none after it.
+func TestStoredFloatingUntilBesideAZonedDTStartEndsOnTheDTStartsWallClock(t *testing.T) {
+	requireHostZones(t, "America/New_York", "Asia/Tokyo")
+	tokyo, _ := ical.HostLocation("Asia/Tokyo")
+	// The last instance, 02:30 on 12 March in New York, is 06:30Z.
+	event := store.Event{UID: "series", RawICAL: buildCalendarObject(buildComponent("VEVENT", "UID:series", "DTSTAMP:20240101T000000Z",
+		"DTSTART;TZID=America/New_York:20240308T023000", "DURATION:PT1H", "RRULE:FREQ=DAILY;UNTIL=20240312T023000"))}
+	for name, zone := range map[string]floatingZone{"no calendar time zone": {}, "calendar time zone Asia/Tokyo": {defined: true, loc: tokyo}} {
+		if !filterMatches(event, calQueryWithTimeRange("20240312T060000Z", "20240312T070000Z"), zone) {
+			t.Errorf("%s: calendar-query missed the series' last instance", name)
+		}
+		if filterMatches(event, calQueryWithTimeRange("20240313T060000Z", "20240313T070000Z"), zone) {
+			t.Errorf("%s: calendar-query matched an instance on the day after the series' last", name)
+		}
 	}
 }
 

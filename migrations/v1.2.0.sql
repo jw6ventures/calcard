@@ -30,7 +30,8 @@ DROP INDEX IF EXISTS idx_deleted_resources_keyset;
 -- STORED generated columns: adding one rewrites its table to fill the existing
 -- rows, and every later write keeps it correct with no application changes.
 -- idx_events_object_acl_path is built after the recurrence repair below, and
--- idx_acl_principal_grant_norm after the ace_order backfill.
+-- idx_acl_principal_grant_norm and idx_acl_resource_path_norm after the
+-- ace_order backfill.
 
 ALTER TABLE acl_entries
     ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
@@ -143,6 +144,12 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
     ON acl_entries (principal_href, is_grant, resource_path_norm);
+
+-- The object-level decisions read one resource's entries by
+-- resource_path_norm; idx_acl_principal_grant_norm leads with the principal, so
+-- it would read every entry the principal holds to find them.
+CREATE INDEX IF NOT EXISTS idx_acl_resource_path_norm
+    ON acl_entries (resource_path_norm);
 
 CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
     ON acl_entries (resource_path, principal_href);
@@ -380,14 +387,34 @@ UPDATE events
 -- RFC 4791 section 9.9 test read a time in (maxStoredInstantSkew in
 -- internal/dav).
 --
--- A finite bound is reset to the sentinel when the body carries a DAILY or
--- WEEKLY rule with COUNT and a DTSTART with a TZID, or a rule with a date UNTIL
--- and a DTSTART with a time of day outside every VTIMEZONE, whose observances
--- always carry one. The tests read the whole body rather than one component,
--- which can only reset a bound that needed none: the row stays a candidate for
--- every range, and the next write of the resource stores its exact bound. Only
+-- RFC 5545 section 3.8.5.3 also makes the DTSTART the first instance even when
+-- the rule's UNTIL falls before it, which a bound read as UNTIL plus the
+-- instance's length leaves out: such a bound lies before the end of that
+-- instance, by however far UNTIL precedes the DTSTART. A finite bound is never
+-- earlier than the start or the end of any component of the object, so a row
+-- whose bound is earlier than its stored dtstart or dtend holds one of these.
+-- GREATEST skips a NULL dtend, so a row whose dtend is earlier than its
+-- dtstart -- a DTEND RFC 5545 refuses, repaired below -- is judged by its
+-- dtstart. A row whose DURATION decides its end stores no dtend, and its bound
+-- can fall short by more than the 48-hour margin while still lying past its
+-- dtstart, so its bound is also compared with its dtstart plus each DURATION
+-- the body carries. An alarm's or an override's DURATION is read too, which
+-- can only reopen a bound that did not need it. A DURATION is cast to an
+-- interval only when it has the RFC 5545 form, with no more than six digits to
+-- a number so the cast cannot overflow; any other DURATION reopens the bound.
+--
+-- A finite bound is reset to the sentinel when it is earlier than the row's
+-- dtstart or dtend; when the row stores no dtend and the bound is earlier
+-- than its dtstart plus a DURATION the body carries; when the body carries a
+-- DAILY or WEEKLY rule with COUNT and a DTSTART with a TZID; or when it
+-- carries a rule with a date UNTIL and a DTSTART with a time of day outside
+-- every VTIMEZONE, whose observances always carry one. The tests read the
+-- whole body rather than one component, which can only reset a bound that
+-- needed none: the row stays a candidate for every range, and the next write
+-- of the resource stores its exact bound. Only
 -- finite bounds are read, so the statement can run again, and a body whose row
--- holds none is never unfolded.
+-- holds none, or whose bound the columns already show to be short, is never
+-- unfolded.
 --
 -- The body is unfolded as in the repair above. Names and values match without
 -- regard to case, and the parts of a rule and the parameters of a property in
@@ -400,17 +427,26 @@ UPDATE events
 UPDATE events
     SET recurrence_until = '9999-12-31T23:59:59Z'
     WHERE recurrence_until <> '9999-12-31T23:59:59Z'
-      AND EXISTS (
+      AND (recurrence_until < GREATEST(dtstart, dtend) OR EXISTS (
           SELECT 1
           FROM regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') AS unfolded(body)
           WHERE CASE
+              WHEN events.dtend IS NULL AND events.dtstart IS NOT NULL AND EXISTS (
+                  SELECT 1
+                  FROM regexp_matches(unfolded.body, $re$(?:^|\r|\n)DURATION(?:;[^\r\n]*)?:[ \t]*([^\r\n]*)$re$, 'gi') AS duration(value)
+                  WHERE CASE
+                      WHEN duration.value[1] ~* $re$^\+?P(?:[0-9]{1,6}W|[0-9]{1,6}D(?:T(?=[0-9])(?:[0-9]{1,6}H)?(?:[0-9]{1,6}M)?(?:[0-9]{1,6}S)?)?|T(?=[0-9])(?:[0-9]{1,6}H)?(?:[0-9]{1,6}M)?(?:[0-9]{1,6}S)?)[ \t]*$$re$
+                          THEN events.recurrence_until < events.dtstart + upper(btrim(duration.value[1], E'+ \t'))::interval
+                      ELSE TRUE
+                  END
+              ) THEN TRUE
               WHEN unfolded.body ~* $re$(^|\r|\n)RRULE(?=[^\r\n]*[;:][ \t]*COUNT[ \t]*=)[^\r\n]*[;:][ \t]*FREQ[ \t]*=[ \t]*(DAILY|WEEKLY)$re$
                   AND unfolded.body ~* $re$(^|\r|\n)DTSTART;[^\r\n]*TZID[ \t]*=$re$ THEN TRUE
               WHEN unfolded.body !~* $re$(^|\r|\n)RRULE[^\r\n]*[;:][ \t]*UNTIL[ \t]*=[ \t]*[0-9]{8}[ \t]*(;|\r|\n|$)$re$ THEN FALSE
               ELSE regexp_replace(unfolded.body, $re$BEGIN:VTIMEZONE.*?END:VTIMEZONE$re$, '', 'gi')
                   ~* $re$(^|\r|\n)DTSTART[;:][^\r\n]*[0-9]{8}T$re$
           END
-      );
+      ));
 
 -- Store the end an event occupies where its DTEND cannot end it.
 --
@@ -575,16 +611,29 @@ CREATE TRIGGER trg_address_books_stamp_updated_at
 BEFORE UPDATE ON address_books
 FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
 
+-- An event write moves its calendar's CTag, except while its transaction has
+-- set calcard.defer_calendar_ctag to that calendar's id. A transaction does
+-- that around writes of many members of one calendar and then moves the CTag
+-- once itself: each update of one row within a transaction leaves a version
+-- that later reads of the row step over, so a move per member would make the
+-- write quadratic in its member count. Any other value defers nothing, and
+-- set_config(..., true) ends the setting with the transaction.
 CREATE OR REPLACE FUNCTION increment_calendar_ctag()
 RETURNS TRIGGER AS $$
+DECLARE
+    deferred TEXT := current_setting('calcard.defer_calendar_ctag', true);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        IF deferred IS DISTINCT FROM OLD.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        END IF;
         INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
         VALUES ('event', OLD.calendar_id, OLD.uid, OLD.resource_name);
         RETURN OLD;
     ELSE
-        UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        IF deferred IS DISTINCT FROM NEW.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        END IF;
         RETURN NEW;
     END IF;
 END;

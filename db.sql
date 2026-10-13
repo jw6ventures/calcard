@@ -382,6 +382,12 @@ ALTER TABLE events
 CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
     ON acl_entries (principal_href, is_grant, resource_path_norm);
 
+-- The object-level decisions read one resource's entries by
+-- resource_path_norm; idx_acl_principal_grant_norm leads with the principal, so
+-- it would read every entry the principal holds to find them.
+CREATE INDEX IF NOT EXISTS idx_acl_resource_path_norm
+    ON acl_entries (resource_path_norm);
+
 CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
     ON events (object_acl_path);
 
@@ -508,16 +514,29 @@ CREATE TRIGGER trg_address_books_stamp_updated_at
 BEFORE UPDATE ON address_books
 FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
 
+-- An event write moves its calendar's CTag, except while its transaction has
+-- set calcard.defer_calendar_ctag to that calendar's id. A transaction does
+-- that around writes of many members of one calendar and then moves the CTag
+-- once itself: each update of one row within a transaction leaves a version
+-- that later reads of the row step over, so a move per member would make the
+-- write quadratic in its member count. Any other value defers nothing, and
+-- set_config(..., true) ends the setting with the transaction.
 CREATE OR REPLACE FUNCTION increment_calendar_ctag()
 RETURNS TRIGGER AS $$
+DECLARE
+    deferred TEXT := current_setting('calcard.defer_calendar_ctag', true);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        IF deferred IS DISTINCT FROM OLD.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        END IF;
         INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
         VALUES ('event', OLD.calendar_id, OLD.uid, OLD.resource_name);
         RETURN OLD;
     ELSE
-        UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        IF deferred IS DISTINCT FROM NEW.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        END IF;
         RETURN NEW;
     END IF;
 END;

@@ -191,17 +191,13 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		writeEventError(w, err)
 		return
 	}
-	ev, created, err := h.events.CreateEvent(r.Context(), user, calendarID, input)
+	ev, err := h.events.CreateEvent(r.Context(), user, calendarID, input)
 	if err != nil {
 		writeEventError(w, err)
 		return
 	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
 	w.Header().Set("ETag", `"`+ev.ETag+`"`)
-	writeJSON(w, status, toEventResponse(*ev))
+	writeJSON(w, http.StatusCreated, toEventResponse(*ev))
 }
 
 func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +244,6 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 
 func decodeUpsertInput(r *http.Request) (events.UpsertInput, error) {
 	input := events.UpsertInput{
-		ContentType: r.Header.Get("Content-Type"),
 		IfMatch:     r.Header.Get("If-Match"),
 		IfNoneMatch: r.Header.Get("If-None-Match"),
 	}

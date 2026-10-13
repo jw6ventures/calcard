@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -308,6 +309,139 @@ func TestOverrideWithNeitherEndTakesItsSeriesLength(t *testing.T) {
 				t.Errorf("stored dtend = %v, want the master's 11:00 on 2 March", end)
 			}
 		})
+	}
+}
+
+// An override writing neither DTEND nor DURATION whose DTSTART is not of its
+// series' value type does not take its series' length, which measures an
+// occurrence of the other kind: it lasts as RFC 5545 §3.6.1 has any VEVENT
+// with that DTSTART alone last, through its day from a DATE and for an instant
+// at a DATE-TIME. Calendar-query places it so, and expansion writes no end it
+// does not occupy.
+func TestOverrideOfAnotherValueTypeThanItsSeriesLastsAsItsOwnStartDoes(t *testing.T) {
+	t.Run("all-day override of a timed series", func(t *testing.T) {
+		raw := zeroLengthCalendar(
+			componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+				"DTSTART:20260105T090000Z", "DTEND:20260105T100000Z", "RRULE:FREQ=DAILY;COUNT=3"),
+			componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+				"RECURRENCE-ID:20260106T090000Z", "DTSTART;VALUE=DATE:20260106"))
+		assertOverrideQueried(t, raw, "20260106T120000Z", "20260106T130000Z", true)
+		assertOverrideQueried(t, raw, "20260107T000000Z", "20260107T080000Z", false)
+		assertExpandedExtents(t, raw, "20260106T000000Z", "20260107T000000Z", expandedExtents{
+			unwanted: []string{"DTEND;VALUE=DATE:20260106"},
+			want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260106T090000Z"),
+				Start: mustUTC(t, "20260106T000000Z"), End: mustUTC(t, "20260107T000000Z")}},
+		})
+	})
+	t.Run("timed override of an all-day series", func(t *testing.T) {
+		raw := zeroLengthCalendar(
+			componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+				"DTSTART;VALUE=DATE:20260105", "RRULE:FREQ=DAILY;COUNT=3"),
+			componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+				"RECURRENCE-ID;VALUE=DATE:20260106", "DTSTART:20260106T120000Z"))
+		assertOverrideQueried(t, raw, "20260106T120000Z", "20260106T123000Z", true)
+		assertOverrideQueried(t, raw, "20260106T130000Z", "20260106T140000Z", false)
+		assertExpandedExtents(t, raw, "20260106T000000Z", "20260107T000000Z", expandedExtents{
+			unwanted: []string{"DTEND"},
+			want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260106T000000Z"),
+				Start: mustUTC(t, "20260106T120000Z"), End: mustUTC(t, "20260106T120000Z")}},
+		})
+	})
+}
+
+// An override taking a zero series length is an instant. Expansion writes an
+// all-day one with a zero DURATION, because an end equal to its start is no
+// DTEND RFC 5545 §3.8.2.2 admits and a DATE start alone reads as the whole
+// day; a timed one, like its series, it writes with no end, which §3.6.1
+// reads as the instant it starts at.
+func TestOverrideTakingAZeroSeriesLengthExpandsAsAnInstant(t *testing.T) {
+	dateSeries := componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+		"DTSTART;VALUE=DATE:20260105", "DURATION:P0D", "RRULE:FREQ=DAILY;COUNT=3")
+	timedSeries := componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
+		"DTSTART:20260105T090000Z", "RRULE:FREQ=DAILY;COUNT=3")
+	for _, tt := range []struct {
+		name                 string
+		master, override     []string
+		rangeStart, rangeEnd string
+		extents              expandedExtents
+	}{
+		{
+			name:       "all-day override",
+			master:     dateSeries,
+			override:   []string{"RECURRENCE-ID;VALUE=DATE:20260106", "DTSTART;VALUE=DATE:20260110"},
+			rangeStart: "20260110T000000Z", rangeEnd: "20260111T000000Z",
+			extents: expandedExtents{wanted: []string{"DURATION:P0D"}, unwanted: []string{"DTEND"},
+				want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260106T000000Z"),
+					Start: mustUTC(t, "20260110T000000Z"), End: mustUTC(t, "20260110T000000Z")}}},
+		},
+		{
+			name:       "all-day override of every later instance",
+			master:     dateSeries,
+			override:   []string{"RECURRENCE-ID;RANGE=THISANDFUTURE;VALUE=DATE:20260106", "DTSTART;VALUE=DATE:20260106", "SUMMARY:Later"},
+			rangeStart: "20260107T000000Z", rangeEnd: "20260108T000000Z",
+			extents: expandedExtents{wanted: []string{"DURATION:P0D"}, unwanted: []string{"DTEND"},
+				want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260107T000000Z"),
+					Start: mustUTC(t, "20260107T000000Z"), End: mustUTC(t, "20260107T000000Z")}}},
+		},
+		{
+			name:       "timed override",
+			master:     timedSeries,
+			override:   []string{"RECURRENCE-ID:20260106T090000Z", "DTSTART:20260106T120000Z"},
+			rangeStart: "20260106T120000Z", rangeEnd: "20260106T130000Z",
+			extents: expandedExtents{wanted: []string{"DTSTART:20260106T120000Z\r\nEND:VEVENT"}, unwanted: []string{"DTEND", "DURATION"},
+				want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260106T090000Z"),
+					Start: mustUTC(t, "20260106T120000Z"), End: mustUTC(t, "20260106T120000Z")}}},
+		},
+		{
+			name:       "timed override of every later instance",
+			master:     timedSeries,
+			override:   []string{"RECURRENCE-ID;RANGE=THISANDFUTURE:20260106T090000Z", "DTSTART:20260106T120000Z", "SUMMARY:Later"},
+			rangeStart: "20260107T120000Z", rangeEnd: "20260107T130000Z",
+			extents: expandedExtents{wanted: []string{"DTSTART:20260107T120000Z\r\nSUMMARY:Later\r\nRECURRENCE-ID"}, unwanted: []string{"DTEND", "DURATION"},
+				want: []calobject.Instance{{RecurrenceID: mustUTC(t, "20260107T090000Z"),
+					Start: mustUTC(t, "20260107T120000Z"), End: mustUTC(t, "20260107T120000Z")}}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			override := append([]string{"UID:instant", "DTSTAMP:20250101T000000Z"}, tt.override...)
+			raw := zeroLengthCalendar(tt.master, componentLines("VEVENT", override...))
+			assertExpandedExtents(t, raw, tt.rangeStart, tt.rangeEnd, tt.extents)
+		})
+	}
+}
+
+// expandedExtents is what a CALDAV:expand is expected to return: the
+// instances it writes, each read back by its own start and end, and text its
+// output must and must not carry.
+type expandedExtents struct {
+	wanted, unwanted []string
+	want             []calobject.Instance
+}
+
+func assertExpandedExtents(t *testing.T, raw, rangeStart, rangeEnd string, expected expandedExtents) {
+	t.Helper()
+	code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="`+rangeStart+`" end="`+rangeEnd+`"/>`))
+	if code != 207 {
+		t.Fatalf("expand status = %d, body %s", code, body)
+	}
+	for _, wanted := range expected.wanted {
+		if !strings.Contains(body, wanted) {
+			t.Errorf("expanded output lacks %s:\n%s", wanted, body)
+		}
+	}
+	for _, unwanted := range expected.unwanted {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("expanded output carries %s:\n%s", unwanted, body)
+		}
+	}
+	got := expandedInstances(t, raw, mustUTC(t, rangeStart), mustUTC(t, rangeEnd))
+	if len(got) != len(expected.want) {
+		t.Fatalf("expanded instances = %v, want %v", got, expected.want)
+	}
+	for i, want := range expected.want {
+		if g := got[i]; !g.RecurrenceID.Equal(want.RecurrenceID) || !g.Start.Equal(want.Start) || !g.End.Equal(want.End) {
+			t.Errorf("expanded instance %d = %v, want %v", i, g, want)
+		}
 	}
 }
 

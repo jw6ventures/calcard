@@ -73,15 +73,17 @@ func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Reque
 			continue
 		}
 		resourcePath := normalizeDAVHref(responses[i].Href)
+		requestPath := resourcePath
 		canonicalPath, canonicalErr := h.canonicalDAVPath(ctx, user, resourcePath)
 		if canonicalErr == nil && canonicalPath != "" {
 			resourcePath = canonicalPath
+			requestPath = requestPathForCanonical(canonicalPath)
 		}
 		for j := range responses[i].Propstat {
 			if responses[i].Propstat[j].Status != httpStatusOK {
 				continue
 			}
-			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop, mask); err != nil {
+			if err := h.decorateDAVProp(ctx, user, resourcePath, requestPath, &responses[i].Propstat[j].Prop, mask); err != nil {
 				return err
 			}
 			for _, property := range deadByPath[resourcePath] {
@@ -136,15 +138,17 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 		}
 	}
 
+	// Cache each resource under the key aclEntriesForResource looks it up by,
+	// holding the spellings it would read.
 	querySeen := make(map[string]struct{})
 	var queryPaths []string
 	for _, resourcePath := range canonicalPaths {
-		for _, statePath := range davStatePaths(resourcePath) {
-			if _, ok := querySeen[statePath]; ok {
+		for _, entryPath := range aclEntryPaths(resourcePath) {
+			if _, ok := querySeen[entryPath]; ok {
 				continue
 			}
-			querySeen[statePath] = struct{}{}
-			queryPaths = append(queryPaths, statePath)
+			querySeen[entryPath] = struct{}{}
+			queryPaths = append(queryPaths, entryPath)
 		}
 	}
 	entries, err := h.store.ACLEntries.ListByResources(ctx, queryPaths)
@@ -153,19 +157,19 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 	}
 	byPath := make(map[string][]store.ACLEntry, len(queryPaths))
 	for _, entry := range entries {
-		key := cleanDAVPath(entry.ResourcePath)
-		byPath[key] = append(byPath[key], entry)
+		byPath[entry.ResourcePath] = append(byPath[entry.ResourcePath], entry)
 	}
 	cache := aclEntryCacheFromContext(ctx)
 	if cache == nil {
 		return nil
 	}
 	for _, resourcePath := range canonicalPaths {
+		paths := aclEntryPaths(resourcePath)
 		var resourceEntries []store.ACLEntry
-		for _, statePath := range davStatePaths(resourcePath) {
-			resourceEntries = append(resourceEntries, byPath[statePath]...)
+		for _, entryPath := range paths {
+			resourceEntries = append(resourceEntries, byPath[entryPath]...)
 		}
-		aclutil.SortEntries(resourceEntries)
+		orderACLEntries(resourceEntries, paths)
 		cache.put(resourcePath, resourceEntries)
 	}
 	return nil
@@ -204,7 +208,11 @@ func (h *DavServer) deadPropertiesForResponses(ctx context.Context, user *store.
 	return result, nil
 }
 
-func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop, mask propDecorationMask) error {
+// decorateDAVProp fills the computed properties of the resource at the
+// canonical resourcePath, which a request names by requestPath. Checks that
+// canonicalize the path they are given take requestPath: a canonical object
+// path would lose its name's own extension to them.
+func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resourcePath, requestPath string, p *prop, mask propDecorationMask) error {
 	if p == nil || resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
 		return nil
 	}
@@ -245,7 +253,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 	}
 
 	if mask.lockDiscovery {
-		lockDiscovery, err := h.lockDiscoveryForPath(ctx, resourcePath)
+		lockDiscovery, err := h.lockDiscoveryForPath(ctx, requestPath)
 		if err != nil {
 			return err
 		}
@@ -253,7 +261,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 	}
 
 	if mask.acl {
-		allowed, err := h.checkACLPrivilege(ctx, user, resourcePath, "read-acl")
+		allowed, err := h.checkACLPrivilege(ctx, user, requestPath, "read-acl")
 		if err != nil {
 			return err
 		}
@@ -287,7 +295,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 		p.CurrentUserPrincipalURL = &hrefProp{Href: principalHref}
 	}
 	if mask.currentUserPrivilegeSet && user != nil {
-		allowed, err := h.checkACLPrivilege(ctx, user, resourcePath, "read-current-user-privilege-set")
+		allowed, err := h.checkACLPrivilege(ctx, user, requestPath, "read-current-user-privilege-set")
 		if err != nil {
 			return err
 		}
@@ -298,7 +306,7 @@ func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resou
 			if h.store == nil || h.store.ACLEntries != nil || h.isResourceOwner(ctx, user, resourcePath) || p.CurrentUserPrivilegeSet == nil {
 				// CalendarPrivileges omits ACL-management privileges, so stored ACLs
 				// must still supply the complete property even when a preset exists.
-				privileges, err := h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+				privileges, err := h.currentUserPrivilegeSetForPath(ctx, user, requestPath)
 				if err != nil {
 					return err
 				}
@@ -348,12 +356,12 @@ func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User,
 			return "", err
 		}
 		if ok {
-			calendar, err := h.store.Calendars.GetByID(ctx, id)
-			if err != nil {
-				return "", err
-			}
-			if calendar != nil {
+			calendar, err := h.getCalendar(ctx, id)
+			if err == nil {
 				return fmt.Sprintf("/dav/principals/%d/", calendar.UserID), nil
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				return "", err
 			}
 		}
 	}
@@ -370,12 +378,12 @@ func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User,
 			return "", err
 		}
 		if ok {
-			book, err := h.store.AddressBooks.GetByID(ctx, id)
-			if err != nil {
-				return "", err
-			}
-			if book != nil {
+			book, err := h.getAddressBook(ctx, id)
+			if err == nil {
 				return fmt.Sprintf("/dav/principals/%d/", book.UserID), nil
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				return "", err
 			}
 		}
 	}
@@ -597,8 +605,7 @@ func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath strin
 		if lock.ExpiresAt.Before(now) {
 			continue
 		}
-		lockPath := normalizeDAVResourceIdentity(lock.ResourcePath)
-		if lockPath != resourcePath && lock.Depth != "infinity" {
+		if !sameLockRoot(lock.ResourcePath, resourcePath) && lock.Depth != "infinity" {
 			continue
 		}
 		activeLocks = append(activeLocks, activeLockFromStoreLock(&lock, user != nil && lock.UserID == user.ID))

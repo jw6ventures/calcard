@@ -20,6 +20,13 @@ import (
 
 func newDAVPostgresStore(t *testing.T) *store.Store {
 	t.Helper()
+	return openDAVPostgresStore(t, func(dsn string) (*sql.DB, error) { return sql.Open("postgres", dsn) })
+}
+
+// openDAVPostgresStore installs db.sql in a fresh schema and returns a store
+// over the pool open makes from a DSN naming that schema.
+func openDAVPostgresStore(t *testing.T, open func(dsn string) (*sql.DB, error)) *store.Store {
+	t.Helper()
 	dsn := os.Getenv("CALCARD_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip("CALCARD_TEST_POSTGRES_DSN is unset; set it to run the HTTP/PostgreSQL concurrency test")
@@ -39,7 +46,7 @@ func newDAVPostgresStore(t *testing.T) *store.Store {
 		t.Fatalf("create schema %s: %v", schema, err)
 	}
 
-	pool, err := sql.Open("postgres", davPostgresSearchPath(t, dsn, schema))
+	pool, err := open(davPostgresSearchPath(t, dsn, schema))
 	if err != nil {
 		admin.Close()
 		t.Fatalf("open PostgreSQL schema %s: %v", schema, err)

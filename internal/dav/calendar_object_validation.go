@@ -53,6 +53,11 @@ func validateCalendarObjectReadAs(raw string, cal *store.CalendarAccess, reading
 	if fault := validateCalendarObject(root); fault != nil {
 		return nil, fault
 	}
+	if reading == readSubmitted {
+		if fault := validateSubmittedCalendarProperties(root); fault != nil {
+			return nil, fault
+		}
+	}
 	times := ical.NewObjectTimesSharingOnsets(lines, sharedTimezoneOnsets)
 	analysis, err := analyzeUnfoldedICalendar(raw, lines, times)
 	if err != nil {

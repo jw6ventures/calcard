@@ -3,7 +3,10 @@ package dav
 import (
 	"context"
 	"net/http/httptest"
+	"path"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -116,6 +119,153 @@ func TestPropfindACLPrefetchIncludesLegacyObjectPaths(t *testing.T) {
 	}
 	if acls.listByResourcesCalls != 1 || acls.listByResourceCalls != 0 {
 		t.Fatalf("ACL calls: batch=%d single=%d, want 1 and 0", acls.listByResourcesCalls, acls.listByResourceCalls)
+	}
+}
+
+// A member's ACL is the entries stored under its canonical path, the path the
+// ACL method writes, and under the spellings the store treats as the same
+// member: the path without a trailing extension of the collection's kind, in
+// any case, and that path with the extension in lower case. The batched
+// listing decision and a request naming the member both read exactly those, so
+// they agree with each other and with the ACL the method set.
+func TestMemberDecisionsReadTheSpellingsOfTheMembersPath(t *testing.T) {
+	user := &store.User{ID: 1}
+	principal := "/dav/principals/1/"
+	cal := &store.Calendar{ID: 2, UserID: 9}
+	book := &store.AddressBook{ID: 3, UserID: 9}
+	domains := []struct {
+		collectionPath string
+		ext            string
+		perRequest     func(h *DavServer, requestPath, privilege string) (bool, bool)
+		batched        func(decider *batchedObjectACLDecider, name, privilege string) (bool, bool)
+		// collectionOnly is the decision on write-content when only the
+		// collection's read grant applies.
+		collectionOnly [2]bool
+	}{
+		{
+			"/dav/calendars/2", ".ics",
+			func(h *DavServer, requestPath, privilege string) (bool, bool) {
+				pc, err := h.calendarPrivilegeContextFor(context.Background(), user, cal, requestPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return pc.decide(privilege)
+			},
+			func(decider *batchedObjectACLDecider, name, privilege string) (bool, bool) {
+				return calendarPrivilegeDecisionWithDecider(&store.CalendarAccess{Calendar: *cal}, name, privilege, decider)
+			},
+			[2]bool{false, true},
+		},
+		{
+			"/dav/addressbooks/3", ".vcf",
+			func(h *DavServer, requestPath, privilege string) (bool, bool) {
+				pc, err := h.addressBookPrivilegeContextFor(context.Background(), user, book, requestPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return pc.decide(privilege)
+			},
+			func(decider *batchedObjectACLDecider, name, privilege string) (bool, bool) {
+				allowed, denied, _ := decider.decide(name, privilege)
+				return allowed, denied
+			},
+			[2]bool{false, false},
+		},
+	}
+	for _, domain := range domains {
+		ext, upper := domain.ext, strings.ToUpper(domain.ext)
+		// Each member name, with the spellings whose entries make up its ACL.
+		members := map[string][]string{
+			"plain":           {"plain", "plain" + ext},
+			"dav" + ext:       {"dav" + ext, "dav"},
+			"dav" + upper:     {"dav" + upper, "dav", "dav" + ext},
+			"uid@example.com": {"uid@example.com", "uid@example.com" + ext},
+			"dotted.name":     {"dotted.name", "dotted.name" + ext},
+			"trailing ":       {"trailing ", "trailing " + ext},
+			" leading":        {" leading", " leading" + ext},
+			"a.b.c" + ext:     {"a.b.c" + ext, "a.b.c"},
+			// No request can name a member whose stored name holds path
+			// segments, but its listing must not decide by another resource.
+			"x/../../5": {"x/../../5", "x/../../5" + ext},
+		}
+		for name, reads := range members {
+			base := strings.TrimSuffix(name, path.Ext(name))
+			spellings := []string{name, name + ext, name + upper, base, base + ext, base + upper, strings.TrimSpace(name), "../5", "5"}
+			for _, spelling := range spellings {
+				for _, isGrant := range []bool{true, false} {
+					entries := []store.ACLEntry{
+						{ID: 1, ResourcePath: domain.collectionPath, PrincipalHref: principal, IsGrant: true, Privilege: "read"},
+						{ID: 2, ResourcePath: domain.collectionPath + "/" + spelling, PrincipalHref: principal, IsGrant: isGrant, Privilege: "read"},
+						{ID: 3, ResourcePath: domain.collectionPath + "/" + spelling, PrincipalHref: principal, IsGrant: isGrant, Privilege: "write-content", Position: 1},
+						{ID: 4, ResourcePath: path.Dir(domain.collectionPath) + "/5", PrincipalHref: principal, IsGrant: false, Privilege: "read"},
+					}
+					applies := slices.Contains(reads, spelling)
+					want := map[string][2]bool{"read": {true, false}, "write-content": domain.collectionOnly}
+					if applies {
+						want["read"] = [2]bool{isGrant, !isGrant}
+						want["write-content"] = [2]bool{isGrant, !isGrant}
+					}
+					h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
+					prefetched, err := h.prefetchACLEntries(context.Background(), user, append([]string{domain.collectionPath}, objectACLPaths(domain.collectionPath, name)...))
+					if err != nil {
+						t.Fatal(err)
+					}
+					decider := newBatchedObjectACLDecider(user, 9, domain.collectionPath, prefetched)
+					for privilege, decision := range want {
+						if allowed, denied := domain.batched(decider, name, privilege); allowed != decision[0] || denied != decision[1] {
+							t.Errorf("%s member %q with grant=%v ACL at %q: batched %s = (%v, %v), want (%v, %v)",
+								domain.collectionPath, name, isGrant, spelling, privilege, allowed, denied, decision[0], decision[1])
+						}
+						if strings.Contains(name, "/") {
+							continue
+						}
+						requestPath := domain.collectionPath + "/" + name + ext
+						if allowed, denied := domain.perRequest(h, requestPath, privilege); allowed != decision[0] || denied != decision[1] {
+							t.Errorf("%s member %q with grant=%v ACL at %q: a request decides %s (%v, %v), want (%v, %v)",
+								domain.collectionPath, name, isGrant, spelling, privilege, allowed, denied, decision[0], decision[1])
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// A member's ACL is read in a content order: the entries at its own path
+// first, then those at the other spellings, each in ACE order, however the
+// rows were saved. Both the batched listing decision and a request naming the
+// member read it so.
+func TestMemberACLReadsItsOwnSpellingFirstThenEachSpellingInACEOrder(t *testing.T) {
+	user := &store.User{ID: 1}
+	principal := "/dav/principals/1/"
+	cal := &store.Calendar{ID: 2, UserID: 9}
+	entries := []store.ACLEntry{
+		{ID: 1, ResourcePath: "/dav/calendars/2/X.ics", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 0},
+		{ID: 2, ResourcePath: "/dav/calendars/2/X.ICS", PrincipalHref: principal, IsGrant: true, Privilege: "read", Position: 2},
+		{ID: 9, ResourcePath: "/dav/calendars/2/X.ICS", PrincipalHref: principal, IsGrant: false, Privilege: "read", Position: 1},
+		{ID: 3, ResourcePath: "/dav/calendars/2/X", PrincipalHref: principal, IsGrant: true, Privilege: "write-content", Position: 0},
+		{ID: 4, ResourcePath: "/dav/calendars/2/X.ics", PrincipalHref: principal, IsGrant: false, Privilege: "write-content", Position: 1},
+	}
+	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
+	prefetched, err := h.prefetchACLEntries(context.Background(), user, append([]string{"/dav/calendars/2"}, objectACLPaths("/dav/calendars/2", "X.ICS")...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decider := newBatchedObjectACLDecider(user, 9, "/dav/calendars/2", prefetched)
+	pc, err := h.calendarPrivilegeContextFor(context.Background(), user, cal, "/dav/calendars/2/X.ICS.ics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// read: X.ICS's own ACEs decide, the deny at position 1 ahead of its
+	// grant at 2, whatever the sibling's position-0 grant says. write-content:
+	// X, the spelling ahead of X.ics, grants.
+	for privilege, want := range map[string][2]bool{"read": {false, true}, "write-content": {true, false}} {
+		if allowed, denied := calendarPrivilegeDecisionWithDecider(&store.CalendarAccess{Calendar: *cal}, "X.ICS", privilege, decider); allowed != want[0] || denied != want[1] {
+			t.Errorf("batched %s = (%v, %v), want (%v, %v)", privilege, allowed, denied, want[0], want[1])
+		}
+		if allowed, denied := pc.decide(privilege); allowed != want[0] || denied != want[1] {
+			t.Errorf("a request decides %s (%v, %v), want (%v, %v)", privilege, allowed, denied, want[0], want[1])
+		}
 	}
 }
 

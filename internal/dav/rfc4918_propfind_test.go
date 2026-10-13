@@ -4,7 +4,9 @@ package dav
 // not restate them, so they are asserted here rather than in the CalDAV suite.
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jw6ventures/calcard/internal/auth"
@@ -123,4 +125,66 @@ func TestRFC4918_PropfindSpellsOneResourceOneWay(t *testing.T) {
 			}
 		})
 	}
+}
+
+// RFC 4918 §9.1: a PROPFIND with an empty body is an allprop request. Whether
+// the body is empty is a matter of what arrives, not of how it was framed, so a
+// chunked body of no bytes, or of XML whitespace alone, is answered exactly as
+// a request that carried no body.
+func TestRFC4918_PropfindEmptyBodyIsAllprop(t *testing.T) {
+	now := store.Now()
+	h := NewDavServer(Options{Store: &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: now}, Editor: true},
+		}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{}},
+	}})
+	serve := func(req *http.Request) *httptest.ResponseRecorder {
+		req.Header.Set("Depth", "0")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+
+	noBody := serve(httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil))
+	if noBody.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND without a body = %d, want 207: %s", noBody.Code, noBody.Body.String())
+	}
+	decodeMultistatus(t, noBody).responseForHref(t, "/dav/calendars/1/").
+		assertPropStatus(t, davQN("displayname"), http.StatusOK)
+
+	tests := map[string]struct {
+		body    string
+		chunked bool
+	}{
+		"chunked, no bytes":        {body: "", chunked: true},
+		"chunked, whitespace only": {body: " \r\n\t\n", chunked: true},
+		"sized, whitespace only":   {body: "\n\n"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", strings.NewReader(tt.body))
+			if tt.chunked {
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			rr := serve(req)
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("status = %d, want 207: %s", rr.Code, rr.Body.String())
+			}
+			if rr.Body.String() != noBody.Body.String() {
+				t.Fatalf("answer differs from the bodiless request:\n%s\nwant:\n%s", rr.Body.String(), noBody.Body.String())
+			}
+		})
+	}
+
+	t.Run("a body that is not XML is still refused", func(t *testing.T) {
+		req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", strings.NewReader("allprop"))
+		req.ContentLength = -1
+		req.TransferEncoding = []string{"chunked"}
+		if rr := serve(req); rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rr.Code, rr.Body.String())
+		}
+	})
 }

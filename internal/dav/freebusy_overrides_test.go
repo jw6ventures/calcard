@@ -162,7 +162,7 @@ func TestRecurrenceOverrideIndexDescribesEachSlot(t *testing.T) {
 		{slot(30), "future-late"},
 	}
 	for _, tt := range tests {
-		if got := index.describing(master, tt.slot).value("SUMMARY"); got != tt.want {
+		if got := index.describing(master, tt.slot, time.Time{}).value("SUMMARY"); got != tt.want {
 			t.Errorf("slot %v described by %q, want %q", tt.slot, got, tt.want)
 		}
 	}

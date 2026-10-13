@@ -399,10 +399,25 @@
                 occurrence.seriesEvent = event;
                 expanded.push(occurrence);
             });
+            // The server places each override replacing one instance where
+            // CalDAV expands it, so one leaving its end to its series or to
+            // RFC 5545 ends where every CalDAV client shows it ending.
+            var placed = {};
+            (event.overrideInstances || []).forEach(function(instance) {
+                placed[instance.recurrenceId] = instance;
+            });
+            // An override of every later instance stands for itself only
+            // when it names a slot the series never generates, and the
+            // server places it then too.
             overrides.forEach(function(ov) {
-                if (ov.recurrenceRange) return;
+                var placement = ov.recurrenceIdText && placed[ov.recurrenceIdText];
+                if (ov.recurrenceRange && !placement) return;
                 var occurrence = Object.assign({}, event, ov);
                 occurrence.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
+                if (placement) {
+                    occurrence.dtstart = parseServerDate(placement.start, occurrence.allDay);
+                    occurrence.dtend = parseServerDate(placement.end, occurrence.allDay);
+                }
                 occurrence.recurrenceIdAllDay = overrideRecurrenceIdAllDay(ov, event);
                 occurrence.isOccurrence = true;
                 occurrence.seriesEvent = event;

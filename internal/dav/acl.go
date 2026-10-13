@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"path"
 	"slices"
 	"strconv"
@@ -54,7 +53,7 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify user has write-acl privilege
-	allowed, err := h.checkACLPrivilege(r.Context(), user, canonicalPath, "write-acl")
+	allowed, err := h.checkACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "write-acl")
 	if err != nil {
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 		return
@@ -384,15 +383,8 @@ func (h *DavServer) resolveACLPrincipal(r *http.Request, principal acePrincipal)
 }
 
 func (h *DavServer) resolveACLPrincipalHref(r *http.Request, raw string) (string, string, error) {
-	u, err := url.ParseRequestURI(strings.TrimSpace(raw))
-	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", "recognized-principal", nil
-	}
-	if u.IsAbs() {
-		if (u.Scheme != "http" && u.Scheme != "https") || !strings.EqualFold(u.Host, r.Host) {
-			return "", "recognized-principal", nil
-		}
-	} else if u.Host != "" || !strings.HasPrefix(u.Path, "/") {
+	u, ok := h.resolveLocalReference(raw, davHrefReferenceBase(r.URL.Path), r)
+	if !ok || u.RawQuery != "" || u.ForceQuery {
 		return "", "recognized-principal", nil
 	}
 	cleanPath := path.Clean(u.Path)
@@ -593,8 +585,10 @@ func principalResourceHref(resourcePath string) string {
 	return acl.PrincipalHref(id)
 }
 
+// aclEntriesForResource returns the ACL of the resource at the canonical
+// resourcePath, in ACE order.
 func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
-	resourcePath = normalizeDAVResourceIdentity(resourcePath)
+	resourcePath = cleanDAVPath(resourcePath)
 	candidates := aclEntryPaths(resourcePath)
 	if len(candidates) == 0 {
 		return nil, nil
@@ -609,15 +603,11 @@ func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath stri
 		}
 	}
 
-	var result []store.ACLEntry
-	for _, candidate := range candidates {
-		entries, err := h.store.ACLEntries.ListByResource(ctx, candidate)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, entries...)
+	result, err := h.store.ACLEntries.ListByResources(ctx, candidates)
+	if err != nil {
+		return nil, err
 	}
-	acl.SortEntries(result)
+	orderACLEntries(result, candidates)
 
 	if cache != nil {
 		cache.put(resourcePath, result)
@@ -625,26 +615,14 @@ func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath stri
 	return result, nil
 }
 
-// aclEntryPaths lists the stored spellings whose entries make up the ACL of
-// resourcePath, which must already be normalized.
+// aclEntryPaths lists, in decision order, the stored spellings whose entries
+// make up the ACL of the canonical resourcePath. The protected roots carry
+// none.
 func aclEntryPaths(resourcePath string) []string {
 	if isProtectedVirtualDAVRoot(resourcePath) {
 		return nil
 	}
-	candidates := append([]string{resourcePath}, legacyDAVResourcePaths(resourcePath)...)
-	seen := make(map[string]struct{}, len(candidates))
-	paths := candidates[:0]
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		paths = append(paths, candidate)
-	}
-	return paths
+	return store.ACLPaths(resourcePath)
 }
 
 // aclDecisionPaths lists the resources whose ACLs checkACLPrivilege consults
@@ -704,7 +682,7 @@ func (h *DavServer) aclGuard(ctx context.Context, user *store.User, resourcePath
 	seen := make(map[string]struct{})
 	for _, canonicalPath := range canonicalPaths {
 		for _, decisionPath := range aclDecisionPaths(canonicalPath) {
-			decisionPath = normalizeDAVResourceIdentity(decisionPath)
+			decisionPath = cleanDAVPath(decisionPath)
 			if _, ok := seen[decisionPath]; ok {
 				continue
 			}
@@ -745,8 +723,8 @@ func (h *DavServer) isResourceOwner(ctx context.Context, user *store.User, resou
 		}
 		segment := strings.Split(trimmed, "/")[0]
 		calID, ok, err := h.resolveCalendarID(ctx, user, segment)
-		if err == nil && ok && h.store.Calendars != nil {
-			if cal, err := h.store.Calendars.GetByID(ctx, calID); err == nil && cal != nil {
+		if err == nil && ok {
+			if cal, err := h.getCalendar(ctx, calID); err == nil {
 				return cal.UserID == user.ID
 			}
 		}
@@ -760,8 +738,8 @@ func (h *DavServer) isResourceOwner(ctx context.Context, user *store.User, resou
 		}
 		segment := strings.Split(trimmed, "/")[0]
 		bookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
-		if err == nil && ok && h.store.AddressBooks != nil {
-			if book, err := h.store.AddressBooks.GetByID(ctx, bookID); err == nil && book != nil {
+		if err == nil && ok {
+			if book, err := h.getAddressBook(ctx, bookID); err == nil {
 				return book.UserID == user.ID
 			}
 		}

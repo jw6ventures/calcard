@@ -193,11 +193,12 @@ func (h *DavServer) proppatchCalendar(ctx context.Context, user *store.User, hre
 	if err != nil {
 		return nil, err
 	}
-	aclGuard, err := h.aclGuard(ctx, user, canonicalPath)
+	requestPath := requestPathForCanonical(canonicalPath)
+	aclGuard, err := h.aclGuard(ctx, user, requestPath)
 	if err != nil {
 		return nil, err
 	}
-	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, canonicalPath, "write-properties")
+	cal, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, requestPath, "write-properties")
 	if err != nil {
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {
 			return nil, errForbidden
@@ -457,7 +458,8 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 	if err != nil {
 		return nil, err
 	}
-	aclGuard, err := h.aclGuard(ctx, user, canonicalPath)
+	requestPath := requestPathForCanonical(canonicalPath)
+	aclGuard, err := h.aclGuard(ctx, user, requestPath)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +467,7 @@ func (h *DavServer) proppatchAddressBook(ctx context.Context, user *store.User, 
 	if err != nil {
 		return nil, err
 	}
-	if err := h.requireAddressBookPrivilege(ctx, user, book, canonicalPath, "write-properties"); err != nil {
+	if err := h.requireAddressBookPrivilege(ctx, user, book, requestPath, "write-properties"); err != nil {
 		if errors.Is(err, errForbidden) || errors.Is(err, store.ErrNotFound) {
 			return nil, errForbidden
 		}

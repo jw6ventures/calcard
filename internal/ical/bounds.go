@@ -162,6 +162,10 @@ func (c recurringComponent) overrideUntil() *time.Time {
 			return nil
 		}
 		until := start.Add(*c.duration)
+		if c.allDay {
+			// EventEnd reads it in the whole days it reaches into.
+			until = start.AddDate(0, 0, DurationDays(*c.duration))
+		}
 		return &until
 	}
 	if !c.dtend.After(*start) {
@@ -291,7 +295,8 @@ func timePointer(value time.Time) *time.Time {
 const recurrenceBoundPad = 24 * time.Hour
 const recurrenceBoundDefaultDuration = time.Hour
 
-// boundedRecurrenceUntil bounds the end of the last instance a rule generates.
+// boundedRecurrenceUntil bounds the end of the last instance of the recurrence
+// set a DTSTART and rule describe.
 // skipped lists the local times the series' zone skips, which RFC 5545 §3.3.10
 // leaves out of a counted series without counting them; it reports false when
 // the zone's definition cannot say.
@@ -307,6 +312,10 @@ func boundedRecurrenceUntil(dtstart time.Time, dtend *time.Time, durationPropert
 	if !durationResolved {
 		if durationProperty != nil && *durationProperty > 0 {
 			duration = *durationProperty
+			if allDay {
+				// EventEnd reads it in the whole days it reaches into.
+				duration = time.Duration(DurationDays(duration)) * 24 * time.Hour
+			}
 		} else if allDay {
 			duration = 24 * time.Hour
 		}
@@ -317,7 +326,13 @@ func boundedRecurrenceUntil(dtstart time.Time, dtend *time.Time, durationPropert
 		return nil, false
 	}
 	if rule.Until != nil {
-		until := rule.Until.Add(duration)
+		// The DTSTART is the first instance even when UNTIL falls before it
+		// (RFC 5545 §3.8.5.3).
+		last := *rule.Until
+		if dtstart.After(last) {
+			last = dtstart
+		}
+		until := last.Add(duration)
 		return &until, true
 	}
 	if rule.Count == 0 || hasRRuleByPart(rrule) {

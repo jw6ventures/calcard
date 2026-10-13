@@ -99,6 +99,69 @@ func TestConservativeRecurrenceBounds(t *testing.T) {
 			wantUntilUnknown: true,
 		},
 		{
+			// RFC 5545 §3.8.5.3 makes the DTSTART the first instance even
+			// when UNTIL falls before it, so the bound reaches its end.
+			name:             "until before dtstart keeps the dtstart instance",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20240110T100000Z\r\nDTEND:20240110T110000Z\r\nRRULE:FREQ=DAILY;UNTIL=20240101T000000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T10:00:00Z",
+			wantUntilAtLeast: "2024-01-10T11:00:00Z",
+		},
+		{
+			name:             "until before dtstart with a duration and a by part",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20240110T100000Z\r\nDURATION:PT5H\r\nRRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20240101T000000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T10:00:00Z",
+			wantUntilAtLeast: "2024-01-10T15:00:00Z",
+		},
+		{
+			name:             "until before a dtstart with no end",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20240110T100000Z\r\nRRULE:FREQ=MONTHLY;UNTIL=20231231T235959Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T10:00:00Z",
+			wantUntilAtLeast: "2024-01-10T10:00:00Z",
+		},
+		{
+			name:             "date until before an all day dtstart",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20240110\r\nRRULE:FREQ=YEARLY;UNTIL=20240101\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T00:00:00Z",
+			wantUntilAtLeast: "2024-01-11T00:00:00Z",
+		},
+		{
+			// A DATE UNTIL on a timed series is read as the end of its day.
+			name:             "date until before a timed dtstart",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20240110T100000Z\r\nDTEND:20240110T110000Z\r\nRRULE:FREQ=DAILY;UNTIL=20240101\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T10:00:00Z",
+			wantUntilAtLeast: "2024-01-10T11:00:00Z",
+		},
+		{
+			name: "until before a dtstart in a zone the object defines",
+			raw: "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Private/Zone\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n" +
+				"BEGIN:VEVENT\r\nDTSTART;TZID=Private/Zone:20240110T100000\r\nDTEND;TZID=Private/Zone:20240110T113000\r\nRRULE:FREQ=DAILY;UNTIL=20240101T000000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2024-01-10T15:00:00Z",
+			wantUntilAtLeast: "2024-01-10T16:30:00Z",
+		},
+		{
+			// An hour beside a DATE start spans the whole day it reaches into,
+			// as every reader places it, so the bound runs to the day's end.
+			name:             "all-day series whose DURATION counts an hour",
+			raw:              "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20260305\r\nDURATION:PT1H\r\nRRULE:FREQ=DAILY;UNTIL=20260310\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2026-03-05T00:00:00Z",
+			wantUntilAtLeast: "2026-03-11T00:00:00Z",
+		},
+		{
+			name: "all-day override whose DURATION counts an hour",
+			raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nRECURRENCE-ID;VALUE=DATE:20260306\r\nDTSTART;VALUE=DATE:20260325\r\n" +
+				"DURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			wantRecurring:    true,
+			wantStart:        "2026-03-25T00:00:00Z",
+			wantUntilAtLeast: "2026-03-26T00:00:00Z",
+		},
+		{
 			name: "timezone recurrence rule is ignored",
 			raw:  "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nBEGIN:DAYLIGHT\r\nDTSTART:19870405T020000\r\nRRULE:FREQ=YEARLY\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nDTSTART:20260101T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 		},

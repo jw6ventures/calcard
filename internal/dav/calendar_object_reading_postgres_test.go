@@ -128,6 +128,31 @@ func TestPostgres_HostDefinitionWrittenBackFollowsTheEventIntoAnotherYear(t *tes
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, rr.Body.String()), []string{"FREEBUSY:" + start + "/" + end})
 }
 
+// A series whose UNTIL falls before its DTSTART still holds the DTSTART as its
+// one instance (RFC 5545 §3.8.5.3), and the SQL narrowing of a time-range read
+// keeps the object for a range around that instance, so calendar-query and
+// free-busy both report it.
+func TestPostgres_UntilBeforeDTStartStillReportsTheFirstInstance(t *testing.T) {
+	h, _, user, calendars := postgresCalendarServer(t, 1)
+	collection := fmt.Sprintf("/dav/calendars/%d/", calendars[0].ID)
+	raw := producerObject("VEVENT", "UID:until-before-start", "DTSTAMP:20240101T000000Z",
+		"DTSTART:20240110T100000Z", "DTEND:20240110T110000Z", "RRULE:FREQ=DAILY;UNTIL=20240101T000000Z")
+	if rr := requestAsUser(h, user, http.MethodPut, collection+"until.ics", raw, nil); rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d: %s", rr.Code, rr.Body.String())
+	}
+	const start, end = "20240110T000000Z", "20240111T000000Z"
+	depth := map[string]string{"Depth": "1"}
+	rr := requestAsUser(h, user, "REPORT", collection, timeRangeQuery(start, end), depth)
+	if rr.Code != http.StatusMultiStatus || !strings.Contains(rr.Body.String(), "until.ics") {
+		t.Errorf("calendar-query [%s, %s) = %d without the event:\n%s", start, end, rr.Code, rr.Body.String())
+	}
+	rr = requestAsUser(h, user, "REPORT", collection, freeBusyQuery(start, end), depth)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("free-busy = %d: %s", rr.Code, rr.Body.String())
+	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, rr.Body.String()), []string{"FREEBUSY:20240110T100000Z/20240110T110000Z"})
+}
+
 // PostgreSQL stores the vertical tabs and form feeds Outlook writes, and the
 // object carrying them is copied and moved as stored.
 func TestPostgres_ControlCharactersSurviveCopyAndMove(t *testing.T) {

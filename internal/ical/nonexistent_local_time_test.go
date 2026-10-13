@@ -459,6 +459,71 @@ func TestRecurrenceSetExceedsLimitDoesNotCountSkippedLocalTimes(t *testing.T) {
 	}
 }
 
+// The validator counts the instances the expansion generates, on the same wall
+// clocks and resolved to the same instants, in a zone the host defines as in
+// one the object does: a series starting on a local time a spring change skips
+// keeps that time of day on the days after it, and a time a fall change
+// repeats names its first occurrence (RFC 5545 §3.3.5). An override naming
+// each expanded instance by its UTC instant then replaces it rather than
+// adding one, so the set holds exactly as many instances as the expansion.
+func TestRecurrenceSetExceedsLimitCountsTheInstantsTheExpansionGenerates(t *testing.T) {
+	tests := []struct {
+		name    string
+		dtstart string
+		rrule   string
+	}{
+		{"New York, DTSTART on the skipped hour", "DTSTART;TZID=America/New_York:20240310T023000", "FREQ=DAILY;COUNT=5"},
+		{"New York, daily through the skipped hour", "DTSTART;TZID=America/New_York:20240308T023000", "FREQ=DAILY;COUNT=5"},
+		{"New York, hourly through the skipped hour", "DTSTART;TZID=America/New_York:20240310T003000", "FREQ=HOURLY;COUNT=5"},
+		{"New York, DTSTART on the repeated hour", "DTSTART;TZID=America/New_York:20241103T013000", "FREQ=DAILY;COUNT=5"},
+		{"New York, daily through the repeated hour", "DTSTART;TZID=America/New_York:20241101T013000", "FREQ=DAILY;UNTIL=20241105T235959Z"},
+		{"New York, hourly through the repeated hour", "DTSTART;TZID=America/New_York:20241103T003000", "FREQ=HOURLY;COUNT=5"},
+		{"Berlin, DTSTART on the skipped hour", "DTSTART;TZID=Europe/Berlin:20240331T023000", "FREQ=DAILY;COUNT=5"},
+		{"Berlin, weekly through the skipped hour", "DTSTART;TZID=Europe/Berlin:20240317T023000", "FREQ=WEEKLY;COUNT=5"},
+		{"Berlin, DTSTART on the repeated hour", "DTSTART;TZID=Europe/Berlin:20241027T023000", "FREQ=DAILY;COUNT=5"},
+		{"Berlin, daily through the repeated hour", "DTSTART;TZID=Europe/Berlin:20241025T023000", "FREQ=DAILY;COUNT=5"},
+		{"Berlin, hourly through the repeated hour", "DTSTART;TZID=Europe/Berlin:20241027T003000", "FREQ=HOURLY;UNTIL=20241027T040000Z"},
+		// Samoa skipped the whole of 30 December 2011.
+		{"Apia, daily through the skipped day", "DTSTART;TZID=Pacific/Apia:20111227T100000", "FREQ=DAILY;COUNT=6"},
+		// Lord Howe Island's clocks move by half an hour: 02:00 to 02:30 in
+		// October, and 02:00 back to 01:30 in April.
+		{"Lord Howe, quarter hours of 02:00 through the skipped half hour", "DTSTART;TZID=Australia/Lord_Howe:20241006T020000", "FREQ=DAILY;BYHOUR=2;BYMINUTE=0,15,30,45;COUNT=12"},
+		{"Lord Howe, every 15 minutes through the repeated half hour", "DTSTART;TZID=Australia/Lord_Howe:20240407T010000", "FREQ=MINUTELY;INTERVAL=15;COUNT=20"},
+		// Havana's clocks skip from midnight to 01:00 on 10 March 2024.
+		{"Havana, daily at midnight through the skipped hour", "DTSTART;TZID=America/Havana:20240308T000000", "FREQ=DAILY;COUNT=5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := recurringObject(tt.dtstart, "RRULE:"+tt.rrule)
+			keyPart, value, _ := SplitContentLine(tt.dtstart)
+			tzid, _ := PropertyParam(keyPart, "TZID")
+			requireHostZone(t, tzid)
+			dtstart, ok := PropertyTimeResolver(nil).ResolvePropertyTime(keyPart, value)
+			if !ok {
+				t.Fatalf("cannot read %s", tt.dtstart)
+			}
+			expanded := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+				dtstart.AddDate(0, 0, -1), dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)))
+			n := len(expanded)
+			if exceeds, valid := RecurrenceSetExceedsLimit(raw, n); !valid || exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want false, true for the expansion's %v", n, exceeds, valid, utcStrings(expanded))
+			}
+			if exceeds, valid := RecurrenceSetExceedsLimit(raw, n-1); !valid || !exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want true, true for the expansion's %v", n-1, exceeds, valid, utcStrings(expanded))
+			}
+			overridden := strings.TrimSuffix(raw, "END:VCALENDAR\r\n")
+			for _, start := range expanded {
+				instant := start.UTC().Format("20060102T150405Z")
+				overridden += "BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:" + instant + "\r\nDTSTART:" + instant + "\r\nSUMMARY:moved\r\nEND:VEVENT\r\n"
+			}
+			overridden += "END:VCALENDAR\r\n"
+			if exceeds, valid := RecurrenceSetExceedsLimit(overridden, n); !valid || exceeds {
+				t.Errorf("with every instance of %v overridden, RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want false, true", utcStrings(expanded), n, exceeds, valid)
+			}
+		})
+	}
+}
+
 // An object shipping its own VTIMEZONE under a name the host also defines is
 // read through its own definition, as the DAV layer's matcher reads it, so the
 // validator counts the instances the expansion produces: the skipped local

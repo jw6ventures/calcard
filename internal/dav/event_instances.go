@@ -2,6 +2,7 @@ package dav
 
 import (
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/calobject"
@@ -43,25 +44,27 @@ func EventInstances(raw string, start, end time.Time) calobject.Expansion {
 	if !ok {
 		return calobject.Expansion{}
 	}
-	instances, expandable, settled := m.recurrenceInstances(master, master, start, end)
-	if !expandable {
+	series := m.expandSeries(root, master, start, end)
+	if !series.expandable {
 		return calobject.Expansion{}
 	}
+	instances, settled := series.instances, series.settled
 
 	overrides := m.overrideIndex(root, master)
 	expansion := calobject.Expansion{Recurs: true, Complete: settled}
 	for _, instance := range instances {
+		recurrenceID := instance.slotShift.apply(dtstart.instant)
 		occurrenceStart := instance.shift.apply(dtstart.instant)
 		occurrenceEnd := occurrenceStart.Add(instance.duration)
 		if !periodInTimeRange(occurrenceStart, occurrenceEnd, start, end) {
 			continue
 		}
 		listed := calobject.Instance{
-			RecurrenceID: instance.slotShift.apply(dtstart.instant),
+			RecurrenceID: recurrenceID,
 			Start:        occurrenceStart,
 			End:          occurrenceEnd,
 		}
-		if override, ok := overrides.governingOverride(listed.RecurrenceID); ok {
+		if override, ok := overrides.governingOverride(recurrenceID, instance.slotDate); ok {
 			listed.Override = override.recurrenceID
 		}
 		expansion.Instances = append(expansion.Instances, listed)
@@ -76,5 +79,56 @@ func EventInstances(raw string, start, end time.Time) calobject.Expansion {
 		expansion.Instances = expansion.Instances[:ical.MaxRecurrenceInstances]
 		expansion.Complete = false
 	}
+	expansion.Overrides = placedOverrides(m, root, overrides, series, start, end)
 	return expansion
+}
+
+// placedOverrides are the overrides of the recurrence set series expands over
+// [start, end) that RFC 4791 §9.6.5 expansion writes as themselves and §9.9
+// places in that range, by start: each replacing one instance, and each
+// RANGE=THISANDFUTURE one standing alone. Each is placed where the expansion
+// writes it, from its DTSTART to the end ical.EventEnd gives it, its series'
+// length included. index already holds each override's slot, and one
+// starting at or after end is passed over before its end is read.
+func placedOverrides(m calendarTimeRangeMatcher, root *icalNode, index recurrenceOverrideIndex, series *seriesExpansion, start, end time.Time) []calobject.Instance {
+	var placed []calobject.Instance
+	for _, override := range index.overrides {
+		if thisAndFutureOverride(override.node) && !m.standsAlone(root, series, override.node) {
+			continue
+		}
+		dtstart, ok := overrideStart(m, override)
+		if !ok || !dtstart.instant.Before(end) {
+			continue
+		}
+		occurrenceEnd := m.eventOccurrenceEnd(override.node, dtstart, noShift)
+		if !periodInTimeRange(dtstart.instant, occurrenceEnd, start, end) {
+			continue
+		}
+		placed = append(placed, calobject.Instance{RecurrenceID: override.recurrenceID, Start: dtstart.instant, End: occurrenceEnd})
+	}
+	slices.SortFunc(placed, func(a, b calobject.Instance) int {
+		if c := a.Start.Compare(b.Start); c != 0 {
+			return c
+		}
+		return a.RecurrenceID.Compare(b.RecurrenceID)
+	})
+	return placed
+}
+
+// overrideStart is where override starts. One whose DTSTART repeats its
+// RECURRENCE-ID -- an override changing its instance but not when it starts --
+// starts at the instant already resolved, which spares resolving it again for
+// each of the overrides a series may carry.
+func overrideStart(m calendarTimeRangeMatcher, override recurrenceOverride) (icalTimeValue, bool) {
+	start, startOK := firstICalProperty(override.node, "DTSTART")
+	id, idOK := firstICalProperty(override.node, "RECURRENCE-ID")
+	if value := strings.TrimSpace(start.value); startOK && idOK && value == strings.TrimSpace(id.value) &&
+		start.parameters["TZID"] == id.parameters["TZID"] {
+		resolved := icalTimeValue{instant: override.recurrenceID, tzid: start.parameters["TZID"]}
+		if date, ok := ical.DateOf(value); ok && len(value) == len(ical.DateLayout) {
+			resolved.isDate, resolved.date = true, date
+		}
+		return resolved, true
+	}
+	return m.dateValue(override.node, "DTSTART", noShift)
 }
