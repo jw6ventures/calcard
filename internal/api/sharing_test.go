@@ -84,9 +84,6 @@ func (f *fakeACLRepo) ListByPrincipal(_ context.Context, principalHref string) (
 	}
 	return out, nil
 }
-func (f *fakeACLRepo) HasPrivilege(context.Context, string, string, string) (bool, error) {
-	return false, nil
-}
 func (f *fakeACLRepo) MoveResourcePath(context.Context, string, string) error { return nil }
 func (f *fakeACLRepo) Delete(context.Context, string) error                   { return nil }
 

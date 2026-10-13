@@ -1546,10 +1546,6 @@ func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (
 func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
 	return nil
 }
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, nil
-}
-
 func key(calendarID int64, uid string) string {
 	return strconv.FormatInt(calendarID, 10) + ":" + uid
 }

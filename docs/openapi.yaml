@@ -84,13 +84,26 @@ paths:
         - name: start
           in: query
           required: false
-          description: Include events ending at or after this instant (RFC3339 or YYYY-MM-DD).
+          description: |
+            Include events ending at or after this instant (RFC3339, or
+            YYYY-MM-DD for midnight UTC of that day), judged by the end the
+            server stores for indexing: for a recurring object the end of its
+            recurrence set, and otherwise the event's `dtend`. A timed event
+            without a `DTEND` ends at its `DTSTART`, so one that starts before
+            this instant is left out; an all-day one ends with its day. A
+            non-recurring event whose end a `DURATION` gives has no stored end
+            and is always included, as is any object with no stored end at
+            all, such as a non-recurring `VTODO`.
           schema:
             type: string
         - name: end
           in: query
           required: false
-          description: Include events starting at or before this instant (RFC3339 or YYYY-MM-DD).
+          description: |
+            Include events whose earliest instance starts at or before this
+            instant (RFC3339, or YYYY-MM-DD for midnight UTC of that day, so
+            events later that day are left out). Any object with no stored
+            start, such as a non-recurring `VTODO`, is always included.
           schema:
             type: string
         - name: title
@@ -880,16 +893,26 @@ components:
           type: string
           format: date-time
           description: |
-            The start of the event's first component as stored for indexing,
-            in UTC (RFC 3339 with `Z`). An all-day event's start is midnight UTC
-            of its first day.
+            The start of the event's master `VEVENT` (the first without a
+            `RECURRENCE-ID`, else the first `VEVENT`) as stored for indexing,
+            in UTC (RFC 3339 with `Z`). An all-day event's start is midnight
+            UTC of its first day. Absent when the object has no `VEVENT`, or
+            its `DTSTART` cannot be read.
         dtend:
           type: string
           format: date-time
           description: |
-            The end of the event's first component as stored for indexing, in
+            The end of the event's master `VEVENT` as stored for indexing, in
             UTC (RFC 3339 with `Z`). An all-day event's end is midnight UTC of
-            the day after its last day, the exclusive iCalendar `DTEND`.
+            the day after its last day, the exclusive iCalendar `DTEND`. An
+            event without a `DTEND`, or with one that cannot end it, ends at its
+            `DTSTART`, or for an all-day event at midnight UTC after its one day
+            (RFC 5545 §3.6.1), and `dtend` is returned for it. Absent when a
+            `DURATION` gives the event's end instead, and when the object has
+            no `VEVENT`. An object stored without a readable `DTSTART` returns
+            its `DTEND`, if it has one. A row a 1.1.x release stored without a
+            `DTEND` has no `dtend` when any `DURATION` appears in it, an
+            alarm's included, and the `start` filter always includes it.
         allDay:
           type: boolean
         etag:

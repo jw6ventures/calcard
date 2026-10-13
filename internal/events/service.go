@@ -358,11 +358,6 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, err
 	}
 	uid := object.UID
-	// The UID is also the resource name; both are unique index keys, whose
-	// entries PostgreSQL bounds in size.
-	if len(uid) > store.MaxIdentifierOctets {
-		return nil, fmt.Errorf("%w: uid must be at most %d octets", ErrBadRequest, store.MaxIdentifierOctets)
-	}
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, err
@@ -888,6 +883,9 @@ func calendarObjectError(err error) error {
 	}
 	if errors.Is(refusal, calobject.ErrUndefinedTimezone) {
 		return fmt.Errorf("%w: %w", ErrBadRequest, calobject.ErrUndefinedTimezone)
+	}
+	if errors.Is(refusal, calobject.ErrUIDTooLong) {
+		return fmt.Errorf("%w: uid must be at most %d octets", ErrBadRequest, store.MaxIdentifierOctets)
 	}
 	return fmt.Errorf("%w: %s", ErrBadRequest, conditions)
 }

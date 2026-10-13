@@ -22,77 +22,48 @@ type fakeDeadPropertyRepo struct {
 	applyErr   error
 }
 
-func TestCopyMoveDeleteDeadPropertyLifecycle(t *testing.T) {
+func TestMoveDeleteDeadPropertyLifecycle(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	events := &fakeEventRepo{events: map[string]*store.Event{
-		"1:event": {CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "source"},
-		"2:old":   {CalendarID: 2, UID: "old", ResourceName: "copied", ETag: "destination"},
+		"2:event": {CalendarID: 2, UID: "event", ResourceName: "source", RawICAL: raw, ETag: "source"},
 	}}
 	dead := &fakeDeadPropertyRepo{properties: map[string]map[string]store.DeadProperty{
-		"/dav/calendars/1/event": {
-			"urn:test\x00note": {ResourcePath: "/dav/calendars/1/event", NamespaceURI: "urn:test", LocalName: "note", InnerXML: "source"},
+		"/dav/calendars/2/source": {
+			"urn:test\x00note": {ResourcePath: "/dav/calendars/2/source", NamespaceURI: "urn:test", LocalName: "note", InnerXML: "source"},
 		},
-		"/dav/calendars/2/copied": {
-			"urn:test\x00note": {ResourcePath: "/dav/calendars/2/copied", NamespaceURI: "urn:test", LocalName: "note", InnerXML: "destination"},
+		"/dav/calendars/2/source.ics": {
+			"urn:test\x00legacy": {ResourcePath: "/dav/calendars/2/source.ics", NamespaceURI: "urn:test", LocalName: "legacy", InnerXML: "legacy-source"},
+		},
+		"/dav/calendars/3/moved.ics": {
+			"urn:test\x00old": {ResourcePath: "/dav/calendars/3/moved.ics", NamespaceURI: "urn:test", LocalName: "old", InnerXML: "old-destination"},
 		},
 	}}
 	locks := &fakeLockRepo{locks: map[string]*store.Lock{
-		"destination": {Token: "destination", ResourcePath: "/dav/calendars/2/copied", ExpiresAt: time.Now().Add(time.Hour)},
-		"legacy":      {Token: "legacy", ResourcePath: "/dav/calendars/2/copied.ics", ExpiresAt: time.Now().Add(time.Hour)},
+		"source-canonical": {Token: "source-canonical", ResourcePath: "/dav/calendars/2/source", ExpiresAt: time.Now().Add(time.Hour)},
+		"source-legacy":    {Token: "source-legacy", ResourcePath: "/dav/calendars/2/source.ics", ExpiresAt: time.Now().Add(time.Hour)},
+		"old-destination":  {Token: "old-destination", ResourcePath: "/dav/calendars/3/moved.ics", ExpiresAt: time.Now().Add(time.Hour)},
 	}}
 	acls := &fakeACLRepo{entries: []store.ACLEntry{
-		{ResourcePath: "/dav/calendars/1/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
-		{ResourcePath: "/dav/calendars/2/copied", PrincipalHref: "/dav/principals/3/", IsGrant: true, Privilege: "read"},
-		{ResourcePath: "/dav/calendars/2/copied.ics", PrincipalHref: "/dav/principals/3/", IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/2/source", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/2/source.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/3/moved.ics", PrincipalHref: "/dav/principals/3/", IsGrant: true, Privilege: "read"},
 	}}
 	st := &store.Store{Events: events, Locks: locks, ACLEntries: acls, DeadProperties: dead}
 
-	_, err := st.CopyEventAndState(context.Background(), 1, 2, "event", "copied", "new-etag", "/dav/calendars/1/event", "/dav/calendars/2/copied", "old")
-	if err != nil {
-		t.Fatalf("CopyEventAndState() error = %v", err)
-	}
-	if got := dead.properties["/dav/calendars/2/copied"]["urn:test\x00note"].InnerXML; got != "source" {
-		t.Fatalf("copied dead property = %q, want source", got)
-	}
-	if len(dead.properties["/dav/calendars/1/event"]) != 1 {
-		t.Fatalf("COPY changed source dead properties: %#v", dead.properties)
-	}
-	if len(locks.locks) != 2 || locks.locks["destination"].ResourcePath != "/dav/calendars/2/copied" || locks.locks["legacy"].ResourcePath != "/dav/calendars/2/copied.ics" {
-		t.Fatalf("COPY changed destination locks: %#v", locks.locks)
-	}
-	for _, entry := range acls.entries {
-		if entry.ResourcePath == "/dav/calendars/2/copied" || entry.ResourcePath == "/dav/calendars/2/copied.ics" {
-			t.Fatalf("COPY retained destination ACL: %#v", acls.entries)
-		}
-	}
-	dead.properties["/dav/calendars/2/copied.ics"] = map[string]store.DeadProperty{
-		"urn:test\x00legacy": {ResourcePath: "/dav/calendars/2/copied.ics", NamespaceURI: "urn:test", LocalName: "legacy", InnerXML: "legacy-source"},
-	}
-	dead.properties["/dav/calendars/3/moved.ics"] = map[string]store.DeadProperty{
-		"urn:test\x00old": {ResourcePath: "/dav/calendars/3/moved.ics", NamespaceURI: "urn:test", LocalName: "old", InnerXML: "old-destination"},
-	}
-	locks.locks["source-canonical"] = &store.Lock{Token: "source-canonical", ResourcePath: "/dav/calendars/2/copied", ExpiresAt: time.Now().Add(time.Hour)}
-	locks.locks["source-legacy"] = &store.Lock{Token: "source-legacy", ResourcePath: "/dav/calendars/2/copied.ics", ExpiresAt: time.Now().Add(time.Hour)}
-	locks.locks["old-destination"] = &store.Lock{Token: "old-destination", ResourcePath: "/dav/calendars/3/moved.ics", ExpiresAt: time.Now().Add(time.Hour)}
-	acls.entries = append(acls.entries,
-		store.ACLEntry{ResourcePath: "/dav/calendars/2/copied", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
-		store.ACLEntry{ResourcePath: "/dav/calendars/2/copied.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
-		store.ACLEntry{ResourcePath: "/dav/calendars/3/moved.ics", PrincipalHref: "/dav/principals/3/", IsGrant: true, Privilege: "read"},
-	)
-
-	if err := st.MoveEventAndState(context.Background(), 2, 3, "event", "moved", "/dav/calendars/2/copied", "/dav/calendars/3/moved", ""); err != nil {
+	if err := st.MoveEventAndState(context.Background(), 2, 3, "event", "moved", "/dav/calendars/2/source", "/dav/calendars/3/moved", ""); err != nil {
 		t.Fatalf("MoveEventAndState() error = %v", err)
 	}
-	if len(dead.properties["/dav/calendars/2/copied"]) != 0 || dead.properties["/dav/calendars/3/moved"]["urn:test\x00note"].InnerXML != "source" {
+	if len(dead.properties["/dav/calendars/2/source"]) != 0 || dead.properties["/dav/calendars/3/moved"]["urn:test\x00note"].InnerXML != "source" {
 		t.Fatalf("MOVE dead properties = %#v", dead.properties)
 	}
-	if len(dead.properties["/dav/calendars/2/copied.ics"]) != 0 || dead.properties["/dav/calendars/3/moved.ics"]["urn:test\x00legacy"].InnerXML != "legacy-source" {
+	if len(dead.properties["/dav/calendars/2/source.ics"]) != 0 || dead.properties["/dav/calendars/3/moved.ics"]["urn:test\x00legacy"].InnerXML != "legacy-source" {
 		t.Fatalf("MOVE legacy dead properties = %#v", dead.properties)
 	}
 	if len(locks.locks) != 1 || locks.locks["old-destination"] == nil || locks.locks["old-destination"].ResourcePath != "/dav/calendars/3/moved.ics" {
 		t.Fatalf("MOVE lock state = %#v", locks.locks)
 	}
 	for _, entry := range acls.entries {
-		if entry.ResourcePath == "/dav/calendars/2/copied" || entry.ResourcePath == "/dav/calendars/2/copied.ics" || entry.PrincipalHref == "/dav/principals/3/" {
+		if entry.ResourcePath == "/dav/calendars/2/source" || entry.ResourcePath == "/dav/calendars/2/source.ics" || entry.PrincipalHref == "/dav/principals/3/" {
 			t.Fatalf("MOVE ACL state = %#v", acls.entries)
 		}
 	}

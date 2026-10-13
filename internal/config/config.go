@@ -296,18 +296,6 @@ func getenvIntDefault(key string, def int) (int, error) {
 	return n, nil
 }
 
-func getenvPositiveIntDefault(key string, def int) (int, error) {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", key)
-	}
-	return n, nil
-}
-
 // getenvLimitDefault reads a DAV resource limit, where 0 turns the limit off
 // rather than being rejected. Unlimited is carried as math.MaxInt so every
 // comparison downstream keeps working without a second "is it set" test.

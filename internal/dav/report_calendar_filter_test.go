@@ -146,7 +146,7 @@ func TestPropFilterMatchesExactPropertyName(t *testing.T) {
 				UID:     "prop-filter",
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:prop-filter\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
-			if got := filterMatches(event, calQueryWithPropFilter(tt.propFilter), floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, calQueryWithPropFilter(tt.propFilter), floatingZone{}); got != tt.want {
 				t.Fatalf("matchEventFilter = %v, want %v for body %q", got, tt.want, tt.body)
 			}
 		})
@@ -197,7 +197,7 @@ func TestTextMatchFoldsOnlyASCIICase(t *testing.T) {
 				RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:collation\r\n" + tt.body + "END:VEVENT\r\nEND:VCALENDAR\r\n",
 			}
 			filter := calQueryWithPropFilter(propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: tt.match}})
-			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("matchEventFilter = %v, want %v matching %q against %q", got, tt.want, tt.match, tt.body)
 			}
 		})
@@ -803,7 +803,7 @@ func TestYearlyByWeekNoInstanceBeforeItsPeriodStart(t *testing.T) {
 	}
 
 	tr := &timeRange{Start: "20241230T000000Z", End: "20241231T000000Z"}
-	if !filterMatches(event, calQueryWithTimeRange(tr.Start, tr.End), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange(tr.Start, tr.End), floatingZone{}) {
 		t.Error("calendar-query missed the instance on 2024-12-30")
 	}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
@@ -1244,7 +1244,7 @@ func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
 				Name:      tt.property,
 				TextMatch: &textMatch{Text: tt.text},
 			}}})
-			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("text-match %q on %s = %v, want %v", tt.text, tt.property, got, tt.want)
 			}
 		})
@@ -1278,7 +1278,7 @@ func TestParamFilterIsScopedToTheNamedParameter(t *testing.T) {
 				Name:        "ATTENDEE",
 				ParamFilter: []paramFilter{tt.param},
 			}}})
-			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("param-filter %+v = %v, want %v", tt.param, got, tt.want)
 			}
 		})
@@ -1362,7 +1362,7 @@ func TestCompFilterScopingAndIsNotDefined(t *testing.T) {
 	event := store.Event{UID: "scoped", RawICAL: filterEventICAL}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := filterMatches(event, tt.filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, tt.filter, floatingZone{}); got != tt.want {
 				t.Fatalf("matchEventFilter = %v, want %v", got, tt.want)
 			}
 		})
@@ -1394,7 +1394,7 @@ func TestTextMatchHonoursTheNamedCollation(t *testing.T) {
 				Name:      "SUMMARY",
 				TextMatch: &textMatch{Text: tt.text, Collation: tt.collation},
 			}}})
-			if got := filterMatches(event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("collation %q matching %q = %v, want %v", tt.collation, tt.text, got, tt.want)
 			}
 		})
@@ -1440,7 +1440,7 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 					Collation: "i;octet",
 				},
 			}}})
-			if got := filterMatches(store.Event{UID: "match", RawICAL: tt.rawICAL}, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, store.Event{UID: "match", RawICAL: tt.rawICAL}, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("filterMatches() = %v, want %v", got, tt.want)
 			}
 		})
@@ -1505,7 +1505,7 @@ func TestBirthdayCalendarEventsMatchScopedFilters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := filterMatches(events[0], tt.filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, events[0], tt.filter, floatingZone{}); got != tt.want {
 				t.Fatalf("matchEventFilter = %v, want %v for %s", got, tt.want, events[0].RawICAL)
 			}
 		})
@@ -1632,9 +1632,13 @@ func TestBirthdayCalendarReportsAgreeOnTheResourceHref(t *testing.T) {
 	fetched.Responses[0].assertPropStatus(t, davQN("getetag"), http.StatusOK)
 }
 
-// filterMatches reports whether matchEventFilter selects event, whatever error
-// a recurrence expansion hit while judging it.
-func filterMatches(event store.Event, filter *calFilter, zone floatingZone) bool {
-	matched, _ := matchEventFilter(event, filter, zone)
+// filterMatches reports whether matchEventFilter selects event, failing the
+// test if a recurrence expansion errored while judging it.
+func filterMatches(t testing.TB, event store.Event, filter *calFilter, zone floatingZone) bool {
+	t.Helper()
+	matched, err := matchEventFilter(event, filter, zone)
+	if err != nil {
+		t.Fatalf("matchEventFilter() error = %v", err)
+	}
 	return matched
 }

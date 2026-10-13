@@ -1569,7 +1569,11 @@ func observanceOffsetAtInstant(observances *ical.IndexedTimezoneObservances, ins
 // the definition is read once however many values name it.
 type submittedZones struct {
 	// timezones is the VTIMEZONE each TZID names, the first whose TZID it
-	// is; it is nil for a definition submittedTimezone sets aside.
+	// is. It is nil for a definition the server wrote for a zone the host
+	// defines, as hostGeneratedTimezone recognises it: that speaks for the
+	// host's database, which answers for the TZID instead, so no reading of
+	// the object depends on the years the definition was generated for or on
+	// the tzdata release it was generated from.
 	timezones map[string]*icalNode
 	// work is what every definition's rules may cost to walk where the
 	// shared listings do not answer them, for as long as the parse is read.
@@ -1657,19 +1661,6 @@ func readSubmittedTimezone(timezone *icalNode) (ical.TimezoneObservances, bool) 
 		components = append(components, properties[first:len(properties):len(properties)])
 	}
 	return ical.ReadTimezoneObservances(components)
-}
-
-// submittedTimezone is the VTIMEZONE the object defines tzid by, or nil when
-// it defines none. A definition the server wrote for a zone the host defines,
-// as hostGeneratedTimezone recognises it, is not the object's own: it speaks for the host's database, which
-// answers for the TZID instead, so no reading of the object depends on the years
-// that definition was generated for or on the tzdata release it was generated
-// from.
-func submittedTimezone(root *icalNode, tzid string) *icalNode {
-	if root == nil {
-		return nil
-	}
-	return root.submittedZones().timezones[tzid]
 }
 
 // hostGeneratedTimezone reports whether the server wrote a VTIMEZONE from the

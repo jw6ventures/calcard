@@ -395,10 +395,10 @@ func TestTimeRangePropFilterConsidersRecurrenceInstances(t *testing.T) {
 		{property: "DTEND", start: "20240610T105000Z", end: "20240610T111000Z"},
 	}
 	for _, tt := range shifted {
-		if !filterMatches(event, propFilterQuery(tt.property, tt.start, tt.end), floatingZone{}) {
+		if !filterMatches(t, event, propFilterQuery(tt.property, tt.start, tt.end), floatingZone{}) {
 			t.Errorf("%s did not take its effective value for the 2024-06-10 instance", tt.property)
 		}
-		if filterMatches(event, propFilterQuery(tt.property, "20240612T000000Z", "20240613T000000Z"), floatingZone{}) {
+		if filterMatches(t, event, propFilterQuery(tt.property, "20240612T000000Z", "20240613T000000Z"), floatingZone{}) {
 			t.Errorf("%s matched a day no recurrence instance reaches", tt.property)
 		}
 	}
@@ -409,17 +409,17 @@ func TestTimeRangePropFilterConsidersRecurrenceInstances(t *testing.T) {
 	)...)}
 	todoQuery := propFilterQuery("DUE", "20240610T105000Z", "20240610T111000Z")
 	todoQuery.CompFilter.CompFilter[0].Name = "VTODO"
-	if !filterMatches(todo, todoQuery, floatingZone{}) {
+	if !filterMatches(t, todo, todoQuery, floatingZone{}) {
 		t.Error("DUE did not take its effective value for the 2024-06-10 instance")
 	}
 
 	// CREATED and DTSTAMP describe the component, not an occurrence of it, so
 	// they stay where the resource wrote them.
 	for _, property := range []string{"CREATED", "DTSTAMP"} {
-		if !filterMatches(event, propFilterQuery(property, "20231201T075000Z", "20231201T081000Z"), floatingZone{}) {
+		if !filterMatches(t, event, propFilterQuery(property, "20231201T075000Z", "20231201T081000Z"), floatingZone{}) {
 			t.Errorf("%s did not match its own written value", property)
 		}
-		if filterMatches(event, propFilterQuery(property, "20240610T075000Z", "20240610T081000Z"), floatingZone{}) {
+		if filterMatches(t, event, propFilterQuery(property, "20240610T075000Z", "20240610T081000Z"), floatingZone{}) {
 			t.Errorf("%s was shifted onto a recurrence instance", property)
 		}
 	}
@@ -1087,7 +1087,7 @@ func TestTimeRangePropFilterUsesEffectiveDTEndAndDue(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			filter := propFilterQuery(tt.component, tt.property, tt.filter)
-			if got := filterMatches(tt.event, filter, floatingZone{}); got != tt.want {
+			if got := filterMatches(t, tt.event, filter, floatingZone{}); got != tt.want {
 				t.Fatalf("filterMatches() = %v, want %v", got, tt.want)
 			}
 		})

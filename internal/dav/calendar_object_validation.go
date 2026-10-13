@@ -19,10 +19,11 @@ type validatedCalendarObject struct {
 	Analysis calendarAnalysis
 }
 
-// validateCalendarObjectForStorage is the one validator every write of calendar
-// data goes through: DAV PUT, COPY and MOVE, the REST API, and the UI's event
-// editor and import, the last two through ValidateCalendarObject. COPY and MOVE
-// go through validateTransferredCalendarObject.
+// validateCalendarObjectForStorage is the validator every write of submitted
+// calendar data goes through: DAV PUT, and the REST API and the UI's event
+// editor and import through ValidateCalendarObject. COPY and MOVE, which write
+// an object the store already holds, go through
+// validateTransferredCalendarObject.
 func validateCalendarObjectForStorage(raw string, cal *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault) {
 	return validateCalendarObjectReadAs(raw, cal, readSubmitted)
 }
@@ -33,7 +34,9 @@ func validateCalendarObjectForStorage(raw string, cal *store.CalendarAccess) (*v
 // malformed ones, which every reader leaves out, so moving one changes nothing
 // any reading of it says. Its octets are kept as they are stored, a leading
 // byte order mark included: it was accepted as it is, and changing them would
-// change the ETag of every member a collection MOVE carries.
+// change the ETag of every member a collection MOVE carries. Nor is its UID
+// held to store.MaxIdentifierOctets: the store already holds it, and a longer
+// UID a 1.1.x release stored must still be copyable and movable.
 func validateTransferredCalendarObject(raw string, cal *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault) {
 	return validateCalendarObjectReadAs(raw, cal, readTransferred)
 }
@@ -83,6 +86,13 @@ func validateCalendarObjectReadAs(raw string, cal *store.CalendarAccess, reading
 	if reading == readTransferred {
 		return &validatedCalendarObject{Body: stored, UID: uid, Analysis: analysis}, nil
 	}
+	if len(uid) > store.MaxIdentifierOctets {
+		// The UID is a unique index key, whose entries PostgreSQL bounds in
+		// size.
+		fault := invalidCalendarObjectResource()
+		fault.cause = calobject.ErrUIDTooLong
+		return nil, fault
+	}
 	// The completion changes nothing the analysis above read -- a DATE DTEND
 	// on its DTSTART is read as the day after, and the definitions speak for
 	// the host's zones, through which it already read every TZID they define --
@@ -107,8 +117,9 @@ var _ calobject.Validator = ValidateCalendarObject
 
 // ValidateCalendarObject is the calobject.Validator the REST API and the UI
 // write calendar data through: it applies to raw the validation a DAV PUT of it
-// into cal would. A nil cal stands for a collection with the server's default
-// supported components. A refusal is a *calobject.Error.
+// into cal would, the bound on the UID's length included. A nil cal stands for
+// a collection with the server's default supported components. A refusal is a
+// *calobject.Error.
 func ValidateCalendarObject(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
 	validated, fault := validateCalendarObjectForStorage(raw, cal)
 	if fault != nil {

@@ -132,7 +132,7 @@ func TestReleaseBlockerRDatePeriodQueryAndExpansion(t *testing.T) {
 		t.Fatalf("storage validation: %#v", fault)
 	}
 	event := store.Event{UID: "period", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20240605T110000Z", "20240605T113000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20240605T110000Z", "20240605T113000Z"), floatingZone{}) {
 		t.Error("calendar-query drops the RDATE occurrence while it is still running")
 	}
 	candidates, rangeErr := filterFreeBusyCandidatesByTimeRange(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240605T110000Z", End: "20240605T113000Z"})

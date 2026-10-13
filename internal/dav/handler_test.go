@@ -8356,24 +8356,6 @@ func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCa
 	return nil
 }
 
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	if f.copyErr != nil {
-		return nil, f.copyErr
-	}
-	src, ok := f.events[f.key(fromCalendarID, uid)]
-	if !ok {
-		return nil, nil
-	}
-	copy := *src
-	copy.CalendarID = toCalendarID
-	if destResourceName != "" {
-		copy.ResourceName = destResourceName
-	}
-	copy.ETag = newETag
-	f.events[f.key(toCalendarID, copy.UID)] = &copy
-	return &copy, nil
-}
-
 func (f *fakeEventRepo) TransferCalendarObject(ctx context.Context, transfer store.CalendarObjectTransfer) (*store.CalendarObjectTransferResult, error) {
 	if transfer.Operation == store.CalendarObjectCopy && f.copyErr != nil {
 		return nil, f.copyErr
@@ -8486,10 +8468,6 @@ func (e *errorEventRepo) MaxLastModified(ctx context.Context, calendarID int64) 
 
 func (e *errorEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
 	return errors.New("fail")
-}
-
-func (e *errorEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, errors.New("fail")
 }
 
 type fakeContactRepo struct {

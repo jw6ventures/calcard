@@ -12,10 +12,10 @@ import (
 func TestCalendarQueryMatchesTheInstanceOnADateUntil(t *testing.T) {
 	raw := producerObject("VEVENT", "UID:e", "DTSTART:20260105T090000Z", "DTEND:20260105T100000Z", "RRULE:FREQ=WEEKLY;UNTIL=20260302")
 	event := store.Event{UID: "e", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260302T000000Z", "20260303T000000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260302T000000Z", "20260303T000000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the Monday 2 March instance")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260303T000000Z", "20260401T000000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260303T000000Z", "20260401T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched an instance after the UNTIL date")
 	}
 }

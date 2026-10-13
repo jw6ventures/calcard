@@ -353,12 +353,14 @@ func eventFilterFromCalFilter(filter *calFilter) (store.EventFilter, bool) {
 // A column is written through ical.ObjectTimes, which reads a TZID as the
 // §9.9 evaluator does, but reads a floating value, and a TZID neither the
 // resource nor the host defines, as UTC where the evaluator reads them in the
-// §7.3 zone. Stored columns may also have been read with every TZID against
-// the host's zone database and one the host does not know as UTC, where the
-// evaluator reads the VTIMEZONE the resource ships, and nothing re-reads them. A shipped observance offset reaches ±23:59:59 and a host zone
-// reaches ±16:00 once the pre-1900 local-mean-time entries
-// CALDAV:min-date-time admits are in play, so 48 hours covers every pairing of
-// the two.
+// §7.3 zone. Columns a 1.1.x release stored may instead hold a reading of
+// every TZID against the host's zone database, with one the host does not
+// know read as UTC, where the evaluator reads the VTIMEZONE the resource
+// ships; no pass re-reads such columns, so they stay until the object is
+// written again. A shipped observance offset reaches
+// ±23:59:59 and a host zone reaches ±16:00 once the pre-1900 local-mean-time
+// entries CALDAV:min-date-time admits are in play, so 48 hours covers every
+// pairing of the two.
 const maxStoredInstantSkew = 48 * time.Hour
 
 // eventFilterFromTimeRange turns a request time-range into the narrowing the

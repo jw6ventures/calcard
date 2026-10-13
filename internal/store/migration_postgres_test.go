@@ -223,9 +223,9 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 	applyV120Migration(t, pool)
 
 	// The decision the collection predicates make, spelled as they spell it:
-	// the whole principal list this user matches, first ACE wins. HasPrivilege
-	// cannot stand in for it -- it narrows to a single principal_href, so it
-	// never sees the DAV:all grant that competes with the user's denial.
+	// the whole principal list this user matches, first ACE wins. A lookup
+	// narrowed to a single principal_href cannot stand in for it: it never sees
+	// the DAV:all grant that competes with the user's denial.
 	const decision = `
 SELECT a.is_grant
 FROM acl_entries a

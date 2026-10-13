@@ -34,7 +34,7 @@ func seriesObject(timezones string, components ...string) string {
 // servedSeries is the events JSON one calendar view gets for the dates
 // [start, end) from a calendar holding raw alone, and the payload of raw. raw
 // is stored as a write stores it when the validator accepts it, and as it is,
-// as data stored before the validator existed, when it does not.
+// as a 1.1.x release may have stored it, when it does not.
 func servedSeries(t *testing.T, raw, start, end string) (string, map[string]any) {
 	t.Helper()
 	stored := &store.Event{ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: raw, ETag: "e"}

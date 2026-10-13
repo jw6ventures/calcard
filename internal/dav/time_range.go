@@ -299,7 +299,8 @@ func (m calendarTimeRangeMatcher) resolveInstant(tzid, value string, form icalDa
 	if tzid = strings.TrimSpace(tzid); tzid != "" {
 		// RFC 4791 §4.1 requires the resource to carry a VTIMEZONE for every
 		// TZID it uses, so that definition is authoritative over the host's,
-		// unless the server generated it from the host's (submittedTimezone).
+		// unless the server generated it from the host's
+		// (hostGeneratedTimezone).
 		if wall, err := ical.ParseDateTime(value); err == nil {
 			if instant, ok := zonedWallInstant(m.timezoneObservances(tzid), tzid, wall); ok {
 				return instant, true

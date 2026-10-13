@@ -144,6 +144,46 @@ func TestCalendarObjectCopyMoveAcceptAlarmExtensions(t *testing.T) {
 	}
 }
 
+// A UID past store.MaxIdentifierOctets is refused only when it is submitted.
+// One the store already holds, as a 1.1.x release may have stored it, is
+// copied and moved like any other.
+func TestCalendarObjectCopyMoveKeepAStoredUIDPastTheSubmittedBound(t *testing.T) {
+	uid := strings.Repeat("u", store.MaxIdentifierOctets+1)
+	raw := producerObject("VEVENT", "UID:"+uid, "DTSTART:20260105T090000Z")
+	if _, fault := validateCalendarObjectForStorage(raw, nil); fault == nil {
+		t.Fatal("the submitted UID past the bound was accepted")
+	}
+	if _, fault := validateTransferredCalendarObject(raw, nil); fault != nil {
+		t.Fatalf("validateTransferredCalendarObject() fault = %+v, want the stored UID kept", fault)
+	}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			calendars := &fakeCalendarRepo{accessible: []store.CalendarAccess{
+				{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Source"}, Editor: true},
+				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Destination"}, Editor: true},
+			}}
+			events := &fakeEventRepo{events: map[string]*store.Event{
+				"1:" + uid: {CalendarID: 1, UID: uid, ResourceName: "legacy", RawICAL: raw, ETag: "source-etag"},
+			}}
+			h := NewDavServer(Options{Store: &store.Store{Calendars: calendars, Events: events, CalendarTransfers: events}})
+			req := httptest.NewRequest(method, "/dav/calendars/1/legacy.ics", nil)
+			req.Header.Set("Destination", "/dav/calendars/2/legacy.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("%s = %d, want 201; body: %s", method, rr.Code, rr.Body.String())
+			}
+			if events.events[events.key(2, uid)] == nil {
+				t.Fatalf("%s stored no destination", method)
+			}
+		})
+	}
+}
+
 func TestCalendarObjectCopyMoveRetryOneConcurrentStateChangeFromFreshSnapshot(t *testing.T) {
 	for _, method := range []string{"COPY", "MOVE"} {
 		t.Run(method, func(t *testing.T) {

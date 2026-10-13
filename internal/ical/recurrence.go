@@ -3285,10 +3285,6 @@ func componentsNamedFromLines(lines []string, componentName string) []Component 
 	})
 }
 
-func topLevelComponents(ical string, accept func(string) bool) []Component {
-	return topLevelComponentsFromLines(UnfoldLines(ical), accept)
-}
-
 // topLevelComponentsFromLines reads the components directly beneath a
 // VCALENDAR that accept selects, in the order they begin, as ReadComponents
 // reads a stored object, so the DAV layer and this package see the same
@@ -3746,13 +3742,13 @@ func knownRecurrenceRulePart(name string) bool {
 
 // parseRecurrenceUntil reads the UNTIL rule part. RFC 5545 §3.3.10 requires a
 // floating UNTIL exactly where DTSTART is floating, and a UTC one beside a
-// DTSTART with a TZID, so a value carrying no zone of its own belongs to
-// whatever zone resolved DTSTART. Beside a DATE-TIME DTSTART it is read on the
-// DTSTART's wall clock, through startWall: in the zone the DTSTART's TZID
-// names, which reading it as a floating value would lose, and for a floating
-// DTSTART wherever that is read. Beside a DATE DTSTART it is read by the
-// caller's resolver first, since that is the only thing holding a zone the
-// observances of the resource itself define, then in loc.
+// DTSTART with a TZID. Beside a DATE-TIME DTSTART, a value carrying no zone of
+// its own is read on the DTSTART's wall clock, through startWall: in the zone
+// the DTSTART's TZID names, which reading it as a floating value would lose,
+// and for a floating DTSTART wherever that is read. Beside a DATE DTSTART it is
+// read as resolve reads any floating value, since resolve is given no TZID for
+// it: a report's resolver reads it in the RFC 4791 §7.3 zone. Without a
+// resolver, or where it cannot read the value, it is read in loc.
 //
 // UNTIL is inclusive, so a DATE bounding a DATE-TIME DTSTART admits every
 // instance on that day: it is read as the day's last instant in the DTSTART's
@@ -4074,14 +4070,6 @@ func jumpCalendarRecurrencePeriods(periodStart, threshold time.Time, rule recurr
 		jumped = jump(steps - 1)
 	}
 	return jumped
-}
-
-func subDailyRecurrenceStep(rule recurrenceRule) (time.Duration, bool) {
-	seconds, ok := subDailyRecurrenceSeconds(rule)
-	if !ok || seconds > int64(time.Duration(1<<63-1)/time.Second) {
-		return 0, false
-	}
-	return time.Duration(seconds) * time.Second, true
 }
 
 func subDailyRecurrenceSeconds(rule recurrenceRule) (int64, bool) {

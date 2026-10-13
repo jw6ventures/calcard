@@ -563,16 +563,16 @@ func TestPostgres_RepositoryWritesHoldTheCollectionBeforeStamping(t *testing.T) 
 			},
 		},
 		{
-			name: "event copy with its DAV state",
+			name: "event move to another calendar",
 			write: func(f fixture) error {
-				_, err := f.s.CopyEventAndState(context.Background(), f.sourceCalendarID, f.calendarID, "copied", "copied", "etag-copy",
-					fmt.Sprintf("/dav/calendars/%d/copied", f.sourceCalendarID), fmt.Sprintf("/dav/calendars/%d/copied", f.calendarID), "")
-				return err
+				return f.s.UpdateAndMoveEventAndState(context.Background(), f.sourceCalendarID,
+					Event{CalendarID: f.calendarID, UID: "moved", ResourceName: "moved", RawICAL: postgresCalendarObject("moved", "Moved"), ETag: "etag-moved"},
+					fmt.Sprintf("/dav/calendars/%d/moved", f.sourceCalendarID), fmt.Sprintf("/dav/calendars/%d/moved", f.calendarID))
 			},
 			lock:     calendarLock,
 			davWrite: calendarDAVWrite,
 			reported: func(t *testing.T, f fixture, token time.Time) bool {
-				return reportedSince(t, f.s, f.calendarID, token)["copied"]
+				return reportedSince(t, f.s, f.calendarID, token)["moved"]
 			},
 		},
 		{
@@ -611,8 +611,8 @@ func TestPostgres_RepositoryWritesHoldTheCollectionBeforeStamping(t *testing.T) 
 			if err != nil {
 				t.Fatalf("create source calendar: %v", err)
 			}
-			if _, err := s.PutCalendarObject(ctx, memberWrite(source.ID, "copied")); err != nil {
-				t.Fatalf("seed copy source: %v", err)
+			if _, err := s.PutCalendarObject(ctx, memberWrite(source.ID, "moved")); err != nil {
+				t.Fatalf("seed the event to move: %v", err)
 			}
 			book, err := s.AddressBooks.Create(ctx, AddressBook{UserID: userID, Name: "Repository"})
 			if err != nil {

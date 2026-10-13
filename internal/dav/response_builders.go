@@ -120,7 +120,7 @@ func rawCalendarResourceReportResponse(href string, event store.Event, projectio
 // propfindRequestForReport turns a report's property selector into the
 // PROPFIND-shaped request the response filter runs on. RFC 4791 §9.5 and §9.10
 // admit DAV:allprop and DAV:propname beside DAV:prop, so all three reach the
-// same filter rather than only the one the tag decoder used to model.
+// same filter.
 func propfindRequestForReport(selector propertySelector, calendarData bool, addressData *addressDataQuery) *propfindRequest {
 	switch {
 	case selector.AllProp:

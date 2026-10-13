@@ -4091,9 +4091,6 @@ func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCa
 	f.moves = append(f.moves, fmt.Sprintf("%d:%d:%s", fromCalendarID, toCalendarID, uid))
 	return nil
 }
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, nil
-}
 
 type fakeAddressBookRepo struct {
 	books map[int64]*store.AddressBook
@@ -4465,20 +4462,6 @@ func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string)
 		result = append(result, entry)
 	}
 	return result, nil
-}
-
-func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	for _, entry := range f.entries {
-		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && !entry.IsGrant {
-			return false, nil
-		}
-	}
-	for _, entry := range f.entries {
-		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && entry.IsGrant {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
@@ -6426,8 +6409,8 @@ func TestUpdateEventRefusesDataTheCalDAVValidatorRefuses(t *testing.T) {
 	}
 }
 
-// seriesWithBackwardsOverride is a stored series the validator refuses, as
-// data written before it existed may be: its override ends before it starts.
+// seriesWithBackwardsOverride is a stored series the validator refuses, as data
+// a 1.1.x release wrote may be: its override ends before it starts.
 const seriesWithBackwardsOverride = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Series\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\n" +
 	"BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:20260112T090000Z\r\nDTSTART:20260112T090000Z\r\nDTEND:20260112T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 
@@ -6587,6 +6570,7 @@ func TestInvalidEventMessageSpeaksPlainly(t *testing.T) {
 		{"too many instances", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-instances"}}, "the event could not be saved: it repeats more times than this server allows"},
 		{"too many attendees", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-attendees-per-instance"}}, "the event could not be saved: it has more attendees than this server allows"},
 		{"several conditions", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-instances", "max-date-time"}}, "the event could not be saved: it repeats more times than this server allows; it has a date later than this server accepts"},
+		{"UID too long", calobject.NewError(http.StatusForbidden, []string{"valid-calendar-object-resource"}, calobject.ErrUIDTooLong), "the event could not be saved: its UID is longer than this server accepts"},
 		{"unknown condition", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"no-uid-conflict"}}, "the event could not be saved: the server could not accept its calendar data"},
 		{"other error", errors.New("boom"), "the event could not be saved: the server could not accept its calendar data"},
 	}
@@ -6786,6 +6770,7 @@ func TestImportCalendarCountsWhatItLeavesOut(t *testing.T) {
 		"BEGIN:VJOURNAL\r\nUID:note\r\nDTSTAMP:20260101T000000Z\r\nEND:VJOURNAL\r\n" +
 		"BEGIN:VEVENT\r\nUID:kept\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Kept\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
 		"BEGIN:VEVENT\r\nUID:backwards\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T080000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:" + strings.Repeat("u", store.MaxIdentifierOctets+1) + "\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
 		"END:VCALENDAR\r\n"
 	req := newICSImportRequest(t, "/calendars/1/import", "mixed.ics", ics)
 	req = withRouteID(req, "1")
@@ -6797,7 +6782,7 @@ func TestImportCalendarCountsWhatItLeavesOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ImportCalendar() Location: %v", err)
 	}
-	if got, want := location.Query().Get("status"), "Imported 1 event(s); skipped 3 (not valid or not events)"; got != want {
+	if got, want := location.Query().Get("status"), "Imported 1 event(s); skipped 4 (not valid or not events)"; got != want {
 		t.Fatalf("ImportCalendar() status = %q, want %q", got, want)
 	}
 	if len(eventRepo.events) != 1 || eventRepo.events["1:kept"] == nil {

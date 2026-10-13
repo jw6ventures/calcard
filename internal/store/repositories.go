@@ -53,7 +53,6 @@ type EventRepository interface {
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error)
 	MaxLastModified(ctx context.Context, calendarID int64) (time.Time, error)
 	MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error
-	CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error)
 }
 
 // AddressBookRepository manages address books.
@@ -175,7 +174,6 @@ type ACLRepository interface {
 	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)
 	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
-	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
 }

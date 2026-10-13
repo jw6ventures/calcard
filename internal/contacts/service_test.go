@@ -245,9 +245,6 @@ func (f *fakeACL) ListByPrincipal(_ context.Context, principalHref string) ([]st
 	}
 	return out, nil
 }
-func (f *fakeACL) HasPrivilege(context.Context, string, string, string) (bool, error) {
-	return false, nil
-}
 func (f *fakeACL) MoveResourcePath(context.Context, string, string) error { return nil }
 func (f *fakeACL) Delete(context.Context, string) error                   { return nil }
 

@@ -461,6 +461,9 @@ func invalidEventMessage(action string, err error) string {
 	if !errors.As(err, &refusal) || len(refusal.Conditions) == 0 {
 		return action + ": " + fallback
 	}
+	if errors.Is(refusal, calobject.ErrUIDTooLong) {
+		return action + ": its UID is longer than this server accepts"
+	}
 	reasons := make([]string, 0, len(refusal.Conditions))
 	for _, condition := range refusal.Conditions {
 		reason, ok := calendarObjectRefusalReasons[condition]

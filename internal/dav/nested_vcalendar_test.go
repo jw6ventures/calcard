@@ -14,10 +14,10 @@ func TestReportsExpandARecurringEventInsideANestedVCalendar(t *testing.T) {
 		"BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n" +
 		"END:VCALENDAR\r\nEND:VCALENDAR\r\n"
 	event := store.Event{UID: "a", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 12 January instance")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260126T000000Z", "20260127T000000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260126T000000Z", "20260127T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched past the rule's COUNT")
 	}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),

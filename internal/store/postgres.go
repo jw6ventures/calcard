@@ -994,90 +994,6 @@ func moveEventTx(ctx context.Context, tx queryExecContext, fromCalendarID, toCal
 	return nil
 }
 
-func (r *eventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error) {
-	defer observeDB(ctx, "events.copy_to_calendar")()
-
-	tx, err := r.pool.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", fromCalendarID, toCalendarID); err != nil {
-		return nil, err
-	}
-
-	const selectQ = `SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`
-	row := tx.QueryRowContext(ctx, selectQ, fromCalendarID, uid)
-	src, err := scanEvent(row.Scan)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-
-	if destResourceName == "" {
-		destResourceName = src.ResourceName
-		if destResourceName == "" {
-			destResourceName = src.UID
-		}
-	}
-
-	const existingDestQ = `SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`
-	var existingDestResourceName string
-	switch err := tx.QueryRowContext(ctx, existingDestQ, toCalendarID, src.UID).Scan(&existingDestResourceName); {
-	case err == nil:
-		if existingDestResourceName != "" && existingDestResourceName != destResourceName {
-			return nil, ErrConflict
-		}
-	case errors.Is(err, sql.ErrNoRows):
-		existingDestResourceName = ""
-	default:
-		return nil, err
-	}
-
-	const deleteDestByNameQ = `DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`
-	if _, err := tx.ExecContext(ctx, deleteDestByNameQ, toCalendarID, destResourceName, src.UID); err != nil {
-		return nil, err
-	}
-	if existingDestResourceName != "" && existingDestResourceName != destResourceName {
-		const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
-		if _, err := tx.ExecContext(ctx, tombstoneQuery, toCalendarID, src.UID, existingDestResourceName); err != nil {
-			return nil, err
-		}
-	}
-
-	const insertQ = `
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-ON CONFLICT (calendar_id, uid) DO UPDATE SET
-        resource_name = EXCLUDED.resource_name,
-        raw_ical = EXCLUDED.raw_ical,
-        etag = EXCLUDED.etag,
-        summary = EXCLUDED.summary,
-        description = EXCLUDED.description,
-        location = EXCLUDED.location,
-        dtstart = EXCLUDED.dtstart,
-        dtend = EXCLUDED.dtend,
-        all_day = EXCLUDED.all_day,
-        recurrence_start = EXCLUDED.recurrence_start,
-        recurrence_until = EXCLUDED.recurrence_until,
-        last_modified = NOW()
-RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
-`
-	recurrenceStart, recurrenceUntil := recurrenceBoundsFromICal(src.RawICAL)
-	insertRow := tx.QueryRowContext(ctx, insertQ, toCalendarID, src.UID, destResourceName, src.RawICAL, newETag, src.Summary, src.Description, src.Location, src.DTStart, src.DTEnd, src.AllDay, recurrenceStart, recurrenceUntil)
-	ev, err := scanEvent(insertRow.Scan)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &ev, nil
-}
-
 // addressBookRepo implements AddressBookRepository.
 type addressBookRepo struct {
 	pool *sql.DB
@@ -2952,24 +2868,6 @@ func (r *aclRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]
 		result = append(result, e)
 	}
 	return result, rows.Err()
-}
-
-func (r *aclRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	const q = `
-SELECT COALESCE((
-    SELECT is_grant
-    FROM acl_entries
-    WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3
-    ORDER BY ace_order, id
-    LIMIT 1
-), FALSE)
-`
-	defer observeDB(ctx, "acl.has_privilege")()
-	var exists bool
-	if err := r.pool.QueryRowContext(ctx, q, resourcePath, principalHref, privilege).Scan(&exists); err != nil {
-		return false, err
-	}
-	return exists, nil
 }
 
 func (r *aclRepo) Delete(ctx context.Context, resourcePath string) error {

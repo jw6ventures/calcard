@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -446,6 +447,163 @@ FOR EACH ROW EXECUTE FUNCTION reject_object_state_change()`, pq.QuoteLiteral(des
 			}
 			if len(properties) != 1 || properties[0].ResourcePath != sourcePath || properties[0].InnerXML != "source-state" {
 				t.Fatalf("DAV state after rollback = %#v", properties)
+			}
+		})
+	}
+}
+
+// A COPY gives the copy the source's dead properties, read from either
+// spelling of the source's state path, and replaces the state the resource it
+// overwrites had: none of the destination's ACL entries or dead properties, at
+// either spelling, survive onto the copy, and the destination's tombstone is
+// cleared. The source keeps its own state.
+func TestPostgres_CalendarObjectCopyReplacesTheDestinationsDAVState(t *testing.T) {
+	s := newPostgresStore(t)
+	_, sourceCalendarID := newPostgresCalendar(t, s, "object-copy-state-source")
+	_, destinationCalendarID := newPostgresCalendar(t, s, "object-copy-state-destination")
+	ctx := context.Background()
+	database := s.Calendars.(*calendarRepo).pool
+	raw := postgresCalendarObject("source", "Source")
+	if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+		CalendarID: sourceCalendarID, UID: "source", ResourceName: "source", RawICAL: raw, ETag: "source-etag",
+	}); err != nil {
+		t.Fatalf("seed source event: %v", err)
+	}
+	if _, err := s.PutCalendarObject(ctx, CalendarObjectWrite{
+		CalendarID: destinationCalendarID, UID: "old", ResourceName: "copied",
+		RawICAL: postgresCalendarObject("old", "Old"), ETag: "old-etag",
+	}); err != nil {
+		t.Fatalf("seed destination event: %v", err)
+	}
+	sourcePath := fmt.Sprintf("/dav/calendars/%d/source", sourceCalendarID)
+	destinationPath := fmt.Sprintf("/dav/calendars/%d/copied", destinationCalendarID)
+	for _, seed := range []struct{ path, local, value string }{
+		{sourcePath, "note", "source"},
+		{sourcePath + ".ics", "legacy", "source legacy"},
+		{destinationPath, "note", "destination"},
+		{destinationPath + ".ics", "stale", "destination legacy"},
+	} {
+		if err := s.DeadProperties.Apply(ctx, seed.path, []DeadPropertyMutation{{NamespaceURI: "urn:calcard:test", LocalName: seed.local, InnerXML: seed.value}}); err != nil {
+			t.Fatalf("seed dead property at %s: %v", seed.path, err)
+		}
+	}
+	for _, path := range []string{sourcePath, destinationPath, destinationPath + ".ics"} {
+		if err := s.ACLEntries.SetACL(ctx, path, []ACLEntry{{PrincipalHref: "/dav/principals/99/", IsGrant: true, Privilege: "read"}}); err != nil {
+			t.Fatalf("seed ACL at %s: %v", path, err)
+		}
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, 'gone', 'copied')`, destinationCalendarID); err != nil {
+		t.Fatalf("seed destination tombstone: %v", err)
+	}
+
+	result, err := s.TransferCalendarObject(ctx, CalendarObjectTransfer{
+		Operation:               CalendarObjectCopy,
+		SourceCalendarID:        sourceCalendarID,
+		SourceUID:               "source",
+		SourceResourceName:      "source",
+		ExpectedSourceETag:      "source-etag",
+		DestinationCalendarID:   destinationCalendarID,
+		DestinationResourceName: "copied",
+		ExpectedDestination:     CalendarObjectTransferState{Exists: true, UID: "old", ETag: "old-etag"},
+		Overwrite:               true,
+		RawICAL:                 raw,
+		ETag:                    "copied-etag",
+		SourceStatePath:         sourcePath,
+		DestinationStatePath:    destinationPath,
+	})
+	if err != nil {
+		t.Fatalf("TransferCalendarObject() error = %v", err)
+	}
+	if result == nil || result.Event == nil || result.Event.CalendarID != destinationCalendarID || result.Event.ResourceName != "copied" || result.Event.UID != "source" {
+		t.Fatalf("copy result = %#v", result)
+	}
+
+	properties, err := s.DeadProperties.ListByResources(ctx, []string{sourcePath, sourcePath + ".ics", destinationPath, destinationPath + ".ics"})
+	if err != nil {
+		t.Fatalf("list dead properties: %v", err)
+	}
+	var got []string
+	for _, property := range properties {
+		got = append(got, property.ResourcePath+" "+property.LocalName+"="+property.InnerXML)
+	}
+	slices.Sort(got)
+	want := []string{
+		destinationPath + " legacy=source legacy",
+		destinationPath + " note=source",
+		sourcePath + " note=source",
+		sourcePath + ".ics legacy=source legacy",
+	}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("dead properties after COPY = %q, want %q", got, want)
+	}
+
+	for path, wantEntries := range map[string]int{sourcePath: 1, destinationPath: 0, destinationPath + ".ics": 0} {
+		entries, err := s.ACLEntries.ListByResource(ctx, path)
+		if err != nil {
+			t.Fatalf("list ACL at %s: %v", path, err)
+		}
+		if len(entries) != wantEntries {
+			t.Errorf("ACL entries at %s after COPY = %#v, want %d", path, entries, wantEntries)
+		}
+	}
+
+	var tombstones int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM deleted_resources WHERE resource_type='event' AND collection_id=$1 AND resource_name='copied'`, destinationCalendarID).Scan(&tombstones); err != nil {
+		t.Fatalf("count destination tombstones: %v", err)
+	}
+	if tombstones != 0 {
+		t.Errorf("destination tombstones after COPY = %d, want 0", tombstones)
+	}
+}
+
+// RFC 4791 §4.1 lets a UID name one resource per calendar, so a transfer
+// into a calendar that already holds the source's UID under another name is
+// refused with that resource, for the CALDAV:no-uid-conflict href, and
+// writes nothing.
+func TestPostgres_CalendarObjectTransferRefusesAUIDBoundElsewhere(t *testing.T) {
+	for _, operation := range []CalendarObjectTransferOperation{CalendarObjectCopy, CalendarObjectMove} {
+		t.Run(string(operation), func(t *testing.T) {
+			s := newPostgresStore(t)
+			_, sourceCalendarID := newPostgresCalendar(t, s, "uid-conflict-source-"+string(operation))
+			_, destinationCalendarID := newPostgresCalendar(t, s, "uid-conflict-destination-"+string(operation))
+			ctx := context.Background()
+			raw := postgresCalendarObject("shared", "Source")
+			for _, seed := range []CalendarObjectWrite{
+				{CalendarID: sourceCalendarID, UID: "shared", ResourceName: "source", RawICAL: raw, ETag: "source-etag"},
+				{CalendarID: destinationCalendarID, UID: "shared", ResourceName: "existing", RawICAL: postgresCalendarObject("shared", "Existing"), ETag: "existing-etag"},
+			} {
+				if _, err := s.PutCalendarObject(ctx, seed); err != nil {
+					t.Fatalf("seed %s: %v", seed.ResourceName, err)
+				}
+			}
+
+			result, err := s.TransferCalendarObject(ctx, CalendarObjectTransfer{
+				Operation:               operation,
+				SourceCalendarID:        sourceCalendarID,
+				SourceUID:               "shared",
+				SourceResourceName:      "source",
+				ExpectedSourceETag:      "source-etag",
+				DestinationCalendarID:   destinationCalendarID,
+				DestinationResourceName: "destination",
+				ExpectedDestination:     CalendarObjectTransferState{},
+				Overwrite:               true,
+				RawICAL:                 raw,
+				ETag:                    "destination-etag",
+				SourceStatePath:         fmt.Sprintf("/dav/calendars/%d/source", sourceCalendarID),
+				DestinationStatePath:    fmt.Sprintf("/dav/calendars/%d/destination", destinationCalendarID),
+			})
+			if !errors.Is(err, ErrUIDConflict) {
+				t.Fatalf("TransferCalendarObject() error = %v, want ErrUIDConflict", err)
+			}
+			if result == nil || result.Conflict == nil || result.Conflict.ResourceName != "existing" {
+				t.Fatalf("conflict = %#v, want the destination's existing resource", result)
+			}
+			if written, err := s.Events.GetByResourceName(ctx, destinationCalendarID, "destination"); err != nil || written != nil {
+				t.Fatalf("destination after refusal = %#v, %v", written, err)
+			}
+			if source, err := s.Events.GetByResourceName(ctx, sourceCalendarID, "source"); err != nil || source == nil {
+				t.Fatalf("source after refusal = %#v, %v", source, err)
 			}
 		})
 	}
@@ -950,10 +1108,6 @@ func TestPostgres_ACLDecisionsFollowACEOrder(t *testing.T) {
 		t.Fatalf("set grant-first ACL: %v", err)
 	}
 	assertVisible(true)
-	allowed, err := s.ACLEntries.HasPrivilege(ctx, resourcePath, principal, "read")
-	if err != nil || !allowed {
-		t.Fatalf("grant-first HasPrivilege() = %v, %v", allowed, err)
-	}
 
 	if err := s.ACLEntries.SetACL(ctx, resourcePath, []ACLEntry{
 		{PrincipalHref: principal, IsGrant: false, Privilege: "read", Position: 0},
@@ -962,10 +1116,6 @@ func TestPostgres_ACLDecisionsFollowACEOrder(t *testing.T) {
 		t.Fatalf("set deny-first ACL: %v", err)
 	}
 	assertVisible(false)
-	allowed, err = s.ACLEntries.HasPrivilege(ctx, resourcePath, principal, "read")
-	if err != nil || allowed {
-		t.Fatalf("deny-first HasPrivilege() = %v, %v", allowed, err)
-	}
 }
 
 func TestPostgres_ConcurrentACLReplacementsDoNotMerge(t *testing.T) {

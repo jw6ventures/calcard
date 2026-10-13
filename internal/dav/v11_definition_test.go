@@ -34,10 +34,10 @@ func legacyNewYorkSeries(start string) string {
 func TestCalendarQueryReadsAV11DefinitionAsTheHostZone(t *testing.T) {
 	requireHostZones(t, "America/New_York")
 	event := store.Event{UID: "legacy", RawICAL: legacyNewYorkSeries("20250706")}
-	if !filterMatches(event, calQueryWithTimeRange("20260705T140000Z", "20260705T143000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260705T140000Z", "20260705T143000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 2026-07-05 10:00 EDT instance")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260705T150000Z", "20260705T153000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260705T150000Z", "20260705T153000Z"), floatingZone{}) {
 		t.Error("calendar-query placed the 2026-07-05 instance at 10:00 EST")
 	}
 }

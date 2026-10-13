@@ -1073,16 +1073,15 @@ WHERE calendar_id=$13 AND uid=$14`
 	return tx.Commit()
 }
 
-// lockEventMoveTx takes what a DAV MOVE or COPY of the same event takes, in
-// the same order: the DAV path locks of both resources and both collections,
-// the object identity locks, and the two collection rows by ascending id. A
-// move skipping
+// lockEventMoveTx takes what a DAV MOVE of the same event takes, in the same
+// order: the DAV path locks of both resources and both collections, the object
+// identity locks, and the two collection rows by ascending id. A move skipping
 // any of them could reach the collection rows in the opposite order from a DAV
-// MOVE going the other way and deadlock against it, and a copy stamping its
-// new member before it waited for the destination could commit behind a sync
-// token handed out meanwhile. sourceResourceName and destResourceName may be
-// empty when the caller has not resolved them yet; the UID keys still
-// serialize the transfer against every other write to the event.
+// MOVE going the other way and deadlock against it, or stamp its moved member
+// before it waited for the destination and commit behind a sync token handed
+// out meanwhile. sourceResourceName and destResourceName may be empty when the
+// caller has not resolved them yet; the UID keys still serialize the move
+// against every other write to the event.
 func lockEventMoveTx(ctx context.Context, tx *sql.Tx, fromCalendarID, toCalendarID int64, uid, sourceResourceName, destResourceName, fromStatePath, toStatePath string) error {
 	lockPaths := []string{calendarCollectionLockPath(fromCalendarID), calendarCollectionLockPath(toCalendarID)}
 	lockPaths = append(lockPaths, davStatePaths(fromStatePath)...)
@@ -1284,48 +1283,6 @@ func (s *Store) moveDeadPropertiesFallback(ctx context.Context, fromPath, toPath
 		return err
 	}
 	return s.DeadProperties.Apply(ctx, fromPath, clearSource)
-}
-
-// CopyEventAndState copies an event and its dead properties atomically while
-// replacing destination DAV security state rather than inheriting it from the
-// source.
-func (s *Store) CopyEventAndState(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag, fromStatePath, toStatePath, replacedUID string) (*Event, error) {
-	if s == nil || s.Events == nil {
-		return nil, ErrNotFound
-	}
-	if s.pool == nil {
-		event, err := s.Events.CopyToCalendar(ctx, fromCalendarID, toCalendarID, uid, destResourceName, newETag)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.copyDAVStateFallback(ctx, fromStatePath, toStatePath, "event", toCalendarID, replacedUID, destResourceName); err != nil {
-			return nil, err
-		}
-		return event, nil
-	}
-
-	tx, err := s.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if err := lockEventMoveTx(ctx, tx, fromCalendarID, toCalendarID, uid, "", destResourceName, fromStatePath, toStatePath); err != nil {
-		return nil, err
-	}
-	event, err := copyEventTx(ctx, tx, fromCalendarID, toCalendarID, uid, destResourceName, newETag)
-	if err != nil {
-		return nil, err
-	}
-	if err := copyDAVStateTx(ctx, tx, fromStatePath, toStatePath); err != nil {
-		return nil, err
-	}
-	if err := clearDestinationTombstonesTx(ctx, tx, "event", toCalendarID, destResourceName); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return event, nil
 }
 
 func (s *Store) CopyContactAndState(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag, fromStatePath, toStatePath, replacedUID string, expected ContactTransferExpectation, lockPreconditions []LockPrecondition) (*Contact, error) {

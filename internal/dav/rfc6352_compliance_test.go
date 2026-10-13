@@ -271,24 +271,6 @@ func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string)
 	return result, nil
 }
 
-func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	entries, err := f.ListByResource(ctx, resourcePath)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if entry.PrincipalHref == principalHref && entry.Privilege == privilege && !entry.IsGrant {
-			return false, nil
-		}
-	}
-	for _, entry := range entries {
-		if entry.PrincipalHref == principalHref && entry.Privilege == privilege && entry.IsGrant {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {

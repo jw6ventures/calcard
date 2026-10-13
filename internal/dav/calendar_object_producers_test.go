@@ -326,6 +326,32 @@ func TestValidateCalendarObjectNamesAnUndefinedTimezone(t *testing.T) {
 	}
 }
 
+// The UID is a unique index key whose entries PostgreSQL bounds in size, so the
+// validator every writer of submitted data goes through refuses one past the
+// limit, with the status and precondition PUT answers, before it reaches the
+// store. COPY and MOVE write a UID the store already holds, so they do not
+// bound it.
+func TestValidateCalendarObjectBoundsTheUID(t *testing.T) {
+	atLimit := producerObject("VEVENT", "UID:"+strings.Repeat("u", store.MaxIdentifierOctets), "DTSTART:20260105T090000Z")
+	if _, err := ValidateCalendarObject(atLimit, nil); err != nil {
+		t.Fatalf("UID at the limit refused: %v", err)
+	}
+
+	over := producerObject("VEVENT", "UID:"+strings.Repeat("u", store.MaxIdentifierOctets+1), "DTSTART:20260105T090000Z")
+	_, err := ValidateCalendarObject(over, nil)
+	if !errors.Is(err, calobject.ErrUIDTooLong) {
+		t.Errorf("error = %v, want it to wrap ErrUIDTooLong", err)
+	}
+	var refusal *calobject.Error
+	if !errors.As(err, &refusal) || refusal.Status != http.StatusForbidden || !reflect.DeepEqual(refusal.Conditions, []string{"valid-calendar-object-resource"}) {
+		t.Errorf("error = %#v, want 403 valid-calendar-object-resource", err)
+	}
+
+	h, _ := writableCalendarServer()
+	rr := putCalendarObject(t, h, "long-uid.ics", over)
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+}
+
 // A zone the object names without defining is the host's definition of that
 // name, both where PUT bounds the object's dates and where reports place it.
 func TestReportsPlaceAnUndefinedIANAZoneByTheHostDefinition(t *testing.T) {
@@ -338,10 +364,10 @@ func TestReportsPlaceAnUndefinedIANAZoneByTheHostDefinition(t *testing.T) {
 	}
 	event := store.Event{UID: "e", RawICAL: raw}
 	// Berlin is an hour ahead of UTC in January.
-	if !filterMatches(event, calQueryWithTimeRange("20260119T080000Z", "20260119T081500Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260119T080000Z", "20260119T081500Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 2026-01-19 instance at 08:00Z")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched the excluded 2026-01-12 instance")
 	}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),
@@ -357,10 +383,10 @@ func TestCalendarQuerySelectsAZeroLengthEventAtItsInstant(t *testing.T) {
 		"zero DURATION":          producerObject("VEVENT", "UID:z", "DTSTART:20260105T090000Z", "DURATION:PT0S"),
 	} {
 		event := store.Event{UID: "z", RawICAL: raw}
-		if !filterMatches(event, calQueryWithTimeRange("20260105T083000Z", "20260105T093000Z"), floatingZone{}) {
+		if !filterMatches(t, event, calQueryWithTimeRange("20260105T083000Z", "20260105T093000Z"), floatingZone{}) {
 			t.Errorf("%s: calendar-query missed the event", name)
 		}
-		if filterMatches(event, calQueryWithTimeRange("20260105T093000Z", "20260105T103000Z"), floatingZone{}) {
+		if filterMatches(t, event, calQueryWithTimeRange("20260105T093000Z", "20260105T103000Z"), floatingZone{}) {
 			t.Errorf("%s: calendar-query matched a range after the event", name)
 		}
 	}

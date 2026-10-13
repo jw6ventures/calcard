@@ -82,6 +82,12 @@ var ErrSchedulingMessage = errors.New("calendar object is a scheduling message")
 // write stores (RFC 4791 §4.1).
 var ErrMultipleUIDs = errors.New("calendar object carries more than one UID")
 
+// ErrUIDTooLong is the reason a calendar object is refused when its UID is
+// longer than store.MaxIdentifierOctets, the bound the server keeps a UID to
+// so the unique index entries it is stored under stay within PostgreSQL's
+// limit.
+var ErrUIDTooLong = errors.New("calendar object UID is too long")
+
 // Error is a calendar object the CalDAV validator refused: the HTTP status and
 // the RFC 4791 §5.3.2.1 precondition elements a PUT of it would be answered
 // with.

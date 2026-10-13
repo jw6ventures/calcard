@@ -242,8 +242,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	}
 	uid := validated.UID
 	resourceName := resourceUID
-	if len(uid) > store.MaxIdentifierOctets || len(resourceName) > store.MaxIdentifierOctets {
-		// Both are unique index keys, which PostgreSQL bounds in size.
+	if len(resourceName) > store.MaxIdentifierOctets {
+		// The validator bounds the UID; the resource name is a unique index
+		// key too, which PostgreSQL bounds in size.
 		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
 		return
 	}

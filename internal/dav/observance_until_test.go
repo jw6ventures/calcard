@@ -161,10 +161,10 @@ func TestClientDefinitionPlacesValuesAfterAnObservancesLastOnset(t *testing.T) {
 
 	event := store.Event{UID: "e", RawICAL: raw}
 	// The 1 April instance runs 23:00Z to 00:00Z at +1000.
-	if !filterMatches(event, calQueryWithTimeRange("20070331T233000Z", "20070401T000000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20070331T233000Z", "20070401T000000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 1 April instance at its +1000 time")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20070331T220000Z", "20070331T230000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20070331T220000Z", "20070331T230000Z"), floatingZone{}) {
 		t.Error("calendar-query matched the 1 April instance an hour early, at +1100")
 	}
 }

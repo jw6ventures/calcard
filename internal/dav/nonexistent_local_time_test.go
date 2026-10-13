@@ -54,8 +54,8 @@ func skippedTimeFixtures() []skippedTimeFixture {
 	return []skippedTimeFixture{
 		{name: "client VTIMEZONE", object: withZone("Europe/Berlin", true)},
 		{name: "zone only the object defines", object: withZone("Private/Berlin", true)},
-		// Rows stored before the validator added the host's definition carry
-		// none, and are read through the host's zone of that name.
+		// Rows stored without the host's definition, as a 1.1.x release
+		// stored them, are read through the host's zone of that name.
 		{name: "no VTIMEZONE", object: withZone("Europe/Berlin", false)},
 		{name: "definition the validator stores", object: func(t *testing.T, properties ...string) string {
 			t.Helper()
@@ -98,7 +98,7 @@ func TestCalendarQueryLeavesOutTheInstanceOnASkippedLocalTime(t *testing.T) {
 				{"20260412T000000Z", "20260413T000000Z", true},
 				{"20260419T000000Z", "20260420T000000Z", false},
 			} {
-				if got := filterMatches(event, calQueryWithTimeRange(tt.start, tt.end), floatingZone{}); got != tt.want {
+				if got := filterMatches(t, event, calQueryWithTimeRange(tt.start, tt.end), floatingZone{}); got != tt.want {
 					t.Errorf("time-range %s/%s matched = %v, want %v", tt.start, tt.end, got, tt.want)
 				}
 			}
@@ -259,10 +259,10 @@ func TestStoredFloatingUntilBesideAZonedDTStartEndsOnTheDTStartsWallClock(t *tes
 	event := store.Event{UID: "series", RawICAL: buildCalendarObject(buildComponent("VEVENT", "UID:series", "DTSTAMP:20240101T000000Z",
 		"DTSTART;TZID=America/New_York:20240308T023000", "DURATION:PT1H", "RRULE:FREQ=DAILY;UNTIL=20240312T023000"))}
 	for name, zone := range map[string]floatingZone{"no calendar time zone": {}, "calendar time zone Asia/Tokyo": {defined: true, loc: tokyo}} {
-		if !filterMatches(event, calQueryWithTimeRange("20240312T060000Z", "20240312T070000Z"), zone) {
+		if !filterMatches(t, event, calQueryWithTimeRange("20240312T060000Z", "20240312T070000Z"), zone) {
 			t.Errorf("%s: calendar-query missed the series' last instance", name)
 		}
-		if filterMatches(event, calQueryWithTimeRange("20240313T060000Z", "20240313T070000Z"), zone) {
+		if filterMatches(t, event, calQueryWithTimeRange("20240313T060000Z", "20240313T070000Z"), zone) {
 			t.Errorf("%s: calendar-query matched an instance on the day after the series' last", name)
 		}
 	}
@@ -284,10 +284,10 @@ func TestOverrideOfASkippedInstanceIsKeptAsItsOwnComponent(t *testing.T) {
 			"DTSTART;TZID=Europe/Berlin:20260329T100000", "DTEND;TZID=Europe/Berlin:20260329T110000")...)...)
 
 	event := store.Event{UID: "series", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260329T070000Z", "20260329T090000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260329T070000Z", "20260329T090000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the override at its own time")
 	}
-	if !filterMatches(event, calQueryWithTimeRange("20260405T000000Z", "20260406T000000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260405T000000Z", "20260406T000000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the series' second instance, after the skipped Sunday")
 	}
 
@@ -320,10 +320,10 @@ func TestShippedDefinitionDecidesWhichLocalTimesAreSkipped(t *testing.T) {
 		"BEGIN:STANDARD", "TZOFFSETFROM:+0100", "TZOFFSETTO:+0100", "DTSTART:19700101T000000", "END:STANDARD",
 		"END:VTIMEZONE"}, componentLines("VEVENT", properties...)...)...)
 	event := store.Event{UID: "series", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260329T013000Z", "20260329T020000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260329T013000Z", "20260329T020000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 29 March instance the shipped definition does not skip")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260412T000000Z", "20260413T000000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260412T000000Z", "20260413T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched a fifth Sunday of a four-instance series")
 	}
 }
@@ -350,10 +350,10 @@ func TestContradictoryDefinitionSkipsOnlyTheGapItsObservanceStates(t *testing.T)
 			"DTSTART;TZID=Example/Contradictory:20260327T013000", "DTEND;TZID=Example/Contradictory:20260327T023000",
 			"RRULE:FREQ=DAILY;COUNT=4")...)...)
 	event := store.Event{UID: "series", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260329T000000Z", "20260329T010000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260329T000000Z", "20260329T010000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the 01:30 instance on 29 March, outside the stated gap")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260330T220000Z", "20260331T030000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260330T220000Z", "20260331T030000Z"), floatingZone{}) {
 		t.Error("calendar-query matched a 31 March instance the four-instance series does not have")
 	}
 	if exceeds, ok := ical.RecurrenceSetExceedsLimit(raw, 4); !ok || exceeds {

@@ -1470,9 +1470,6 @@ func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (
 func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
 	return nil
 }
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, nil
-}
 
 type fakeACLRepo struct {
 	entries              []store.ACLEntry
@@ -1537,10 +1534,6 @@ func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string)
 		}
 	}
 	return result, nil
-}
-
-func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	return false, nil
 }
 
 func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
@@ -1769,8 +1762,8 @@ func TestCreateEventBoundsTheUID(t *testing.T) {
 	_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{
 		RawICS: validICS(strings.Repeat("u", store.MaxIdentifierOctets+1)),
 	})
-	if !errors.Is(err, ErrBadRequest) {
-		t.Fatalf("CreateEvent() error = %v, want ErrBadRequest", err)
+	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), fmt.Sprintf("uid must be at most %d octets", store.MaxIdentifierOctets)) {
+		t.Fatalf("CreateEvent() error = %v, want ErrBadRequest naming the UID bound", err)
 	}
 	if len(repo.events) != 0 {
 		t.Fatal("the event was stored")

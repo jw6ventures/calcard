@@ -42,10 +42,10 @@ func TestReportsReadAnEventInANestedVCALENDAR(t *testing.T) {
 		t.Fatal("PUT accepts the fixture, so it does not exercise stored-object reading")
 	}
 	event := store.Event{UID: "legacy", RawICAL: raw}
-	if !filterMatches(event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
+	if !filterMatches(t, event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
 		t.Error("calendar-query missed the nested event")
 	}
-	if filterMatches(event, calQueryWithTimeRange("20260113T000000Z", "20260114T000000Z"), floatingZone{}) {
+	if filterMatches(t, event, calQueryWithTimeRange("20260113T000000Z", "20260114T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched a day without the nested event")
 	}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),
@@ -430,7 +430,7 @@ func TestCalendarQueryKeepsAStoredObjectWithNoCalendarToRead(t *testing.T) {
 			t.Fatalf("%q: read as a calendar", raw)
 		}
 		event := store.Event{UID: "unreadable", RawICAL: raw}
-		if !filterMatches(event, filter, floatingZone{}) {
+		if !filterMatches(t, event, filter, floatingZone{}) {
 			t.Errorf("%q: left out by matchEventFilter", raw)
 		}
 		kept, err := applyCalendarFilter(t.Context(), []store.Event{event}, filter, floatingZone{})

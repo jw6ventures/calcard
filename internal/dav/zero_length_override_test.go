@@ -18,10 +18,10 @@ func TestCalendarQueryPlacesInstancesMovedByAZeroLengthOverride(t *testing.T) {
 			buildComponent("VEVENT", "UID:e", "RECURRENCE-ID;RANGE=THISANDFUTURE:20260112T090000Z", "DTSTART:20260112T110000Z", length),
 		)
 		event := store.Event{UID: "e", RawICAL: raw}
-		if !filterMatches(event, calQueryWithTimeRange("20260119T103000Z", "20260119T113000Z"), floatingZone{}) {
+		if !filterMatches(t, event, calQueryWithTimeRange("20260119T103000Z", "20260119T113000Z"), floatingZone{}) {
 			t.Errorf("%s: calendar-query missed the moved 19 January instance", name)
 		}
-		if filterMatches(event, calQueryWithTimeRange("20260119T113000Z", "20260119T120000Z"), floatingZone{}) {
+		if filterMatches(t, event, calQueryWithTimeRange("20260119T113000Z", "20260119T120000Z"), floatingZone{}) {
 			t.Errorf("%s: the moved 19 January instance still lasts the master's hour", name)
 		}
 	}
