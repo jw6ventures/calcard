@@ -1,12 +1,10 @@
 package dav
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -70,33 +68,11 @@ func requestPathForCanonical(canonicalPath string) string {
 	return canonicalPath
 }
 
-// objectACLPaths lists, in decision order, the stored spellings whose ACL
-// entries make up the ACL of the member resourceName of the canonical
-// collectionPath. The store's ACL writes replace exactly these.
-func objectACLPaths(collectionPath, resourceName string) []string {
-	return store.ObjectACLPaths(collectionPath, resourceName)
-}
-
-// orderACLEntries puts entries read from the spellings paths of one
-// resource's ACL in the order a decision reads them: by the spelling's place
-// in paths, so the resource's own path comes first, then by each spelling's
-// ACE order. The order then depends on what the spellings hold, not on the
-// order their rows were saved in.
-func orderACLEntries(entries []store.ACLEntry, paths []string) {
-	slices.SortStableFunc(entries, func(a, b store.ACLEntry) int {
-		return cmp.Or(
-			cmp.Compare(spellingRank(paths, a.ResourcePath), spellingRank(paths, b.ResourcePath)),
-			cmp.Compare(a.Position, b.Position),
-			cmp.Compare(a.ID, b.ID),
-		)
-	})
-}
-
-func spellingRank(paths []string, resourcePath string) int {
-	if rank := slices.Index(paths, resourcePath); rank >= 0 {
-		return rank
-	}
-	return len(paths)
+// objectStatePath is the path the member resourceName of the canonical
+// collectionPath keeps its ACL entries, locks and dead properties at, which
+// is also its canonical path.
+func objectStatePath(collectionPath, resourceName string) string {
+	return store.MemberStatePath(collectionPath, resourceName)
 }
 
 // requirePrivilegeDecision turns the (allowed, denied) result of a privilege
@@ -132,10 +108,12 @@ func isPrivilegeRefusal(err error) bool {
 // refusal on the existing object at cleanPath. A principal that may not read
 // the object is given answerAsAbsent's answer, the one the same request gets
 // when no object is at cleanPath, so the refusal does not disclose that the
-// object exists. answerAsAbsent returns nil when that request would succeed;
-// then, as when the principal may read the object, its existence is no secret
-// from the principal, and refusal stands. So does a refusal that already
-// answers as for a missing resource.
+// object exists. A refusal that already answers as for a missing resource
+// stands. So does refusal when answerAsAbsent returns nil, meaning that request
+// would succeed: a principal that may create the member can learn whether it
+// exists however this request is answered, by creating it or, creating
+// nothing, by a write whose body the collection refuses, which is refused for
+// its body when the member is absent and for the privilege when it exists.
 func (h *DavServer) existingObjectWriteRefusal(ctx context.Context, user *store.User, cleanPath string, refusal error, answerAsAbsent func() error) error {
 	if !refusalNamesPrivilege(refusal) {
 		return refusal

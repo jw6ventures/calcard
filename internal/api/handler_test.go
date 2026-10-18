@@ -1021,7 +1021,7 @@ func TestEventUpdatesAndDeletesAnswerAPrincipalWhoCannotSeeTheEventAlikeWhetherO
 		notFound    = http.StatusNotFound
 		failed      = http.StatusPreconditionFailed
 		collection  = "/dav/calendars/1"
-		eventObject = "/dav/calendars/1/stored.ics"
+		eventObject = "/dav/calendars/1/stored"
 	)
 	storedICS := func(uid string) string {
 		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Planning\r\nDTSTART:20260320T100000Z\r\nDTEND:20260320T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"

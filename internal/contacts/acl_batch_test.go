@@ -2,6 +2,7 @@ package contacts
 
 import (
 	"context"
+	"slices"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -12,6 +13,16 @@ func (f *fakeACL) ListByResources(_ context.Context, paths []string) ([]store.AC
 
 func (f *fakeACL) ListByResourcesAndPrincipals(_ context.Context, paths, principals []string) ([]store.ACLEntry, error) {
 	return filterTestACLEntries(f.entries, paths, principals), nil
+}
+
+func (f *fakeACL) ListByPrincipals(_ context.Context, principals []string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if slices.Contains(principals, entry.PrincipalHref) {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
 }
 
 func filterTestACLEntries(entries []store.ACLEntry, paths, principals []string) []store.ACLEntry {

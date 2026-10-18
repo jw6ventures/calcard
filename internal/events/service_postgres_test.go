@@ -93,7 +93,7 @@ func TestPostgres_EventsAreHiddenFromAUserWithNoAccessToTheirCalendar(t *testing
 	if err := database.ACLEntries.SetACL(ctx, collection, []store.ACLEntry{{PrincipalHref: fmt.Sprintf("/dav/principals/%d/", reader.ID), IsGrant: true, Privilege: "read"}}); err != nil {
 		t.Fatalf("grant read on the calendar: %v", err)
 	}
-	if err := database.ACLEntries.SetACL(ctx, collection+"/stored.ics", []store.ACLEntry{{PrincipalHref: fmt.Sprintf("/dav/principals/%d/", objectReader.ID), IsGrant: true, Privilege: "read"}}); err != nil {
+	if err := database.ACLEntries.SetACL(ctx, collection+"/stored", []store.ACLEntry{{PrincipalHref: fmt.Sprintf("/dav/principals/%d/", objectReader.ID), IsGrant: true, Privilege: "read"}}); err != nil {
 		t.Fatalf("grant read on the event: %v", err)
 	}
 
@@ -311,8 +311,8 @@ func TestPostgres_EventUpdatesAndDeletesFollowTheAccessRules(t *testing.T) {
 // (internal/dav/delete.go): DAV:unbind on the calendar and some privilege on
 // the event, with a principal holding no privilege on the event answered as
 // for a UID the calendar does not hold. They differ, deliberately, for a
-// principal holding no privilege on the calendar either, only ACEs that grant
-// none or deny every one: DAV answers 403, which confirms the calendar exists,
+// principal holding no privilege on the calendar either, only ACEs that deny
+// every one: DAV answers 403, which confirms the calendar exists,
 // and REST answers 404, as REST GetEvent does. Neither answer depends on
 // whether the event exists. eventWriteAccessCase.davDelete names each such
 // case and DAV's answer, which this test asserts.

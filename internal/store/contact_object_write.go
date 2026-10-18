@@ -186,16 +186,20 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
+// clearCreatedObjectDAVStateTx removes the ACL entries and dead properties
+// stored at a member path before a calendar object or contact is created
+// there: no stored resource owns them, so they are not the new resource's. A
+// lock stays, since a lock on an unmapped name is the lock-null resource the
+// write maps (RFC 4918 section 7.3).
 func clearCreatedObjectDAVStateTx(ctx context.Context, tx execContext, statePath string) error {
-	for _, candidate := range davStatePaths(statePath) {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, candidate); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, candidate); err != nil {
-			return err
-		}
+	if statePath == "" {
+		return nil
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, statePath); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, statePath)
+	return err
 }
 
 func (s *Store) putContactObjectViaRepository(ctx context.Context, write ContactObjectWrite) (*ContactObjectWriteResult, error) {
@@ -222,16 +226,14 @@ func (s *Store) putContactObjectViaRepository(ctx context.Context, write Contact
 	if !contactPreconditionSatisfied(write.Precondition, existing) {
 		return nil, ErrPreconditionFailed
 	}
-	if existing == nil {
-		for _, candidate := range davStatePaths(write.StatePath) {
-			if s.ACLEntries != nil {
-				if err := s.ACLEntries.Delete(ctx, candidate); err != nil {
-					return nil, err
-				}
-			}
-			if err := s.clearDeadPropertiesFallback(ctx, candidate); err != nil {
+	if existing == nil && write.StatePath != "" {
+		if s.ACLEntries != nil {
+			if err := s.ACLEntries.Delete(ctx, write.StatePath); err != nil {
 				return nil, err
 			}
+		}
+		if err := s.clearDeadPropertiesFallback(ctx, write.StatePath); err != nil {
+			return nil, err
 		}
 	}
 	contact, err := s.Contacts.Upsert(ctx, Contact{AddressBookID: write.AddressBookID, UID: write.UID,

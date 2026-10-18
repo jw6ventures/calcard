@@ -1123,11 +1123,16 @@ func EnsureUID(ical, uid string) string {
 	return strings.Join(out, "\r\n") + "\r\n"
 }
 
-// ResourceNameForUID derives a stable .ics resource name from a UID.
+// ResourceNameForUID derives a stable resource name from a UID, which CalDAV
+// serves with .ics added. It adds no extension of its own, replaces each
+// character other than an ASCII letter, digit, '.', '-' or '_' with '_', and
+// trims '.' and '_' from both ends, giving "event" where that leaves nothing.
+// The name is never "." or "..", and is no longer than the UID or "event".
+// Distinct UIDs can give one name, as "a@b" and "a_b" do.
 func ResourceNameForUID(uid string) string {
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
-		return "event.ics"
+		return "event"
 	}
 	var b strings.Builder
 	for _, r := range uid {
@@ -1143,9 +1148,6 @@ func ResourceNameForUID(uid string) string {
 	name := strings.Trim(b.String(), "._")
 	if name == "" {
 		name = "event"
-	}
-	if !strings.HasSuffix(strings.ToLower(name), ".ics") {
-		name += ".ics"
 	}
 	return name
 }

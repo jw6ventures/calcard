@@ -74,8 +74,9 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		jw6utils.Log("Main", "runServer", jw6_utils.Warn, fmt.Sprintf("request traffic capture enabled: %s", cfg.TrafficCaptureFile))
 	}
 
+	relayPostgresNotices(&jw6utils)
 	dbManager := database.NewManager(database.Config{
-		Driver:           "postgres",
+		Driver:           postgresDriverName,
 		ConnString:       cfg.DB.DSN,
 		MigrationsPath:   "migrations",
 		AppVersion:       version,

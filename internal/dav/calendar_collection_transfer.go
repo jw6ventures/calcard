@@ -120,6 +120,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 		return
 	}
 	lockPaths := []string{destinationPath, path.Dir(destinationPath)}
+	var replacedRoots []string
 	if destination != nil {
 		destinationMembers, err := h.store.Events.ListForCalendar(r.Context(), destination.ID)
 		if err != nil {
@@ -129,17 +130,31 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 		for i := range destinationMembers {
 			lockPaths = append(lockPaths, strings.TrimSuffix(destinationPath, "/")+"/"+eventResourceName(destinationMembers[i])+".ics")
 		}
+		replacedRoots = append(replacedRoots, calendarStatePath(destination.ID))
 	}
 	if operation == store.CalendarCollectionMove {
 		lockPaths = append(lockPaths, sourcePath, path.Dir(sourcePath))
 		for i := range members {
 			lockPaths = append(lockPaths, strings.TrimSuffix(sourcePath, "/")+"/"+members[i].ResourceName+".ics")
 		}
+		replacedRoots = append(replacedRoots, calendarStatePath(source.ID))
+	}
+	for _, root := range replacedRoots {
+		lockedBelow, err := h.lockedPathsBelow(r.Context(), root)
+		if err != nil {
+			writeLockStateError(w, err)
+			return
+		}
+		lockPaths = append(lockPaths, lockedBelow...)
 	}
 	if !h.requireLocks(w, r, "resource is locked", lockPaths...) {
 		return
 	}
 
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
+	if !ok {
+		return
+	}
 	destinationState := store.CalendarCollectionState{}
 	destinationStatePath := ""
 	destinationLockPath := ""
@@ -167,7 +182,7 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 		DestinationStatePath: destinationStatePath,
 		DestinationLockPath:  destinationLockPath,
 		Members:              members,
-		LockPreconditions:    h.lockPreconditions(r, lockPaths...),
+		LockPreconditions:    lockPreconditions,
 		ExpectedACL:          aclGuard,
 	}
 	defer invalidateDAVRequestState(r.Context())

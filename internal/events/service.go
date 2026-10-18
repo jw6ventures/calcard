@@ -23,6 +23,12 @@ var (
 	ErrBadRequest         = errors.New("bad request")
 	ErrConflict           = errors.New("conflict")
 	ErrPreconditionFailed = errors.New("precondition failed")
+
+	// ErrUnwritableName refuses a write that would keep an event under a name
+	// no href carries, such as "." as a 1.1.x release could store it. Such an
+	// event can be read, deleted, or moved over CalDAV to another name. It is
+	// ErrBadRequest.
+	ErrUnwritableName = fmt.Errorf("%w: the event is stored under a name that cannot be kept; it can be read, deleted or moved to another name", ErrBadRequest)
 )
 
 type Service struct {
@@ -292,20 +298,18 @@ func (s *Service) collectCalendarACLEntries(ctx context.Context, user *store.Use
 	resourcePrefix := collectionPath + "/"
 	entriesByPath := make(map[string][]store.ACLEntry)
 	hasResourceEntries := false
-	for _, principalHref := range acl.PrincipalHrefs(user) {
-		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, entry := range entries {
-			path := strings.TrimSpace(entry.ResourcePath)
-			switch {
-			case path == collectionPath:
-				entriesByPath[path] = append(entriesByPath[path], entry)
-			case strings.HasPrefix(path, resourcePrefix):
-				entriesByPath[path] = append(entriesByPath[path], entry)
-				hasResourceEntries = true
-			}
+	entries, err := s.store.ACLEntries.ListByPrincipals(ctx, acl.PrincipalHrefs(user))
+	if err != nil {
+		return nil, false, err
+	}
+	for _, entry := range entries {
+		path := entry.ResourcePath
+		switch {
+		case path == collectionPath:
+			entriesByPath[path] = append(entriesByPath[path], entry)
+		case strings.HasPrefix(path, resourcePrefix):
+			entriesByPath[path] = append(entriesByPath[path], entry)
+			hasResourceEntries = true
 		}
 	}
 	for resourcePath := range entriesByPath {
@@ -358,6 +362,11 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 		return nil, err
 	}
 	uid := object.UID
+	// The event is stored under its UID as its resource name, which must be
+	// one an href can name.
+	if !store.ValidMemberName(uid) {
+		return nil, fmt.Errorf(`%w: uid must be one path segment, neither "." nor "..", without '/'`, ErrBadRequest)
+	}
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, err
@@ -404,12 +413,15 @@ func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID 
 	if err != nil {
 		return nil, false, err
 	}
-	cal, existing, err := s.authorizeEventWrite(ctx, user, calendarID, existing, "write-content")
+	cal, existing, err := s.AuthorizeEventWrite(ctx, user, calendarID, existing, "write-content")
 	if err != nil {
 		return nil, false, err
 	}
 	if existing == nil {
 		return nil, false, ErrNotFound
+	}
+	if err := writableEventName(*existing); err != nil {
+		return nil, false, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
 		return nil, false, ErrPreconditionFailed
@@ -428,7 +440,7 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	if err != nil {
 		return err
 	}
-	if existing, err = s.authorizeEventDelete(ctx, user, calendarID, existing); err != nil {
+	if existing, err = s.AuthorizeEventRemoval(ctx, user, calendarID, existing); err != nil {
 		return err
 	}
 	// RFC 9110 §13.2.1: a precondition is not evaluated where the request
@@ -454,7 +466,8 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 	return err
 }
 
-// authorizeEventDelete decides a delete of existing as DAV DELETE decides it
+// AuthorizeEventRemoval decides taking existing out of calendarID, by deleting
+// it or moving it to another calendar, as DAV DELETE decides it
 // (internal/dav/delete.go), but for one difference: the principal needs some
 // privilege on the event and DAV:unbind on the calendar, a privilege of the
 // collection a member leaves (RFC 3744 §3.10). A principal holding no
@@ -462,11 +475,11 @@ func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID 
 // answered as for a UID that names nothing, and gets existing back as nil. For
 // such a UID, a principal holding some privilege on the calendar but not
 // DAV:unbind gets ErrForbidden, and one holding none gets ErrNotFound. The
-// difference: where a principal's ACEs on the calendar grant none of its
-// privileges, or deny every one, DAV answers 403, which confirms the calendar
-// exists; this answers ErrNotFound, concealing the calendar from a principal
-// who holds nothing on it, as GetEvent does.
-func (s *Service) authorizeEventDelete(ctx context.Context, user *store.User, calendarID int64, existing *store.Event) (*store.Event, error) {
+// difference: where a principal's ACEs on the calendar deny every one of its
+// privileges, DAV answers 403, which confirms the calendar exists; this
+// answers ErrNotFound, concealing the calendar from a principal who holds
+// nothing on it, as GetEvent does.
+func (s *Service) AuthorizeEventRemoval(ctx context.Context, user *store.User, calendarID int64, existing *store.Event) (*store.Event, error) {
 	cal, err := s.calendarForPrincipal(ctx, user, calendarID)
 	if err != nil {
 		return nil, err
@@ -479,16 +492,15 @@ func (s *Service) authorizeEventDelete(ctx context.Context, user *store.User, ca
 	if err != nil {
 		return nil, err
 	}
-	if existing != nil && !holdsAnyCalendarPrivilege(user, cal, resourceName, entriesByPath) {
-		existing = nil
-	}
-	if existing == nil && !holdsAnyCalendarPrivilege(user, cal, "", entriesByPath) {
+	switch acl.DecideRemoval(calendarHolding(user, cal, resourceName, entriesByPath), calendarHolding(user, cal, "", entriesByPath),
+		calendarPrivilegeAllowed(user, cal, "", "unbind", entriesByPath), existing != nil) {
+	case acl.RemovalAllowed:
+		return existing, nil
+	case acl.RemovalRefused:
+		return nil, ErrForbidden
+	default:
 		return nil, ErrNotFound
 	}
-	if !calendarPrivilegeAllowed(user, cal, "", "unbind", entriesByPath) {
-		return nil, ErrForbidden
-	}
-	return existing, nil
 }
 
 // calendarACLEntries are the ACL entries on calendarID and, unless
@@ -518,28 +530,40 @@ func calendarPrivilegeAllowed(user *store.User, cal *store.CalendarAccess, resou
 	return cal != nil && cal.EffectivePrivileges().Allows(privilege)
 }
 
-// holdsAnyCalendarPrivilege reports whether user holds any of
-// acl.CalendarPrivilegeNames on the event resourceName names, or on the
-// calendar when it is empty, each decided from entriesByPath as
-// requireCalendarPrivilege decides it. As in DAV's check, the calendar's
-// resolved privileges count only when no ACE applicable to the user decides
-// any of them.
-func holdsAnyCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
+// calendarHolding is what user holds of acl.CalendarPrivilegeNames on the
+// event resourceName names, or on the calendar when it is empty, each decided
+// from entriesByPath as DAV's removal decides it. An entry that names the user
+// but decides none of them refuses nothing, and the calendar's resolved
+// privileges count only when the entries decide none of them.
+func calendarHolding(user *store.User, cal *store.CalendarAccess, resourceName string, entriesByPath map[string][]store.ACLEntry) acl.Holding {
 	if cal == nil || user == nil {
-		return false
+		return acl.HoldsNothing
 	}
+	if cal.UserID == user.ID {
+		return acl.HoldsSome
+	}
+	principals := calendarApplicablePrincipals(user, cal.UserID)
+	resourceEntries := calendarResourceEntries(cal.ID, resourceName, entriesByPath)
+	collectionEntries := entriesByPath[calendarACLCollectionPath(cal.ID)]
 	denied := false
 	for _, privilege := range acl.CalendarPrivilegeNames {
-		allowed, privilegeDenied := calendarPrivilegeDecisionFromEntries(user, cal, resourceName, privilege, entriesByPath)
-		if allowed {
-			return true
+		granted, decided := acl.DecisionThroughLayers(principals, privilege, resourceEntries, collectionEntries)
+		if granted {
+			return acl.HoldsSome
 		}
-		denied = denied || privilegeDenied
+		denied = denied || decided
 	}
-	return !denied && cal.EffectivePrivileges().HasAny()
+	switch {
+	case denied:
+		return acl.HoldsDenied
+	case cal.EffectivePrivileges().HasAny():
+		return acl.HoldsSome
+	default:
+		return acl.HoldsNothing
+	}
 }
 
-// authorizeEventWrite checks privilege on the target of a write to existing:
+// AuthorizeEventWrite checks privilege on the target of a write to existing:
 // the event, or the calendar when the UID names none. It runs before anything
 // about the event is answered. A principal who can neither read the event nor
 // hold privilege on it is treated as for a UID that names nothing, and gets
@@ -548,7 +572,7 @@ func holdsAnyCalendarPrivilege(user *store.User, cal *store.CalendarAccess, reso
 // ErrForbidden when they read the calendar and ErrNotFound otherwise, as
 // GetEvent answers a principal who cannot read; one with it is authorized,
 // and the caller answers as for a missing event.
-func (s *Service) authorizeEventWrite(ctx context.Context, user *store.User, calendarID int64, existing *store.Event, privilege string) (*store.CalendarAccess, *store.Event, error) {
+func (s *Service) AuthorizeEventWrite(ctx context.Context, user *store.User, calendarID int64, existing *store.Event, privilege string) (*store.CalendarAccess, *store.Event, error) {
 	cal, err := s.calendarForPrincipal(ctx, user, calendarID)
 	if err != nil {
 		return nil, nil, err
@@ -641,51 +665,27 @@ func (s *Service) calendarPrivilegeDecision(ctx context.Context, user *store.Use
 		return false, false, nil
 	}
 
-	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
-	resourceApplicable, err := s.aclHasApplicablePrincipal(ctx, user, cal.UserID, resourcePaths)
+	resourceEntries, err := s.aclEntriesForPaths(ctx, calendarACLResourcePaths(cal.ID, resourceName))
 	if err != nil {
 		return false, false, err
 	}
-	if granted, applicable, err := s.aclDecision(ctx, user, cal.UserID, resourcePaths, privilege); err != nil {
-		return false, false, err
-	} else if applicable {
-		return granted, !granted, nil
-	}
-
-	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
-	collectionApplicable, err := s.aclHasApplicablePrincipal(ctx, user, cal.UserID, collectionPaths)
+	collectionEntries, err := s.aclEntriesForPaths(ctx, []string{calendarACLCollectionPath(cal.ID)})
 	if err != nil {
 		return false, false, err
 	}
-	if granted, applicable, err := s.aclDecision(ctx, user, cal.UserID, collectionPaths, privilege); err != nil {
-		return false, false, err
-	} else if applicable {
-		return granted, !granted, nil
-	}
-
-	return false, resourceApplicable || collectionApplicable, nil
+	allowed, denied := calendarDecisionFromLayers(user, cal.UserID, privilege, resourceEntries, collectionEntries)
+	return allowed, denied, nil
 }
 
-func (s *Service) aclDecision(ctx context.Context, user *store.User, ownerID int64, resourcePaths []string, privilege string) (bool, bool, error) {
-	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
-	if err != nil {
-		return false, false, err
+// calendarDecisionFromLayers decides privilege from the ACL of an event, when
+// one is named, ahead of its calendar's. With no decision, denied reports
+// whether any entry names a principal the user counts as.
+func calendarDecisionFromLayers(user *store.User, ownerID int64, privilege string, resourceEntries, collectionEntries []store.ACLEntry) (allowed, denied bool) {
+	principals := calendarApplicablePrincipals(user, ownerID)
+	if granted, decided := acl.DecisionThroughLayers(principals, privilege, resourceEntries, collectionEntries); decided {
+		return granted, !granted
 	}
-
-	granted, applicable := acl.DecisionForPrivilege(entries, calendarApplicablePrincipals(user, ownerID), privilege)
-	return granted, applicable, nil
-}
-
-func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, ownerID int64, resourcePaths []string) (bool, error) {
-	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
-	if err != nil {
-		return false, err
-	}
-	if len(entries) == 0 {
-		return false, nil
-	}
-
-	return acl.HasApplicablePrincipal(entries, calendarApplicablePrincipals(user, ownerID)), nil
+	return false, acl.HasApplicablePrincipal(resourceEntries, principals) || acl.HasApplicablePrincipal(collectionEntries, principals)
 }
 
 // calendarApplicablePrincipals names the principals an ACE on a calendar or one
@@ -734,19 +734,17 @@ func (s *Service) prefetchCalendarACLEntries(ctx context.Context, user *store.Us
 		}
 	}
 
+	entries, err := s.store.ACLEntries.ListByPrincipals(ctx, acl.PrincipalHrefs(user))
+	if err != nil {
+		return nil, err
+	}
 	result := make(map[string][]store.ACLEntry, len(relevantPaths))
-	for _, principalHref := range acl.PrincipalHrefs(user) {
-		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principalHref)
-		if err != nil {
-			return nil, err
+	for _, entry := range entries {
+		resourcePath := entry.ResourcePath
+		if _, ok := relevantPaths[resourcePath]; !ok {
+			continue
 		}
-		for _, entry := range entries {
-			resourcePath := strings.TrimSpace(entry.ResourcePath)
-			if _, ok := relevantPaths[resourcePath]; !ok {
-				continue
-			}
-			result[resourcePath] = append(result[resourcePath], entry)
-		}
+		result[resourcePath] = append(result[resourcePath], entry)
 	}
 	for resourcePath := range result {
 		acl.SortEntries(result[resourcePath])
@@ -758,19 +756,24 @@ func calendarACLCollectionPath(calendarID int64) string {
 	return fmt.Sprintf("/dav/calendars/%d", calendarID)
 }
 
+// calendarACLResourcePaths lists the paths whose ACL entries make up the ACL
+// of the event resourceName names: its state path, which is where DAV reads
+// and writes it, or none for an empty name.
 func calendarACLResourcePaths(calendarID int64, resourceName string) []string {
-	resourceName = strings.TrimSpace(resourceName)
 	if resourceName == "" {
 		return nil
 	}
-	base := calendarACLCollectionPath(calendarID) + "/" + resourceName
-	paths := []string{base}
-	if strings.EqualFold(pathExt(resourceName), ".ics") {
-		paths = append(paths, strings.TrimSuffix(base, pathExt(resourceName)))
-	} else {
-		paths = append(paths, base+".ics")
+	return []string{store.MemberStatePath(calendarACLCollectionPath(calendarID), resourceName)}
+}
+
+// writableEventName refuses a write in place to event when it is stored under
+// a name store.ValidMemberName refuses, as a 1.1.x release could store one:
+// its state path names the calendar, or the calendar's parent, once cleaned.
+func writableEventName(event store.Event) error {
+	if name := eventResourceName(event); !store.ValidMemberName(name) {
+		return fmt.Errorf("%w: %q", ErrUnwritableName, name)
 	}
-	return paths
+	return nil
 }
 
 func eventResourceName(event store.Event) string {
@@ -788,51 +791,16 @@ func calendarPrivilegeDecisionFromEntries(user *store.User, cal *store.CalendarA
 		return true, false
 	}
 
-	resourcePaths := calendarACLResourcePaths(cal.ID, resourceName)
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, cal.UserID, resourcePaths, privilege); applicable {
-		return granted, !granted
-	}
-
-	collectionPaths := []string{calendarACLCollectionPath(cal.ID)}
-	if granted, applicable := aclDecisionForResourcePaths(entriesByPath, user, cal.UserID, collectionPaths, privilege); applicable {
-		return granted, !granted
-	}
-
-	return false, aclHasApplicablePrincipalForPaths(entriesByPath, user, cal.UserID, resourcePaths) ||
-		aclHasApplicablePrincipalForPaths(entriesByPath, user, cal.UserID, collectionPaths)
+	return calendarDecisionFromLayers(user, cal.UserID, privilege, calendarResourceEntries(cal.ID, resourceName, entriesByPath), entriesByPath[calendarACLCollectionPath(cal.ID)])
 }
 
-func aclDecisionForResourcePaths(entriesByPath map[string][]store.ACLEntry, user *store.User, ownerID int64, resourcePaths []string, privilege string) (bool, bool) {
-	if len(entriesByPath) == 0 {
-		return false, false
+// calendarResourceEntries is the ACL of the event resourceName names in
+// calendarID from entriesByPath, or none for an empty name.
+func calendarResourceEntries(calendarID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) []store.ACLEntry {
+	if resourceName == "" {
+		return nil
 	}
-	entries := make([]store.ACLEntry, 0, len(resourcePaths))
-	for _, resourcePath := range resourcePaths {
-		entries = append(entries, entriesByPath[resourcePath]...)
-	}
-	acl.SortEntries(entries)
-	return acl.DecisionForPrivilege(entries, calendarApplicablePrincipals(user, ownerID), privilege)
-}
-
-func aclHasApplicablePrincipalForPaths(entriesByPath map[string][]store.ACLEntry, user *store.User, ownerID int64, resourcePaths []string) bool {
-	if len(entriesByPath) == 0 {
-		return false
-	}
-	applicablePrincipals := calendarApplicablePrincipals(user, ownerID)
-	for _, resourcePath := range resourcePaths {
-		if acl.HasApplicablePrincipal(entriesByPath[resourcePath], applicablePrincipals) {
-			return true
-		}
-	}
-	return false
-}
-
-func pathExt(resourceName string) string {
-	idx := strings.LastIndex(resourceName, ".")
-	if idx < 0 {
-		return ""
-	}
-	return resourceName[idx:]
+	return entriesByPath[store.MemberStatePath(calendarACLCollectionPath(calendarID), resourceName)]
 }
 
 // normalizeEventPayload builds the calendar object a request describes and puts

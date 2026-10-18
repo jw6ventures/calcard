@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -100,13 +101,15 @@ func TestPostgres_CalendarCollectionCopyQueriesDoNotGrowWithMembers(t *testing.T
 // A collection MOVE or DELETE writes every member, and a COPY or MOVE over an
 // existing collection removes every member of that one, so a lock on any such
 // member stops the request unless its token is submitted, whatever the member
-// is named.
+// is named. So does a lock on an unmapped member, a lock-null resource the
+// request would remove with the collection (RFC 4918 §9.6.1, §9.9.2).
 func TestPostgres_CalendarCollectionWritesHonourEveryMembersLock(t *testing.T) {
+	const unmapped = "unmapped"
 	for _, request := range []struct {
 		method          string
 		lockDestination bool
 	}{{"MOVE", false}, {"DELETE", false}, {"MOVE", true}, {"COPY", true}} {
-		for _, name := range []string{"plain", "uid@example.com", "dav.ics", "Shout.ICS"} {
+		for _, name := range []string{"plain", "uid@example.com", "dav.ics", "Shout.ICS", unmapped} {
 			label := request.method + " " + name
 			if request.lockDestination {
 				label = request.method + " over " + name
@@ -131,10 +134,14 @@ func TestPostgres_CalendarCollectionWritesHonourEveryMembersLock(t *testing.T) {
 					}
 					return cal
 				}
-				source := newCalendar("source", name, "other")
+				members := []string{name, "other"}
+				if name == unmapped {
+					members = []string{"other"}
+				}
+				source := newCalendar("source", members...)
 				locked := source
 				if request.lockDestination {
-					locked = newCalendar("dest", name, "other")
+					locked = newCalendar("dest", members...)
 				}
 				h := NewDavServer(Options{Store: database})
 				do := func(method, target string, header map[string]string, body string) *httptest.ResponseRecorder {
@@ -149,9 +156,15 @@ func TestPostgres_CalendarCollectionWritesHonourEveryMembersLock(t *testing.T) {
 				}
 				const exclusive = `<?xml version="1.0" encoding="utf-8"?><d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>`
 				lockedHref := calendarCollectionResourcePath(locked.ID) + "/" + url.PathEscape(name) + ".ics"
-				if lock := do("LOCK", lockedHref, map[string]string{"Depth": "0"}, exclusive); lock.Code != http.StatusOK {
-					t.Fatalf("LOCK = %d: %s", lock.Code, lock.Body.String())
+				wantLock := http.StatusOK
+				if name == unmapped {
+					wantLock = http.StatusCreated
 				}
+				lock := do("LOCK", lockedHref, map[string]string{"Depth": "0"}, exclusive)
+				if lock.Code != wantLock {
+					t.Fatalf("LOCK = %d, want %d: %s", lock.Code, wantLock, lock.Body.String())
+				}
+				token := strings.Trim(lock.Header().Get("Lock-Token"), "<>")
 				header := map[string]string{}
 				switch {
 				case request.lockDestination:
@@ -163,8 +176,15 @@ func TestPostgres_CalendarCollectionWritesHonourEveryMembersLock(t *testing.T) {
 				if rr := do(request.method, calendarCollectionResourcePath(source.ID)+"/", header, ""); rr.Code != http.StatusLocked {
 					t.Errorf("%s with member %q locked = %d, want 423: %s", label, name, rr.Code, rr.Body.String())
 				}
-				if events, err := database.Events.ListForCalendar(ctx, locked.ID); err != nil || len(events) != 2 {
+				if events, err := database.Events.ListForCalendar(ctx, locked.ID); err != nil || len(events) != len(members) {
 					t.Errorf("locked collection's members after the refused %s = %d, %v", label, len(events), err)
+				}
+				if held, err := database.Locks.GetByToken(ctx, token); err != nil || held == nil {
+					t.Errorf("the refused %s left lock %s = %#v, %v", label, token, held, err)
+				}
+				header["If"] = "(<" + token + ">)"
+				if rr := do(request.method, calendarCollectionResourcePath(source.ID)+"/", header, ""); rr.Code >= 300 {
+					t.Errorf("%s with member %q locked and its token = %d: %s", label, name, rr.Code, rr.Body.String())
 				}
 			})
 		}
@@ -236,4 +256,68 @@ func TestPostgres_MemberDenyHoldsWhateverSpellingNamesThePrincipal(t *testing.T)
 		t.Fatalf("COPY = %d, want 207 refusing the denied member: %s", copied.Code, copied.Body.String())
 	}
 	decodeMultistatus(t, copied).assertHrefs(t, secretHref)
+}
+
+// A collection DELETE or MOVE holds the collection itself exclusively, which
+// every write to one of its members waits on, so it takes a fixed number of
+// advisory locks however many members it removes: one per member would run
+// PostgreSQL's shared lock table out for a large collection.
+func TestPostgres_CalendarCollectionWritesTakeAdvisoryLocksIndependentOfMembers(t *testing.T) {
+	for _, method := range []string{"DELETE", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			locksFor := func(members int) int {
+				t.Helper()
+				var pool *sql.DB
+				database := openDAVPostgresStore(t, func(dsn string) (*sql.DB, error) {
+					var err error
+					pool, err = sql.Open("postgres", dsn)
+					return pool, err
+				})
+				ctx := t.Context()
+				if _, err := pool.ExecContext(ctx, `
+CREATE TABLE advisory_lock_counts (held integer NOT NULL);
+CREATE FUNCTION record_advisory_locks() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO advisory_lock_counts SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER record_advisory_locks BEFORE DELETE ON calendars FOR EACH ROW EXECUTE FUNCTION record_advisory_locks()`); err != nil {
+					t.Fatal(err)
+				}
+				owner, err := database.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "Owner", "Owner")
+				if err != nil {
+					t.Fatal(err)
+				}
+				slug := "source"
+				cal, err := database.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: slug, Slug: &slug})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range members {
+					uid := fmt.Sprintf("member-%d", i)
+					if _, err := database.Events.Upsert(ctx, store.Event{CalendarID: cal.ID, UID: uid, ResourceName: uid, RawICAL: buildCalendarObject(buildVEvent(uid, "SUMMARY:x")), ETag: "e-" + uid}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				req := httptest.NewRequest(method, calendarCollectionResourcePath(cal.ID)+"/", nil)
+				if method == "MOVE" {
+					req.Header.Set("Destination", "/dav/calendars/moved/")
+				}
+				rr := httptest.NewRecorder()
+				NewDavServer(Options{Store: database}).ServeHTTP(rr, req.WithContext(auth.WithUser(req.Context(), owner)))
+				if rr.Code >= 300 {
+					t.Fatalf("%s of %d members = %d: %s", method, members, rr.Code, rr.Body.String())
+				}
+				var held int
+				if err := pool.QueryRowContext(ctx, `SELECT held FROM advisory_lock_counts`).Scan(&held); err != nil {
+					t.Fatal(err)
+				}
+				return held
+			}
+			if few, many := locksFor(3), locksFor(60); few != many {
+				t.Errorf("%s held %d advisory locks for 3 members and %d for 60", method, few, many)
+			}
+		})
+	}
 }

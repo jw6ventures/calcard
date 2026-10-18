@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -15,65 +16,116 @@ func (h *DavServer) delete(w http.ResponseWriter, r *http.Request) {
 	h.deleteWithRetry(w, r, maxResourceStateRetries)
 }
 
-// memberDeleteDecision decides a DELETE of a member, which needs some
-// privilege on the member and DAV:unbind on its collection (RFC 3744 Appendix
-// B). decide makes the decision as the ACL entries at the path it is given
-// have it: the member's own and its collection's at the member's path, the
-// collection's alone, as for a member that is not there, at the collection's.
-//
-// A principal holding no privilege on an existing member, and so unable to
-// read it, would learn from a refusal its own ACL entries caused that it
-// exists, so it gets the answer a member that is not there gets: the
-// collection's refusal, or answerAsAbsent=true for the request to go on as
-// for a missing member, to 404. A principal holding some privilege on
-// the member has been told it is there, and is refused as it stands.
-func memberDeleteDecision(memberPath, parentPath string, exists func() (bool, error), decide func(decisionPath string) (holdsNone bool, refusal error)) (refusal error, answerAsAbsent bool, err error) {
-	holdsNone, refusal := decide(memberPath)
-	if refusal == nil || !holdsNone || !refusalNamesPrivilege(refusal) {
-		return refusal, false, nil
-	}
-	existing, err := exists()
-	if err != nil || !existing {
-		return refusal, false, err
-	}
-	if _, absentRefusal := decide(parentPath); absentRefusal != nil {
-		return absentRefusal, false, nil
-	}
-	return nil, true, nil
-}
-
-// calendarMemberDeleteRefusal is memberDeleteDecision's decide for a member of
-// calendarID. holdsNone reports a refusal for want of any privilege on the
-// member, as opposed to one for want of DAV:unbind on the collection. A
-// principal holding no privilege at all is answered as for a missing
-// resource.
-func (h *DavServer) calendarMemberDeleteRefusal(ctx context.Context, user *store.User, calendarID int64, decisionPath, parentPath string) (holdsNone bool, refusal error) {
-	source, err := h.loadCalendarWithAnyPrivilege(ctx, user, calendarID, decisionPath)
+// memberRemoval decides a DELETE of the member at memberPath in the collection
+// at parentPath with acl.DecideRemoval, which needs DAV:unbind on the
+// collection (RFC 3744 Appendix B) and, so as not to disclose the member to a
+// principal that may know nothing of it, some privilege on the member. It
+// answers it: a refusal to answer with, answerAsAbsent=true for the request
+// to go on as for a missing member, to 404, or neither for the delete to go
+// ahead.
+// holding reports what the principal holds at the path it is given: the
+// member's own ACL and its collection's at the member's path, the
+// collection's alone at the collection's. Whether the member exists is looked
+// up only for a principal its ACL refuses, the one case the decision reads
+// it, so nothing about a member is read for a principal who may know nothing
+// of it.
+func memberRemoval(memberPath, parentPath string, exists func() (bool, error), holding func(decisionPath string) (acl.Holding, error), unbind func() (bool, error)) (refusal error, answerAsAbsent bool, err error) {
+	onMember, err := holding(memberPath)
 	if err != nil {
-		if errors.Is(err, errForbidden) {
-			return true, requirePrivilegeAt(err, parentPath, "unbind")
+		return nil, false, err
+	}
+	onCollection, err := holding(parentPath)
+	if err != nil {
+		return nil, false, err
+	}
+	canUnbind, err := unbind()
+	if err != nil {
+		return nil, false, err
+	}
+	isThere := false
+	if onMember == acl.HoldsDenied {
+		if isThere, err = exists(); err != nil {
+			return nil, false, err
 		}
-		return true, requirePrivatePrivilegeAt(err, parentPath, "unbind")
 	}
-	if err := h.requireCalendarPrivilege(ctx, user, &source.Calendar, parentPath, "unbind"); err != nil {
-		return false, requirePrivilegeAt(err, parentPath, "unbind")
+	switch acl.DecideRemoval(onMember, onCollection, canUnbind, isThere) {
+	case acl.RemovalAllowed:
+		return nil, false, nil
+	case acl.RemovalRefused:
+		return requirePrivilegeAt(errPrivilegeNotGranted, parentPath, "unbind"), false, nil
+	case acl.RemovalDenied:
+		return requirePrivilegeAt(errForbidden, parentPath, "unbind"), false, nil
+	default:
+		return nil, true, nil
 	}
-	return false, nil
 }
 
-// addressBookMemberDeleteRefusal is calendarMemberDeleteRefusal for a member
-// of book.
-func (h *DavServer) addressBookMemberDeleteRefusal(ctx context.Context, user *store.User, book *store.AddressBook, decisionPath, parentPath string) (holdsNone bool, refusal error) {
-	if err := h.requireAnyAddressBookPrivilege(ctx, user, book, decisionPath); err != nil {
-		if errors.Is(err, errForbidden) {
-			return true, requirePrivilegeAt(err, parentPath, "unbind")
+// removalHolding turns the answer to whether a principal holds any privilege
+// at a path into what acl.DecideRemoval reads: some held, every one refused,
+// or nothing decided.
+func removalHolding(err error) (acl.Holding, error) {
+	switch {
+	case err == nil:
+		return acl.HoldsSome, nil
+	case errors.Is(err, errForbidden):
+		return acl.HoldsDenied, nil
+	case errors.Is(err, store.ErrNotFound):
+		return acl.HoldsNothing, nil
+	default:
+		return acl.HoldsNothing, err
+	}
+}
+
+// privilegeHeld turns a privilege check's answer into whether the privilege
+// is held.
+func privilegeHeld(err error) (bool, error) {
+	switch {
+	case err == nil:
+		return true, nil
+	case isPrivilegeRefusal(err), errors.Is(err, store.ErrNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// calendarMemberRemoval is memberRemoval for a member of calendarID.
+func (h *DavServer) calendarMemberRemoval(ctx context.Context, user *store.User, calendarID int64, memberPath string, exists func() (bool, error)) (refusal error, answerAsAbsent bool, err error) {
+	parentPath := path.Dir(memberPath)
+	var cal *store.Calendar
+	holding := func(decisionPath string) (acl.Holding, error) {
+		held, loaded, err := h.calendarRemovalHolding(ctx, user, calendarID, decisionPath)
+		if cal == nil {
+			cal = loaded
 		}
-		return true, requirePrivatePrivilegeAt(err, parentPath, "unbind")
+		return held, err
 	}
-	if err := h.requireAddressBookPrivilege(ctx, user, book, parentPath, "unbind"); err != nil {
-		return false, requirePrivilegeAt(err, parentPath, "unbind")
+	unbind := func() (bool, error) {
+		if cal == nil {
+			loaded, err := h.getCalendar(ctx, calendarID)
+			if errors.Is(err, store.ErrNotFound) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			cal = loaded
+		}
+		return privilegeHeld(h.requireCalendarPrivilege(ctx, user, cal, parentPath, "unbind"))
 	}
-	return false, nil
+	return memberRemoval(memberPath, parentPath, exists, holding, unbind)
+}
+
+// addressBookMemberRemoval is memberRemoval for a member of book.
+func (h *DavServer) addressBookMemberRemoval(ctx context.Context, user *store.User, book *store.AddressBook, memberPath string, exists func() (bool, error)) (refusal error, answerAsAbsent bool, err error) {
+	parentPath := path.Dir(memberPath)
+	return memberRemoval(memberPath, parentPath, exists,
+		func(decisionPath string) (acl.Holding, error) {
+			return removalHolding(h.requireAnyAddressBookPrivilege(ctx, user, book, decisionPath))
+		},
+		func() (bool, error) {
+			return privilegeHeld(h.requireAddressBookPrivilege(ctx, user, book, parentPath, "unbind"))
+		})
 }
 
 func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retries int) {
@@ -106,17 +158,12 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 			return
 		}
-		privilegePath := path.Dir(cleanPath)
-		refusal, answerAsAbsent, err := memberDeleteDecision(cleanPath, privilegePath,
-			func() (bool, error) {
-				event, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
-				return event != nil, err
-			},
-			func(decisionPath string) (bool, error) {
-				return h.calendarMemberDeleteRefusal(r.Context(), user, calendarID, decisionPath, privilegePath)
-			})
+		refusal, answerAsAbsent, err := h.calendarMemberRemoval(r.Context(), user, calendarID, cleanPath, func() (bool, error) {
+			event, err := h.store.Events.GetByResourceName(r.Context(), calendarID, uid)
+			return event != nil, err
+		})
 		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
+			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 			return
 		}
 		if refusal != nil {
@@ -150,10 +197,14 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 			return
 		}
+		lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
+		if !ok {
+			return
+		}
 		defer invalidateDAVRequestState(r.Context())
 		expected := store.EventDAVResourceState(existing)
 		expected.ACL = aclGuard
-		if err := h.store.DeleteEventAndState(r.Context(), calendarID, expected, canonicalPath, h.lockPreconditions(r, lockPaths...)); err != nil {
+		if err := h.store.DeleteEventAndState(r.Context(), calendarID, expected, canonicalPath, lockPreconditions); err != nil {
 			if errors.Is(err, store.ErrLockConflict) {
 				http.Error(w, "resource is locked", http.StatusLocked)
 				return
@@ -206,14 +257,9 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "failed to load contact", http.StatusInternalServerError)
 			return
 		}
-		privilegePath := path.Dir(cleanPath)
-		refusal, answerAsAbsent, err := memberDeleteDecision(cleanPath, privilegePath,
-			func() (bool, error) { return existing != nil, nil },
-			func(decisionPath string) (bool, error) {
-				return h.addressBookMemberDeleteRefusal(r.Context(), user, book, decisionPath, privilegePath)
-			})
+		refusal, answerAsAbsent, err := h.addressBookMemberRemoval(r.Context(), user, book, cleanPath, func() (bool, error) { return existing != nil, nil })
 		if err != nil {
-			http.Error(w, "failed to load contact", http.StatusInternalServerError)
+			http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 			return
 		}
 		if refusal != nil {
@@ -240,10 +286,14 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "failed to resolve resource state", http.StatusInternalServerError)
 			return
 		}
+		lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
+		if !ok {
+			return
+		}
 		defer invalidateDAVRequestState(r.Context())
 		expected := store.ContactDAVResourceState(existing)
 		expected.ACL = aclGuard
-		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, expected, canonicalPath, h.lockPreconditions(r, lockPaths...)); err != nil {
+		if err := h.store.DeleteContactAndState(r.Context(), addressBookID, expected, canonicalPath, lockPreconditions); err != nil {
 			if errors.Is(err, store.ErrLockConflict) {
 				http.Error(w, "resource is locked", http.StatusLocked)
 				return
@@ -312,7 +362,17 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 	for i := range members {
 		lockPaths = append(lockPaths, strings.TrimSuffix(cleanPath, "/")+"/"+members[i].ResourceName+".ics")
 	}
+	lockedBelow, err := h.lockedPathsBelow(r.Context(), calendarStatePath(source.ID))
+	if err != nil {
+		writeLockStateError(w, err)
+		return
+	}
+	lockPaths = append(lockPaths, lockedBelow...)
 	if !h.requireLocks(w, r, "resource is locked", lockPaths...) {
+		return
+	}
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, lockPaths...)
+	if !ok {
 		return
 	}
 	defer invalidateDAVRequestState(r.Context())
@@ -322,7 +382,7 @@ func (h *DavServer) deleteCalendarCollection(w http.ResponseWriter, r *http.Requ
 		ExpectedSourceCTag: source.CTag,
 		SourceStatePath:    calendarStatePath(source.ID),
 		Members:            members,
-		LockPreconditions:  h.lockPreconditions(r, lockPaths...),
+		LockPreconditions:  lockPreconditions,
 	})
 	if err != nil {
 		switch {

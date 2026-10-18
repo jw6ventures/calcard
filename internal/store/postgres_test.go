@@ -413,14 +413,14 @@ func TestDAVPathLocksHoldTheParentCollectionExclusively(t *testing.T) {
 	}
 }
 
-// An ACL write serializes on every stored spelling of one resource identity,
-// and the transaction that wraps it can name an enclosing collection as well.
-// Taking such a path shared as an ancestor and later exclusively as a target
-// would let two transactions holding it shared deadlock on the upgrade, so every
-// target has to come out of one pass already marked exclusive.
+// An ACL write serializes on the resource's state path, and the transaction
+// that wraps it can name the enclosing collection as well. Taking such a path
+// shared as an ancestor and later exclusively as a target would let two
+// transactions holding it shared deadlock on the upgrade, so every target has
+// to come out of one pass already marked exclusive.
 func TestDAVPathLocksAssignOneModePerNestedStatePath(t *testing.T) {
 	for _, resourcePath := range []string{"/dav/addressbooks/5/alice.vcf", "/dav/calendars/5/x.ics"} {
-		targets := davStatePaths(resourcePath)
+		targets := []string{resourcePath, path.Dir(resourcePath)}
 		locks := davPathLocks(targets...)
 		modes := make(map[string]bool, len(locks))
 		for _, lock := range locks {
@@ -437,8 +437,8 @@ func TestDAVPathLocksAssignOneModePerNestedStatePath(t *testing.T) {
 	}
 }
 
-// SetACLAndState writes the ACL of every state path of one resource, so those
-// paths are part of its exclusive set and have to be held before it reads the
+// SetACLAndState writes the ACL at the resource's state path, so that path is
+// part of its exclusive set and has to be held before it reads the
 // state its preconditions are checked against. One acquisition covers the whole
 // transaction whether or not the request carried lock preconditions: a second
 // one would decide the exclusive set again, and reads taken between the two
@@ -447,12 +447,10 @@ func TestDAVPathLocksAssignOneModePerNestedStatePath(t *testing.T) {
 func TestSetACLAndStateTakesOneOrderedLockSet(t *testing.T) {
 	const resourcePath = "/dav/addressbooks/7/alice.vcf"
 	const addressBookID = int64(7)
-	statePaths := davStatePaths(resourcePath)
 	lockSet := map[string]bool{
 		"/dav":                          false,
 		"/dav/addressbooks":             false,
 		"/dav/addressbooks/7":           true,
-		"/dav/addressbooks/7/alice":     true,
 		"/dav/addressbooks/7/alice.vcf": true,
 	}
 
@@ -497,11 +495,11 @@ func TestSetACLAndStateTakesOneOrderedLockSet(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta(`SELECT 1 FROM address_books WHERE id=$1 FOR KEY SHARE`)).
 				WithArgs(addressBookID).
 				WillReturnRows(sqlmock.NewRows([]string{"present"}).AddRow(1))
-			mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`)).
-				WithArgs(pq.Array(statePaths)).
+			mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`)).
+				WithArgs(resourcePath).
 				WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "ace_order", "created_at"}))
-			mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path = ANY($1)`)).
-				WithArgs(pq.Array(statePaths)).
+			mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path = $1`)).
+				WithArgs(resourcePath).
 				WillReturnResult(sqlmock.NewResult(0, 0))
 			mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at) VALUES ($1, $2, $3, $4, $5, $6)`)).
 				WithArgs(resourcePath, "/dav/principals/2/", true, "read", 0, sqlmock.AnyArg()).
@@ -509,8 +507,8 @@ func TestSetACLAndStateTakesOneOrderedLockSet(t *testing.T) {
 			mock.ExpectExec(regexp.QuoteMeta(`UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 				WithArgs(addressBookID).
 				WillReturnResult(sqlmock.NewResult(0, 1))
-			mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1 AND resource_name = ANY($2)`)).
-				WithArgs(addressBookID, pq.Array([]string{"alice", "alice.vcf"})).
+			mock.ExpectExec(regexp.QuoteMeta(`UPDATE contacts SET last_modified = NOW() WHERE address_book_id = $1 AND object_acl_path = ANY($2)`)).
+				WithArgs(addressBookID, pq.Array([]string{resourcePath})).
 				WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectCommit()
 
@@ -561,8 +559,8 @@ func TestRevokePrincipalGrantsTouchesMembersInOneBatch(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(4)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name = ANY($2)`)).
-		WithArgs(int64(4), pq.Array([]string{"a", "a.ics", "b", "b.ics", "c", "c.ics"})).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND object_acl_path = ANY($2)`)).
+		WithArgs(int64(4), pq.Array([]string{"/dav/calendars/4/a", "/dav/calendars/4/b.ics", "/dav/calendars/4/c"})).
 		WillReturnResult(sqlmock.NewResult(0, 3))
 	mock.ExpectCommit()
 
@@ -612,22 +610,27 @@ func TestParseVCardFieldsUnescapesDisplayNameInOnePass(t *testing.T) {
 	}
 }
 
-// Earlier releases recorded locks on calendar and address objects under the
-// extension-suffixed spelling. Such a lock is on the resource itself, not on
-// an ancestor, so it binds whatever its depth.
-func TestLockPreconditionsHonourLegacySpellingsOfTheTarget(t *testing.T) {
-	for _, tt := range []struct{ target, lockPath string }{
-		{target: "/dav/calendars/1/target", lockPath: "/dav/calendars/1/target.ics"},
-		{target: "/dav/addressbooks/1/alice", lockPath: "/dav/addressbooks/1/alice.vcf"},
+// A lock is on the resource whose state path it is stored at. One stored at
+// target.ics is on the member named target.ics, so it binds a write to that
+// member and not one to the member named target, even when a caller looks the
+// lock up for it.
+func TestLockPreconditionsBindOnlyTheLockedPath(t *testing.T) {
+	for _, tt := range []struct{ target, sibling string }{
+		{target: "/dav/calendars/1/target", sibling: "/dav/calendars/1/target.ics"},
+		{target: "/dav/addressbooks/1/alice", sibling: "/dav/addressbooks/1/alice.vcf"},
 	} {
-		precondition := LockPrecondition{ResourcePath: tt.target, LookupPaths: []string{tt.target, tt.lockPath}}
-		lock := Lock{Token: "opaquelocktoken:legacy", ResourcePath: tt.lockPath, Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}
-		if LockPreconditionsSatisfied([]LockPrecondition{precondition}, []Lock{lock}) {
-			t.Errorf("a depth-0 lock on %s did not bind a write to %s without its token", tt.lockPath, tt.target)
+		lock := Lock{Token: "opaquelocktoken:sibling", ResourcePath: tt.sibling, Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}
+		onTarget := LockPrecondition{ResourcePath: tt.target, LookupPaths: []string{tt.target, tt.sibling}}
+		if !LockPreconditionsSatisfied([]LockPrecondition{onTarget}, []Lock{lock}) {
+			t.Errorf("a depth-0 lock on %s binds a write to %s", tt.sibling, tt.target)
 		}
-		precondition.Tokens = []string{lock.Token}
-		if !LockPreconditionsSatisfied([]LockPrecondition{precondition}, []Lock{lock}) {
-			t.Errorf("the token of the lock on %s did not satisfy a write to %s", tt.lockPath, tt.target)
+		onSibling := LockPrecondition{ResourcePath: tt.sibling, LookupPaths: []string{tt.sibling}}
+		if LockPreconditionsSatisfied([]LockPrecondition{onSibling}, []Lock{lock}) {
+			t.Errorf("a depth-0 lock on %s did not bind a write to it without its token", tt.sibling)
+		}
+		onSibling.Tokens = []string{lock.Token}
+		if !LockPreconditionsSatisfied([]LockPrecondition{onSibling}, []Lock{lock}) {
+			t.Errorf("the token of the lock on %s did not satisfy a write to it", tt.sibling)
 		}
 	}
 }
@@ -678,5 +681,24 @@ func TestParseICalFieldsReadsDatesAsTheReportsDo(t *testing.T) {
 				t.Errorf("dtend = %v, want %v", dtend, tt.wantEnd)
 			}
 		})
+	}
+}
+
+// A lock path prefix is read as the byte range text_pattern_ops sorts every
+// path starting with it into, which an index serves whatever the plan.
+func TestLockPathPrefixRangeHoldsExactlyThePathsStartingWithIt(t *testing.T) {
+	for _, prefix := range []string{"/dav/calendars/42/", "/dav/calendars/4%_\\/", "/dav/addressbooks/7/café", "/dav/x~é"} {
+		low, high, bounded := lockPathPrefixRange(prefix)
+		if !bounded || low != prefix {
+			t.Fatalf("lockPathPrefixRange(%q) = %q, %q, %t", prefix, low, high, bounded)
+		}
+		for _, path := range []string{prefix, prefix + "a", prefix + "ÿÿ", prefix + "\U0010FFFF"} {
+			if path < low || path >= high {
+				t.Errorf("%q, which starts with %q, lies outside [%q, %q)", path, prefix, low, high)
+			}
+		}
+	}
+	if _, _, bounded := lockPathPrefixRange(""); bounded {
+		t.Error("the empty prefix has an upper bound")
 	}
 }

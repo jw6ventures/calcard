@@ -17,13 +17,15 @@ func TestPrincipalSetsUseCanonicalDAVPrincipals(t *testing.T) {
 	if got, want := PrincipalHrefs(nil), []string{"DAV:all", "DAV:unauthenticated"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("PrincipalHrefs(nil) = %#v, want %#v", got, want)
 	}
-	if got, want := PrincipalHrefs(user), []string{"DAV:all", "DAV:authenticated", "/dav/principals/42/"}; !reflect.DeepEqual(got, want) {
+	if got, want := PrincipalHrefs(user), []string{"DAV:all", "DAV:authenticated", "/dav/principals/42/", "/dav/principals/42"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("PrincipalHrefs(user) = %#v, want %#v", got, want)
 	}
 
+	// A lookup by these hrefs finds exactly the entries a decision over
+	// ApplicablePrincipals matches once it normalizes them.
 	applicable := ApplicablePrincipals(user)
 	for _, principal := range PrincipalHrefs(user) {
-		if _, ok := applicable[principal]; !ok {
+		if _, ok := applicable[NormalizePrincipalHref(principal)]; !ok {
 			t.Fatalf("ApplicablePrincipals() missing %q from PrincipalHrefs()", principal)
 		}
 	}
@@ -246,6 +248,46 @@ func TestDecisionForPrivilegeUsesSharedPrivilegeRules(t *testing.T) {
 			wantGranted:    true,
 			wantApplicable: true,
 		},
+		// RFC 3744 section 3.2 makes DAV:write the aggregate of its
+		// sub-privileges, so a deny of any one refuses it, whichever the
+		// entries decide first.
+		{
+			name: "a denied unbind refuses aggregate write when write-content is undecided",
+			entries: []store.ACLEntry{
+				{PrincipalHref: "/dav/principals/42/", IsGrant: false, Privilege: "unbind"},
+			},
+			privilege:      "write",
+			wantGranted:    false,
+			wantApplicable: true,
+		},
+		{
+			name: "a denied bind refuses aggregate write ahead of a later write grant",
+			entries: []store.ACLEntry{
+				{PrincipalHref: "/dav/principals/42/", IsGrant: false, Privilege: "bind"},
+				{PrincipalHref: "/dav/principals/42/", IsGrant: true, Privilege: "write"},
+			},
+			privilege:      "write",
+			wantGranted:    false,
+			wantApplicable: true,
+		},
+		{
+			name: "a grant of part of write decides it unheld whichever part it is",
+			entries: []store.ACLEntry{
+				{PrincipalHref: "/dav/principals/42/", IsGrant: true, Privilege: "bind"},
+			},
+			privilege:      "write",
+			wantGranted:    false,
+			wantApplicable: true,
+		},
+		{
+			name: "no write entry leaves aggregate write undecided",
+			entries: []store.ACLEntry{
+				{PrincipalHref: "/dav/principals/42/", IsGrant: true, Privilege: "read"},
+			},
+			privilege:      "write",
+			wantGranted:    false,
+			wantApplicable: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -255,6 +297,72 @@ func TestDecisionForPrivilegeUsesSharedPrivilegeRules(t *testing.T) {
 				t.Fatalf("DecisionForPrivilege() = (%t, %t), want (%t, %t)", gotGranted, gotApplicable, tc.wantGranted, tc.wantApplicable)
 			}
 		})
+	}
+}
+
+// A member's ACL decides each privilege ahead of its collection's, and
+// DAV:write, equivalent to the set of its parts (RFC 3744 section 3.12), is
+// decided part by part through both.
+func TestDecisionThroughLayersDecidesWritePartByPart(t *testing.T) {
+	principals := ApplicablePrincipals(&store.User{ID: 42})
+	ace := func(grant bool, privilege string) store.ACLEntry {
+		return store.ACLEntry{PrincipalHref: "/dav/principals/42/", IsGrant: grant, Privilege: privilege}
+	}
+	tests := []struct {
+		name                     string
+		member, collection       []store.ACLEntry
+		privilege                string
+		wantGranted, wantDecided bool
+	}{
+		{"the member's grant of one part completes the collection's write", []store.ACLEntry{ace(true, "bind")}, []store.ACLEntry{ace(true, "write")}, "write", true, true},
+		{"parts granted across the two layers make write", []store.ACLEntry{ace(true, "write-content"), ace(true, "write-properties")}, []store.ACLEntry{ace(true, "bind"), ace(true, "unbind")}, "write", true, true},
+		{"the member's deny of a part refuses the collection's write", []store.ACLEntry{ace(false, "unbind")}, []store.ACLEntry{ace(true, "write")}, "write", false, true},
+		{"the collection's deny of a part the member leaves undecided refuses write", []store.ACLEntry{ace(true, "write-content")}, []store.ACLEntry{ace(true, "write-properties"), ace(false, "bind"), ace(true, "write")}, "write", false, true},
+		{"parts granted with others undecided decide write unheld", []store.ACLEntry{ace(true, "bind")}, []store.ACLEntry{ace(true, "read")}, "write", false, true},
+		{"no part decided leaves write undecided", []store.ACLEntry{ace(true, "read")}, nil, "write", false, false},
+		{"the member's decision of a part stands over the collection's", []store.ACLEntry{ace(true, "unbind")}, []store.ACLEntry{ace(false, "unbind")}, "unbind", true, true},
+		{"the collection decides what the member leaves undecided", []store.ACLEntry{ace(true, "read")}, []store.ACLEntry{ace(false, "bind")}, "bind", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			granted, decided := DecisionThroughLayers(principals, tc.privilege, tc.member, tc.collection)
+			if granted != tc.wantGranted || decided != tc.wantDecided {
+				t.Fatalf("DecisionThroughLayers(%s) = (%t, %t), want (%t, %t)", tc.privilege, granted, decided, tc.wantGranted, tc.wantDecided)
+			}
+		})
+	}
+}
+
+// An aggregate is held as current-user-privilege-set reports it only while
+// every privilege it contains is held (RFC 3744 section 3.12): DAV:all all of
+// them, and DAV:read read-free-busy as well, through the layers.
+func TestHeldThroughLayersHoldsAnAggregateOnlyWithEverythingItContains(t *testing.T) {
+	principals := ApplicablePrincipals(&store.User{ID: 42})
+	ace := func(grant bool, privilege string) store.ACLEntry {
+		return store.ACLEntry{PrincipalHref: "/dav/principals/42/", IsGrant: grant, Privilege: privilege}
+	}
+	collection := []store.ACLEntry{ace(true, "all")}
+	tests := []struct {
+		name      string
+		member    []store.ACLEntry
+		privilege string
+		want      bool
+	}{
+		{"all through the collection", nil, "all", true},
+		{"all with unbind refused on the member", []store.ACLEntry{ace(false, "unbind")}, "all", false},
+		{"all with write-acl refused on the member", []store.ACLEntry{ace(false, "write-acl")}, "all", false},
+		{"read with read-free-busy refused on the member", []store.ACLEntry{ace(false, "read-free-busy")}, "read", false},
+		{"read-acl beside a refused read-free-busy", []store.ACLEntry{ace(false, "read-free-busy")}, "read-acl", true},
+		{"read-free-busy granted alone", []store.ACLEntry{ace(true, "read-free-busy")}, "read-free-busy", true},
+	}
+	for _, tc := range tests {
+		if got := HeldThroughLayers(principals, tc.privilege, tc.member, collection); got != tc.want {
+			t.Errorf("%s: HeldThroughLayers(%s) = %t, want %t", tc.name, tc.privilege, got, tc.want)
+		}
+	}
+	parts := []store.ACLEntry{ace(true, "read"), ace(true, "write"), ace(true, "read-acl"), ace(true, "read-current-user-privilege-set"), ace(true, "write-acl"), ace(true, "unlock")}
+	if !HeldThroughLayers(principals, "all", parts) {
+		t.Error("DAV:all is not held though every privilege it contains is granted one by one")
 	}
 }
 

@@ -879,8 +879,12 @@ components:
           format: int64
         resourceName:
           type: string
-          description: Stored resource name for the calendar object.
-          example: example-event.ics
+          description: |
+            Stored resource name for the calendar object. CalDAV serves the
+            object at this name with `.ics` added. An event this API creates is
+            stored under its UID, so a create whose UID contains `/` is refused
+            with 400.
+          example: example-event
         summary:
           type: string
         description:

@@ -270,16 +270,6 @@ func TestPostgresCalendarDeleteRetryChecksCurrentState(t *testing.T) {
 // write transaction still finds it, and the client is told the resource is
 // locked, as a contact PUT tells it, rather than that the server failed.
 func TestPostgresCalendarPutReportsALockTakenDuringTheRequest(t *testing.T) {
-	for _, tt := range []struct{ name, suffix string }{
-		{name: "canonical spelling"},
-		// Earlier releases recorded object locks with the extension.
-		{name: "legacy spelling", suffix: ".ics"},
-	} {
-		t.Run(tt.name, func(t *testing.T) { testCalendarPutReportsALockTakenDuringTheRequest(t, tt.suffix) })
-	}
-}
-
-func testCalendarPutReportsALockTakenDuringTheRequest(t *testing.T, lockSuffix string) {
 	db := newDAVPostgresStore(t)
 	ctx := t.Context()
 	owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
@@ -313,7 +303,7 @@ func testCalendarPutReportsALockTakenDuringTheRequest(t *testing.T, lockSuffix s
 			return nil
 		}
 		_, err := db.Locks.Create(ctx, store.Lock{
-			Token: "opaquelocktoken:concurrent", ResourcePath: strings.TrimSuffix(target, ".ics") + lockSuffix, UserID: owner.ID,
+			Token: "opaquelocktoken:concurrent", ResourcePath: strings.TrimSuffix(target, ".ics"), UserID: owner.ID,
 			LockScope: "exclusive", LockType: "write", Depth: "0", TimeoutSeconds: 300, ExpiresAt: time.Now().Add(5 * time.Minute),
 		})
 		return err

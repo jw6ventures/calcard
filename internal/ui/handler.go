@@ -13,6 +13,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/contacts"
+	"github.com/jw6ventures/calcard/internal/events"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -23,7 +24,9 @@ type Handler struct {
 	store       *store.Store
 	authService *auth.Service
 	contacts    *contacts.Service
-	templates   map[string]*template.Template
+	// events decides writes to and removals of events as REST and DAV do.
+	events    *events.Service
+	templates map[string]*template.Template
 	// validateCalendarObject is the validator every calendar object the UI
 	// stores must pass.
 	validateCalendarObject calobject.Validator
@@ -51,8 +54,8 @@ func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Servic
 	if expand == nil {
 		panic("ui: NewHandler requires a recurrence expander")
 	}
-	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates,
-		validateCalendarObject: validate, expandEvent: expand}
+	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), events: events.NewService(store, validate),
+		templates: templates, validateCalendarObject: validate, expandEvent: expand}
 }
 
 // ShareTimezoneOnsets has the calendar views read the observance rules of

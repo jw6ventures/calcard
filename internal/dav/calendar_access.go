@@ -123,19 +123,74 @@ func (h *DavServer) calendarPrivilegeContextFor(ctx context.Context, user *store
 // entries, and with no applicable decision the caller's fallback sees denied
 // only when some entry named an applicable principal without granting.
 func (pc *calendarPrivilegeContext) decide(privilege string) (allowed, denied bool) {
-	if pc.owner {
-		return true, false
-	}
-	if granted, applicable := acl.DecisionForPrivilege(pc.resourceEntries, pc.principals, privilege); applicable {
+	if granted, decided := pc.decision(privilege); decided {
 		return granted, !granted
 	}
-	if !pc.sameCollection {
-		if granted, applicable := acl.DecisionForPrivilege(pc.collectionEntries, pc.principals, privilege); applicable {
-			return granted, !granted
-		}
-		return false, pc.hasApplicable || pc.collectionApplicable
+	return false, pc.hasApplicable || pc.collectionApplicable
+}
+
+// decision is what the entries decide of privilege: whether it is granted,
+// and whether they decide it at all, object entries ahead of collection
+// entries. The owner holds every privilege.
+func (pc *calendarPrivilegeContext) decision(privilege string) (granted, decided bool) {
+	if pc.owner {
+		return true, true
 	}
-	return false, pc.hasApplicable
+	return acl.DecisionThroughLayers(pc.principals, privilege, pc.resourceEntries, pc.collectionEntries)
+}
+
+// reports is whether current-user-privilege-set lists privilege, as
+// acl.HeldThroughLayers decides it.
+func (pc *calendarPrivilegeContext) reports(privilege string) bool {
+	return pc.owner || acl.HeldThroughLayers(pc.principals, privilege, pc.resourceEntries, pc.collectionEntries)
+}
+
+// removalHolding is what the context's principal holds of
+// calendarPrivilegeNames, as acl.DecideRemoval reads it. An entry that names
+// the principal but decides none of them, such as a grant of DAV:write-acl
+// alone, refuses nothing, as it refuses nothing on an address book. The
+// privileges stored resolves count only where the entries decide none.
+func (pc *calendarPrivilegeContext) removalHolding(stored *store.CalendarAccess) acl.Holding {
+	refused := false
+	for _, privilege := range calendarPrivilegeNames {
+		granted, decided := pc.decision(privilege)
+		if granted {
+			return acl.HoldsSome
+		}
+		refused = refused || decided
+	}
+	switch {
+	case refused:
+		return acl.HoldsDenied
+	case stored != nil && stored.EffectivePrivileges().HasAny():
+		return acl.HoldsSome
+	default:
+		return acl.HoldsNothing
+	}
+}
+
+// calendarRemovalHolding is what user holds at decisionPath, a member of
+// calendarID or the calendar itself, for a removal from it, with the calendar
+// it read, nil when there is none.
+func (h *DavServer) calendarRemovalHolding(ctx context.Context, user *store.User, calendarID int64, decisionPath string) (acl.Holding, *store.Calendar, error) {
+	stored, err := h.storedCalendarAccess(ctx, user, calendarID)
+	if err != nil {
+		return acl.HoldsNothing, nil, err
+	}
+	cal, err := h.getCalendar(ctx, calendarID)
+	switch {
+	case errors.Is(err, store.ErrNotFound) && stored != nil:
+		cal = &stored.Calendar
+	case errors.Is(err, store.ErrNotFound):
+		return acl.HoldsNothing, nil, nil
+	case err != nil:
+		return acl.HoldsNothing, nil, err
+	}
+	pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, decisionPath)
+	if err != nil {
+		return acl.HoldsNothing, nil, err
+	}
+	return pc.removalHolding(stored), cal, nil
 }
 
 func (h *DavServer) calendarPrivilegeDecision(ctx context.Context, user *store.User, cal *store.Calendar, cleanPath, privilege string) (bool, bool, error) {
@@ -274,10 +329,10 @@ func (h *DavServer) canReadCalendarObject(ctx context.Context, user *store.User,
 
 func (h *DavServer) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
 	collectionPath := calendarCollectionResourcePath(calendarID)
-	relevantPaths := make([]string, 0, 1+2*len(events))
+	relevantPaths := make([]string, 0, 1+len(events))
 	relevantPaths = append(relevantPaths, collectionPath)
 	for _, event := range events {
-		relevantPaths = append(relevantPaths, objectACLPaths(collectionPath, eventResourceName(event))...)
+		relevantPaths = append(relevantPaths, objectStatePath(collectionPath, eventResourceName(event)))
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }
@@ -410,6 +465,9 @@ func (h *DavServer) prefetchACLEntries(ctx context.Context, user *store.User, re
 	for _, entry := range entries {
 		result[entry.ResourcePath] = append(result[entry.ResourcePath], entry)
 	}
+	for resourcePath := range result {
+		acl.SortEntries(result[resourcePath])
+	}
 	return result, nil
 }
 
@@ -461,8 +519,9 @@ func (d *batchedObjectACLDecider) decide(resourceName, privilege string) (grante
 		return true, false, true
 	}
 	if d.hasObjectEntries {
-		if granted, applicable := acl.DecisionForPrivilege(d.objectEntries(resourceName), d.principals, privilege); applicable {
-			return granted, !granted, true
+		if objectEntries := d.objectEntries(resourceName); len(objectEntries) != 0 {
+			granted, applicable := acl.DecisionThroughLayers(d.principals, privilege, objectEntries, d.collectionEntries)
+			return granted, applicable && !granted, applicable
 		}
 	}
 	decision, ok := d.collectionDecision(privilege)
@@ -508,16 +567,9 @@ func (d *batchedObjectACLDecider) collectionDecision(privilege string) (batchedA
 	return d.collectionDecisions[index], true
 }
 
-// objectEntries returns the ACL of the member resourceName in ACE order, read
-// from the spellings a request naming that member reads.
+// objectEntries returns the ACL of the member resourceName in ACE order.
 func (d *batchedObjectACLDecider) objectEntries(resourceName string) []store.ACLEntry {
-	paths := objectACLPaths(d.collectionPath, resourceName)
-	var entries []store.ACLEntry
-	for _, resourcePath := range paths {
-		entries = append(entries, d.entriesByPath[resourcePath]...)
-	}
-	orderACLEntries(entries, paths)
-	return entries
+	return d.entriesByPath[objectStatePath(d.collectionPath, resourceName)]
 }
 
 func (h *DavServer) loadCalendar(ctx context.Context, user *store.User, id int64) (*store.CalendarAccess, error) {

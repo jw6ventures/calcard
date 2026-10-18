@@ -197,6 +197,10 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 	// The collection, the dead properties its body set, and the lock rebinding
 	// are written as one unit, so a failure in any of them leaves no partial
 	// collection behind (RFC 4791 §5.3.1).
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, cleanPath, path.Dir(cleanPath))
+	if !ok {
+		return
+	}
 	created, err := h.store.CreateCalendarAndState(r.Context(), store.Calendar{
 		UserID:              user.ID,
 		Name:                state.name,
@@ -206,7 +210,7 @@ func (h *DavServer) mkcalendar(w http.ResponseWriter, r *http.Request) {
 		Timezone:            state.timezone,
 		Color:               state.color,
 		SupportedComponents: state.components,
-	}, preflight.dead, h.lockPreconditions(r, cleanPath, path.Dir(cleanPath)), pendingLockPath, calendarStatePath)
+	}, preflight.dead, lockPreconditions, pendingLockPath, calendarStatePath)
 	invalidateDAVRequestState(r.Context())
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {

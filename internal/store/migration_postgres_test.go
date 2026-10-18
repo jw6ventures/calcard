@@ -92,6 +92,14 @@ func newV119ReleasePool(t *testing.T) *sql.DB {
 	return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.1.9_release.sql"), "v1.1.9")
 }
 
+// newV118TagPool builds the database an installation of the v1.1.8 tag has:
+// the v1.2.0-rc6 schema, with the generated ACL columns that strip extensions,
+// stamped v1.1.9 by its own db.sql, so the runner applies v1.2.0.sql alone.
+func newV118TagPool(t *testing.T) *sql.DB {
+	t.Helper()
+	return newPostgresSchemaPool(t, filepath.Join("testdata", "schema_v1.1.8_tag.sql"))
+}
+
 // schemaCatalog lists every table, column, constraint, index, trigger and
 // function in the pool's schema, one whitespace-normalized definition each with
 // the schema qualifier removed, so an upgraded database and a fresh install
@@ -180,6 +188,7 @@ func TestPostgres_UpgradeThroughRunnerMatchesFreshInstall(t *testing.T) {
 			return newReleaseInstallPool(t, filepath.Join("testdata", "schema_v1.1.9_release.sql"), "v1.1.7")
 		}},
 		{name: "v1.1.9", install: newV119ReleasePool},
+		{name: "v1.1.8 tag (v1.2.0-rc6)", install: newV118TagPool},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pool := test.install(t)
@@ -243,17 +252,31 @@ LIMIT 1`
 	}
 }
 
-// The object-level predicates join on resource_path_norm, so an ACE stored with
-// the .ics suffix and one stored without it are one ordered group at evaluation
-// time. The backfill has to order them against each other for the same reason.
+// A v1.1.x release decided an event from the entries at its name with .ics
+// added as well as at its own, denials first. The upgrade carries such a
+// denial to the event, ahead of the event's own grant, so it still answers
+// first.
 func TestPostgres_V120MigrationPreservesDenialsAcrossPathSpellings(t *testing.T) {
 	pool := newV119ReleasePool(t)
 
+	var calendarID int64
+	if err := pool.QueryRow(`
+WITH seeded_user AS (
+    INSERT INTO users (oauth_subject, primary_email) VALUES ('subject-spellings', 'spellings@example.test')
+    RETURNING id
+)
+INSERT INTO calendars (user_id, name) SELECT id, 'Spellings' FROM seeded_user RETURNING id`).Scan(&calendarID); err != nil {
+		t.Fatalf("seed calendar: %v", err)
+	}
+	if _, err := pool.Exec(`INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag) VALUES ($1, 'event', 'event', '', 'etag')`, calendarID); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+	eventPath := fmt.Sprintf("/dav/calendars/%d/event", calendarID)
 	const principal = "/dav/principals/2/"
 	if _, err := pool.Exec(`
 INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES
-    ('/dav/calendars/1/event',     'DAV:all', TRUE,  'read', NOW() - INTERVAL '2 days'),
-    ('/dav/calendars/1/event.ics', $1,        FALSE, 'read', NOW() - INTERVAL '1 day')`, principal); err != nil {
+    ($1,            'DAV:all', TRUE,  'read', NOW() - INTERVAL '2 days'),
+    ($1 || '.ics',  $2,        FALSE, 'read', NOW() - INTERVAL '1 day')`, eventPath, principal); err != nil {
 		t.Fatalf("seed legacy ACL: %v", err)
 	}
 
@@ -261,11 +284,11 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 
 	var denyOrder, grantOrder int
 	if err := pool.QueryRow(
-		`SELECT ace_order FROM acl_entries WHERE is_grant = FALSE`).Scan(&denyOrder); err != nil {
+		`SELECT ace_order FROM acl_entries WHERE resource_path = $1 AND is_grant = FALSE`, eventPath).Scan(&denyOrder); err != nil {
 		t.Fatalf("read deny order: %v", err)
 	}
 	if err := pool.QueryRow(
-		`SELECT ace_order FROM acl_entries WHERE is_grant = TRUE`).Scan(&grantOrder); err != nil {
+		`SELECT ace_order FROM acl_entries WHERE resource_path = $1 AND is_grant = TRUE`, eventPath).Scan(&grantOrder); err != nil {
 		t.Fatalf("read grant order: %v", err)
 	}
 	if denyOrder >= grantOrder {
@@ -446,8 +469,9 @@ VALUES ($1, 'detached', 'detached.ics', $2, 'etag', 'January',
 // An installation of the v1.1.9 release has neither the recurrence columns nor
 // the ACL join key, so the upgrade adds both and fills what they hold: every
 // resource that recurs -- through RRULE, RDATE, or detached instances alone --
-// gets the open-ended bounds while a one-off stays NULL, and the stored ACL is
-// ordered deny-first across its path spellings. The first release carrying
+// gets the open-ended bounds while a one-off stays NULL, and a denial stored at
+// the spelling of an imported event's name without its .ics, which its
+// decisions read, is carried ahead of the event's own entries. The first release carrying
 // display names is this one too, so the columns an OAuth login writes exist.
 func TestPostgres_UpgradeFromV119ReleaseFillsTheColumnsItAdds(t *testing.T) {
 	pool := newV119ReleasePool(t)
@@ -521,7 +545,7 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 	}
 
 	orders := map[string]int{}
-	rows, err := pool.Query(`SELECT principal_href, ace_order FROM acl_entries WHERE resource_path_norm = $1`, objectPath)
+	rows, err := pool.Query(`SELECT principal_href, ace_order FROM acl_entries WHERE resource_path = $1`, objectPath+".ics")
 	if err != nil {
 		t.Fatalf("read ACL: %v", err)
 	}
@@ -537,8 +561,12 @@ INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, cre
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read ACL: %v", err)
 	}
-	if len(orders) != 2 || orders["/dav/principals/2/"] != 0 || orders["DAV:all"] != 1 {
-		t.Errorf("ace_order = %v, want the denial first across both path spellings", orders)
+	if len(orders) != 2 || orders["/dav/principals/2/"] >= orders["DAV:all"] {
+		t.Errorf("ace_order = %v, want the carried denial ahead of the event's own grant", orders)
+	}
+	var left int
+	if err := pool.QueryRow(`SELECT count(*) FROM acl_entries WHERE resource_path = $1`, objectPath).Scan(&left); err != nil || left != 0 {
+		t.Errorf("%d entries (%v) left at %s, which no event is stored under, want them carried and removed", left, err, objectPath)
 	}
 
 	user, err := New(pool).Users.UpsertOAuthUser(t.Context(), "subject-v119", "v119@example.test", "Dana Lee", "Dana")
@@ -616,18 +644,18 @@ const legacyRecurrenceRepairPredicate = `
       AND (
           EXISTS (
               SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$BEGIN:VEVENT(.*?)END:VEVENT$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VEVENT[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VEVENT[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
           )
-          OR EXISTS (
+          OR           EXISTS (
               SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$BEGIN:VTODO(.*?)END:VTODO$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTODO[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTODO[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
           )
-          OR EXISTS (
+          OR           EXISTS (
               SELECT 1
-              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$BEGIN:VJOURNAL(.*?)END:VJOURNAL$re$, 'gi') AS component(match)
-              WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+              FROM regexp_matches(regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g'), $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VJOURNAL[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VJOURNAL[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+              WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
           )
       )`
 
@@ -637,6 +665,11 @@ type recurrenceRepairCase struct {
 	uid       string
 	raw       string
 	recurring bool
+	// beyondReader marks a body the repair bounds though
+	// ical.ConservativeRecurrenceBounds reads it as not recurring: bounding a
+	// row needlessly keeps it a candidate for every range, which costs a scan
+	// and never an instance.
+	beyondReader bool
 }
 
 func recurrenceRepairCases() []recurrenceRepairCase {
@@ -663,8 +696,21 @@ func recurrenceRepairCases() []recurrenceRepairCase {
 		{uid: "fold-cr", raw: "BEGIN:VCALENDAR\rBEGIN:VEVENT\rUID:fold-cr\rRRU\r LE:FREQ=DAILY\rEND:VEVENT\rEND:VCALENDAR\r", recurring: true},
 
 		// A nested VALARM lies inside the VEVENT span, so a recurrence property
-		// there counts exactly as one on the VEVENT itself does.
-		{uid: "valarm-nested", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:valarm-nested\r\nDTSTART:20260115T100000Z\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nRRULE:FREQ=DAILY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
+		// there counts as one on the VEVENT itself does, though the reader
+		// gives it to the VALARM.
+		{uid: "valarm-nested", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:valarm-nested\r\nDTSTART:20260115T100000Z\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nRRULE:FREQ=DAILY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true, beyondReader: true},
+
+		// Names are read as the reader reads them: white space strings.TrimSpace
+		// removes may follow BEGIN: or END:, and may lead a property name or
+		// separate it from the colon of a line without parameters. An RDATE
+		// that holds no colon is still one.
+		{uid: "begin-spaced", raw: "BEGIN:VCALENDAR\r\nBEGIN: VEVENT\r\nUID:begin-spaced\r\nDTSTART:20260115T100000Z\r\nRRULE:FREQ=DAILY\r\nEND:\tVEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
+		{uid: "end-spaced", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:end-spaced\r\nDTSTART:20260115T100000Z\r\nEND: VEVENT\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n"},
+		{uid: "rrule-spaced-colon", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rrule-spaced-colon\r\nDTSTART:20260115T100000Z\r\nRRULE :FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
+		{uid: "rrule-vertical-tab", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rrule-vertical-tab\r\nDTSTART:20260115T100000Z\r\n\vRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", recurring: true},
+		{uid: "rdate-bare", raw: "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:rdate-bare\r\nRDATE \r\nEND:VTODO\r\nEND:VCALENDAR\r\n", recurring: true},
+		// A name parted from its parameters is another name.
+		{uid: "rrule-spaced-parameters", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rrule-spaced-parameters\r\nDTSTART:20260115T100000Z\r\nRRULE ;X-A=1:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 
 		// Text outside ASCII anywhere in the component, ahead of the recurrence
 		// property or after it. Whether a regex character class admits it can
@@ -686,11 +732,14 @@ func recurrenceRepairCases() []recurrenceRepairCase {
 		{uid: "x-prop-literal", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x-prop-literal\r\nX-ALT-DESC:see RRULE:FREQ=DAILY for details\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 		{uid: "fold-desc-value", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:fold-desc-value\r\nDESCRIPTION:hello\r\n RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 
-		// Inside a component that carries no recurrence for the matcher, after
-		// the component closed, and inside one that never closes.
+		// Inside a component that carries no recurrence for the matcher, and
+		// after the component closed. A component still open when its
+		// VCALENDAR ends, or when the body ends, closes there, and what it
+		// held is its own.
 		{uid: "vfreebusy-rdate", raw: "BEGIN:VCALENDAR\r\nBEGIN:VFREEBUSY\r\nUID:vfreebusy-rdate\r\nRDATE:20260615T100000Z\r\nEND:VFREEBUSY\r\nBEGIN:VEVENT\r\nUID:vfreebusy-rdate-2\r\nDTSTART:20260115T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 		{uid: "rrule-after-end", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rrule-after-end\r\nDTSTART:20260115T100000Z\r\nEND:VEVENT\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n"},
-		{uid: "unterminated", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:unterminated\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n"},
+		{uid: "unterminated", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:unterminated\r\nRRULE:FREQ=DAILY\r\nEND:VCALENDAR\r\n", recurring: true},
+		{uid: "unterminated-body", raw: "BEGIN:VCALENDAR\r\nBEGIN:VJOURNAL\r\nUID:unterminated-body\r\nRECURRENCE-ID:20260615T100000Z\r\n", recurring: true},
 		{uid: "plain", raw: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:plain\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nSUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 	}
 }
@@ -798,6 +847,12 @@ WHERE recurrence_start IS NOT NULL OR recurrence_until IS NOT NULL`)
 	for _, test := range cases {
 		if repaired[test.uid] != expected[test.uid] {
 			t.Errorf("%s: repaired = %t, want %t", test.uid, repaired[test.uid], expected[test.uid])
+		}
+		// The expectation is the reader's, but where the case says the
+		// repair reaches beyond it.
+		if reader := icalpkg.ConservativeRecurrenceBounds(test.raw).Recurring; reader != (test.recurring && !test.beyondReader) {
+			t.Errorf("%s: ical.ConservativeRecurrenceBounds reads recurring = %t, but the case expects the repair to bound it %t (beyond the reader: %t)",
+				test.uid, reader, test.recurring, test.beyondReader)
 		}
 		if repaired[test.uid] != legacy[test.uid] {
 			t.Errorf("%s: repaired = %t, but the unstaged predicate selects %t: the staged predicate changed which rows are repaired",
@@ -1403,10 +1458,11 @@ CREATE INDEX idx_deleted_resources_keyset ON deleted_resources (resource_type, c
 
 // Everything in this file runs under ACCESS EXCLUSIVE inside the startup budget,
 // so no index costs more than one build. None is built twice. An index the
-// upgrade retires goes before any table is rewritten or updated, so no rewrite
-// rebuilds it and no backfill maintains it. The recurrence repair and the
-// ace_order backfill run while no index they would maintain per row and the file
-// builds anyway exists yet.
+// upgrade drops, whether it retires it or builds it again, goes before any
+// statement rewrites or writes its table, so no rewrite rebuilds it and no
+// backfill or repair maintains it. The recurrence repair and the ace_order
+// backfill run while no index they would maintain per row and the file builds
+// anyway exists yet.
 func TestV120MigrationMaintainsNoIndexItRebuildsOrRetires(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "migrations", "v1.2.0.sql"))
 	if err != nil {
@@ -1423,7 +1479,7 @@ func TestV120MigrationMaintainsNoIndexItRebuildsOrRetires(t *testing.T) {
 		statements = append(statements, strings.TrimSpace(strings.Join(code, "\n")))
 	}
 
-	repair, aceOrderBackfill, firstWrite := -1, -1, -1
+	repair, aceOrderBackfill := -1, -1
 	for i, statement := range statements {
 		if strings.HasPrefix(statement, "UPDATE events\n") {
 			repair = i
@@ -1431,15 +1487,47 @@ func TestV120MigrationMaintainsNoIndexItRebuildsOrRetires(t *testing.T) {
 		if strings.Contains(statement, "UPDATE acl_entries") {
 			aceOrderBackfill = i
 		}
-		if firstWrite < 0 && (strings.HasPrefix(statement, "ALTER TABLE") || strings.HasPrefix(statement, "UPDATE ")) {
-			firstWrite = i
-		}
 	}
 	if repair < 0 {
 		t.Fatal("the migration no longer carries the recurrence repair")
 	}
 	if aceOrderBackfill < 0 {
 		t.Fatal("the migration no longer carries the ace_order backfill")
+	}
+
+	// A statement writes a table when it updates, inserts into or deletes from
+	// it, or alters it in a way that rewrites every row: dropping a column, or
+	// adding a generated one. Statements inside a DO block are read one by
+	// one, like the file's own.
+	writes := func(statement, table string) bool {
+		for _, write := range []string{"UPDATE " + table, "INSERT INTO " + table, "DELETE FROM " + table} {
+			if strings.Contains(statement, write+" ") || strings.Contains(statement, write+"\n") {
+				return true
+			}
+		}
+		alter := "ALTER TABLE " + table + " "
+		alterAt := strings.Index(statement, alter)
+		if alterAt < 0 {
+			alter = "ALTER TABLE " + table + "\n"
+			alterAt = strings.Index(statement, alter)
+		}
+		if alterAt < 0 {
+			return false
+		}
+		altered := statement[alterAt:]
+		return strings.Contains(altered, "DROP COLUMN") || strings.Contains(altered, "GENERATED ALWAYS")
+	}
+	indexTable := func(name string) string {
+		for prefix, table := range map[string]string{
+			"idx_events_": "events", "idx_contacts_": "contacts", "idx_acl_": "acl_entries",
+			"idx_deleted_resources_": "deleted_resources", "idx_locks_": "locks",
+		} {
+			if strings.HasPrefix(name, prefix) {
+				return table
+			}
+		}
+		t.Fatalf("no table known for the index %s", name)
+		return ""
 	}
 
 	dropped := map[string]int{}
@@ -1472,8 +1560,12 @@ func TestV120MigrationMaintainsNoIndexItRebuildsOrRetires(t *testing.T) {
 	}
 
 	for name, at := range dropped {
-		if _, rebuilt := built[name]; !rebuilt && at > firstWrite {
-			t.Errorf("%s is retired only after a table is rewritten or updated, which maintains it until then", name)
+		table := indexTable(name)
+		for i, statement := range statements[:at] {
+			if writes(statement, table) {
+				t.Errorf("%s is dropped only after statement %d writes %s, which maintains or rebuilds it until then:\n%.200s", name, i, table, statement)
+				break
+			}
 		}
 	}
 }
@@ -1968,4 +2060,47 @@ FROM generate_series(1, $4) AS n`,
 
 func ptr[T any](value T) *T {
 	return &value
+}
+
+// The upgrade rewrites events, contacts and acl_entries and adds the columns
+// the 1.2.0 queries filter and join on, so it leaves statistics for them
+// rather than leaving the first queries after it to plan without any.
+func TestPostgres_V120MigrationAnalyzesTheTablesItRewrites(t *testing.T) {
+	pool := newV119ReleasePool(t)
+	calendarID := seedRepairCalendar(t, pool, "subject-analyze")
+	if _, err := pool.Exec(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, last_modified)
+SELECT $1, 'analyze-' || g, 'analyze-' || g || '.ics', 'BEGIN:VCALENDAR' || E'\r\n' || 'END:VCALENDAR' || E'\r\n', 'etag', NOW()
+FROM generate_series(1, 50) g`, calendarID); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+	if _, err := pool.Exec(`
+INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege)
+SELECT '/dav/calendars/' || $1::text || '/analyze-' || g || '.ics', '/dav/principals/9/', TRUE, 'read'
+FROM generate_series(1, 50) g`, calendarID); err != nil {
+		t.Fatalf("seed ACL entries: %v", err)
+	}
+	var bookID int64
+	if err := pool.QueryRow(`INSERT INTO address_books (user_id, name) SELECT user_id, 'Analyze' FROM calendars WHERE id = $1 RETURNING id`, calendarID).Scan(&bookID); err != nil {
+		t.Fatalf("seed address book: %v", err)
+	}
+	if _, err := pool.Exec(`
+INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag)
+SELECT $1, 'analyze-' || g, 'analyze-' || g || '.vcf', 'BEGIN:VCARD' || E'\r\n' || 'END:VCARD' || E'\r\n', 'etag'
+FROM generate_series(1, 50) g`, bookID); err != nil {
+		t.Fatalf("seed contacts: %v", err)
+	}
+
+	applyV120Migration(t, pool)
+
+	for _, column := range [][2]string{{"events", "object_acl_path"}, {"contacts", "object_acl_path"}, {"acl_entries", "ace_order"}} {
+		var analyzed bool
+		if err := pool.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_stats WHERE schemaname = current_schema() AND tablename = $1 AND attname = $2)`,
+			column[0], column[1]).Scan(&analyzed); err != nil {
+			t.Fatalf("read statistics: %v", err)
+		}
+		if !analyzed {
+			t.Errorf("the upgrade leaves no statistics for %s.%s", column[0], column[1])
+		}
+	}
 }

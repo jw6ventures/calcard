@@ -174,6 +174,7 @@ type ACLRepository interface {
 	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)
 	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
+	ListByPrincipals(ctx context.Context, principalHrefs []string) ([]ACLEntry, error)
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
 }

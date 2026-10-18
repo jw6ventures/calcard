@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"slices"
 
 	"github.com/jw6ventures/calcard/internal/store"
 )
@@ -12,6 +13,16 @@ func (f *fakeACLRepo) ListByResources(_ context.Context, paths []string) ([]stor
 
 func (f *fakeACLRepo) ListByResourcesAndPrincipals(_ context.Context, paths, principals []string) ([]store.ACLEntry, error) {
 	return filterBatchEntries(f.entries, paths, principals), nil
+}
+
+func (f *fakeACLRepo) ListByPrincipals(_ context.Context, principals []string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, entry := range f.entries {
+		if slices.Contains(principals, entry.PrincipalHref) {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
 }
 
 func filterBatchEntries(entries []store.ACLEntry, paths, principals []string) []store.ACLEntry {

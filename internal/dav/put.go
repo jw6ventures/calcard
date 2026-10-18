@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -242,9 +243,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	}
 	uid := validated.UID
 	resourceName := resourceUID
-	if len(resourceName) > store.MaxIdentifierOctets {
-		// The validator bounds the UID; the resource name is a unique index
-		// key too, which PostgreSQL bounds in size.
+	if !storableMemberName(resourceName) {
 		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
 		return
 	}
@@ -267,6 +266,10 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, putLockPaths(cleanPath, existingByResource == nil)...)
+	if !ok {
+		return
+	}
 	write := store.CalendarObjectWrite{
 		CalendarID:        calendarID,
 		UID:               uid,
@@ -277,7 +280,7 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		Precondition:      calendarObjectPrecondition(r),
 		ExpectedState:     &store.CalendarObjectResourceState{Exists: existingByResource != nil},
 		ExpectedACL:       aclGuard,
-		LockPreconditions: h.lockPreconditions(r, putLockPaths(cleanPath, existingByResource == nil)...),
+		LockPreconditions: lockPreconditions,
 	}
 	result, err := h.store.PutCalendarObject(r.Context(), write)
 	for attempt := 0; attempt < maxResourceStateRetries && errors.Is(err, store.ErrResourceStateChanged); attempt++ {
@@ -307,7 +310,9 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 		// failed still answers 412 rather than being retried into a wrong result.
 		write.ExpectedState = &store.CalendarObjectResourceState{Exists: current != nil}
 		write.ExpectedACL = currentACL
-		write.LockPreconditions = h.lockPreconditions(r, putLockPaths(cleanPath, current == nil)...)
+		if write.LockPreconditions, ok = h.writeLockPreconditions(w, r, putLockPaths(cleanPath, current == nil)...); !ok {
+			return
+		}
 		result, err = h.store.PutCalendarObject(r.Context(), write)
 	}
 	switch {
@@ -395,7 +400,11 @@ func entityTags(headerValue string, allowWeak bool) []string {
 }
 
 // calendarObjectConflictHref is the URL of the calendar object resource already
-// holding a UID, as the CALDAV:no-uid-conflict error body reports it.
+// holding a UID, as the CALDAV:no-uid-conflict error body reports it. RFC 4791
+// §5.3.2.1 asks for that URL and the element's DTD requires it, so it is named
+// even to a requester that may not read the resource. That is deliberate: the
+// requester already knows the UID and may add or rewrite a member of the
+// collection, so it learns one href in a collection it can write to.
 func calendarObjectConflictHref(calendarID int64, event *store.Event) string {
 	if event == nil {
 		return ""
@@ -403,7 +412,8 @@ func calendarObjectConflictHref(calendarID int64, event *store.Event) string {
 	return calendarObjectHref(fmt.Sprintf("/dav/calendars/%d", calendarID), eventResourceName(*event))
 }
 
-// addressObjectConflictHref is its CardDAV:no-uid-conflict counterpart.
+// addressObjectConflictHref is its CardDAV:no-uid-conflict counterpart, which
+// RFC 6352 §6.3.2.1 asks for in the same way.
 func addressObjectConflictHref(addressBookID int64, resourceName string) string {
 	return addressObjectHref(fmt.Sprintf("/dav/addressbooks/%d", addressBookID), resourceName)
 }
@@ -425,17 +435,23 @@ func (h *DavServer) authorizeCalendarObjectTarget(w http.ResponseWriter, r *http
 		refusal := requirePrivilegeAt(err, privilegePath, requiredPrivilege)
 		if existing != nil {
 			refusal = h.existingObjectWriteRefusal(r.Context(), user, cleanPath, refusal, func() error {
-				parentPath := path.Dir(cleanPath)
-				if _, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, parentPath, "bind"); err != nil {
-					return requirePrivilegeAt(err, parentPath, "bind")
-				}
-				return nil
+				return h.calendarMemberBindRefusal(r.Context(), user, calendarID, cleanPath)
 			})
 		}
 		_ = writePrivilegeRequirementError(w, refusal)
 		return nil, nil, false
 	}
 	return cal, existing, true
+}
+
+// calendarMemberBindRefusal is the refusal a write creating the member at
+// cleanPath meets: DAV:bind on its calendar, or nil when user holds it.
+func (h *DavServer) calendarMemberBindRefusal(ctx context.Context, user *store.User, calendarID int64, cleanPath string) error {
+	parentPath := path.Dir(cleanPath)
+	if _, err := h.loadCalendarWithPrivilege(ctx, user, calendarID, parentPath, "bind"); err != nil {
+		return requirePrivilegeAt(err, parentPath, "bind")
+	}
+	return nil
 }
 
 // putLockPaths names the resources whose locks a PUT to cleanPath must hold
@@ -500,8 +516,7 @@ func (h *DavServer) putContact(w http.ResponseWriter, r *http.Request, user *sto
 	}
 	req.uid = uid
 
-	if len(resourceName) > store.MaxIdentifierOctets {
-		// A unique index key, which PostgreSQL bounds in size.
+	if !storableMemberName(resourceName) {
 		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
 		return
 	}
@@ -607,6 +622,10 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 	}
 	expectedState := store.ContactDAVResourceState(existingByName)
 	expectedState.ACL = aclGuard
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, putLockPaths(req.cleanPath, existingByName == nil)...)
+	if !ok {
+		return
+	}
 	result, err := h.store.PutContactObject(r.Context(), store.ContactObjectWrite{
 		AddressBookID:     req.addressBookID,
 		UID:               req.uid,
@@ -616,7 +635,7 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		Precondition:      calendarObjectPrecondition(r),
 		ExpectedState:     expectedState,
 		StatePath:         canonicalPath,
-		LockPreconditions: h.lockPreconditions(r, putLockPaths(req.cleanPath, existingByName == nil)...),
+		LockPreconditions: lockPreconditions,
 	})
 	switch {
 	case errors.Is(err, store.ErrUIDConflict):
@@ -660,4 +679,30 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		h.logger().Info("Put", "updated contact %q in address book %d", req.uid, req.addressBookID)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// storableMemberName reports whether a write may store an object as name:
+// one store.ValidMemberName accepts, which as a unique index key PostgreSQL
+// bounds in size.
+func storableMemberName(name string) bool {
+	return store.ValidMemberName(name) && len(name) <= store.MaxIdentifierOctets
+}
+
+// refusedMemberName refuses a request that would write the state of a member
+// target names by a name store.ValidMemberName refuses, as a PUT of that name
+// is refused, and reports whether it did. Such a member's state path names its
+// collection, or that collection's parent, once cleaned, so a lock, ACL entry
+// or dead property kept there would be read as theirs or not at all. A member
+// stored under such a name before can still be read, copied or moved to a
+// name the server accepts, or deleted.
+func refusedMemberName(w http.ResponseWriter, target davTarget) bool {
+	if !target.Resource || store.ValidMemberName(target.ResourceName) {
+		return false
+	}
+	if target.Domain == davPathAddressBook {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+	} else {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
+	}
+	return true
 }

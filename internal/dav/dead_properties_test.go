@@ -56,16 +56,20 @@ func TestMoveDeleteDeadPropertyLifecycle(t *testing.T) {
 	if len(dead.properties["/dav/calendars/2/source"]) != 0 || dead.properties["/dav/calendars/3/moved"]["urn:test\x00note"].InnerXML != "source" {
 		t.Fatalf("MOVE dead properties = %#v", dead.properties)
 	}
-	if len(dead.properties["/dav/calendars/2/source.ics"]) != 0 || dead.properties["/dav/calendars/3/moved.ics"]["urn:test\x00legacy"].InnerXML != "legacy-source" {
-		t.Fatalf("MOVE legacy dead properties = %#v", dead.properties)
+	// source.ics and moved.ics are other resources, whose state stays theirs.
+	if dead.properties["/dav/calendars/2/source.ics"]["urn:test\x00legacy"].InnerXML != "legacy-source" || dead.properties["/dav/calendars/3/moved.ics"]["urn:test\x00old"].InnerXML != "old-destination" {
+		t.Fatalf("MOVE changed other resources' dead properties: %#v", dead.properties)
 	}
-	if len(locks.locks) != 1 || locks.locks["old-destination"] == nil || locks.locks["old-destination"].ResourcePath != "/dav/calendars/3/moved.ics" {
-		t.Fatalf("MOVE lock state = %#v", locks.locks)
+	if len(locks.locks) != 2 || locks.locks["source-legacy"] == nil || locks.locks["old-destination"] == nil {
+		t.Fatalf("MOVE lock state = %#v, want only the moved resource's lock dropped", locks.locks)
 	}
+	movedACL := map[string]string{}
 	for _, entry := range acls.entries {
-		if entry.ResourcePath == "/dav/calendars/2/source" || entry.ResourcePath == "/dav/calendars/2/source.ics" || entry.PrincipalHref == "/dav/principals/3/" {
-			t.Fatalf("MOVE ACL state = %#v", acls.entries)
-		}
+		movedACL[entry.ResourcePath] += entry.Privilege
+	}
+	if want := map[string]string{"/dav/calendars/3/moved": "read", "/dav/calendars/2/source.ics": "write", "/dav/calendars/3/moved.ics": "read"}; len(movedACL) != len(want) ||
+		movedACL["/dav/calendars/3/moved"] != want["/dav/calendars/3/moved"] || movedACL["/dav/calendars/2/source.ics"] != want["/dav/calendars/2/source.ics"] || movedACL["/dav/calendars/3/moved.ics"] != want["/dav/calendars/3/moved.ics"] {
+		t.Fatalf("MOVE ACL state = %#v, want %v", acls.entries, want)
 	}
 
 	moved, err := events.GetByUID(context.Background(), 3, "event")

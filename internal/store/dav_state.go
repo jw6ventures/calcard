@@ -262,7 +262,8 @@ func (s *Store) CreateCalendarAndState(ctx context.Context, cal Calendar, dead [
 // kind, which the per-kind root it names as its collection's parent would do.
 //
 // alsoSerialize names paths a later step of the same transaction takes
-// exclusively in its own right. They join this acquisition so the transaction
+// exclusively in its own right, so no precondition below one of them needs a
+// lock of its own. They join this acquisition so the transaction
 // settles its whole exclusive set in one ordered pass: a path taken shared here
 // as an ancestor and exclusively later would be an upgrade that two
 // transactions holding it shared can deadlock on. That later step writes them
@@ -272,7 +273,7 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	if len(preconditions) == 0 && len(alsoSerialize) == 0 {
 		return nil
 	}
-	serializationTargets := append(slices.Clone(alsoSerialize), lockPreconditionTargets(preconditions)...)
+	serializationTargets := append(slices.Clone(alsoSerialize), lockPreconditionTargets(preconditions, alsoSerialize)...)
 	if err := acquireDAVPathLocks(ctx, tx, serializationTargets...); err != nil {
 		return err
 	}
@@ -327,7 +328,17 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 // strict ancestor of another precondition's path; davPathLocks already covers
 // such an ancestor as the other path's. Every path that has a given prefix
 // sorts directly at or after it, so one search per path finds whether any has.
-func lockPreconditionTargets(preconditions []LockPrecondition) []string {
+//
+// A path below one of heldExclusively is left out too. Every write below a
+// collection takes the collection's path lock, exclusively when it writes one
+// of its members, so holding the collection exclusively already excludes it,
+// and a write to the whole collection needs no lock per member: thousands of
+// them would exhaust PostgreSQL's shared lock table.
+func lockPreconditionTargets(preconditions []LockPrecondition, heldExclusively []string) []string {
+	held := make(map[string]struct{}, len(heldExclusively))
+	for _, heldPath := range heldExclusively {
+		held[path.Clean(heldPath)] = struct{}{}
+	}
 	cleaned := make([]string, len(preconditions))
 	for i, precondition := range preconditions {
 		cleaned[i] = path.Clean(precondition.ResourcePath)
@@ -341,9 +352,26 @@ func lockPreconditionTargets(preconditions []LockPrecondition) []string {
 		if next < len(sorted) && strings.HasPrefix(sorted[next], prefix) {
 			continue
 		}
+		if hasHeldAncestor(cleaned[i], held) {
+			continue
+		}
 		targets = append(targets, precondition.ResourcePath)
 	}
 	return targets
+}
+
+// hasHeldAncestor reports whether a strict ancestor of the cleaned resourcePath
+// is in held.
+func hasHeldAncestor(resourcePath string, held map[string]struct{}) bool {
+	if len(held) == 0 {
+		return false
+	}
+	for _, ancestor := range lockAncestorPaths(resourcePath) {
+		if _, ok := held[ancestor]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func validateLockPreconditionsFallback(ctx context.Context, locks LockRepository, preconditions []LockPrecondition) error {
@@ -430,7 +458,7 @@ func (s *Store) SetACLAndState(ctx context.Context, resourcePath string, entries
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, ACLPaths(resourcePath)...); err != nil {
+	if err := validateLockPreconditionsTx(ctx, tx, lockPreconditions, resourcePath); err != nil {
 		return err
 	}
 	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
@@ -538,50 +566,58 @@ func validateTargetStateTx(ctx context.Context, tx *sql.Tx, kind string, collect
 
 // LockPreconditionsSatisfied applies the write-lock conditions captured by the
 // DAV layer. Atomic non-PostgreSQL CalendarStateCreator implementations use the
-// same check immediately before they create the collection.
+// same check immediately before they create the collection. Its work is linear
+// in the locks and in the preconditions' lookup paths and tokens: the locks
+// are indexed by path once, and a precondition's tokens are read only when a
+// lock applies to it.
 func LockPreconditionsSatisfied(preconditions []LockPrecondition, locks []Lock) bool {
 	now := time.Now()
+	activeByPath := make(map[string][]*Lock, len(locks))
+	for i := range locks {
+		lock := &locks[i]
+		if !lock.ExpiresAt.IsZero() && lock.ExpiresAt.Before(now) {
+			continue
+		}
+		lockPath := path.Clean(lock.ResourcePath)
+		activeByPath[lockPath] = append(activeByPath[lockPath], lock)
+	}
+	if len(activeByPath) == 0 {
+		return true
+	}
+	var applicable []*Lock
 	for _, precondition := range preconditions {
-		lookupPaths := make(map[string]struct{}, len(precondition.LookupPaths))
-		for _, resourcePath := range precondition.LookupPaths {
-			lookupPaths[path.Clean(resourcePath)] = struct{}{}
-		}
-		tokens := make(map[string]struct{}, len(precondition.Tokens))
-		for _, token := range precondition.Tokens {
-			tokens[token] = struct{}{}
-		}
-
-		// A lock recorded under any stored spelling of the target, such as the
-		// extension-suffixed one earlier releases wrote, is on the target itself
-		// and binds at any depth; one on an ancestor binds only at infinity.
-		targetSpellings := make(map[string]struct{})
-		for _, spelling := range davStatePaths(path.Clean(precondition.ResourcePath)) {
-			targetSpellings[path.Clean(spelling)] = struct{}{}
-		}
-		active := false
-		satisfied := false
-		for _, lock := range locks {
-			if !lock.ExpiresAt.IsZero() && lock.ExpiresAt.Before(now) {
-				continue
-			}
-			lockPath := path.Clean(lock.ResourcePath)
-			if _, applies := lookupPaths[lockPath]; !applies {
-				continue
-			}
-			if _, onTarget := targetSpellings[lockPath]; !onTarget && lock.Depth != "infinity" {
-				continue
-			}
-			active = true
-			if _, ok := tokens[lock.Token]; ok {
-				satisfied = true
-				break
+		// A lock on the target itself binds at any depth; one on an ancestor
+		// binds only at infinity.
+		target := path.Clean(precondition.ResourcePath)
+		applicable = applicable[:0]
+		for _, lookupPath := range precondition.LookupPaths {
+			lookupPath = path.Clean(lookupPath)
+			for _, lock := range activeByPath[lookupPath] {
+				if lookupPath == target || lock.Depth == "infinity" {
+					applicable = append(applicable, lock)
+				}
 			}
 		}
-		if active && !satisfied {
+		if len(applicable) == 0 {
+			continue
+		}
+		if !submitsAnyLockToken(precondition.Tokens, applicable) {
 			return false
 		}
 	}
 	return true
+}
+
+// submitsAnyLockToken reports whether tokens holds the token of any of locks.
+func submitsAnyLockToken(tokens []string, locks []*Lock) bool {
+	for _, token := range tokens {
+		for _, lock := range locks {
+			if lock.Token == token {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func moveLocksTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
@@ -777,147 +813,53 @@ func selectContactTx(ctx context.Context, tx *sql.Tx, column string, addressBook
 	return &contact, nil
 }
 
-func deleteDAVStateTx(ctx context.Context, tx execContext, resourcePath string, deleteACL bool) error {
-	for _, statePath := range davStatePaths(resourcePath) {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, statePath); err != nil {
-			return err
-		}
-		if deleteACL {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, statePath); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, statePath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Store) deleteDAVStateFallback(ctx context.Context, resourcePath string, deleteACL bool) error {
-	if resourcePath == "" || s == nil {
+func deleteDAVStateTx(ctx context.Context, tx execContext, statePath string, deleteACL bool) error {
+	if statePath == "" {
 		return nil
 	}
-	for _, statePath := range davStatePaths(resourcePath) {
-		if s.Locks != nil {
-			if err := s.Locks.DeleteByResourcePath(ctx, statePath); err != nil {
-				return err
-			}
-		}
-		if deleteACL && s.ACLEntries != nil {
-			if err := s.ACLEntries.Delete(ctx, statePath); err != nil {
-				return err
-			}
-		}
-		if err := s.clearDeadPropertiesFallback(ctx, statePath); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, statePath); err != nil {
+		return err
+	}
+	if deleteACL {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, statePath); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, statePath)
+	return err
 }
 
-// ObjectACLPaths lists the stored spellings whose ACL entries make up the ACL
-// of the member resourceName of collectionPath, a calendar or address book
-// path, in the order a decision reads them: the member's own path, which the
-// ACL method writes, then, for a name ending in the collection kind's
-// extension in any case, the path without it and that path with the extension
-// in lower case, and otherwise the path with the extension added. Decisions
-// read exactly these, and a write of the member's ACL replaces exactly these.
-// The name is joined as it is stored, without cleaning, so a name holding path
-// segments cannot reach another resource's ACL.
-func ObjectACLPaths(collectionPath, resourceName string) []string {
+func (s *Store) deleteDAVStateFallback(ctx context.Context, statePath string, deleteACL bool) error {
+	if statePath == "" || s == nil {
+		return nil
+	}
+	if s.Locks != nil {
+		if err := s.Locks.DeleteByResourcePath(ctx, statePath); err != nil {
+			return err
+		}
+	}
+	if deleteACL && s.ACLEntries != nil {
+		if err := s.ACLEntries.Delete(ctx, statePath); err != nil {
+			return err
+		}
+	}
+	return s.clearDeadPropertiesFallback(ctx, statePath)
+}
+
+// MemberStatePath is the path under which the ACL entries, locks and dead
+// properties of the member resourceName of the collection at collectionPath
+// are stored: the collection's canonical path and the stored name, joined as
+// they are. RFC 3986 section 6.2.2.1 makes a path case-sensitive and gives an
+// extension no meaning, so X, X.ics and X.ICS name three resources, and no
+// spelling of one name reaches another's state. The name is neither cleaned
+// nor trimmed, so padding cannot reach another resource's state either. A name
+// ValidMemberName refuses would: "<collection>/." is the collection's own path
+// once cleaned, which is why no writer stores one.
+func MemberStatePath(collectionPath, resourceName string) string {
 	if resourceName == "" {
-		return nil
+		return ""
 	}
-	collectionPath = strings.TrimSuffix(collectionPath, "/")
-	ext := ".ics"
-	if strings.HasPrefix(collectionPath, "/dav/addressbooks/") {
-		ext = ".vcf"
-	}
-	own := collectionPath + "/" + resourceName
-	base := resourceName
-	if strings.EqualFold(path.Ext(resourceName), ext) {
-		base = strings.TrimSuffix(resourceName, path.Ext(resourceName))
-	}
-	if base == "" {
-		return []string{own}
-	}
-	identity := collectionPath + "/" + base
-	paths := []string{own}
-	for _, spelling := range []string{identity, identity + ext} {
-		if !slices.Contains(paths, spelling) {
-			paths = append(paths, spelling)
-		}
-	}
-	return paths
-}
-
-// ACLPaths lists the stored spellings whose ACL entries make up the ACL of
-// the resource at the canonical resourcePath: ObjectACLPaths for a member of a
-// calendar or address book, and the path alone for any other resource.
-func ACLPaths(resourcePath string) []string {
-	if resourcePath == "" {
-		return nil
-	}
-	for _, prefix := range []string{"/dav/calendars/", "/dav/addressbooks/"} {
-		rest, ok := strings.CutPrefix(resourcePath, prefix)
-		if !ok {
-			continue
-		}
-		if collection, name, member := strings.Cut(rest, "/"); member && collection != "" && name != "" && !strings.Contains(name, "/") {
-			return ObjectACLPaths(prefix+collection, name)
-		}
-	}
-	return []string{resourcePath}
-}
-
-func davStatePaths(resourcePath string) []string {
-	resourcePath = strings.TrimSpace(resourcePath)
-	if resourcePath == "" {
-		return nil
-	}
-
-	seen := map[string]struct{}{}
-	var paths []string
-	addPath := func(p string) {
-		if p == "" {
-			return
-		}
-		if _, ok := seen[p]; ok {
-			return
-		}
-		seen[p] = struct{}{}
-		paths = append(paths, p)
-	}
-
-	addPath(resourcePath)
-	switch {
-	case strings.HasPrefix(resourcePath, "/dav/addressbooks/"):
-		if !strings.Contains(strings.Trim(strings.TrimPrefix(resourcePath, "/dav/addressbooks/"), "/"), "/") {
-			return paths
-		}
-		base := resourcePath
-		if strings.EqualFold(path.Ext(base), ".vcf") {
-			base = strings.TrimSuffix(base, path.Ext(base))
-			addPath(base)
-			addPath(resourcePath)
-			return paths
-		}
-		addPath(base + ".vcf")
-	case strings.HasPrefix(resourcePath, "/dav/calendars/"):
-		if !strings.Contains(strings.Trim(strings.TrimPrefix(resourcePath, "/dav/calendars/"), "/"), "/") {
-			return paths
-		}
-		base := resourcePath
-		if strings.EqualFold(path.Ext(base), ".ics") {
-			base = strings.TrimSuffix(base, path.Ext(base))
-			addPath(base)
-			addPath(resourcePath)
-			return paths
-		}
-		addPath(base + ".ics")
-	}
-	return paths
+	return strings.TrimSuffix(collectionPath, "/") + "/" + resourceName
 }
 
 type execContext interface {
@@ -1084,8 +1026,11 @@ WHERE calendar_id=$13 AND uid=$14`
 // against every other write to the event.
 func lockEventMoveTx(ctx context.Context, tx *sql.Tx, fromCalendarID, toCalendarID int64, uid, sourceResourceName, destResourceName, fromStatePath, toStatePath string) error {
 	lockPaths := []string{calendarCollectionLockPath(fromCalendarID), calendarCollectionLockPath(toCalendarID)}
-	lockPaths = append(lockPaths, davStatePaths(fromStatePath)...)
-	lockPaths = append(lockPaths, davStatePaths(toStatePath)...)
+	for _, statePath := range []string{fromStatePath, toStatePath} {
+		if statePath != "" {
+			lockPaths = append(lockPaths, statePath)
+		}
+	}
 	if err := acquireDAVPathLocks(ctx, tx, lockPaths...); err != nil {
 		return err
 	}
@@ -1159,34 +1104,28 @@ func (s *Store) MoveContactAndState(ctx context.Context, fromAddressBookID, toAd
 	return tx.Commit()
 }
 
+// moveDAVStateTx rebinds the ACL entries and dead properties at the moved
+// resource's state path to its destination's, replacing whatever the
+// destination held, and drops the source's locks, which a MOVE does not carry
+// (RFC 4918 section 7.7).
 func moveDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
 	if fromPath == "" || toPath == "" || fromPath == toPath {
 		return nil
 	}
-	fromPaths := davStatePaths(fromPath)
-	toPaths := davStatePaths(toPath)
-	for i, sourcePath := range fromPaths {
-		destinationPath := toPath
-		if i < len(toPaths) {
-			destinationPath = toPaths[i]
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, destinationPath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`, destinationPath, sourcePath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, sourcePath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, destinationPath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE dav_dead_properties SET resource_path=$1, updated_at=NOW() WHERE resource_path=$2`, destinationPath, sourcePath); err != nil {
-			return err
-		}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, toPath); err != nil {
+		return err
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`, toPath, fromPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM locks WHERE resource_path=$1`, fromPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, toPath); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE dav_dead_properties SET resource_path=$1, updated_at=NOW() WHERE resource_path=$2`, toPath, fromPath)
+	return err
 }
 
 func clearDestinationTombstonesTx(ctx context.Context, tx execContext, resourceType string, collectionID int64, resourceName string) error {
@@ -1196,36 +1135,21 @@ func clearDestinationTombstonesTx(ctx context.Context, tx execContext, resourceT
 
 func (s *Store) moveDAVStateFallback(ctx context.Context, fromPath, toPath, resourceType string, collectionID int64, replacedUID, resourceName string) error {
 	if fromPath != "" && toPath != "" && fromPath != toPath {
-		fromPaths := davStatePaths(fromPath)
-		toPaths := davStatePaths(toPath)
-		for _, destinationPath := range toPaths {
-			if s.ACLEntries != nil {
-				if err := s.ACLEntries.Delete(ctx, destinationPath); err != nil {
-					return err
-				}
+		if s.ACLEntries != nil {
+			if err := s.ACLEntries.Delete(ctx, toPath); err != nil {
+				return err
 			}
-			if err := s.clearDeadPropertiesFallback(ctx, destinationPath); err != nil {
+			if err := s.ACLEntries.MoveResourcePath(ctx, fromPath, toPath); err != nil {
 				return err
 			}
 		}
-		for i, sourcePath := range fromPaths {
-			destinationPath := toPath
-			if i < len(toPaths) {
-				destinationPath = toPaths[i]
-			}
-			if s.ACLEntries != nil {
-				if err := s.ACLEntries.MoveResourcePath(ctx, sourcePath, destinationPath); err != nil {
-					return err
-				}
-			}
-			if s.Locks != nil {
-				if err := s.Locks.DeleteByResourcePath(ctx, sourcePath); err != nil {
-					return err
-				}
-			}
-			if err := s.moveDeadPropertiesFallback(ctx, sourcePath, destinationPath); err != nil {
+		if s.Locks != nil {
+			if err := s.Locks.DeleteByResourcePath(ctx, fromPath); err != nil {
 				return err
 			}
+		}
+		if err := s.moveDeadPropertiesFallback(ctx, fromPath, toPath); err != nil {
+			return err
 		}
 	}
 	if replacedUID != "" && s.DeletedResources != nil {
@@ -1490,42 +1414,39 @@ func contactID(contact *Contact) int64 {
 	return contact.ID
 }
 
+// copyDAVStateTx gives the copy at toPath the dead properties stored at
+// fromPath and no ACL entries, replacing whatever the destination held, so
+// the copy's collection decides its access.
 func copyDAVStateTx(ctx context.Context, tx execContext, fromPath, toPath string) error {
 	if toPath == "" {
 		return nil
 	}
-	for _, statePath := range davStatePaths(toPath) {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, statePath); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, statePath); err != nil {
-			return err
-		}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path=$1`, toPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dav_dead_properties WHERE resource_path=$1`, toPath); err != nil {
+		return err
 	}
 	if fromPath == "" || fromPath == toPath {
 		return nil
 	}
-	fromPaths := davStatePaths(fromPath)
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at)
-SELECT DISTINCT ON (namespace_uri, local_name) $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
+SELECT $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
 FROM dav_dead_properties
-WHERE resource_path = ANY($2)
-ORDER BY namespace_uri, local_name, CASE WHEN resource_path=$3 THEN 0 ELSE 1 END, updated_at DESC`, toPath, pq.Array(fromPaths), fromPath)
+WHERE resource_path = $2`, toPath, fromPath)
 	return err
 }
 
 func (s *Store) copyDAVStateFallback(ctx context.Context, fromPath, toPath, resourceType string, collectionID int64, replacedUID, resourceName string) error {
 	if toPath != "" {
-		for _, statePath := range davStatePaths(toPath) {
-			if s.ACLEntries != nil {
-				if err := s.ACLEntries.Delete(ctx, statePath); err != nil {
-					return err
-				}
-			}
-			if err := s.clearDeadPropertiesFallback(ctx, statePath); err != nil {
+		if s.ACLEntries != nil {
+			if err := s.ACLEntries.Delete(ctx, toPath); err != nil {
 				return err
 			}
+		}
+		if err := s.clearDeadPropertiesFallback(ctx, toPath); err != nil {
+			return err
 		}
 		if err := s.copyDeadPropertiesFallback(ctx, fromPath, toPath); err != nil {
 			return err
@@ -1538,40 +1459,16 @@ func (s *Store) copyDAVStateFallback(ctx context.Context, fromPath, toPath, reso
 }
 
 func (s *Store) copyDeadPropertiesFallback(ctx context.Context, fromPath, toPath string) error {
-	if s == nil || s.DeadProperties == nil || toPath == "" || fromPath == toPath {
+	if s == nil || s.DeadProperties == nil || fromPath == "" || toPath == "" || fromPath == toPath {
 		return nil
 	}
-	fromPaths := davStatePaths(fromPath)
-	toPaths := davStatePaths(toPath)
-	lookupPaths := append(append([]string(nil), fromPaths...), toPaths...)
-	properties, err := s.DeadProperties.ListByResources(ctx, lookupPaths)
+	properties, err := s.DeadProperties.ListByResources(ctx, []string{fromPath})
 	if err != nil {
 		return err
 	}
-	propertiesByPath := make(map[string][]DeadProperty)
+	setDestination := make([]DeadPropertyMutation, 0, len(properties))
 	for _, property := range properties {
-		propertiesByPath[property.ResourcePath] = append(propertiesByPath[property.ResourcePath], property)
-	}
-	for _, destinationPath := range toPaths {
-		var clearDestination []DeadPropertyMutation
-		for _, property := range propertiesByPath[destinationPath] {
-			clearDestination = append(clearDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, Remove: true})
-		}
-		if err := s.DeadProperties.Apply(ctx, destinationPath, clearDestination); err != nil {
-			return err
-		}
-	}
-	seen := make(map[string]struct{})
-	var setDestination []DeadPropertyMutation
-	for _, sourcePath := range fromPaths {
-		for _, property := range propertiesByPath[sourcePath] {
-			key := property.NamespaceURI + "\x00" + property.LocalName
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			setDestination = append(setDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, InnerXML: property.InnerXML})
-		}
+		setDestination = append(setDestination, DeadPropertyMutation{NamespaceURI: property.NamespaceURI, LocalName: property.LocalName, InnerXML: property.InnerXML})
 	}
 	return s.DeadProperties.Apply(ctx, toPath, setDestination)
 }

@@ -296,6 +296,95 @@ func TestCurrentUserPrivilegeSetForObjectPathsIsPresent(t *testing.T) {
 	}
 }
 
+// DAV:write is the aggregate of write-content, write-properties, bind and
+// unbind (RFC 3744 section 3.2), so a member whose ACL denies the delegate
+// unbind does not report DAV:write, though its collection grants it, and
+// still reports write-content, which only the collection decides.
+func TestCurrentUserPrivilegeSetOmitsWriteWhenTheMemberDeniesAPart(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	h := privilegeKindsHandler("read", "write", "read-current-user-privilege-set")
+	acls := h.store.ACLEntries.(*fakeACLRepo)
+	acls.entries = append(acls.entries, store.ACLEntry{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"})
+
+	response := privilegeSetPropfindResponse(t, h, delegate, "/dav/calendars/5/event.ics", "/dav/calendars/5/event.ics")
+	if strings.Contains(response, "<d:write>") || strings.Contains(response, "<d:write/>") {
+		t.Errorf("current-user-privilege-set reports DAV:write despite the member's unbind deny: %s", response)
+	}
+	if !strings.Contains(response, "<d:write-content") {
+		t.Errorf("current-user-privilege-set lost write-content, which the collection grants: %s", response)
+	}
+}
+
+// RFC 3744 section 3.12 makes an aggregate privilege equivalent to the set of
+// its parts, so a member whose own ACL grants one part of DAV:write, leaving
+// the rest to its collection's grant of DAV:write, still reports DAV:write.
+func TestCurrentUserPrivilegeSetReportsWriteWhosePartsTheMemberAndCollectionGrant(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	for _, member := range []struct{ statePath, href string }{
+		{"/dav/calendars/5/event", "/dav/calendars/5/event.ics"},
+		{"/dav/addressbooks/6/alice", "/dav/addressbooks/6/alice.vcf"},
+	} {
+		h := privilegeKindsHandler("read", "write", "read-current-user-privilege-set")
+		acls := h.store.ACLEntries.(*fakeACLRepo)
+		acls.entries = append(acls.entries, store.ACLEntry{ResourcePath: member.statePath, PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"})
+
+		response := privilegeSetPropfindResponse(t, h, delegate, member.href, member.href)
+		if !strings.Contains(response, "<d:write>") && !strings.Contains(response, "<d:write/>") {
+			t.Errorf("%s: current-user-privilege-set omits DAV:write though every part of it is granted: %s", member.href, response)
+		}
+	}
+}
+
+// RFC 3744 section 3.12 makes an aggregate privilege equivalent to the set of
+// the privileges it contains, so DAV:all is reported only while every
+// privilege it contains is held, and DAV:read only with read-free-busy, which
+// CalCard's DAV:read contains. A collection's grant of DAV:all and a member's
+// refusal of one contained privilege leave both the refused privilege and the
+// aggregates containing it unreported, and the rest reported.
+func TestCurrentUserPrivilegeSetReportsAnAggregateOnlyWithEveryPrivilegeItContains(t *testing.T) {
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	cases := []struct {
+		denied         string
+		want, unwanted []string
+	}{
+		{"unbind", []string{"read", "read-free-busy", "write-content", "bind", "write-acl"}, []string{"all", "write", "unbind"}},
+		{"read-free-busy", []string{"read-acl", "write", "unbind"}, []string{"all", "read", "read-free-busy"}},
+		{"write-acl", []string{"read", "write"}, []string{"all", "write-acl"}},
+	}
+	for _, member := range []struct{ statePath, href string }{
+		{"/dav/calendars/5/event", "/dav/calendars/5/event.ics"},
+		{"/dav/addressbooks/6/alice", "/dav/addressbooks/6/alice.vcf"},
+	} {
+		for _, tc := range cases {
+			h := privilegeKindsHandler("all")
+			acls := h.store.ACLEntries.(*fakeACLRepo)
+			acls.entries = append(acls.entries, store.ACLEntry{ResourcePath: member.statePath, PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: tc.denied})
+
+			response := privilegeSetPropfindResponse(t, h, delegate, member.href, member.href)
+			for _, name := range tc.want {
+				if !reportsPrivilege(response, name) {
+					t.Errorf("%s, member denying %s: %s is not reported: %s", member.href, tc.denied, name, response)
+				}
+			}
+			for _, name := range tc.unwanted {
+				if reportsPrivilege(response, name) {
+					t.Errorf("%s, member denying %s: %s is reported: %s", member.href, tc.denied, name, response)
+				}
+			}
+		}
+	}
+
+	// Every privilege DAV:all contains, granted one by one, is DAV:all.
+	h := privilegeKindsHandler("read", "write", "read-acl", "read-current-user-privilege-set", "write-acl", "unlock")
+	if response := privilegeSetPropfindResponse(t, h, delegate, "/dav/calendars/5/event.ics", "/dav/calendars/5/event.ics"); !reportsPrivilege(response, "all") {
+		t.Errorf("DAV:all is not reported though each privilege it contains is granted: %s", response)
+	}
+}
+
+func reportsPrivilege(response, name string) bool {
+	return strings.Contains(response, ":"+name+">") || strings.Contains(response, ":"+name+"/>")
+}
+
 func TestCurrentUserPrivilegeSetForDelegatedPrincipalReportsGrantedPrivileges(t *testing.T) {
 	delegate := &store.User{ID: 1, PrimaryEmail: "delegate@example.com"}
 	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{

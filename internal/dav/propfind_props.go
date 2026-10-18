@@ -138,17 +138,11 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 		}
 	}
 
-	// Cache each resource under the key aclEntriesForResource looks it up by,
-	// holding the spellings it would read.
-	querySeen := make(map[string]struct{})
-	var queryPaths []string
+	// Cache each resource under the key aclEntriesForResource looks it up by.
+	queryPaths := make([]string, 0, len(canonicalPaths))
 	for _, resourcePath := range canonicalPaths {
-		for _, entryPath := range aclEntryPaths(resourcePath) {
-			if _, ok := querySeen[entryPath]; ok {
-				continue
-			}
-			querySeen[entryPath] = struct{}{}
-			queryPaths = append(queryPaths, entryPath)
+		if !isProtectedVirtualDAVRoot(resourcePath) {
+			queryPaths = append(queryPaths, resourcePath)
 		}
 	}
 	entries, err := h.store.ACLEntries.ListByResources(ctx, queryPaths)
@@ -164,12 +158,8 @@ func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.
 		return nil
 	}
 	for _, resourcePath := range canonicalPaths {
-		paths := aclEntryPaths(resourcePath)
-		var resourceEntries []store.ACLEntry
-		for _, entryPath := range paths {
-			resourceEntries = append(resourceEntries, byPath[entryPath]...)
-		}
-		orderACLEntries(resourceEntries, paths)
+		resourceEntries := byPath[resourcePath]
+		aclutil.SortEntries(resourceEntries)
 		cache.put(resourcePath, resourceEntries)
 	}
 	return nil
@@ -449,7 +439,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 		}
 		privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
 		for _, name := range calendarCurrentPrivilegeNames {
-			if allowed, _ := pc.decide(name); allowed {
+			if pc.reports(name) {
 				privileges = append(privileges, privilegeElementForName(name))
 			}
 		}
@@ -502,7 +492,7 @@ func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *st
 	}
 	privileges := make([]privilege, 0, len(addressBookCurrentPrivilegeNames))
 	for _, name := range addressBookCurrentPrivilegeNames {
-		if allowed, _ := pc.decide(name); allowed {
+		if pc.reports(name) {
 			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
@@ -525,7 +515,7 @@ func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *st
 	}
 	privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
 	for _, name := range calendarCurrentPrivilegeNames {
-		if allowed, _ := aclutil.DecisionForPrivilege(entries, principals, name); allowed {
+		if aclutil.HeldThroughLayers(principals, name, entries) {
 			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
@@ -616,7 +606,7 @@ func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath strin
 
 // lockLookupPathsForResource canonicalizes resourcePath (best effort) and
 // returns the canonical path together with the set of paths whose locks could
-// apply to it (the resource itself plus its ancestors and legacy aliases).
+// apply to it: the resource itself and its ancestors.
 func (h *DavServer) lockLookupPathsForResource(ctx context.Context, resourcePath string) (string, []string) {
 	if user, ok := auth.UserFromContext(ctx); ok {
 		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
@@ -626,15 +616,30 @@ func (h *DavServer) lockLookupPathsForResource(ctx context.Context, resourcePath
 	return resourcePath, lockLookupPaths(resourcePath)
 }
 
-// locksForLookupPaths returns the active locks for the given lookup paths. When
-// a prefetched batch index is installed (see prefetchLockBatchIndex) it serves
-// from that index to avoid one lock query per PROPFIND response; otherwise it
-// queries directly.
+// locksForLookupPaths returns the active locks for the given lookup paths,
+// served from the request's lock index for the paths it has read and read from
+// the store, then indexed, for the rest. A request without a lock index state
+// reads the store each time.
 func (h *DavServer) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
-	if idx := lockBatchIndexFromContext(ctx); idx != nil && !idx.isStale() {
-		return idx.locksForPaths(paths), nil
+	idx := lockBatchIndexFromContext(ctx)
+	if idx == nil || idx.isStale() {
+		locks, err := h.store.Locks.ListByResources(ctx, paths)
+		if err != nil {
+			return nil, err
+		}
+		if state := davRequestStateFromContext(ctx); state != nil {
+			state.setLockIndex(newLockBatchIndex(paths, locks))
+		}
+		return locks, nil
 	}
-	return h.store.Locks.ListByResources(ctx, paths)
+	if missing := idx.unfetched(paths); len(missing) > 0 {
+		locks, err := h.store.Locks.ListByResources(ctx, missing)
+		if err != nil {
+			return nil, err
+		}
+		idx.add(missing, locks)
+	}
+	return idx.locksForPaths(paths), nil
 }
 
 // prefetchLockBatchIndex fetches, in a single query, every lock that could
@@ -671,12 +676,7 @@ func (h *DavServer) prefetchLockBatchIndex(ctx context.Context, responses []resp
 	if err != nil {
 		return nil, err
 	}
-	byPath := make(map[string][]store.Lock, len(locks))
-	for i := range locks {
-		key := cleanDAVPath(locks[i].ResourcePath)
-		byPath[key] = append(byPath[key], locks[i])
-	}
-	return withLockBatchIndex(ctx, &lockBatchIndex{byPath: byPath}), nil
+	return withLockBatchIndex(ctx, newLockBatchIndex(union, locks)), nil
 }
 
 func (h *DavServer) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {

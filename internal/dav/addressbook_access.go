@@ -149,15 +149,16 @@ func (pc *addressBookPrivilegeContext) decide(privilege string) (allowed, denied
 	if pc.owner {
 		return true, false
 	}
-	if granted, applicable := acl.DecisionForPrivilege(pc.resourceEntries, pc.principals, privilege); applicable {
+	if granted, applicable := acl.DecisionThroughLayers(pc.principals, privilege, pc.resourceEntries, pc.collectionEntries); applicable {
 		return granted, !granted
 	}
-	if !pc.sameCollection {
-		if granted, applicable := acl.DecisionForPrivilege(pc.collectionEntries, pc.principals, privilege); applicable {
-			return granted, !granted
-		}
-	}
 	return false, false
+}
+
+// reports is whether current-user-privilege-set lists privilege, as
+// acl.HeldThroughLayers decides it.
+func (pc *addressBookPrivilegeContext) reports(privilege string) bool {
+	return pc.owner || acl.HeldThroughLayers(pc.principals, privilege, pc.resourceEntries, pc.collectionEntries)
 }
 
 func (h *DavServer) addressBookPrivilegeDecision(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath, privilege string) (bool, bool, error) {
@@ -218,10 +219,10 @@ func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.Addre
 // O(N) in ACL repository queries.
 func (h *DavServer) prefetchAddressBookACLEntries(ctx context.Context, user *store.User, bookID int64, resourceNames []string) (map[string][]store.ACLEntry, error) {
 	collectionPath := addressBookCollectionResourcePath(bookID)
-	relevantPaths := make([]string, 0, 1+2*len(resourceNames))
+	relevantPaths := make([]string, 0, 1+len(resourceNames))
 	relevantPaths = append(relevantPaths, collectionPath)
 	for _, resourceName := range resourceNames {
-		relevantPaths = append(relevantPaths, objectACLPaths(collectionPath, resourceName)...)
+		relevantPaths = append(relevantPaths, objectStatePath(collectionPath, resourceName))
 	}
 	return h.prefetchACLEntries(ctx, user, relevantPaths)
 }

@@ -395,6 +395,8 @@ func contactWriteFlashError(r *http.Request, err error, fallback string) string 
 		return "The contact contains characters it cannot store."
 	case errors.Is(err, contacts.ErrCardNotEditable):
 		return "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead."
+	case errors.Is(err, contacts.ErrUnwritableName):
+		return unwritableContactMessage
 	case errors.Is(err, contacts.ErrPreconditionFailed):
 		return "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again."
 	case errors.Is(err, contacts.ErrChangedConcurrently):
@@ -405,6 +407,10 @@ func contactWriteFlashError(r *http.Request, err error, fallback string) string 
 	httperrors.LogError(r, fallback, err)
 	return fallback
 }
+
+// unwritableContactMessage is the flash text for a write refused because the
+// contact is stored under a name no href carries.
+const unwritableContactMessage = "This contact is stored under a name that cannot be kept. Delete it, or move it to another name in a CardDAV client."
 
 // contactKeptChangingMessage is the flash text for a contact write given up
 // because another client kept changing the contact or its access under it.
@@ -664,6 +670,8 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, sourcePage, map[string]string{"error": contactKeptChangingMessage("moved")})
 	case errors.Is(err, contacts.ErrConflict):
 		h.redirect(w, r, sourcePage, map[string]string{"error": "contact already exists in target address book"})
+	case errors.Is(err, contacts.ErrUnwritableName):
+		h.redirect(w, r, sourcePage, map[string]string{"error": unwritableContactMessage})
 	default:
 		httperrors.LogError(r, "failed to move contact", err)
 		h.redirect(w, r, sourcePage, map[string]string{"error": "failed to move contact"})

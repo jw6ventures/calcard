@@ -279,6 +279,12 @@ CREATE TABLE IF NOT EXISTS locks (
 );
 CREATE INDEX IF NOT EXISTS idx_locks_resource ON locks(resource_path);
 CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks(expires_at);
+-- Serves the scans for every lock beneath a collection, a LIKE on the path
+-- prefix, whatever the database's collation: text_pattern_ops compares
+-- byte-wise, which a prefix LIKE needs and the default btree does not give
+-- under a linguistic collation.
+CREATE INDEX IF NOT EXISTS idx_locks_resource_path_pattern
+    ON locks (resource_path text_pattern_ops);
 
 -- ACL entries for WebDAV access control (RFC 3744)
 CREATE TABLE IF NOT EXISTS acl_entries (
@@ -367,26 +373,17 @@ CREATE TRIGGER trg_contacts_increment_ctag
 AFTER INSERT OR UPDATE OR DELETE ON contacts
 FOR EACH ROW EXECUTE FUNCTION increment_address_book_ctag();
 
--- Normalized ACL join keys for object-level access checks. resource_path_norm
--- and object_acl_path both drop the trailing .ics/.vcf extension so a grant
--- stored with or without it lines up. Maintained as STORED generated columns so
--- the normalization is always correct on write and can be indexed.
-ALTER TABLE acl_entries
-    ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
-    GENERATED ALWAYS AS (regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i')) STORED;
-
+-- The path an object's ACL entries, locks and dead properties are stored at:
+-- its collection's canonical path and its stored name, exactly, or its UID
+-- where it has no name (store.MemberStatePath). The object-level ACL decisions
+-- join acl_entries.resource_path to it by plain equality. A STORED generated
+-- column is always correct on write and can be indexed.
 ALTER TABLE events
     ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || regexp_replace(resource_name, '\.ics$', '', 'i')) STORED;
+    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
 
-CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
-    ON acl_entries (principal_href, is_grant, resource_path_norm);
-
--- The object-level decisions read one resource's entries by
--- resource_path_norm; idx_acl_principal_grant_norm leads with the principal, so
--- it would read every entry the principal holds to find them.
-CREATE INDEX IF NOT EXISTS idx_acl_resource_path_norm
-    ON acl_entries (resource_path_norm);
+CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_path
+    ON acl_entries (principal_href, is_grant, resource_path);
 
 CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
     ON events (object_acl_path);
@@ -442,7 +439,7 @@ CREATE INDEX IF NOT EXISTS idx_acl_resource_path_pattern
 
 ALTER TABLE contacts
     ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;
+    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
 
 CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
     ON contacts (object_acl_path);

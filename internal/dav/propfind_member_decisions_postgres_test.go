@@ -27,7 +27,8 @@ const memberDecisionSyncBody = `<?xml version="1.0" encoding="utf-8"?>
 const memberDecisionCalendarQueryBody = `<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/></d:prop><c:filter><c:comp-filter name="VCALENDAR"/></c:filter></c:calendar-query>`
 
-// memberACL is an ACL stored at one spelling of a member's path.
+// memberACL is an ACL stored at the state path of the member storedName,
+// which need not be the member it is listed under.
 type memberACL struct {
 	storedName string
 	entries    []store.ACLEntry
@@ -36,7 +37,8 @@ type memberACL struct {
 // A Depth: 1 PROPFIND and the listing REPORTs have to list exactly the members
 // a request naming each one may read, the PROPFIND describing each listed
 // member exactly as a Depth: 0 PROPFIND of that member does, whatever the
-// member is named and whichever spelling of its path its ACL is stored under.
+// member is named. Only the ACL stored at a member's own path decides for it:
+// one stored under another spelling of its name is another resource's.
 func TestPostgres_PropfindListsAndDescribesEachMemberAsItsOwnRequestDoes(t *testing.T) {
 	database := newDAVPostgresStore(t)
 	ctx := t.Context()
@@ -151,25 +153,24 @@ func TestPostgres_PropfindListsAndDescribesEachMemberAsItsOwnRequestDoes(t *test
 					grant(shareeHref, "read"), deny(shareeHref, "read"))}}, true},
 				"deny-then-grant": {[]memberACL{{storedName: "deny-then-grant", entries: positioned(
 					deny(acl.PrincipalAll, "read"), grant(shareeHref, "read"))}}, false},
-				"stored-with-ext": {[]memberACL{{storedName: "stored-with-ext" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, false},
-				// Members named with the extension the store strips, in either case,
-				// with their ACL stored under the canonical spelling the ACL method
-				// writes, under the spelling without the extension, and under the
-				// legacy spelling with it in lower case.
-				"named" + domain.ext:     {[]memberACL{{storedName: "named", entries: positioned(deny(shareeHref, "read"))}}, false},
+				"stored-with-ext": {[]memberACL{{storedName: "stored-with-ext" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, true},
+				// Members named with the extension a request strips, in either
+				// case, with a denial stored at their own path, which the ACL
+				// method writes, or at another spelling of their name.
+				"named" + domain.ext:     {[]memberACL{{storedName: "named", entries: positioned(deny(shareeHref, "read"))}}, true},
 				"legacy" + domain.ext:    {[]memberACL{{storedName: "legacy" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, false},
-				"Shout" + upper:          {[]memberACL{{storedName: "Shout" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, false},
+				"Shout" + upper:          {[]memberACL{{storedName: "Shout" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, true},
 				"Quiet" + upper:          {[]memberACL{{storedName: "Quiet" + upper, entries: positioned(deny(shareeHref, "read"))}}, false},
 				"uid@example.com":        {[]memberACL{{storedName: "uid@example.com", entries: positioned(grant(strangerHref, "read-acl"), deny(shareeHref, "read"))}}, false},
 				"dotted":                 {[]memberACL{{storedName: "dotted", entries: positioned(deny(shareeHref, "read"), deny(acl.PrincipalAuthenticated, "read"))}}, false},
 				"dotted.name":            {nil, true},
 				"all-grant":              {[]memberACL{{storedName: "all-grant", entries: positioned(grant(acl.PrincipalAll, "read", "read-current-user-privilege-set"))}}, true},
 				"write-only":             {[]memberACL{{storedName: "write-only", entries: positioned(deny(strangerHref, "read"), grant(strangerHref, "write-content"))}}, true},
-				"two-spellings":          {[]memberACL{{storedName: "two-spellings", entries: positioned(grant(strangerHref, "read-acl"))}, {storedName: "two-spellings" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, false},
+				"two-spellings":          {[]memberACL{{storedName: "two-spellings", entries: positioned(grant(strangerHref, "read-acl"))}, {storedName: "two-spellings" + domain.ext, entries: positioned(deny(shareeHref, "read"))}}, true},
 				"owner-property-deny":    {[]memberACL{{storedName: "owner-property-deny", entries: positioned(deny(acl.PrincipalPropertyOwner, "read-acl"), grant(shareeHref, "read-acl"))}}, true},
 				"unauthenticated-denied": {[]memberACL{{storedName: "unauthenticated-denied", entries: positioned(deny(acl.PrincipalUnauthenticated, "read"))}}, true},
-				// A name the store does not strip, whose ACL also covers its path
-				// with the extension added.
+				// A name with no stem before its dot, and an ACL stored at the
+				// name with the extension added, another resource's.
 				".hidden": {[]memberACL{{storedName: ".hidden" + domain.ext, entries: positioned(deny(shareeHref, "read-acl"))}}, true},
 			}
 

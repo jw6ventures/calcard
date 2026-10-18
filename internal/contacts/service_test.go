@@ -396,7 +396,9 @@ func TestListContactsHonorsACEOrderAcrossPrincipalQueries(t *testing.T) {
 	}
 }
 
-func TestCanReadContactHonorsACEOrderAcrossResourceAliases(t *testing.T) {
+// A contact's ACL is the entries at its own state path: the deny at
+// contact.vcf is the ACL of the contact of that name, not of contact.
+func TestCanReadContactReadsOnlyItsOwnPath(t *testing.T) {
 	entries := map[string][]store.ACLEntry{
 		"/dav/addressbooks/1/contact": {
 			{ID: 2, ResourcePath: "/dav/addressbooks/1/contact", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read", Position: 1},
@@ -406,8 +408,11 @@ func TestCanReadContactHonorsACEOrderAcrossResourceAliases(t *testing.T) {
 		},
 	}
 
-	if canReadContactFromEntries(sharee, 1, owner.ID, "contact", entries) {
-		t.Fatal("canReadContactFromEntries() ignored earlier deny on a resource alias")
+	if !canReadContactFromEntries(sharee, 1, owner.ID, "contact", entries) {
+		t.Error("contact is decided by the ACL of contact.vcf")
+	}
+	if canReadContactFromEntries(sharee, 1, owner.ID, "contact.vcf", entries) {
+		t.Error("contact.vcf is not decided by its own deny")
 	}
 }
 
@@ -617,6 +622,25 @@ func TestShareDoesNotClobberConcurrentGrant(t *testing.T) {
 	}
 	if len(shares) != 2 {
 		t.Fatalf("ListAddressBookShares() = %#v, want both the concurrent and the new share", shares)
+	}
+}
+
+// A grant naming the user by its principal href without the trailing slash
+// is the user's, as every decider reads it, so the share list shows it.
+func TestListAddressBookSharesIncludesAGrantToTheSlashlessPrincipalHref(t *testing.T) {
+	svc := NewService(&store.Store{
+		AddressBooks: &fakeAB{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: owner.ID, Name: "Owner book"}}},
+		ACLEntries: &fakeACL{entries: []store.ACLEntry{
+			{ID: 1, ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/2", IsGrant: true, Privilege: "read"},
+		}},
+	})
+
+	shares, err := svc.ListAddressBookShares(context.Background(), owner, 1)
+	if err != nil {
+		t.Fatalf("ListAddressBookShares() error = %v", err)
+	}
+	if len(shares) != 1 || shares[0].UserID != 2 || shares[0].Editor {
+		t.Fatalf("ListAddressBookShares() = %#v, want a read-only share with user 2", shares)
 	}
 }
 
@@ -952,5 +976,34 @@ func TestDowngradeToViewerRevokesContactLevelWriteGrants(t *testing.T) {
 				t.Fatalf("downgrade removed the owner's contact-level read grant: %#v", aclRepo.entries)
 			}
 		})
+	}
+}
+
+// A 1.1.x release could store a contact as "." or "..", which name the book or
+// its parent once a path is cleaned. Such a contact can be read, deleted, or
+// moved to another name over CardDAV, but not written in place, nor moved to
+// another book under the same name.
+func TestAContactStoredUnderANameNoHrefCarriesIsNotWritten(t *testing.T) {
+	for _, name := range []string{".", ".."} {
+		svc, _ := newTestService()
+		books := svc.store.AddressBooks.(*fakeAB)
+		books.books[2] = &store.AddressBook{ID: 2, UserID: 1, Name: "Other book"}
+		contacts := svc.store.Contacts.(*fakeContacts)
+		legacy := contacts.items["1:c1"]
+		legacy.ResourceName = name
+		contacts.items["1:c1"] = legacy
+
+		if _, _, err := svc.UpdateContact(context.Background(), owner, 1, "c1", uvCard("c1")); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("UpdateContact of the contact stored as %q: error = %v, want ErrBadRequest", name, err)
+		}
+		if err := svc.MoveContact(context.Background(), owner, 1, 2, "c1"); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("MoveContact of the contact stored as %q: error = %v, want ErrBadRequest", name, err)
+		}
+		if stored := contacts.items["1:c1"]; stored.ETag != "e1" || stored.ResourceName != name {
+			t.Errorf("the contact stored as %q was written: %+v", name, stored)
+		}
+		if err := svc.DeleteContact(context.Background(), owner, 1, "c1", "", ""); err != nil {
+			t.Errorf("DeleteContact of the contact stored as %q: %v", name, err)
+		}
 	}
 }

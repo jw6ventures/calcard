@@ -106,9 +106,9 @@ func (l *ContactListing) collectionACLEntriesViaRepository(ctx context.Context, 
 }
 
 // ContactNamesForACLPaths returns the identity of every contact in the address
-// book whose ACL path, its resource path less a trailing .vcf in any case, is
-// one of aclPaths, and of every contact with no resource name, whose ACL path
-// its UID gives instead. A store without a database returns every contact.
+// book whose state path (MemberStatePath of its stored name, or of its UID
+// when it has none) is one of aclPaths. A store without a database returns
+// every contact.
 func (l *ContactListing) ContactNamesForACLPaths(ctx context.Context, addressBookID int64, aclPaths []string) ([]ContactName, error) {
 	if l.tx == nil {
 		contacts, err := l.allContacts(ctx, addressBookID)
@@ -122,7 +122,7 @@ func (l *ContactListing) ContactNamesForACLPaths(ctx context.Context, addressBoo
 		return names, nil
 	}
 	const q = `SELECT id, uid, resource_name FROM contacts
-WHERE address_book_id=$1 AND (object_acl_path = ANY($2) OR resource_name = '')`
+WHERE address_book_id=$1 AND object_acl_path = ANY($2)`
 	defer observeDB(ctx, "contacts.list_names_for_acl_paths")()
 	rows, err := l.tx.QueryContext(ctx, q, addressBookID, pq.Array(aclPaths))
 	if err != nil {

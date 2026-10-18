@@ -40,6 +40,12 @@ var (
 	// destination address book, or of a destination book the user can reach.
 	// It is ErrForbidden.
 	ErrDestinationForbidden = fmt.Errorf("%w: the destination address book does not admit the contact", ErrForbidden)
+
+	// ErrUnwritableName refuses a write that would keep a contact under a name
+	// no href carries, such as "." as a 1.1.x release could store it. Such a
+	// contact can be read, deleted, or moved over CardDAV to another name. It
+	// is ErrBadRequest.
+	ErrUnwritableName = fmt.Errorf("%w: the contact is stored under a name that cannot be kept; it can be read, deleted or moved to another name", ErrBadRequest)
 )
 
 // FieldError is a refused structured payload field. Field is the
@@ -263,10 +269,7 @@ func (d *readDecider) selection(ctx context.Context, listing *store.ContactListi
 		if !strings.HasPrefix(resourcePath, memberPrefix) {
 			continue
 		}
-		// A contact's entries sit on its ACL path and on that path with .vcf
-		// (addressBookACLResourcePaths), and the store finds the contact by
-		// its ACL path.
-		aclPaths = append(aclPaths, resourcePath, strings.TrimSuffix(resourcePath, ".vcf"))
+		aclPaths = append(aclPaths, resourcePath)
 	}
 	if len(aclPaths) == 0 {
 		return selection, nil
@@ -494,6 +497,9 @@ func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookI
 		}
 		return nil, err
 	}
+	if err := writableContactName(resourceName); err != nil {
+		return nil, err
+	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
 		return nil, ErrPreconditionFailed
 	}
@@ -525,6 +531,18 @@ func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookI
 		return nil, err
 	}
 	return result.Contact, nil
+}
+
+// writableContactName refuses a write that would keep a contact under
+// resourceName when store.ValidMemberName refuses it, as a 1.1.x release could
+// store one: its state path names the book, or the book's parent, once
+// cleaned. Such a contact can still be read, deleted, or moved over CardDAV to
+// another name.
+func writableContactName(resourceName string) error {
+	if !store.ValidMemberName(resourceName) {
+		return fmt.Errorf("%w: %q", ErrUnwritableName, resourceName)
+	}
+	return nil
 }
 
 // missingContactUpdate is the answer to an update of a UID book does not hold:
@@ -662,6 +680,9 @@ func (s *Service) moveContactOnce(ctx context.Context, user *store.User, fromBoo
 	if fromBookID == toBookID {
 		return nil
 	}
+	if err := writableContactName(resourceName); err != nil {
+		return err
+	}
 	fromPaths := addressBookACLResourcePaths(fromBookID, resourceName)
 	toPaths := addressBookACLResourcePaths(toBookID, resourceName)
 	if len(fromPaths) == 0 || len(toPaths) == 0 {
@@ -712,24 +733,25 @@ func newRemovalACL(user *store.User, book *store.AddressBook, resourceName strin
 	}
 }
 
-// holdsAny reports whether the user holds some memberPrivilege on the contact,
-// or, with atMember false, on the book itself; and, when not, whether some was
-// denied rather than left undecided.
-func (a *removalACL) holdsAny(atMember bool) (held, denied bool) {
+// holding reports what the user holds of memberPrivileges on the contact, or,
+// with atMember false, on the book itself.
+func (a *removalACL) holding(atMember bool) acl.Holding {
+	denied := false
 	for _, privilege := range memberPrivileges {
-		granted, decided := false, false
+		layers := [][]store.ACLEntry{a.book}
 		if atMember {
-			granted, decided = acl.DecisionForPrivilege(a.member, a.principals, privilege)
+			layers = [][]store.ACLEntry{a.member, a.book}
 		}
-		if !decided {
-			granted, decided = acl.DecisionForPrivilege(a.book, a.principals, privilege)
-		}
+		granted, decided := acl.DecisionThroughLayers(a.principals, privilege, layers...)
 		if granted {
-			return true, false
+			return acl.HoldsSome
 		}
 		denied = denied || decided
 	}
-	return false, denied
+	if denied {
+		return acl.HoldsDenied
+	}
+	return acl.HoldsNothing
 }
 
 func (a *removalACL) granted(privilege string) bool {
@@ -754,27 +776,14 @@ func requireDeletion(user *store.User, book *store.AddressBook, resourceName str
 		return ErrNotFound
 	}
 	decision := newRemovalACL(user, book, resourceName, pinned)
-	held, denied := decision.holdsAny(true)
-	switch {
-	case held && decision.granted("unbind"):
+	switch acl.DecideRemoval(decision.holding(true), decision.holding(false), decision.granted("unbind"), exists) {
+	case acl.RemovalAllowed:
 		return nil
-	case held:
-		return ErrForbidden
-	case !denied:
+	case acl.RemovalAbsent:
 		return ErrNotFound
-	case !exists:
+	default:
 		return ErrForbidden
 	}
-	if held, denied := decision.holdsAny(false); !held {
-		if denied {
-			return ErrForbidden
-		}
-		return ErrNotFound
-	}
-	if !decision.granted("unbind") {
-		return ErrForbidden
-	}
-	return ErrNotFound
 }
 
 // requireMoveOut decides and answers the source side of a move of the contact
@@ -789,7 +798,7 @@ func requireMoveOut(user *store.User, book *store.AddressBook, resourceName stri
 		return ErrNotFound
 	}
 	decision := newRemovalACL(user, book, resourceName, pinned)
-	if held, _ := decision.holdsAny(true); !held {
+	if decision.holding(true) != acl.HoldsSome {
 		return ErrNotFound
 	}
 	if !decision.granted("unbind") {
@@ -879,33 +888,31 @@ func (s *Service) ListAccessibleAddressBooks(ctx context.Context, user *store.Us
 		return result, nil
 	}
 
-	for _, principal := range acl.PrincipalHrefs(user) {
-		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, principal)
+	entries, err := s.store.ACLEntries.ListByPrincipals(ctx, acl.PrincipalHrefs(user))
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		bookID, ok := addressBookIDFromCollectionPath(entry.ResourcePath)
+		if !ok {
+			continue
+		}
+		if _, ok := seen[bookID]; ok {
+			continue
+		}
+		seen[bookID] = struct{}{}
+		book, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "read")
+		if err != nil {
+			if err == ErrNotFound || err == ErrForbidden {
+				continue
+			}
+			return nil, err
+		}
+		access, err := s.AddressBookAccessFor(ctx, user, *book)
 		if err != nil {
 			return nil, err
 		}
-		for _, entry := range entries {
-			bookID, ok := addressBookIDFromCollectionPath(entry.ResourcePath)
-			if !ok {
-				continue
-			}
-			if _, ok := seen[bookID]; ok {
-				continue
-			}
-			book, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "read")
-			if err != nil {
-				if err == ErrNotFound || err == ErrForbidden {
-					continue
-				}
-				return nil, err
-			}
-			seen[bookID] = struct{}{}
-			access, err := s.AddressBookAccessFor(ctx, user, *book)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, access)
-		}
+		result = append(result, access)
 	}
 	return result, nil
 }
@@ -1002,7 +1009,7 @@ func validateStructuredFields(input *StructuredInput) error {
 // safeResourceSegment reports whether a UID can name a new contact's resource
 // as a single path segment without escaping.
 func safeResourceSegment(uid string) bool {
-	if uid == "" || uid == "." || uid == ".." {
+	if !store.ValidMemberName(uid) {
 		return false
 	}
 	for i := 0; i < len(uid); i++ {

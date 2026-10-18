@@ -7,15 +7,18 @@
 -- which of the v1.1.6-v1.1.9 schema changes an installation holds, so this file
 -- makes every one of them, each idempotently, before anything that reads them.
 
--- The indexes this upgrade retires go first, so the rewrites below do not
--- rebuild them and the backfills do not maintain them row by row.
--- idx_acl_unique gives way to idx_acl_resource_order, and idx_events_calendar_id
--- and idx_contacts_address_book_id are leading-column prefixes of the keyset
--- indexes built below and serve no lookup those cannot. The three stamp
--- indexes give way to the change-stream indexes built below, which add the id
--- to their stamp and serve every read the stamp alone did;
+-- The indexes this upgrade retires or builds again go first, so the rewrites
+-- below do not rebuild them and the backfills and repairs do not maintain them
+-- row by row. idx_acl_unique gives way to idx_acl_resource_order, and
+-- idx_events_calendar_id and idx_contacts_address_book_id are leading-column
+-- prefixes of the keyset indexes built below and serve no lookup those cannot.
+-- The three stamp indexes give way to the change-stream indexes built below,
+-- which add the id to their stamp and serve every read the stamp alone did;
 -- idx_deleted_resources_keyset, which a v1.2.0 release candidate built, is
--- superseded the same way.
+-- superseded the same way. The recurrence and keyset indexes are built again
+-- below, after the repairs that write the columns they read: the v1.1.7 pair
+-- on other expressions, and the keyset pair narrower, where a release
+-- candidate built them.
 DROP INDEX IF EXISTS idx_acl_unique;
 DROP INDEX IF EXISTS idx_events_calendar_id;
 DROP INDEX IF EXISTS idx_contacts_address_book_id;
@@ -23,23 +26,14 @@ DROP INDEX IF EXISTS idx_events_last_modified;
 DROP INDEX IF EXISTS idx_contacts_last_modified;
 DROP INDEX IF EXISTS idx_deleted_resources_lookup;
 DROP INDEX IF EXISTS idx_deleted_resources_keyset;
+DROP INDEX IF EXISTS idx_events_recurrence_start;
+DROP INDEX IF EXISTS idx_events_recurrence_until;
+DROP INDEX IF EXISTS idx_events_calendar_keyset;
+DROP INDEX IF EXISTS idx_contacts_book_keyset;
 
--- v1.1.6: normalized, indexable join keys for the object-level ACL checks.
--- resource_path_norm and object_acl_path drop the trailing .ics/.vcf extension
--- so a grant stored with or without it lines up by plain equality. They are
--- STORED generated columns: adding one rewrites its table to fill the existing
--- rows, and every later write keeps it correct with no application changes.
--- idx_events_object_acl_path is built after the recurrence repair below, and
--- idx_acl_principal_grant_norm and idx_acl_resource_path_norm after the
--- ace_order backfill.
-
-ALTER TABLE acl_entries
-    ADD COLUMN IF NOT EXISTS resource_path_norm TEXT
-    GENERATED ALWAYS AS (regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i')) STORED;
-
-ALTER TABLE events
-    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || regexp_replace(resource_name, '\.ics$', '', 'i')) STORED;
+-- v1.1.6: indexable join keys for the object-level ACL checks. The resource
+-- identity repair below adds them, as events.object_acl_path and
+-- contacts.object_acl_path, once it has rewritten the ACL entries they join.
 
 -- v1.1.7: recurrence_start and recurrence_until bound a recurring resource's
 -- instances so calendar-query time ranges can use an index; both are NULL for a
@@ -50,7 +44,8 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
 
 -- v1.1.8: persistent DAV dead properties and scoped ACL lookup indexes.
--- idx_acl_resource_principal is built after the ace_order backfill below.
+-- idx_acl_resource_principal is built after the ace_order backfill below, and
+-- contacts.object_acl_path by the resource identity repair.
 
 CREATE TABLE IF NOT EXISTS dav_dead_properties (
     resource_path TEXT NOT NULL,
@@ -64,13 +59,6 @@ CREATE TABLE IF NOT EXISTS dav_dead_properties (
 
 CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
     ON dav_dead_properties (resource_path);
-
-ALTER TABLE contacts
-    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
-    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || regexp_replace(resource_name, '\.vcf$', '', 'i')) STORED;
-
-CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
-    ON contacts (object_acl_path);
 
 -- v1.1.9: display names from the OAuth profile.
 
@@ -111,12 +99,9 @@ ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];
 -- user-specific denial answer first and admit a principal the installation had
 -- denied.
 --
--- The partition is resource_path_norm, the column the object-level predicates
--- join on, so an ACE stored as /path/x.ics and one stored as /path/x order
--- against each other here exactly as they are evaluated. The resulting
--- ace_order values are not contiguous within a single resource_path, which
--- nothing requires: the ACL method rewrites every position on write, and the
--- reader groups on a change of position rather than on its value.
+-- The partition is resource_path: the entries at one path are one resource's
+-- ACL. The resource identity repair below decides how entries stored under
+-- another spelling of a member's name take part in that member's ACL.
 DO $$
 DECLARE
     backfill_needed BOOLEAN;
@@ -132,7 +117,7 @@ BEGIN
 
     IF backfill_needed THEN
         WITH ordered AS (
-            SELECT id, ROW_NUMBER() OVER (PARTITION BY resource_path_norm ORDER BY is_grant, created_at, id) - 1 AS position
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY resource_path ORDER BY is_grant, created_at, id) - 1 AS position
             FROM acl_entries
         )
         UPDATE acl_entries AS entry
@@ -142,14 +127,534 @@ BEGIN
     END IF;
 END $$;
 
-CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_norm
-    ON acl_entries (principal_href, is_grant, resource_path_norm);
+-- ---------------------------------------------------------------------------
+-- Resource identity: one state path per stored resource.
+--
+-- A member's ACL entries, locks and dead properties are stored at its state
+-- path: its collection's canonical path and its stored resource name, exactly,
+-- or its UID where it has no name (store.MemberStatePath). RFC 3986 section
+-- 6.2.2.1 makes X, X.ics and X.ICS three resources, yet the v1.1.x releases
+-- and the v1.2.0 release candidates decided a member's privileges from the
+-- entries at other spellings of its name as well, each reader from its own
+-- set. With "the extension" meaning .ics in a calendar and .vcf in an address
+-- book, matched in any case, and white space being what strings.TrimSpace
+-- removes:
+--
+--   * a DAV request read the member's path less trailing white space, with
+--     the extension removed where it ends the name and leaves something
+--     before it, and that path with the extension added in lower case;
+--   * a GET, and a v1.1.x contact listing, read the same for the stored name
+--     with its last extension of any kind removed first, so a.b read a and
+--     a.ics;
+--   * a DAV listing, the REST API and the UI read the stored name, trimmed,
+--     and that name with the extension removed where it has it, or added in
+--     lower case where it has not; a name that is nothing but the extension
+--     read its collection's entries;
+--   * the v1.1.x SQL deciders read the stored name, that name with a
+--     lower-case .ics removed, and that with .ics added;
+--   * the release candidates' SQL deciders read every path that, less one
+--     .ics or .vcf in any case, is the stored name less the extension in any
+--     case.
+--
+-- Every reader honoured a denial at any path it read. This repair rewrites the
+-- ACL so that a member's decisions read its own entries only, and replaces the
+-- release candidates' join columns, which strip the extension, with ones that
+-- keep the name as it is stored. It runs once: until events.object_acl_path is
+-- generated as db.sql generates it, which this statement installs. For each
+-- member, and each other path any of those readers read for it:
+--
+--   * a deny entry stored there is copied to the member, ahead of the
+--     member's own entries, so it still refuses what any reader refused;
+--   * a grant entry at a member path is carried to the member, after its own
+--     entries, only where no member is stored under that path, no other
+--     member's decisions read it, and the member's DAV requests read it, so
+--     the entry decided this member's requests and this member's alone; a
+--     grant only another reader applied never decided a write;
+--   * any other grant at a member path stays with the member stored there,
+--     or goes; either way it no longer reaches this member, and is reported.
+--
+-- Copied denials take positions ahead of the member's first and carried
+-- grants positions after its last, so its own entries keep theirs; each keeps
+-- the order of the readers above, then of the paths, then its own. A denial
+-- ahead of the member's own grant can refuse what the grant allowed; that
+-- errs towards refusing. Entries at a member path no member is stored under
+-- but some member read have then been carried to every member they applied
+-- to, and are removed. Each entry removed, and each grant withheld from a
+-- member that read it, is first kept in acl_entries_v120_removed, with the
+-- reason and the members that read it; the table is created only when there
+-- is such an entry.
+--
+-- A member whose decisions this changes -- one that read entries at another
+-- path, or holds entries of its own that a DAV request or GET read past -- is
+-- stamped as changed, and the event and contact repairs below move each
+-- collection holding one once, so a client syncing it, a sharee's among them,
+-- reads again what it may now access.
+--
+-- Entries and dead properties at a member path no member is stored under or
+-- read are left in place and reported; creating a member under that name
+-- clears them, as it clears whatever ACL and dead properties are stored at
+-- the path it takes. Dead properties are not rewritten: a member's own are at
+-- its own path, and the releases whose collection COPY merged the dead
+-- properties of every spelling into the copy wrote them at the copy's path.
+-- A lock was always taken at the state path of the name its request bound,
+-- so none is rewritten either; one stored at a path another member's DAV
+-- requests read covered that member as well, and now covers only the name it
+-- was taken on, which is reported. Also reported: members whose state paths
+-- coincide (one stored without a name, at its UID, beside one stored under
+-- that name), which share their state; and members whose stored names the
+-- releases' path handling resolved to another path -- a name with a "." or
+-- ".." segment, an empty one, a trailing "/", a "?", a "#" or a
+-- percent-encoded octet -- which no request reaches as itself, and whose
+-- other paths the repair reads without that resolution. At a member path that
+-- path.Clean changes, which DAV requests cleaned before reading but the SQL
+-- deciders read as stored, the denials stay; the grants, dead properties and
+-- locks, which only DAV requests would have applied, are removed: a lock there
+-- would refuse its collection's DELETE and MOVE with a token no request can
+-- submit.
+--
+-- Each report is a WARNING, which the server log records.
+-- docs/upgrade-1.2.0/leftover-state.sql lists what was left in place.
+--
+-- Every join below is on equal paths, so each step is linear in the rows it
+-- reads.
+DO $identity$
+DECLARE
+    repair_needed BOOLEAN;
+    copied_denials BIGINT;
+    carried_grants BIGINT;
+    changed_members BIGINT;
+    changed_sample TEXT;
+    removed_entries BIGINT;
+    removed_denials BIGINT;
+    removed_carried BIGINT;
+    removed_sample TEXT;
+    withheld_grants BIGINT;
+    withheld_sample TEXT;
+    unread_entries BIGINT;
+    unread_entry_sample TEXT;
+    unread_properties BIGINT;
+    unread_property_sample TEXT;
+    narrowed_locks BIGINT;
+    narrowed_lock_sample TEXT;
+    shared_paths BIGINT;
+    shared_sample TEXT;
+    resolved_names BIGINT;
+    resolved_sample TEXT;
+    resolved_locks BIGINT;
+    resolved_entries BIGINT;
+    resolved_properties BIGINT;
+    resolved_state_sample TEXT;
+BEGIN
+    SELECT NOT EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = 'events'::regclass
+          AND a.attname = 'object_acl_path'
+          AND NOT a.attisdropped
+          AND pg_get_expr(d.adbin, d.adrelid) LIKE '%NULLIF%'
+    ) INTO repair_needed;
 
--- The object-level decisions read one resource's entries by
--- resource_path_norm; idx_acl_principal_grant_norm leads with the principal, so
--- it would read every entry the principal holds to find them.
-CREATE INDEX IF NOT EXISTS idx_acl_resource_path_norm
-    ON acl_entries (resource_path_norm);
+    IF repair_needed THEN
+        CREATE TEMPORARY TABLE v120_members ON COMMIT DROP AS
+        SELECT stored.collection || '/' || stored.name AS own, stored.*
+        FROM (
+            SELECT '/dav/calendars/' || calendar_id::text AS collection,
+                   COALESCE(NULLIF(resource_name, ''), uid) AS name, resource_name, '.ics' AS ext
+            FROM events
+            UNION ALL
+            SELECT '/dav/addressbooks/' || address_book_id::text,
+                   COALESCE(NULLIF(resource_name, ''), uid), resource_name, '.vcf'
+            FROM contacts
+        ) AS stored;
+        ANALYZE v120_members;
+
+        -- Each path a reader read for a member, ranked in the order of the
+        -- readers above. An extension is the last dot of the name's last
+        -- segment and what follows it, as Go's path.Ext reads it; it is the
+        -- collection kind's when it folds to it as strings.EqualFold folds,
+        -- under which U+017F folds to s.
+        CREATE TEMPORARY TABLE v120_spellings ON COMMIT DROP AS
+        SELECT DISTINCT ON (read.member, read.spelling) read.member, read.spelling, read.rank
+        FROM (
+            SELECT m.own AS member, path.spelling, path.rank
+            FROM v120_members m
+            CROSS JOIN LATERAL (
+                SELECT regexp_replace(m.name, $re$[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]+$$re$, '') AS request,
+                       regexp_replace(m.name, $re$^[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]+|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]+$$re$, '', 'g') AS listed
+                OFFSET 0
+            ) AS trimmed
+            CROSS JOIN LATERAL (
+                SELECT request.stem AS request_stem, request.own_ext AS request_own_ext,
+                       listed.stem AS listed_stem, listed.own_ext AS listed_own_ext
+                FROM (SELECT left(trimmed.request, length(trimmed.request) - COALESCE(length(substring(trimmed.request FROM $re$\.[^/.]*$$re$)), 0)) AS stem,
+                             COALESCE(translate(lower(substring(trimmed.request FROM $re$\.[^/.]*$$re$)), 'ſ', 's') = m.ext, FALSE) AS own_ext) AS request,
+                     (SELECT left(trimmed.listed, length(trimmed.listed) - COALESCE(length(substring(trimmed.listed FROM $re$\.[^/.]*$$re$)), 0)) AS stem,
+                             COALESCE(translate(lower(substring(trimmed.listed FROM $re$\.[^/.]*$$re$)), 'ſ', 's') = m.ext, FALSE) AS own_ext) AS listed
+                OFFSET 0
+            ) AS split
+            -- The DAV request's base, and the base a GET read from the name
+            -- less its last extension.
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN split.request_own_ext AND split.request_stem <> '' THEN split.request_stem ELSE trimmed.request END AS request,
+                       CASE WHEN split.request_stem <> '' THEN split.request_stem ELSE trimmed.request END AS stored
+                OFFSET 0
+            ) AS named
+            CROSS JOIN LATERAL (
+                SELECT named.request,
+                       left(named.request, length(named.request) - COALESCE(length(substring(named.request FROM $re$\.[^/.]*$$re$)), 0)) <> '' AS request_extended,
+                       CASE WHEN COALESCE(translate(lower(substring(named.stored FROM $re$\.[^/.]*$$re$)), 'ſ', 's') = m.ext, FALSE)
+                                 AND left(named.stored, length(named.stored) - length(substring(named.stored FROM $re$\.[^/.]*$$re$))) <> ''
+                            THEN left(named.stored, length(named.stored) - length(substring(named.stored FROM $re$\.[^/.]*$$re$)))
+                            ELSE named.stored
+                       END AS stored
+                OFFSET 0
+            ) AS base
+            CROSS JOIN LATERAL (VALUES
+                (m.collection || '/' || base.request, 1),
+                (CASE WHEN base.request_extended THEN m.collection || '/' || base.request || m.ext END, 2),
+                (m.collection || '/' || base.stored, 3),
+                (CASE WHEN left(base.stored, length(base.stored) - COALESCE(length(substring(base.stored FROM $re$\.[^/.]*$$re$)), 0)) <> ''
+                      THEN m.collection || '/' || base.stored || m.ext END, 4),
+                (m.collection || '/' || trimmed.listed, 5),
+                (CASE WHEN NOT split.listed_own_ext THEN m.collection || '/' || trimmed.listed || m.ext
+                      WHEN split.listed_stem <> '' THEN m.collection || '/' || split.listed_stem
+                      ELSE m.collection END, 6),
+                (CASE WHEN split.listed_own_ext AND split.listed_stem = '' THEN m.collection || '/' END, 6),
+                (CASE WHEN m.ext = '.ics' THEN m.collection || '/' || m.resource_name END, 7),
+                (CASE WHEN m.ext = '.ics' THEN m.collection || '/' || regexp_replace(m.resource_name, '\.ics$', '') END, 8),
+                (CASE WHEN m.ext = '.ics' THEN m.collection || '/' || regexp_replace(m.resource_name, '\.ics$', '') || '.ics' END, 9)
+            ) AS path(spelling, rank)
+            WHERE path.spelling IS NOT NULL
+            UNION ALL
+            SELECT m.own, entry.resource_path, 10
+            FROM v120_members m
+            JOIN (
+                SELECT DISTINCT resource_path, regexp_replace(resource_path, '\.(ics|vcf)$', '', 'i') AS norm
+                FROM acl_entries
+                WHERE resource_path ~ '^/dav/(calendars|addressbooks)/[0-9]+/'
+            ) AS entry
+              ON entry.norm = m.collection || '/' || regexp_replace(m.resource_name, CASE m.ext WHEN '.ics' THEN '\.ics$' ELSE '\.vcf$' END, '', 'i')
+        ) AS read
+        WHERE read.spelling <> read.member
+        ORDER BY read.member, read.spelling, read.rank;
+
+        -- Only paths that hold entries matter; reader_count is how many
+        -- members' decisions read each, owned whether a member is stored
+        -- under it, member_path whether it is a member's path at all rather
+        -- than its collection's, and carries whether its grants go to the
+        -- member: a member path no member is stored under, read for this
+        -- member alone, and read by its DAV requests.
+        CREATE TEMPORARY TABLE v120_aliased ON COMMIT DROP AS
+        SELECT read.*, read.member_path AND NOT read.owned AND read.reader_count = 1 AND read.rank <= 2 AS carries
+        FROM (
+            SELECT s.member, s.spelling, s.rank,
+                   count(*) OVER (PARTITION BY s.spelling) AS reader_count,
+                   o.own IS NOT NULL AS owned,
+                   s.spelling ~ '^/dav/(calendars|addressbooks)/[0-9]+/.' AS member_path
+            FROM v120_spellings s
+            LEFT JOIN (SELECT DISTINCT own FROM v120_members) AS o ON o.own = s.spelling
+            WHERE s.spelling IN (SELECT resource_path FROM acl_entries)
+        ) AS read;
+        ANALYZE v120_aliased;
+
+        IF EXISTS (
+            SELECT 1
+            FROM v120_aliased a
+            JOIN acl_entries e ON e.resource_path = a.spelling
+            WHERE a.member_path AND (NOT a.owned OR e.is_grant)
+        ) OR EXISTS (
+            SELECT 1 FROM acl_entries
+            WHERE is_grant AND ('/' || substring(resource_path FROM '^/dav/(?:calendars|addressbooks)/[0-9]+/(.+)$') || '/') ~ '//|/\.\.?/'
+        ) THEN
+            CREATE TABLE IF NOT EXISTS acl_entries_v120_removed (
+                id BIGINT NOT NULL,
+                resource_path TEXT NOT NULL,
+                principal_href TEXT NOT NULL,
+                is_grant BOOLEAN NOT NULL,
+                privilege TEXT NOT NULL,
+                ace_order INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                still_stored BOOLEAN NOT NULL,
+                reason TEXT NOT NULL,
+                read_by TEXT[] NOT NULL
+            );
+            INSERT INTO acl_entries_v120_removed
+            SELECT e.id, e.resource_path, e.principal_href, e.is_grant, e.privilege, e.ace_order, e.created_at,
+                   path.owned,
+                   CASE
+                       WHEN path.owned THEN 'grant withheld from the members that read it at another spelling of their names; the member stored here keeps it'
+                       WHEN NOT e.is_grant THEN 'denial copied to every member that read it, then removed'
+                       WHEN path.carries THEN 'grant carried to the one member whose DAV requests read it, then removed'
+                       WHEN path.reader_count > 1 THEN 'grant withheld from the several members that read it, then removed'
+                       ELSE 'grant withheld from the member that read it, whose DAV requests did not, then removed'
+                   END,
+                   path.readers
+            FROM (
+                SELECT spelling, bool_or(owned) AS owned, max(reader_count) AS reader_count, bool_or(carries) AS carries,
+                       array_agg(member ORDER BY member) AS readers
+                FROM v120_aliased
+                WHERE member_path
+                GROUP BY spelling
+            ) AS path
+            JOIN acl_entries e ON e.resource_path = path.spelling
+            WHERE NOT path.owned OR e.is_grant;
+            INSERT INTO acl_entries_v120_removed
+            SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at, FALSE,
+                   'grant stored at a path that resolves to another, which no DAV request read, then removed', '{}'
+            FROM acl_entries
+            WHERE is_grant AND ('/' || substring(resource_path FROM '^/dav/(?:calendars|addressbooks)/[0-9]+/(.+)$') || '/') ~ '//|/\.\.?/';
+        END IF;
+
+        WITH carried AS (
+            SELECT a.member, a.rank, a.spelling, e.id, e.principal_href, e.is_grant, e.privilege, e.ace_order, e.created_at
+            FROM v120_aliased a
+            JOIN acl_entries e ON e.resource_path = a.spelling
+            WHERE NOT e.is_grant OR a.carries
+        ),
+        placed AS (
+            SELECT c.*,
+                   row_number() OVER (PARTITION BY c.member, c.is_grant ORDER BY c.rank, c.spelling, c.ace_order, c.id) AS place,
+                   count(*) OVER (PARTITION BY c.member, c.is_grant) AS places
+            FROM carried c
+        ),
+        inserted AS (
+            INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at)
+            SELECT p.member, p.principal_href, p.is_grant, p.privilege,
+                   CASE
+                       WHEN p.is_grant THEN COALESCE(own.last, -1) + p.place
+                       ELSE COALESCE(own.first, 0) - p.places - 1 + p.place
+                   END,
+                   p.created_at
+            FROM placed p
+            LEFT JOIN (
+                SELECT resource_path, min(ace_order) AS first, max(ace_order) AS last FROM acl_entries GROUP BY resource_path
+            ) AS own ON own.resource_path = p.member
+            ORDER BY p.member, p.is_grant, p.place
+            RETURNING resource_path, is_grant
+        )
+        SELECT count(*) FILTER (WHERE NOT is_grant), count(*) FILTER (WHERE is_grant), count(DISTINCT resource_path),
+               (SELECT string_agg(path, ', ' ORDER BY path) FROM (SELECT DISTINCT resource_path AS path FROM inserted ORDER BY 1 LIMIT 50) AS sample)
+        FROM inserted
+        INTO copied_denials, carried_grants, changed_members, changed_sample;
+
+        WITH withheld AS (
+            SELECT a.spelling || ' -> ' || a.member AS pair
+            FROM v120_aliased a
+            JOIN acl_entries e ON e.resource_path = a.spelling
+            WHERE a.member_path AND e.is_grant AND NOT a.carries
+        )
+        SELECT count(*), (SELECT string_agg(pair, ', ' ORDER BY pair) FROM (SELECT DISTINCT pair FROM withheld ORDER BY 1 LIMIT 50) AS sample)
+        FROM withheld
+        INTO withheld_grants, withheld_sample;
+
+        WITH removed AS (
+            DELETE FROM acl_entries e
+            USING (SELECT spelling, bool_or(carries) AS carries FROM v120_aliased WHERE member_path AND NOT owned GROUP BY spelling) AS unowned
+            WHERE e.resource_path = unowned.spelling
+            RETURNING e.resource_path, e.is_grant, unowned.carries
+        )
+        SELECT count(*), count(*) FILTER (WHERE NOT is_grant), count(*) FILTER (WHERE is_grant AND carries),
+               (SELECT string_agg(path, ', ' ORDER BY path) FROM (SELECT DISTINCT resource_path AS path FROM removed ORDER BY 1 LIMIT 50) AS sample)
+        FROM removed
+        INTO removed_entries, removed_denials, removed_carried, removed_sample;
+
+        -- State at a member path that path.Clean changes -- a name with a "."
+        -- or ".." segment, an empty one, or a trailing "/". A DAV request
+        -- cleaned the path to another before it read any state, and so did
+        -- the DAV listing, the REST API and the UI. The SQL deciders, the
+        -- v1.1.x ones, the release candidates' and 1.2.0's own, read the
+        -- member's ACL there as stored, so its denials stay. Its grants, which
+        -- no DAV request read and no write was decided by, go, kept in
+        -- acl_entries_v120_removed, as do its dead properties, which only DAV
+        -- requests read. Its locks go: one would refuse a DELETE or MOVE of
+        -- its collection that no request can submit its token for.
+        WITH resolved AS (
+            SELECT 'lock' AS kind, resource_path FROM locks
+            WHERE ('/' || substring(resource_path FROM '^/dav/(?:calendars|addressbooks)/[0-9]+/(.+)$') || '/') ~ '//|/\.\.?/'
+        ),
+        removed_locks AS (
+            DELETE FROM locks l USING (SELECT DISTINCT resource_path FROM resolved) AS r
+            WHERE l.resource_path = r.resource_path
+            RETURNING l.resource_path
+        ),
+        removed_entries AS (
+            DELETE FROM acl_entries
+            WHERE is_grant AND ('/' || substring(resource_path FROM '^/dav/(?:calendars|addressbooks)/[0-9]+/(.+)$') || '/') ~ '//|/\.\.?/'
+            RETURNING resource_path
+        ),
+        removed_properties AS (
+            DELETE FROM dav_dead_properties
+            WHERE ('/' || substring(resource_path FROM '^/dav/(?:calendars|addressbooks)/[0-9]+/(.+)$') || '/') ~ '//|/\.\.?/'
+            RETURNING resource_path
+        )
+        SELECT (SELECT count(*) FROM removed_locks), (SELECT count(*) FROM removed_entries), (SELECT count(*) FROM removed_properties),
+               (SELECT string_agg(path, ', ' ORDER BY path) FROM (
+                    SELECT resource_path AS path FROM removed_locks
+                    UNION SELECT resource_path FROM removed_entries
+                    UNION SELECT resource_path FROM removed_properties
+                    ORDER BY 1 LIMIT 50) AS sample)
+        INTO resolved_locks, resolved_entries, resolved_properties, resolved_state_sample;
+
+        -- A member path is a calendar's or an address book's path followed by
+        -- a name; the collections' own entries, and a pending collection's
+        -- locks, are not member paths.
+        SELECT count(*), (SELECT string_agg(path, ', ' ORDER BY path) FROM (
+                   SELECT DISTINCT e.resource_path AS path
+                   FROM acl_entries e
+                   LEFT JOIN (SELECT DISTINCT own FROM v120_members) AS o ON o.own = e.resource_path
+                   WHERE e.resource_path ~ '^/dav/(calendars|addressbooks)/[0-9]+/.' AND o.own IS NULL
+                   ORDER BY 1 LIMIT 50) AS sample)
+        FROM acl_entries e
+        LEFT JOIN (SELECT DISTINCT own FROM v120_members) AS o ON o.own = e.resource_path
+        WHERE e.resource_path ~ '^/dav/(calendars|addressbooks)/[0-9]+/.' AND o.own IS NULL
+        INTO unread_entries, unread_entry_sample;
+
+        SELECT count(*), (SELECT string_agg(path, ', ' ORDER BY path) FROM (
+                   SELECT DISTINCT p.resource_path AS path
+                   FROM dav_dead_properties p
+                   LEFT JOIN (SELECT DISTINCT own FROM v120_members) AS o ON o.own = p.resource_path
+                   WHERE p.resource_path ~ '^/dav/(calendars|addressbooks)/[0-9]+/.' AND o.own IS NULL
+                   ORDER BY 1 LIMIT 50) AS sample)
+        FROM dav_dead_properties p
+        LEFT JOIN (SELECT DISTINCT own FROM v120_members) AS o ON o.own = p.resource_path
+        WHERE p.resource_path ~ '^/dav/(calendars|addressbooks)/[0-9]+/.' AND o.own IS NULL
+        INTO unread_properties, unread_property_sample;
+
+        SELECT count(*), (SELECT string_agg(path, ', ' ORDER BY path) FROM (
+                   SELECT DISTINCT l.resource_path AS path
+                   FROM locks l
+                   JOIN (SELECT DISTINCT spelling FROM v120_spellings WHERE rank <= 2) AS s ON s.spelling = l.resource_path
+                   WHERE l.expires_at > now()
+                   ORDER BY 1 LIMIT 50) AS sample)
+        FROM locks l
+        JOIN (SELECT DISTINCT spelling FROM v120_spellings WHERE rank <= 2) AS s ON s.spelling = l.resource_path
+        WHERE l.expires_at > now()
+        INTO narrowed_locks, narrowed_lock_sample;
+
+        SELECT count(*), string_agg(own, ', ' ORDER BY own) FILTER (WHERE place <= 50)
+        FROM (
+            SELECT own, row_number() OVER (ORDER BY own) AS place
+            FROM v120_members
+            GROUP BY own
+            HAVING count(*) > 1
+        ) AS shared
+        INTO shared_paths, shared_sample;
+
+        SELECT count(*), string_agg(own, ', ' ORDER BY own) FILTER (WHERE place <= 50)
+        FROM (
+            SELECT own, row_number() OVER (ORDER BY own) AS place
+            FROM v120_members
+            WHERE name ~ '[?#]|%[0-9A-Fa-f]{2}'
+               OR ('/' || regexp_replace(name, $re$[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]+$$re$, '') || '/') ~ '//|/\.\.?/'
+        ) AS resolved
+        INTO resolved_names, resolved_sample;
+
+        IF changed_members > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: copied % deny and % grant ACL entries from other spellings of their names to % members (first 50: %)',
+                copied_denials, carried_grants, changed_members, changed_sample;
+        END IF;
+        IF removed_entries > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: removed % ACL entries stored under no member''s name: % denials copied to every member that read them, % grants carried to the one member whose DAV requests read each, and % grants no member keeps; acl_entries_v120_removed keeps each (first 50 paths: %)',
+                removed_entries, removed_denials, removed_carried, removed_entries - removed_denials - removed_carried, removed_sample;
+        END IF;
+        IF withheld_grants > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: % ACL grants no longer apply to a member they reached only through another spelling of its name; acl_entries_v120_removed keeps each (first 50, spelling -> member: %)',
+                withheld_grants, withheld_sample;
+        END IF;
+        IF resolved_locks + resolved_entries + resolved_properties > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: removed % locks, % ACL grants and % dead properties stored at member paths that resolve to another path, which no DAV request read; the denials there stay, and acl_entries_v120_removed keeps the grants (first 50 paths: %)',
+                resolved_locks, resolved_entries, resolved_properties, resolved_state_sample;
+        END IF;
+        IF unread_entries > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: left % ACL entries at member paths no member is stored under (first 50 paths: %)',
+                unread_entries, unread_entry_sample;
+        END IF;
+        IF unread_properties > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: left % dead properties at member paths no member is stored under (first 50 paths: %)',
+                unread_properties, unread_property_sample;
+        END IF;
+        IF narrowed_locks > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: % active locks now cover only the name they were taken on, not the other member whose name they also spelled (first 50 paths: %)',
+                narrowed_locks, narrowed_lock_sample;
+        END IF;
+        IF shared_paths > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: % state paths are each the path of more than one member, one stored without a name at its UID and one stored under that name, which share their ACL entries, locks and dead properties (first 50: %)',
+                shared_paths, shared_sample;
+        END IF;
+        IF resolved_names > 0 THEN
+            RAISE WARNING 'v1.2.0 resource identity repair: % members have stored names that resolve to another path, with a "." or ".." segment, an empty one, a trailing "/", a "?", a "#" or a percent-encoded octet; no request reaches them as themselves (first 50: %)',
+                resolved_names, resolved_sample;
+        END IF;
+    END IF;
+
+    -- A release candidate built these columns stripping the extension.
+    -- PostgreSQL 16 cannot change a generated column's expression, so one
+    -- built otherwise than db.sql builds it is dropped and added again;
+    -- dropping a column drops the indexes on it.
+    ALTER TABLE acl_entries DROP COLUMN IF EXISTS resource_path_norm;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = 'events'::regclass
+          AND a.attname = 'object_acl_path'
+          AND NOT a.attisdropped
+          AND pg_get_expr(d.adbin, d.adrelid) NOT LIKE '%NULLIF%'
+    ) THEN
+        ALTER TABLE events DROP COLUMN object_acl_path;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = 'contacts'::regclass
+          AND a.attname = 'object_acl_path'
+          AND NOT a.attisdropped
+          AND pg_get_expr(d.adbin, d.adrelid) NOT LIKE '%NULLIF%'
+    ) THEN
+        ALTER TABLE contacts DROP COLUMN object_acl_path;
+    END IF;
+
+    ALTER TABLE events
+        ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+        GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
+    ALTER TABLE contacts
+        ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+        GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
+
+    -- The members whose decisions changed: those that read entries at
+    -- another path, and those holding entries of their own that the DAV
+    -- request or GET reader passed over for another path. The stamp is
+    -- trg_*_touch_last_modified's; the collection moves follow the event and
+    -- contact repairs, which find the members by it.
+    IF repair_needed THEN
+        CREATE TEMPORARY TABLE v120_changed ON COMMIT DROP AS
+        SELECT member FROM v120_aliased
+        UNION
+        SELECT s.member
+        FROM v120_spellings s
+        WHERE s.rank IN (1, 3)
+          AND s.member IN (SELECT resource_path FROM acl_entries);
+        ALTER TABLE events DISABLE TRIGGER trg_events_increment_ctag;
+        ALTER TABLE contacts DISABLE TRIGGER trg_contacts_increment_ctag;
+        UPDATE events SET last_modified = last_modified
+            WHERE object_acl_path IN (SELECT member FROM v120_changed);
+        UPDATE contacts SET last_modified = last_modified
+            WHERE object_acl_path IN (SELECT member FROM v120_changed);
+        ALTER TABLE events ENABLE TRIGGER trg_events_increment_ctag;
+        ALTER TABLE contacts ENABLE TRIGGER trg_contacts_increment_ctag;
+    END IF;
+END
+$identity$;
+-- End of the resource identity repair.
+-- ---------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
+    ON contacts (object_acl_path);
+
+CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_path
+    ON acl_entries (principal_href, is_grant, resource_path);
 
 CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
     ON acl_entries (resource_path, principal_href);
@@ -162,6 +667,11 @@ CREATE INDEX IF NOT EXISTS idx_acl_resource_path_pattern
     ON acl_entries (resource_path text_pattern_ops);
 
 CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
+
+-- Serves the scans for every lock beneath a collection, a LIKE on the path
+-- prefix, as idx_acl_resource_path_pattern serves the ACL's.
+CREATE INDEX IF NOT EXISTS idx_locks_resource_path_pattern
+    ON locks (resource_path text_pattern_ops);
 
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT;
 ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_sha256_ha1 TEXT;
@@ -203,17 +713,23 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- statements are individually idempotent as well.
 --
 -- The duration is therefore what matters operationally. It is mostly the
--- recurrence and event-end repairs, plus the index builds and the birthday
--- backfill, and on an installation that lacks the generated ACL join keys, the
--- rewrite of acl_entries, events and contacts that adding them costs. The
--- server does not open its listener until migrations finish, so on a container
--- deployment it is startup time and has to fit the probe budget.
+-- recurrence, event-end and TZID repairs, plus the index builds and the
+-- birthday backfill, and the rewrite of events and contacts that adding the
+-- generated ACL join keys costs, or replacing them on a database a release
+-- candidate migrated. The server does not open its listener until migrations
+-- finish, so on a container deployment it is startup time and has to fit the
+-- probe budget.
 --
 -- Check that budget against the table before upgrading. The whole file, run
 -- from a v1.1.9 release install, where it also adds the generated columns,
--- measured about 25 seconds per hundred thousand events when two fifths are
--- recurring, a fifth have no DTEND and bodies are about 3 KB with a VTIMEZONE,
--- and about 55 seconds with 10 KB bodies. It grows with the number of events
+-- measured on 20,000 events across 50 calendars, two fifths recurring, a
+-- quarter with an ACL entry of their own, and each with a VTIMEZONE: about 30
+-- seconds per hundred thousand events with 3 KB bodies and 70 with 10 KB
+-- bodies, whether their TZIDs are IANA names or Windows names. The TZID repair
+-- reads and rewrites a body only where a TZID needs it, at about 0.65
+-- milliseconds an event with 3 KB bodies and 1.25 with 10 KB: for events that
+-- all carry Exchange's TZID=UTC the whole file took 95 seconds per hundred
+-- thousand with 3 KB bodies and 190 with 10 KB. It grows with the number of events
 -- and their size, not with how they are spread across calendars: the time was
 -- the same with every event in one calendar as across 500. The Helm chart's
 -- default startup budget is ten minutes
@@ -221,41 +737,29 @@ CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
 -- is killed rather than allowed to finish, and because the file is one
 -- transaction the kill rolls it back: the container then restarts and begins
 -- the same work again, so the deployment does not fail loudly, it never comes
--- up. Above roughly half a million events, or a quarter of a million with large
--- bodies, raise startupProbe.failureThreshold first, or apply the file by hand
--- as below.
+-- up. Above roughly 400,000 events, or 200,000 with large bodies, raise
+-- startupProbe.failureThreshold first, or apply the file by hand as below;
+-- those figures leave a third of the budget spare even where every event
+-- carries TZID=UTC.
 --
 -- On a deployment that cannot take that pause, run the file's statements by hand
 -- outside a transaction, using DROP INDEX CONCURRENTLY and CREATE INDEX
 -- CONCURRENTLY for each index statement and checking pg_index.indisvalid
 -- afterwards -- concurrent builds can fail and leave an invalid index behind,
--- which then has to be dropped by hand.
+-- which then has to be dropped by hand. Stop every server instance first all
+-- the same: the resource identity repair runs once, and a 1.1.x server still
+-- running writes ACL entries under the spellings it has just rewritten, which
+-- nothing repairs afterwards; and on a database a release candidate migrated,
+-- the repair drops acl_entries.resource_path_norm and replaces the
+-- object_acl_path columns, which that server's queries read.
 
--- Every events index that reads recurrence_start or recurrence_until is dropped
--- ahead of the two recurrence repairs and built after them, so building each
--- once over the repaired rows replaces maintaining it per repaired row.
--- idx_events_object_acl_path is built after the repairs for the same reason
--- where the upgrade is what adds it. The repairs' updates still fire
--- trg_events_touch_last_modified, so they rewrite last_modified and maintain
--- every index that remains.
---
--- The two time-range expression indexes are built on the expressions
--- ListForCalendarFiltered filters on:
---
---     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz)   >= range_start
---     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= range_end
---
--- The infinity sentinels keep a row the columns cannot bound in the candidate
--- set, where the RFC 4791 §9.9 test can judge it; the reasoning is on the
--- predicates in internal/store/postgres.go. An expression index only applies
--- when it matches the predicate verbatim, so the v1.1.7 pair, built on other
--- expressions, is replaced.
---
--- idx_events_calendar_keyset exists only on a database that ran a v1.2.0
--- release candidate, which built it narrower than it is built below.
-DROP INDEX IF EXISTS idx_events_recurrence_start;
-DROP INDEX IF EXISTS idx_events_recurrence_until;
-DROP INDEX IF EXISTS idx_events_calendar_keyset;
+-- Every events index that reads recurrence_start or recurrence_until was
+-- dropped at the top of the file and is built after the two recurrence
+-- repairs, so building each once over the repaired rows replaces maintaining
+-- it per repaired row. idx_events_object_acl_path is built after the repairs
+-- for the same reason where the upgrade adds or replaces its column. The
+-- repairs' updates still fire trg_events_touch_last_modified, so they rewrite
+-- last_modified and maintain every index that remains.
 
 -- The repairs below can update most rows of events, and every update fires
 -- trg_events_increment_ctag, which updates the row of the event's calendar.
@@ -266,7 +770,8 @@ DROP INDEX IF EXISTS idx_events_calendar_keyset;
 -- them. The repairs and both trigger changes are one statement, so the trigger
 -- is never left off, even when the file is run by hand outside a transaction.
 --
--- The repaired rows are found by their stamp. trg_events_touch_last_modified
+-- The repaired rows, and the members the resource identity repair stamped,
+-- are found by their stamp. trg_events_touch_last_modified
 -- stays on, and both the function an earlier release installed (NOW()) and the
 -- one this file installs below (clock_timestamp(), kept past the calendar's
 -- token) stamp a row at or after the start of the transaction that updates
@@ -280,6 +785,11 @@ DROP INDEX IF EXISTS idx_events_calendar_keyset;
 -- repaired rows again, while one holding an older token is, and the CTag move
 -- tells a client that compares CTags to look again.
 DO $repairs$
+DECLARE
+    tzid_rewritten_events BIGINT;
+    tzid_untouched_lines BIGINT;
+    tzid_untouched_events BIGINT;
+    tzid_untouched_ids BIGINT[];
 BEGIN
 ALTER TABLE events DISABLE TRIGGER trg_events_increment_ctag;
 
@@ -313,12 +823,43 @@ ALTER TABLE events DISABLE TRIGGER trg_events_increment_ctag;
 -- than the body length, so two cheaper tests run ahead of it and each admits
 -- every row the one after it would. The first is a plain search for the property
 -- names. The second is a greedy, linear match from the first BEGIN of a
--- component to the last END of one, which covers every character the non-greedy
--- match could capture; it rejects the common shape the first cannot, a VTIMEZONE
--- whose DST rules are RRULEs around a non-recurring event. A VTIMEZONE between
--- two events lies inside that span, which is why the non-greedy match remains.
--- Both filters test the property name unanchored, so each plainly admits
--- everything the anchored test after it can accept.
+-- component to the end of the body, which covers every character the
+-- non-greedy match could capture; it rejects the common shape the first cannot,
+-- a VTIMEZONE whose DST rules are RRULEs ahead of a non-recurring event. A
+-- VTIMEZONE after an event lies inside that span, which is why the non-greedy
+-- match remains. Both filters test the component and property names
+-- unanchored, so each plainly admits everything the anchored test after it can
+-- accept.
+--
+-- The deciding match reads a component's lines as ical.ReadComponents and
+-- ical.ConservativeRecurrenceBounds read them, with white space being what
+-- strings.TrimSpace removes (the bracket class: ASCII white space, U+0085,
+-- U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F and U+3000):
+--   - a BEGIN or END is a content line of its own starting with BEGIN: or END:,
+--     and names the component with nothing but white space around the name;
+--   - a component ends at its END line, or, when it has none, at the end of
+--     the body, where the reader closes what is still open;
+--   - a property line names RRULE, RDATE or RECURRENCE-ID after any leading
+--     white space, followed by its parameters or, after any white space, by
+--     its colon; an RDATE holding no colon counts as well.
+-- The same text inside a value -- a DESCRIPTION quoting END:VEVENT, or a
+-- calendar description naming BEGIN:VEVENT ahead of a VTIMEZONE -- neither
+-- ends a component early nor opens one, and a longer name such as VEVENTX is
+-- another component. The match reaches beyond the reader in three ways, each
+-- of which only bounds a row that needed none: it reads the lines of a
+-- component nested in the one it matches (a VALARM's) as that component's; a
+-- component the reader closes at the END of an enclosing one runs on to the
+-- end of the body; and it counts an RRULE with an empty value and a
+-- RECURRENCE-ID the reader cannot resolve. It falls short of the reader in one
+-- shape no client writes: a component nested in another of the same name,
+-- whose END the match takes for the outer one's.
+--
+-- Each anchor is a lookaround constraint, not a quantified atom: PostgreSQL
+-- takes a regular expression's preference for the longest or shortest match
+-- from its first quantified atom, so white space matched ahead of the ".*?"
+-- would turn the whole match greedy and pair a BEGIN with the last END in the
+-- body. The component's name is therefore looked ahead to, and the captured
+-- text starts with it.
 --
 -- CASE rather than AND'd conditions because it evaluates its branches in order;
 -- the planner costs the two regex subplans identically and would otherwise keep
@@ -335,39 +876,39 @@ UPDATE events
           SELECT 1
           FROM regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') AS unfolded(body)
           WHERE CASE
-              WHEN unfolded.body !~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$ THEN FALSE
+              WHEN unfolded.body !~* $re$(RRULE|RDATE|RECURRENCE-ID)$re$ THEN FALSE
               WHEN NOT (
                   EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VEVENT(.*)END:VEVENT$re$, 'gi') AS span(match)
-                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VEVENT(.*)$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)$re$
                   )
                   OR EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VTODO(.*)END:VTODO$re$, 'gi') AS span(match)
-                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTODO(.*)$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)$re$
                   )
                   OR EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VJOURNAL(.*)END:VJOURNAL$re$, 'gi') AS span(match)
-                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$BEGIN:[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VJOURNAL(.*)$re$, 'gi') AS span(match)
+                      WHERE span.match[1] ~* $re$(RRULE|RDATE|RECURRENCE-ID)$re$
                   )
               ) THEN FALSE
               ELSE
                   EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VEVENT(.*?)END:VEVENT$re$, 'gi') AS component(match)
-                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VEVENT[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VEVENT[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
                   )
                   OR EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VTODO(.*?)END:VTODO$re$, 'gi') AS component(match)
-                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTODO[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTODO[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
                   )
                   OR EXISTS (
                       SELECT 1
-                      FROM regexp_matches(unfolded.body, $re$BEGIN:VJOURNAL(.*?)END:VJOURNAL$re$, 'gi') AS component(match)
-                      WHERE component.match[1] ~* $re$(^|\r|\n)(RRULE|RDATE|RECURRENCE-ID)[;:]$re$
+                      FROM regexp_matches(unfolded.body, $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VJOURNAL[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))(.*?)(?:(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VJOURNAL[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))|$)$re$, 'gi') AS component(match)
+                      WHERE component.match[1] ~* $re$(^|\r|\n)[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:(?:RRULE|RECURRENCE-ID)(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*:)|RDATE(?:;|[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?::|\r|\n|$)))$re$
                   )
           END
       );
@@ -423,7 +964,11 @@ UPDATE events
 -- such as [^\r\n] admits every other character under any collation; it is the
 -- named classes that a C collation confines to ASCII. Stripping the VTIMEZONEs
 -- costs a non-greedy match, so the CASE runs it only for a body the cheap tests
--- have not settled.
+-- have not settled. A VTIMEZONE is stripped from its own BEGIN line to its own
+-- END line, each read as the recurrence repair above reads a component's: a
+-- VTIMEZONE named inside a value would otherwise strip the DTSTART after it.
+-- One without an END line is not stripped: what it holds then stays a
+-- candidate for a time of day, which can only reopen a bound.
 UPDATE events
     SET recurrence_until = '9999-12-31T23:59:59Z'
     WHERE recurrence_until <> '9999-12-31T23:59:59Z'
@@ -443,7 +988,7 @@ UPDATE events
               WHEN unfolded.body ~* $re$(^|\r|\n)RRULE(?=[^\r\n]*[;:][ \t]*COUNT[ \t]*=)[^\r\n]*[;:][ \t]*FREQ[ \t]*=[ \t]*(DAILY|WEEKLY)$re$
                   AND unfolded.body ~* $re$(^|\r|\n)DTSTART;[^\r\n]*TZID[ \t]*=$re$ THEN TRUE
               WHEN unfolded.body !~* $re$(^|\r|\n)RRULE[^\r\n]*[;:][ \t]*UNTIL[ \t]*=[ \t]*[0-9]{8}[ \t]*(;|\r|\n|$)$re$ THEN FALSE
-              ELSE regexp_replace(unfolded.body, $re$BEGIN:VTIMEZONE.*?END:VTIMEZONE$re$, '', 'gi')
+              ELSE regexp_replace(unfolded.body, $re$(?<![^\r\n])BEGIN:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTIMEZONE[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$)).*?(?<![^\r\n])END:(?=[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*VTIMEZONE[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]*(?:\r|\n|$))$re$, '', 'gi')
                   ~* $re$(^|\r|\n)DTSTART[;:][^\r\n]*[0-9]{8}T$re$
           END
       ));
@@ -500,6 +1045,328 @@ UPDATE events
       AND dtend IS NULL
       AND regexp_replace(raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') !~* $re$(^|\r|\n)(DTEND|DURATION)[;:]$re$;
 
+-- Write the zone of each stored time in the form DAVx5 reads as the server
+-- does.
+--
+-- DAVx5 parses calendar data with ical4j under relaxed parsing, and loses the
+-- zone of two TZID spellings the server reads correctly, so the device shows
+-- the time at its own local time instead:
+--   - ical4j's PropertyBuilder.build deletes every parameter whose value is
+--     exactly UTC, compared with regard to case once one pair of enclosing
+--     quotes is removed, leaving the local time floating;
+--   - ical4j keeps a parameter value's white space, so " Europe/Berlin" names
+--     no zone it knows, and DAVx5 drops the TZID and floats the time.
+-- The server trims a TZID with strings.TrimSpace and resolves UTC through the
+-- host's zone database or the object's own definition.
+--
+-- The rule:
+--   - It reads the DTSTART, DTEND, DUE, RECURRENCE-ID, EXDATE and RDATE lines
+--     outside every VTIMEZONE: the properties RFC 5545 qualifies with a TZID.
+--     An observance's DTSTART is a local time by definition, and ical4j
+--     ignores a TZID inside a VTIMEZONE.
+--   - A line's TZID is its first parameter, outside quotes, whose name is TZID
+--     in any case with white space around the name ignored. Its value is read
+--     as ical.PropertyParam and every TZID reader read it: white space
+--     trimmed, one pair of enclosing quotes removed, white space trimmed
+--     again. White space is what strings.TrimSpace removes, the class
+--     [\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000] once
+--     line breaks are gone.
+--   - A TZID whose value is exactly UTC on a line whose value holds a local
+--     DATE-TIME (YYYYMMDDTHHMMSS with no Z) is removed, and the DATE-TIME is
+--     written with Z appended: the instant the server read, which every reader
+--     reads as UTC. A DATE and a value already in UTC are left, since no zone
+--     places them, and so is another spelling of UTC, which ical4j keeps and
+--     every reader takes for the zone name it is.
+--   - Any other TZID written as anything but its trimmed value, bare or in
+--     quotes, is written as that value, in quotes if it was quoted.
+--
+-- The repair keeps every octet the rule does not change, so it rewrites only a
+-- line whose rewrite is an edit of that line alone: one that is not folded,
+-- whose parameters are each a name of letters, digits and hyphens, "=", and
+-- values that are either quoted or hold no quote, ";", ":" or ",", of which
+-- exactly one is named TZID with a single value, and which for UTC holds one
+-- DATE-TIME and no VALUE but DATE-TIME. A TZID is therefore trimmed on an
+-- EXDATE or RDATE list or period as on any other line, while UTC on one is
+-- left: its rewrite would append Z to each of its values. Every other line the
+-- rule applies to -- a folded line, UTC on an EXDATE or RDATE list or period,
+-- a parameter in another form -- is left as stored and reported. Lines in two
+-- more cases are left and reported:
+--   - PUT holds an override's RECURRENCE-ID to the form and TZID of its
+--     series' DTSTART, so where a DTSTART or RECURRENCE-ID naming UTC cannot
+--     be rewritten, none of the body's DTSTARTs and RECURRENCE-IDs naming UTC
+--     is.
+--   - A definition of its own named UTC whose offsets are not all zero reads a
+--     local time as another instant than the UTC form names, so a body
+--     carrying one keeps every time naming UTC.
+-- A VTIMEZONE named UTC stays, used or not: RFC 5545 section 3.6.5 asks for a
+-- definition of every TZID an object uses, not that every definition be used,
+-- the PUT validator leaves an unused one alone, and DAVx5 discards a
+-- definition of a zone Java knows.
+--
+-- A write of the rewritten body derives the columns a write of the stored one
+-- does, so they are left as they are: the UTC form names the instant the
+-- local time named, and the readers of dtstart, dtend and recurrence_start
+-- trim the TZID they resolve. The one reading that does not trim, the local
+-- times a zone skips, only lengthens a DAILY or WEEKLY COUNT series past a
+-- finite recurrence_until, and the reopening above has already opened every
+-- such bound whose DTSTART carries a TZID. Each rewritten row gets the ETag
+-- PUT, the REST API and the UI give the octets they store, the lowercase hex
+-- SHA-256 of their UTF-8, and is stamped by trg_events_touch_last_modified,
+-- so the move below reaches its calendar.
+--
+-- The events rewritten and the lines left as stored are counted in a WARNING,
+-- with the ids of the events holding the lines left, which PostgreSQL writes to
+-- its log and the server to its own; docs/upgrade-1.2.0/tzid-repair-pending.sql
+-- lists those events afterwards. A run that finds nothing to do says so in a
+-- NOTICE. A run over rows already rewritten changes nothing, and reports the
+-- same lines.
+--
+-- Cost: every body is unfolded and searched once for a TZID parameter whose
+-- value is UTC, or has white space at an end, inside its quotes or out: every
+-- body the rule changes or reports carries one, and a body naming zones
+-- correctly, IANA's names, Windows names with spaces inside them and names
+-- such as "(UTC+01:00) Amsterdam" included, does not. A body that has one
+-- is read on its own, in a lateral subquery, so each sort and window covers
+-- its lines alone and the cost stays linear in the table. It is split into
+-- its logical lines; only a line that can be a BEGIN or END, a TZID parameter,
+-- or a VTIMEZONE's TZID or offset is unfolded and matched, and only a line
+-- naming a TZID parameter is parsed. The body is joined back from its lines
+-- in order, so an unchanged line keeps its octets. No expression here uses a
+-- capturing group: PostgreSQL evaluates one an order of magnitude more slowly
+-- than a plain match. pattern spells out the white space class once for the
+-- expressions that use it.
+WITH pattern AS (
+    SELECT '^' || space || '+|' || space || '+$' AS trim,
+           ';' || space || '*TZID' || space || '*=(?:' || space || '|"' || space || '|"[^"\r\n]*(?:' || space || '"|"' || space || ')|[^";:\r\n]*'
+               || space || '[;:]|(?:UTC|"' || space || '*UTC' || space || '*")' || space || '*[;:])' AS candidate,
+           ';' || space || '*TZID' || space || '*=' AS tzid,
+           '^' || space || '*TZID' || space || '*[;:]' AS timezone_name,
+           '^' || space || '*(?:TZID|TZOFFSET(?:FROM|TO))' || space || '*[;:]' AS timezone_property,
+           '^' || space || '*TZOFFSET(?:FROM|TO)' || space || '*[;:]' AS timezone_offset,
+           '^' || space || '*[+-]0000(?:00)?' || space || '*$' AS zero_offset
+    FROM (VALUES ('[\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000]')) AS white(space)
+),
+repaired AS (
+    SELECT events.id, body.text AS body, body.untouched_lines
+    FROM events
+    CROSS JOIN pattern
+    CROSS JOIN LATERAL (
+        -- A logical line runs to a line break that no space or tab follows,
+        -- so it holds its folds and ends with its own break.
+        WITH line AS (
+            SELECT split.position, split.text,
+                   CASE WHEN initial.letter = 'B' AND unfolded.line ~* '^BEGIN:' THEN 'B'
+                        WHEN initial.letter = 'E' AND unfolded.line ~* '^END:' THEN 'E'
+                   END AS kind,
+                   CASE WHEN initial.letter = 'B' AND unfolded.line ~* '^BEGIN:' THEN upper(regexp_replace(substr(unfolded.line, 7), pattern.trim, '', 'g'))
+                        WHEN initial.letter = 'E' AND unfolded.line ~* '^END:' THEN upper(regexp_replace(substr(unfolded.line, 5), pattern.trim, '', 'g'))
+                   END AS component,
+                   CASE WHEN (initial.parameters AND unfolded.line ~* pattern.tzid)
+                          OR (initial.timezone_property AND unfolded.line ~* pattern.timezone_property)
+                        THEN unfolded.line
+                   END AS unfolded
+            FROM regexp_split_to_table(events.raw_ical, $re$(?<=\n)(?![ \t])|(?<=\r)(?![\n \t])$re$)
+                WITH ORDINALITY AS split(text, position)
+            -- What a line can be, read off octets a fold cannot move: its
+            -- first character, and whether it holds a ";" and an "=" at all.
+            -- Only a line that can be a BEGIN or END, a TZID parameter's or a
+            -- VTIMEZONE's TZID or offset is unfolded and matched; a name
+            -- starting with white space strings.TrimSpace removes counts as
+            -- either of the last two.
+            CROSS JOIN LATERAL (
+                SELECT upper(left(split.text, 1)) AS letter,
+                       strpos(split.text, ';') > 0 AND strpos(split.text, '=') > 0 AS parameters,
+                       upper(left(split.text, 1)) = 'T' OR ascii(upper(left(split.text, 1))) NOT BETWEEN 65 AND 90 AS timezone_property
+                OFFSET 0
+            ) AS initial
+            CROSS JOIN LATERAL (
+                SELECT CASE
+                    WHEN NOT (initial.letter IN ('B', 'E') OR initial.parameters OR initial.timezone_property) THEN NULL
+                    WHEN strpos(ending.content, E'\r') + strpos(ending.content, E'\n') = 0 THEN ending.content
+                    ELSE regexp_replace(ending.content, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g')
+                END AS line
+                FROM (SELECT CASE
+                    WHEN right(split.text, 2) = E'\r\n' THEN left(split.text, -2)
+                    WHEN right(split.text, 1) IN (E'\r', E'\n') THEN left(split.text, -1)
+                    ELSE split.text
+                END AS content) AS ending
+                OFFSET 0
+            ) AS unfolded
+        ),
+        -- The VTIMEZONE a line follows is the last one begun at or before it. It
+        -- runs to the first END naming it, or naming a component already open
+        -- where it began, which closes it with everything opened inside it, as
+        -- ical.ReadComponents reads it; an END naming a component that is not open
+        -- closes nothing. An END line names a component open where the VTIMEZONE
+        -- began exactly when the line naming that component before it is a BEGIN
+        -- ahead of the VTIMEZONE: nothing named so has begun or ended since.
+        -- This misreads one shape no client writes: a component nested in another
+        -- of the same name. After the inner one's END the outer one is still open,
+        -- and its END closes a VTIMEZONE begun in between, as the reader has it,
+        -- but the line before that END naming the component is the inner END, so
+        -- here the VTIMEZONE runs on.
+        began AS (
+            SELECT line.*,
+                   max(line.position) FILTER (WHERE line.kind = 'B' AND line.component = 'VTIMEZONE')
+                       OVER (ORDER BY line.position) AS timezone,
+                   lag(line.kind) OVER named AS previous_kind,
+                   lag(line.position) OVER named AS previous_position
+            FROM line
+            WINDOW named AS (PARTITION BY line.component ORDER BY line.position)
+        ),
+        closing AS (
+            SELECT began.*,
+                   began.kind = 'E' AND began.timezone IS NOT NULL
+                       AND (began.component = 'VTIMEZONE'
+                            OR (began.previous_kind = 'B' AND began.previous_position < began.timezone)) AS closes
+            FROM began
+        ),
+        scoped AS (
+            SELECT closing.position, closing.text, closing.unfolded, closing.timezone,
+                   COALESCE(closing.timezone > max(closing.position) FILTER (WHERE closing.closes) OVER (ORDER BY closing.position),
+                            closing.timezone IS NOT NULL) AS in_timezone
+            FROM closing
+        ),
+        -- Each line the rule applies to, read as the server reads it, and
+        -- whether it has the form the repair rewrites.
+        applies AS (
+            SELECT scoped.position, property.name, params.utc,
+                   property.written_name || params.rebuilt || ':' || property.value
+                       || CASE WHEN params.utc THEN 'Z' ELSE '' END
+                       || substr(scoped.text, length(scoped.unfolded) + 1) AS rewritten,
+                   left(scoped.text, length(scoped.unfolded)) = scoped.unfolded
+                       AND substr(scoped.text, length(scoped.unfolded) + 1) IN ('', E'\r\n', E'\r', E'\n')
+                       AND property.written_name ~* '^(?:DTSTART|DTEND|DUE|RECURRENCE-ID|EXDATE|RDATE)$'
+                       AND params.strict
+                       AND params.tzids = 1
+                       AND params.written ~ $re$^(?:"[^"]*"|[^";:,]*)$$re$
+                       AND (NOT params.utc OR (property.value ~ '^[0-9]{8}T[0-9]{6}$' AND params.date_time)) AS rewritable
+            FROM scoped
+            -- The key runs to the first colon outside quotes, as
+            -- ical.SplitContentLine reads it.
+            CROSS JOIN LATERAL (SELECT substring(scoped.unfolded FROM $re$^(?:[^:"]|"[^"]*")*$re$) AS key OFFSET 0) AS key_part
+            CROSS JOIN LATERAL (
+                SELECT substring(key_part.key FROM '^[^;]*') AS written_name,
+                       upper(regexp_replace(substring(key_part.key FROM '^[^;]*'), pattern.trim, '', 'g')) AS name,
+                       substr(scoped.unfolded, length(key_part.key) + 2) AS value
+                OFFSET 0
+            ) AS property
+            CROSS JOIN LATERAL (
+                SELECT (array_agg(param.written ORDER BY param.position) FILTER (WHERE param.tzid))[1] AS written,
+                       (array_agg(param.effective = 'UTC' ORDER BY param.position) FILTER (WHERE param.tzid))[1]
+                           AND property.value ~ '[0-9]{8}T[0-9]{6}(?![0-9Z])' AS utc,
+                       (array_agg(param.written NOT IN (param.effective, '"' || param.effective || '"') ORDER BY param.position)
+                           FILTER (WHERE param.tzid))[1] AS untrimmed,
+                       count(*) FILTER (WHERE param.tzid) AS tzids,
+                       COALESCE(bool_and(param.text ~ $re$^[A-Za-z0-9-]+=(?:"[^"]*"|[^";:,]*)(?:,(?:"[^"]*"|[^";:,]*))*$$re$), TRUE) AS strict,
+                       COALESCE(bool_and(upper(param.name) <> 'VALUE' OR upper(param.written) IN ('DATE-TIME', '"DATE-TIME"')), TRUE) AS date_time,
+                       string_agg(CASE
+                           WHEN NOT param.tzid THEN ';' || param.text
+                           WHEN param.effective = 'UTC' AND property.value ~ '[0-9]{8}T[0-9]{6}(?![0-9Z])' THEN ''
+                           WHEN param.written LIKE '"%' THEN ';' || param.name || '="' || param.effective || '"'
+                           ELSE ';' || param.name || '=' || param.effective
+                       END, '' ORDER BY param.position) AS rebuilt
+                FROM (
+                    SELECT match.position, substr(match.parts[1], 2) AS text,
+                           split_part(substr(match.parts[1], 2), '=', 1) AS name,
+                           substr(match.parts[1], strpos(match.parts[1], '=') + 1) AS written,
+                           strpos(match.parts[1], '=') > 0
+                               AND upper(regexp_replace(split_part(substr(match.parts[1], 2), '=', 1), pattern.trim, '', 'g')) = 'TZID' AS tzid,
+                           regexp_replace(CASE WHEN trimmed.value LIKE '"%"' THEN substr(trimmed.value, 2, length(trimmed.value) - 2)
+                                               ELSE trimmed.value END, pattern.trim, '', 'g') AS effective
+                    FROM regexp_matches(key_part.key, $re$;(?:[^;"]|"[^"]*")*$re$, 'g') WITH ORDINALITY AS match(parts, position)
+                    CROSS JOIN LATERAL (
+                        SELECT regexp_replace(substr(match.parts[1], strpos(match.parts[1], '=') + 1), pattern.trim, '', 'g') AS value
+                        OFFSET 0
+                    ) AS trimmed
+                    OFFSET 0
+                ) AS param
+            ) AS params
+            WHERE NOT scoped.in_timezone
+              AND scoped.unfolded ~* pattern.tzid
+              AND substr(scoped.unfolded, length(key_part.key) + 1, 1) = ':'
+              AND property.name IN ('DTSTART', 'DTEND', 'DUE', 'RECURRENCE-ID', 'EXDATE', 'RDATE')
+              AND (params.utc OR params.untrimmed)
+        ),
+        held AS MATERIALIZED (
+            SELECT
+                -- A definition of its own named UTC that moves the clock: a
+                -- VTIMEZONE both named UTC and carrying an offset other than
+                -- zero.
+                -- Each property's value follows the first colon outside
+                -- quotes, as for the lines the rule applies to.
+                (SELECT COALESCE(
+                            array_agg(scoped.timezone) FILTER (WHERE scoped.unfolded ~* pattern.timezone_name
+                                AND regexp_replace(definition.value, pattern.trim, '', 'g') = 'UTC')
+                            && array_agg(scoped.timezone) FILTER (WHERE scoped.unfolded ~* pattern.timezone_offset
+                                AND definition.value !~ pattern.zero_offset),
+                            FALSE)
+                 FROM scoped
+                 CROSS JOIN LATERAL (SELECT substring(scoped.unfolded FROM $re$^(?:[^:"]|"[^"]*")*$re$) AS key OFFSET 0) AS definition_key
+                 CROSS JOIN LATERAL (
+                     SELECT CASE WHEN substr(scoped.unfolded, length(definition_key.key) + 1, 1) = ':'
+                                 THEN substr(scoped.unfolded, length(definition_key.key) + 2)
+                            END AS value
+                     OFFSET 0
+                 ) AS definition
+                 WHERE scoped.in_timezone AND scoped.unfolded IS NOT NULL) AS utc,
+                -- A DTSTART or RECURRENCE-ID naming UTC that cannot be
+                -- rewritten.
+                EXISTS (
+                    SELECT 1
+                    FROM applies
+                    WHERE applies.utc AND applies.name IN ('DTSTART', 'RECURRENCE-ID') AND NOT applies.rewritable
+                ) AS identity
+        ),
+        -- The lines rewritten: those of the form the repair rewrites, less
+        -- the ones held back above.
+        rewrite AS (
+            SELECT applies.position, applies.rewritten
+            FROM applies, held
+            WHERE applies.rewritable
+              AND (NOT applies.utc OR (NOT held.utc
+                   AND (applies.name NOT IN ('DTSTART', 'RECURRENCE-ID') OR NOT held.identity)))
+        )
+        SELECT string_agg(COALESCE(rewrite.rewritten, scoped.text), '' ORDER BY scoped.position) AS text,
+               (SELECT count(*) FROM applies) - (SELECT count(*) FROM rewrite) AS untouched_lines
+        FROM scoped
+        LEFT JOIN rewrite ON rewrite.position = scoped.position
+    ) AS body
+    WHERE regexp_replace(events.raw_ical, E'(?:\\r\\n?|\\n)[ \\t]', '', 'g') ~* pattern.candidate
+),
+rewritten AS (
+    UPDATE events
+    SET raw_ical = repaired.body,
+        etag = encode(sha256(convert_to(repaired.body, 'UTF8')), 'hex')
+    FROM repaired
+    WHERE events.id = repaired.id
+      AND events.raw_ical <> repaired.body
+    RETURNING events.id
+)
+SELECT (SELECT count(*) FROM rewritten),
+       COALESCE(sum(repaired.untouched_lines), 0),
+       count(*) FILTER (WHERE repaired.untouched_lines > 0),
+       array_agg(repaired.id ORDER BY repaired.id) FILTER (WHERE repaired.untouched_lines > 0)
+FROM repaired
+INTO tzid_rewritten_events, tzid_untouched_lines, tzid_untouched_events, tzid_untouched_ids;
+
+IF tzid_untouched_lines > 0 THEN
+    RAISE WARNING 'v1.2.0 TZID repair: rewrote % events, and left % content lines in % events as stored',
+        tzid_rewritten_events, tzid_untouched_lines, tzid_untouched_events
+        USING DETAIL = 'events.id: ' || array_to_string(tzid_untouched_ids[1:1000], ', ')
+                       || CASE WHEN tzid_untouched_events > 1000
+                               THEN format(' and %s more', tzid_untouched_events - 1000) ELSE '' END,
+              HINT = 'DAVx5 may show these events at the device''s local time. Each line is folded, '
+                     'names UTC on an EXDATE or RDATE list or period, spells its parameters in a form '
+                     'the repair does not rewrite, or is held with its series or by a definition of UTC '
+                     'that moves the clock. docs/upgrade-1.2.0/tzid-repair-pending.sql lists the events.';
+ELSIF tzid_rewritten_events > 0 THEN
+    RAISE WARNING 'v1.2.0 TZID repair: rewrote % events, and left 0 content lines in 0 events as stored',
+        tzid_rewritten_events;
+ELSE
+    RAISE NOTICE 'v1.2.0 TZID repair: rewrote 0 events, and left 0 content lines in 0 events as stored';
+END IF;
+
 ALTER TABLE events ENABLE TRIGGER trg_events_increment_ctag;
 
 UPDATE calendars
@@ -509,6 +1376,17 @@ UPDATE calendars
 END
 $repairs$;
 
+-- The two time-range expression indexes are built on the expressions
+-- ListForCalendarFiltered filters on:
+--
+--     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz)   >= range_start
+--     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= range_end
+--
+-- The infinity sentinels keep a row the columns cannot bound in the candidate
+-- set, where the RFC 4791 §9.9 test can judge it; the reasoning is on the
+-- predicates in internal/store/postgres.go. An expression index only applies
+-- when it matches the predicate verbatim, which is why the v1.1.7 pair, built
+-- on other expressions, was dropped.
 CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
     ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
@@ -539,8 +1417,6 @@ CREATE INDEX IF NOT EXISTS idx_events_calendar_keyset ON events (
     COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
     COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
 
--- A v1.2.0 release candidate built this on other columns.
-DROP INDEX IF EXISTS idx_contacts_book_keyset;
 CREATE INDEX IF NOT EXISTS idx_contacts_book_keyset ON contacts (address_book_id, id);
 
 -- sync-collection reads a collection's changes in stream order, member rows by
@@ -787,5 +1663,9 @@ END
 $birthdays$;
 
 CREATE INDEX IF NOT EXISTS idx_contacts_change_stream ON contacts (address_book_id, last_modified, id);
+
+-- The rewrites above leave events, contacts and acl_entries with columns no
+-- statistics describe, and the first queries after the upgrade plan on them.
+ANALYZE events, contacts, acl_entries;
 
 UPDATE application SET value = 'v1.2.0' WHERE key = 'version';

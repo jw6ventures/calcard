@@ -271,16 +271,22 @@ func TestMoveContactRechecksAnACLChangedBeforeTheWrite(t *testing.T) {
 
 // A stored contact whose resource name is blank has no DAV path, so deleting
 // or moving it reports it missing rather than failing.
-func TestDeleteAndMoveReportAContactWithABlankResourceNameAsMissing(t *testing.T) {
-	svc, _ := newTestService()
+// A resource name is used as it is stored. A contact named " " is the
+// resource CardDAV serves at /%20.vcf, and its owner moves and deletes it as
+// any other.
+func TestDeleteAndMoveReachAContactWithABlankResourceName(t *testing.T) {
 	ctx := context.Background()
-	svc.store.AddressBooks.(*fakeAB).books[2] = &store.AddressBook{ID: 2, UserID: owner.ID, Name: "Second book"}
-	svc.store.Contacts.(*fakeContacts).items["1:blank"] = store.Contact{AddressBookID: 1, UID: "blank", ResourceName: " ", ETag: "b"}
-	if err := svc.MoveContact(ctx, owner, 1, 2, "blank"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("MoveContact() error = %v, want ErrNotFound", err)
+	withBlankContact := func() *Service {
+		svc, _ := newTestService()
+		svc.store.AddressBooks.(*fakeAB).books[2] = &store.AddressBook{ID: 2, UserID: owner.ID, Name: "Second book"}
+		svc.store.Contacts.(*fakeContacts).items["1:blank"] = store.Contact{AddressBookID: 1, UID: "blank", ResourceName: " ", ETag: "b"}
+		return svc
 	}
-	if err := svc.DeleteContact(ctx, owner, 1, "blank", "", ""); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("DeleteContact() error = %v, want ErrNotFound", err)
+	if err := withBlankContact().MoveContact(ctx, owner, 1, 2, "blank"); err != nil {
+		t.Fatalf("MoveContact() error = %v", err)
+	}
+	if err := withBlankContact().DeleteContact(ctx, owner, 1, "blank", "", ""); err != nil {
+		t.Fatalf("DeleteContact() error = %v", err)
 	}
 }
 
@@ -328,11 +334,11 @@ func TestContactRemovalIsDecidedAsDAVDecidesIt(t *testing.T) {
 			want:    ErrNotFound,
 		},
 		{
-			name:    "a deny stored on the contact's .vcf path",
+			name:    "a deny stored at another contact's path, the name with .vcf",
 			user:    sharee,
 			share:   editor,
 			entries: []store.ACLEntry{entry("/dav/addressbooks/1/c1.vcf", sharePrincipalHref(sharee.ID), false, "all", 0)},
-			want:    ErrNotFound,
+			want:    nil,
 		},
 		{
 			name:  "read on the book alone",

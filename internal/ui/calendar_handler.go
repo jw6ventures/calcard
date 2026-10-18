@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/calobject"
+	"github.com/jw6ventures/calcard/internal/events"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
@@ -293,45 +296,24 @@ func calendarSharePrincipalHref(userID int64) string {
 	return fmt.Sprintf("/dav/principals/%d/", userID)
 }
 
+// calendarEventResourcePath is the state path of the event resourceName
+// names, where DAV reads and writes its ACL.
 func calendarEventResourcePath(calendarID int64, resourceName string) string {
-	return path.Join(calendarACLResourcePath(calendarID), resourceName)
+	return store.MemberStatePath(calendarACLResourcePath(calendarID), resourceName)
 }
 
-func calendarACLLookupPaths(resourcePath string) []string {
-	resourcePath = path.Clean(resourcePath)
-	if resourcePath == "." || resourcePath == "/" || resourcePath == "" {
-		return nil
-	}
-
-	seen := map[string]struct{}{}
-	paths := make([]string, 0, 3)
-	addPath := func(candidate string) {
-		candidate = path.Clean(candidate)
-		if candidate == "." || candidate == "/" || candidate == "" {
-			return
-		}
-		if _, ok := seen[candidate]; ok {
-			return
-		}
-		seen[candidate] = struct{}{}
-		paths = append(paths, candidate)
-	}
-
-	addPath(resourcePath)
-	if ext := path.Ext(resourcePath); strings.EqualFold(ext, ".ics") {
-		addPath(strings.TrimSuffix(resourcePath, ext))
-	} else if strings.Count(strings.TrimPrefix(resourcePath, "/dav/calendars/"), "/") == 1 {
-		addPath(resourcePath + ".ics")
-	}
-
-	return paths
-}
-
+// calendarEventResourceName is the stored name of existing, which is its UID
+// where it records none, or the name an import of uid stores a new event
+// under.
 func calendarEventResourceName(uid string, existing *store.Event) string {
-	if existing != nil && existing.ResourceName != "" {
+	switch {
+	case existing == nil:
+		return utils.ResourceNameForUID(uid)
+	case existing.ResourceName != "":
 		return existing.ResourceName
+	default:
+		return existing.UID
 	}
-	return utils.ResourceNameForUID(uid)
 }
 
 // calendarShareManagedPrivileges are the collection grants the sharing UI owns,
@@ -380,9 +362,8 @@ func calendarApplicablePrincipalHrefs(user *store.User) []string {
 	return acl.PrincipalHrefs(user)
 }
 
-// decideCalendarPrivilege evaluates the resource's ordered ACEs before falling
-// back to the collection's ordered ACEs. Alternate resource spellings are one
-// resource identity, so their entries are merged by ACE position first.
+// decideCalendarPrivilege evaluates the resource's ordered ACEs, those at its
+// state path, before falling back to the collection's ordered ACEs.
 func decideCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resourcePath, privilege string, lookup func(candidate string) ([]store.ACLEntry, error)) (bool, error) {
 	if cal == nil || user == nil {
 		return false, nil
@@ -391,29 +372,23 @@ func decideCalendarPrivilege(user *store.User, cal *store.CalendarAccess, resour
 		return true, nil
 	}
 
-	applicablePrincipals := acl.ApplicablePrincipals(user)
 	collectionPath := calendarACLResourcePath(cal.ID)
-	if path.Clean(resourcePath) != collectionPath {
-		var resourceEntries []store.ACLEntry
-		for _, candidate := range calendarACLLookupPaths(resourcePath) {
-			entries, err := lookup(candidate)
-			if err != nil {
-				return false, err
-			}
-			resourceEntries = append(resourceEntries, entries...)
+	var resourceEntries []store.ACLEntry
+	if resourcePath != collectionPath {
+		entries, err := lookup(resourcePath)
+		if err != nil {
+			return false, err
 		}
+		resourceEntries = slices.Clone(entries)
 		acl.SortEntries(resourceEntries)
-		if granted, decided := acl.DecisionForPrivilege(resourceEntries, applicablePrincipals, privilege); decided {
-			return granted, nil
-		}
 	}
-
-	entries, err := lookup(collectionPath)
+	collectionEntries, err := lookup(collectionPath)
 	if err != nil {
 		return false, err
 	}
-	acl.SortEntries(entries)
-	granted, _ := acl.DecisionForPrivilege(entries, applicablePrincipals, privilege)
+	collectionEntries = slices.Clone(collectionEntries)
+	acl.SortEntries(collectionEntries)
+	granted, _ := acl.DecisionThroughLayers(acl.ApplicablePrincipals(user), privilege, resourceEntries, collectionEntries)
 	return granted, nil
 }
 
@@ -544,22 +519,10 @@ func (h *Handler) canReadCalendarEvent(ctx context.Context, user *store.User, ca
 // unrelated server-wide ACL state. This mirrors the DAV batching in
 // internal/dav/calendar_access.go (prefetchCalendarACLEntries / prefetchACLEntries).
 func (h *Handler) prefetchCalendarACLEntries(ctx context.Context, user *store.User, calendarID int64, events []store.Event) (map[string][]store.ACLEntry, error) {
-	collectionPath := calendarACLResourcePath(calendarID)
-	relevantPaths := make([]string, 0, 1+2*len(events))
-	seen := make(map[string]struct{}, 1+2*len(events))
-	addPath := func(candidate string) {
-		if _, ok := seen[candidate]; ok {
-			return
-		}
-		seen[candidate] = struct{}{}
-		relevantPaths = append(relevantPaths, candidate)
-	}
-	addPath(collectionPath)
+	relevantPaths := make([]string, 0, 1+len(events))
+	relevantPaths = append(relevantPaths, calendarACLResourcePath(calendarID))
 	for _, event := range events {
-		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(event.UID, &event))
-		for _, candidate := range calendarACLLookupPaths(resourcePath) {
-			addPath(candidate)
-		}
+		relevantPaths = append(relevantPaths, calendarEventResourcePath(calendarID, calendarEventResourceName(event.UID, &event)))
 	}
 
 	entries, err := h.store.ACLEntries.ListByResourcesAndPrincipals(ctx, relevantPaths, calendarApplicablePrincipalHrefs(user))
@@ -638,12 +601,11 @@ func (h *Handler) calendarShareViews(ctx context.Context, calendarID int64, user
 
 	createdAt := map[int64]time.Time{}
 	for _, entry := range entries {
-		if !entry.IsGrant || !calendarShareVisiblePrivilege(entry.Privilege) || !strings.HasPrefix(entry.PrincipalHref, "/dav/principals/") || !strings.HasSuffix(entry.PrincipalHref, "/") {
+		if !entry.IsGrant || !calendarShareVisiblePrivilege(entry.Privilege) {
 			continue
 		}
-		rawID := strings.TrimSuffix(strings.TrimPrefix(entry.PrincipalHref, "/dav/principals/"), "/")
-		userID, err := strconv.ParseInt(rawID, 10, 64)
-		if err != nil {
+		userID, ok := acl.PrincipalUserID(entry.PrincipalHref)
+		if !ok {
 			continue
 		}
 		if createdAt[userID].IsZero() || entry.CreatedAt.Before(createdAt[userID]) {
@@ -1195,41 +1157,65 @@ func (h *Handler) calendarImportAccess(ctx context.Context, user *store.User, ca
 	if h.store.ACLEntries == nil {
 		return importForbidden, nil
 	}
-	for _, principal := range calendarApplicablePrincipalHrefs(user) {
-		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principal)
+	entries, err := h.store.ACLEntries.ListByPrincipals(ctx, calendarApplicablePrincipalHrefs(user))
+	if err != nil {
+		return importForbidden, err
+	}
+	for _, entry := range entries {
+		if !entry.IsGrant || !strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		allowed, err := h.hasCalendarPrivilege(ctx, user, cal, entry.ResourcePath, "write-content")
 		if err != nil {
 			return importForbidden, err
 		}
-		for _, entry := range entries {
-			if !entry.IsGrant || !strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
-				continue
-			}
-			allowed, err := h.hasCalendarPrivilege(ctx, user, cal, entry.ResourcePath, "write-content")
-			if err != nil {
-				return importForbidden, err
-			}
-			if allowed {
-				return importPerEvent, nil
-			}
+		if allowed {
+			return importPerEvent, nil
 		}
 	}
 	return importForbidden, nil
 }
 
 // importTarget is the stored event an import of uid replaces, if any, and
-// whether the caller may write it: bind on the resource a new event takes,
-// write-content on the one an existing event has.
+// whether the caller may write it: bind on the calendar for a new event,
+// which RFC 3744 section 3.9 makes a privilege of the collection, and
+// write-content on the event an existing one is.
 func (h *Handler) importTarget(ctx context.Context, user *store.User, cal *store.CalendarAccess, uid string) (*store.Event, bool, error) {
 	existing, err := h.store.Events.GetByUID(ctx, cal.ID, uid)
 	if err != nil {
 		return nil, false, err
 	}
-	privilege := "bind"
-	if existing != nil {
-		privilege = "write-content"
+	if existing == nil {
+		allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarACLResourcePath(cal.ID), "bind")
+		return nil, allowed, err
 	}
-	allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, calendarEventResourceName(uid, existing)), privilege)
+	allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, calendarEventResourceName(uid, existing)), "write-content")
 	return existing, allowed, err
+}
+
+// unclaimedImportName is the name a new event uid is imported under: the one
+// utils.ResourceNameForUID derives from uid, or, where an event of another UID
+// is stored under that name or claims it earlier in the same import, that name
+// with a suffix derived from the whole UID, since distinct UIDs can derive one
+// name.
+func (h *Handler) unclaimedImportName(ctx context.Context, calendarID int64, uid string, claimed map[string]struct{}) (string, error) {
+	name := utils.ResourceNameForUID(uid)
+	digest := sha256.Sum256([]byte(uid))
+	suffix := "-" + hex.EncodeToString(digest[:6])
+	suffixed := name[:min(len(name), store.MaxIdentifierOctets-len(suffix))] + suffix
+	for _, candidate := range []string{name, suffixed} {
+		if _, taken := claimed[candidate]; taken {
+			continue
+		}
+		holder, err := h.store.Events.GetByResourceName(ctx, calendarID, candidate)
+		if err != nil {
+			return "", err
+		}
+		if holder == nil {
+			return candidate, nil
+		}
+	}
+	return utils.ResourceNameForUID(utils.GenerateUID()), nil
 }
 
 // ImportCalendar imports events from an ICS file into an existing calendar.
@@ -1301,6 +1287,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	// and is skipped.
 	refused := leftOut
 	pending := make([]store.Event, 0, len(events))
+	claimed := make(map[string]struct{}, len(events))
 	for _, eventICAL := range events {
 		uid := utils.ExtractUID(eventICAL)
 		if uid == "" {
@@ -1340,6 +1327,13 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		event.ResourceName = calendarEventResourceName(uid, existing)
+		if existing == nil {
+			if event.ResourceName, err = h.unclaimedImportName(r.Context(), cal.ID, uid, claimed); err != nil {
+				http.Error(w, "failed to load event", http.StatusInternalServerError)
+				return
+			}
+		}
+		claimed[event.ResourceName] = struct{}{}
 		pending = append(pending, event)
 	}
 
@@ -1475,7 +1469,9 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uid := utils.GenerateUID()
-	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, uid), "bind"); err != nil {
+	// DAV:bind is a privilege of the calendar the event joins (RFC 3744
+	// section 3.9), so no ACL stored for a member bears on it.
+	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarACLResourcePath(calendarID), "bind"); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1536,17 +1532,12 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-	if err != nil {
-		http.Error(w, "failed to load event", http.StatusInternalServerError)
+	existing, ok := h.authorizedEventWrite(w, r, user, calendarID, uid)
+	if !ok {
 		return
 	}
-	if existing == nil {
-		http.Error(w, "event not found", http.StatusNotFound)
-		return
-	}
-	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing)), "write-content"); err != nil {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !store.ValidMemberName(calendarEventResourceName(uid, existing)) {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": unwritableEventMessage})
 		return
 	}
 
@@ -1570,9 +1561,8 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	destinationCalendar := cal
 	if movingCalendar {
-		sourcePath := calendarEventResourcePath(calendarID, resourceName)
-		if err := h.requireCalendarPrivilege(r.Context(), user, cal, sourcePath, "unbind"); err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		if _, err := h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
+			writeEventAccessError(w, err)
 			return
 		}
 
@@ -1585,8 +1575,9 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "destination calendar not found", http.StatusNotFound)
 			return
 		}
-		destinationPath := calendarEventResourcePath(destinationCalendarID, resourceName)
-		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, destinationPath, "bind"); err != nil {
+		// DAV:bind is a privilege of the calendar the event joins (RFC 3744
+		// section 3.9), so no ACL stored for a member bears on it.
+		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, calendarACLResourcePath(destinationCalendarID), "bind"); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -1762,17 +1753,12 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if editScope == "occurrence" && recurrenceID != "" {
-		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
+		existing, ok := h.authorizedEventWrite(w, r, user, calendarID, uid)
+		if !ok {
 			return
 		}
-		if existing == nil {
-			http.Error(w, "event not found", http.StatusNotFound)
-			return
-		}
-		if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing)), "write-content"); err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		if !store.ValidMemberName(calendarEventResourceName(uid, existing)) {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": unwritableEventMessage})
 			return
 		}
 
@@ -1817,6 +1803,10 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 
 		if !masterHandled {
 			// No master to update; fall back to deleting the whole event.
+			if _, err := h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
+				writeEventAccessError(w, err)
+				return
+			}
 			resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
 			if err := h.store.DeleteEventAndState(r.Context(), calendarID, store.EventDAVResourceState(existing), resourcePath, nil); err != nil {
 				h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
@@ -1850,12 +1840,12 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to load event", http.StatusInternalServerError)
 			return
 		}
-		if existing == nil {
-			http.Error(w, "event not found", http.StatusNotFound)
+		if existing, err = h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
+			writeEventAccessError(w, err)
 			return
 		}
-		if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing)), "unbind"); err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		if existing == nil {
+			http.Error(w, "event not found", http.StatusNotFound)
 			return
 		}
 		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
@@ -1864,6 +1854,47 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
+	}
+}
+
+// authorizedEventWrite loads the event uid of calendarID for a write needing
+// DAV:write-content on it, as REST and DAV decide that write, and answers the
+// request itself when the write is refused. A user who may not read the event
+// is answered as for a UID the calendar does not hold.
+func (h *Handler) authorizedEventWrite(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, uid string) (*store.Event, bool) {
+	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
+	if err != nil {
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		return nil, false
+	}
+	if _, existing, err = h.events.AuthorizeEventWrite(r.Context(), user, calendarID, existing, "write-content"); err != nil {
+		writeEventAccessError(w, err)
+		return nil, false
+	}
+	if existing == nil {
+		http.Error(w, "event not found", http.StatusNotFound)
+		return nil, false
+	}
+	return existing, true
+}
+
+// unwritableEventMessage is the flash text for a write refused because the
+// event is stored under a name no href carries, as a 1.1.x release could store
+// one: "." or "..", which name the calendar or its parent once a path is
+// cleaned.
+const unwritableEventMessage = "This event is stored under a name that cannot be kept. Delete it, or move it to another name in a CalDAV client."
+
+// writeEventAccessError answers a write to or removal of an event that the
+// events service refused. A refusal that conceals the event is answered
+// exactly as a UID the calendar does not hold is.
+func writeEventAccessError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, events.ErrNotFound):
+		http.Error(w, "event not found", http.StatusNotFound)
+	case errors.Is(err, events.ErrForbidden):
+		http.Error(w, "forbidden", http.StatusForbidden)
+	default:
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
 	}
 }
 

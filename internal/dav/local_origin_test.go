@@ -355,11 +355,10 @@ func TestACLPrincipalHrefNamingThisServerIsRecognized(t *testing.T) {
 	}
 }
 
-// RFC 4918 §10.4.2: a tagged list applies to the resource its tag names. A tag
-// naming this server through either authority submits its lock token for that
-// resource; one naming another server submits nothing here, and its list is not
-// read as an untagged one either.
-func TestIfHeaderResourceTagsNameResourcesByAuthority(t *testing.T) {
+// RFC 4918 §10.4.1 has a lock token submitted by its appearing in the If
+// header, whatever resource the tag of its list names: this server's through
+// either authority, or another server's.
+func TestIfHeaderSubmitsATaggedTokenWhateverAuthorityTheTagNames(t *testing.T) {
 	const destToken = "opaquelocktoken:dest-calendar-lock"
 	tests := []struct {
 		tag        string
@@ -370,8 +369,8 @@ func TestIfHeaderResourceTagsNameResourcesByAuthority(t *testing.T) {
 		{tag: "https://dav.example.com:443/dav/calendars/6/renamed.ics", wantStatus: http.StatusNoContent},
 		{tag: "https://calcard.internal:8080/dav/calendars/6/renamed.ics", wantStatus: http.StatusNoContent},
 		{tag: "http://calcard.internal:8080/dav/calendars/6/renamed.ics", wantStatus: http.StatusNoContent},
-		{tag: "https://other.example/dav/calendars/6/renamed.ics", wantStatus: http.StatusLocked},
-		{tag: "http://dav.example.com/dav/calendars/6/renamed.ics", wantStatus: http.StatusLocked},
+		{tag: "https://other.example/dav/calendars/6/renamed.ics", wantStatus: http.StatusNoContent},
+		{tag: "http://dav.example.com/dav/calendars/6/renamed.ics", wantStatus: http.StatusNoContent},
 	}
 	for _, tt := range tests {
 		t.Run(tt.tag, func(t *testing.T) {
@@ -418,27 +417,42 @@ func TestIfHeaderResourceTagsNameResourcesByAuthority(t *testing.T) {
 	}
 }
 
-// A resource tag names a resource by its path. The Request-URI's query plays
-// no part in it, unlike the DAV:href of a multiget, and a relative tag resolves
-// against the Request-URI.
-func TestIfHeaderResourceTagsIgnoreTheRequestQuery(t *testing.T) {
+// Every lock token in the If header is submitted whatever form its list's tag
+// takes, a tag being read only so far as to skip it: a relative or
+// percent-encoded tag, one with a query or parentheses in it, or none. A token
+// is not submitted by a condition Not negates, and Not negates only the
+// condition right after it (RFC 4918 §10.4). An entity tag is read as the
+// quoted string it is, whatever brackets, parentheses or words it holds.
+func TestIfHeaderTagsDoNotScopeTheirTokens(t *testing.T) {
 	const token = "opaquelocktoken:t"
-	tests := []struct {
-		name, target, tag, path string
+	for _, tt := range []struct {
+		name, ifHeader string
+		submitted      bool
 	}{
-		{name: "request with a query", target: "/dav/calendars/6/renamed.ics?x=1", tag: "/dav/calendars/6/renamed.ics", path: "/dav/calendars/6/renamed.ics"},
-		{name: "relative tag", target: "/dav/calendars/6/renamed.ics", tag: "renamed.ics", path: "/dav/calendars/6/renamed.ics"},
-		{name: "relative tag under a collection without its slash", target: "/dav/calendars/6", tag: "x.ics", path: "/dav/calendars/6/x.ics"},
-		{name: "percent-encoded tag", target: "/dav/calendars/6/a%20b.ics", tag: "/dav/calendars/6/a%20b.ics", path: "/dav/calendars/6/a b.ics"},
-		{name: "https tag on a plain http request", target: "/dav/calendars/6/x.ics", tag: "https://example.com/dav/calendars/6/x.ics", path: "/dav/calendars/6/x.ics"},
-	}
-	for _, tt := range tests {
+		{name: "relative tag", ifHeader: "<renamed.ics> (<" + token + ">)", submitted: true},
+		{name: "percent-encoded tag", ifHeader: "</dav/calendars/6/a%20b.ics> (<" + token + ">)", submitted: true},
+		{name: "tag with a query", ifHeader: "</dav/calendars/6/x.ics?x=1> (<" + token + ">)", submitted: true},
+		{name: "tag with parentheses", ifHeader: "</dav/calendars/6/a(b).ics> (<" + token + ">)", submitted: true},
+		{name: "second of two tagged lists", ifHeader: "</dav/calendars/5/x.ics> ([\"etag\"]) </dav/calendars/6/y.ics> (<" + token + ">)", submitted: true},
+		{name: "beside an entity tag", ifHeader: "([\"etag\"] <" + token + ">)", submitted: true},
+		{name: "after Not", ifHeader: "</dav/calendars/6/x.ics> (Not <" + token + ">)"},
+		{name: "a tag only", ifHeader: "<" + token + ">"},
+		{name: "after Not in capitals", ifHeader: "(NOT <" + token + ">)"},
+		{name: "after Not without a space", ifHeader: "(Not<" + token + ">)"},
+		{name: "after an entity tag and Not", ifHeader: "([\"e\"] Not <" + token + ">)"},
+		{name: "after another token and Not", ifHeader: "(<opaquelocktoken:other> Not <" + token + ">)"},
+		{name: "after a negated entity tag", ifHeader: "(Not [\"e\"] <" + token + ">)", submitted: true},
+		{name: "after a list ending in Not", ifHeader: "(Not [\"e\"]) (<" + token + ">)", submitted: true},
+		{name: "after an entity tag holding a parenthesis", ifHeader: "([\"a)b\"] <" + token + ">)", submitted: true},
+		{name: "after an entity tag holding an angle bracket", ifHeader: "([\"a<b\"] <" + token + ">)", submitted: true},
+		{name: "after a weak entity tag holding a bracket", ifHeader: "([W/\"a]b\"] <" + token + ">)", submitted: true},
+		{name: "after an entity tag holding Not", ifHeader: "([\"Not\"] <" + token + ">)", submitted: true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, tt.target, nil)
-			req.Header.Set("If", "<"+tt.tag+"> (<"+token+">)")
-			got := (&DavServer{}).parseIfHeader(req).lockTokensForPaths(tt.path)
-			if len(got) != 1 || got[0] != token {
-				t.Fatalf("tokens for %s = %v, want [%s]", tt.path, got, token)
+			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/6/renamed.ics", nil)
+			req.Header.Set("If", tt.ifHeader)
+			if got := (&DavServer{}).parseIfHeader(req).submitsLockToken(token); got != tt.submitted {
+				t.Fatalf("If: %s submits %s = %v, want %v", tt.ifHeader, token, got, tt.submitted)
 			}
 		})
 	}

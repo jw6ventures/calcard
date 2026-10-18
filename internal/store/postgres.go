@@ -132,14 +132,16 @@ func calendarACLBooleanExpr(userParam string, privileges ...string) string {
 	return aclOrderedBooleanExpr("a.resource_path = '/dav/calendars/' || c.id::text", userParam, privileges...)
 }
 
+// aclPrincipalListExpr lists the stored principal_href values an entry naming
+// the user can hold, the hrefs acl.PrincipalHrefs lists for the in-memory
+// deciders.
 func aclPrincipalListExpr(userParam string) string {
-	return "('DAV:all', 'DAV:authenticated', '/dav/principals/' || " + userParam + "::text || '/')"
+	return "('DAV:all', 'DAV:authenticated', '/dav/principals/' || " + userParam + "::text || '/', '/dav/principals/' || " + userParam + "::text)"
 }
 
-// Event ACL paths are matched against the normalized columns
-// acl_entries.resource_path_norm and events.object_acl_path (both strip the
-// trailing .ics/.vcf so a grant stored either way lines up). The equality is
-// index-backed.
+// A member's ACL entries are the ones stored at exactly its state path,
+// events.object_acl_path or contacts.object_acl_path (MemberStatePath), so the
+// member predicates are an index-backed equality on acl_entries.resource_path.
 func aclOrderedDecisionExpr(resourcePredicate, userParam string, privileges ...string) string {
 	privilegeList := sqlLiteralList(privileges...)
 	return `(SELECT a.is_grant
@@ -156,11 +158,11 @@ func aclOrderedBooleanExpr(resourcePredicate, userParam string, privileges ...st
 }
 
 func calendarEventACLAllowsExpr(userParam string, privileges ...string) string {
-	return aclOrderedBooleanExpr("a.resource_path_norm = e.object_acl_path", userParam, privileges...)
+	return aclOrderedBooleanExpr("a.resource_path = e.object_acl_path", userParam, privileges...)
 }
 
 func calendarEventACLAllowsWithCollectionFallbackExpr(userParam string, privileges ...string) string {
-	return `COALESCE(` + aclOrderedDecisionExpr("a.resource_path_norm = e.object_acl_path", userParam, privileges...) + `, ` + calendarACLBooleanExpr(userParam, privileges...) + `)`
+	return `COALESCE(` + aclOrderedDecisionExpr("a.resource_path = e.object_acl_path", userParam, privileges...) + `, ` + calendarACLBooleanExpr(userParam, privileges...) + `)`
 }
 
 func addressBookACLBooleanExpr(userParam string, privileges ...string) string {
@@ -168,7 +170,7 @@ func addressBookACLBooleanExpr(userParam string, privileges ...string) string {
 }
 
 func contactACLBooleanExpr(userParam string, privileges ...string) string {
-	return aclOrderedBooleanExpr("a.resource_path_norm = c.object_acl_path", userParam, privileges...)
+	return aclOrderedBooleanExpr("a.resource_path = c.object_acl_path", userParam, privileges...)
 }
 
 func calendarACLAnyAccessExpr(userParam string) string {
@@ -194,7 +196,7 @@ func calendarObjectACLAnyAccessExpr(userParam string) string {
            FROM acl_entries g0
            JOIN events e
              ON e.calendar_id = c.id
-            AND e.object_acl_path = g0.resource_path_norm
+            AND e.object_acl_path = g0.resource_path
            WHERE g0.principal_href IN ` + aclPrincipalListExpr(userParam) + `
              AND g0.is_grant = TRUE
              AND (
@@ -523,6 +525,15 @@ RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, descript
 	defer tx.Rollback()
 	if err := lockRepositoryCollectionsTx(ctx, tx, "calendars", event.CalendarID); err != nil {
 		return nil, err
+	}
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM events WHERE calendar_id = $1 AND uid = $2)`, event.CalendarID, event.UID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		if err := clearCreatedObjectDAVStateTx(ctx, tx, MemberStatePath(calendarCollectionLockPath(event.CalendarID), event.ResourceName)); err != nil {
+			return nil, err
+		}
 	}
 	row := tx.QueryRowContext(ctx, q, event.CalendarID, event.UID, event.ResourceName, event.RawICAL, event.ETag, metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay, metadata.RecurrenceStart, metadata.RecurrenceUntil)
 	ev, err := scanEvent(row.Scan)
@@ -1090,8 +1101,8 @@ WHERE b.user_id=$1
            OR EXISTS (
                SELECT 1
                FROM acl_entries g0
-               JOIN contacts c ON c.address_book_id=b.id AND c.object_acl_path=g0.resource_path_norm
-               WHERE g0.principal_href IN ('DAV:all', 'DAV:authenticated', '/dav/principals/' || $1::text || '/')
+               JOIN contacts c ON c.address_book_id=b.id AND c.object_acl_path=g0.resource_path
+               WHERE g0.principal_href IN ` + aclPrincipalListExpr("$1") + `
                  AND g0.is_grant=TRUE
                  AND g0.privilege IN ('read', 'all')
                  AND ` + contactACLBooleanExpr("$1", "read", "all") + `
@@ -2118,9 +2129,14 @@ func createLockTx(ctx context.Context, tx *sql.Tx, lock Lock, acl *ACLGuard) (*L
 	}
 
 	if lock.Depth == "infinity" {
-		const descendantQ = `SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`
-		descendantPrefix := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.TrimSuffix(lock.ResourcePath, "/") + "/")
-		dRows, err := tx.QueryContext(ctx, descendantQ, descendantPrefix+"%")
+		query, args := lockDescendantScopeQuery, []any{}
+		low, high, bounded := lockPathPrefixRange(strings.TrimSuffix(lock.ResourcePath, "/") + "/")
+		if bounded {
+			args = append(args, low, high)
+		} else {
+			query, args = lockUnboundedDescendantScopeQuery, append(args, low)
+		}
+		dRows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -2376,11 +2392,40 @@ func (r *lockRepo) ListByResources(ctx context.Context, paths []string) ([]Lock,
 	return result, rows.Err()
 }
 
+const lockColumns = `id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at`
+
+// The active locks at paths starting with a prefix, read as the byte range
+// lockPathPrefixRange gives, which idx_locks_resource_path_pattern serves under
+// a generic plan as well as a custom one; starts_with keeps the range exact.
+const (
+	lockPrefixQuery                   = `SELECT ` + lockColumns + ` FROM locks WHERE resource_path ~>=~ $1 AND resource_path ~<~ $2 AND starts_with(resource_path, $1) AND expires_at > NOW() ORDER BY created_at`
+	lockDescendantScopeQuery          = `SELECT lock_scope FROM locks WHERE resource_path ~>=~ $1 AND resource_path ~<~ $2 AND starts_with(resource_path, $1) AND expires_at > NOW()`
+	lockUnboundedPrefixQuery          = `SELECT ` + lockColumns + ` FROM locks WHERE starts_with(resource_path, $1) AND expires_at > NOW() ORDER BY created_at`
+	lockUnboundedDescendantScopeQuery = `SELECT lock_scope FROM locks WHERE starts_with(resource_path, $1) AND expires_at > NOW()`
+)
+
+// lockPathPrefixRange returns the byte range [low, high) holding exactly the
+// paths that start with prefix, as text_pattern_ops orders them: low is the
+// prefix, and high is it cut after its last ASCII octet below DEL, that octet
+// raised by one, which keeps high valid UTF-8 and above every path starting
+// with prefix. A prefix with no such octet has no bound.
+func lockPathPrefixRange(prefix string) (low, high string, bounded bool) {
+	for i := len(prefix) - 1; i >= 0; i-- {
+		if prefix[i] < 0x7f {
+			return prefix, prefix[:i] + string(rune(prefix[i]+1)), true
+		}
+	}
+	return prefix, "", false
+}
+
 func (r *lockRepo) ListByResourcePrefix(ctx context.Context, prefix string) ([]Lock, error) {
-	const q = `SELECT id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW() ORDER BY created_at`
 	defer observeDB(ctx, "locks.list_by_resource_prefix")()
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-	rows, err := r.pool.QueryContext(ctx, q, escaped+"%")
+	low, high, bounded := lockPathPrefixRange(prefix)
+	query, args := lockPrefixQuery, []any{low, high}
+	if !bounded {
+		query, args = lockUnboundedPrefixQuery, []any{prefix}
+	}
+	rows, err := r.pool.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2476,7 +2521,7 @@ func (r *aclRepo) SetACL(ctx context.Context, resourcePath string, entries []ACL
 		return err
 	}
 	defer tx.Rollback()
-	if err := lockACLPathsTx(ctx, tx, ACLPaths(resourcePath)...); err != nil {
+	if err := lockACLPathsTx(ctx, tx, resourcePath); err != nil {
 		return err
 	}
 	if err := setACLTx(ctx, tx, resourcePath, entries); err != nil {
@@ -2499,14 +2544,12 @@ func (r *aclRepo) UpdateACL(ctx context.Context, resourcePath string, mutate fun
 	// Locking before the snapshot read is the whole point: mutate derives the new
 	// ACL from that read, so a hold that only starts at the write lets a caller
 	// write back a stale ACL.
-	if err := lockACLPathsTx(ctx, tx, ACLPaths(resourcePath)...); err != nil {
+	if err := lockACLPathsTx(ctx, tx, resourcePath); err != nil {
 		return err
 	}
 
-	// setACLTx replaces every stored spelling of the resource, so mutate has to
-	// see the entries of all of them: one it was not shown would be dropped.
-	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`
-	rows, err := tx.QueryContext(ctx, q, pq.Array(ACLPaths(resourcePath)))
+	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`
+	rows, err := tx.QueryContext(ctx, q, resourcePath)
 	if err != nil {
 		return err
 	}
@@ -2610,22 +2653,19 @@ func lockACLPathsTx(ctx context.Context, tx *sql.Tx, resourcePaths ...string) er
 	return acquireDAVPathLocks(ctx, tx, resourcePaths...)
 }
 
-// setACLTx replaces the ACL of every stored spelling of one resource identity.
-// The caller holds the DAV path locks for those paths already: they are part of
-// the transaction's exclusive set, which one ordered pass has to settle, and
-// anything the caller read to derive these entries needs the hold to have
-// started before the read.
+// setACLTx replaces the ACL stored at resourcePath. The caller holds the DAV
+// path lock for that path already: it is part of the transaction's exclusive
+// set, which one ordered pass has to settle, and anything the caller read to
+// derive these entries needs the hold to have started before the read.
 func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []ACLEntry) error {
-	statePaths := ACLPaths(resourcePath)
-
 	type aclIdentity struct {
 		principalHref string
 		isGrant       bool
 		privilege     string
 	}
 
-	const existingQ = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = ANY($1) ORDER BY ace_order, resource_path, id`
-	rows, err := tx.QueryContext(ctx, existingQ, pq.Array(statePaths))
+	const existingQ = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`
+	rows, err := tx.QueryContext(ctx, existingQ, resourcePath)
 	if err != nil {
 		return err
 	}
@@ -2655,10 +2695,7 @@ func setACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, entries []AC
 		return err
 	}
 
-	// Replace every historical spelling of the resource identity so a legacy
-	// extension-suffixed ACE cannot survive a revocation on the canonical URL.
-	const deleteQ = `DELETE FROM acl_entries WHERE resource_path = ANY($1)`
-	if _, err := tx.ExecContext(ctx, deleteQ, pq.Array(statePaths)); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acl_entries WHERE resource_path = $1`, resourcePath); err != nil {
 		return err
 	}
 
@@ -2697,6 +2734,8 @@ func touchACLDependentState(ctx context.Context, tx *sql.Tx, resourcePath string
 // so CTag and sync-collection clients re-read what they may access. It issues
 // one CTag bump and one member update per collection however many of its
 // resources changed; a change on the collection itself touches every member.
+// A member is the one whose state path is the changed path exactly, as
+// MemberStatePath gives it.
 func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []string) error {
 	type collectionKey struct {
 		kind string
@@ -2704,12 +2743,12 @@ func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []st
 	}
 	type touched struct {
 		whole bool
-		names []string
+		paths []string
 	}
 	var order []collectionKey
 	byCollection := make(map[collectionKey]*touched)
 	for _, resourcePath := range resourcePaths {
-		kind, id, resourceName, isCollection, ok := aclResourceIdentity(resourcePath)
+		kind, id, isCollection, ok := aclResourceIdentity(resourcePath)
 		if !ok {
 			continue
 		}
@@ -2724,13 +2763,7 @@ func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []st
 			entry.whole = true
 			continue
 		}
-		collectionPath := calendarCollectionLockPath(id)
-		if kind == "addressbook" {
-			collectionPath = addressBookCollectionLockPath(id)
-		}
-		for _, spelling := range ObjectACLPaths(collectionPath, resourceName) {
-			entry.names = append(entry.names, strings.TrimPrefix(spelling, collectionPath+"/"))
-		}
+		entry.paths = append(entry.paths, resourcePath)
 	}
 
 	for _, key := range order {
@@ -2748,17 +2781,19 @@ func touchACLDependentStates(ctx context.Context, tx *sql.Tx, resourcePaths []st
 			}
 			continue
 		}
-		slices.Sort(entry.names)
-		names := slices.Compact(entry.names)
-		if _, err := tx.ExecContext(ctx, `UPDATE `+memberTable+` SET last_modified = NOW() WHERE `+memberCollection+` = $1 AND resource_name = ANY($2)`, key.id, pq.Array(names)); err != nil {
+		slices.Sort(entry.paths)
+		paths := slices.Compact(entry.paths)
+		if _, err := tx.ExecContext(ctx, `UPDATE `+memberTable+` SET last_modified = NOW() WHERE `+memberCollection+` = $1 AND object_acl_path = ANY($2)`, key.id, pq.Array(paths)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func aclResourceIdentity(resourcePath string) (string, int64, string, bool, bool) {
-	cleanPath := path.Clean(strings.TrimSpace(resourcePath))
+// aclResourceIdentity reads the collection an ACL path belongs to, and whether
+// the path is the collection's own. The path is read as stored, neither
+// cleaned nor trimmed, as MemberStatePath writes it.
+func aclResourceIdentity(resourcePath string) (kind string, id int64, isCollection, ok bool) {
 	for _, candidate := range []struct {
 		prefix string
 		kind   string
@@ -2766,28 +2801,18 @@ func aclResourceIdentity(resourcePath string) (string, int64, string, bool, bool
 		{prefix: "/dav/calendars/", kind: "calendar"},
 		{prefix: "/dav/addressbooks/", kind: "addressbook"},
 	} {
-		if !strings.HasPrefix(cleanPath, candidate.prefix) {
+		rest, found := strings.CutPrefix(resourcePath, candidate.prefix)
+		if !found {
 			continue
 		}
-		trimmed := strings.TrimPrefix(cleanPath, candidate.prefix)
-		segment := strings.Split(trimmed, "/")[0]
-		if segment == "" {
-			return "", 0, "", false, false
-		}
+		segment, member, _ := strings.Cut(rest, "/")
 		id, err := strconv.ParseInt(segment, 10, 64)
 		if err != nil {
-			return "", 0, "", false, false
+			return "", 0, false, false
 		}
-		if len(strings.Split(trimmed, "/")) == 1 {
-			return candidate.kind, id, "", true, true
-		}
-		resourceName := strings.Split(trimmed, "/")[1]
-		if resourceName == "" {
-			return "", 0, "", false, false
-		}
-		return candidate.kind, id, resourceName, false, true
+		return candidate.kind, id, member == "", true
 	}
-	return "", 0, "", false, false
+	return "", 0, false, false
 }
 
 func (r *aclRepo) ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error) {

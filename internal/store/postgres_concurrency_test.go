@@ -452,11 +452,11 @@ FOR EACH ROW EXECUTE FUNCTION reject_object_state_change()`, pq.QuoteLiteral(des
 	}
 }
 
-// A COPY gives the copy the source's dead properties, read from either
-// spelling of the source's state path, and replaces the state the resource it
-// overwrites had: none of the destination's ACL entries or dead properties, at
-// either spelling, survive onto the copy, and the destination's tombstone is
-// cleared. The source keeps its own state.
+// A COPY gives the copy the dead properties at the source's state path, and
+// replaces the state the resource it overwrites had: none of the destination's
+// ACL entries or dead properties survive onto the copy, and the destination's
+// tombstone is cleared. The source keeps its own state, and the members named
+// source.ics and copied.ics, other resources, keep theirs.
 func TestPostgres_CalendarObjectCopyReplacesTheDestinationsDAVState(t *testing.T) {
 	s := newPostgresStore(t)
 	_, sourceCalendarID := newPostgresCalendar(t, s, "object-copy-state-source")
@@ -528,8 +528,8 @@ func TestPostgres_CalendarObjectCopyReplacesTheDestinationsDAVState(t *testing.T
 	}
 	slices.Sort(got)
 	want := []string{
-		destinationPath + " legacy=source legacy",
 		destinationPath + " note=source",
+		destinationPath + ".ics stale=destination legacy",
 		sourcePath + " note=source",
 		sourcePath + ".ics legacy=source legacy",
 	}
@@ -538,7 +538,7 @@ func TestPostgres_CalendarObjectCopyReplacesTheDestinationsDAVState(t *testing.T
 		t.Errorf("dead properties after COPY = %q, want %q", got, want)
 	}
 
-	for path, wantEntries := range map[string]int{sourcePath: 1, destinationPath: 0, destinationPath + ".ics": 0} {
+	for path, wantEntries := range map[string]int{sourcePath: 1, destinationPath: 0, destinationPath + ".ics": 1} {
 		entries, err := s.ACLEntries.ListByResource(ctx, path)
 		if err != nil {
 			t.Fatalf("list ACL at %s: %v", path, err)
@@ -929,6 +929,164 @@ func TestPostgres_CalendarCollectionTransferPreservesDestinationLockTree(t *test
 				}
 			}
 		})
+	}
+}
+
+// A collection DELETE or MOVE removes everything below its source, and a COPY
+// or MOVE over an existing collection everything below that one, a lock on an
+// unmapped member included, so the transfer re-checks every lock below them in
+// its own transaction, not only those on the paths its preconditions name: a
+// lock-null resource locked after the request's own check is refused there. A
+// token any precondition carries satisfies such a lock.
+func TestPostgres_CalendarCollectionTransferHonoursLocksBelowTheCollections(t *testing.T) {
+	for _, tt := range []struct {
+		operation   CalendarCollectionTransferOperation
+		destination bool
+		lockSource  bool
+	}{
+		{operation: CalendarCollectionDelete, lockSource: true},
+		{operation: CalendarCollectionMove, lockSource: true},
+		{operation: CalendarCollectionMove, destination: true},
+		{operation: CalendarCollectionCopy, destination: true},
+	} {
+		label := string(tt.operation)
+		if tt.destination {
+			label += " over a collection"
+		}
+		for _, submitted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/token submitted %v", label, submitted), func(t *testing.T) {
+				s := newPostgresStore(t)
+				ctx := context.Background()
+				userID, sourceID := newPostgresCalendar(t, s, "lock-null-below")
+				raw := postgresCalendarObject("member", "Member")
+				seeded, err := s.PutCalendarObject(ctx, CalendarObjectWrite{CalendarID: sourceID, UID: "member", ResourceName: "member", RawICAL: raw, ETag: "member-etag"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				source, _ := s.Calendars.GetByID(ctx, sourceID)
+				transfer := CalendarCollectionTransfer{
+					Operation: tt.operation, Depth: "infinity", Overwrite: true, SourceID: sourceID,
+					ExpectedSourceCTag: source.CTag, SourceStatePath: calendarCollectionStatePath(sourceID),
+					DestinationOwnerID: userID, DestinationSlug: "lock-null-destination",
+					Members: []CalendarCollectionMember{{ID: seeded.Event.ID, UID: "member", ResourceName: "member", RawICAL: raw, ETag: "member-etag", NewETag: "copied-etag"}},
+				}
+				lockedRoot := transfer.SourceStatePath
+				if tt.destination {
+					slug := transfer.DestinationSlug
+					destination, err := s.Calendars.Create(ctx, Calendar{UserID: userID, Name: "Destination", Slug: &slug})
+					if err != nil {
+						t.Fatal(err)
+					}
+					lockedRoot = calendarCollectionStatePath(destination.ID)
+					transfer.ExpectedDestination = CalendarCollectionState{Exists: true, ID: destination.ID, CTag: destination.CTag}
+					transfer.DestinationStatePath, transfer.DestinationLockPath = lockedRoot, lockedRoot
+				}
+				const token = "opaquelocktoken:lock-null"
+				if _, err := s.Locks.Create(ctx, Lock{
+					Token: token, ResourcePath: lockedRoot + "/unmapped", UserID: userID, LockScope: "exclusive", LockType: "write",
+					Depth: "0", TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				precondition := LockPrecondition{ResourcePath: lockedRoot, LookupPaths: []string{lockedRoot}}
+				if submitted {
+					precondition.Tokens = []string{token}
+				}
+				transfer.LockPreconditions = []LockPrecondition{precondition}
+
+				_, err = s.TransferCalendarCollection(ctx, transfer)
+				if !submitted {
+					if !errors.Is(err, ErrLockConflict) {
+						t.Fatalf("TransferCalendarCollection() error = %v, want ErrLockConflict", err)
+					}
+					if held, err := s.Locks.GetByToken(ctx, token); err != nil || held == nil {
+						t.Fatalf("refused transfer left the lock-null lock as %#v, %v", held, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("TransferCalendarCollection() with the token = %v", err)
+				}
+			})
+		}
+	}
+}
+
+// Finding the locks below the collections a transfer removes reads each
+// collection's range of the resource path pattern index rather than scanning
+// every lock, however many locks the table holds.
+func TestPostgres_LocksBelowACollectionAreReadThroughThePathIndex(t *testing.T) {
+	pool := newPostgresPool(t)
+	ctx := context.Background()
+	userID, _ := newPostgresCalendar(t, New(pool), "locks-below-plan")
+	if _, err := pool.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_locks_resource_path_pattern ON locks (resource_path text_pattern_ops)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.ExecContext(ctx, `
+INSERT INTO locks (token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, expires_at)
+SELECT 'opaquelocktoken:' || i, '/dav/calendars/' || (i % 2000) || '/member-' || i, $1, 'exclusive', 'write', '0', '', 3600, NOW() + interval '1 hour'
+FROM generate_series(1, 20000) AS i`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.ExecContext(ctx, `ANALYZE locks`); err != nil {
+		t.Fatal(err)
+	}
+	low, high := locksBelowRanges([]string{"/dav/calendars/7", "/dav/calendars/8"})
+	rows, err := pool.QueryContext(ctx, `EXPLAIN `+locksBelowQuery, pq.Array(low), pq.Array(high))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line + "\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "idx_locks_resource_path_pattern") || strings.Contains(plan.String(), "Seq Scan on locks") {
+		t.Fatalf("locks below a collection are not read through the path index:\n%s", plan.String())
+	}
+}
+
+// The ranges read for the locks below a collection hold exactly the paths
+// below it, whatever characters its path holds.
+func TestPostgres_LocksBelowACollectionAreExactlyThePathsBelowIt(t *testing.T) {
+	s := newPostgresStore(t)
+	ctx := context.Background()
+	userID, _ := newPostgresCalendar(t, s, "locks-below")
+	roots := []string{"/dav/calendars/a%_\\b", "/dav/calendars/7"}
+	below := []string{"/dav/calendars/a%_\\b/x", "/dav/calendars/a%_\\b/y/z", "/dav/calendars/7/m", "/dav/calendars/7/\u00ff\U0010ffff"}
+	outside := []string{"/dav/calendars/a%_\\b", "/dav/calendars/a%_\\bc/x", "/dav/calendars/aX_\\b/x", "/dav/calendars/a%_\\b0", "/dav/calendars/7", "/dav/calendars/70/m", "/dav/calendars/7.ics"}
+	for i, resourcePath := range append(slices.Clone(below), outside...) {
+		if _, err := s.Locks.Create(ctx, Lock{
+			Token: fmt.Sprintf("opaquelocktoken:%d", i), ResourcePath: resourcePath, UserID: userID, LockScope: "shared", LockType: "write",
+			Depth: "0", TimeoutSeconds: 3600, ExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("seed lock at %q: %v", resourcePath, err)
+		}
+	}
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var submitted []string
+	for i := range below {
+		submitted = append(submitted, fmt.Sprintf("opaquelocktoken:%d", i))
+	}
+	if err := validateLocksBelowTx(ctx, tx, roots, []LockPrecondition{{Tokens: submitted}}); err != nil {
+		t.Fatalf("locks below %q, all submitted: %v", roots, err)
+	}
+	for i := range below {
+		without := slices.Delete(slices.Clone(submitted), i, i+1)
+		if err := validateLocksBelowTx(ctx, tx, roots, []LockPrecondition{{Tokens: without}}); !errors.Is(err, ErrLockConflict) {
+			t.Fatalf("lock at %q unsubmitted: %v, want ErrLockConflict", below[i], err)
+		}
 	}
 }
 
@@ -1328,42 +1486,41 @@ func TestPostgres_RevokePrincipalGrantsMatchesEitherSlashSpelling(t *testing.T) 
 	}
 }
 
-// UpdateACL rewrites every stored spelling of the resource, so the entries it
-// hands mutate have to come from all of them: a grant stored under the legacy
-// extension-suffixed path would otherwise be dropped by an unrelated update.
-func TestPostgres_UpdateACLKeepsEntriesOfEverySpelling(t *testing.T) {
+// UpdateACL reads and rewrites the entries stored at exactly the resource's
+// path. The member meeting.ics is another resource, whose entries an update
+// of meeting neither sees nor replaces.
+func TestPostgres_UpdateACLReadsAndWritesOnlyItsOwnPath(t *testing.T) {
 	s := newPostgresStore(t)
 	_, calendarID := newPostgresCalendar(t, s, "update-acl-spellings")
 	resourcePath := fmt.Sprintf("/dav/calendars/%d/meeting", calendarID)
+	siblingPath := resourcePath + ".ics"
 	ctx := context.Background()
 
 	pool := s.Calendars.(*calendarRepo).pool
-	if _, err := pool.ExecContext(ctx, `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order) VALUES ($1, '/dav/principals/300/', TRUE, 'read', 0)`, resourcePath+".ics"); err != nil {
-		t.Fatalf("store legacy-spelled grant: %v", err)
+	if _, err := pool.ExecContext(ctx, `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order) VALUES ($1, '/dav/principals/300/', TRUE, 'read', 0)`, siblingPath); err != nil {
+		t.Fatalf("store the sibling's grant: %v", err)
 	}
 
 	var seen []ACLEntry
 	err := s.ACLEntries.UpdateACL(ctx, resourcePath, func(current []ACLEntry) ([]ACLEntry, error) {
 		seen = current
-		return append(current, ACLEntry{PrincipalHref: "/dav/principals/301/", IsGrant: true, Privilege: "read", Position: 1}), nil
+		return append(current, ACLEntry{PrincipalHref: "/dav/principals/301/", IsGrant: true, Privilege: "read"}), nil
 	})
 	if err != nil {
 		t.Fatalf("UpdateACL() error = %v", err)
 	}
-	if len(seen) != 1 || seen[0].PrincipalHref != "/dav/principals/300/" {
-		t.Fatalf("UpdateACL() handed mutate %#v, want the legacy-spelled grant", seen)
+	if len(seen) != 0 {
+		t.Fatalf("UpdateACL() handed mutate %#v, want no entries: meeting has none", seen)
 	}
 
-	stored, err := s.ACLEntries.ListByResources(ctx, davStatePaths(resourcePath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	granted := make(map[string]bool, len(stored))
-	for _, entry := range stored {
-		granted[entry.PrincipalHref] = true
-	}
-	if !granted["/dav/principals/300/"] || !granted["/dav/principals/301/"] || len(stored) != 2 {
-		t.Fatalf("stored ACL = %#v, want the legacy grant kept beside the new one", stored)
+	for path, want := range map[string]string{resourcePath: "/dav/principals/301/", siblingPath: "/dav/principals/300/"} {
+		stored, err := s.ACLEntries.ListByResource(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stored) != 1 || stored[0].PrincipalHref != want {
+			t.Errorf("ACL at %s = %#v, want only the grant to %s", path, stored, want)
+		}
 	}
 }
 
@@ -1486,7 +1643,7 @@ func TestPostgres_DAVPathLocksKeepCollectionScopeExclusive(t *testing.T) {
 func TestPostgres_DAVPathLocksSurviveNestedTargetSets(t *testing.T) {
 	pool := newPostgresPool(t)
 	collection := uniqueDAVCollectionPath("/dav/addressbooks")
-	targets := append(davStatePaths(collection+"/alice.vcf"), collection)
+	targets := []string{collection + "/alice", collection + "/alice.vcf", collection}
 
 	errs := runConcurrently(8, func(int) error {
 		for round := 0; round < 10; round++ {
@@ -1615,7 +1772,7 @@ func lockPreconditionHolder(pool txPool, lockTimeout string, resourcePaths ...st
 func TestPostgres_LockPreconditionGateSerializesCallerPathsWithoutPreconditions(t *testing.T) {
 	pool := newPostgresPool(t)
 	collection := uniqueDAVCollectionPath("/dav/addressbooks")
-	statePaths := davStatePaths(collection + "/alice.vcf")
+	statePaths := []string{collection + "/alice", collection + "/alice.vcf"}
 	ctx := context.Background()
 
 	holder, err := pool.BeginTx(ctx, nil)
@@ -1685,5 +1842,71 @@ func TestPostgres_YearlessBirthdaysRoundTrip(t *testing.T) {
 	}
 	if want := time.Date(NoYearBirthdayYear, 7, 4, 0, 0, 0, 0, time.UTC); !legacy.Birthday.Equal(want) {
 		t.Errorf("legacy year-1 birthday read back as %v, want %v", legacy.Birthday, want)
+	}
+}
+
+// A created calendar object starts with no ACL entries or dead properties of
+// its own, as a created contact does: state left at its path by a resource no
+// longer stored there is not the new resource's. A lock taken on the unmapped
+// name is the lock-null resource the PUT maps, and stays.
+func TestPostgres_CreatedCalendarObjectClearsLeftoverStateButKeepsItsLock(t *testing.T) {
+	pool := newPostgresPool(t)
+	s := New(pool)
+	ctx := context.Background()
+	userID, calendarID := newPostgresCalendar(t, s, "created-state")
+	collection := calendarCollectionLockPath(calendarID)
+
+	create := map[string]func(name string) error{
+		"put": func(name string) error {
+			_, err := s.PutCalendarObject(ctx, CalendarObjectWrite{CalendarID: calendarID, UID: "uid-" + name, ResourceName: name,
+				RawICAL: postgresCalendarObject("uid-"+name, "created"), ETag: "etag-" + name})
+			return err
+		},
+		"upsert": func(name string) error {
+			_, err := s.Events.Upsert(ctx, Event{CalendarID: calendarID, UID: "uid-" + name, ResourceName: name,
+				RawICAL: postgresCalendarObject("uid-"+name, "created"), ETag: "etag-" + name})
+			return err
+		},
+	}
+	for path, write := range create {
+		statePath := MemberStatePath(collection, path)
+		if _, err := pool.ExecContext(ctx, `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege) VALUES ($1, '/dav/principals/99/', true, 'write')`, statePath); err != nil {
+			t.Fatalf("seed ACL: %v", err)
+		}
+		if _, err := pool.ExecContext(ctx, `INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml) VALUES ($1, 'urn:x', 'left', 'over')`, statePath); err != nil {
+			t.Fatalf("seed dead property: %v", err)
+		}
+		if _, err := pool.ExecContext(ctx, `INSERT INTO locks (token, resource_path, user_id, depth, expires_at) VALUES ($1, $2, $3, '0', NOW() + INTERVAL '1 hour')`,
+			"opaquelocktoken:"+path, statePath, userID); err != nil {
+			t.Fatalf("seed lock: %v", err)
+		}
+
+		if err := write(path); err != nil {
+			t.Fatalf("%s: create: %v", path, err)
+		}
+
+		var entries, properties, locks int
+		if err := pool.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM acl_entries WHERE resource_path = $1),
+       (SELECT count(*) FROM dav_dead_properties WHERE resource_path = $1),
+       (SELECT count(*) FROM locks WHERE resource_path = $1)`, statePath).Scan(&entries, &properties, &locks); err != nil {
+			t.Fatalf("read state: %v", err)
+		}
+		if entries != 0 || properties != 0 {
+			t.Errorf("%s: the created object kept %d ACL entries and %d dead properties left at its path", path, entries, properties)
+		}
+		if locks != 1 {
+			t.Errorf("%s: the created object's lock-null lock is gone (%d locks)", path, locks)
+		}
+
+		// A write of the object that now exists keeps the state it has.
+		if _, err := pool.ExecContext(ctx, `INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege) VALUES ($1, '/dav/principals/99/', true, 'read')`, statePath); err != nil {
+			t.Fatalf("seed ACL: %v", err)
+		}
+		if err := write(path); err != nil {
+			t.Fatalf("%s: update: %v", path, err)
+		}
+		if err := pool.QueryRowContext(ctx, `SELECT count(*) FROM acl_entries WHERE resource_path = $1`, statePath).Scan(&entries); err != nil || entries != 1 {
+			t.Errorf("%s: an update of the existing object left %d of its ACL entries (%v)", path, entries, err)
+		}
 	}
 }

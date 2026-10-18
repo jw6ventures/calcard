@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http/httptest"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -89,12 +88,21 @@ func TestDiscoverySeedsCollectionRequestCaches(t *testing.T) {
 	}
 }
 
-func TestPropfindACLPrefetchIncludesLegacyObjectPaths(t *testing.T) {
+// The PROPFIND prefetch serves each member the entries at its own state path.
+// The entries at meeting.ics belong to the member of that name, not to the
+// member meeting a request for /meeting.ics names.
+func TestPropfindACLPrefetchServesEachMemberItsOwnPath(t *testing.T) {
 	user := &store.User{ID: 1}
 	acls := &fakeACLRepo{entries: []store.ACLEntry{
 		{
 			ResourcePath:  "/dav/calendars/2/meeting.ics",
 			PrincipalHref: "/dav/principals/3/",
+			IsGrant:       true,
+			Privilege:     "read",
+		},
+		{
+			ResourcePath:  "/dav/calendars/2/meeting",
+			PrincipalHref: "/dav/principals/4/",
 			IsGrant:       true,
 			Privilege:     "read",
 		},
@@ -114,8 +122,8 @@ func TestPropfindACLPrefetchIncludesLegacyObjectPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("aclEntriesForResource() error = %v", err)
 	}
-	if len(entries) != 1 || entries[0].ResourcePath != "/dav/calendars/2/meeting.ics" {
-		t.Fatalf("aclEntriesForResource() = %#v, want legacy-path entry", entries)
+	if len(entries) != 1 || entries[0].ResourcePath != "/dav/calendars/2/meeting" {
+		t.Fatalf("aclEntriesForResource() = %#v, want only the entry at meeting's own path", entries)
 	}
 	if acls.listByResourcesCalls != 1 || acls.listByResourceCalls != 0 {
 		t.Fatalf("ACL calls: batch=%d single=%d, want 1 and 0", acls.listByResourcesCalls, acls.listByResourceCalls)
@@ -123,12 +131,11 @@ func TestPropfindACLPrefetchIncludesLegacyObjectPaths(t *testing.T) {
 }
 
 // A member's ACL is the entries stored under its canonical path, the path the
-// ACL method writes, and under the spellings the store treats as the same
-// member: the path without a trailing extension of the collection's kind, in
-// any case, and that path with the extension in lower case. The batched
-// listing decision and a request naming the member both read exactly those, so
-// they agree with each other and with the ACL the method set.
-func TestMemberDecisionsReadTheSpellingsOfTheMembersPath(t *testing.T) {
+// ACL method writes, and under no other spelling of its name: with or without
+// an extension, in any case, trimmed or not, each names another resource. The
+// batched listing decision and a request naming the member both read exactly
+// that path, so they agree with each other and with the ACL the method set.
+func TestMemberDecisionsReadOnlyTheMembersOwnPath(t *testing.T) {
 	user := &store.User{ID: 1}
 	principal := "/dav/principals/1/"
 	cal := &store.Calendar{ID: 2, UserID: 9}
@@ -174,21 +181,13 @@ func TestMemberDecisionsReadTheSpellingsOfTheMembersPath(t *testing.T) {
 	}
 	for _, domain := range domains {
 		ext, upper := domain.ext, strings.ToUpper(domain.ext)
-		// Each member name, with the spellings whose entries make up its ACL.
-		members := map[string][]string{
-			"plain":           {"plain", "plain" + ext},
-			"dav" + ext:       {"dav" + ext, "dav"},
-			"dav" + upper:     {"dav" + upper, "dav", "dav" + ext},
-			"uid@example.com": {"uid@example.com", "uid@example.com" + ext},
-			"dotted.name":     {"dotted.name", "dotted.name" + ext},
-			"trailing ":       {"trailing ", "trailing " + ext},
-			" leading":        {" leading", " leading" + ext},
-			"a.b.c" + ext:     {"a.b.c" + ext, "a.b.c"},
+		members := []string{
+			"plain", "dav" + ext, "dav" + upper, "uid@example.com", "dotted.name", "trailing ", " leading", "a.b.c" + ext,
 			// No request can name a member whose stored name holds path
 			// segments, but its listing must not decide by another resource.
-			"x/../../5": {"x/../../5", "x/../../5" + ext},
+			"x/../../5",
 		}
-		for name, reads := range members {
+		for _, name := range members {
 			base := strings.TrimSuffix(name, path.Ext(name))
 			spellings := []string{name, name + ext, name + upper, base, base + ext, base + upper, strings.TrimSpace(name), "../5", "5"}
 			for _, spelling := range spellings {
@@ -199,14 +198,14 @@ func TestMemberDecisionsReadTheSpellingsOfTheMembersPath(t *testing.T) {
 						{ID: 3, ResourcePath: domain.collectionPath + "/" + spelling, PrincipalHref: principal, IsGrant: isGrant, Privilege: "write-content", Position: 1},
 						{ID: 4, ResourcePath: path.Dir(domain.collectionPath) + "/5", PrincipalHref: principal, IsGrant: false, Privilege: "read"},
 					}
-					applies := slices.Contains(reads, spelling)
+					applies := spelling == name
 					want := map[string][2]bool{"read": {true, false}, "write-content": domain.collectionOnly}
 					if applies {
 						want["read"] = [2]bool{isGrant, !isGrant}
 						want["write-content"] = [2]bool{isGrant, !isGrant}
 					}
 					h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
-					prefetched, err := h.prefetchACLEntries(context.Background(), user, append([]string{domain.collectionPath}, objectACLPaths(domain.collectionPath, name)...))
+					prefetched, err := h.prefetchACLEntries(context.Background(), user, []string{domain.collectionPath, objectStatePath(domain.collectionPath, name)})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -231,11 +230,11 @@ func TestMemberDecisionsReadTheSpellingsOfTheMembersPath(t *testing.T) {
 	}
 }
 
-// A member's ACL is read in a content order: the entries at its own path
-// first, then those at the other spellings, each in ACE order, however the
-// rows were saved. Both the batched listing decision and a request naming the
-// member read it so.
-func TestMemberACLReadsItsOwnSpellingFirstThenEachSpellingInACEOrder(t *testing.T) {
+// A member's ACL is the entries at its own path in ACE order, however the rows
+// were saved, and the entries of its siblings X, X.ics and X.ics's other
+// spellings take no part. Both the batched listing decision and a request
+// naming the member read it so.
+func TestMemberACLReadsOnlyItsOwnEntriesInACEOrder(t *testing.T) {
 	user := &store.User{ID: 1}
 	principal := "/dav/principals/1/"
 	cal := &store.Calendar{ID: 2, UserID: 9}
@@ -247,7 +246,7 @@ func TestMemberACLReadsItsOwnSpellingFirstThenEachSpellingInACEOrder(t *testing.
 		{ID: 4, ResourcePath: "/dav/calendars/2/X.ics", PrincipalHref: principal, IsGrant: false, Privilege: "write-content", Position: 1},
 	}
 	h := &DavServer{store: &store.Store{ACLEntries: &fakeACLRepo{entries: entries}}}
-	prefetched, err := h.prefetchACLEntries(context.Background(), user, append([]string{"/dav/calendars/2"}, objectACLPaths("/dav/calendars/2", "X.ICS")...))
+	prefetched, err := h.prefetchACLEntries(context.Background(), user, []string{"/dav/calendars/2", objectStatePath("/dav/calendars/2", "X.ICS")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,8 +257,9 @@ func TestMemberACLReadsItsOwnSpellingFirstThenEachSpellingInACEOrder(t *testing.
 	}
 	// read: X.ICS's own ACEs decide, the deny at position 1 ahead of its
 	// grant at 2, whatever the sibling's position-0 grant says. write-content:
-	// X, the spelling ahead of X.ics, grants.
-	for privilege, want := range map[string][2]bool{"read": {false, true}, "write-content": {true, false}} {
+	// only the siblings X and X.ics decide it, so X.ICS's ACL leaves it
+	// refused.
+	for privilege, want := range map[string][2]bool{"read": {false, true}, "write-content": {false, true}} {
 		if allowed, denied := calendarPrivilegeDecisionWithDecider(&store.CalendarAccess{Calendar: *cal}, "X.ICS", privilege, decider); allowed != want[0] || denied != want[1] {
 			t.Errorf("batched %s = (%v, %v), want (%v, %v)", privilege, allowed, denied, want[0], want[1])
 		}

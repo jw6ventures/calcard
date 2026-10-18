@@ -171,6 +171,25 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		}
 	})
 
+	// A 1.1.x release could store an event as "." or "..", which name the
+	// calendar or its parent once a path is cleaned. Such an event can be read,
+	// deleted, or moved to another name over CalDAV, but not written in place.
+	t.Run("update of an event stored under a name no href carries", func(t *testing.T) {
+		for _, name := range []string{".", ".."} {
+			repo := &fakeEventRepo{events: map[string]store.Event{
+				"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: name, ETag: "etag-old"},
+			}}
+			svc := newServiceWithRepos(true, repo)
+			_, _, err := svc.UpdateEvent(context.Background(), user, 1, "uid-1", UpsertInput{RawICS: validICS("uid-1")})
+			if !errors.Is(err, ErrBadRequest) {
+				t.Fatalf("UpdateEvent of the event stored as %q: error = %v, want ErrBadRequest", name, err)
+			}
+			if stored := repo.events["1:uid-1"]; stored.ETag != "etag-old" {
+				t.Fatalf("the event stored as %q was written: %+v", name, stored)
+			}
+		}
+	})
+
 	t.Run("update payload uid mismatch", func(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{
 			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "etag-old"},
@@ -409,7 +428,7 @@ func TestServiceRequiresSpecificCalendarACLPrivileges(t *testing.T) {
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
-				{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
+				{ResourcePath: "/dav/calendars/1/event-1.ics", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
 			}},
 		}, dav.ValidateCalendarObject)
 
@@ -571,8 +590,9 @@ func TestCreateEventNeedsBindOnTheCalendarWhateverAnObjectACLSays(t *testing.T) 
 	delegate := &store.User{ID: 2}
 	collectionRead := store.ACLEntry{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"}
 	collectionBind := store.ACLEntry{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"}
-	objectGrant := store.ACLEntry{ResourcePath: "/dav/calendars/1/new.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "all"}
-	objectDeny := store.ACLEntry{ResourcePath: "/dav/calendars/1/new.ics", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "all"}
+	objectGrant := store.ACLEntry{ResourcePath: "/dav/calendars/1/new", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "all"}
+	objectDeny := store.ACLEntry{ResourcePath: "/dav/calendars/1/new", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "all"}
+	extensionGrant := store.ACLEntry{ResourcePath: "/dav/calendars/1/new.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "all"}
 	tests := map[string]struct {
 		storedName string
 		acl        []store.ACLEntry
@@ -580,7 +600,7 @@ func TestCreateEventNeedsBindOnTheCalendarWhateverAnObjectACLSays(t *testing.T) 
 	}{
 		"object grant without calendar bind":          {storedName: "new", acl: []store.ACLEntry{collectionRead, objectGrant}, want: ErrForbidden},
 		"object deny with calendar bind":              {storedName: "new", acl: []store.ACLEntry{collectionRead, collectionBind, objectDeny}, want: ErrConflict},
-		"grant on an object named with its extension": {storedName: "new.ics", acl: []store.ACLEntry{collectionRead, objectGrant}, want: ErrForbidden},
+		"grant on an object named with its extension": {storedName: "new.ics", acl: []store.ACLEntry{collectionRead, extensionGrant}, want: ErrForbidden},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -747,10 +767,12 @@ var eventWriteAccessCases = []eventWriteAccessCase{
 		davDelete: &[3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
 	},
 	{
+		// A grant of read-acl alone decides none of the privileges a removal
+		// reads, so it refuses nothing either, and DAV, as for an address
+		// book, answers as REST does.
 		principal: "calendar read-acl only", aces: []aceSpec{onCalendar("read-acl")}, concealed: true,
-		update:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
-		delete:    [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
-		davDelete: &[3]targetOutcome{{ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}, {ErrForbidden, ErrForbidden}},
+		update: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
+		delete: [3]targetOutcome{{ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}, {ErrNotFound, ErrNotFound}},
 	},
 	{
 		principal: "event read, calendar deny all", aces: []aceSpec{onEvent("read"), deniedOnCalendar("all")},
@@ -776,7 +798,7 @@ func eventWriteAccessEntries(calendarID, userID int64, aces []aceSpec) map[strin
 	for _, ace := range aces {
 		path := collection
 		if ace.onEvent {
-			path += "/stored.ics"
+			path += "/stored"
 		}
 		entries[path] = append(entries[path], store.ACLEntry{ResourcePath: path, PrincipalHref: fmt.Sprintf("/dav/principals/%d/", userID), IsGrant: !ace.deny, Privilege: ace.privilege})
 	}
@@ -1004,8 +1026,8 @@ func TestServiceListEventsBatchesACLLookups(t *testing.T) {
 	if aclRepo.listByResourceCalls != 0 {
 		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
 	}
-	if aclRepo.listByPrincipalCalls == 0 || aclRepo.listByPrincipalCalls > 3 {
-		t.Fatalf("expected batched ListByPrincipal calls, got %d", aclRepo.listByPrincipalCalls)
+	if aclRepo.listByPrincipalsCalls != 1 || aclRepo.listByPrincipalCalls != 0 {
+		t.Fatalf("expected the delegate's entries read in one query, got %d ListByPrincipals and %d ListByPrincipal calls", aclRepo.listByPrincipalsCalls, aclRepo.listByPrincipalCalls)
 	}
 }
 
@@ -1057,7 +1079,10 @@ func TestServiceListEventsHonorsACEOrderAcrossPrincipalQueries(t *testing.T) {
 	}
 }
 
-func TestCalendarPrivilegeDecisionHonorsACEOrderAcrossResourceAliases(t *testing.T) {
+// An event's ACL is the entries at its own state path. The deny at
+// event.ics belongs to the event of that name, and does not decide for the
+// event named event.
+func TestCalendarPrivilegeDecisionReadsOnlyTheEventsOwnPath(t *testing.T) {
 	user := &store.User{ID: 2}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
 	entries := map[string][]store.ACLEntry{
@@ -1069,9 +1094,11 @@ func TestCalendarPrivilegeDecisionHonorsACEOrderAcrossResourceAliases(t *testing
 		},
 	}
 
-	granted, denied := calendarPrivilegeDecisionFromEntries(user, cal, "event", "read", entries)
-	if granted || !denied {
-		t.Fatalf("calendarPrivilegeDecisionFromEntries() = (%v, %v), want denied", granted, denied)
+	if granted, denied := calendarPrivilegeDecisionFromEntries(user, cal, "event", "read", entries); !granted || denied {
+		t.Fatalf("decision for event = (%v, %v), want granted by its own ACL", granted, denied)
+	}
+	if granted, denied := calendarPrivilegeDecisionFromEntries(user, cal, "event.ics", "read", entries); granted || !denied {
+		t.Fatalf("decision for event.ics = (%v, %v), want denied by its own ACL", granted, denied)
 	}
 }
 
@@ -1472,9 +1499,10 @@ func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCa
 }
 
 type fakeACLRepo struct {
-	entries              []store.ACLEntry
-	listByResourceCalls  int
-	listByPrincipalCalls int
+	entries               []store.ACLEntry
+	listByResourceCalls   int
+	listByPrincipalCalls  int
+	listByPrincipalsCalls int
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
@@ -1772,6 +1800,31 @@ func TestCreateEventBoundsTheUID(t *testing.T) {
 		RawICS: validICS(strings.Repeat("u", store.MaxIdentifierOctets)),
 	}); err != nil {
 		t.Fatalf("UID at the limit: err=%v", err)
+	}
+}
+
+// A created event's resource name is its UID, and a name holding a slash is
+// one no href can name: /dav/calendars/1/a/b.ics is no member of the
+// calendar. The names "." and ".." are the calendar and its parent once a path
+// is cleaned. Such a UID is the caller's error, answered as an oversized one
+// is.
+func TestCreateEventRefusesAUIDNoHrefCanName(t *testing.T) {
+	user := &store.User{ID: 1}
+	repo := &fakeEventRepo{events: map[string]store.Event{}}
+	svc := newServiceWithRepos(true, repo)
+	for _, uid := range []string{"a/b", "/leading", "trailing/", ".", ".."} {
+		_, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS(uid)})
+		if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), `uid must be one path segment, neither "." nor ".."`) {
+			t.Errorf("CreateEvent(%q) error = %v, want ErrBadRequest naming the rule", uid, err)
+		}
+	}
+	if len(repo.events) != 0 {
+		t.Fatalf("an event was stored: %#v", repo.events)
+	}
+	for _, uid := range []string{"a.b@example.com", "...", ".hidden"} {
+		if _, err := svc.CreateEvent(context.Background(), user, 1, UpsertInput{RawICS: validICS(uid)}); err != nil {
+			t.Fatalf("CreateEvent(%q): %v", uid, err)
+		}
 	}
 }
 

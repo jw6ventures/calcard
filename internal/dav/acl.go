@@ -25,6 +25,9 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
+	if refusedMemberName(w, parsedDAVTarget(r.Context(), cleanPath)) {
+		return
+	}
 	canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -59,7 +62,13 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !allowed {
-		writeNeedPrivileges(w, canonicalPath, "write-acl")
+		refusal := requirePrivilegeAt(errPrivilegeNotGranted, canonicalPath, "write-acl")
+		if expected.ResourceState != nil {
+			refusal = h.existingObjectWriteRefusal(r.Context(), user, cleanPath, refusal, func() error {
+				return requirePrivilegeAt(store.ErrNotFound, cleanPath, "write-acl")
+			})
+		}
+		_ = writePrivilegeRequirementError(w, refusal)
 		return
 	}
 	if !h.requireLock(w, r, cleanPath, "resource is locked") {
@@ -167,7 +176,11 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.SetACLAndState(r.Context(), canonicalPath, entries, expected, h.lockPreconditions(r, cleanPath)); err != nil {
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, cleanPath)
+	if !ok {
+		return
+	}
+	if err := h.store.SetACLAndState(r.Context(), canonicalPath, entries, expected, lockPreconditions); err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is locked", http.StatusLocked)
 			return
@@ -589,8 +602,7 @@ func principalResourceHref(resourcePath string) string {
 // resourcePath, in ACE order.
 func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
 	resourcePath = cleanDAVPath(resourcePath)
-	candidates := aclEntryPaths(resourcePath)
-	if len(candidates) == 0 {
+	if isProtectedVirtualDAVRoot(resourcePath) || resourcePath == "" {
 		return nil, nil
 	}
 
@@ -603,26 +615,16 @@ func (h *DavServer) aclEntriesForResource(ctx context.Context, resourcePath stri
 		}
 	}
 
-	result, err := h.store.ACLEntries.ListByResources(ctx, candidates)
+	result, err := h.store.ACLEntries.ListByResources(ctx, []string{resourcePath})
 	if err != nil {
 		return nil, err
 	}
-	orderACLEntries(result, candidates)
+	acl.SortEntries(result)
 
 	if cache != nil {
 		cache.put(resourcePath, result)
 	}
 	return result, nil
-}
-
-// aclEntryPaths lists, in decision order, the stored spellings whose entries
-// make up the ACL of the canonical resourcePath. The protected roots carry
-// none.
-func aclEntryPaths(resourcePath string) []string {
-	if isProtectedVirtualDAVRoot(resourcePath) {
-		return nil
-	}
-	return store.ACLPaths(resourcePath)
 }
 
 // aclDecisionPaths lists the resources whose ACLs checkACLPrivilege consults
@@ -691,7 +693,9 @@ func (h *DavServer) aclGuard(ctx context.Context, user *store.User, resourcePath
 			if err != nil {
 				return nil, err
 			}
-			guardedPaths = append(guardedPaths, aclEntryPaths(decisionPath)...)
+			if !isProtectedVirtualDAVRoot(decisionPath) {
+				guardedPaths = append(guardedPaths, decisionPath)
+			}
 			entries = append(entries, decisionEntries...)
 		}
 	}

@@ -3525,7 +3525,7 @@ func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t 
 	resp.assertPrivileges(t, davQN("read"), calQN("read-free-busy"), davQN("bind"))
 }
 
-func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T) {
+func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusyAndTheReadContainingIt(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	calRepo := &fakeCalendarRepo{
@@ -3546,17 +3546,11 @@ func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T)
 	if privilegeSet == nil {
 		t.Fatal("expected privilege set for readable calendar")
 	}
-	if len(privilegeSet.Privileges) != 1 {
-		t.Fatalf("expected only the granted DAV:read privilege, got %#v", privilegeSet.Privileges)
-	}
-	if privilegeSet.Privileges[0].Read == nil {
-		t.Fatalf("expected DAV:read privilege, got %#v", privilegeSet.Privileges[0])
-	}
-	if privilegeSet.Privileges[0].Read.ReadFreeBusy != nil {
-		t.Fatalf("did not expect read-free-busy nested under DAV:read when explicitly denied, got %#v", privilegeSet.Privileges[0])
-	}
-	if privilegeSet.Privileges[0].ReadFreeBusy != nil {
-		t.Fatalf("did not expect standalone read-free-busy privilege when explicitly denied, got %#v", privilegeSet.Privileges[0])
+	// CalCard's DAV:read contains read-free-busy, and RFC 3744 section 3.12
+	// makes an aggregate equivalent to what it contains, so the refused
+	// read-free-busy leaves DAV:read unreported as well.
+	if len(privilegeSet.Privileges) != 0 {
+		t.Fatalf("expected neither DAV:read nor the denied read-free-busy, got %#v", privilegeSet.Privileges)
 	}
 }
 
@@ -4203,24 +4197,6 @@ func TestCanonicalDAVPathUsesExtensionlessResourceIdentity(t *testing.T) {
 	}
 }
 
-func TestNormalizeDAVResourceIdentityPreservesDottedCanonicalNames(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{path: "/dav/calendars/2/event.v2", want: "/dav/calendars/2/event.v2"},
-		{path: "/dav/addressbooks/5/alice.v1", want: "/dav/addressbooks/5/alice.v1"},
-		{path: "/dav/calendars/2/event.ics", want: "/dav/calendars/2/event"},
-		{path: "/dav/addressbooks/5/alice.vcf", want: "/dav/addressbooks/5/alice"},
-	}
-
-	for _, tc := range tests {
-		if got := normalizeDAVResourceIdentity(tc.path); got != tc.want {
-			t.Fatalf("normalizeDAVResourceIdentity(%q) = %q, want %q", tc.path, got, tc.want)
-		}
-	}
-}
-
 func TestDeleteRejectsCanonicalResourceLockAcrossExtensions(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -4542,7 +4518,7 @@ func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
 	}
 }
 
-func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
+func TestCollectionLockRefreshesAndUnlocksWithinItsScope(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -4569,7 +4545,7 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		t.Fatal("expected collection lock to be stored")
 	}
 
-	t.Run("refresh uses lock root", func(t *testing.T) {
+	t.Run("refresh within the lock's scope keeps its root", func(t *testing.T) {
 		refreshReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", nil)
 		refreshReq.Header.Set("If", "(<"+token+">)")
 		refreshReq.Header.Set("Timeout", "Second-7200")
@@ -4581,6 +4557,9 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 			t.Fatalf("expected lock-root refresh to succeed, got %d: %s", refreshRR.Code, refreshRR.Body.String())
 		}
 
+		// RFC 4918 §9.10.2 refreshes a lock from any resource within its
+		// scope, which a depth-infinity lock extends to the collection's
+		// members; the lock keeps its root.
 		descendantReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
 		descendantReq.Header.Set("If", "(<"+token+">)")
 		descendantReq.Header.Set("Timeout", "Second-3600")
@@ -4588,31 +4567,26 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		descendantRR := httptest.NewRecorder()
 		h.Lock(descendantRR, descendantReq)
 
-		// RFC 4918 §9.10.6 gives the refresh case 412 with the precondition
-		// named, where §9.11.1 gives UNLOCK 409 for the same condition.
-		assertErrorConditions(t, descendantRR, http.StatusPreconditionFailed, davQN("lock-token-matches-request-uri"))
+		if descendantRR.Code != http.StatusOK || !strings.Contains(descendantRR.Body.String(), "<d:lockroot><d:href>/dav/addressbooks/5</d:href></d:lockroot>") {
+			t.Fatalf("expected a refresh from within the lock's scope to keep its root, got %d: %s", descendantRR.Code, descendantRR.Body.String())
+		}
 	})
 
-	t.Run("unlock uses lock root", func(t *testing.T) {
+	// RFC 4918 §9.11: the Request-URI of an UNLOCK identifies a resource
+	// within the scope of the lock, which a depth-infinity lock extends to
+	// the collection's members.
+	t.Run("unlock within the lock's scope", func(t *testing.T) {
 		descendantReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 		descendantReq.Header.Set("Lock-Token", "<"+token+">")
 		descendantReq = descendantReq.WithContext(auth.WithUser(descendantReq.Context(), user))
 		descendantRR := httptest.NewRecorder()
 		h.Unlock(descendantRR, descendantReq)
 
-		assertErrorConditions(t, descendantRR, http.StatusConflict, davQN("lock-token-matches-request-uri"))
-		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock == nil {
-			t.Fatal("expected descendant UNLOCK to preserve the collection lock")
+		if descendantRR.Code != http.StatusNoContent {
+			t.Fatalf("expected UNLOCK from within the lock's scope to succeed, got %d: %s", descendantRR.Code, descendantRR.Body.String())
 		}
-
-		unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/", nil)
-		unlockReq.Header.Set("Lock-Token", "<"+token+">")
-		unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user))
-		unlockRR := httptest.NewRecorder()
-		h.Unlock(unlockRR, unlockReq)
-
-		if unlockRR.Code != http.StatusNoContent {
-			t.Fatalf("expected lock-root UNLOCK to succeed, got %d: %s", unlockRR.Code, unlockRR.Body.String())
+		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock != nil {
+			t.Fatal("expected UNLOCK from within the lock's scope to remove the collection lock")
 		}
 	})
 }
@@ -5489,7 +5463,7 @@ func TestCopyDoesNotRequireSourceLockTokenAndPreservesDestinationLock(t *testing
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:src": {
 				Token:        "opaquelocktoken:src",
-				ResourcePath: "/dav/addressbooks/5/alice.vcf",
+				ResourcePath: "/dav/addressbooks/5/alice",
 				UserID:       user.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -5498,7 +5472,7 @@ func TestCopyDoesNotRequireSourceLockTokenAndPreservesDestinationLock(t *testing
 			},
 			"opaquelocktoken:dest": {
 				Token:        "opaquelocktoken:dest",
-				ResourcePath: "/dav/addressbooks/6/copied.vcf",
+				ResourcePath: "/dav/addressbooks/6/copied",
 				UserID:       user.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -6144,7 +6118,7 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:event": {
 				Token:          "opaquelocktoken:event",
-				ResourcePath:   "/dav/calendars/5/event.ics",
+				ResourcePath:   "/dav/calendars/5/event",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -6156,7 +6130,7 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/calendars/5/event.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
@@ -6248,7 +6222,7 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:alice": {
 				Token:          "opaquelocktoken:alice",
-				ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+				ResourcePath:   "/dav/addressbooks/5/alice",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -6260,7 +6234,7 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 		},
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
@@ -6919,6 +6893,7 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
+				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"},
 			}
@@ -7008,6 +6983,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 				{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
+				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"},
 			}
@@ -11557,6 +11533,33 @@ func TestCopyMoveLockPrefetchServesLockChecks(t *testing.T) {
 	}
 	if lockRepo.listByResourcesCalls != 1 {
 		t.Fatalf("lock checks after prefetch issued %d extra queries, want 0", lockRepo.listByResourcesCalls-1)
+	}
+}
+
+// A lock index prefetched for some paths answers only for those: a lock check
+// on any other path reads the store, and the paths it read are served from the
+// index after that.
+func TestLockIndexReadsTheStoreForPathsItHasNotFetched(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/calendars/9/event", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MOVE", "/dav/calendars/1/event.ics", nil)
+	req = h.prefetchCopyMoveLocks(req, "/dav/calendars/1/event.ics", "/dav/calendars/2/event.ics")
+
+	for range 2 {
+		allowed, err := h.checkLock(req, "/dav/calendars/9/event")
+		if err != nil {
+			t.Fatalf("checkLock returned error: %v", err)
+		}
+		if allowed {
+			t.Fatal("a lock on a path the prefetch did not cover was not found")
+		}
+	}
+	if lockRepo.listByResourcesCalls != 2 {
+		t.Fatalf("lock queries = %d, want the prefetch and one read of the uncovered path", lockRepo.listByResourcesCalls)
 	}
 }
 

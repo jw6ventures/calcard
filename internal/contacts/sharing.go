@@ -3,10 +3,8 @@ package contacts
 import (
 	"context"
 	"fmt"
-	"path"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -60,25 +58,23 @@ var viewerRevokedPrivileges = []string{
 func (s *Service) revokeContactWriteGrants(ctx context.Context, bookID int64, principalHref string) error {
 	memberPrefix := addressBookACLCollectionPath(bookID) + "/"
 	seen := map[string]struct{}{}
-	for _, spelling := range []string{principalHref, strings.TrimSuffix(principalHref, "/")} {
-		entries, err := s.store.ACLEntries.ListByPrincipal(ctx, spelling)
-		if err != nil {
-			return err
+	entries, err := s.store.ACLEntries.ListByPrincipals(ctx, []string{principalHref, strings.TrimSuffix(principalHref, "/")})
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := entry.ResourcePath
+		if !entry.IsGrant || !strings.HasPrefix(path, memberPrefix) || !slices.Contains(viewerRevokedPrivileges, entry.Privilege) {
+			continue
 		}
-		for _, entry := range entries {
-			path := entry.ResourcePath
-			if !entry.IsGrant || !strings.HasPrefix(path, memberPrefix) || !slices.Contains(viewerRevokedPrivileges, entry.Privilege) {
-				continue
-			}
-			if _, done := seen[path]; done {
-				continue
-			}
-			seen[path] = struct{}{}
-			if err := s.store.ACLEntries.UpdateACL(ctx, path, func(current []store.ACLEntry) ([]store.ACLEntry, error) {
-				return withoutWriteGrants(current, principalHref), nil
-			}); err != nil {
-				return err
-			}
+		if _, done := seen[path]; done {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := s.store.ACLEntries.UpdateACL(ctx, path, func(current []store.ACLEntry) ([]store.ACLEntry, error) {
+			return withoutWriteGrants(current, principalHref), nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -128,19 +124,14 @@ func sharePrincipalHref(userID int64) string {
 }
 
 // addressBookACLResourcePaths lists the paths whose ACL entries make up the
-// ACL of the contact named resourceName, spelled as the DAV layer spells a
-// contact's identity: its canonical path, which drops a trailing .vcf in any
-// case, then the legacy path, the canonical one with .vcf. The canonical path
-// is also the store's contacts.object_acl_path. A blank name has no path.
+// ACL of the contact named resourceName: its state path, which is where DAV
+// reads and writes it and the store's contacts.object_acl_path, or none for an
+// empty name.
 func addressBookACLResourcePaths(bookID int64, resourceName string) []string {
-	if strings.TrimSpace(resourceName) == "" {
+	if resourceName == "" {
 		return nil
 	}
-	canonical := addressBookACLCollectionPath(bookID) + "/" + resourceName
-	if ext := path.Ext(canonical); strings.EqualFold(ext, ".vcf") {
-		canonical = strings.TrimSuffix(canonical, ext)
-	}
-	return []string{canonical, canonical + ".vcf"}
+	return []string{store.MemberStatePath(addressBookACLCollectionPath(bookID), resourceName)}
 }
 
 func contactResourceName(c store.Contact) string {
@@ -172,31 +163,6 @@ func (s *Service) aclEntriesForPaths(ctx context.Context, resourcePaths []string
 	}
 	acl.SortEntries(result)
 	return result, nil
-}
-
-func (s *Service) aclDecision(ctx context.Context, user *store.User, bookID int64, resourcePaths []string, privilege string) (bool, bool, error) {
-	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
-	if err != nil {
-		return false, false, err
-	}
-	principals, err := s.addressBookApplicablePrincipals(ctx, user, bookID, entries)
-	if err != nil {
-		return false, false, err
-	}
-	granted, applicable := acl.DecisionForPrivilege(entries, principals, privilege)
-	return granted, applicable, nil
-}
-
-func (s *Service) aclHasApplicablePrincipal(ctx context.Context, user *store.User, bookID int64, resourcePaths []string) (bool, error) {
-	entries, err := s.aclEntriesForPaths(ctx, resourcePaths)
-	if err != nil {
-		return false, err
-	}
-	principals, err := s.addressBookApplicablePrincipals(ctx, user, bookID, entries)
-	if err != nil {
-		return false, err
-	}
-	return acl.HasApplicablePrincipal(entries, principals), nil
 }
 
 // addressBookApplicablePrincipals names the principals an ACE on an address
@@ -231,27 +197,22 @@ func (s *Service) privilegeDecision(ctx context.Context, user *store.User, bookI
 		return false, false, nil
 	}
 
-	resourcePaths := addressBookACLResourcePaths(bookID, resourceName)
-	if len(resourcePaths) > 0 {
-		if granted, applicable, err := s.aclDecision(ctx, user, bookID, resourcePaths, privilege); err != nil {
-			return false, false, err
-		} else if applicable {
-			return granted, true, nil
-		}
-	}
-
-	collectionPaths := []string{addressBookACLCollectionPath(bookID)}
-	if granted, applicable, err := s.aclDecision(ctx, user, bookID, collectionPaths, privilege); err != nil {
-		return false, false, err
-	} else if applicable {
-		return granted, true, nil
-	}
-
-	applicable, err := s.aclHasApplicablePrincipal(ctx, user, bookID, append(append([]string{}, resourcePaths...), collectionPaths...))
+	resourceEntries, err := s.aclEntriesForPaths(ctx, addressBookACLResourcePaths(bookID, resourceName))
 	if err != nil {
 		return false, false, err
 	}
-	return false, applicable, nil
+	collectionEntries, err := s.aclEntriesForPaths(ctx, []string{addressBookACLCollectionPath(bookID)})
+	if err != nil {
+		return false, false, err
+	}
+	principals, err := s.addressBookApplicablePrincipals(ctx, user, bookID, append(slices.Clone(resourceEntries), collectionEntries...))
+	if err != nil {
+		return false, false, err
+	}
+	if granted, decided := acl.DecisionThroughLayers(principals, privilege, resourceEntries, collectionEntries); decided {
+		return granted, true, nil
+	}
+	return false, acl.HasApplicablePrincipal(resourceEntries, principals) || acl.HasApplicablePrincipal(collectionEntries, principals), nil
 }
 
 func canReadContactFromEntries(user *store.User, bookID, ownerID int64, resourceName string, entriesByPath map[string][]store.ACLEntry) bool {
@@ -261,13 +222,8 @@ func canReadContactFromEntries(user *store.User, bookID, ownerID int64, resource
 		resourceEntries = append(resourceEntries, entriesByPath[p]...)
 	}
 	acl.SortEntries(resourceEntries)
-	if granted, decided := acl.DecisionForPrivilege(resourceEntries, applicable, "read"); decided {
-		return granted
-	}
-	if granted, decided := acl.DecisionForPrivilege(entriesByPath[addressBookACLCollectionPath(bookID)], applicable, "read"); decided {
-		return granted
-	}
-	return false
+	granted, _ := acl.DecisionThroughLayers(applicable, "read", resourceEntries, entriesByPath[addressBookACLCollectionPath(bookID)])
+	return granted
 }
 
 // ShareAddressBook grants another user read-only or editor access to an owned
@@ -400,12 +356,8 @@ func (s *Service) ListAddressBookShares(ctx context.Context, owner *store.User, 
 		if !entry.IsGrant || !shareVisiblePrivilege(entry.Privilege) {
 			continue
 		}
-		if !strings.HasPrefix(entry.PrincipalHref, "/dav/principals/") || !strings.HasSuffix(entry.PrincipalHref, "/") {
-			continue
-		}
-		rawID := strings.TrimSuffix(strings.TrimPrefix(entry.PrincipalHref, "/dav/principals/"), "/")
-		userID, err := strconv.ParseInt(rawID, 10, 64)
-		if err != nil {
+		userID, ok := acl.PrincipalUserID(entry.PrincipalHref)
+		if !ok {
 			continue
 		}
 		if createdAt[userID].IsZero() || entry.CreatedAt.Before(createdAt[userID]) {

@@ -17,6 +17,7 @@ type davRequestState struct {
 	addressBooks          map[int64]*store.AddressBook
 	calendarAccess        map[calendarAccessKey]*store.CalendarAccess
 	primaryTarget         *davTarget
+	ifHeader              *ifHeaderState
 }
 
 // calendarAccessKey names one store-side resolution of a user's access to a
@@ -174,6 +175,27 @@ func (s *davRequestState) invalidateCollectionResolutions() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.collectionResolutions = make(map[collectionResolutionKey]collectionResolutionResult)
+}
+
+// parsedIfHeader returns the request's If header as parseIfHeader read it, or
+// nil before it has. The header does not change during a request, so this
+// survives invalidateDAVRequestState.
+func (s *davRequestState) parsedIfHeader() *ifHeaderState {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ifHeader
+}
+
+func (s *davRequestState) setParsedIfHeader(state *ifHeaderState) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ifHeader = state
 }
 
 func (s *davRequestState) setPrimaryDAVTarget(target davTarget) {

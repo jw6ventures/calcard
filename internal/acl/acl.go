@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/store"
@@ -23,14 +24,36 @@ func PrincipalHref(userID int64) string {
 	return fmt.Sprintf("/dav/principals/%d/", userID)
 }
 
+// PrincipalHrefs lists the principal_href values a stored ACL entry that
+// applies to user can hold, for a lookup by principal: the principals
+// ApplicablePrincipals names, and the user's href also without its trailing
+// slash, which NormalizePrincipalHref folds into it. Every writer stores a
+// principal href as NormalizePrincipalHref leaves it, so these are all a
+// decision that normalizes the entries it reads can match.
 func PrincipalHrefs(user *store.User) []string {
 	principals := []string{PrincipalAll}
 	if user != nil {
-		principals = append(principals, PrincipalAuthenticated, PrincipalHref(user.ID))
+		href := PrincipalHref(user.ID)
+		principals = append(principals, PrincipalAuthenticated, href, strings.TrimSuffix(href, "/"))
 	} else {
 		principals = append(principals, PrincipalUnauthenticated)
 	}
 	return principals
+}
+
+// PrincipalUserID is the user a principal href names, with or without its
+// trailing slash or in any other spelling NormalizePrincipalHref folds into
+// PrincipalHref's, and whether it names one.
+func PrincipalUserID(href string) (int64, bool) {
+	normalized := NormalizePrincipalHref(href)
+	if !isCanonicalPrincipalHref(normalized) {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(normalized, "/dav/principals/"), "/"), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 func ApplicablePrincipals(user *store.User) map[string]struct{} {
@@ -157,11 +180,74 @@ func PrivilegeMatches(granted, requested string) bool {
 	return granted == "write" && (requested == "write-content" || requested == "write-properties" || requested == "bind" || requested == "unbind")
 }
 
+// DecisionForPrivilege decides privilege from one ACL: whether it is granted,
+// and whether the entries decide it at all.
 func DecisionForPrivilege(entries []store.ACLEntry, applicablePrincipals map[string]struct{}, privilege string) (bool, bool) {
-	if privilege == "write" {
-		return aggregateWriteDecision(entries, applicablePrincipals)
+	return DecisionThroughLayers(applicablePrincipals, privilege, entries)
+}
+
+// DecisionThroughLayers decides privilege from the ACLs of a resource and of
+// the collections it inherits from, the resource's own first: the first layer
+// whose entries decide a privilege decides it. DAV:write, which RFC 3744
+// section 3.2 makes the aggregate of DAV:write-content, DAV:write-properties,
+// DAV:bind and DAV:unbind, is decided part by part through the layers, so a
+// part the member's ACL leaves undecided is decided by its collection's, as a
+// request for that part alone would be. It is granted when every part is,
+// refused when any part is refused, and decided unheld when only some parts
+// are granted.
+func DecisionThroughLayers(applicablePrincipals map[string]struct{}, privilege string, layers ...[]store.ACLEntry) (granted, decided bool) {
+	if privilege != "write" {
+		return decideThroughLayers(applicablePrincipals, privilege, layers)
 	}
-	return decidePrivilege(entries, applicablePrincipals, privilege)
+	grantedAll := true
+	for _, part := range writeParts {
+		partGranted, partDecided := decideThroughLayers(applicablePrincipals, part, layers)
+		if partDecided && !partGranted {
+			return false, true
+		}
+		decided = decided || partDecided
+		grantedAll = grantedAll && partGranted
+	}
+	return decided && grantedAll, decided
+}
+
+// HeldThroughLayers reports whether privilege is held through layers, as
+// current-user-privilege-set reports it: RFC 3744 section 3.12 makes an
+// aggregate privilege equivalent to the set of the privileges it contains, so
+// DAV:all is held when every privilege it contains is, and DAV:read when
+// read-free-busy, which PrivilegeMatches has it contain, is held as well.
+// DAV:write is decided part by part already. A method's own check decides the
+// privilege it needs with DecisionThroughLayers, not this.
+func HeldThroughLayers(applicablePrincipals map[string]struct{}, privilege string, layers ...[]store.ACLEntry) bool {
+	parts := []string{privilege}
+	switch privilege {
+	case "all":
+		parts = allParts
+	case "read":
+		parts = []string{"read", "read-free-busy"}
+	}
+	for _, part := range parts {
+		if granted, _ := DecisionThroughLayers(applicablePrincipals, part, layers...); !granted {
+			return false
+		}
+	}
+	return true
+}
+
+// allParts are the privileges DAV:all contains that a decision can resolve,
+// DAV:write among them standing for its own parts.
+var allParts = []string{"read", "read-free-busy", "read-acl", "read-current-user-privilege-set", "write", "write-acl", "unlock"}
+
+// writeParts are the privileges DAV:write aggregates (RFC 3744 section 3.2).
+var writeParts = []string{"write-content", "write-properties", "bind", "unbind"}
+
+func decideThroughLayers(applicablePrincipals map[string]struct{}, privilege string, layers [][]store.ACLEntry) (bool, bool) {
+	for _, entries := range layers {
+		if granted, decided := decidePrivilege(entries, applicablePrincipals, privilege); decided {
+			return granted, true
+		}
+	}
+	return false, false
 }
 
 func HasApplicablePrincipal(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) bool {
@@ -184,20 +270,6 @@ func decidePrivilege(entries []store.ACLEntry, applicablePrincipals map[string]s
 		return entry.IsGrant, true
 	}
 	return false, false
-}
-
-func aggregateWriteDecision(entries []store.ACLEntry, applicablePrincipals map[string]struct{}) (bool, bool) {
-	applicable := false
-	for _, privilege := range []string{"write-content", "write-properties", "bind", "unbind"} {
-		granted, decided := decidePrivilege(entries, applicablePrincipals, privilege)
-		if decided {
-			applicable = true
-		}
-		if !granted {
-			return false, applicable
-		}
-	}
-	return applicable, applicable
 }
 
 func normalizeHref(raw string) string {

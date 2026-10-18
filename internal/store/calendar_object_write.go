@@ -192,6 +192,10 @@ func putCalendarObjectTx(ctx context.Context, tx *sql.Tx, write CalendarObjectWr
 
 	metadata := calendarObjectMetadata(write)
 	if existing == nil {
+		statePath := MemberStatePath(calendarCollectionLockPath(write.CalendarID), write.ResourceName)
+		if err := clearCreatedObjectDAVStateTx(ctx, tx, statePath); err != nil {
+			return nil, err
+		}
 		const insert = `
 INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())

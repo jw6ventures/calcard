@@ -100,7 +100,10 @@ func (h *DavServer) prefetchCopyMoveLocks(r *http.Request, srcPath, destPath str
 		if p == "" || p == "." || p == "/" {
 			continue
 		}
-		target := h.resolveLockTarget(r, p)
+		target, err := h.resolveLockTarget(r, p)
+		if err != nil {
+			return r
+		}
 		for _, lookupPath := range target.lookupPaths {
 			if _, ok := seen[lookupPath]; ok {
 				continue
@@ -116,12 +119,7 @@ func (h *DavServer) prefetchCopyMoveLocks(r *http.Request, srcPath, destPath str
 	if err != nil {
 		return r
 	}
-	byPath := make(map[string][]store.Lock, len(locks))
-	for i := range locks {
-		key := cleanDAVPath(locks[i].ResourcePath)
-		byPath[key] = append(byPath[key], locks[i])
-	}
-	return r.WithContext(withLockBatchIndex(r.Context(), &lockBatchIndex{byPath: byPath}))
+	return r.WithContext(withLockBatchIndex(r.Context(), newLockBatchIndex(union, locks)))
 }
 
 // writeSourceResolutionError maps COPY/MOVE source-path resolution failures to
@@ -224,6 +222,10 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
+	if destinationNameRefused(destResourceName, eventResourceName(*src)) {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
+		return
+	}
 
 	existing, err := h.store.Events.GetByResourceName(r.Context(), destCalID, destResourceName)
 	if err != nil {
@@ -238,11 +240,22 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 	destCal, err := h.loadCalendarWithPrivilege(r.Context(), user, destCalID, loadPrivilegePath, loadPrivilege)
 	if err != nil {
-		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, loadPrivilegePath, loadPrivilege))
+		h.writeCalendarDestinationRefusal(w, r, user, destCalID, destPath, existing, requirePrivilegeAt(err, loadPrivilegePath, loadPrivilege))
 		return
 	}
+	// A COPY replaces an existing destination's properties with the source's
+	// as well as its body, and RFC 3744 Appendix B has it need DAV:read on the
+	// destination too.
+	if existing != nil {
+		for _, privilege := range []string{"write-properties", "read"} {
+			if err := h.requireCalendarPrivilege(r.Context(), user, &destCal.Calendar, destPath, privilege); err != nil {
+				h.writeCalendarDestinationRefusal(w, r, user, destCalID, destPath, existing, requirePrivilegeAt(err, destPath, privilege))
+				return
+			}
+		}
+	}
 	if err := h.requireCalendarDestinationWritePrivileges(r.Context(), user, destCal, destPath, existing); err != nil {
-		_ = writePrivilegeRequirementError(w, err)
+		h.writeCalendarDestinationRefusal(w, r, user, destCalID, destPath, existing, err)
 		return
 	}
 	if !h.requireLocks(w, r, "destination is locked", destPath, path.Dir(destPath)) {
@@ -292,6 +305,10 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
 		return
 	}
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, destPath, path.Dir(destPath))
+	if !ok {
+		return
+	}
 	defer invalidateDAVRequestState(r.Context())
 	result, err := h.store.TransferCalendarObject(r.Context(), store.CalendarObjectTransfer{
 		Operation:               store.CalendarObjectCopy,
@@ -309,7 +326,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		Metadata:                &validated.Analysis.Metadata,
 		SourceStatePath:         fromStatePath,
 		DestinationStatePath:    toStatePath,
-		LockPreconditions:       h.lockPreconditions(r, destPath, path.Dir(destPath)),
+		LockPreconditions:       lockPreconditions,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrResourceStateChanged) && retries > 0 {
@@ -342,12 +359,6 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 		return
 	}
-	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
-	if err != nil || !destMatched {
-		http.Error(w, "invalid destination", http.StatusForbidden)
-		return
-	}
-
 	srcBook, err := h.getAddressBook(r.Context(), srcBookID)
 	if err != nil {
 		http.Error(w, "source not found", http.StatusNotFound)
@@ -371,6 +382,15 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	}
+	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
+	if err != nil || !destMatched {
+		http.Error(w, "invalid destination", http.StatusForbidden)
+		return
+	}
+	if destinationNameRefused(destResourceName, contactResourceName(*src)) {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
 		http.Error(w, "destination not found", http.StatusNotFound)
@@ -382,8 +402,8 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
 		return
 	}
-	if err := h.requireAddressBookDestinationWritePrivileges(r.Context(), user, destBook, destPath, existingByName); err != nil {
-		_ = writePrivilegeRequirementError(w, err)
+	if !h.authorizeAddressBookDestination(w, r, user, destBook, destPath, existingByName,
+		privilegeAt{"write-content", destPath}, privilegeAt{"write-properties", destPath}, privilegeAt{"read", destPath}) {
 		return
 	}
 	if !h.requireLocks(w, r, "destination is locked", destPath, path.Dir(destPath)) {
@@ -442,9 +462,13 @@ func (h *DavServer) copyContactWithRetry(w http.ResponseWriter, r *http.Request,
 		ACL:         aclGuard,
 		Overwrite:   overwrite,
 	}
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, destPath, path.Dir(destPath))
+	if !ok {
+		return
+	}
 	defer invalidateDAVRequestState(r.Context())
 	_, err = h.store.CopyContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, etag, fromStatePath, toStatePath, replacedUID,
-		expected, h.lockPreconditions(r, destPath, path.Dir(destPath)))
+		expected, lockPreconditions)
 	if err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is locked", http.StatusLocked)
@@ -597,6 +621,10 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid destination", http.StatusForbidden)
 		return
 	}
+	if destinationNameRefused(destResourceName, eventResourceName(*src)) {
+		writeCalDAVError(w, http.StatusForbidden, "valid-calendar-object-resource")
+		return
+	}
 
 	existing, err := h.store.Events.GetByResourceName(r.Context(), destCalID, destResourceName)
 	if err != nil {
@@ -610,11 +638,11 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 	}
 	destCal, err := h.loadCalendarWithPrivilege(r.Context(), user, destCalID, loadPrivilegePath, loadPrivilege)
 	if err != nil {
-		_ = writePrivilegeRequirementError(w, requirePrivilegeAt(err, loadPrivilegePath, loadPrivilege))
+		h.writeCalendarDestinationRefusal(w, r, user, destCalID, destPath, existing, requirePrivilegeAt(err, loadPrivilegePath, loadPrivilege))
 		return
 	}
 	if err := h.requireCalendarDestinationWritePrivileges(r.Context(), user, destCal, destPath, existing); err != nil {
-		_ = writePrivilegeRequirementError(w, err)
+		h.writeCalendarDestinationRefusal(w, r, user, destCalID, destPath, existing, err)
 		return
 	}
 	if !h.requireLocks(w, r, "destination is locked", destPath, path.Dir(destPath)) {
@@ -656,6 +684,10 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "failed to resolve resource state paths", http.StatusInternalServerError)
 		return
 	}
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, srcPath(r), path.Dir(srcPath(r)), destPath, path.Dir(destPath))
+	if !ok {
+		return
+	}
 	defer invalidateDAVRequestState(r.Context())
 	result, err := h.store.TransferCalendarObject(r.Context(), store.CalendarObjectTransfer{
 		Operation:               store.CalendarObjectMove,
@@ -672,7 +704,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		Metadata:                &validated.Analysis.Metadata,
 		SourceStatePath:         fromStatePath,
 		DestinationStatePath:    toStatePath,
-		LockPreconditions:       h.lockPreconditions(r, srcPath(r), path.Dir(srcPath(r)), destPath, path.Dir(destPath)),
+		LockPreconditions:       lockPreconditions,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrResourceStateChanged) && retries > 0 {
@@ -758,12 +790,6 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
 		return
 	}
-	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
-	if err != nil || !destMatched {
-		http.Error(w, "invalid destination", http.StatusForbidden)
-		return
-	}
-
 	srcBook, err := h.getAddressBook(r.Context(), srcBookID)
 	if err != nil {
 		http.Error(w, "source not found", http.StatusNotFound)
@@ -796,6 +822,15 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 		return
 	}
+	destBookID, destResourceName, destMatched, err := h.parseAddressBookResourcePath(r.Context(), user, destPath)
+	if err != nil || !destMatched {
+		http.Error(w, "invalid destination", http.StatusForbidden)
+		return
+	}
+	if destinationNameRefused(destResourceName, contactResourceName(*src)) {
+		writeCardDAVPrecondition(w, http.StatusBadRequest, "valid-address-data")
+		return
+	}
 	destBook, err := h.getAddressBook(r.Context(), destBookID)
 	if err != nil {
 		http.Error(w, "destination not found", http.StatusNotFound)
@@ -807,8 +842,7 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "failed to load destination contact", http.StatusInternalServerError)
 		return
 	}
-	if err := h.requireAddressBookDestinationWritePrivileges(r.Context(), user, destBook, destPath, existingByName); err != nil {
-		_ = writePrivilegeRequirementError(w, err)
+	if !h.authorizeAddressBookDestination(w, r, user, destBook, destPath, existingByName, privilegeAt{"unbind", path.Dir(destPath)}) {
 		return
 	}
 	if !h.requireLocks(w, r, "destination is locked", destPath, path.Dir(destPath)) {
@@ -860,9 +894,13 @@ func (h *DavServer) moveContactWithRetry(w http.ResponseWriter, r *http.Request,
 		ACL:         aclGuard,
 		Overwrite:   overwrite,
 	}
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, srcPath(r), path.Dir(srcPath(r)), destPath, path.Dir(destPath))
+	if !ok {
+		return
+	}
 	defer invalidateDAVRequestState(r.Context())
 	if err := h.store.MoveContactAndState(r.Context(), srcBookID, destBookID, src.UID, destResourceName, fromStatePath, toStatePath, replacedUID,
-		expected, h.lockPreconditions(r, srcPath(r), path.Dir(srcPath(r)), destPath, path.Dir(destPath))); err != nil {
+		expected, lockPreconditions); err != nil {
 		if errors.Is(err, store.ErrLockConflict) {
 			http.Error(w, "resource is locked", http.StatusLocked)
 			return
@@ -916,6 +954,68 @@ func (h *DavServer) writeContactCopyMoveConflict(w http.ResponseWriter, r *http.
 	writeCardDAVUIDConflict(w, addressObjectConflictHref(addressBookID, contactResourceName(*conflict)))
 }
 
+// writeCalendarDestinationRefusal answers a COPY or MOVE refused on its
+// destination. A principal that may not read an existing destination is
+// answered as for an absent one, as a PUT to it would be.
+func (h *DavServer) writeCalendarDestinationRefusal(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, destPath string, existing *store.Event, refusal error) {
+	if existing != nil {
+		refusal = h.existingObjectWriteRefusal(r.Context(), user, destPath, refusal, func() error {
+			return h.calendarMemberBindRefusal(r.Context(), user, calendarID, destPath)
+		})
+	}
+	_ = writePrivilegeRequirementError(w, refusal)
+}
+
+// privilegeAt names a privilege and the path it is needed on.
+type privilegeAt struct {
+	privilege, path string
+}
+
+// authorizeAddressBookDestination checks the privileges RFC 3744 Appendix B
+// makes a COPY or MOVE need on its destination in book, as calendars check
+// them, and answers a refusal: DAV:bind on the collection for an absent
+// destination, and for an existing one first overwrite, which is
+// DAV:write-content, DAV:write-properties and DAV:read on the destination for
+// a COPY and DAV:unbind on the collection for a MOVE, then DAV:bind and
+// DAV:unbind on the collection. A principal that may not read an existing destination is
+// answered as for an absent one.
+func (h *DavServer) authorizeAddressBookDestination(w http.ResponseWriter, r *http.Request, user *store.User, book *store.AddressBook, destPath string, existing *store.Contact, overwrite ...privilegeAt) bool {
+	needed := []privilegeAt{{"bind", path.Dir(destPath)}}
+	if existing != nil {
+		needed = overwrite
+	}
+	var refusal error
+	for _, need := range needed {
+		if err := h.requireAddressBookPrivilege(r.Context(), user, book, need.path, need.privilege); err != nil {
+			refusal = requirePrivilegeAt(err, need.path, need.privilege)
+			break
+		}
+	}
+	if refusal == nil {
+		refusal = h.requireAddressBookDestinationWritePrivileges(r.Context(), user, book, destPath, existing)
+	}
+	if refusal == nil {
+		return true
+	}
+	if existing != nil {
+		refusal = h.existingObjectWriteRefusal(r.Context(), user, destPath, refusal, func() error {
+			return h.addressBookMemberBindRefusal(r.Context(), user, book, destPath)
+		})
+	}
+	_ = writePrivilegeRequirementError(w, refusal)
+	return false
+}
+
+// addressBookMemberBindRefusal is the refusal a write creating the member at
+// cleanPath meets: DAV:bind on its address book, or nil when user holds it.
+func (h *DavServer) addressBookMemberBindRefusal(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string) error {
+	parentPath := path.Dir(cleanPath)
+	if err := h.requireAddressBookPrivilege(ctx, user, book, parentPath, "bind"); err != nil {
+		return requirePrivilegeAt(err, parentPath, "bind")
+	}
+	return nil
+}
+
 func (h *DavServer) requireAddressBookDestinationWritePrivileges(ctx context.Context, user *store.User, book *store.AddressBook, cleanPath string, existing *store.Contact) error {
 	parentPath := path.Dir(cleanPath)
 	if err := h.requireAddressBookPrivilege(ctx, user, book, parentPath, "bind"); err != nil {
@@ -942,6 +1042,18 @@ func (h *DavServer) requireCalendarDestinationWritePrivileges(ctx context.Contex
 		return requirePrivilegeAt(err, parentPath, "unbind")
 	}
 	return nil
+}
+
+// destinationNameRefused reports whether a COPY or MOVE of the object stored
+// as sourceName is refused the destination name destName, as a PUT of that
+// name is. A name the object is already stored under is kept whatever its
+// length, since its index entry fits, but not one store.ValidMemberName
+// refuses.
+func destinationNameRefused(destName, sourceName string) bool {
+	if !store.ValidMemberName(destName) {
+		return true
+	}
+	return len(destName) > store.MaxIdentifierOctets && destName != sourceName
 }
 
 func srcPath(r *http.Request) string {

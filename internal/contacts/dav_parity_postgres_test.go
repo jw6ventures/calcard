@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,7 +73,7 @@ func newParityStore(t *testing.T) *store.Store {
 // answer with the status DAV answers. A user who may not read the contact is
 // answered as for a contact that is not there, preconditions included. Each
 // case runs for a plain resource name, a dotted one and one ending in an
-// upper-case .VCF, whose ACL paths DAV spells without that extension.
+// upper-case .VCF, each with its ACL at its own state path.
 func TestPostgres_ContactRemovalMatchesDAV(t *testing.T) {
 	database := newParityStore(t)
 	ctx := t.Context()
@@ -122,7 +121,7 @@ func TestPostgres_ContactRemovalMatchesDAV(t *testing.T) {
 		{name: "contact denies everything", actor: "sharee", book: editor, contact: []store.ACLEntry{ace(sharee, false, "all", 0)}, deleteCode: http.StatusNotFound},
 		{name: "contact denies everything to a group", actor: "sharee", book: editor, contact: []store.ACLEntry{ace(acl.PrincipalAuthenticated, false, "all", 0)}, deleteCode: http.StatusNotFound},
 		{name: "contact denies a group ahead of granting everyone", actor: "sharee", book: editor, contact: []store.ACLEntry{ace(acl.PrincipalAuthenticated, false, "all", 0), ace(acl.PrincipalAll, true, "all", 1)}, deleteCode: http.StatusNotFound},
-		{name: "contact denies everything on its .vcf path", actor: "sharee", book: editor, contact: []store.ACLEntry{ace(sharee, false, "all", 0)}, onVCFPath: true, deleteCode: http.StatusNotFound},
+		{name: "another contact's ACL at its name with .vcf denies everything", actor: "sharee", book: editor, contact: []store.ACLEntry{ace(sharee, false, "all", 0)}, onVCFPath: true, deleteCode: http.StatusNoContent, moveAllowed: true},
 		{name: "contact denies everything and the book unbind", actor: "sharee", book: viewer, contact: []store.ACLEntry{ace(sharee, false, "all", 0)}, deleteCode: http.StatusForbidden},
 		{name: "contact denies everything and the book grants nothing", actor: "stranger", contact: []store.ACLEntry{ace(stranger, false, "all", 0)}, deleteCode: http.StatusNotFound},
 		{name: "write on the book into an invisible book", actor: "sharee", book: editor, deleteCode: http.StatusNoContent, destination: invisibleDestination},
@@ -178,9 +177,6 @@ func TestPostgres_ContactRemovalMatchesDAV(t *testing.T) {
 						t.Fatal(err)
 					}
 					aclPath := fmt.Sprintf("/dav/addressbooks/%d/%s", bookID, resourceName)
-					if ext := path.Ext(aclPath); strings.EqualFold(ext, ".vcf") {
-						aclPath = strings.TrimSuffix(aclPath, ext)
-					}
 					if tc.onVCFPath {
 						aclPath += ".vcf"
 					}

@@ -45,10 +45,16 @@ type fakeLockRepo struct {
 	locks                map[string]*store.Lock
 	listByResourcesErr   error
 	listByResourcesCalls int
+	getByTokenCalls      int
+	getByTokenErr        error
 	moveResourcePathErr  error
+	refreshErr           error
+	// calls counts every call to any of the repository's methods.
+	calls int
 }
 
 func (f *fakeLockRepo) Create(ctx context.Context, lock store.Lock) (*store.Lock, error) {
+	f.calls++
 	if f.locks == nil {
 		f.locks = map[string]*store.Lock{}
 	}
@@ -75,6 +81,11 @@ func (f *fakeLockRepo) Create(ctx context.Context, lock store.Lock) (*store.Lock
 }
 
 func (f *fakeLockRepo) GetByToken(ctx context.Context, token string) (*store.Lock, error) {
+	f.calls++
+	f.getByTokenCalls++
+	if f.getByTokenErr != nil {
+		return nil, f.getByTokenErr
+	}
 	if lock, ok := f.locks[token]; ok {
 		copy := *lock
 		return &copy, nil
@@ -83,6 +94,7 @@ func (f *fakeLockRepo) GetByToken(ctx context.Context, token string) (*store.Loc
 }
 
 func (f *fakeLockRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.Lock, error) {
+	f.calls++
 	var result []store.Lock
 	for _, lock := range f.locks {
 		if lock.ResourcePath == resourcePath {
@@ -93,6 +105,7 @@ func (f *fakeLockRepo) ListByResource(ctx context.Context, resourcePath string) 
 }
 
 func (f *fakeLockRepo) ListByResources(ctx context.Context, paths []string) ([]store.Lock, error) {
+	f.calls++
 	f.listByResourcesCalls++
 	if f.listByResourcesErr != nil {
 		return nil, f.listByResourcesErr
@@ -122,6 +135,7 @@ func containsPath(path, parent string) bool {
 }
 
 func (f *fakeLockRepo) ListByResourcePrefix(ctx context.Context, prefix string) ([]store.Lock, error) {
+	f.calls++
 	var result []store.Lock
 	for _, lock := range f.locks {
 		if strings.HasPrefix(lock.ResourcePath, prefix) {
@@ -132,6 +146,7 @@ func (f *fakeLockRepo) ListByResourcePrefix(ctx context.Context, prefix string) 
 }
 
 func (f *fakeLockRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	f.calls++
 	if f.moveResourcePathErr != nil {
 		return f.moveResourcePathErr
 	}
@@ -149,6 +164,7 @@ func (f *fakeLockRepo) MoveResourcePath(ctx context.Context, fromPath, toPath st
 }
 
 func (f *fakeLockRepo) DeleteByResourcePath(ctx context.Context, resourcePath string) error {
+	f.calls++
 	for token, lock := range f.locks {
 		if lock.ResourcePath == resourcePath {
 			delete(f.locks, token)
@@ -158,15 +174,21 @@ func (f *fakeLockRepo) DeleteByResourcePath(ctx context.Context, resourcePath st
 }
 
 func (f *fakeLockRepo) Delete(ctx context.Context, token string) error {
+	f.calls++
 	delete(f.locks, token)
 	return nil
 }
 
 func (f *fakeLockRepo) DeleteExpired(ctx context.Context) (int64, error) {
+	f.calls++
 	return 0, nil
 }
 
 func (f *fakeLockRepo) Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*store.Lock, error) {
+	f.calls++
+	if f.refreshErr != nil {
+		return nil, f.refreshErr
+	}
 	lock, ok := f.locks[token]
 	if !ok {
 		return nil, store.ErrNotFound
@@ -190,14 +212,9 @@ type fakeACLRepo struct {
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
-	statePaths := davStatePaths(resourcePath)
-	aliases := make(map[string]struct{}, len(statePaths))
-	for _, statePath := range statePaths {
-		aliases[statePath] = struct{}{}
-	}
 	filtered := make([]store.ACLEntry, 0, len(f.entries))
 	for _, entry := range f.entries {
-		if _, replace := aliases[entry.ResourcePath]; !replace {
+		if entry.ResourcePath != resourcePath {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -255,6 +272,18 @@ func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, p
 	}
 	f.entries = kept
 	return nil
+}
+
+func (f *fakeACLRepo) ListByPrincipals(ctx context.Context, principalHrefs []string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, principalHref := range principalHrefs {
+		entries, err := f.ListByPrincipal(ctx, principalHref)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, entries...)
+	}
+	return result, nil
 }
 
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
@@ -434,8 +463,8 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
@@ -465,7 +494,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
@@ -528,7 +557,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
@@ -4076,7 +4105,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 		descendantLockRepo := &fakeLockRepo{locks: map[string]*store.Lock{
 			"opaquelocktoken:child": {
 				Token:        "opaquelocktoken:child",
-				ResourcePath: "/dav/addressbooks/5/alice.vcf",
+				ResourcePath: "/dav/addressbooks/5/alice",
 				UserID:       user1.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -4422,7 +4451,7 @@ func TestRFC4918_NegatedIfStateDoesNotAuthorizeLockedWrite(t *testing.T) {
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:member": {
 				Token:          "opaquelocktoken:member",
-				ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+				ResourcePath:   "/dav/addressbooks/5/alice",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -4744,7 +4773,7 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 		}
 		lockRepo := &fakeLockRepo{
 			locks: map[string]*store.Lock{
-				"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice.vcf", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+				"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
@@ -5104,7 +5133,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 		}
 		lockRepo := &fakeLockRepo{
 			locks: map[string]*store.Lock{
-				"tok-src": {Token: "tok-src", ResourcePath: "/dav/addressbooks/5/carol.vcf", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+				"tok-src": {Token: "tok-src", ResourcePath: "/dav/addressbooks/5/carol", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 			},
 		}
 		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}

@@ -130,8 +130,14 @@ func (s *Store) TransferCalendarCollection(ctx context.Context, transfer Calenda
 	defer tx.Rollback()
 	// The source is held even by a COPY, which leaves it in place: the member
 	// set and the ACL the request was checked against must not change before
-	// the copy commits.
-	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions, calendarCollectionLockPath(transfer.SourceID)); err != nil {
+	// the copy commits. A collection whose members are removed is held too, so
+	// no lock appears below it once its locks are checked.
+	removedRoots := calendarCollectionTransferRemovedRoots(transfer)
+	serialized := append([]string{calendarCollectionLockPath(transfer.SourceID)}, removedRoots...)
+	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions, serialized...); err != nil {
+		return nil, err
+	}
+	if err := validateLocksBelowTx(ctx, tx, removedRoots, transfer.LockPreconditions); err != nil {
 		return nil, err
 	}
 	if err := validateACLGuardTx(ctx, tx, transfer.ExpectedACL); err != nil {
@@ -410,26 +416,20 @@ ORDER BY m.position`
 // dead properties from beneath fromRoot to the same name beneath toRoot, as
 // copyCalendarDeadPropertiesTx copies one resource's.
 func copyCalendarMemberDeadPropertiesTx(ctx context.Context, tx *sql.Tx, fromRoot, toRoot string, members []CalendarCollectionMember) error {
-	var toPaths, fromPaths, exactPaths []string
+	var toPaths, fromPaths []string
 	for _, member := range members {
-		fromPath := calendarCollectionMemberStatePath(fromRoot, member.ResourceName)
-		toPath := calendarCollectionMemberStatePath(toRoot, member.ResourceName)
-		for _, spelling := range davStatePaths(fromPath) {
-			toPaths = append(toPaths, toPath)
-			fromPaths = append(fromPaths, spelling)
-			exactPaths = append(exactPaths, fromPath)
-		}
+		toPaths = append(toPaths, MemberStatePath(toRoot, member.ResourceName))
+		fromPaths = append(fromPaths, MemberStatePath(fromRoot, member.ResourceName))
 	}
 	if len(toPaths) == 0 {
 		return nil
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at)
-SELECT DISTINCT ON (m.to_path, d.namespace_uri, d.local_name) m.to_path, d.namespace_uri, d.local_name, d.inner_xml, NOW(), NOW()
-FROM unnest($1::text[], $2::text[], $3::text[]) AS m(to_path, from_path, exact_path)
-JOIN dav_dead_properties d ON d.resource_path = m.from_path
-ORDER BY m.to_path, d.namespace_uri, d.local_name, CASE WHEN d.resource_path = m.exact_path THEN 0 ELSE 1 END, d.updated_at DESC`,
-		pq.Array(toPaths), pq.Array(fromPaths), pq.Array(exactPaths))
+SELECT m.to_path, d.namespace_uri, d.local_name, d.inner_xml, NOW(), NOW()
+FROM unnest($1::text[], $2::text[]) AS m(to_path, from_path)
+JOIN dav_dead_properties d ON d.resource_path = m.from_path`,
+		pq.Array(toPaths), pq.Array(fromPaths))
 	return err
 }
 
@@ -612,6 +612,75 @@ func calendarCollectionTransferLockKeys(transfer CalendarCollectionTransfer) []s
 	return slices.Compact(keys)
 }
 
+// calendarCollectionTransferRemovedRoots names the collections whose members
+// transfer removes: the source of a DELETE or MOVE, and the destination a COPY
+// or MOVE overwrites.
+func calendarCollectionTransferRemovedRoots(transfer CalendarCollectionTransfer) []string {
+	var roots []string
+	if transfer.Operation != CalendarCollectionCopy {
+		roots = append(roots, transfer.SourceStatePath)
+	}
+	if transfer.Operation != CalendarCollectionDelete && transfer.ExpectedDestination.Exists {
+		roots = append(roots, transfer.DestinationStatePath)
+	}
+	return roots
+}
+
+// locksBelowQuery lists the tokens of the active locks whose paths fall in
+// any of the byte ranges [$1[i], $2[i]). The ~>=~ and ~<~ operators compare
+// bytewise, as the resource path pattern index orders, so each range is read
+// from that index.
+const locksBelowQuery = `SELECT l.token FROM unnest($1::text[], $2::text[]) AS r(low, high)
+JOIN locks l ON l.resource_path ~>=~ r.low AND l.resource_path ~<~ r.high
+WHERE l.expires_at > NOW()`
+
+// locksBelowRanges turns each root into the byte range holding exactly the
+// paths below it: those starting with root + "/", which sort at or after it
+// and before root + "0", "0" being the byte after "/".
+func locksBelowRanges(roots []string) (low, high []string) {
+	for _, root := range roots {
+		if root = strings.TrimSuffix(root, "/"); root != "" {
+			low = append(low, root+"/")
+			high = append(high, root+"0")
+		}
+	}
+	return low, high
+}
+
+// validateLocksBelowTx refuses with ErrLockConflict when an active lock below
+// any of roots carries a token no precondition submits. The preconditions name
+// the members a request found, while a lock-null resource below a collection
+// has no member to be found by, and one locked after the request's own check
+// is found only here. The caller holds the roots' path locks, which a LOCK
+// below them waits on.
+func validateLocksBelowTx(ctx context.Context, tx *sql.Tx, roots []string, preconditions []LockPrecondition) error {
+	low, high := locksBelowRanges(roots)
+	if len(low) == 0 {
+		return nil
+	}
+	submitted := make(map[string]struct{})
+	for _, precondition := range preconditions {
+		for _, token := range precondition.Tokens {
+			submitted[token] = struct{}{}
+		}
+	}
+	rows, err := tx.QueryContext(ctx, locksBelowQuery, pq.Array(low), pq.Array(high))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var token string
+		if err := rows.Scan(&token); err != nil {
+			return err
+		}
+		if _, ok := submitted[token]; !ok {
+			return ErrLockConflict
+		}
+	}
+	return rows.Err()
+}
+
 func deleteCalendarTreeStateTx(ctx context.Context, tx execContext, root string, deleteLocks bool) error {
 	if root == "" {
 		return nil
@@ -677,17 +746,12 @@ func copyCalendarDeadPropertiesTx(ctx context.Context, tx execContext, fromPath,
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml, created_at, updated_at)
-SELECT DISTINCT ON (namespace_uri, local_name) $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
+SELECT $1, namespace_uri, local_name, inner_xml, NOW(), NOW()
 FROM dav_dead_properties
-WHERE resource_path = ANY($2)
-ORDER BY namespace_uri, local_name, CASE WHEN resource_path=$3 THEN 0 ELSE 1 END, updated_at DESC`, toPath, pq.Array(davStatePaths(fromPath)), fromPath)
+WHERE resource_path = $2`, toPath, fromPath)
 	return err
 }
 
 func calendarCollectionStatePath(id int64) string {
 	return fmt.Sprintf("/dav/calendars/%d", id)
-}
-
-func calendarCollectionMemberStatePath(collectionPath, resourceName string) string {
-	return strings.TrimSuffix(collectionPath, "/") + "/" + resourceName
 }

@@ -1208,10 +1208,28 @@ func appleAlarm(uid string) string {
 	return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
 }
 
+// A UI event's resource name is its UID made safe for a path segment, with no
+// extension added: CalDAV serves it at that name plus .ics, so a name already
+// ending in .ics would be served at a .ics.ics href. Every character it
+// replaces becomes one octet, so the name is never longer than the UID, and a
+// UID the server accepts gives a name it accepts.
 func TestResourceNameForUID(t *testing.T) {
-	got := ResourceNameForUID("series/one@example.com")
-	if got != "series_one_example.com.ics" {
-		t.Fatalf("ResourceNameForUID() = %q", got)
+	for uid, want := range map[string]string{
+		"series/one@example.com": "series_one_example.com",
+		"plain":                  "plain",
+		"imported.ics":           "imported.ics",
+		" padded ":               "padded",
+		"日本":                     "event",
+		"":                       "event",
+	} {
+		if got := ResourceNameForUID(uid); got != want {
+			t.Errorf("ResourceNameForUID(%q) = %q, want %q", uid, got, want)
+		}
+	}
+	for _, uid := range []string{strings.Repeat("a", 1024), strings.Repeat("é", 512), "x" + strings.Repeat("é", 511) + "y"} {
+		if got := ResourceNameForUID(uid); len(got) > len(uid) {
+			t.Errorf("ResourceNameForUID of a %d-octet UID = %d octets", len(uid), len(got))
+		}
 	}
 }
 

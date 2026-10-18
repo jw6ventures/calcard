@@ -149,6 +149,7 @@ func TestEventRepositoryUsesPrecomputedWriteMetadata(t *testing.T) {
 		"/dav/calendars/7": true,
 	})
 	expectCollectionRowLock(mock, "calendars", 7)
+	expectCreatedEventStateCleared(mock, 7, "event", "event", false)
 	mock.ExpectQuery(`INSERT INTO events`).
 		WithArgs(int64(7), "event", "event", raw, "etag", summary, nil, nil, dtstart, dtend, false, dtstart, recurrenceUntil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
@@ -233,7 +234,7 @@ func TestAddressBookRepositoryListsCollectionAndObjectAccessibleBooks(t *testing
 	defer db.Close()
 
 	now := time.Now().UTC()
-	mock.ExpectQuery(`(?s)FROM address_books b.*SELECT a\.is_grant.*ORDER BY a\.ace_order, a\.id.*JOIN contacts c.*c\.object_acl_path=g0\.resource_path_norm.*SELECT a\.is_grant.*ORDER BY a\.ace_order, a\.id`).
+	mock.ExpectQuery(`(?s)FROM address_books b.*SELECT a\.is_grant.*ORDER BY a\.ace_order, a\.id.*JOIN contacts c.*c\.object_acl_path=g0\.resource_path\b.*SELECT a\.is_grant.*ORDER BY a\.ace_order, a\.id`).
 		WithArgs(int64(4)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "description", "ctag", "created_at", "updated_at"}).
 			AddRow(int64(5), int64(9), "Shared", nil, int64(2), now, now))
@@ -287,12 +288,10 @@ func TestStoreCopyContactAndStateCopiesDeadPropertiesAndClearsDestinationState(t
 	mock.ExpectQuery(`INSERT INTO contacts`).
 		WithArgs(int64(3), "alice", "copied", raw, "new-etag", "Alice", "alice@example.com", nil).
 		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(11), int64(3), "alice", "copied", raw, "new-etag", "Alice", "alice@example.com", nil, now))
-	for _, statePath := range []string{"/dav/addressbooks/3/copied", "/dav/addressbooks/3/copied.vcf"} {
-		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).WithArgs(statePath).WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).WithArgs(statePath).WillReturnResult(sqlmock.NewResult(0, 1))
-	}
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).WithArgs("/dav/addressbooks/3/copied").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).WithArgs("/dav/addressbooks/3/copied").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO dav_dead_properties`).
-		WithArgs("/dav/addressbooks/3/copied", pq.Array(davStatePaths("/dav/addressbooks/2/alice")), "/dav/addressbooks/2/alice").
+		WithArgs("/dav/addressbooks/3/copied", "/dav/addressbooks/2/alice").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
 		WithArgs("contact", int64(3), "copied").

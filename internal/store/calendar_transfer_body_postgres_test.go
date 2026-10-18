@@ -414,9 +414,9 @@ WHERE e.calendar_id=$1 AND e.last_modified > c.updated_at`, moved.ID).Scan(&stal
 	}
 }
 
-// A collection COPY gives each member's copy the member's dead properties,
-// read from every spelling of the member's path with the member's own path
-// winning, and gives no member another's.
+// A collection COPY gives each member's copy the dead properties at the
+// member's own state path, and gives no member another's: bom.ics and
+// plain.ics name other resources, here members that are not there.
 func TestPostgres_CalendarCollectionCopyCopiesEachMembersDeadProperties(t *testing.T) {
 	s := newPostgresStore(t)
 	ctx := context.Background()
@@ -456,9 +456,7 @@ func TestPostgres_CalendarCollectionCopyCopiesEachMembersDeadProperties(t *testi
 		copied = append(copied, row)
 	}
 	want := []string{
-		copyRoot + "/bom legacy-only=bom legacy only",
 		copyRoot + "/bom shared=bom exact",
-		copyRoot + "/plain shared=plain legacy",
 	}
 	if fmt.Sprint(copied) != fmt.Sprint(want) {
 		t.Errorf("copied member dead properties = %q, want %q", copied, want)

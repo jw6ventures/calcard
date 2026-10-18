@@ -108,7 +108,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	case strings.HasPrefix(cleanPath, "/dav/calendars"):
 		responses, err := h.calendarResponses(ctx, cleanPath, depth, user)
 		if err != nil {
-			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath, "")
 			if lockErr != nil {
 				return nil, lockErr
 			}
@@ -117,7 +117,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 			}
 			responses = []response{*lockNull}
 		} else if len(responses) == 1 && responses[0].Status == httpStatusNotFound {
-			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath, responses[0].Href)
 			if lockErr != nil {
 				return nil, lockErr
 			}
@@ -148,7 +148,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	case strings.HasPrefix(cleanPath, "/dav/addressbooks"):
 		responses, err := h.addressBookResponses(ctx, cleanPath, depth, user)
 		if err != nil {
-			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath, "")
 			if lockErr != nil {
 				return nil, lockErr
 			}
@@ -157,7 +157,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 			}
 			responses = []response{*lockNull}
 		} else if len(responses) == 1 && responses[0].Status == httpStatusNotFound {
-			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath)
+			lockNull, lockErr := h.lockNullResourceResponse(ctx, user, cleanPath, responses[0].Href)
 			if lockErr != nil {
 				return nil, lockErr
 			}
@@ -215,7 +215,11 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 	}
 }
 
-func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.User, cleanPath string) (*response, error) {
+// lockNullResourceResponse answers a Depth 0 PROPFIND of cleanPath when it is a
+// lock-null resource. href is the href the answer for an absent member at
+// cleanPath carries, which names the resource as a mapped member at the same
+// spelling is named; without one, the lock's root names it.
+func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.User, cleanPath, href string) (*response, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil || user == nil {
 		return nil, nil
 	}
@@ -233,6 +237,11 @@ func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.Us
 		if lock.ExpiresAt.Before(now) {
 			continue
 		}
+		// A lock on a mapped URL is its resource's state, which the
+		// resource's own answer reports or withholds.
+		if exists, err := h.lockTargetExists(ctx, user, cleanPath); err != nil || exists {
+			return nil, err
+		}
 		publicPath := publicDAVLockRoot(lock.ResourcePath)
 		allowed, err := h.checkACLPrivilege(ctx, user, path.Dir(publicPath), "read")
 		if err != nil {
@@ -241,7 +250,10 @@ func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.Us
 		if !allowed {
 			return nil, nil
 		}
-		result := resourceResponse(escapeDAVPath(publicPath), statusOKProp(path.Base(publicPath), resourceType{}))
+		if href == "" {
+			href = escapeDAVPath(publicPath)
+		}
+		result := resourceResponse(href, statusOKProp(path.Base(publicPath), resourceType{}))
 		return &result, nil
 	}
 	return nil, nil
@@ -593,6 +605,13 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 		return nil, http.ErrNotSupported
 	}
 	book, err := h.loadAddressBookWithPrivilege(ctx, user, bookID, cleanPath, "read")
+	memberReadable := true
+	if err != nil && len(segments) == 2 && isPrivilegeRefusal(err) {
+		// A member the principal may not read is answered as an absent one
+		// is, by the address book's own read decision.
+		memberReadable = false
+		book, err = h.loadAddressBookWithPrivilege(ctx, user, bookID, path.Dir(cleanPath), "read")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -605,11 +624,14 @@ func (h *DavServer) addressBookResponses(ctx context.Context, cleanPath, depth s
 		if resourceName == "" {
 			return nil, http.ErrNotSupported
 		}
+		href := addressObjectHref(collectionHref, resourceName)
+		if !memberReadable {
+			return []response{{Href: href, Status: httpStatusNotFound}}, nil
+		}
 		contact, err := h.store.Contacts.GetByResourceName(ctx, book.ID, resourceName)
 		if err != nil {
 			return nil, err
 		}
-		href := addressObjectHref(collectionHref, resourceName)
 		if contact == nil {
 			return []response{{Href: href, Status: httpStatusNotFound}}, nil
 		}

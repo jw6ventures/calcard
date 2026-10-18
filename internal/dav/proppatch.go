@@ -67,6 +67,9 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported path for PROPPATCH", http.StatusBadRequest)
 		return
 	}
+	if refusedMemberName(w, target) {
+		return
+	}
 	body, err := readDAVBody(w, r, maxDAVBodyBytes)
 	if err != nil {
 		if errors.Is(err, errRequestTooLarge) {
@@ -83,7 +86,10 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var responses []response
-	lockPreconditions := h.lockPreconditions(r, cleanPath)
+	lockPreconditions, ok := h.writeLockPreconditions(w, r, cleanPath)
+	if !ok {
+		return
+	}
 	for attempt := 0; ; attempt++ {
 		switch target.Domain {
 		case davPathCalendar:
