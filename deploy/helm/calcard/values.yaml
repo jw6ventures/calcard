@@ -73,7 +73,8 @@ app:
   # turns that limit off entirely.
   dav: {}
     # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
-    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default because Digest needs a stored, password-equivalent HA1 (see README). While off, no HA1 is written and any already stored is cleared. When on, each app password gains its HA1 when issued or on its next Basic authentication over HTTPS; the App Passwords page shows which are ready.
+    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default because Digest needs a stored, password-equivalent HA1 (see README). While off, no HA1 is written and any already stored is cleared. When on, each app password gains its HA1 when issued or on its next Basic authentication over HTTPS; the App Passwords page shows which are ready. A client that prefers Digest may not fall back to Basic, so it may be unable to use an app password that is not ready yet; reissue it, or authenticate once over Basic, first.
+    # insecureBasicEnabled: false # Accept HTTP Basic on /dav and /api over plain HTTP, and offer the Basic challenge there. Off by default: RFC 4791 Section 11 forbids Basic without TLS, so the app password and all calendar and contact data cross the network in cleartext. The server logs it at Warn level on every start while this is on (app.logLevel Error or Fatal hides it). Prefer terminating TLS at the ingress.
     # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
     # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
     # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.
@@ -89,7 +90,7 @@ app:
 
 # Kubernetes Service that fronts the app pods.
 service:
-  type: ClusterIP # Service type. Must stay ClusterIP while ingress.enabled is true: the app accepts HTTP Basic only over TLS (RFC 4791 Section 11), so no route may publish the cleartext port beside the ingress. Set NodePort or LoadBalancer only with ingress.enabled=false, terminating TLS yourself.
+  type: ClusterIP # Service type. Must stay ClusterIP while ingress.enabled is true: the app refuses HTTP Basic over plain HTTP unless app.dav.insecureBasicEnabled is set (RFC 4791 Section 11), and this guard applies either way, because a cleartext route beside the TLS ingress is wrong whatever the app accepts, so no route may publish the cleartext port beside the ingress. Set NodePort or LoadBalancer only with ingress.enabled=false, terminating TLS yourself.
   port: 80 # Port the Service listens on (the container always listens on 8080).
 
 # Ingress for external HTTP(S) access.

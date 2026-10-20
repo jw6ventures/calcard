@@ -203,10 +203,10 @@ func TestCalendarViewsNormalizeAllDayServerDates(t *testing.T) {
 		t.Fatalf("read the shared event helpers: %v", err)
 	}
 	for _, want := range []string{
-		"function parseServerDate(value, allDay)",
-		"parsed.dtstart = parseServerDate(raw.dtstart, allDay);",
-		"parsed.dtend = parseServerDate(raw.dtend, allDay);",
-		"raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay);",
+		"function parseServerDate(value, allDay, floating)",
+		"parsed.dtstart = parseServerDate(raw.dtstart, allDay, floating);",
+		"parsed.dtend = parseServerDate(raw.dtend, allDay, floating);",
+		"var recurrenceAllDay = raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay;",
 	} {
 		if !strings.Contains(string(partial), want) {
 			t.Errorf("the shared event helpers are missing %q: an all-day date keeps the instant the server sent", want)
@@ -451,6 +451,7 @@ func TestCalendarViewsEditAnEventInAZoneOnlyTheObjectDefines(t *testing.T) {
 					Values               []string
 					Zone, RecurrenceZone string
 					Until                string
+					ETag, DeleteETag     string
 				}
 				var result struct {
 					Instances            []string
@@ -475,6 +476,13 @@ func TestCalendarViewsEditAnEventInAZoneOnlyTheObjectDefines(t *testing.T) {
 				}
 				if result.Summary != result.SummaryWant {
 					t.Errorf("recurrence summary = %q, want %q", result.Summary, result.SummaryWant)
+				}
+				// Whichever occurrence is opened, the forms carry back the ETag of the
+				// stored event the page was built from.
+				for name, opened := range map[string]form{"series": result.Forms.Series, "moved occurrence": result.Forms.Override, "occurrence": result.Forms.Occurrence} {
+					if opened.ETag != "e" || opened.DeleteETag != "e" {
+						t.Errorf("%s editor carries ETag %q and its delete form %q, want the stored event's \"e\"", name, opened.ETag, opened.DeleteETag)
+					}
 				}
 				for _, check := range []struct {
 					name string
@@ -595,6 +603,8 @@ func servedEventsJSON(t *testing.T, handler *Handler, user *store.User, template
 // updateServedEvent submits the edit form for the "outlook-standup" series.
 func updateServedEvent(t *testing.T, handler *Handler, user *store.User, zone string, fields url.Values) {
 	t.Helper()
+	fields = maps.Clone(fields)
+	fields.Set("etag", storedETag(t, handler.store.Events, "outlook-standup"))
 	w := httptest.NewRecorder()
 	handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/outlook-standup", "outlook-standup", user, zone, fields))
 	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {

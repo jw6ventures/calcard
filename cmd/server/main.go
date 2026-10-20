@@ -15,6 +15,7 @@ import (
 	appauth "github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	httpserver "github.com/jw6ventures/calcard/internal/http"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
 	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 	"github.com/jw6ventures/jw6-go-utils/database"
@@ -73,6 +74,8 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		opts.Router.TrafficCaptureWriter = captureFile
 		jw6utils.Log("Main", "runServer", jw6_utils.Warn, fmt.Sprintf("request traffic capture enabled: %s", cfg.TrafficCaptureFile))
 	}
+
+	logInsecureBasicWarning(&jw6utils, cfg)
 
 	relayPostgresNotices(&jw6utils)
 	dbManager := database.NewManager(database.Config{
@@ -155,6 +158,16 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		log.Printf("graceful shutdown failed: %v", err)
 	}
 	return nil
+}
+
+// logInsecureBasicWarning reports on every start that Basic is accepted over
+// plain HTTP, which RFC 4791 Section 11 forbids: the app password and all
+// calendar and contact data then cross the network in cleartext.
+func logInsecureBasicWarning(sink logging.Sink, cfg *config.Config) {
+	if !cfg.DAV.InsecureBasicEnabled {
+		return
+	}
+	logging.New(sink, "Main").Warn("runServer", "APP_DAV_INSECURE_BASIC_ENABLED is set: HTTP Basic is accepted on /dav and /api over plain HTTP, so app passwords and all calendar and contact data cross the network in cleartext. RFC 4791 Section 11 forbids Basic without TLS; terminate TLS in front of CalCard and unset it where you can")
 }
 
 func openTrafficCaptureFile(path string) (*os.File, error) {

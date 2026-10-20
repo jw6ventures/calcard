@@ -9,7 +9,8 @@
 // March 2024, it prints {instances, summary, summaryWant, forms}: every
 // occurrence the view's expansion places in that month as a free-busy period,
 // the series' recurrence summary, and the editor's values for the
-// "outlook-standup" series and two of its occurrences.
+// "outlook-standup" series and two of its occurrences, including the ETag the
+// edit and delete forms carry back.
 import fs from 'node:fs';
 const html = fs.readFileSync(process.argv[2], 'utf8');
 function extract(name) {
@@ -23,7 +24,7 @@ function extract(name) {
     return html.slice(start, i + 1);
 }
 const aggregate = process.argv[2].includes('all_calendars');
-const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'rruleUntilDay', 'overrideRecurrenceIdAllDay', 'expandRecurringEvents',
+const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'editorTimeZone', 'editorRecurrenceTimeZone', 'recurrenceIsFloating', 'editorRecurrenceFloating', 'editorClock', 'editorRecurrenceClock', 'isFloatingTime', 'rruleUntilDay', 'overrideRecurrenceIdAllDay', 'expandRecurringEvents',
     'parseServerDate', 'normalizeServerEvent', 'formatRRule', 'formatDateTimeForInput', 'browserTimeZone', 'showPartialRecurrence', 'refreshPartialRecurrence'];
 const names = shared.concat(aggregate
     ? ['formatLocalDate', 'formatDateInput', 'formatRecurrenceInput', 'setEditorDateValues', 'inclusiveAllDayEnd', 'startOfDay', 'addDays', 'openEditEditor', 'openCreateEditor']
@@ -56,6 +57,11 @@ const stubs = `
     window.refreshPartialRecurrence = refreshPartialRecurrence;
     window.formatDateTimeForInput = formatDateTimeForInput;
     window.timeZoneClock = timeZoneClock;
+    window.editorTimeZone = editorTimeZone;
+    window.editorRecurrenceTimeZone = editorRecurrenceTimeZone;
+    window.editorRecurrenceFloating = editorRecurrenceFloating;
+    window.editorClock = editorClock;
+    window.editorRecurrenceClock = editorRecurrenceClock;
     window.browserTimeZone = browserTimeZone;
 `;
 const view = new Function('document', stubs + source + '\nreturn {' +
@@ -75,7 +81,7 @@ function editorValues(event) {
         throw new Error('delete form changed the occurrence identity');
     }
     return {values: [read('-dtstart'), read('-dtend'), recurrenceID], zone: read('-timezone'), recurrenceZone,
-            until: read('-recurrence-until')};
+            until: read('-recurrence-until'), etag: read('-etag'), deleteETag: document.getElementById('delete-etag').value};
 }
 
 if (process.argv[3]) {

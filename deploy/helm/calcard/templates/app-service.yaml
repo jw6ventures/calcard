@@ -1,8 +1,11 @@
-{{- /* RFC 4791 Section 11: the application accepts HTTP Basic only over a
-       secure transport, which holds only while every route to it terminates TLS.
-       A NodePort or LoadBalancer beside the ingress publishes the cleartext
-       container port, so the two settings are refused together rather than
-       rendered into a deployment that quietly defeats the rule. */ -}}
+{{- /* RFC 4791 Section 11: unless app.dav.insecureBasicEnabled is set, the
+       application refuses HTTP Basic over plain HTTP, which holds only while
+       every route to it terminates TLS. A NodePort or LoadBalancer beside the
+       ingress publishes the cleartext container port, so the two settings are
+       refused together rather than rendered into a deployment that quietly
+       defeats the rule. The refusal applies with the opt-out set as well: a
+       cleartext route beside the TLS ingress is wrong whatever the application
+       accepts. */ -}}
 {{- if and .Values.ingress.enabled (ne .Values.service.type "ClusterIP") -}}
 {{- fail (printf "service.type must be ClusterIP while ingress.enabled is true (got %s): any other type publishes the cleartext container port beside the TLS ingress" .Values.service.type) -}}
 {{- end -}}

@@ -50,8 +50,8 @@ if (source.includes('function createEventDateError(')) {
     // The reported case: an end before the start, rejected before submitting.
     ['2026-09-17T10:00', '2026-09-17T09:00', false, true],
     ['2026-09-18T10:00', '2026-09-17T10:00', false, true],
-    // A timed event of zero length is what the server rejects too.
-    ['2026-09-17T10:00', '2026-09-17T10:00', false, true],
+    // A timed event of zero length is one the server accepts too.
+    ['2026-09-17T10:00', '2026-09-17T10:00', false, false],
     ['2026-09-17T10:00', '2026-09-17T11:00', false, false],
     // An all-day event may start and end on the same day; the form's end date
     // is inclusive.

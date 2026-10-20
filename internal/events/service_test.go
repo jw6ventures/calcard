@@ -203,26 +203,17 @@ func TestServiceCRUDAndValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("update resource conflict", func(t *testing.T) {
-		repo := &fakeEventRepo{events: map[string]store.Event{
-			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "resource-a", ETag: "etag-old"},
-			"1:uid-2": {CalendarID: 1, UID: "uid-2", ResourceName: "resource-b", ETag: "etag-2"},
-		}}
-		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-b", mustCalendarObject(t, validICS("uid-1")), "", "")
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("expected ErrConflict, got %v", err)
-		}
-	})
-
-	t.Run("save event precondition failed", func(t *testing.T) {
+	t.Run("update with a stale If-Match", func(t *testing.T) {
 		repo := &fakeEventRepo{events: map[string]store.Event{
 			"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "resource-a", ETag: "etag-old"},
 		}}
 		svc := newServiceWithRepos(true, repo)
-		_, _, err := svc.saveEvent(context.Background(), 1, "uid-1", "resource-a", mustCalendarObject(t, validICS("uid-1")), `"wrong"`, "")
+		_, _, err := svc.UpdateEvent(context.Background(), user, 1, "uid-1", UpsertInput{RawICS: validICS("uid-1"), IfMatch: `"wrong"`})
 		if !errors.Is(err, ErrPreconditionFailed) {
 			t.Fatalf("expected ErrPreconditionFailed, got %v", err)
+		}
+		if stored := repo.events["1:uid-1"]; stored.ETag != "etag-old" {
+			t.Fatalf("the event was written: %+v", stored)
 		}
 	})
 
@@ -1743,15 +1734,6 @@ func TestStructuredEventsRefuseAZoneOrUntilTheServerCannotRead(t *testing.T) {
 	}
 }
 
-func mustCalendarObject(t *testing.T, raw string) *calobject.Object {
-	t.Helper()
-	object, err := dav.ValidateCalendarObject(raw, nil)
-	if err != nil {
-		t.Fatalf("fixture refused: %v", err)
-	}
-	return object
-}
-
 type changedDeleteEventRepo struct{ *fakeEventRepo }
 
 func (r *changedDeleteEventRepo) GetByResourceName(ctx context.Context, collectionID int64, name string) (*store.Event, error) {
@@ -1761,19 +1743,23 @@ func (r *changedDeleteEventRepo) GetByResourceName(ctx context.Context, collecti
 	}
 	return item, err
 }
+
+// A delete whose event differs from the one it decided on at every attempt is
+// given up on as a conflict, whether or not the request named a version, and
+// removes nothing.
 func TestDeleteEventConcurrentChange(t *testing.T) {
 	for _, conditional := range []bool{false, true} {
 		t.Run(fmt.Sprint(conditional), func(t *testing.T) {
 			base := &fakeEventRepo{events: map[string]store.Event{"1:changed": {CalendarID: 1, UID: "changed", ResourceName: "changed", ETag: "old-etag"}}}
 			svc := newServiceWithRepos(true, base)
 			svc.store.Events = &changedDeleteEventRepo{base}
-			match, want := "", ErrConflict
+			match := ""
 			if conditional {
-				match, want = "old-etag", ErrPreconditionFailed
+				match = "old-etag"
 			}
 			err := svc.DeleteEvent(context.Background(), &store.User{ID: 1}, 1, "changed", match, "")
-			if !errors.Is(err, want) {
-				t.Fatalf("error = %v, want %v", err, want)
+			if !errors.Is(err, ErrChangedConcurrently) || !errors.Is(err, ErrConflict) {
+				t.Fatalf("error = %v, want ErrChangedConcurrently, a conflict", err)
 			}
 			if len(base.events) != 1 {
 				t.Fatal("concurrent update was deleted")
@@ -1973,6 +1959,53 @@ func TestRawICSReadsUIDWithParameters(t *testing.T) {
 			if len(repo.events) != 0 {
 				t.Fatal("the event was stored")
 			}
+		})
+	}
+}
+
+// A REST write evaluates If-Match and If-None-Match as RFC 9110 section 13.1
+// does, for an update and a delete alike: "*" matches an event that exists, a
+// list matches when any of its tags does, If-Match compares strongly and
+// If-None-Match weakly, and the two headers are both evaluated.
+func TestRESTWritesEvaluateConditionalHeadersAsRFC9110(t *testing.T) {
+	user := &store.User{ID: 1}
+	for _, tc := range []struct {
+		name        string
+		ifMatch     string
+		ifNoneMatch string
+		held        bool
+	}{
+		{"If-Match star", "*", "", true},
+		{"If-Match tag", `"e1"`, "", true},
+		{"If-Match list holding the tag", `"zzz", "e1"`, "", true},
+		{"If-Match list without the tag", `"zzz", "yyy"`, "", false},
+		{"If-Match weak tag", `W/"e1"`, "", false},
+		{"If-None-Match other tag", "", `"zzz"`, true},
+		{"If-None-Match tag", "", `"e1"`, false},
+		{"If-None-Match weak tag", "", `W/"e1"`, false},
+		{"If-None-Match list holding the tag", "", `"zzz", "e1"`, false},
+		{"If-None-Match star", "", "*", false},
+		{"If-Match tag with If-None-Match tag", `"e1"`, `"e1"`, false},
+		{"If-Match tag with If-None-Match other tag", `"e1"`, `"zzz"`, true},
+	} {
+		newRepo := func() *fakeEventRepo {
+			return &fakeEventRepo{events: map[string]store.Event{"1:uid-1": {CalendarID: 1, UID: "uid-1", ResourceName: "uid-1", ETag: "e1"}}}
+		}
+		check := func(t *testing.T, err error) {
+			t.Helper()
+			switch {
+			case tc.held && err != nil:
+				t.Fatalf("error = %v, want the write to go ahead", err)
+			case !tc.held && !errors.Is(err, ErrPreconditionFailed):
+				t.Fatalf("error = %v, want ErrPreconditionFailed", err)
+			}
+		}
+		t.Run("update/"+tc.name, func(t *testing.T) {
+			_, _, err := newServiceWithRepos(true, newRepo()).UpdateEvent(context.Background(), user, 1, "uid-1", UpsertInput{RawICS: validICS("uid-1"), IfMatch: tc.ifMatch, IfNoneMatch: tc.ifNoneMatch})
+			check(t, err)
+		})
+		t.Run("delete/"+tc.name, func(t *testing.T) {
+			check(t, newServiceWithRepos(true, newRepo()).DeleteEvent(context.Background(), user, 1, "uid-1", tc.ifMatch, tc.ifNoneMatch))
 		})
 	}
 }

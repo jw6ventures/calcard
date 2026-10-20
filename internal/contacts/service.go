@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/acl"
+	"github.com/jw6ventures/calcard/internal/httpcond"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 	"github.com/jw6ventures/calcard/internal/vcard"
@@ -30,6 +31,12 @@ var (
 	ErrBadRequest         = errors.New("bad request")
 	ErrConflict           = errors.New("conflict")
 	ErrPreconditionFailed = errors.New("precondition failed")
+
+	// ErrLocked refuses a write that DAV would refuse for want of a lock token.
+	// A UI or REST request cannot submit one, so any active lock covering the
+	// contact, or the address book where the write changes its membership,
+	// refuses the write, whoever holds the lock.
+	ErrLocked = errors.New("locked: a WebDAV lock covers the contact or its address book")
 
 	// ErrChangedConcurrently is a change to a contact given up because the
 	// contact or its access kept changing between each attempt's read and its
@@ -341,42 +348,93 @@ func (s *Service) CreateContact(ctx context.Context, user *store.User, bookID in
 }
 
 func (s *Service) createContactOnce(ctx context.Context, user *store.User, bookID int64, uid, body string, input UpsertInput) (*store.Contact, error) {
+	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return nil, ErrNotFound
+	}
+	write, err := s.createWrite(ctx, user, book, uid, body, input)
+	if err != nil {
+		return nil, err
+	}
+	return s.putContact(ctx, write)
+}
+
+// createWrite decides the creation of the contact uid in book and returns the
+// write that carries it out.
+func (s *Service) createWrite(ctx context.Context, user *store.User, book *store.AddressBook, uid, body string, input UpsertInput) (store.ContactObjectWrite, error) {
 	resourceName := newContactResourceName(uid)
-	guard, err := s.writeGuard(ctx, user, aclScope{bookID: bookID, resourceName: resourceName})
+	guard, err := s.writeGuard(ctx, user, aclScope{bookID: book.ID, resourceName: resourceName, book: book})
 	if err != nil {
-		return nil, err
+		return store.ContactObjectWrite{}, err
 	}
-	if _, err := s.loadAddressBookWithPrivilege(ctx, user, bookID, "", "bind"); err != nil {
-		return nil, err
+	if err := s.requireBookPrivilege(ctx, user, book, "", "bind"); err != nil {
+		return store.ContactObjectWrite{}, err
 	}
-	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
+	statePath := addressBookACLResourcePaths(book.ID, resourceName)[0]
+	lockPreconditions := []store.LockPrecondition{
+		store.NewLockPrecondition(statePath),
+		store.NewLockPrecondition(addressBookACLCollectionPath(book.ID)),
+	}
+	if err := s.lockedAheadOfPreconditions(ctx, input, lockPreconditions); err != nil {
+		return store.ContactObjectWrite{}, err
+	}
+	existing, err := s.store.Contacts.GetByUID(ctx, book.ID, uid)
 	if err != nil {
-		return nil, err
+		return store.ContactObjectWrite{}, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, ErrPreconditionFailed
+		return store.ContactObjectWrite{}, ErrPreconditionFailed
 	}
 	if existing != nil {
-		return nil, ErrConflict
+		return store.ContactObjectWrite{}, ErrConflict
 	}
-	result, err := s.store.PutContactObject(ctx, store.ContactObjectWrite{
-		AddressBookID: bookID,
-		UID:           uid,
-		ResourceName:  resourceName,
-		RawVCard:      body,
-		ETag:          utils.GenerateETag(body),
-		ExpectedState: store.DAVResourceState{ACL: guard},
-		StatePath:     addressBookACLResourcePaths(bookID, resourceName)[0],
-	})
-	switch {
-	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
-		return nil, ErrConflict
-	case errors.Is(err, store.ErrPreconditionFailed):
-		return nil, ErrPreconditionFailed
-	case err != nil:
-		return nil, err
+	return store.ContactObjectWrite{
+		AddressBookID:     book.ID,
+		UID:               uid,
+		ResourceName:      resourceName,
+		RawVCard:          body,
+		ETag:              utils.GenerateETag(body),
+		ExpectedState:     store.DAVResourceState{ACL: guard},
+		StatePath:         statePath,
+		LockPreconditions: lockPreconditions,
+	}, nil
+}
+
+// lockedAheadOfPreconditions refuses a write that carries If-Match or
+// If-None-Match with ErrLocked when a lock refuses it, before the preconditions
+// are decided: DAV answers 423 ahead of 412. The write checks the locks again
+// in its transaction, which decides.
+func (s *Service) lockedAheadOfPreconditions(ctx context.Context, input UpsertInput, lockPreconditions []store.LockPrecondition) error {
+	if input.IfMatch == "" && input.IfNoneMatch == "" {
+		return nil
+	}
+	return contactWriteError(s.store.CheckLocks(ctx, lockPreconditions))
+}
+
+// putContact stores write and answers its refusals in the service's errors.
+func (s *Service) putContact(ctx context.Context, write store.ContactObjectWrite) (*store.Contact, error) {
+	result, err := s.store.PutContactObject(ctx, write)
+	if err != nil {
+		return nil, contactWriteError(err)
 	}
 	return result.Contact, nil
+}
+
+// contactWriteError is the service's error for a refusal by the store of a
+// write to contacts.
+func contactWriteError(err error) error {
+	switch {
+	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
+		return ErrConflict
+	case errors.Is(err, store.ErrPreconditionFailed):
+		return ErrPreconditionFailed
+	case errors.Is(err, store.ErrLockConflict):
+		return ErrLocked
+	}
+	return err
 }
 
 // aclScope is what one access decision reads the ACL of: a book, and the
@@ -479,58 +537,65 @@ func (s *Service) updateContactOnce(ctx context.Context, user *store.User, bookI
 	if book == nil {
 		return nil, ErrNotFound
 	}
-	existing, err := s.store.Contacts.GetByUID(ctx, bookID, uid)
+	write, err := s.updateWrite(ctx, user, book, uid, input)
 	if err != nil {
 		return nil, err
+	}
+	return s.putContact(ctx, write)
+}
+
+// updateWrite decides the replacement of the contact uid of book and returns
+// the write that carries it out. It is ErrNotFound for a UID the book does not
+// hold, unless the user's refusal of write-content on the book is the answer.
+func (s *Service) updateWrite(ctx context.Context, user *store.User, book *store.AddressBook, uid string, input UpsertInput) (store.ContactObjectWrite, error) {
+	existing, err := s.store.Contacts.GetByUID(ctx, book.ID, uid)
+	if err != nil {
+		return store.ContactObjectWrite{}, err
 	}
 	if existing == nil {
-		return nil, s.missingContactUpdate(ctx, user, book)
+		return store.ContactObjectWrite{}, s.missingContactUpdate(ctx, user, book)
 	}
 	resourceName := contactResourceName(*existing)
-	guard, err := s.writeGuard(ctx, user, aclScope{bookID: bookID, resourceName: resourceName, book: book})
+	guard, err := s.writeGuard(ctx, user, aclScope{bookID: book.ID, resourceName: resourceName, book: book})
 	if err != nil {
-		return nil, err
+		return store.ContactObjectWrite{}, err
 	}
 	if err := s.requireBookPrivilege(ctx, user, book, resourceName, "write-content"); err != nil {
 		if errors.Is(err, ErrForbidden) && s.requireBookPrivilege(ctx, user, book, resourceName, "read") != nil {
-			return nil, s.missingContactUpdate(ctx, user, book)
+			return store.ContactObjectWrite{}, s.missingContactUpdate(ctx, user, book)
 		}
-		return nil, err
+		return store.ContactObjectWrite{}, err
+	}
+	statePath := addressBookACLResourcePaths(book.ID, resourceName)[0]
+	lockPreconditions := []store.LockPrecondition{store.NewLockPrecondition(statePath)}
+	if err := s.lockedAheadOfPreconditions(ctx, input, lockPreconditions); err != nil {
+		return store.ContactObjectWrite{}, err
 	}
 	if err := writableContactName(resourceName); err != nil {
-		return nil, err
+		return store.ContactObjectWrite{}, err
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, ErrPreconditionFailed
+		return store.ContactObjectWrite{}, ErrPreconditionFailed
 	}
 	body, normalizedUID, err := normalizeVCardPayload(input, uid, existing.RawVCard)
 	if err != nil {
-		return nil, err
+		return store.ContactObjectWrite{}, err
 	}
 	if normalizedUID != uid {
-		return nil, fmt.Errorf("%w: uid mismatch", ErrBadRequest)
+		return store.ContactObjectWrite{}, fmt.Errorf("%w: uid mismatch", ErrBadRequest)
 	}
 	expected := store.ContactDAVResourceState(existing)
 	expected.ACL = guard
-	statePaths := addressBookACLResourcePaths(bookID, resourceName)
-	result, err := s.store.PutContactObject(ctx, store.ContactObjectWrite{
-		AddressBookID: bookID,
-		UID:           uid,
-		ResourceName:  resourceName,
-		RawVCard:      body,
-		ETag:          utils.GenerateETag(body),
-		ExpectedState: expected,
-		StatePath:     statePaths[0],
-	})
-	switch {
-	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
-		return nil, ErrConflict
-	case errors.Is(err, store.ErrPreconditionFailed):
-		return nil, ErrPreconditionFailed
-	case err != nil:
-		return nil, err
-	}
-	return result.Contact, nil
+	return store.ContactObjectWrite{
+		AddressBookID:     book.ID,
+		UID:               uid,
+		ResourceName:      resourceName,
+		RawVCard:          body,
+		ETag:              utils.GenerateETag(body),
+		ExpectedState:     expected,
+		StatePath:         statePath,
+		LockPreconditions: lockPreconditions,
+	}, nil
 }
 
 // writableContactName refuses a write that would keep a contact under
@@ -600,16 +665,23 @@ func (s *Service) deleteContactOnce(ctx context.Context, user *store.User, bookI
 	if existing == nil {
 		return ErrNotFound
 	}
-	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
-		return ErrPreconditionFailed
-	}
 	resourcePaths := addressBookACLResourcePaths(bookID, resourceName)
 	if len(resourcePaths) == 0 {
 		return ErrNotFound
 	}
+	lockPreconditions := []store.LockPrecondition{
+		store.NewLockPrecondition(resourcePaths[0]),
+		store.NewLockPrecondition(addressBookACLCollectionPath(bookID)),
+	}
+	if err := s.lockedAheadOfPreconditions(ctx, UpsertInput{IfMatch: ifMatch, IfNoneMatch: ifNoneMatch}, lockPreconditions); err != nil {
+		return err
+	}
+	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
+		return ErrPreconditionFailed
+	}
 	expected := store.ContactDAVResourceState(existing)
 	expected.ACL = guard
-	return s.store.DeleteContactAndState(ctx, bookID, expected, resourcePaths[0], nil)
+	return contactWriteError(s.store.DeleteContactAndState(ctx, bookID, expected, resourcePaths[0], lockPreconditions))
 }
 
 // MoveContact moves a contact into another address book under the resource
@@ -702,12 +774,14 @@ func (s *Service) moveContactOnce(ctx context.Context, user *store.User, fromBoo
 	// checks above fails the move with ErrResourceStateChanged and the next
 	// attempt reports it; ErrConflict is a contact holding the UID under
 	// another resource name.
-	err = s.store.MoveContactAndState(ctx, fromBookID, toBookID, uid, resourceName, fromPaths[0], toPaths[0], "",
-		store.ContactTransferExpectation{Source: store.ContactDAVResourceState(existing), ACL: guard}, nil)
-	if errors.Is(err, store.ErrConflict) {
-		return ErrConflict
+	lockPreconditions := []store.LockPrecondition{
+		store.NewLockPrecondition(fromPaths[0]),
+		store.NewLockPrecondition(addressBookACLCollectionPath(fromBookID)),
+		store.NewLockPrecondition(toPaths[0]),
+		store.NewLockPrecondition(addressBookACLCollectionPath(toBookID)),
 	}
-	return err
+	return contactWriteError(s.store.MoveContactAndState(ctx, fromBookID, toBookID, uid, resourceName, fromPaths[0], toPaths[0], "",
+		store.ContactTransferExpectation{Source: store.ContactDAVResourceState(existing), ACL: guard}, lockPreconditions))
 }
 
 // memberPrivileges are the privileges any one of which, held on a contact,
@@ -1101,23 +1175,14 @@ func ensureCRLF(body string) string {
 	return body
 }
 
+// checkConditionalHeaders evaluates a request's If-Match and If-None-Match
+// against the contact it writes, which is nil where there is none.
 func checkConditionalHeaders(ifMatch, ifNoneMatch string, existing *store.Contact) bool {
-	if ifNoneMatch == "*" {
-		return existing == nil
+	etag := ""
+	if existing != nil {
+		etag = existing.ETag
 	}
-	if ifMatch != "" {
-		if existing == nil {
-			return false
-		}
-		return strings.Trim(ifMatch, "\"") == existing.ETag
-	}
-	if ifNoneMatch != "" {
-		if existing == nil {
-			return true
-		}
-		return strings.Trim(ifNoneMatch, "\"") != existing.ETag
-	}
-	return true
+	return httpcond.Check(ifMatch, ifNoneMatch, etag, existing != nil)
 }
 
 // StatusCode maps a service error to the HTTP status the API should return.
@@ -1133,6 +1198,8 @@ func StatusCode(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, ErrPreconditionFailed):
 		return http.StatusPreconditionFailed
+	case errors.Is(err, ErrLocked):
+		return http.StatusLocked
 	case errors.Is(err, ErrBadRequest):
 		return http.StatusBadRequest
 	default:

@@ -132,7 +132,7 @@ func TestSeriesEditKeepsDeletedOccurrencesDeleted(t *testing.T) {
 			}
 
 			w = httptest.NewRecorder()
-			handler.DeleteEvent(w, deleteOccurrenceRequest(t, uid, url.Values{
+			handler.DeleteEvent(w, deleteOccurrenceRequest(t, uid, url.Values{"etag": {storedETag(t, eventRepo, uid)},
 				"recurrence_id": {"2026-06-22T10:00"}, "recurrence_timezone": {"America/New_York"},
 			}))
 			if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=occurrence_deleted") {
@@ -141,6 +141,7 @@ func TestSeriesEditKeepsDeletedOccurrencesDeleted(t *testing.T) {
 
 			edit := maps.Clone(series)
 			maps.Copy(edit, tt.edit)
+			edit.Set("etag", storedETag(t, eventRepo, uid))
 			w = httptest.NewRecorder()
 			handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/"+uid, uid, user, tt.zone, edit))
 			if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
@@ -186,7 +187,7 @@ func TestSeriesEditEndingTheSeriesDropsItsExclusions(t *testing.T) {
 		uid = created.UID
 	}
 	w = httptest.NewRecorder()
-	handler.DeleteEvent(w, deleteOccurrenceRequest(t, uid, url.Values{
+	handler.DeleteEvent(w, deleteOccurrenceRequest(t, uid, url.Values{"etag": {storedETag(t, eventRepo, uid)},
 		"recurrence_id": {"2026-06-15T10:00"}, "recurrence_timezone": {"America/New_York"},
 	}))
 	if location := w.Header().Get("Location"); !strings.Contains(location, "status=occurrence_deleted") {
@@ -195,7 +196,7 @@ func TestSeriesEditEndingTheSeriesDropsItsExclusions(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/"+uid, uid, user, "America/New_York", url.Values{
-		"dtstart": {"2026-06-15T10:00"}, "dtend": {"2026-06-15T11:00"},
+		"dtstart": {"2026-06-15T10:00"}, "dtend": {"2026-06-15T11:00"}, "etag": {storedETag(t, eventRepo, uid)},
 	}))
 	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
 		t.Fatalf("UpdateEvent() status = %d location = %s", w.Code, location)
@@ -250,7 +251,7 @@ func TestSeriesEditKeepsWhatTheEditorDoesNotEdit(t *testing.T) {
 		t.Fatalf("the client's series should pass the validator: %v", err)
 	}
 	kept := []string{
-		"CREATED:20251201T120000Z", "SEQUENCE:3", "PRIORITY:1", "GEO:40.7;-74.0",
+		"CREATED:20251201T120000Z", "PRIORITY:1", "GEO:40.7;-74.0",
 		"COMMENT:Bring laptops", "CONTACT:Front desk", "RESOURCES:Projector", "RELATED-TO:parent-uid",
 		"X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
 	}
@@ -266,7 +267,7 @@ func TestSeriesEditKeepsWhatTheEditorDoesNotEdit(t *testing.T) {
 		{
 			name:    "renamed",
 			edit:    url.Values{"summary": {"Planning (moved rooms)"}},
-			present: append([]string{"SUMMARY:Planning (moved rooms)", "EXDATE:20260622T140000Z", "RDATE;TZID=America/New_York:20260625T150000", "X-ALT-DESC;FMTTYPE=text/html:<p>Agenda</p>"}, kept...),
+			present: append([]string{"SUMMARY:Planning (moved rooms)", "SEQUENCE:3", "EXDATE:20260622T140000Z", "RDATE;TZID=America/New_York:20260625T150000", "X-ALT-DESC;FMTTYPE=text/html:<p>Agenda</p>"}, kept...),
 			absent:  []string{"LAST-MODIFIED:20251215T120000Z", "SUMMARY:Planning"},
 			walls:   []string{"2026-06-15T10:00", "2026-06-25T15:00", "2026-06-29T10:00", "2026-07-06T10:00"},
 		},
@@ -274,7 +275,7 @@ func TestSeriesEditKeepsWhatTheEditorDoesNotEdit(t *testing.T) {
 			name: "moved an hour later with a new description",
 			edit: url.Values{"dtstart": {"2026-06-15T11:00"}, "dtend": {"2026-06-15T12:00"}, "description": {"New agenda"}},
 			present: append([]string{
-				"EXDATE;TZID=America/New_York:20260622T110000", "RDATE;TZID=America/New_York:20260625T160000",
+				"SEQUENCE:4", "EXDATE;TZID=America/New_York:20260622T110000", "RDATE;TZID=America/New_York:20260625T160000",
 			}, kept...),
 			absent: []string{"X-ALT-DESC;FMTTYPE=text/html:<p>Agenda</p>", "EXDATE:20260622T140000Z"},
 			walls:  []string{"2026-06-15T11:00", "2026-06-25T16:00", "2026-06-29T11:00", "2026-07-06T11:00"},
@@ -288,7 +289,7 @@ func TestSeriesEditKeepsWhatTheEditorDoesNotEdit(t *testing.T) {
 			}}}
 			s := &store.Store{Calendars: calRepo, Events: eventRepo}
 			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
-			user := &store.User{ID: 100}
+			user := &store.User{ID: 100, PrimaryEmail: "owner@example.com"}
 
 			edit := maps.Clone(clientSeriesForm)
 			maps.Copy(edit, tt.edit)

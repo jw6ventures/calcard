@@ -562,6 +562,9 @@ func TestRevokePrincipalGrantsTouchesMembersInOneBatch(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND object_acl_path = ANY($2)`)).
 		WithArgs(int64(4), pq.Array([]string{"/dav/calendars/4/a", "/dav/calendars/4/b.ics", "/dav/calendars/4/c"})).
 		WillReturnResult(sqlmock.NewResult(0, 3))
+	mock.ExpectExec(`DELETE FROM locks WHERE user_id=\$1`).
+		WithArgs(int64(9), collectionPath, `/dav/calendars/4/%`, int64(4)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
 	if err := (&aclRepo{pool: db}).RevokePrincipalGrants(context.Background(), collectionPath, "/dav/principals/9/", []string{"read"}); err != nil {

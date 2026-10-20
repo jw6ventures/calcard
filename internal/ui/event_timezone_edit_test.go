@@ -107,6 +107,7 @@ func TestUpdateEventKeepsTheZoneDefinitionCoveringTheEditedTimes(t *testing.T) {
 			}
 
 			w = httptest.NewRecorder()
+			tt.edit.Set("etag", storedETag(t, eventRepo, uid))
 			handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/"+uid, uid, user, tt.zone, tt.edit))
 			if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
 				t.Fatalf("UpdateEvent() status = %d location = %s", w.Code, location)
@@ -138,9 +139,13 @@ func TestUpdateEventKeepsTheZoneDefinitionCoveringTheEditedTimes(t *testing.T) {
 	}
 }
 
+// seededEventETag is the ETag the events these tests store carry, which the
+// forms they post name as the version they were built from.
+const seededEventETag = "e"
+
 func eventFormRequest(t *testing.T, target, uid string, user *store.User, zone string, fields url.Values) *http.Request {
 	t.Helper()
-	form := url.Values{"summary": {"Meeting"}, "timezone": {zone}}
+	form := url.Values{"summary": {"Meeting"}, "timezone": {zone}, "etag": {seededEventETag}}
 	for key, values := range fields {
 		form[key] = values
 	}
@@ -305,6 +310,8 @@ func TestEventInAZoneOnlyTheObjectDefinesKeepsItsInstants(t *testing.T) {
 
 	update := func(fields url.Values) {
 		t.Helper()
+		fields = maps.Clone(fields)
+		fields.Set("etag", storedETag(t, eventRepo, "outlook-series"))
 		w := httptest.NewRecorder()
 		handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/outlook-series", "outlook-series", user, zone, fields))
 		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
@@ -363,6 +370,7 @@ func TestEventInAZoneOnlyTheObjectDefinesKeepsItsInstants(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "outlook-series", url.Values{
+		"etag":          {storedETag(t, eventRepo, "outlook-series")},
 		"recurrence_id": {view.editorWallClock(t, "2024-03-25T13:00:00Z", zone)}, "recurrence_timezone": {zone},
 	}))
 	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=occurrence_deleted") {
@@ -497,7 +505,7 @@ func TestEventInASkippedLocalTimeKeepsTheEnteredWallClock(t *testing.T) {
 	handler.CreateEvent(w, eventFormRequest(t, "/calendars/1/events", "", user, zone, url.Values{
 		"dtstart": {"2024-03-10T02:30"}, "dtend": {"2024-03-10T03:15"},
 	}))
-	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "error=end+date+must+not+be+before+start+date") {
+	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "error=The+end+must+not+be+before+the+start.") {
 		t.Fatalf("CreateEvent() of an event ending at 03:15 EDT, before 02:30 read as 03:30 EDT: status = %d location = %s", w.Code, location)
 	}
 

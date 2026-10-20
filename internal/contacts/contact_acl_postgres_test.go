@@ -215,8 +215,9 @@ func newPostgresMoveFixture(t *testing.T) (*store.Store, *store.User, int64, int
 
 // The DAV state bound to a contact's path goes with the contact when it moves,
 // as a DAV MOVE takes it: its dead properties and its own ACL are found at the
-// new path and nowhere else (RFC 3744 section 7.3), and no lock is left on the
-// path it left.
+// new path and nowhere else (RFC 3744 section 7.3), and no lock row is left on
+// the path it left. A lock that has not expired refuses the move, so the lock
+// here has expired.
 func TestPostgres_MoveContactTakesItsDAVStateToTheNewPath(t *testing.T) {
 	database, user, fromBookID, toBookID := newPostgresMoveFixture(t)
 	ctx := t.Context()
@@ -235,7 +236,7 @@ func TestPostgres_MoveContactTakesItsDAVStateToTheNewPath(t *testing.T) {
 	}
 	if _, err := database.Locks.Create(ctx, store.Lock{
 		Token: "opaquelocktoken:contact-move", ResourcePath: oldPath, UserID: user.ID,
-		LockScope: "exclusive", LockType: "write", Depth: "0", TimeoutSeconds: 300, ExpiresAt: time.Now().Add(5 * time.Minute),
+		LockScope: "exclusive", LockType: "write", Depth: "0", TimeoutSeconds: 300, ExpiresAt: time.Now().Add(-time.Minute),
 	}); err != nil {
 		t.Fatalf("create lock: %v", err)
 	}

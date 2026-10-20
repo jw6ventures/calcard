@@ -255,3 +255,71 @@ func TestCalendarEventsJSONReadsAV11DefinitionAsTheHostZone(t *testing.T) {
 		t.Errorf("the v1.1 definition's offsets are listed for the browser: %v", offsets)
 	}
 }
+
+// Each event the view model lists carries the ETag of the stored event, which
+// the editor sends back with an edit or a delete to show what version it was
+// opened on.
+func TestCalendarEventsJSONCarriesTheETagOfEachEvent(t *testing.T) {
+	handler, _, events := servedOutlookHandler(t)
+	events.events["1:outlook-standup"].ETag = "standup-version"
+	user := &store.User{ID: 100}
+
+	endpoints := map[string]func(http.ResponseWriter, *http.Request){
+		"one calendar": func(w http.ResponseWriter, r *http.Request) {
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			handler.GetCalendarEventsJSON(w, r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx)))
+		},
+		"all calendars": func(w http.ResponseWriter, r *http.Request) { handler.GetAllCalendarEventsJSON(w, r) },
+	}
+	for name, serve := range endpoints {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/events.json?start=2024-03-01&end=2024-04-01", nil)
+			w := httptest.NewRecorder()
+			serve(w, req.WithContext(auth.WithUser(req.Context(), user)))
+			var payload []map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil || w.Code != http.StatusOK || len(payload) == 0 {
+				t.Fatalf("events JSON = %d %s (%v)", w.Code, w.Body.String(), err)
+			}
+			for _, event := range payload {
+				want := "e"
+				if event["uid"] == "outlook-standup" {
+					want = "standup-version"
+				}
+				if event["etag"] != want {
+					t.Errorf("event %v carries etag %v, want %q", event["uid"], event["etag"], want)
+				}
+			}
+		})
+	}
+}
+
+// A date range the events listings refuse is answered with a plain message of
+// the listing's own, never the text of an error.
+func TestCalendarEventsJSONRefusesABadRangeInPlainWords(t *testing.T) {
+	handler, _, _ := servedOutlookHandler(t)
+	user := &store.User{ID: 100}
+	tests := map[string]string{
+		"start=2024-03-01":                "start and end are required",
+		"start=soon&end=2024-04-01":       "invalid start date",
+		"start=2024-03-01&end=later":      "invalid end date",
+		"start=2024-04-01&end=2024-03-01": "invalid date range",
+	}
+	for query, want := range tests {
+		for name, serve := range map[string]func(http.ResponseWriter, *http.Request){
+			"one calendar": func(w http.ResponseWriter, r *http.Request) {
+				rctx := chi.NewRouteContext()
+				rctx.URLParams.Add("id", "1")
+				handler.GetCalendarEventsJSON(w, r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx)))
+			},
+			"all calendars": func(w http.ResponseWriter, r *http.Request) { handler.GetAllCalendarEventsJSON(w, r) },
+		} {
+			req := httptest.NewRequest(http.MethodGet, "/events.json?"+query, nil)
+			w := httptest.NewRecorder()
+			serve(w, req.WithContext(auth.WithUser(req.Context(), user)))
+			if got := strings.TrimSpace(w.Body.String()); w.Code != http.StatusBadRequest || got != want {
+				t.Errorf("%s ?%s: status %d body %q, want 400 %q", name, query, w.Code, got, want)
+			}
+		}
+	}
+}

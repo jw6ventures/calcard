@@ -29,6 +29,7 @@ vm.runInNewContext(
   [
     'function parseICAL() { throw new Error("the server sent an event without a DTSTART"); }',
     extract('parseServerDate'),
+    extract('recurrenceIsFloating'),
     extract('normalizeServerEvent'),
     extract('overrideRecurrenceIdAllDay'),
     extract('expandRecurringEvents'),

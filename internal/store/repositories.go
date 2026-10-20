@@ -168,7 +168,11 @@ type ACLRepository interface {
 	// set through the ACL method on that resource, and both are taken: a revoked
 	// principal keeps no access anywhere in the collection, even where the owner
 	// had granted it separately. Deny entries are never removed: revoking access
-	// must not widen it.
+	// must not widen it. When the principal is left without access to the
+	// collection, the locks they hold on it and beneath it are deleted in the same
+	// transaction, since they could only keep the owner from writing; the
+	// collection's owner, and a principal another entry still admits, keep theirs.
+	// No lock refuses the revocation.
 	RevokePrincipalGrants(ctx context.Context, collectionPath, principalHref string, collectionPrivileges []string) error
 	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
 	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)

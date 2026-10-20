@@ -88,6 +88,7 @@
                     case 'RECURRENCE-ID':
                         event.recurrenceId = parseICALDate(value, params);
                         event.recurrenceIdAllDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        event.recurrenceFloating = isFloatingTime(value, params);
                         break;
                     case 'X-ALT-DESC':
                         if (params['FMTTYPE'] === 'text/html') {
@@ -100,6 +101,7 @@
                     case 'DTSTART':
                         event.dtstart = parseICALDate(value, params);
                         event.allDay = value.length === 8 || params['VALUE'] === 'DATE';
+                        event.floating = isFloatingTime(value, params);
                         if (params['TZID']) event.timezone = params['TZID'];
                         break;
                     case 'DTEND':
@@ -263,6 +265,54 @@
         return new Date(year, month, day, hour, min, sec);
     }
 
+    // Whether an iCalendar DTSTART or RECURRENCE-ID value is a floating
+    // DATE-TIME: not a DATE, not UTC, and in no zone (RFC 5545 section 3.3.5).
+    function isFloatingTime(value, params) {
+        return /^\d{8}T\d{6}$/.test(String(value).trim()) && !(params && params['TZID']);
+    }
+
+    // What an editor's time zone field holds for event's times. A floating
+    // event's field is blank: the server keeps its times floating, as they
+    // are stored, where UTC would turn them into instants. A timed event
+    // naming no zone is read in UTC, and an all-day one needs none.
+    function editorTimeZone(event) {
+        if (event.floating) return '';
+        return event.timezone || (event.allDay ? '' : 'UTC');
+    }
+
+    // What an editor's field for the zone of RECURRENCE-ID, the slot of event
+    // in its series, holds; blank for a floating series, as editorTimeZone.
+    function editorRecurrenceTimeZone(event) {
+        if (recurrenceIsFloating(event)) return '';
+        return event.recurrenceTimezone || event.timezone || 'UTC';
+    }
+
+    // Whether the RECURRENCE-ID of event, or of the instance the event is
+    // the master of, is floating: its own, or the series' when the event
+    // states none.
+    function recurrenceIsFloating(event) {
+        return event.recurrenceFloating === undefined ? !!event.floating : !!event.recurrenceFloating;
+    }
+
+    // The value of an editor's marker that the occurrence it edits is of a
+    // floating series, which the server reads its RECURRENCE-ID in whatever
+    // zone is typed.
+    function editorRecurrenceFloating(event) {
+        return recurrenceIsFloating(event) ? '1' : '';
+    }
+
+    // The clock an editor reads event's times on: none for a floating event,
+    // whose times are the browser's wall clock (parseServerDate), and the
+    // zone's otherwise.
+    function editorClock(event) {
+        return event.floating ? null : timeZoneClock(event, event.timezone);
+    }
+
+    // The clock an editor reads the RECURRENCE-ID of event on, in zone tzid.
+    function editorRecurrenceClock(event, tzid) {
+        return recurrenceIsFloating(event) ? null : timeZoneClock(event, tzid);
+    }
+
     // The offsets, in milliseconds east of UTC, that the server lists for zone
     // tzid in event.timezoneOffsets, as a function of the instant: the entry
     // in force then -- the last one from at or before it -- or, before the
@@ -318,9 +368,11 @@
     // The wall clock of zone tzid as the server reads event's times in it. A
     // reading is held in a Date's UTC fields. The offsets the server lists
     // for the zone come first: they are the object's own definition of it,
-    // which the server reads even where Intl knows the name. A zone it lists
-    // none for is Intl's zone of that name, and no zone, or one Intl does not
-    // know, is UTC, as the server reads a TZID its zone database lacks.
+    // which the server reads even where Intl knows the name, and a UTC offset
+    // for a name it defines nowhere, which Intl may know in another case. A
+    // zone it lists none for is Intl's zone of that name, and no zone, or one
+    // Intl does not know, is UTC, as the server reads a TZID its zone database
+    // lacks.
     function timeZoneClock(event, tzid) {
         var offsetAt = listedOffsets(event, tzid) || intlOffsets(tzid);
         if (!offsetAt) {
@@ -389,11 +441,13 @@
                 // The instance's times are of the value type of the content
                 // it carries, and its slot of the series': a wall clock of the
                 // series' zone, which names that slot again when read back.
-                occurrence.dtstart = parseServerDate(instance.start, occurrence.allDay);
-                occurrence.dtend = parseServerDate(instance.end, occurrence.allDay);
-                occurrence.recurrenceId = parseServerDate(instance.recurrenceId, event.allDay);
+                var floatingContent = !occurrence.allDay && !!occurrence.floating;
+                occurrence.dtstart = parseServerDate(instance.start, occurrence.allDay, floatingContent);
+                occurrence.dtend = parseServerDate(instance.end, occurrence.allDay, floatingContent);
+                occurrence.recurrenceId = parseServerDate(instance.recurrenceId, event.allDay, !event.allDay && !!event.floating);
                 occurrence.recurrenceIdAllDay = !!event.allDay;
                 occurrence.recurrenceTimezone = event.allDay ? undefined : (event.timezone || 'UTC');
+                occurrence.recurrenceFloating = !event.allDay && !!event.floating;
                 occurrence.recurrenceRange = undefined;
                 occurrence.isOccurrence = true;
                 occurrence.seriesEvent = event;
@@ -415,8 +469,9 @@
                 var occurrence = Object.assign({}, event, ov);
                 occurrence.allDay = ov.allDay !== undefined ? ov.allDay : event.allDay;
                 if (placement) {
-                    occurrence.dtstart = parseServerDate(placement.start, occurrence.allDay);
-                    occurrence.dtend = parseServerDate(placement.end, occurrence.allDay);
+                    var floatingPlacement = !occurrence.allDay && !!occurrence.floating;
+                    occurrence.dtstart = parseServerDate(placement.start, occurrence.allDay, floatingPlacement);
+                    occurrence.dtend = parseServerDate(placement.end, occurrence.allDay, floatingPlacement);
                 }
                 occurrence.recurrenceIdAllDay = overrideRecurrenceIdAllDay(ov, event);
                 occurrence.isOccurrence = true;
@@ -459,26 +514,42 @@
     // previous day, so the event rendered -- and saved -- one day early.
     // Rebuilding it on local midnight is what parseICALDate already does for the
     // iCal fallback, so both paths land an all-day event on the same day.
-    function parseServerDate(value, allDay) {
+    // A floating value is likewise a wall clock, not an instant: the server
+    // names it as the UTC instant with the same fields, so it is rebuilt on
+    // the browser's clock, as the iCalendar fallback reads it, and every view
+    // places and labels it at the time it is written at. A wall clock the
+    // browser's zone skips (02:30 on the day its clocks go forward) becomes the
+    // nearest time it has, which is right for placing the event on a grid but
+    // is not the time the event is stored at; the Date carries that time as
+    // floatingWall, which the editors show and submit so a save changes no time.
+    function parseServerDate(value, allDay, floating) {
         if (!value) return null;
         var parsed = new Date(value);
         if (isNaN(parsed.getTime())) return null;
-        if (!allDay) return parsed;
-        return new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
+        if (allDay) return new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
+        if (floating) {
+            var shown = new Date(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(),
+                parsed.getUTCHours(), parsed.getUTCMinutes(), parsed.getUTCSeconds());
+            shown.floatingWall = parsed.toISOString().substring(0, parsed.getUTCSeconds() ? 19 : 16);
+            return shown;
+        }
+        return parsed;
     }
 
     function normalizeServerEvent(raw) {
         var parsed = Object.assign({}, raw);
         var allDay = !!raw.allDay;
-        parsed.dtstart = parseServerDate(raw.dtstart, allDay);
-        parsed.dtend = parseServerDate(raw.dtend, allDay);
-        parsed.recurrenceId = parseServerDate(raw.recurrenceId,
-            raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay);
+        var floating = !allDay && !!raw.floating;
+        parsed.dtstart = parseServerDate(raw.dtstart, allDay, floating);
+        parsed.dtend = parseServerDate(raw.dtend, allDay, floating);
+        var recurrenceAllDay = raw.recurrenceIdAllDay !== undefined ? raw.recurrenceIdAllDay : allDay;
+        parsed.recurrenceId = parseServerDate(raw.recurrenceId, recurrenceAllDay,
+            !recurrenceAllDay && recurrenceIsFloating(raw));
         parsed.recurrenceIdText = raw.recurrenceId;
         // Passing parseServerDate to map directly would hand it the index as the
         // all-day flag.
         parsed.exdates = (raw.exdates || []).map(function(value) {
-            return parseServerDate(value, allDay);
+            return parseServerDate(value, allDay, floating);
         }).filter(Boolean);
         parsed.overrides = (raw.overrides || []).map(normalizeServerEvent);
         if (!parsed.dtstart && raw.ical) {
@@ -569,9 +640,11 @@
     }
 
     // date as a datetime-local input value: its reading on clock, a
-    // timeZoneClock, when one is given, and in the browser's zone otherwise.
+    // timeZoneClock, when one is given, and in the browser's zone otherwise,
+    // except that a floating time is shown as it is stored (parseServerDate).
     // A clock's reading shows its seconds when they are not zero.
     function formatDateTimeForInput(date, clock) {
+        if (!clock && date.floatingWall) return date.floatingWall;
         function pad(value) { return String(value).padStart(2, '0'); }
         if (clock) {
             var wall = clock.wallOf(date);
@@ -580,7 +653,8 @@
                 (wall.getUTCSeconds() ? ':' + pad(wall.getUTCSeconds()) : '');
         }
         return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
-            'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+            'T' + pad(date.getHours()) + ':' + pad(date.getMinutes()) +
+            (date.getSeconds() ? ':' + pad(date.getSeconds()) : '');
     }
 
     // The browser's own zone, which the create forms submit beside the times

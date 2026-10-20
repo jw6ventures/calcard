@@ -60,7 +60,14 @@ type Config struct {
 		// gains its HA1 when it is issued, or the first time it authenticates
 		// over Basic, so a deployment turns this on once its credentials have
 		// caught up.
-		DigestEnabled           bool
+		DigestEnabled bool
+		// InsecureBasicEnabled accepts HTTP Basic on the DAV and REST endpoints
+		// over plain HTTP, and puts the Basic challenge back in their 401s.
+		// RFC 4791 §11 forbids Basic unless TLS is in effect, so it is off by
+		// default and every start with it on is logged as a warning: the
+		// password and all calendar and contact data cross the network in
+		// cleartext.
+		InsecureBasicEnabled    bool
 		MaxMultistatusResponses int
 		MaxMultistatusBytes     int
 		// MaxFilterElements bounds how many filter elements one CALDAV:filter or
@@ -196,6 +203,7 @@ func Load() (*Config, error) {
 	cfg.PrometheusEnabled = getenvBool("APP_PROMETHEUS_ENDPOINT_ENABLED", false)
 	cfg.DAV.PropfindInfinityEnabled = getenvBool("APP_DAV_PROPFIND_INFINITY_ENABLED", true)
 	cfg.DAV.DigestEnabled = getenvBool("APP_DAV_DIGEST_ENABLED", false)
+	cfg.DAV.InsecureBasicEnabled = getenvBool("APP_DAV_INSECURE_BASIC_ENABLED", false)
 	cfg.DAV.MaxMultistatusResponses, err = getenvLimitDefault("APP_DAV_MAX_MULTISTATUS_RESPONSES", 10000)
 	if err != nil {
 		return nil, err

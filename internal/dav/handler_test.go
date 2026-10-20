@@ -10147,6 +10147,71 @@ func TestDeleteWithIfMatchFailure(t *testing.T) {
 	}
 }
 
+// A lock the request holds no token for is answered with 423 ahead of a failed
+// If-Match, as it is for a contact and for a MOVE. With the lock's token
+// submitted the lock no longer refuses, and the stale If-Match gets 412.
+func TestDeleteEventAnswersAHeldLockBeforeAFailedIfMatch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		locks map[string]*store.Lock
+		ifHdr string
+		want  int
+	}{
+		{"lock and no token", map[string]*store.Lock{"opaquelocktoken:tok-1": {Token: "opaquelocktoken:tok-1", ResourcePath: "/dav/calendars/2/event", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}}, "", http.StatusLocked},
+		{"lock and its token", map[string]*store.Lock{"opaquelocktoken:tok-1": {Token: "opaquelocktoken:tok-1", ResourcePath: "/dav/calendars/2/event", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}}, "(<opaquelocktoken:tok-1>)", http.StatusPreconditionFailed},
+		{"no lock", nil, "", http.StatusPreconditionFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eventRepo := &fakeEventRepo{events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
+			}}
+			h := &DavServer{store: &store.Store{
+				Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true}}},
+				Events:    eventRepo,
+				Locks:     &fakeLockRepo{locks: tc.locks},
+			}}
+			req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+			req.Header.Set("If-Match", `"wrong"`)
+			if tc.ifHdr != "" {
+				req.Header.Set("If", tc.ifHdr)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Delete(rr, req)
+
+			if rr.Code != tc.want {
+				t.Fatalf("DELETE answered %d, want %d: %s", rr.Code, tc.want, rr.Body.String())
+			}
+			if _, ok := eventRepo.events["2:event"]; !ok {
+				t.Fatal("a refused DELETE removed the event")
+			}
+		})
+	}
+}
+
+// RFC 9110 section 13.2.1: a member that is not there is 404 whatever the lock
+// and the conditional header say.
+func TestDeleteOfAMissingEventIsNotFoundUnderALockAndAnIfMatch(t *testing.T) {
+	h := &DavServer{store: &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true}}},
+		Events:    &fakeEventRepo{events: map[string]*store.Event{}},
+		Locks: &fakeLockRepo{locks: map[string]*store.Lock{
+			"tok-1": {Token: "tok-1", ResourcePath: "/dav/calendars/2", UserID: 2, LockScope: "exclusive", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		}},
+	}}
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/absent.ics", nil)
+	req.Header.Set("If-Match", `"wrong"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("DELETE answered %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestPutRejectsInvalidICalendar(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{

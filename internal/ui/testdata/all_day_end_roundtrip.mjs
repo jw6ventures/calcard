@@ -24,7 +24,7 @@ function extract(name) {
 }
 const src = ['formatLocalDate','formatDateInput','listedOffsets','intlOffsets','timeZoneClock','formatDateTimeForInput','startOfDay','addDays',
              'inclusiveAllDayEnd','exclusiveAllDayEnd','setEditorDateValues',
-             'parseServerDate','normalizeServerEvent']
+             'parseServerDate','recurrenceIsFloating','normalizeServerEvent']
   .map(extract).join('\n');
 
 // Enough of a DOM for setEditorDateValues, which is the function that actually

@@ -337,7 +337,7 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 		)
 		switch {
 		case strings.EqualFold(scheme, "Basic"):
-			if !s.secureRequest(r) {
+			if !s.basicAllowed(r) {
 				err = errors.New("basic authentication requires a secure transport")
 				break
 			}
@@ -388,6 +388,17 @@ func (s *Service) cookieSecure(r *http.Request) bool {
 	}
 	base, err := url.Parse(s.cfg.BaseURL)
 	return err == nil && base.Scheme == "https"
+}
+
+// basicAllowed reports whether this request may authenticate with, and be
+// challenged for, HTTP Basic. RFC 4791 Section 11 forbids Basic unless TLS is
+// in effect, so that is the rule; APP_DAV_INSECURE_BASIC_ENABLED is the
+// operator's explicit exception for deployments that serve DAV over plain HTTP.
+func (s *Service) basicAllowed(r *http.Request) bool {
+	if s != nil && s.cfg != nil && s.cfg.DAV.InsecureBasicEnabled {
+		return true
+	}
+	return s.secureRequest(r)
 }
 
 func (s *Service) secureRequest(r *http.Request) bool {

@@ -353,6 +353,40 @@ func TestHelmChartDAVDigestSwitchIsOptInAndReachable(t *testing.T) {
 	}
 }
 
+// Basic over plain HTTP is an operator's explicit exception to RFC 4791
+// Section 11, so an unset value must leave the server on its default (off) and
+// the switch must still be reachable.
+func TestHelmChartInsecureBasicSwitchIsOptInAndReachable(t *testing.T) {
+	defaults := requireDocument(t, renderChart(t), "configmap.yaml")
+	if strings.Contains(defaults, "APP_DAV_INSECURE_BASIC_ENABLED") {
+		t.Errorf("an unset app.dav.insecureBasicEnabled reached the server:\n%s", defaults)
+	}
+
+	enabled := requireDocument(t, renderChart(t, "--set", "app.dav.insecureBasicEnabled=true"), "configmap.yaml")
+	if !hasLine(enabled, `APP_DAV_INSECURE_BASIC_ENABLED: "true"`) {
+		t.Errorf("configmap does not carry app.dav.insecureBasicEnabled:\n%s", enabled)
+	}
+
+	disabled := requireDocument(t, renderChart(t, "--set", "app.dav.insecureBasicEnabled=false"), "configmap.yaml")
+	if !hasLine(disabled, `APP_DAV_INSECURE_BASIC_ENABLED: "false"`) {
+		t.Errorf("configmap does not carry an explicit app.dav.insecureBasicEnabled=false:\n%s", disabled)
+	}
+}
+
+// The schema types the switch as a boolean, so a misspelt value fails the
+// render instead of being read by the server as "off".
+func TestHelmChartRefusesANonBooleanInsecureBasicSwitch(t *testing.T) {
+	args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+	args = append(args, "--set-string", "app.dav.insecureBasicEnabled=yes please")
+	output, err := runHelm(t, args...)
+	if err == nil {
+		t.Fatalf("chart rendered a non-boolean app.dav.insecureBasicEnabled:\n%s", output)
+	}
+	if !strings.Contains(output, "insecureBasicEnabled") {
+		t.Fatalf("expected the render to name the value, got:\n%s", output)
+	}
+}
+
 // TestChartPathExists keeps a moved chart from turning every test above into a
 // helm error that reads like a chart defect.
 func TestChartPathExists(t *testing.T) {
@@ -427,10 +461,12 @@ func TestHelmChartGivesMigrationsAStartupBudget(t *testing.T) {
 }
 
 // The v1.2.0 migration instructs that it be applied with the application
-// stopped. A rolling update does the opposite: it brings the new pod up while
-// the old one still serves, so the previous release keeps reading and writing a
-// schema the new one is rewriting. Recreate is what makes the deployment obey
-// the instruction the migration states.
+// stopped, so only one version of the application may meet the database at a
+// time. A rolling update does the opposite, even with maxSurge 0: the
+// ReplicaSet does not count a Terminating pod, so the new pod starts and runs
+// migrations while the old one is still shutting down. Recreate waits for the
+// old pod to be gone, and carries no rollingUpdate block, which Kubernetes
+// rejects beside it.
 func TestHelmChartReplacesPodsRatherThanRollingThem(t *testing.T) {
 	deployment := requireDocument(t, renderChart(t), "app-deployment.yaml")
 
@@ -440,6 +476,9 @@ func TestHelmChartReplacesPodsRatherThanRollingThem(t *testing.T) {
 	}
 	if !hasLine(strategy, "type: Recreate") {
 		t.Errorf("strategy is not Recreate:\n%s", strategy)
+	}
+	if strings.Contains(strategy, "rollingUpdate") {
+		t.Errorf("strategy carries a rollingUpdate block, which Kubernetes rejects beside Recreate:\n%s", strategy)
 	}
 }
 
@@ -461,8 +500,8 @@ func TestHelmChartStartupBudgetIsConfigurable(t *testing.T) {
 // Schema migrations run in the app container on startup, and the runner takes
 // no lock: it reads the stored version, then applies every migration file past
 // it. The strategy above is Recreate, so a second replica does not trail the
-// first -- both start at once, read the same version and apply the same files
-// against one database. The chart refuses that rather than rendering it,
+// first -- both start at once, read the same version and apply the same files against
+// one database. The chart refuses that rather than rendering it,
 // matching how service.type is handled: a value whose result is a corrupted
 // schema is not a value to warn about in a comment.
 //

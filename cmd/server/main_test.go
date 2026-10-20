@@ -7,10 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/ical"
+	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 )
 
 func TestOpenTrafficCaptureFileAppendsAndRestrictsPermissions(t *testing.T) {
@@ -135,5 +138,36 @@ func assertSameOffsets(t *testing.T, alias string, aliasLoc *time.Location, zone
 		if aliasOffset != zoneOffset {
 			t.Errorf("%s keeps offset %d at %v, %s keeps %d", alias, aliasOffset, at, zone, zoneOffset)
 		}
+	}
+}
+
+// Accepting Basic over plain HTTP sends the password and every calendar and
+// contact byte in cleartext, so every start with it enabled says so at Warn,
+// and a start without it says nothing.
+func TestInsecureBasicStartupWarning(t *testing.T) {
+	enabled := &config.Config{}
+	enabled.DAV.InsecureBasicEnabled = true
+
+	logger := &recordingLogger{}
+	logInsecureBasicWarning(logger, enabled)
+	logger.mu.Lock()
+	entries := append([]recordedLog(nil), logger.entries...)
+	logger.mu.Unlock()
+	if len(entries) != 1 {
+		t.Fatalf("logged %#v, want one warning", entries)
+	}
+	if entries[0].level != jw6_utils.Warn {
+		t.Errorf("level = %v, want Warn", entries[0].level)
+	}
+	for _, want := range []string{"APP_DAV_INSECURE_BASIC_ENABLED", "plain HTTP", "cleartext"} {
+		if !strings.Contains(entries[0].message, want) {
+			t.Errorf("warning %q does not mention %q", entries[0].message, want)
+		}
+	}
+
+	quiet := &recordingLogger{}
+	logInsecureBasicWarning(quiet, &config.Config{})
+	if len(quiet.entries) != 0 {
+		t.Fatalf("logged %#v with the setting off", quiet.entries)
 	}
 }

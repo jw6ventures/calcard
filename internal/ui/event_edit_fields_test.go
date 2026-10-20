@@ -99,13 +99,28 @@ func storedEventHandler(t *testing.T, uid, raw string) (*Handler, *store.Store, 
 		"1:" + uid: {ID: 1, CalendarID: 1, UID: uid, ResourceName: uid + ".ics", RawICAL: validated.Body, ETag: "e"},
 	}}}
 	s := &store.Store{Calendars: calRepo, Events: eventRepo}
-	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances), s, eventRepo, &store.User{ID: 100}
+	return NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances), s, eventRepo, &store.User{ID: 100, PrimaryEmail: "owner@example.com"}
+}
+
+// storedETag is the ETag of the event uid of calendar 1 as stored now, which
+// a page loaded now builds its forms from.
+func storedETag(t *testing.T, events store.EventRepository, uid string) string {
+	t.Helper()
+	event, err := events.GetByUID(t.Context(), 1, uid)
+	if err != nil || event == nil {
+		t.Fatalf("event %q is not stored: %v, %v", uid, event, err)
+	}
+	return event.ETag
 }
 
 // updateEvent submits form as an edit of uid in calendar 1, which must be
-// stored, and returns the stored object.
+// stored, and returns the stored object. The edit is of the version stored
+// now, as one from a page loaded after any earlier edit is.
 func updateEvent(t *testing.T, handler *Handler, events *fakeEventRepoWithUpsert, user *store.User, uid, zone string, form url.Values) string {
 	t.Helper()
+	if form.Get("etag") == "" {
+		form.Set("etag", storedETag(t, events, uid))
+	}
 	w := httptest.NewRecorder()
 	handler.UpdateEvent(w, eventFormRequest(t, "/calendars/1/events/"+uid, uid, user, zone, form))
 	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_updated") {
@@ -427,7 +442,7 @@ func TestOccurrenceEditKeepsTheOverridesUneditedData(t *testing.T) {
 	raw := updateEvent(t, handler, events, user, "fielded", "America/New_York", form)
 	override := storedOverride(t, raw, "RECURRENCE-ID;TZID=America/New_York:20260622T100000")
 	for _, want := range []string{
-		"SUMMARY:Planning (late afternoon)", "SEQUENCE:1", "X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE",
+		"SUMMARY:Planning (late afternoon)", "SEQUENCE:2", "X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE",
 		"CATEGORIES:Work", "CATEGORIES:Moved", "ATTENDEE;PARTSTAT=DECLINED;CN=Ann:mailto:ann@example.com",
 	} {
 		if !slices.Contains(override, want) {

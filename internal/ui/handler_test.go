@@ -540,7 +540,7 @@ func TestDeleteEventHandler(t *testing.T) {
 	eventRepo := &fakeEventRepoWithDelete{
 		fakeEventRepo: fakeEventRepo{
 			events: map[string]*store.Event{
-				"1:event-1": {ID: 1, CalendarID: 1, UID: "event-1"},
+				"1:event-1": {ID: 1, CalendarID: 1, UID: "event-1", ETag: "tag"},
 			},
 		},
 	}
@@ -556,7 +556,7 @@ func TestDeleteEventHandler(t *testing.T) {
 
 	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
-	req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1?etag=tag", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "1")
 	rctx.URLParams.Add("uid", "event-1")
@@ -880,6 +880,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			"edit_scope":         {"occurrence"},
 			"recurrence_id":      {"2024-01-02T10:00"},
 			"recurrence_all_day": {"false"},
+			"etag":               {"etag-1"},
 		}
 		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event-1/delete", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -1684,8 +1685,9 @@ func TestImportCalendarHandler(t *testing.T) {
 		if w.Code != http.StatusFound {
 			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusFound)
 		}
-		if location := w.Header().Get("Location"); !strings.Contains(location, "error=invalid+ICS+file") {
-			t.Fatalf("expected invalid ICS redirect, got %s", location)
+		// The parser's own reason goes to the log, not to the page.
+		if got, want := flashedError(t, w), "The file is not a valid iCalendar file with at least one event."; got != want {
+			t.Fatalf("flashed error = %q, want %q", got, want)
 		}
 		if len(eventRepo.events) != 0 {
 			t.Fatalf("expected no stored events, got %d", len(eventRepo.events))
@@ -5463,6 +5465,7 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 				"dtstart":    {"2024-01-02T10:00"},
 				"dtend":      {"2024-01-02T11:00"},
 				"edit_scope": {"series"},
+				"etag":       {"original-etag"},
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
@@ -5527,6 +5530,7 @@ func TestUpdateEventMovesSeriesToSelectedCalendar(t *testing.T) {
 		"recurrence_end_type":     {"never"},
 		"destination_calendar_id": {"2"},
 		"return_to":               {"/calendars/all?view=week&date=2026-07-24"},
+		"etag":                    {"old"},
 	}
 	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5564,7 +5568,7 @@ func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
 	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	eventRepo := &fakeEventRepoWithUpsert{
 		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
-			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
 		}},
 	}
 	handler := NewHandler(&config.Config{}, &store.Store{
@@ -5589,6 +5593,7 @@ func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
 		"dtstart":                 {"2026-07-24T10:00"},
 		"dtend":                   {"2026-07-24T10:30"},
 		"destination_calendar_id": {"2"},
+		"etag":                    {"tag"},
 	}
 	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5638,7 +5643,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 	t.Run("a move into a VTODO-only calendar is refused", func(t *testing.T) {
 		eventRepo := &fakeEventRepoWithUpsert{
 			fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
-				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
 			}},
 		}
 		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
@@ -5648,6 +5653,7 @@ func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
 			"dtstart":                 {"2026-07-24T10:00"},
 			"dtend":                   {"2026-07-24T10:30"},
 			"destination_calendar_id": {"2"},
+			"etag":                    {"tag"},
 		}
 		req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5753,7 +5759,7 @@ func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {
 	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	eventRepo := &fakeEventRepoWithUpsert{
 		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
-			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
 			"2:event-1": {CalendarID: 2, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
 		}},
 	}
@@ -5771,6 +5777,7 @@ func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {
 		"dtend":                   {"2026-07-24T10:30"},
 		"destination_calendar_id": {"2"},
 		"return_to":               {"/calendars/all?view=month&date=2026-07-24"},
+		"etag":                    {"tag"},
 	}
 	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5823,6 +5830,7 @@ func TestUpdateAllDayEventAllowsSameStartAndEndDate(t *testing.T) {
 		"dtend":      {"2026-07-25"},
 		"all_day":    {"on"},
 		"edit_scope": {"series"},
+		"etag":       {"original-etag"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -5880,6 +5888,7 @@ func TestUpdateEventRequiresDates(t *testing.T) {
 		"summary":    {"Updated Summary"},
 		"dtstart":    {"2024-01-02T10:00"},
 		"edit_scope": {"series"},
+		"etag":       {"original-etag"},
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
@@ -5982,7 +5991,7 @@ func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
 			raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=America/New_York:20250724T090000\r\nDTEND;TZID=America/New_York:20250724T100000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 			repo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{"1:event": {ID: 1, CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: raw, ETag: "original"}}}}
 			h := NewHandler(&config.Config{}, &store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100}}}, Events: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
-			form := url.Values{"summary": {"Changed"}, "dtstart": {"2025-07-25T09:00"}, "dtend": {"2025-07-25T10:00"}, "timezone": {"America/Los_Angeles"}, "edit_scope": {"occurrence"}, "recurrence_id": {"2025-07-25T09:00"}, "recurrence_timezone": {"America/New_York"}}
+			form := url.Values{"summary": {"Changed"}, "dtstart": {"2025-07-25T09:00"}, "dtend": {"2025-07-25T10:00"}, "timezone": {"America/Los_Angeles"}, "edit_scope": {"occurrence"}, "recurrence_id": {"2025-07-25T09:00"}, "recurrence_timezone": {"America/New_York"}, "etag": {"original"}}
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event", strings.NewReader(form.Encode()))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			rctx := chi.NewRouteContext()
@@ -6509,7 +6518,7 @@ func TestUpdateEventRefusesDataTheCalDAVValidatorRefuses(t *testing.T) {
 
 	form := url.Values{
 		"summary": {"Renamed"}, "dtstart": {"2026-01-05T09:00"}, "dtend": {"2026-01-05T10:00"}, "edit_scope": {"series"},
-		"recurrence": {"WEEKLY"}, "recurrence_end_type": {"after"}, "recurrence_count": {"4"},
+		"recurrence": {"WEEKLY"}, "recurrence_end_type": {"after"}, "recurrence_count": {"4"}, "etag": {"e"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/series", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -6540,12 +6549,15 @@ const seriesWithBackwardsOverride = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEV
 func deleteOccurrenceRequest(t *testing.T, uid string, form url.Values) *http.Request {
 	t.Helper()
 	form.Set("edit_scope", "occurrence")
+	if _, named := form["etag"]; !named {
+		form.Set("etag", seededEventETag)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/"+uid+"/delete", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "1")
 	rctx.URLParams.Add("uid", uid)
-	return req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100}), chi.RouteCtxKey, rctx))
+	return req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}), chi.RouteCtxKey, rctx))
 }
 
 // zonedSeries is a weekly series at 09:00 in New York as the validator stores
@@ -6911,7 +6923,9 @@ func TestImportCalendarCountsWhatItLeavesOut(t *testing.T) {
 	if len(eventRepo.events) != 1 || eventRepo.events["1:kept"] == nil {
 		t.Errorf("stored %v, want only the valid event", eventRepo.events)
 	}
-	if eventRepo.lookups != 1 {
-		t.Errorf("ImportCalendar() looked up %d events, want only the one it stores", eventRepo.lookups)
+	// The one event it stores is looked up to decide the write, and again by the
+	// write the repository fallback makes; the events it leaves out cost none.
+	if eventRepo.lookups != 2 {
+		t.Errorf("ImportCalendar() looked up %d events, want only the one it stores, twice", eventRepo.lookups)
 	}
 }

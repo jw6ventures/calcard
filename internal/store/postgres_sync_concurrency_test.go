@@ -565,9 +565,13 @@ func TestPostgres_RepositoryWritesHoldTheCollectionBeforeStamping(t *testing.T) 
 		{
 			name: "event move to another calendar",
 			write: func(f fixture) error {
-				return f.s.UpdateAndMoveEventAndState(context.Background(), f.sourceCalendarID,
+				source, err := f.s.Events.GetByUID(context.Background(), f.sourceCalendarID, "moved")
+				if err != nil || source == nil {
+					return fmt.Errorf("read the event to move: %v, %v", source, err)
+				}
+				return f.s.UpdateAndMoveEventAndState(context.Background(), f.sourceCalendarID, EventDAVResourceState(source),
 					Event{CalendarID: f.calendarID, UID: "moved", ResourceName: "moved", RawICAL: postgresCalendarObject("moved", "Moved"), ETag: "etag-moved"},
-					fmt.Sprintf("/dav/calendars/%d/moved", f.sourceCalendarID), fmt.Sprintf("/dav/calendars/%d/moved", f.calendarID))
+					fmt.Sprintf("/dav/calendars/%d/moved", f.sourceCalendarID), fmt.Sprintf("/dav/calendars/%d/moved", f.calendarID), nil)
 			},
 			lock:     calendarLock,
 			davWrite: calendarDAVWrite,

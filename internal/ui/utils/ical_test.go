@@ -591,6 +591,72 @@ func TestEventZoneWallClockIsTheWallClockInstantReads(t *testing.T) {
 	}
 }
 
+// With no zone named, an edit reads and writes the times of a series that
+// starts at a floating time as floating ones, and any other object's as UTC.
+func TestEventZoneInNoNameFollowsAFloatingSeries(t *testing.T) {
+	object := func(master string, rest ...string) []string {
+		lines := []string{"BEGIN:VCALENDAR", "BEGIN:VTIMEZONE", "TZID:Zone", "BEGIN:STANDARD", "DTSTART:19700101T000000",
+			"TZOFFSETFROM:+0000", "TZOFFSETTO:+0000", "END:STANDARD", "END:VTIMEZONE"}
+		lines = append(lines, rest...)
+		lines = append(lines, "BEGIN:VEVENT", "UID:u")
+		if master != "" {
+			lines = append(lines, master)
+		}
+		return append(lines, "BEGIN:VALARM", "DTSTART:20260101T000000Z", "END:VALARM", "END:VEVENT", "END:VCALENDAR")
+	}
+	override := []string{"BEGIN:VEVENT", "UID:u", "RECURRENCE-ID:20260106T090000Z", "DTSTART:20260106T090000Z", "END:VEVENT"}
+	tests := []struct {
+		name     string
+		object   []string
+		floating bool
+	}{
+		{"no object", nil, false},
+		{"floating start", object("DTSTART:20260105T090000"), true},
+		{"floating start with a value type", object("DTSTART;VALUE=DATE-TIME:20260105T090000"), true},
+		{"UTC start", object("DTSTART:20260105T090000Z"), false},
+		{"zoned start", object("DTSTART;TZID=Zone:20260105T090000"), false},
+		{"date start", object("DTSTART;VALUE=DATE:20260105"), false},
+		{"bare date start", object("DTSTART:20260105"), false},
+		{"no start", object(""), false},
+		{"floating start after a UTC override", append(slices.Clone(override), object("DTSTART:20260105T090000")...), true},
+		{"UTC start after a floating override", append([]string{"BEGIN:VEVENT", "RECURRENCE-ID:20260106T090000", "DTSTART:20260106T090000", "END:VEVENT"}, object("DTSTART:20260105T090000Z")...), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			zone, known := ResolveEventZone("", tt.object)
+			if !known || zone.floating != tt.floating {
+				t.Errorf("ResolveEventZone(\"\") = floating %v known %v, want floating %v", zone.floating, known, tt.floating)
+			}
+			line, err := FormatICalDateTimeIn("2026-01-07T09:00", false, false, "EXDATE", zone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "EXDATE:20260107T090000Z"
+			if tt.floating {
+				want = "EXDATE:20260107T090000"
+			}
+			if line != want {
+				t.Errorf("FormatICalDateTimeIn() = %q, want %q", line, want)
+			}
+			if !tt.floating {
+				return
+			}
+			if instant := zone.Instant(time.Date(2026, 1, 7, 9, 0, 0, 0, time.UTC)); instant.Hour() != 9 {
+				t.Errorf("Instant() = %s, want the wall clock read as UTC", instant)
+			}
+			until, _ := recurrenceUntil("2026-01-09", false, zone)
+			if until != "20260109T235959" {
+				t.Errorf("recurrenceUntil() = %q, want a floating UNTIL", until)
+			}
+		})
+	}
+
+	named := EventZoneIn("UTC", object("DTSTART:20260105T090000"))
+	if line, _ := FormatICalDateTimeIn("2026-01-07T09:00", false, false, "DTSTART", named); line != "DTSTART:20260107T090000Z" {
+		t.Errorf("UTC named for a floating series is written %q, want UTC", line)
+	}
+}
+
 func TestBuildEvent_WithOptions(t *testing.T) {
 	opts := &EventOptions{
 		Timezone:     "America/New_York",
@@ -1438,6 +1504,30 @@ func TestParseICSFileDefinesAZoneOnceForAUIDSpanningCalendars(t *testing.T) {
 	}
 	if n := strings.Count(events[0], "BEGIN:VTIMEZONE\r\n"); n != 1 || !strings.Contains(events[0], "TZOFFSETTO:-0500\r\n") {
 		t.Errorf("payload defines the zone %d times, want once as the master's calendar does:\n%s", n, events[0])
+	}
+}
+
+// A zone the first component naming it has no definition of is defined as the
+// calendar of a later component defines it, rather than left undefined.
+func TestParseICSFileCarriesAZoneDefinedOnlyByALaterCalendar(t *testing.T) {
+	zone := "BEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\n" +
+		"TZOFFSETFROM:-0500\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+	ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//A//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;TZID=Customized Time Zone:20260105T090000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n" +
+		"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//B//EN\r\n" + zone +
+		"BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260101T000000Z\r\nRECURRENCE-ID;TZID=Customized Time Zone:20260106T090000\r\nDTSTART;TZID=Customized Time Zone:20260106T110000\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	events, _, err := ParseICSFile(ics)
+	if err != nil {
+		t.Fatalf("ParseICSFile() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("ParseICSFile() returned %d payloads, want 1", len(events))
+	}
+	if n := strings.Count(events[0], "BEGIN:VTIMEZONE\r\n"); n != 1 || !strings.Contains(events[0], "TZID:Customized Time Zone\r\n") {
+		t.Errorf("payload defines the zone %d times, want once from the later calendar:\n%s", n, events[0])
 	}
 }
 

@@ -57,6 +57,9 @@ data:
   {{- if hasKey . "digestEnabled" }}
   APP_DAV_DIGEST_ENABLED: {{ .digestEnabled | quote }}
   {{- end }}
+  {{- if hasKey . "insecureBasicEnabled" }}
+  APP_DAV_INSECURE_BASIC_ENABLED: {{ .insecureBasicEnabled | quote }}
+  {{- end }}
   {{- if hasKey . "maxMultistatusResponses" }}
   APP_DAV_MAX_MULTISTATUS_RESPONSES: {{ include "calcard.integer" (list "app.dav.maxMultistatusResponses" .maxMultistatusResponses 0) | quote }}
   {{- end }}

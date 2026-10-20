@@ -775,6 +775,158 @@ func TestRequireDAVAuthDoesNotOfferOrAcceptBasicOnCleartextTransport(t *testing.
 	}
 }
 
+// With APP_DAV_INSECURE_BASIC_ENABLED an operator accepts Basic over plain
+// HTTP: Basic is honoured and challenged for on every transport, beside Digest
+// where that is on. A request whose HTTPS claim is not believed is plain HTTP,
+// so the opt-out covers it too; with the setting off the same request is
+// refused and gets no Basic challenge.
+func TestRequireDAVAuthInsecureBasicOptIn(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+
+	type transport struct {
+		name   string
+		secure bool
+		build  func() *http.Request
+	}
+	transports := []transport{
+		{name: "plain HTTP", build: func() *http.Request {
+			return httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+		}},
+		{name: "TLS", secure: true, build: func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "https://calcard.example/dav/", nil)
+			req.TLS = &tls.ConnectionState{}
+			return req
+		}},
+		{name: "trusted proxy forwarding HTTPS", secure: true, build: func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			return req.WithContext(clientip.WithPeerAddr(req.Context(), "10.1.2.3:4567"))
+		}},
+		{name: "untrusted peer claiming HTTPS", build: func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			return req.WithContext(clientip.WithPeerAddr(req.Context(), "203.0.113.9:4567"))
+		}},
+		{name: "trusted proxy forwarding HTTP", build: func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+			req.Header.Set("X-Forwarded-Proto", "http")
+			return req.WithContext(clientip.WithPeerAddr(req.Context(), "10.1.2.3:4567"))
+		}},
+	}
+
+	for _, insecureBasic := range []bool{false, true} {
+		for _, digest := range []bool{false, true} {
+			for _, tr := range transports {
+				name := fmt.Sprintf("insecureBasic=%v/digest=%v/%s", insecureBasic, digest, tr.name)
+				t.Run(name, func(t *testing.T) {
+					cfg := testAuthConfig("https://calcard.example")
+					cfg.TrustedProxies = []string{"10.0.0.0/8"}
+					cfg.DAV.DigestEnabled = digest
+					cfg.DAV.InsecureBasicEnabled = insecureBasic
+					service := &Service{
+						cfg: cfg,
+						store: digestTestStore(&digestNonceRepoMock{}, func(context.Context, int64) ([]store.AppPassword, error) {
+							return []store.AppPassword{{ID: 3, TokenHash: string(hash)}}, nil
+						}),
+					}
+					handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						w.WriteHeader(http.StatusNoContent)
+					}))
+					basicAllowed := tr.secure || insecureBasic
+
+					wantChallenges := 0
+					if digest {
+						wantChallenges += 2
+					}
+					if basicAllowed {
+						wantChallenges++
+					}
+					assertChallenges := func(t *testing.T, rec *httptest.ResponseRecorder) {
+						t.Helper()
+						if rec.Code != http.StatusUnauthorized {
+							t.Fatalf("status = %d, want 401", rec.Code)
+						}
+						challenges := rec.Header().Values("WWW-Authenticate")
+						if len(challenges) != wantChallenges {
+							t.Fatalf("challenges = %#v, want %d", challenges, wantChallenges)
+						}
+						offersBasic := false
+						for _, challenge := range challenges {
+							if challenge == `Basic realm="CalCard DAV"` {
+								offersBasic = true
+							}
+						}
+						if offersBasic != basicAllowed {
+							t.Fatalf("Basic offered = %v, want %v: %#v", offersBasic, basicAllowed, challenges)
+						}
+					}
+
+					unauthenticated := httptest.NewRecorder()
+					handler.ServeHTTP(unauthenticated, tr.build())
+					assertChallenges(t, unauthenticated)
+
+					wrong := tr.build()
+					wrong.SetBasicAuth(username, "not-the-password")
+					wrongRec := httptest.NewRecorder()
+					handler.ServeHTTP(wrongRec, wrong)
+					assertChallenges(t, wrongRec)
+
+					valid := tr.build()
+					valid.SetBasicAuth(username, password)
+					validRec := httptest.NewRecorder()
+					handler.ServeHTTP(validRec, valid)
+					if basicAllowed {
+						if validRec.Code != http.StatusNoContent {
+							t.Fatalf("Basic status = %d, want 204: %s", validRec.Code, validRec.Body.String())
+						}
+						return
+					}
+					assertChallenges(t, validRec)
+				})
+			}
+		}
+	}
+}
+
+// A Basic request over plain HTTP that the opt-out admits is the one moment
+// the server holds the password, so it must catch a Basic-only app password up
+// to Digest exactly as an HTTPS one does.
+func TestInsecureBasicBackfillsDigestCredentials(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	cfg := testDigestAuthConfig("http://calcard.example")
+	cfg.DAV.InsecureBasicEnabled = true
+	row := &digestCredentialRow{t: t, token: store.AppPassword{ID: 3, TokenHash: string(hash)}}
+	service := &Service{cfg: cfg, store: row.backingStore()}
+	handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://calcard.example/dav/", nil)
+	req.SetBasicAuth(username, password)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if !DigestReady(cfg, row.token) {
+		t.Fatal("Basic over plain HTTP did not give the app password its Digest credentials")
+	}
+}
+
 // A deployment naming its trusted proxies believes X-Forwarded-Proto only from
 // those peers. The check reads r.RemoteAddr, so it holds only while the
 // forwarded-address middleware leaves that field alone for an untrusted peer --
@@ -1910,7 +2062,7 @@ func TestUnreadableDigestCredentialReportNamesTheCause(t *testing.T) {
 		{
 			name: "secret rotated",
 			err:  errors.New("cipher: message authentication failed"),
-			want: []string{"rotated", "HTTPS", "reissued"},
+			want: []string{"rotated", "HTTPS", "reissued", "APP_DAV_INSECURE_BASIC_ENABLED"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

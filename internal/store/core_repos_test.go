@@ -43,6 +43,15 @@ func expectDAVPathLocks(mock sqlmock.Sqlmock, want map[string]bool) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
+// expectSourceEventRow expects the locked read of the event the transaction
+// is to write, as it was stored.
+func expectSourceEventRow(mock sqlmock.Sqlmock, calendarID int64, uid, resourceName, raw, etag string) {
+	columns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+	mock.ExpectQuery(`SELECT .* FROM events WHERE calendar_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(calendarID, resourceName).
+		WillReturnRows(sqlmock.NewRows(columns).AddRow(int64(10), calendarID, uid, resourceName, raw, etag, nil, nil, nil, nil, nil, false, time.Now()))
+}
+
 // expectCollectionRowLock asserts the row lock a member write takes on its
 // collection before writing any member.
 func expectCollectionRowLock(mock sqlmock.Sqlmock, table string, id int64) {
@@ -2088,6 +2097,7 @@ func TestStoreUpdateAndMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
 	expectIdentityLocks(mock, "calendar-object:2:name:custom.ics", "calendar-object:2:uid:event", "calendar-object:3:name:custom.ics", "calendar-object:3:uid:event")
 	expectCollectionRowLock(mock, "calendars", 2)
 	expectCollectionRowLock(mock, "calendars", 3)
+	expectSourceEventRow(mock, 2, "event", "custom.ics", "old-raw", "old-etag")
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET
 calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
 summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
@@ -2110,9 +2120,11 @@ WHERE calendar_id=$13 AND uid=$14`)).
 	err = st.UpdateAndMoveEventAndState(
 		context.Background(),
 		2,
+		DAVResourceState{Exists: true, UID: "event", ResourceName: "custom.ics", ETag: "old-etag", RawData: "old-raw"},
 		event,
 		"/dav/calendars/2/custom.ics",
 		"/dav/calendars/3/custom.ics",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("UpdateAndMoveEventAndState() error = %v", err)
@@ -2151,6 +2163,7 @@ func TestStoreUpdateAndMoveEventAndStateRollsBackOnDAVStateFailure(t *testing.T)
 	expectIdentityLocks(mock, "calendar-object:2:name:event", "calendar-object:2:uid:event", "calendar-object:3:name:event", "calendar-object:3:uid:event")
 	expectCollectionRowLock(mock, "calendars", 2)
 	expectCollectionRowLock(mock, "calendars", 3)
+	expectSourceEventRow(mock, 2, "event", "event", "old-raw", "old-etag")
 	mock.ExpectExec(`UPDATE events SET`).
 		WithArgs(int64(3), "event", event.RawICAL, "new-etag", nil, nil, nil, nil, nil, false, nil, nil, int64(2), "event").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -2166,9 +2179,11 @@ func TestStoreUpdateAndMoveEventAndStateRollsBackOnDAVStateFailure(t *testing.T)
 	err = st.UpdateAndMoveEventAndState(
 		context.Background(),
 		2,
+		DAVResourceState{Exists: true, UID: "event", ResourceName: "event", ETag: "old-etag", RawData: "old-raw"},
 		event,
 		"/dav/calendars/2/event",
 		"/dav/calendars/3/event",
+		nil,
 	)
 	if err == nil {
 		t.Fatal("UpdateAndMoveEventAndState() error = nil, want rollback error")

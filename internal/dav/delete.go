@@ -185,12 +185,12 @@ func (h *DavServer) deleteWithRetry(w http.ResponseWriter, r *http.Request, retr
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		if !h.checkConditionalHeaders(r, existing) {
-			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
-			return
-		}
 		lockPaths := []string{cleanPath, path.Dir(cleanPath)}
 		if !h.requireLocks(w, r, "resource is locked", lockPaths...) {
+			return
+		}
+		if !h.checkConditionalHeaders(r, existing) {
+			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
 			return
 		}
 		canonicalPath, err := h.canonicalDAVPath(r.Context(), user, cleanPath)

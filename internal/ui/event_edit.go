@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,6 +45,13 @@ func serverZoneDefinition(timezone ical.TimezoneComponent) bool {
 	return known
 }
 
+// floatingTime reports whether a DTSTART or RECURRENCE-ID with these
+// parameters and this value is a floating DATE-TIME: neither a DATE, nor
+// zoned, nor UTC (RFC 5545 §3.3.5).
+func floatingTime(params map[string]string, value string, allDay bool) bool {
+	return !allDay && strings.TrimSpace(params["TZID"]) == "" && len(strings.TrimSpace(value)) == len("20060102T150405")
+}
+
 // editorWrittenProperties are the properties an edit writes from the editor's
 // fields, and those what it writes supersedes: DURATION, by the DTEND it
 // writes. An attachment the editor cannot show is not written by it; see
@@ -71,9 +80,10 @@ func binaryAttachment(keyPart string) bool {
 
 // withUneditedProperties returns edited, the master VEVENT a series edit built
 // from the editor's fields, merged with previous, the master it replaces, as
-// mergeEdit merges them; both are the content lines between BEGIN:VEVENT and
-// END:VEVENT. object is the unfolded calendar object the edit is stored as,
-// whose zones the series' times are read in, and recurrence the repeat
+// mergeEdit merges them, its SEQUENCE incremented when the edit revises the
+// series' schedule (see incrementSequence); both are the content lines between
+// BEGIN:VEVENT and END:VEVENT. object is the unfolded calendar object the edit
+// is stored as, whose zones the series' times are read in, and recurrence the repeat
 // fields the editor submitted, whose RRULE keeps what keptRule keeps of
 // previous'.
 //
@@ -93,7 +103,7 @@ func withUneditedProperties(edited, previous, object []string, form *utils.Event
 			edited[i] = keptRule(rule, firstPropertyLine(previousProperties, "RRULE"), recurrence, shown, moved)
 		}
 	}
-	return mergeEdit(edited, previous, form, func(name, line string) (string, bool) {
+	merged := mergeEdit(edited, previous, form, func(name, line string) (string, bool) {
 		switch name {
 		case "EXDATE", "RDATE", "EXRULE":
 			if endsSeries {
@@ -105,18 +115,28 @@ func withUneditedProperties(edited, previous, object []string, form *utils.Event
 		}
 		return line, true
 	})
+	if scheduleRevised(previousProperties, merged, ical.NewObjectTimes(object, nil, nil)) && mayRevise(previousProperties, nil, form.EditorAddresses) {
+		return incrementSequence(merged)
+	}
+	return merged
 }
 
 // withUneditedOverrideProperties returns edited, the override an occurrence
-// edit built from the editor's fields, merged with previous as mergeEdit
-// merges them. previous is the override the edit replaces, or, for an
-// occurrence edited for the first time, the series' master, whose data the
-// instance had: a client copies the master into a new override the same way.
-// What makes a master a series is not an override's, and is left out. An
-// override of this and every later instance stays one: the RANGE of previous'
-// RECURRENCE-ID is kept.
-func withUneditedOverrideProperties(edited, previous []string, form *utils.EventOptions) []string {
-	if previousID := firstPropertyLine(previous, "RECURRENCE-ID"); previousID != "" {
+// edit built from the editor's fields, merged with source.previous as
+// mergeEdit merges them. source.previous is the override the edit replaces;
+// else the override of this and every later instance that governs the instance
+// the edit is of, which gave the instance its data; else, for an occurrence
+// edited for the first time, the series' master, whose data the instance had: a
+// client copies the master into a new override the same way. What makes a
+// master a series is not an override's, and is left out. An override of this
+// and every later instance stays one: the RANGE of the RECURRENCE-ID it
+// replaces is kept. The override's SEQUENCE, which starts as previous' and is
+// never below the series' when previous is another instance's override, is
+// incremented when the edit moves the occurrence or changes its length and the
+// editor may revise it (see incrementSequence).
+func withUneditedOverrideProperties(edited []string, source overrideSource, form *utils.EventOptions) []string {
+	replaces := source.replacesPrevious(edited)
+	if previousID := firstPropertyLine(source.previous, "RECURRENCE-ID"); previousID != "" && replaces {
 		keyPart, _, _ := ical.SplitContentLine(previousID)
 		if r, ok := ical.PropertyParam(keyPart, "RANGE"); ok {
 			edited = slices.Clone(edited)
@@ -128,13 +148,220 @@ func withUneditedOverrideProperties(edited, previous []string, form *utils.Event
 			}
 		}
 	}
-	return mergeEdit(edited, previous, form, func(name, line string) (string, bool) {
+	merged := mergeEdit(edited, source.previous, form, func(name, line string) (string, bool) {
 		switch name {
 		case "EXDATE", "RDATE", "EXRULE":
 			return "", false
 		}
 		return line, true
 	})
+	if !replaces && firstPropertyLine(source.previous, "RECURRENCE-ID") != "" {
+		merged = atLeastSequence(merged, sequenceOf(source.master))
+	}
+	if overrideRevised(source, merged, ical.NewObjectTimes(form.Object, nil, nil)) && mayRevise(source.previous, source.master, form.EditorAddresses) {
+		return incrementSequence(merged)
+	}
+	return merged
+}
+
+// mayRevise reports whether the user editing, whose addresses editor holds, may
+// increment the SEQUENCE of a component with the properties previous, or, when
+// it names no organizer, master's: only the organizer's calendar user may (RFC
+// 5545 §3.8.7.4), and a component with no organizer has no one else.
+func mayRevise(previous, master, editor []string) bool {
+	previousProperties, _ := splitComponentBody(previous)
+	masterProperties, _ := splitComponentBody(master)
+	organizer := firstPropertyLine(previousProperties, "ORGANIZER")
+	if organizer == "" {
+		organizer = firstPropertyLine(masterProperties, "ORGANIZER")
+	}
+	if organizer == "" {
+		return true
+	}
+	address := normalizedAddress(propertyValue(organizer))
+	return address != "" && slices.ContainsFunc(editor, func(own string) bool { return normalizedAddress(own) == address })
+}
+
+// schedule is when an instance of an event starts and ends, as the changes that
+// make an organizer increment its SEQUENCE are read (RFC 5545 §3.8.7.4).
+type schedule struct {
+	// date is true for an instance of whole days, floating for one in no zone.
+	date, floating bool
+	start, end     time.Time
+}
+
+// differs reports whether s and other are not the same time span, in the same
+// kind of time: a span in another zone that names the same instants is the same
+// one, and a floating span is not the span of the same instants in UTC.
+func (s schedule) differs(other schedule) bool {
+	return s.date != other.date || s.floating != other.floating || !s.start.Equal(other.start) || !s.end.Equal(other.end)
+}
+
+// readSchedule reads the schedule of a component with these content lines: its
+// DTSTART, and its end, which a DTEND or a DURATION gives, and which an instance
+// with neither has at its start, or at the end of its day if it is a date (RFC
+// 5545 §3.6.1). times resolves the times of the object holding it.
+func readSchedule(lines []string, times *ical.ObjectTimes) (schedule, bool) {
+	properties, _ := splitComponentBody(lines)
+	read := func(name string) (schedule, time.Time, bool) {
+		start, ok := readSeriesTime(properties, name)
+		if !ok {
+			return schedule{}, time.Time{}, false
+		}
+		instant := start.wall
+		if !start.date {
+			keyPart, value, _ := ical.SplitContentLine(firstPropertyLine(properties, name))
+			if instant, ok = times.ResolvePropertyTime(keyPart, value); !ok {
+				return schedule{}, time.Time{}, false
+			}
+		}
+		return schedule{date: start.date, floating: !start.date && !start.utc && start.tzid == ""}, instant, true
+	}
+	span, start, ok := read("DTSTART")
+	if !ok {
+		return schedule{}, false
+	}
+	span.start, span.end = start, start
+	switch {
+	case firstPropertyLine(properties, "DTEND") != "":
+		if _, end, ok := read("DTEND"); ok {
+			span.end = end
+		}
+	case firstPropertyLine(properties, "DURATION") != "":
+		if length, ok := ical.ParseDuration(propertyValue(firstPropertyLine(properties, "DURATION"))); ok {
+			span.end = start.Add(length)
+		}
+	case span.date:
+		span.end = start.AddDate(0, 0, 1)
+	}
+	return span, true
+}
+
+// differentRules reports whether two components, given as content lines, have
+// repeat rules that do not state the same parts: one repeating and the other
+// not, or rules differing in a part, in the case of its name or value, or in an
+// INTERVAL of 1 that one states and the other leaves out.
+func differentRules(previous, edited []string) bool {
+	previousProperties, _ := splitComponentBody(previous)
+	editedProperties, _ := splitComponentBody(edited)
+	parts := func(properties []string) map[string]string {
+		_, value, _ := ical.SplitContentLine(firstPropertyLine(properties, "RRULE"))
+		rule := ical.RRuleParts(value)
+		for name, part := range rule {
+			rule[name] = strings.ToUpper(part)
+		}
+		if rule["INTERVAL"] == "1" {
+			delete(rule, "INTERVAL")
+		}
+		return rule
+	}
+	return !maps.Equal(parts(previousProperties), parts(editedProperties)) ||
+		(firstPropertyLine(previousProperties, "RRULE") == "") != (firstPropertyLine(editedProperties, "RRULE") == "")
+}
+
+// scheduleRevised reports whether an edit that made the master merged of the
+// master previous changed its start, its end or duration, or its repeat rule;
+// both are content lines. times resolves the object's times.
+func scheduleRevised(previous, merged []string, times *ical.ObjectTimes) bool {
+	before, beforeRead := readSchedule(previous, times)
+	after, afterRead := readSchedule(merged, times)
+	return beforeRead && afterRead && before.differs(after) || differentRules(previous, merged)
+}
+
+// overrideRevised reports whether an edit that made the override merged from
+// source moved its occurrence or changed its length. The instance started and
+// lasted as source.previous says when that is the override replaced; else as
+// source.instance says, when that is the schedule the instance of the override
+// governing it had; else as previous would place it at the new RECURRENCE-ID:
+// at the RECURRENCE-ID, for as long as the series' instances last, for the
+// master.
+func overrideRevised(source overrideSource, merged []string, times *ical.ObjectTimes) bool {
+	after, afterRead := readSchedule(merged, times)
+	before, beforeRead := readSchedule(source.previous, times)
+	if !afterRead || !beforeRead {
+		return false
+	}
+	previousID := firstPropertyLine(source.previous, "RECURRENCE-ID")
+	if previousID == "" || !source.replacesPrevious(merged) {
+		mergedProperties, _ := splitComponentBody(merged)
+		keyPart, value, ok := ical.SplitContentLine(firstPropertyLine(mergedProperties, "RECURRENCE-ID"))
+		if !ok {
+			return false
+		}
+		instance, ok := times.ResolvePropertyTime(keyPart, value)
+		if !ok {
+			return false
+		}
+		switch {
+		case source.instance != nil:
+			before = *source.instance
+		case previousID == "":
+			before.start, before.end = instance, instance.Add(before.end.Sub(before.start))
+		default:
+			previousKeyPart, previousValue, _ := ical.SplitContentLine(previousID)
+			anchor, ok := times.ResolvePropertyTime(previousKeyPart, previousValue)
+			if !ok {
+				return false
+			}
+			before.start, before.end = before.start.Add(instance.Sub(anchor)), before.end.Add(instance.Sub(anchor))
+		}
+	}
+	return before.differs(after)
+}
+
+// sequenceOf is the SEQUENCE of a component with these content lines: zero for
+// one with none, or with one that is not a non-negative integer (RFC 5545
+// §3.8.7.4).
+func sequenceOf(lines []string) int64 {
+	properties, _ := splitComponentBody(lines)
+	current, err := strconv.ParseInt(propertyValue(firstPropertyLine(properties, "SEQUENCE")), 10, 32)
+	if err != nil || current < 0 {
+		return 0
+	}
+	return current
+}
+
+// withSequence returns lines, the content lines of a component, with its
+// SEQUENCE n, replacing the first it states among its own properties or, when
+// it has none, added to them.
+func withSequence(lines []string, n int64) []string {
+	lines = slices.Clone(lines)
+	depth := 0
+	firstComponent := len(lines)
+	for i, line := range lines {
+		switch upper := strings.ToUpper(strings.TrimSpace(line)); {
+		case strings.HasPrefix(upper, "BEGIN:"):
+			if depth == 0 && firstComponent == len(lines) {
+				firstComponent = i
+			}
+			depth++
+		case strings.HasPrefix(upper, "END:"):
+			depth--
+		case depth == 0:
+			if keyPart, _, ok := ical.SplitContentLine(line); ok && strings.EqualFold(strings.TrimSpace(ical.PropertyName(keyPart)), "SEQUENCE") {
+				lines[i] = "SEQUENCE:" + strconv.FormatInt(n, 10)
+				return lines
+			}
+		}
+	}
+	return slices.Insert(lines, firstComponent, "SEQUENCE:"+strconv.FormatInt(n, 10))
+}
+
+// incrementSequence returns properties, the content lines of a component, with
+// its SEQUENCE one higher, or 1 when it has none: a missing or unreadable
+// SEQUENCE counts as zero (RFC 5545 §3.8.7.4). A SEQUENCE already at the
+// largest integer RFC 5545 §3.3.8 allows stays there.
+func incrementSequence(properties []string) []string {
+	return withSequence(properties, min(sequenceOf(properties)+1, math.MaxInt32))
+}
+
+// atLeastSequence returns lines with its SEQUENCE no lower than n; a component
+// with none that is asked for none keeps having none.
+func atLeastSequence(lines []string, n int64) []string {
+	if sequenceOf(lines) >= n {
+		return lines
+	}
+	return withSequence(lines, n)
 }
 
 // mergeEdit returns edited, a component an edit built from the editor's

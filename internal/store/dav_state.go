@@ -270,17 +270,35 @@ func (s *Store) CreateCalendarAndState(ctx context.Context, cal Calendar, dead [
 // whether or not the request carried any precondition, so they are acquired
 // even when there is nothing to validate.
 func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition, alsoSerialize ...string) error {
-	if len(preconditions) == 0 && len(alsoSerialize) == 0 {
-		return nil
-	}
-	serializationTargets := append(slices.Clone(alsoSerialize), lockPreconditionTargets(preconditions, alsoSerialize)...)
-	if err := acquireDAVPathLocks(ctx, tx, serializationTargets...); err != nil {
+	if err := serializeLockPreconditionsTx(ctx, tx, preconditions, alsoSerialize...); err != nil {
 		return err
 	}
 	if len(preconditions) == 0 {
 		return nil
 	}
+	locks, err := activeLocksForPreconditionsTx(ctx, tx, preconditions)
+	if err != nil {
+		return err
+	}
+	if !LockPreconditionsSatisfied(preconditions, locks) {
+		return ErrLockConflict
+	}
+	return nil
+}
 
+// serializeLockPreconditionsTx takes the path locks validateLockPreconditionsTx
+// documents, without reading any lock.
+func serializeLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition, alsoSerialize ...string) error {
+	if len(preconditions) == 0 && len(alsoSerialize) == 0 {
+		return nil
+	}
+	serializationTargets := append(slices.Clone(alsoSerialize), lockPreconditionTargets(preconditions, alsoSerialize)...)
+	return acquireDAVPathLocks(ctx, tx, serializationTargets...)
+}
+
+// activeLocksForPreconditionsTx reads the active locks on every path the
+// preconditions look up.
+func activeLocksForPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions []LockPrecondition) ([]Lock, error) {
 	lookupSet := make(map[string]struct{})
 	var lookupPaths []string
 	for _, precondition := range preconditions {
@@ -297,13 +315,13 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 		}
 	}
 	if len(lookupPaths) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	const query = `SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`
 	rows, err := tx.QueryContext(ctx, query, pq.Array(lookupPaths))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -311,17 +329,11 @@ func validateLockPreconditionsTx(ctx context.Context, tx *sql.Tx, preconditions 
 	for rows.Next() {
 		var lock Lock
 		if err := rows.Scan(&lock.Token, &lock.ResourcePath, &lock.Depth, &lock.ExpiresAt); err != nil {
-			return err
+			return nil, err
 		}
 		locks = append(locks, lock)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !LockPreconditionsSatisfied(preconditions, locks) {
-		return ErrLockConflict
-	}
-	return nil
+	return locks, rows.Err()
 }
 
 // lockPreconditionTargets returns the paths of the preconditions that are no
@@ -562,6 +574,18 @@ func validateTargetStateTx(ctx context.Context, tx *sql.Tx, kind string, collect
 		return ErrResourceStateChanged
 	}
 	return nil
+}
+
+// NewLockPrecondition is the condition a write to resourcePath meets when it
+// submits no lock token: an active lock on the path itself, at any depth, or a
+// depth-infinity lock on one of its ancestors, refuses it. resourcePath is the
+// canonical state path DAV stores locks under.
+func NewLockPrecondition(resourcePath string) LockPrecondition {
+	resourcePath = path.Clean(resourcePath)
+	return LockPrecondition{
+		ResourcePath: resourcePath,
+		LookupPaths:  append([]string{resourcePath}, lockAncestorPaths(resourcePath)...),
+	}
 }
 
 // LockPreconditionsSatisfied applies the write-lock conditions captured by the
@@ -914,13 +938,18 @@ func (s *Store) MoveEventAndState(ctx context.Context, fromCalendarID, toCalenda
 
 // UpdateAndMoveEventAndState updates an event while moving it to another
 // calendar, keeping the event row and DAV resource state in one transaction.
-func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID int64, event Event, fromStatePath, toStatePath string) error {
+// The move applies only to the source event as expected describes it, the
+// state the new content was built from, and only while the ACL entries
+// expected pins are unchanged; otherwise it is ErrResourceStateChanged and
+// nothing is written. It also meets lockPreconditions, checked under the move's
+// path locks, or it is ErrLockConflict: a lock on the paths they name is never
+// dropped with the state the move rebinds.
+func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID int64, expected DAVResourceState, event Event, fromStatePath, toStatePath string, lockPreconditions []LockPrecondition) error {
 	if s == nil || s.Events == nil {
 		return ErrNotFound
 	}
 	if event.CalendarID == fromCalendarID {
-		_, err := s.Events.Upsert(ctx, event)
-		return err
+		return errors.New("the event must be moved to another calendar")
 	}
 	if event.ResourceName == "" {
 		event.ResourceName = event.UID
@@ -935,6 +964,19 @@ func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID i
 	}
 
 	if s.pool == nil {
+		if err := validateLockPreconditionsFallback(ctx, s.Locks, lockPreconditions); err != nil {
+			return err
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, expected.ACL); err != nil {
+			return err
+		}
+		current, err := s.Events.GetByResourceName(ctx, fromCalendarID, expected.ResourceName)
+		if err != nil {
+			return err
+		}
+		if current == nil || !eventDAVStateMatches(expected, current) {
+			return ErrResourceStateChanged
+		}
 		sourceEvent := event
 		sourceEvent.CalendarID = fromCalendarID
 		if _, err := s.Events.Upsert(ctx, sourceEvent); err != nil {
@@ -958,8 +1000,34 @@ func (s *Store) UpdateAndMoveEventAndState(ctx context.Context, fromCalendarID i
 	}
 	defer tx.Rollback()
 
-	if err := lockEventMoveTx(ctx, tx, fromCalendarID, event.CalendarID, event.UID, event.ResourceName, event.ResourceName, fromStatePath, toStatePath); err != nil {
+	// The paths the preconditions name join the move's exclusive set in one
+	// ordered pass, so a precondition's ancestor held shared is never upgraded.
+	if len(lockPreconditions) != 0 {
+		if err := serializeLockPreconditionsTx(ctx, tx, lockPreconditions, eventMoveLockPaths(fromCalendarID, event.CalendarID, fromStatePath, toStatePath)...); err != nil {
+			return err
+		}
+	}
+	if err := lockEventMoveTx(ctx, tx, fromCalendarID, event.CalendarID, event.UID, expected.ResourceName, event.ResourceName, fromStatePath, toStatePath); err != nil {
 		return err
+	}
+	if len(lockPreconditions) != 0 {
+		locks, err := activeLocksForPreconditionsTx(ctx, tx, lockPreconditions)
+		if err != nil {
+			return err
+		}
+		if !LockPreconditionsSatisfied(lockPreconditions, locks) {
+			return ErrLockConflict
+		}
+	}
+	if err := validateACLGuardTx(ctx, tx, expected.ACL); err != nil {
+		return err
+	}
+	current, err := selectEventTx(ctx, tx, `resource_name`, fromCalendarID, expected.ResourceName)
+	if err != nil {
+		return err
+	}
+	if current == nil || !eventDAVStateMatches(expected, current) {
+		return ErrResourceStateChanged
 	}
 	const updateQuery = `UPDATE events SET
 calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
@@ -999,7 +1067,7 @@ WHERE calendar_id=$13 AND uid=$14`
 	}
 
 	const tombstoneQuery = `INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`
-	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromCalendarID, event.UID, event.ResourceName); err != nil {
+	if _, err := tx.ExecContext(ctx, tombstoneQuery, fromCalendarID, event.UID, expected.ResourceName); err != nil {
 		return err
 	}
 	const incrementSourceCTagQuery = `UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`
@@ -1015,6 +1083,18 @@ WHERE calendar_id=$13 AND uid=$14`
 	return tx.Commit()
 }
 
+// eventMoveLockPaths are the DAV paths a move of an event between calendars
+// holds exclusively: both collections and both resources' state paths.
+func eventMoveLockPaths(fromCalendarID, toCalendarID int64, fromStatePath, toStatePath string) []string {
+	lockPaths := []string{calendarCollectionLockPath(fromCalendarID), calendarCollectionLockPath(toCalendarID)}
+	for _, statePath := range []string{fromStatePath, toStatePath} {
+		if statePath != "" {
+			lockPaths = append(lockPaths, statePath)
+		}
+	}
+	return lockPaths
+}
+
 // lockEventMoveTx takes what a DAV MOVE of the same event takes, in the same
 // order: the DAV path locks of both resources and both collections, the object
 // identity locks, and the two collection rows by ascending id. A move skipping
@@ -1025,13 +1105,7 @@ WHERE calendar_id=$13 AND uid=$14`
 // caller has not resolved them yet; the UID keys still serialize the move
 // against every other write to the event.
 func lockEventMoveTx(ctx context.Context, tx *sql.Tx, fromCalendarID, toCalendarID int64, uid, sourceResourceName, destResourceName, fromStatePath, toStatePath string) error {
-	lockPaths := []string{calendarCollectionLockPath(fromCalendarID), calendarCollectionLockPath(toCalendarID)}
-	for _, statePath := range []string{fromStatePath, toStatePath} {
-		if statePath != "" {
-			lockPaths = append(lockPaths, statePath)
-		}
-	}
-	if err := acquireDAVPathLocks(ctx, tx, lockPaths...); err != nil {
+	if err := acquireDAVPathLocks(ctx, tx, eventMoveLockPaths(fromCalendarID, toCalendarID, fromStatePath, toStatePath)...); err != nil {
 		return err
 	}
 	keys := []string{

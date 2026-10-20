@@ -20,7 +20,7 @@ function extract(name) {
 }
 const aggregate = process.argv[2].includes('all_calendars');
 const prefix = aggregate ? 'event' : 'edit';
-const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'formatDateTimeForInput', 'browserTimeZone',
+const shared = ['parseICALDate', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'editorTimeZone', 'editorRecurrenceTimeZone', 'recurrenceIsFloating', 'editorRecurrenceFloating', 'editorClock', 'editorRecurrenceClock', 'isFloatingTime', 'formatDateTimeForInput', 'browserTimeZone',
     'showPartialRecurrence', 'refreshPartialRecurrence'];
 const names = shared.concat(aggregate
     ? ['formatLocalDate', 'formatDateInput', 'formatRecurrenceInput', 'setEditorDateValues', 'inclusiveAllDayEnd', 'startOfDay',
@@ -70,6 +70,11 @@ const stubs = `
     window.selectStoredValue = selectStoredValue;
     window.formatDateTimeForInput = formatDateTimeForInput;
     window.timeZoneClock = timeZoneClock;
+    window.editorTimeZone = editorTimeZone;
+    window.editorRecurrenceTimeZone = editorRecurrenceTimeZone;
+    window.editorRecurrenceFloating = editorRecurrenceFloating;
+    window.editorClock = editorClock;
+    window.editorRecurrenceClock = editorRecurrenceClock;
     window.browserTimeZone = browserTimeZone;
     window.showPartialRecurrence = showPartialRecurrence;
     window.refreshPartialRecurrence = refreshPartialRecurrence;

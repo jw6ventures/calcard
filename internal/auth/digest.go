@@ -224,7 +224,7 @@ func (s *Service) reportUnreadableDigestCredential(algorithm string, tokenID int
 			s.logger().Error("dav_digest", "stored %s credential for app password %d cannot be opened because APP_SESSION_SECRET is not configured; Digest cannot verify any app password until it is", algorithm, tokenID)
 			return
 		}
-		s.logger().Error("dav_digest", "stored %s credential for app password %d could not be opened, so Digest cannot verify it; APP_SESSION_SECRET was most likely rotated. An affected app password is re-sealed the next time it authenticates over Basic, which is only accepted over HTTPS; where DAV is served without HTTPS, affected app passwords must be revoked and reissued: %v", algorithm, tokenID, err)
+		s.logger().Error("dav_digest", "stored %s credential for app password %d could not be opened, so Digest cannot verify it; APP_SESSION_SECRET was most likely rotated. An affected app password is re-sealed the next time it authenticates over Basic, which is only accepted over HTTPS unless APP_DAV_INSECURE_BASIC_ENABLED is set; where DAV is served without HTTPS and that setting is off, affected app passwords must be revoked and reissued: %v", algorithm, tokenID, err)
 	})
 }
 
@@ -246,8 +246,10 @@ func (s *Service) writeDAVAuthChallenge(w http.ResponseWriter, r *http.Request, 
 	// with Digest turned off leaves no scheme this server will honour and the
 	// 401 carries no challenge. RFC 7235 Section 3.1 asks for one, but naming a
 	// scheme that would then be refused is the worse answer, and a deployment
-	// serving DAV over cleartext at all is already misconfigured.
-	if s.secureRequest(r) {
+	// serving DAV over cleartext at all is already misconfigured. An operator
+	// who has accepted that risk (APP_DAV_INSECURE_BASIC_ENABLED) gets the
+	// challenge on every transport.
+	if s.basicAllowed(r) {
 		w.Header().Add("WWW-Authenticate", `Basic realm="CalCard DAV"`)
 	}
 	return nil

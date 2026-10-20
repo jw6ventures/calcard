@@ -37,6 +37,7 @@
         "dav": {
           "type": "object",
           "properties": {
+            "insecureBasicEnabled": { "type": "boolean" },
             "maxMultistatusResponses": { "type": "integer", "minimum": 0 },
             "maxMultistatusBytes": { "type": "integer", "minimum": 0 },
             "maxFilterElements": { "type": "integer", "minimum": 0 },

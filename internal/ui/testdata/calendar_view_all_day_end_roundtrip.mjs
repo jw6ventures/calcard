@@ -26,7 +26,7 @@ function extract(name) {
 }
 
 const pure = ['startOfDay', 'addDays', 'inclusiveAllDayEnd', 'exclusiveAllDayEnd',
-              'formatDateForInput', 'listedOffsets', 'intlOffsets', 'timeZoneClock',
+              'formatDateForInput', 'listedOffsets', 'intlOffsets', 'timeZoneClock', 'editorTimeZone', 'editorRecurrenceTimeZone', 'recurrenceIsFloating', 'editorRecurrenceFloating', 'editorClock', 'editorRecurrenceClock', 'isFloatingTime',
               'formatDateTimeForInput', 'browserTimeZone',
               'parseServerDate', 'normalizeServerEvent']
   .map(extract).join('\n');
@@ -66,7 +66,7 @@ const mod = new Function(
   'document', 'window', 'alert', 'setReminderList',
   'toggleRecurrenceOptions', 'toggleRecurrenceEnd', 'setEditScope',
   src + '\nreturn {startOfDay, addDays, inclusiveAllDayEnd, exclusiveAllDayEnd,' +
-    ' formatDateForInput, timeZoneClock, formatDateTimeForInput, browserTimeZone,' +
+    ' formatDateForInput, timeZoneClock, editorTimeZone, editorRecurrenceTimeZone, editorRecurrenceFloating, editorClock, editorRecurrenceClock, formatDateTimeForInput, browserTimeZone,' +
     ' parseServerDate, normalizeServerEvent,' +
     ' showCreateEventModal, showEditEventModal, toggleAllDay};'
 )(document, window, noop, noop, noop, noop, noop);
@@ -78,6 +78,11 @@ window.inclusiveAllDayEnd = mod.inclusiveAllDayEnd;
 window.exclusiveAllDayEnd = mod.exclusiveAllDayEnd;
 window.formatDateTimeForInput = mod.formatDateTimeForInput;
 window.timeZoneClock = mod.timeZoneClock;
+window.editorTimeZone = mod.editorTimeZone;
+window.editorRecurrenceTimeZone = mod.editorRecurrenceTimeZone;
+window.editorRecurrenceFloating = mod.editorRecurrenceFloating;
+window.editorClock = mod.editorClock;
+window.editorRecurrenceClock = mod.editorRecurrenceClock;
 window.browserTimeZone = mod.browserTimeZone;
 // The status, visibility and availability selects play no part in the dates.
 window.selectStoredValue = (select, value) => { select.value = value || ''; };

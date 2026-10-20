@@ -29,6 +29,7 @@ vm.runInNewContext(
     extract('unescapeText'),
     extract('unfoldLines'),
     extract('parseICALDate'),
+    extract('isFloatingTime'),
     extract('parseTriggerMinutes'),
     extract('formatEmailValue'),
     extract('parseICAL'),
@@ -80,3 +81,14 @@ assert.deepEqual(local(floating.recurrenceId), [2025, 7, 26, 0, 0, 0], `DATE REC
 
 // A value that is not a date is an invalid Date, not a guess.
 assert.ok(Number.isNaN(context._parseICALDate('2025-07-24', {}).getTime()), 'an extended-format value was accepted');
+
+// Only a DATE-TIME with neither a Z nor a TZID is floating, for the series'
+// start and for the RECURRENCE-ID naming one of its instances.
+const flags = (lines) => {
+  const parsed = context._parseICAL(['BEGIN:VEVENT', 'UID:flags', ...lines, 'END:VEVENT'].join('\r\n'));
+  return [parsed.floating, parsed.recurrenceFloating];
+};
+assert.deepEqual(flags(['DTSTART:20250724T090000', 'RECURRENCE-ID:20250724T090000']), [true, true], 'floating values');
+assert.deepEqual(flags(['DTSTART:20250724T090000Z', 'RECURRENCE-ID:20250724T090000Z']), [false, false], 'UTC values');
+assert.deepEqual(flags(['DTSTART;TZID=Europe/Berlin:20250724T090000', 'RECURRENCE-ID;TZID=Europe/Berlin:20250724T090000']), [false, false], 'zoned values');
+assert.deepEqual(flags(['DTSTART;VALUE=DATE:20250724', 'RECURRENCE-ID;VALUE=DATE:20250724']), [false, false], 'DATE values');

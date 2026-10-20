@@ -2547,7 +2547,15 @@ func (r *aclRepo) UpdateACL(ctx context.Context, resourcePath string, mutate fun
 	if err := lockACLPathsTx(ctx, tx, resourcePath); err != nil {
 		return err
 	}
+	if err := updateACLTx(ctx, tx, resourcePath, mutate); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+// updateACLTx replaces the ACL at resourcePath with mutate's result. The caller
+// holds the DAV path lock for the path before the call.
+func updateACLTx(ctx context.Context, tx *sql.Tx, resourcePath string, mutate func([]ACLEntry) ([]ACLEntry, error)) error {
 	const q = `SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`
 	rows, err := tx.QueryContext(ctx, q, resourcePath)
 	if err != nil {
@@ -2563,10 +2571,7 @@ func (r *aclRepo) UpdateACL(ctx context.Context, resourcePath string, mutate fun
 	if err != nil {
 		return err
 	}
-	if err := setACLTx(ctx, tx, resourcePath, next); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return setACLTx(ctx, tx, resourcePath, next)
 }
 
 // RevokePrincipalGrants revokes a share across the whole collection. Member
@@ -2588,7 +2593,18 @@ func (r *aclRepo) RevokePrincipalGrants(ctx context.Context, collectionPath, pri
 	if err := lockACLPathsTx(ctx, tx, collectionPath); err != nil {
 		return err
 	}
+	if err := revokePrincipalGrantsTx(ctx, tx, collectionPath, principalHref, collectionPrivileges); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+// revokePrincipalGrantsTx is RevokePrincipalGrants within a transaction that
+// holds collectionPath. A principal the revocation leaves without access has no
+// use for a lock on the collection or beneath it, which would only keep the
+// owner from writing, so the principal's locks there are deleted with the
+// grants.
+func revokePrincipalGrantsTx(ctx context.Context, tx *sql.Tx, collectionPath, principalHref string, collectionPrivileges []string) error {
 	memberPattern := likeEscape(collectionPath) + "/%"
 	principals := pq.Array(principalHrefSpellings(principalHref))
 	privileges := pq.Array(collectionPrivileges)
@@ -2615,19 +2631,57 @@ func (r *aclRepo) RevokePrincipalGrants(ctx context.Context, collectionPath, pri
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if len(affected) == 0 {
-		return tx.Commit()
+	if len(affected) > 0 {
+		const deleteQ = `DELETE FROM acl_entries WHERE ` + scope
+		if _, err := tx.ExecContext(ctx, deleteQ, principals, collectionPath, memberPattern, privileges); err != nil {
+			return err
+		}
+		if err := touchACLDependentStates(ctx, tx, affected); err != nil {
+			return err
+		}
 	}
+	return deleteLocksOfExcludedPrincipalTx(ctx, tx, collectionPath, principalHref)
+}
 
-	const deleteQ = `DELETE FROM acl_entries WHERE ` + scope
-	if _, err := tx.ExecContext(ctx, deleteQ, principals, collectionPath, memberPattern, privileges); err != nil {
-		return err
+// deleteLocksOfExcludedPrincipalTx deletes the locks the user principalHref
+// names holds on the collection and beneath it, unless the user still has
+// access to it: as its owner, through an entry on the collection that grants
+// any privilege to them or to DAV:all or DAV:authenticated, decided as the
+// accessible-calendar queries decide it, or through a grant on something
+// beneath it. The caller holds the collection's DAV path lock.
+func deleteLocksOfExcludedPrincipalTx(ctx context.Context, tx *sql.Tx, collectionPath, principalHref string) error {
+	userID, ok := principalUserID(principalHref)
+	table, collectionID, isCollection := collectionOfPath(collectionPath)
+	if !ok || !isCollection || strings.Count(collectionPath, "/") != 3 {
+		return nil
 	}
+	predicate := "a.resource_path = $2"
+	collectionAccess := strings.Join([]string{
+		aclOrderedBooleanExpr(predicate, "$1", "read", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "read-free-busy", "read", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "write", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "write-content", "write", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "write-properties", "write", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "bind", "write", "all"),
+		aclOrderedBooleanExpr(predicate, "$1", "unbind", "write", "all"),
+	}, ` OR `)
+	query := `DELETE FROM locks WHERE user_id=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')
+AND NOT EXISTS (SELECT 1 FROM ` + table + ` c WHERE c.id=$4 AND c.user_id=$1)
+AND NOT (` + collectionAccess + `)
+AND NOT EXISTS (SELECT 1 FROM acl_entries g WHERE g.is_grant AND g.resource_path LIKE $3 ESCAPE '\' AND g.principal_href IN ` + aclPrincipalListExpr("$1") + `)`
+	_, err := tx.ExecContext(ctx, query, userID, collectionPath, likeEscape(collectionPath)+"/%", collectionID)
+	return err
+}
 
-	if err := touchACLDependentStates(ctx, tx, affected); err != nil {
-		return err
+// principalUserID is the user a /dav/principals/{id} href, with or without its
+// trailing slash, names.
+func principalUserID(principalHref string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSuffix(principalHref, "/"), "/dav/principals/")
+	if !ok {
+		return 0, false
 	}
-	return tx.Commit()
+	id, err := strconv.ParseInt(rest, 10, 64)
+	return id, err == nil && id > 0
 }
 
 // principalHrefSpellings returns the stored forms of a principal href that the

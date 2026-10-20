@@ -774,8 +774,10 @@
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
             <input type="hidden" id="event-editor-method" name="_method" value="PUT" disabled>
             <input type="hidden" id="event-return-to" name="return_to">
+            <input type="hidden" id="event-etag" name="etag">
             <input type="hidden" id="event-recurrence-id" name="recurrence_id">
             <input type="hidden" id="event-recurrence-timezone" name="recurrence_timezone">
+            <input type="hidden" id="event-recurrence-floating" name="recurrence_floating">
             <input type="hidden" id="event-recurrence-all-day" name="recurrence_all_day">
             <div class="alert alert-error" id="event-editor-error" role="alert" style="display:none"></div>
 
@@ -956,9 +958,11 @@
         <form id="delete-event-form" method="POST" style="display:none">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
             <input type="hidden" id="delete-return-to" name="return_to">
+            <input type="hidden" id="delete-etag" name="etag">
             <input type="hidden" id="delete-edit-scope" name="edit_scope" value="series">
             <input type="hidden" id="delete-recurrence-id" name="recurrence_id">
             <input type="hidden" id="delete-recurrence-timezone" name="recurrence_timezone">
+            <input type="hidden" id="delete-recurrence-floating" name="recurrence_floating">
             <input type="hidden" id="delete-recurrence-all-day" name="recurrence_all_day">
             <input type="hidden" id="delete-timezone" name="timezone">
         </form>
@@ -1359,6 +1363,7 @@
 
     function resetEditorFields() {
         editorForm.reset();
+        document.getElementById('event-timezone').placeholder = 'e.g., America/Chicago';
         // Options added for the last event's stored values go with it.
         ['event-status', 'event-visibility', 'event-availability', 'event-recurrence'].forEach(function(id) {
             selectStoredValue(document.getElementById(id), '');
@@ -1372,6 +1377,7 @@
         document.getElementById('event-recurrence-count').value = '10';
         showPartialRecurrence(document.getElementById('event-recurrence-partial'), '', null);
         document.getElementById('event-recurrence-id').value = '';
+        document.getElementById('event-recurrence-floating').value = '';
         document.getElementById('event-recurrence-all-day').value = '';
         document.getElementById('event-edit-scope').value = 'series';
         document.getElementById('event-edit-scope').querySelector('option[value="occurrence"]').disabled = false;
@@ -1408,7 +1414,10 @@
         document.getElementById('event-summary').value = event.summary || '';
         document.getElementById('event-location').value = event.location || '';
         document.getElementById('event-description').value = event.description || '';
-        document.getElementById('event-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
+        var editorZone = editorTimeZone(event);
+        var zoneField = document.getElementById('event-timezone');
+        zoneField.value = editorZone;
+        zoneField.placeholder = event.floating ? 'Floating (no time zone)' : 'e.g., America/Chicago';
         selectStoredValue(document.getElementById('event-status'), event.status);
         selectStoredValue(document.getElementById('event-visibility'), event.class);
         selectStoredValue(document.getElementById('event-availability'), event.transp);
@@ -1423,12 +1432,13 @@
         // of one day, which is an exclusive end of the day after DTSTART.
         var eventEnd = event.dtend ||
             (event.allDay ? addDays(startOfDay(event.dtstart), 1) : new Date(event.dtstart.getTime() + 30 * 60000));
-        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay, timeZoneClock(event, event.timezone));
+        setEditorDateValues(event.dtstart, eventEnd, !!event.allDay, editorClock(event));
         var recurrenceID = event.recurrenceId || (event.isOccurrence ? event.dtstart : null);
-        var recurrenceZone = event.recurrenceTimezone || event.timezone || 'UTC';
+        var recurrenceZone = editorRecurrenceTimeZone(event);
         document.getElementById('event-recurrence-id').value =
-            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay, timeZoneClock(event, recurrenceZone));
+            formatRecurrenceInput(recurrenceID, !!event.recurrenceIdAllDay, editorRecurrenceClock(event, recurrenceZone));
         document.getElementById('event-recurrence-timezone').value = recurrenceZone;
+        document.getElementById('event-recurrence-floating').value = editorRecurrenceFloating(event);
         document.getElementById('event-recurrence-all-day').value =
             event.recurrenceIdAllDay ? 'true' : 'false';
         document.getElementById('event-edit-scope-group').style.display = event.isOccurrence ? 'block' : 'none';
@@ -1462,12 +1472,16 @@
             '/calendars/' + event.calendarId + '/events/' + encodedUID + '/delete';
         document.getElementById('event-return-to').value = currentReturnPath();
         document.getElementById('delete-return-to').value = currentReturnPath();
+        // The edit and the delete apply only to the version of the event this page shows.
+        document.getElementById('event-etag').value = event.etag || '';
+        document.getElementById('delete-etag').value = event.etag || '';
         document.getElementById('delete-recurrence-timezone').value = document.getElementById('event-recurrence-timezone').value;
+        document.getElementById('delete-recurrence-floating').value = document.getElementById('event-recurrence-floating').value;
         document.getElementById('delete-recurrence-id').value =
             document.getElementById('event-recurrence-id').value;
         document.getElementById('delete-recurrence-all-day').value =
             document.getElementById('event-recurrence-all-day').value;
-        document.getElementById('delete-timezone').value = event.timezone || (event.allDay ? '' : 'UTC');
+        document.getElementById('delete-timezone').value = editorZone;
 
         modal.classList.remove('show');
         editorModal.classList.add('show');
@@ -1497,7 +1511,7 @@
             // ends on the day it starts.
             return end < start ? 'End date must be on or after the start date.' : null;
         }
-        return end <= start ? 'End time must be after the start time.' : null;
+        return end < start ? 'End time must not be before the start time.' : null;
     }
 
     function showEventEditorError(message) {

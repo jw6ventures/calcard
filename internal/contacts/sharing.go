@@ -2,6 +2,7 @@ package contacts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -71,13 +72,22 @@ func (s *Service) revokeContactWriteGrants(ctx context.Context, bookID int64, pr
 			continue
 		}
 		seen[path] = struct{}{}
-		if err := s.store.ACLEntries.UpdateACL(ctx, path, func(current []store.ACLEntry) ([]store.ACLEntry, error) {
+		if err := s.store.UpdateACLAndState(ctx, path, nil, func(current []store.ACLEntry) ([]store.ACLEntry, error) {
 			return withoutWriteGrants(current, principalHref), nil
 		}); err != nil {
-			return err
+			return shareWriteError(err)
 		}
 	}
 	return nil
+}
+
+// shareWriteError is contactWriteError for a write of a book's ACL, which a
+// book deleted meanwhile answers as a book that is not there.
+func shareWriteError(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrNotFound
+	}
+	return contactWriteError(err)
 }
 
 func withoutWriteGrants(entries []store.ACLEntry, principalHref string) []store.ACLEntry {
@@ -245,7 +255,14 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 
 	resourcePath := addressBookACLCollectionPath(bookID)
 	principalHref := sharePrincipalHref(targetUserID)
+	lockPreconditions := []store.LockPrecondition{store.NewLockPrecondition(resourcePath)}
 	if !editor {
+		// A share the ACL method would refuse on a locked book is refused before
+		// any contact's grants are changed. Only the book's own lock conditions
+		// are read; the role write checks them again and decides.
+		if err := s.store.CheckLocks(ctx, lockPreconditions); err != nil {
+			return contactWriteError(err)
+		}
 		// A contact's own grant is evaluated ahead of the book's, so a viewer
 		// keeps no write grant on any contact. This runs before the role is
 		// written so that a failure part way leaves less access, never more.
@@ -253,7 +270,7 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 			return err
 		}
 	}
-	err = s.store.ACLEntries.UpdateACL(ctx, resourcePath, func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
+	err = s.store.UpdateACLAndState(ctx, resourcePath, lockPreconditions, func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
 		filtered := make([]store.ACLEntry, 0, len(entries))
 		sharePosition := -1
 		maxPosition := -1
@@ -284,17 +301,50 @@ func (s *Service) ShareAddressBook(ctx context.Context, owner *store.User, bookI
 		return filtered, nil
 	})
 	if err != nil || editor {
-		return err
+		return shareWriteError(err)
 	}
 	// A contact-level write grant committed while the role was being written
 	// would outlive the downgrade, so the contacts are swept once more.
 	return s.revokeContactWriteGrants(ctx, bookID, principalHref)
 }
 
+// RenameAddressBook renames an owned address book. A book a WebDAV lock covers
+// is refused with ErrLocked, as a PROPPATCH of its display name is without the
+// lock token.
+func (s *Service) RenameAddressBook(ctx context.Context, owner *store.User, bookID int64, name string) error {
+	if _, err := s.requireOwnedBook(ctx, owner, bookID); err != nil {
+		return err
+	}
+	err := s.store.RenameAddressBookAndState(ctx, owner.ID, bookID, name,
+		[]store.LockPrecondition{store.NewLockPrecondition(addressBookACLCollectionPath(bookID))})
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrNotFound
+	}
+	return contactWriteError(err)
+}
+
+// DeleteAddressBook deletes an owned address book. A lock on the book at any
+// depth, on a contact in it or on a name below it, or a depth-infinity lock
+// above it, refuses the delete with ErrLocked, as the same lock refuses the
+// DELETE of a collection.
+func (s *Service) DeleteAddressBook(ctx context.Context, owner *store.User, bookID int64) error {
+	if _, err := s.requireOwnedBook(ctx, owner, bookID); err != nil {
+		return err
+	}
+	err := s.store.DeleteAddressBookAndState(ctx, owner.ID, bookID,
+		[]store.LockPrecondition{store.NewLockPrecondition(addressBookACLCollectionPath(bookID))})
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrNotFound
+	}
+	return contactWriteError(err)
+}
+
 // UnshareAddressBook removes a share. The owner may remove any principal; a
 // sharee may remove only their own (leave the book). It revokes every grant the
 // principal holds on the book and its contacts, since a contact's own grant is
-// evaluated ahead of the book's; deny entries stay.
+// evaluated ahead of the book's; deny entries stay. It only removes grants, so
+// no lock refuses it, and the locks the principal holds on the book and its
+// contacts go with their access.
 func (s *Service) UnshareAddressBook(ctx context.Context, user *store.User, bookID, targetUserID int64) error {
 	book, err := s.store.AddressBooks.GetByID(ctx, bookID)
 	if err != nil {

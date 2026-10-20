@@ -33,10 +33,11 @@ metadata:
 spec:
   replicas: {{ $replicas }}
   # Migrations run on startup and expect the application stopped while they
-  # apply. A rolling update starts the new pod first and keeps the old one
-  # serving, which runs the previous release against a schema being migrated
-  # out from under it; Recreate terminates the old pod before the new one
-  # starts, so only one version ever meets the database.
+  # apply, so only one version may meet the database at a time. Recreate
+  # terminates the old pod and waits for it to be gone before the new one
+  # starts. A rolling update does not, even with maxSurge 0: the ReplicaSet does
+  # not count a Terminating pod, so the new pod starts, and runs migrations,
+  # while the old one is still shutting down.
   strategy:
     type: Recreate
   selector:

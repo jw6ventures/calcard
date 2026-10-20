@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -113,6 +114,20 @@ func (f *uiEventFixture) serve(handle http.HandlerFunc, calendarID int64, uid st
 	return rr
 }
 
+// serveOpened is serve for a form built from the event as it is stored: the
+// form names that version of it, as every page the server renders does.
+func (f *uiEventFixture) serveOpened(handle http.HandlerFunc, calendarID int64, uid string, form url.Values) *httptest.ResponseRecorder {
+	f.t.Helper()
+	form = maps.Clone(form)
+	if form == nil {
+		form = url.Values{}
+	}
+	if event := f.storedEvent(calendarID, uid); event != nil {
+		form.Set("etag", event.ETag)
+	}
+	return f.serve(handle, calendarID, uid, form)
+}
+
 func uiEventBody(uid string, lines ...string) string {
 	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:20260101T000000Z\r\n" +
 		strings.Join(lines, "\r\n") + "\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -143,7 +158,7 @@ func TestPostgres_UIRemovesAnEventOnlyWithUnbindOnItsCalendar(t *testing.T) {
 		t.Run("series delete: "+tc.name, func(t *testing.T) {
 			uid := "delete-" + strings.ReplaceAll(tc.name, " ", "-")
 			calendarID := f.calendarWithEvent(uid, single(uid), tc.calendarACL, tc.eventACL)
-			rr := f.serve(f.handler.DeleteEvent, calendarID, uid, nil)
+			rr := f.serveOpened(f.handler.DeleteEvent, calendarID, uid, nil)
 			if rr.Code != tc.wantStatus {
 				t.Errorf("DeleteEvent = %d, want %d", rr.Code, tc.wantStatus)
 			}
@@ -162,7 +177,7 @@ func TestPostgres_UIRemovesAnEventOnlyWithUnbindOnItsCalendar(t *testing.T) {
 		t.Run("move out: "+tc.name, func(t *testing.T) {
 			uid := "move-" + strings.ReplaceAll(tc.name, " ", "-")
 			calendarID := f.calendarWithEvent(uid, single(uid), tc.calendarACL, tc.eventACL)
-			rr := f.serve(f.handler.UpdateEvent, calendarID, uid, url.Values{
+			rr := f.serveOpened(f.handler.UpdateEvent, calendarID, uid, url.Values{
 				"summary": {"moved"}, "dtstart": {"2026-01-15T10:00"}, "dtend": {"2026-01-15T11:00"},
 				"destination_calendar_id": {strconv.FormatInt(f.mine.ID, 10)},
 			})
@@ -194,7 +209,7 @@ func TestPostgres_UIRemovesAnEventOnlyWithUnbindOnItsCalendar(t *testing.T) {
 			uid := "override-" + strings.ReplaceAll(tc.name, " ", "-")
 			body := uiEventBody(uid, "RECURRENCE-ID:20260115T100000Z", "DTSTART:20260115T100000Z", "DTEND:20260115T110000Z")
 			calendarID := f.calendarWithEvent(uid, body, tc.calendarACL, f.shareeACE(true, "write"))
-			rr := f.serve(f.handler.DeleteEvent, calendarID, uid, url.Values{"edit_scope": {"occurrence"}, "recurrence_id": {"2026-01-15T10:00"}, "timezone": {"UTC"}})
+			rr := f.serveOpened(f.handler.DeleteEvent, calendarID, uid, url.Values{"edit_scope": {"occurrence"}, "recurrence_id": {"2026-01-15T10:00"}, "timezone": {"UTC"}})
 			if rr.Code != tc.wantStatus {
 				t.Errorf("%s: DeleteEvent of the occurrence = %d, want %d (%s)", tc.name, rr.Code, tc.wantStatus, rr.Header().Get("Location"))
 			}
@@ -342,7 +357,7 @@ func TestPostgres_UIWritesNoItemStoredUnderANameNoHrefCarries(t *testing.T) {
 				{"move", f.handler.UpdateEvent, move},
 				{"occurrence delete", f.handler.DeleteEvent, occurrence},
 			} {
-				rr := f.serve(request.handle, cal.ID, uid, request.form)
+				rr := f.serveOpened(request.handle, cal.ID, uid, request.form)
 				if rr.Code != http.StatusFound || !strings.Contains(rr.Header().Get("Location"), "error=") {
 					t.Errorf("%s: status %d location %q, want a redirect naming the error", request.label, rr.Code, rr.Header().Get("Location"))
 				}
@@ -357,7 +372,7 @@ func TestPostgres_UIWritesNoItemStoredUnderANameNoHrefCarries(t *testing.T) {
 					t.Errorf("%s moved the event stored as %q", request.label, name)
 				}
 			}
-			if rr := f.serve(f.handler.DeleteEvent, cal.ID, uid, nil); rr.Code != http.StatusFound || f.eventStored(cal.ID, uid) {
+			if rr := f.serveOpened(f.handler.DeleteEvent, cal.ID, uid, nil); rr.Code != http.StatusFound || f.eventStored(cal.ID, uid) {
 				t.Errorf("delete of the event stored as %q: status %d location %q, stored %t", name, rr.Code, rr.Header().Get("Location"), f.eventStored(cal.ID, uid))
 			}
 		})
@@ -433,7 +448,7 @@ func TestPostgres_UIMoveDecidesBindOnTheDestinationCalendar(t *testing.T) {
 			if err := f.database.ACLEntries.SetACL(ctx, store.MemberStatePath(destinationPath, uid), tc.member); err != nil {
 				t.Fatal(err)
 			}
-			rr := f.serve(f.handler.UpdateEvent, source, uid, url.Values{
+			rr := f.serveOpened(f.handler.UpdateEvent, source, uid, url.Values{
 				"summary": {"moved"}, "dtstart": {"2026-01-15T10:00"}, "dtend": {"2026-01-15T11:00"},
 				"destination_calendar_id": {strconv.FormatInt(destination.ID, 10)},
 			})

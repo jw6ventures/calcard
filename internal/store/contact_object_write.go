@@ -67,11 +67,8 @@ func (s *Store) PutContactObject(ctx context.Context, write ContactObjectWrite) 
 	if err := validateACLGuardTx(ctx, tx, write.ExpectedState.ACL); err != nil {
 		return nil, err
 	}
-	if err := acquireDAVObjectIdentityLocks(ctx, tx, "contact-object", write.AddressBookID,
+	if err := lockContactWritesTx(ctx, tx, write.AddressBookID,
 		DAVResourceState{UID: write.UID, ResourceName: write.ResourceName}); err != nil {
-		return nil, err
-	}
-	if err := lockCollectionRowsTx(ctx, tx, "address_books", write.AddressBookID); err != nil {
 		return nil, err
 	}
 

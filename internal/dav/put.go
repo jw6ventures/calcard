@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/httpcond"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -29,29 +30,10 @@ import (
 // request open indefinitely.
 const maxResourceStateRetries = 16
 
-// checkConditional validates If-Match and If-None-Match headers per RFC 7232:
-// If-Match requires strong comparison, If-None-Match uses weak comparison.
+// checkConditional validates the request's If-Match and If-None-Match headers
+// against the resource's entity tag.
 func checkConditional(r *http.Request, etag string, exists bool) bool {
-	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
-		if !exists || !etagListMatches(ifMatch, etag, false) {
-			return false
-		}
-	}
-	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
-		if exists && etagListMatches(ifNoneMatch, etag, true) {
-			return false
-		}
-	}
-	return true
-}
-
-// etagListMatches reports whether any entity-tag in a comma-separated
-// If-Match/If-None-Match value matches etag. "*" matches any existing
-// resource. Stored ETags are strong, so a weak candidate (W/"...") can only
-// weak-compare equal (RFC 7232 §2.3.2); it never matches under the strong
-// comparison If-Match requires.
-func etagListMatches(headerValue, etag string, allowWeak bool) bool {
-	return headerValue == "*" || slices.Contains(entityTags(headerValue, allowWeak), etag)
+	return httpcond.Check(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"), etag, exists)
 }
 
 func (h *DavServer) checkConditionalHeaders(r *http.Request, existing *store.Event) bool {
@@ -371,31 +353,12 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 func calendarObjectPrecondition(r *http.Request) store.CalendarObjectPrecondition {
 	precondition := store.CalendarObjectPrecondition{}
 	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
-		precondition.IfMatch = &store.ETagCondition{Any: ifMatch == "*", ETags: entityTags(ifMatch, false)}
+		precondition.IfMatch = &store.ETagCondition{Any: ifMatch == "*", ETags: httpcond.EntityTags(ifMatch, false)}
 	}
 	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
-		precondition.IfNoneMatch = &store.ETagCondition{Any: ifNoneMatch == "*", ETags: entityTags(ifNoneMatch, true)}
+		precondition.IfNoneMatch = &store.ETagCondition{Any: ifNoneMatch == "*", ETags: httpcond.EntityTags(ifNoneMatch, true)}
 	}
 	return precondition
-}
-
-// entityTags parses a comma-separated If-Match or If-None-Match value into the
-// bare entity tags it names, dropping weak ones where the comparison is strong.
-func entityTags(headerValue string, allowWeak bool) []string {
-	var tags []string
-	for _, candidate := range strings.Split(headerValue, ",") {
-		candidate = strings.TrimSpace(candidate)
-		if strings.HasPrefix(candidate, "W/") {
-			if !allowWeak {
-				continue
-			}
-			candidate = strings.TrimPrefix(candidate, "W/")
-		}
-		if candidate = strings.Trim(candidate, "\""); candidate != "" {
-			tags = append(tags, candidate)
-		}
-	}
-	return tags
 }
 
 // calendarObjectConflictHref is the URL of the calendar object resource already

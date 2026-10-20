@@ -56,6 +56,9 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.DigestEnabled {
 		t.Fatal("expected DAV.DigestEnabled to default to false")
 	}
+	if cfg.DAV.InsecureBasicEnabled {
+		t.Fatal("expected DAV.InsecureBasicEnabled to default to false")
+	}
 	if cfg.DAV.MaxMultistatusResponses != 10000 {
 		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 10000", cfg.DAV.MaxMultistatusResponses)
 	}
@@ -330,6 +333,42 @@ func TestLoadEnablesDAVDigestOnlyWhenOptedIn(t *testing.T) {
 	}
 	if !cfg.DAV.DigestEnabled {
 		t.Fatal("expected APP_DAV_DIGEST_ENABLED=true to enable DAV Digest")
+	}
+}
+
+// RFC 4791 Section 11 forbids Basic without TLS, so accepting it over plain
+// HTTP is an operator's explicit choice and never a default.
+func TestLoadEnablesInsecureBasicOnlyWhenOptedIn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "unset", want: false},
+		{name: "true", value: "true", set: true, want: true},
+		{name: "1", value: "1", set: true, want: true},
+		{name: "false", value: "false", set: true, want: false},
+		{name: "unrecognised value", value: "maybe", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("APP_DB_DSN", "postgres://dsn")
+			t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+			t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+			t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+			t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+			if tc.set {
+				t.Setenv("APP_DAV_INSECURE_BASIC_ENABLED", tc.value)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.DAV.InsecureBasicEnabled != tc.want {
+				t.Fatalf("DAV.InsecureBasicEnabled = %v, want %v", cfg.DAV.InsecureBasicEnabled, tc.want)
+			}
+		})
 	}
 }
 

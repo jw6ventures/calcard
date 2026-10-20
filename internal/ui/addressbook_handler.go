@@ -149,8 +149,12 @@ func (h *Handler) RenameAddressBook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if err := h.store.AddressBooks.Rename(r.Context(), user.ID, id, name); err != nil {
-		h.redirect(w, r, "/addressbooks", map[string]string{"error": "rename failed"})
+	if err := h.contacts.RenameAddressBook(r.Context(), user, id, name); err != nil {
+		message := "rename failed"
+		if errors.Is(err, contacts.ErrLocked) {
+			message = addressBookLockedMessage
+		}
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": message})
 		return
 	}
 	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_renamed"})
@@ -164,8 +168,12 @@ func (h *Handler) DeleteAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, _ := auth.UserFromContext(r.Context())
-	if err := h.store.AddressBooks.Delete(r.Context(), user.ID, id); err != nil {
-		h.redirect(w, r, "/addressbooks", map[string]string{"error": "delete failed"})
+	if err := h.contacts.DeleteAddressBook(r.Context(), user, id); err != nil {
+		message := "delete failed"
+		if errors.Is(err, contacts.ErrLocked) {
+			message = addressBookLockedMessage
+		}
+		h.redirect(w, r, "/addressbooks", map[string]string{"error": message})
 		return
 	}
 	h.redirect(w, r, "/addressbooks", map[string]string{"status": "addressbook_deleted"})
@@ -230,8 +238,14 @@ func (h *Handler) writeContactAccessError(w http.ResponseWriter, err error) {
 	}
 }
 
+// addressBookLockedMessage is the flash text for a change to an address book
+// refused because a CardDAV or WebDAV client has locked it.
+const addressBookLockedMessage = "This address book is locked by a CardDAV client. Try again once it has been unlocked."
+
 func addressBookShareError(err error) string {
 	switch contacts.StatusCode(err) {
+	case http.StatusLocked:
+		return addressBookLockedMessage
 	case http.StatusNotFound:
 		return "not found"
 	case http.StatusForbidden:
@@ -397,6 +411,8 @@ func contactWriteFlashError(r *http.Request, err error, fallback string) string 
 		return "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead."
 	case errors.Is(err, contacts.ErrUnwritableName):
 		return unwritableContactMessage
+	case errors.Is(err, contacts.ErrLocked):
+		return contactLockedMessage
 	case errors.Is(err, contacts.ErrPreconditionFailed):
 		return "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again."
 	case errors.Is(err, contacts.ErrChangedConcurrently):
@@ -407,6 +423,11 @@ func contactWriteFlashError(r *http.Request, err error, fallback string) string 
 	httperrors.LogError(r, fallback, err)
 	return fallback
 }
+
+// contactLockedMessage is the flash text for a write refused because a
+// CardDAV or WebDAV client has locked the contact or its address book. The
+// page cannot submit the lock token that would let the write through.
+const contactLockedMessage = "This contact or its address book is locked by a CardDAV client. Try again once it has been unlocked."
 
 // unwritableContactMessage is the flash text for a write refused because the
 // contact is stored under a name no href carries.
@@ -603,6 +624,8 @@ func (h *Handler) DeleteContact(w http.ResponseWriter, r *http.Request) {
 		h.redirect(w, r, page, map[string]string{"status": "contact_deleted"})
 	case errors.Is(err, contacts.ErrForbidden):
 		h.redirect(w, r, page, map[string]string{"error": "You may not delete contacts from this address book."})
+	case errors.Is(err, contacts.ErrLocked):
+		h.redirect(w, r, page, map[string]string{"error": contactLockedMessage})
 	case errors.Is(err, contacts.ErrChangedConcurrently):
 		h.redirect(w, r, page, map[string]string{"error": contactKeptChangingMessage("deleted")})
 	default:
@@ -666,6 +689,8 @@ func (h *Handler) MoveContact(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "contact not found", http.StatusNotFound)
 	case errors.Is(err, contacts.ErrForbidden):
 		h.redirect(w, r, sourcePage, map[string]string{"error": "You may not move contacts out of this address book."})
+	case errors.Is(err, contacts.ErrLocked):
+		h.redirect(w, r, sourcePage, map[string]string{"error": contactLockedMessage})
 	case errors.Is(err, contacts.ErrChangedConcurrently):
 		h.redirect(w, r, sourcePage, map[string]string{"error": contactKeptChangingMessage("moved")})
 	case errors.Is(err, contacts.ErrConflict):
@@ -750,6 +775,8 @@ func importSkipMessage(skip contacts.ImportSkip) string {
 		return "you may not change this contact"
 	case contacts.ImportSkipChanged:
 		return "the contact changed while it was being imported"
+	case contacts.ImportSkipLocked:
+		return "it is locked by a CardDAV client"
 	default:
 		return "not a vCard this server can read"
 	}

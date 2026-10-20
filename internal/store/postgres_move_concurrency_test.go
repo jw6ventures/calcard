@@ -53,13 +53,17 @@ func TestPostgres_OppositeCalendarMovesDoNotDeadlock(t *testing.T) {
 		return err
 	}
 	uiMove := func(s *Store, from, to int64, uid string) error {
-		return s.UpdateAndMoveEventAndState(context.Background(), from, Event{
+		source, err := s.Events.GetByUID(context.Background(), from, uid)
+		if err != nil || source == nil {
+			return fmt.Errorf("read the event to move: %v, %v", source, err)
+		}
+		return s.UpdateAndMoveEventAndState(context.Background(), from, EventDAVResourceState(source), Event{
 			CalendarID:   to,
 			UID:          uid,
 			ResourceName: uid,
 			RawICAL:      postgresCalendarObject(uid, uid+" edited"),
 			ETag:         "edited-" + uid,
-		}, fmt.Sprintf("/dav/calendars/%d/%s", from, uid), fmt.Sprintf("/dav/calendars/%d/%s", to, uid))
+		}, fmt.Sprintf("/dav/calendars/%d/%s", from, uid), fmt.Sprintf("/dav/calendars/%d/%s", to, uid), nil)
 	}
 
 	for _, tt := range []struct {

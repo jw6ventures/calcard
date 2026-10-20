@@ -22,6 +22,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/events"
+	httperrors "github.com/jw6ventures/calcard/internal/http/errors"
 	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
@@ -157,7 +158,18 @@ func (h *Handler) RenameCalendar(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := h.store.Calendars.Update(r.Context(), user.ID, id, name, cal.Description, cal.Timezone, color); err != nil {
+	// Only the name, and the colour when the form sends one, are written, as a
+	// PROPPATCH of them would write them, under a lock on the calendar or a
+	// depth-infinity lock above it. A property a client changed since this
+	// handler read the calendar is kept.
+	_, setColor := r.Form["color"]
+	err = h.store.RenameCalendarAndState(r.Context(), user.ID, id, name, color, setColor, calendarWriteLockPreconditions(id))
+	if errors.Is(err, store.ErrLockConflict) {
+		h.redirect(w, r, "/calendars", map[string]string{"error": calendarLockedMessage})
+		return
+	}
+	if err != nil {
+		httperrors.LogError(r, "rename calendar", err)
 		h.redirect(w, r, "/calendars", map[string]string{"error": "rename failed"})
 		return
 	}
@@ -190,19 +202,76 @@ func calendarColorFromForm(r *http.Request, existing *string) (*string, error) {
 	return &normalized, nil
 }
 
-// DeleteCalendar deletes a calendar.
+// DeleteCalendar deletes a calendar, with its events and the DAV state bound
+// beneath it, as a CalDAV DELETE of the collection does: it is refused, with
+// nothing removed, while a lock holds the calendar or any event in it.
 func (h *Handler) DeleteCalendar(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
 		h.redirect(w, r, "/calendars", map[string]string{"error": "invalid id"})
 		return
 	}
-	user, _ := auth.UserFromContext(r.Context())
-	if err := h.store.Calendars.Delete(r.Context(), user.ID, id); err != nil {
-		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
-		return
+	for attempt := 1; ; attempt++ {
+		if !h.deleteCalendarOnce(w, r, id) {
+			return
+		}
+		if attempt == maxEventWriteAttempts {
+			h.redirect(w, r, "/calendars", map[string]string{"error": "This calendar kept changing elsewhere and could not be deleted. Reload the page and try again."})
+			return
+		}
 	}
-	h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_deleted"})
+}
+
+// deleteCalendarOnce reads the calendar and its events and deletes exactly
+// them. It reports true, having answered nothing, when the calendar or an event
+// changed after they were read, which the caller reads again.
+func (h *Handler) deleteCalendarOnce(w http.ResponseWriter, r *http.Request, id int64) (changedConcurrently bool) {
+	user, _ := auth.UserFromContext(r.Context())
+	cal, err := h.store.Calendars.GetByID(r.Context(), id)
+	if err != nil {
+		httperrors.LogError(r, "delete calendar", err)
+		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
+		return false
+	}
+	if cal == nil || cal.UserID != user.ID {
+		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
+		return false
+	}
+	events, err := h.store.Events.ListForCalendar(r.Context(), id)
+	if err != nil {
+		httperrors.LogError(r, "delete calendar", err)
+		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
+		return false
+	}
+	members := make([]store.CalendarCollectionMember, 0, len(events))
+	for _, event := range events {
+		members = append(members, store.CalendarCollectionMember{
+			ID: event.ID, UID: event.UID, ResourceName: calendarEventResourceName(event.UID, &event), RawICAL: event.RawICAL, ETag: event.ETag,
+		})
+	}
+	statePath := calendarACLResourcePath(id)
+	_, err = h.store.TransferCalendarCollection(r.Context(), store.CalendarCollectionTransfer{
+		Operation:          store.CalendarCollectionDelete,
+		SourceID:           id,
+		ExpectedSourceCTag: cal.CTag,
+		SourceStatePath:    statePath,
+		Members:            members,
+		LockPreconditions:  []store.LockPrecondition{store.NewLockPrecondition(statePath), store.NewLockPrecondition(path.Dir(statePath))},
+	})
+	switch {
+	case err == nil:
+		h.redirect(w, r, "/calendars", map[string]string{"status": "calendar_deleted"})
+		return false
+	case errors.Is(err, store.ErrResourceStateChanged):
+		return true
+	case errors.Is(err, store.ErrLockConflict):
+		h.redirect(w, r, "/calendars", map[string]string{"error": calendarDeleteLockedMessage})
+		return false
+	default:
+		httperrors.LogError(r, "delete calendar", err)
+		h.redirect(w, r, "/calendars", map[string]string{"error": "delete failed"})
+		return false
+	}
 }
 
 // ShareCalendar shares a calendar with another user.
@@ -240,6 +309,14 @@ func (h *Handler) ShareCalendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.setCalendarShare(r.Context(), cal.ID, targetUser.ID, true); err != nil {
+		if errors.Is(err, store.ErrLockConflict) {
+			h.redirect(w, r, "/calendars", map[string]string{"error": calendarLockedMessage})
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			h.redirect(w, r, "/calendars", map[string]string{"error": "not found"})
+			return
+		}
 		h.redirect(w, r, "/calendars", map[string]string{"error": "failed to share"})
 		return
 	}
@@ -653,7 +730,7 @@ func effectiveCalendarShareAccess(entries []store.ACLEntry, userID int64) (bool,
 func (h *Handler) setCalendarShare(ctx context.Context, calendarID, userID int64, editor bool) error {
 	resourcePath := calendarACLResourcePath(calendarID)
 	principalHref := calendarSharePrincipalHref(userID)
-	return h.store.ACLEntries.UpdateACL(ctx, resourcePath, func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
+	return h.store.UpdateACLAndState(ctx, resourcePath, calendarWriteLockPreconditions(calendarID), func(entries []store.ACLEntry) ([]store.ACLEntry, error) {
 		filtered := make([]store.ACLEntry, 0, len(entries))
 		sharePosition := -1
 		maxPosition := -1
@@ -683,9 +760,20 @@ func (h *Handler) setCalendarShare(ctx context.Context, calendarID, userID int64
 // records no origin to tell a share's leftovers from one the owner set through
 // the ACL method on that event. Every grant the principal holds anywhere in the
 // calendar therefore goes. Only grants are removed, so this never widens
-// access and needs no precondition, whoever asks for it.
+// access, needs no access precondition whoever asks for it, and is refused by
+// no lock: a principal who locked the calendar could otherwise not be removed.
+// The locks the principal holds on the calendar and its events go with the
+// grants.
 func (h *Handler) removeCalendarShare(ctx context.Context, calendarID, userID int64) error {
 	return h.store.ACLEntries.RevokePrincipalGrants(ctx, calendarACLResourcePath(calendarID), calendarSharePrincipalHref(userID), calendarShareManagedPrivileges)
+}
+
+// calendarWriteLockPreconditions are the lock conditions a write to the
+// calendar's own properties or ACL meets without a lock token: a lock on the
+// calendar at any depth, or a depth-infinity lock above it, refuses it, and a
+// lock on one of its events does not.
+func calendarWriteLockPreconditions(calendarID int64) []store.LockPrecondition {
+	return []store.LockPrecondition{store.NewLockPrecondition(calendarACLResourcePath(calendarID))}
 }
 
 // ViewCalendar displays a calendar and its events.
@@ -729,7 +817,7 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 
 	rangeStart, rangeEndExclusive, err := calendarEventQueryRange(r, time.Now())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeQueryRangeError(w, r, err)
 		return
 	}
 
@@ -927,18 +1015,18 @@ func calendarEventQueryRange(r *http.Request, now time.Time) (time.Time, time.Ti
 	endValue := strings.TrimSpace(r.URL.Query().Get("end"))
 	if startValue != "" || endValue != "" {
 		if startValue == "" || endValue == "" {
-			return time.Time{}, time.Time{}, fmt.Errorf("start and end are required")
+			return time.Time{}, time.Time{}, &queryRangeError{message: "start and end are required"}
 		}
 		start, err := time.Parse("2006-01-02", startValue)
 		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("invalid start date")
+			return time.Time{}, time.Time{}, &queryRangeError{message: "invalid start date"}
 		}
 		endExclusive, err := time.Parse("2006-01-02", endValue)
 		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("invalid end date")
+			return time.Time{}, time.Time{}, &queryRangeError{message: "invalid end date"}
 		}
 		if !endExclusive.After(start) || endExclusive.Sub(start) > maxAllCalendarRangeDays*24*time.Hour {
-			return time.Time{}, time.Time{}, fmt.Errorf("invalid date range")
+			return time.Time{}, time.Time{}, &queryRangeError{message: "invalid date range"}
 		}
 		return start, endExclusive, nil
 	}
@@ -953,11 +1041,30 @@ func calendarEventQueryRange(r *http.Request, now time.Time) (time.Time, time.Ti
 	return start, start.AddDate(0, 1, 0), nil
 }
 
+// queryRangeError is a refusal of the date range an events listing was asked
+// for, with the plain message it is answered with.
+type queryRangeError struct{ message string }
+
+func (e *queryRangeError) Error() string { return e.message }
+
+// writeQueryRangeError answers a request for a date range calendarEventQueryRange
+// refused with its plain message, and any other failure with a generic one,
+// keeping the detail in the log.
+func writeQueryRangeError(w http.ResponseWriter, r *http.Request, err error) {
+	var refusal *queryRangeError
+	if errors.As(err, &refusal) {
+		http.Error(w, refusal.message, http.StatusBadRequest)
+		return
+	}
+	httperrors.LogError(r, "events date range", err)
+	http.Error(w, "invalid date range", http.StatusBadRequest)
+}
+
 // GetAllCalendarEventsJSON returns events across all accessible calendars for a date range.
 func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Request) {
 	rangeStart, rangeEndExclusive, err := calendarEventQueryRange(r, time.Now())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeQueryRangeError(w, r, err)
 		return
 	}
 
@@ -1209,18 +1316,98 @@ func (h *Handler) calendarImportAccess(ctx context.Context, user *store.User, ca
 // importTarget is the stored event an import of uid replaces, if any, and
 // whether the caller may write it: bind on the calendar for a new event,
 // which RFC 3744 section 3.9 makes a privilege of the collection, and
-// write-content on the event an existing one is.
-func (h *Handler) importTarget(ctx context.Context, user *store.User, cal *store.CalendarAccess, uid string) (*store.Event, bool, error) {
-	existing, err := h.store.Events.GetByUID(ctx, cal.ID, uid)
+// write-content on the event an existing one is. The guard pins the ACL
+// entries the decision reads, for the write to carry.
+func (h *Handler) importTarget(ctx context.Context, user *store.User, cal *store.CalendarAccess, uid string) (existing *store.Event, guard *store.ACLGuard, allowed bool, err error) {
+	existing, err = h.store.Events.GetByUID(ctx, cal.ID, uid)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = calendarEventResourceName(uid, existing)
+	}
+	guard, err = h.pinEventACL(ctx, user, eventACLScope{calendarID: cal.ID, calendar: &cal.Calendar, resourceName: resourceName})
+	if err != nil {
+		return nil, nil, false, err
 	}
 	if existing == nil {
-		allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarACLResourcePath(cal.ID), "bind")
-		return nil, allowed, err
+		allowed, err = h.hasCalendarPrivilege(ctx, user, cal, calendarACLResourcePath(cal.ID), "bind")
+		return nil, guard, allowed, err
 	}
-	allowed, err := h.hasCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, calendarEventResourceName(uid, existing)), "write-content")
-	return existing, allowed, err
+	allowed, err = h.hasCalendarPrivilege(ctx, user, cal, calendarEventResourcePath(cal.ID, resourceName), "write-content")
+	return existing, guard, allowed, err
+}
+
+// importItem is an event to import with the version of the stored event the
+// decision to write it was made on, nil for a new event, and the ACL entries
+// that decision read.
+type importItem struct {
+	event    store.Event
+	existing *store.Event
+	guard    *store.ACLGuard
+}
+
+// importOutcome is what became of one event of an import.
+type importOutcome int
+
+const (
+	importWritten importOutcome = iota
+	importFailed
+	// importLocked: a lock a CalDAV client holds refused the write.
+	importLocked
+	// importChanged: the event or the access that decided its write changed
+	// before it was written.
+	importChanged
+)
+
+// writeImportedEvent writes one event of an import as a UI create or edit is
+// written: only over the version it was decided on, only while the ACL it was
+// decided on holds, and only past the locks a CalDAV request submitting no
+// token would meet. A write that loses to a change of the ACL alone is decided
+// again once, and goes on when that finds the event as it was.
+func (h *Handler) writeImportedEvent(ctx context.Context, r *http.Request, user *store.User, cal *store.CalendarAccess, item importItem) importOutcome {
+	for attempt := 1; ; attempt++ {
+		var err error
+		if item.existing == nil {
+			err = h.storeNewEvent(ctx, item.event, item.guard)
+		} else {
+			err = h.storeEventEdit(ctx, item.existing, item.event, item.guard)
+		}
+		switch {
+		case err == nil:
+			return importWritten
+		case errors.Is(err, store.ErrLockConflict):
+			return importLocked
+		case errors.Is(err, store.ErrPreconditionFailed), errors.Is(err, store.ErrUIDConflict):
+			return importChanged
+		case errors.Is(err, store.ErrResourceStateChanged):
+			if attempt == 2 {
+				return importChanged
+			}
+			existing, guard, allowed, decideErr := h.importTarget(ctx, user, cal, item.event.UID)
+			if decideErr != nil {
+				httperrors.LogError(r, "import event", decideErr)
+				return importFailed
+			}
+			if !allowed || !sameStoredVersion(existing, item.existing) {
+				return importChanged
+			}
+			item.guard = guard
+		default:
+			httperrors.LogError(r, "import event", err)
+			return importFailed
+		}
+	}
+}
+
+// sameStoredVersion reports whether a and b are the same version of one event,
+// or both absent.
+func sameStoredVersion(a, b *store.Event) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.UID == b.UID && a.ETag == b.ETag
 }
 
 // unclaimedImportName is the name a new event uid is imported under: the one
@@ -1302,7 +1489,8 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 
 	events, leftOut, err := utils.ParseICSFile(string(icsData))
 	if err != nil {
-		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": fmt.Sprintf("invalid ICS file: %v", err)})
+		httperrors.LogError(r, "import calendar", err)
+		h.redirect(w, r, fmt.Sprintf("/calendars/%d", calendarID), map[string]string{"error": "The file is not a valid iCalendar file with at least one event."})
 		return
 	}
 
@@ -1316,7 +1504,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 	// decided first, so an event the caller cannot write costs no validation,
 	// and is skipped.
 	refused := leftOut
-	pending := make([]store.Event, 0, len(events))
+	pending := make([]importItem, 0, len(events))
 	claimed := make(map[string]struct{}, len(events))
 	for _, eventICAL := range events {
 		uid := utils.ExtractUID(eventICAL)
@@ -1325,10 +1513,11 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			eventICAL = utils.EnsureUID(eventICAL, uid)
 		}
 		var existing *store.Event
+		var guard *store.ACLGuard
 		decided := false
 		if access == importPerEvent {
 			allowed := false
-			existing, allowed, err = h.importTarget(r.Context(), user, cal, uid)
+			existing, guard, allowed, err = h.importTarget(r.Context(), user, cal, uid)
 			if err != nil {
 				http.Error(w, "failed to load event", http.StatusInternalServerError)
 				return
@@ -1346,7 +1535,7 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		if !decided {
 			allowed := false
-			existing, allowed, err = h.importTarget(r.Context(), user, cal, uid)
+			existing, guard, allowed, err = h.importTarget(r.Context(), user, cal, uid)
 			if err != nil {
 				http.Error(w, "failed to load event", http.StatusInternalServerError)
 				return
@@ -1357,6 +1546,10 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		event.ResourceName = calendarEventResourceName(uid, existing)
+		if existing != nil && !store.ValidMemberName(event.ResourceName) {
+			refused++
+			continue
+		}
 		if existing == nil {
 			if event.ResourceName, err = h.unclaimedImportName(r.Context(), cal.ID, uid, claimed); err != nil {
 				http.Error(w, "failed to load event", http.StatusInternalServerError)
@@ -1364,22 +1557,28 @@ func (h *Handler) ImportCalendar(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		claimed[event.ResourceName] = struct{}{}
-		pending = append(pending, event)
+		pending = append(pending, importItem{event: event, existing: existing, guard: guard})
 	}
 
-	imported := 0
-	failed := 0
-	for _, event := range pending {
-		if _, err := h.store.Events.Upsert(r.Context(), event); err != nil {
-			failed++
-			continue
-		}
-		imported++
+	// The decisions above are all made before the first write, so a forbidden
+	// event stops a collection-wide import before anything is stored. The writes
+	// are separate, each atomic on its own: one that fails or is refused leaves
+	// the others to go on.
+	counts := map[importOutcome]int{}
+	for _, item := range pending {
+		counts[h.writeImportedEvent(r.Context(), r, user, cal, item)]++
 	}
+	imported, failed := counts[importWritten], counts[importFailed]
 
 	var skippedParts []string
 	if refused > 0 {
 		skippedParts = append(skippedParts, fmt.Sprintf("skipped %d (not valid or not events)", refused))
+	}
+	if locked := counts[importLocked]; locked > 0 {
+		skippedParts = append(skippedParts, fmt.Sprintf("skipped %d held by a lock of a CalDAV client", locked))
+	}
+	if changed := counts[importChanged]; changed > 0 {
+		skippedParts = append(skippedParts, fmt.Sprintf("skipped %d changed during the import", changed))
 	}
 	if failed > 0 {
 		skippedParts = append(skippedParts, fmt.Sprintf("%d could not be saved", failed))
@@ -1456,28 +1655,43 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for attempt := 1; ; attempt++ {
+		if !h.createEventOnce(w, r, calendarID) {
+			return
+		}
+		if attempt == maxEventWriteAttempts {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventKeptChangingMessage("saved")})
+			return
+		}
+	}
+}
+
+// createEventOnce decides and writes one create. It reports true, having
+// answered nothing, when the write lost to a change of the calendar's access
+// that was made after the decision, which the caller decides again.
+func (h *Handler) createEventOnce(w http.ResponseWriter, r *http.Request, calendarID int64) (changedConcurrently bool) {
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
-		return
+		return false
 	}
 	if cal == nil {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 
 	summary := strings.TrimSpace(r.FormValue("summary"))
 	if summary == "" {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "summary is required"})
-		return
+		return false
 	}
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
 	if dtstart == "" || dtend == "" {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "start and end are required"})
-		return
+		return false
 	}
 
 	allDay := r.FormValue("all_day") == "on"
@@ -1485,8 +1699,8 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Validate date format and range
 	if err := utils.ValidateEventDates(dtstart, dtend, allDay, utils.EventZoneIn(opts.Timezone, nil)); err != nil {
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-		return
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+		return false
 	}
 
 	location := strings.TrimSpace(r.FormValue("location"))
@@ -1494,50 +1708,61 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	recurrence, err := utils.ParseRecurrenceOptions(r)
 	if err != nil {
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-		return
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+		return false
 	}
 
 	uid := utils.GenerateUID()
+	guard, err := h.pinEventACL(r.Context(), user, eventACLScope{calendarID: calendarID, calendar: &cal.Calendar})
+	if err != nil {
+		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		return false
+	}
 	// DAV:bind is a privilege of the calendar the event joins (RFC 3744
 	// section 3.9), so no ACL stored for a member bears on it.
 	if err := h.requireCalendarPrivilege(r.Context(), user, cal, calendarACLResourcePath(calendarID), "bind"); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+		return false
 	}
 	if !calendarAcceptsUIWrite(cal) {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "this calendar does not accept events"})
-		return
+		return false
 	}
 	body, err := utils.BuildEvent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, opts)
 	if err != nil {
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-		return
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+		return false
 	}
 	event, err := h.validatedEvent(cal, uid, body)
 	if err != nil {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage(eventNotSaved, err)})
-		return
+		return false
 	}
 
-	if _, err := h.store.Events.Upsert(r.Context(), event); err != nil {
+	err = h.storeNewEvent(r.Context(), event, guard)
+	switch {
+	case errors.Is(err, store.ErrResourceStateChanged):
+		return true
+	case errors.Is(err, store.ErrLockConflict):
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
+		return false
+	case err != nil:
+		httperrors.LogError(r, "failed to create event", err)
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to create event"})
-		return
+		return false
 	}
 
 	h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_created"})
+	return false
 }
 
-// UpdateEvent updates an existing event.
+// UpdateEvent updates an existing event. The form names the version of the
+// event it was built from, and the update applies only to that version.
 func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-
-	editScope := r.FormValue("edit_scope")
-	recurrenceID := strings.TrimSpace(r.FormValue("recurrence_id"))
-	recurrenceAllDay := r.FormValue("recurrence_all_day") == "true"
 
 	calendarID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -1551,38 +1776,62 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for attempt := 1; ; attempt++ {
+		if !h.updateEventOnce(w, r, calendarID, uid) {
+			return
+		}
+		if attempt == maxEventWriteAttempts {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventKeptChangingMessage("saved")})
+			return
+		}
+	}
+}
+
+// updateEventOnce decides and writes one update. It reports true, having
+// answered nothing, when the write lost to a change of the event or of the
+// access that decided it, made after the decision, which the caller decides
+// again from the event as it then is.
+func (h *Handler) updateEventOnce(w http.ResponseWriter, r *http.Request, calendarID int64, uid string) (changedConcurrently bool) {
+	editScope := r.FormValue("edit_scope")
+	recurrenceID := strings.TrimSpace(r.FormValue("recurrence_id"))
+	recurrenceAllDay := r.FormValue("recurrence_all_day") == "true"
+
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
-		return
+		return false
 	}
 	if cal == nil {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 
-	existing, ok := h.authorizedEventWrite(w, r, user, calendarID, uid)
+	destinationCalendarID, validDestination := requestedDestination(r, calendarID)
+	movingCalendar := validDestination && destinationCalendarID != calendarID
+	var decidedAlso []eventACLScope
+	if movingCalendar {
+		decidedAlso = append(decidedAlso, eventACLScope{calendarID: destinationCalendarID})
+	}
+	existing, guard, ok := h.authorizedEventWrite(w, r, user, cal, uid, decidedAlso...)
 	if !ok {
-		return
+		return false
 	}
 	if !store.ValidMemberName(calendarEventResourceName(uid, existing)) {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": unwritableEventMessage})
-		return
+		return false
+	}
+	if !h.requireOpenedETag(w, r, calendarID, existing) {
+		return false
 	}
 
-	destinationCalendarID := calendarID
-	if rawDestinationID := strings.TrimSpace(r.FormValue("destination_calendar_id")); rawDestinationID != "" {
-		destinationCalendarID, err = strconv.ParseInt(rawDestinationID, 10, 64)
-		if err != nil || destinationCalendarID <= 0 {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid destination calendar"})
-			return
-		}
+	if !validDestination {
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid destination calendar"})
+		return false
 	}
-	movingCalendar := destinationCalendarID != calendarID
 	if movingCalendar && editScope == "occurrence" {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "move the recurring series before editing one occurrence"})
-		return
+		return false
 	}
 
 	resourceName := uid
@@ -1593,66 +1842,67 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	if movingCalendar {
 		if _, err := h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
 			writeEventAccessError(w, err)
-			return
+			return false
 		}
 
 		destinationCalendar, err = h.store.Calendars.GetAccessible(r.Context(), destinationCalendarID, user.ID)
 		if err != nil {
 			http.Error(w, "failed to load destination calendar", http.StatusInternalServerError)
-			return
+			return false
 		}
 		if destinationCalendar == nil {
 			http.Error(w, "destination calendar not found", http.StatusNotFound)
-			return
+			return false
 		}
 		// DAV:bind is a privilege of the calendar the event joins (RFC 3744
 		// section 3.9), so no ACL stored for a member bears on it.
 		if err := h.requireCalendarPrivilege(r.Context(), user, destinationCalendar, calendarACLResourcePath(destinationCalendarID), "bind"); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
-			return
+			return false
 		}
 		if !calendarAcceptsUIWrite(destinationCalendar) {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar does not accept events"})
-			return
+			return false
 		}
 
 		existingByUID, err := h.store.Events.GetByUID(r.Context(), destinationCalendarID, uid)
 		if err != nil {
 			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
-			return
+			return false
 		}
 		existingByName, err := h.store.Events.GetByResourceName(r.Context(), destinationCalendarID, resourceName)
 		if err != nil {
 			http.Error(w, "failed to check destination calendar", http.StatusInternalServerError)
-			return
+			return false
 		}
 		if existingByUID != nil || existingByName != nil {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar already contains this event"})
-			return
+			return false
 		}
 	}
 
 	summary := strings.TrimSpace(r.FormValue("summary"))
 	if summary == "" {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "summary is required"})
-		return
+		return false
 	}
 
 	dtstart := strings.TrimSpace(r.FormValue("dtstart"))
 	dtend := strings.TrimSpace(r.FormValue("dtend"))
 	if dtstart == "" || dtend == "" {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "start and end are required"})
-		return
+		return false
 	}
 
 	allDay := r.FormValue("all_day") == "on"
 	opts := parseEventOptions(r)
 	opts.Object = withoutServerZoneDefinitions(utils.UnfoldLines(existing.RawICAL))
+	opts.EditorAddresses = editorAddresses(user)
 
 	// Validate date format and range
 	if err := utils.ValidateEventDates(dtstart, dtend, allDay, utils.EventZoneIn(opts.Timezone, opts.Object)); err != nil {
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-		return
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+		return false
 	}
 
 	location := strings.TrimSpace(r.FormValue("location"))
@@ -1660,8 +1910,8 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 
 	recurrence, err := utils.ParseRecurrenceOptions(r)
 	if err != nil {
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-		return
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+		return false
 	}
 
 	header, components, footer := utils.SplitComponentLines(opts.Object)
@@ -1670,17 +1920,13 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		// Update only a single occurrence by replacing/adding a RECURRENCE-ID component.
 		override, err := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, nil, "", opts)
 		if err != nil {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-			return
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+			return false
 		}
-		recurrenceZone := strings.TrimSpace(r.FormValue("recurrence_timezone"))
-		if recurrenceZone == "" {
-			recurrenceZone = opts.Timezone
-		}
-		recLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", utils.EventZoneIn(recurrenceZone, opts.Object))
+		recLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "RECURRENCE-ID", occurrenceZone(r, opts.Object))
 		if err != nil {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid occurrence date"})
-			return
+			return false
 		}
 		if recLine != "" {
 			if len(override) >= 2 {
@@ -1691,19 +1937,13 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var newComponents [][]string
-		var previous []string
 		for _, comp := range components {
-			if utils.SameRecurrenceID(comp, override) {
-				previous = comp
-				continue
+			if !utils.SameRecurrenceID(comp, override) {
+				newComponents = append(newComponents, comp)
 			}
-			if previous == nil && utils.RecurrenceIDValue(comp) == "" {
-				previous = comp
-			}
-			newComponents = append(newComponents, comp)
 		}
-		if previous != nil {
-			override = withUneditedOverrideProperties(override, previous, opts)
+		if source := h.overrideSourceOf(existing.RawICAL, opts.Object, components, override); source.previous != nil {
+			override = withUneditedOverrideProperties(override, source, opts)
 		}
 		newComponents = append(newComponents, override)
 		ical = utils.BuildFromComponents(header, newComponents, footer)
@@ -1711,8 +1951,8 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		// Update the series/master event while keeping overrides intact.
 		master, err := utils.BuildEventComponent(uid, summary, dtstart, dtend, allDay, location, description, recurrence, "", opts)
 		if err != nil {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": err.Error()})
-			return
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventFormFlash(r, err)})
+			return false
 		}
 		replaced := false
 		for i, comp := range components {
@@ -1731,33 +1971,47 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	updatedEvent, err := h.validatedEvent(destinationCalendar, resourceName, ical)
 	if err != nil {
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": invalidEventMessage(eventNotSaved, err)})
-		return
+		return false
 	}
 	if movingCalendar {
 		fromPath := calendarEventResourcePath(calendarID, resourceName)
 		toPath := calendarEventResourcePath(destinationCalendarID, resourceName)
-		err = h.store.UpdateAndMoveEventAndState(r.Context(), calendarID, updatedEvent, fromPath, toPath)
+		err = h.store.UpdateAndMoveEventAndState(r.Context(), calendarID, expectedEventState(existing, guard), updatedEvent, fromPath, toPath, moveLockPreconditions(calendarID, destinationCalendarID, resourceName))
 	} else {
-		_, err = h.store.Events.Upsert(r.Context(), updatedEvent)
+		err = h.storeEventEdit(r.Context(), existing, updatedEvent, guard)
 	}
-	if err != nil {
-		message := "failed to update event"
-		if err == store.ErrConflict {
-			message = "destination calendar already contains this event"
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrResourceStateChanged):
+		return true
+	case errors.Is(err, store.ErrPreconditionFailed):
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventChangedElsewhereMessage})
+		return false
+	case errors.Is(err, store.ErrLockConflict):
+		message := eventLockedMessage
+		if movingCalendar {
+			message = eventMoveLockedMessage
 		}
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": message})
-		return
+		return false
+	case movingCalendar && errors.Is(err, store.ErrConflict):
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "destination calendar already contains this event"})
+		return false
+	default:
+		httperrors.LogError(r, "failed to update event", err)
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to update event"})
+		return false
 	}
 
 	h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_updated"})
+	return false
 }
 
-// DeleteEvent removes an event from a calendar.
+// DeleteEvent removes an event from a calendar, or one occurrence of it. The
+// form names the version of the event it was built from, and the removal
+// applies only to that version.
 func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
-	editScope := r.FormValue("edit_scope")
-	recurrenceID := strings.TrimSpace(r.FormValue("recurrence_id"))
-	recurrenceAllDay := r.FormValue("recurrence_all_day") == "true"
 
 	calendarID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -1771,79 +2025,70 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for attempt := 1; ; attempt++ {
+		if !h.deleteEventOnce(w, r, calendarID, uid) {
+			return
+		}
+		if attempt == maxEventWriteAttempts {
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventKeptChangingMessage("deleted")})
+			return
+		}
+	}
+}
+
+// deleteEventOnce decides and carries out one removal. It reports true,
+// having answered nothing, when the write lost to a change of the event or of
+// the access that decided it, made after the decision, which the caller
+// decides again from the event as it then is.
+func (h *Handler) deleteEventOnce(w http.ResponseWriter, r *http.Request, calendarID int64, uid string) (changedConcurrently bool) {
+	editScope := r.FormValue("edit_scope")
+	recurrenceID := strings.TrimSpace(r.FormValue("recurrence_id"))
+	recurrenceAllDay := r.FormValue("recurrence_all_day") == "true"
+
 	user, _ := auth.UserFromContext(r.Context())
 	cal, err := h.store.Calendars.GetAccessible(r.Context(), calendarID, user.ID)
 	if err != nil {
 		http.Error(w, "failed to load calendar", http.StatusInternalServerError)
-		return
+		return false
 	}
 	if cal == nil {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 
 	if editScope == "occurrence" && recurrenceID != "" {
-		existing, ok := h.authorizedEventWrite(w, r, user, calendarID, uid)
+		existing, guard, ok := h.authorizedEventWrite(w, r, user, cal, uid)
 		if !ok {
-			return
+			return false
 		}
 		if !store.ValidMemberName(calendarEventResourceName(uid, existing)) {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": unwritableEventMessage})
-			return
+			return false
+		}
+		if !h.requireOpenedETag(w, r, calendarID, existing) {
+			return false
 		}
 
-		timezone := strings.TrimSpace(r.FormValue("recurrence_timezone"))
-		if timezone == "" {
-			timezone = strings.TrimSpace(r.FormValue("timezone"))
-		}
 		// The occurrence is removed as an edit of it is stored: from the object
 		// less the definitions the server wrote, read in the host's zones,
 		// whose definitions the validator stores afresh.
 		object := withoutServerZoneDefinitions(utils.UnfoldLines(existing.RawICAL))
-		exdateLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "EXDATE", utils.EventZoneIn(timezone, object))
+		exdateLine, err := utils.FormatICalDateTimeIn(recurrenceID, recurrenceAllDay, false, "EXDATE", occurrenceZone(r, object))
 		if err != nil || exdateLine == "" {
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
-			return
+			return false
 		}
-		targetValueParts := strings.SplitN(exdateLine, ":", 2)
-		if len(targetValueParts) != 2 {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "invalid recurrence id"})
-			return
-		}
-		targetValue := targetValueParts[1]
-
 		header, components, footer := utils.SplitComponentLines(object)
-		var newComponents [][]string
-		masterHandled := false
-		targetIdentity := []string{strings.Replace(exdateLine, "EXDATE", "RECURRENCE-ID", 1)}
-		for _, comp := range components {
-			recID := utils.RecurrenceIDValue(comp)
-			if utils.SameRecurrenceID(comp, targetIdentity) {
-				// Drop an overridden occurrence matching the target.
-				continue
-			}
-			if recID == "" && !masterHandled {
-				if !utils.HasPropertyValue(comp, "EXDATE", targetValue) {
-					comp = append(comp, exdateLine)
-				}
-				masterHandled = true
-			}
-			newComponents = append(newComponents, comp)
-		}
+		newComponents, masterHandled := h.withoutOccurrence(existing.RawICAL, object, components, exdateLine, editorAddresses(user))
 
 		if !masterHandled {
 			// No master to update; fall back to deleting the whole event.
 			if _, err := h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
 				writeEventAccessError(w, err)
-				return
+				return false
 			}
 			resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
-			if err := h.store.DeleteEventAndState(r.Context(), calendarID, store.EventDAVResourceState(existing), resourcePath, nil); err != nil {
-				h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
-				return
-			}
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
-			return
+			return h.deleteEventState(w, r, calendarID, expectedEventState(existing, guard), resourcePath)
 		}
 
 		resourceName := uid
@@ -1857,55 +2102,109 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 				message += "; the whole series can still be deleted"
 			}
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": message})
-			return
+			return false
 		}
-		if _, err := h.store.Events.Upsert(r.Context(), updatedEvent); err != nil {
+		err = h.storeEventEdit(r.Context(), existing, updatedEvent, guard)
+		switch {
+		case err == nil:
+		case errors.Is(err, store.ErrResourceStateChanged):
+			return true
+		case errors.Is(err, store.ErrPreconditionFailed):
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventChangedElsewhereMessage})
+			return false
+		case errors.Is(err, store.ErrLockConflict):
+			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
+			return false
+		default:
+			httperrors.LogError(r, "failed to delete occurrence", err)
 			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete occurrence"})
-			return
+			return false
 		}
 		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "occurrence_deleted"})
-	} else {
-		existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
-		if err != nil {
-			http.Error(w, "failed to load event", http.StatusInternalServerError)
-			return
-		}
-		if existing, err = h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
-			writeEventAccessError(w, err)
-			return
-		}
-		if existing == nil {
-			http.Error(w, "event not found", http.StatusNotFound)
-			return
-		}
-		resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
-		if err := h.store.DeleteEventAndState(r.Context(), calendarID, store.EventDAVResourceState(existing), resourcePath, nil); err != nil {
-			h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
-			return
-		}
-		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
+		return false
 	}
-}
 
-// authorizedEventWrite loads the event uid of calendarID for a write needing
-// DAV:write-content on it, as REST and DAV decide that write, and answers the
-// request itself when the write is refused. A user who may not read the event
-// is answered as for a UID the calendar does not hold.
-func (h *Handler) authorizedEventWrite(w http.ResponseWriter, r *http.Request, user *store.User, calendarID int64, uid string) (*store.Event, bool) {
 	existing, err := h.store.Events.GetByUID(r.Context(), calendarID, uid)
 	if err != nil {
 		http.Error(w, "failed to load event", http.StatusInternalServerError)
-		return nil, false
+		return false
 	}
-	if _, existing, err = h.events.AuthorizeEventWrite(r.Context(), user, calendarID, existing, "write-content"); err != nil {
+	resourceName := ""
+	if existing != nil {
+		resourceName = calendarEventResourceName(uid, existing)
+	}
+	guard, err := h.pinEventACL(r.Context(), user, eventACLScope{calendarID: calendarID, calendar: &cal.Calendar, resourceName: resourceName})
+	if err != nil {
+		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		return false
+	}
+	if existing, err = h.events.AuthorizeEventRemoval(r.Context(), user, calendarID, existing); err != nil {
 		writeEventAccessError(w, err)
-		return nil, false
+		return false
 	}
 	if existing == nil {
 		http.Error(w, "event not found", http.StatusNotFound)
-		return nil, false
+		return false
 	}
-	return existing, true
+	if !h.requireOpenedETag(w, r, calendarID, existing) {
+		return false
+	}
+	resourcePath := calendarEventResourcePath(calendarID, calendarEventResourceName(uid, existing))
+	return h.deleteEventState(w, r, calendarID, expectedEventState(existing, guard), resourcePath)
+}
+
+// deleteEventState removes the event expected describes, with the DAV state
+// stored at resourcePath, and answers the request. It reports true, having
+// answered nothing, when the event or the ACL it pins has changed since it was
+// read.
+func (h *Handler) deleteEventState(w http.ResponseWriter, r *http.Request, calendarID int64, expected store.DAVResourceState, resourcePath string) (changedConcurrently bool) {
+	err := h.store.DeleteEventAndState(r.Context(), calendarID, expected, resourcePath, memberLockPreconditions(calendarID, expected.ResourceName))
+	switch {
+	case err == nil:
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"status": "event_deleted"})
+		return false
+	case errors.Is(err, store.ErrResourceStateChanged):
+		return true
+	case errors.Is(err, store.ErrLockConflict):
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": eventLockedMessage})
+		return false
+	default:
+		httperrors.LogError(r, "failed to delete event", err)
+		h.redirectToEventPage(w, r, calendarID, map[string]string{"error": "failed to delete event"})
+		return false
+	}
+}
+
+// authorizedEventWrite loads the event uid of cal for a write needing
+// DAV:write-content on it, as REST and DAV decide that write, and answers the
+// request itself when the write is refused. A user who may not read the event
+// is answered as for a UID the calendar does not hold. It pins the ACL entries
+// that decide the write, those of cal and of the event and those of any scope
+// in also, in the guard it returns for the write to carry.
+func (h *Handler) authorizedEventWrite(w http.ResponseWriter, r *http.Request, user *store.User, cal *store.CalendarAccess, uid string, also ...eventACLScope) (*store.Event, *store.ACLGuard, bool) {
+	existing, err := h.store.Events.GetByUID(r.Context(), cal.ID, uid)
+	if err != nil {
+		http.Error(w, "failed to load event", http.StatusInternalServerError)
+		return nil, nil, false
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = calendarEventResourceName(uid, existing)
+	}
+	guard, err := h.pinEventACL(r.Context(), user, append([]eventACLScope{{calendarID: cal.ID, calendar: &cal.Calendar, resourceName: resourceName}}, also...)...)
+	if err != nil {
+		http.Error(w, "failed to evaluate event access", http.StatusInternalServerError)
+		return nil, nil, false
+	}
+	if _, existing, err = h.events.AuthorizeEventWrite(r.Context(), user, cal.ID, existing, "write-content"); err != nil {
+		writeEventAccessError(w, err)
+		return nil, nil, false
+	}
+	if existing == nil {
+		http.Error(w, "event not found", http.StatusNotFound)
+		return nil, nil, false
+	}
+	return existing, guard, true
 }
 
 // unwritableEventMessage is the flash text for a write refused because the
@@ -2473,6 +2772,7 @@ func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, ons
 	ev, lines := unfolded.event, unfolded.lines
 	payload := map[string]any{
 		"uid":     ev.UID,
+		"etag":    ev.ETag,
 		"ical":    ev.RawICAL,
 		"lastMod": ev.LastModified.Format(time.RFC3339),
 	}
@@ -2572,7 +2872,10 @@ type calendarTimezoneOffset struct {
 // at the instants the browser reads in it. The browser need not know such a
 // zone -- Outlook's "Eastern Standard Time" -- or may define it differently,
 // while the DAV layer reads the object's definition. A zone read through the
-// host's database, which the browser shares, is left out.
+// host's database, which the browser shares, is left out. A name neither the
+// object nor the host defines, which the DAV layer reads in UTC, is listed at
+// a UTC offset, since the browser's own database may know the name in another
+// case.
 //
 // The browser reads the event's and its overrides' own times and UNTIL, and
 // the instances it shows from viewStart to viewEnd; each is listed with two
@@ -2625,6 +2928,13 @@ func calendarEventTimezoneOffsets(event calendarEventMetadata, viewStart, viewEn
 	listings := make(map[string][]calendarTimezoneOffset)
 	for tzid := range tzids {
 		zone := zones.times.Timezone(tzid)
+		if !zone.Defined() {
+			// The server reads a TZID neither the object nor the host
+			// defines in UTC; the browser's Intl, which accepts a name in
+			// any case, must not read it in a zone of its own.
+			listings[tzid] = []calendarTimezoneOffset{{From: merged[0].from.UTC().Format(time.RFC3339), Offset: 0}}
+			continue
+		}
 		var listing []calendarTimezoneOffset
 		listed := true
 		for _, s := range merged {
@@ -2665,6 +2975,7 @@ type calendarEventMetadata struct {
 	DTEnd              *time.Time
 	AllDay             bool
 	Timezone           string
+	Floating           bool
 	Duration           string
 	RRule              string
 	RRuleParsed        map[string]string
@@ -2681,6 +2992,7 @@ type calendarEventMetadata struct {
 	RecurrenceID       *time.Time
 	RecurrenceIDAllDay bool
 	RecurrenceTimezone string
+	RecurrenceFloating bool
 	// RecurrenceRange is "THISANDFUTURE" for an override of its instance and
 	// every later one (RFC 5545 §3.8.4.4), and "" for any other.
 	RecurrenceRange string
@@ -2710,6 +3022,7 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 		payload["dtend"] = m.DTEnd.Format(time.RFC3339)
 	}
 	payload["allDay"] = m.AllDay
+	payload["floating"] = m.Floating
 	if m.Timezone != "" {
 		payload["timezone"] = m.Timezone
 	}
@@ -2756,6 +3069,7 @@ func (m calendarEventMetadata) addToPayload(payload map[string]any) {
 		payload["recurrenceId"] = m.RecurrenceID.Format(time.RFC3339)
 		payload["recurrenceIdAllDay"] = m.RecurrenceIDAllDay
 		payload["recurrenceTimezone"] = m.RecurrenceTimezone
+		payload["recurrenceFloating"] = m.RecurrenceFloating
 		if m.RecurrenceRange != "" {
 			payload["recurrenceRange"] = m.RecurrenceRange
 		}
@@ -2900,7 +3214,8 @@ func parseCalendarEventComponent(lines []string, zones *calendarEventZones) cale
 				event.RecurrenceID = t
 				event.RecurrenceIDAllDay = allDay
 				event.RecurrenceTimezone = params["TZID"]
-				if event.RecurrenceTimezone == "" && !allDay {
+				event.RecurrenceFloating = floatingTime(params, value, allDay)
+				if event.RecurrenceTimezone == "" && !allDay && !event.RecurrenceFloating {
 					event.RecurrenceTimezone = "UTC"
 				}
 				if strings.EqualFold(strings.TrimSpace(params["RANGE"]), "THISANDFUTURE") {
@@ -2917,6 +3232,7 @@ func parseCalendarEventComponent(lines []string, zones *calendarEventZones) cale
 			if t, allDay := parseCalendarEventDate(value, params, zones); t != nil {
 				event.DTStart = t
 				event.AllDay = allDay
+				event.Floating = floatingTime(params, value, allDay)
 			}
 			if tzid := params["TZID"]; tzid != "" {
 				event.Timezone = tzid

@@ -2,6 +2,7 @@ package utils
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/mail"
@@ -23,6 +24,33 @@ func GenerateETag(content string) string {
 	h := sha256.Sum256([]byte(content))
 	return fmt.Sprintf("%x", h)
 }
+
+// The refusals of an event form that a handler tells apart to describe in its
+// own words. Their texts are for logs.
+var (
+	ErrInvalidStart      = errors.New("invalid start date format")
+	ErrInvalidEnd        = errors.New("invalid end date format")
+	ErrEndBeforeStart    = errors.New("end date must not be before start date")
+	ErrInvalidFrequency  = errors.New("invalid recurrence frequency")
+	ErrInvalidDayOfMonth = errors.New("invalid day of month")
+)
+
+// PropertyError is the refusal of the form's value for the iCalendar property
+// Name. Err says what is wrong with a value that cannot be read, and is nil
+// for one that is not an allowed token.
+type PropertyError struct {
+	Name string
+	Err  error
+}
+
+func (e *PropertyError) Error() string {
+	if e.Err == nil {
+		return "invalid " + strings.ToLower(e.Name)
+	}
+	return e.Name + ": " + e.Err.Error()
+}
+
+func (e *PropertyError) Unwrap() error { return e.Err }
 
 // RecurrenceOptions holds recurrence rule parameters.
 type RecurrenceOptions struct {
@@ -53,6 +81,10 @@ type EventOptions struct {
 	Attendees    []string
 	Attachments  []string
 	Reminders    []int
+	// EditorAddresses are the calendar user addresses of the user making an
+	// edit, whose SEQUENCE increment RFC 5545 §3.8.7.4 allows only for the
+	// organizer.
+	EditorAddresses []string
 }
 
 // ParseRecurrenceOptions extracts recurrence options from form data. It fails
@@ -129,7 +161,7 @@ func ParseMonthDays(value string) ([]int, error) {
 	for _, field := range strings.Split(value, ",") {
 		day, err := strconv.Atoi(strings.TrimSpace(field))
 		if err != nil || day == 0 || day < -31 || day > 31 {
-			return nil, fmt.Errorf("invalid day of month %q", strings.TrimSpace(field))
+			return nil, fmt.Errorf("%w %q", ErrInvalidDayOfMonth, strings.TrimSpace(field))
 		}
 		days = append(days, day)
 	}
@@ -147,8 +179,8 @@ func FormatICalDateTime(value string, allDay bool, exclusiveEnd bool, prop strin
 // for prop. An all-day value is a DATE, the day after it when exclusiveEnd is
 // set. A timed value is a wall clock in zone: a named zone gets it as written,
 // with its TZID, so a wall clock the zone skips keeps the reading RFC 5545
-// §3.3.5 gives it rather than one normalized away from it; otherwise it is
-// written in UTC.
+// §3.3.5 gives it rather than one normalized away from it; a floating zone
+// writes it with neither; otherwise it is written in UTC.
 func FormatICalDateTimeIn(value string, allDay bool, exclusiveEnd bool, prop string, zone EventZone) (string, error) {
 	if value == "" {
 		return "", nil
@@ -169,7 +201,10 @@ func FormatICalDateTimeIn(value string, allDay bool, exclusiveEnd bool, prop str
 	if err != nil {
 		return "", err
 	}
-	if zone.tzid != "" {
+	switch {
+	case zone.floating:
+		return fmt.Sprintf("%s:%s", prop, wall.Format("20060102T150405")), nil
+	case zone.tzid != "":
 		return fmt.Sprintf("%s;TZID=%s:%s", prop, quoteParamValue(zone.tzid), wall.Format("20060102T150405")), nil
 	}
 	return fmt.Sprintf("%s:%s", prop, wall.Format("20060102T150405Z")), nil
@@ -181,6 +216,9 @@ type EventZone struct {
 	// tzid is the TZID values are written with, or "" for UTC.
 	tzid string
 	zone ical.ObjectTimezone
+	// floating is true for the zone of a floating series, whose times are
+	// written with neither a TZID nor a Z and are read as UTC.
+	floating bool
 }
 
 // EventZoneIn is the zone tzid names for an event: the zone object, the
@@ -190,6 +228,9 @@ type EventZone struct {
 // TZID, or with one neither the object nor the host defines, in UTC, so saving
 // what the editor shows does not move the event whatever zone the server
 // process runs in.
+//
+// No name at all is the zone of the object's series when that starts at a
+// floating time, whose times an edit keeps floating, and UTC otherwise.
 func EventZoneIn(tzid string, object []string) EventZone {
 	zone, _ := ResolveEventZone(tzid, object)
 	return zone
@@ -200,7 +241,10 @@ func EventZoneIn(tzid string, object []string) EventZone {
 // case, and for a name the object or the host defines.
 func ResolveEventZone(tzid string, object []string) (zone EventZone, known bool) {
 	tzid = strings.TrimSpace(tzid)
-	if tzid == "" || ical.UTCName(tzid) {
+	if tzid == "" {
+		return EventZone{floating: floatingSeries(object)}, true
+	}
+	if ical.UTCName(tzid) {
 		return EventZone{}, true
 	}
 	if !validParamValue(tzid) {
@@ -212,6 +256,70 @@ func ResolveEventZone(tzid string, object []string) (zone EventZone, known bool)
 	}
 	return EventZone{tzid: tzid, zone: defined}, true
 }
+
+// floatingSeries reports whether the series of object, the unfolded content
+// lines of a calendar object, starts at a floating time: the DTSTART of its
+// first VEVENT without a RECURRENCE-ID is a DATE-TIME with neither a TZID nor
+// a Z.
+func floatingSeries(object []string) bool {
+	var start string
+	var override, inEvent bool
+	depth := 0
+	for _, line := range object {
+		upper := strings.ToUpper(strings.TrimSpace(line))
+		switch {
+		case !inEvent:
+			if upper == "BEGIN:VEVENT" {
+				inEvent, depth, start, override = true, 0, "", false
+			}
+		case strings.HasPrefix(upper, "BEGIN:"):
+			depth++
+		case strings.HasPrefix(upper, "END:"):
+			if depth > 0 {
+				depth--
+				continue
+			}
+			if !override {
+				return floatingStart(start)
+			}
+			inEvent = false
+		case depth == 0:
+			keyPart, _, ok := ical.SplitContentLine(line)
+			if !ok {
+				continue
+			}
+			switch strings.ToUpper(strings.TrimSpace(ical.PropertyName(keyPart))) {
+			case "DTSTART":
+				if start == "" {
+					start = line
+				}
+			case "RECURRENCE-ID":
+				override = true
+			}
+		}
+	}
+	return false
+}
+
+// floatingStart reports whether line, a DTSTART content line, is a floating
+// DATE-TIME.
+func floatingStart(line string) bool {
+	keyPart, value, ok := ical.SplitContentLine(line)
+	if !ok {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	if tzid, _ := ical.PropertyParam(keyPart, "TZID"); strings.TrimSpace(tzid) != "" ||
+		ical.PropertyParamEquals(keyPart, "VALUE", "DATE") || strings.HasSuffix(strings.ToUpper(value), "Z") {
+		return false
+	}
+	_, err := ical.ParseDateTime(value)
+	return err == nil && len(value) > len("20060102")
+}
+
+// Floating reports whether the zone is a floating series' own, in which times
+// are written with neither a TZID nor a Z.
+func (z EventZone) Floating() bool { return z.floating }
 
 // Instant is the instant a wall clock in the zone names, held as the UTC time
 // with the same fields, read per RFC 5545 §3.3.5 as the DAV layer reads it.
@@ -265,21 +373,21 @@ func ValidateEventDates(dtstart, dtend string, allDay bool, zone EventZone) erro
 		return err == nil
 	}
 	if !shaped(dtstart) {
-		return fmt.Errorf("invalid start date format")
+		return ErrInvalidStart
 	}
 	if !shaped(dtend) {
-		return fmt.Errorf("invalid end date format")
+		return ErrInvalidEnd
 	}
 	startTime, err := zone.FormInstant(dtstart)
 	if err != nil {
-		return fmt.Errorf("invalid start date format")
+		return ErrInvalidStart
 	}
 	endTime, err := zone.FormInstant(dtend)
 	if err != nil {
-		return fmt.Errorf("invalid end date format")
+		return ErrInvalidEnd
 	}
 	if endTime.Before(startTime) {
-		return fmt.Errorf("end date must not be before start date")
+		return ErrEndBeforeStart
 	}
 	return nil
 }
@@ -309,8 +417,9 @@ func quoteParamValue(value string) string {
 // recurrenceUntil is the RRULE UNTIL value that makes the picked date
 // (YYYY-MM-DD) the last day of a series. RFC 5545 §3.3.10 gives UNTIL the
 // value type of DTSTART: an all-day series takes the DATE, which is inclusive,
-// and a timed one, whose DTSTART is zoned or UTC, takes a UTC DATE-TIME, here
-// the last second of that date in the zone the event's times are read in.
+// a floating one takes a floating DATE-TIME, and a timed one, whose DTSTART is
+// zoned or UTC, takes a UTC DATE-TIME, here the last second of that date in
+// the zone the event's times are read in.
 func recurrenceUntil(date string, allDay bool, zone EventZone) (string, bool) {
 	day, err := time.Parse("2006-01-02", date)
 	if err != nil {
@@ -318,6 +427,9 @@ func recurrenceUntil(date string, allDay bool, zone EventZone) (string, bool) {
 	}
 	if allDay {
 		return day.Format("20060102"), true
+	}
+	if zone.floating {
+		return day.Format("20060102") + "T235959", true
 	}
 	lastSecond := day.Add(24*time.Hour - time.Second)
 	return zone.Instant(lastSecond).Format("20060102T150405Z"), true
@@ -342,7 +454,7 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 	}{{recurrenceID, "RECURRENCE-ID", false}, {dtstart, "DTSTART", false}, {dtend, "DTEND", true}} {
 		line, err := FormatICalDateTimeIn(value.value, allDay, value.end, value.name, zone)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", value.name, err)
+			return nil, &PropertyError{Name: value.name, Err: err}
 		}
 		if line != "" {
 			lines = append(lines, line)
@@ -379,7 +491,7 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 			}
 			value := strings.ToUpper(token.value)
 			if !token.allowed(value) {
-				return nil, fmt.Errorf("invalid %s", strings.ToLower(token.name))
+				return nil, &PropertyError{Name: token.name}
 			}
 			lines = append(lines, token.name+":"+value)
 		}
@@ -412,7 +524,7 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 	if recurrence != nil && recurrence.Frequency != "" && recurrenceID == "" {
 		frequency := strings.ToUpper(recurrence.Frequency)
 		if !recurrenceFrequency(frequency) {
-			return nil, fmt.Errorf("invalid recurrence frequency")
+			return nil, ErrInvalidFrequency
 		}
 		rrule := "RRULE:FREQ=" + frequency
 		if recurrence.Interval > 1 {
@@ -430,7 +542,7 @@ func BuildEventComponent(uid, summary, dtstart, dtend string, allDay bool, locat
 			days := make([]string, len(recurrence.ByMonthDay))
 			for i, day := range recurrence.ByMonthDay {
 				if day == 0 || day < -31 || day > 31 {
-					return nil, fmt.Errorf("invalid day of month %d", day)
+					return nil, fmt.Errorf("%w %d", ErrInvalidDayOfMonth, day)
 				}
 				days[i] = strconv.Itoa(day)
 			}
@@ -1006,17 +1118,17 @@ func (zones calendarTimezones) define(vtimezone []string) {
 // groupTimezones is the VTIMEZONEs defining the zones a group of events name,
 // in the order they are first named. A resource defines each zone once, so a
 // zone named by events from several VCALENDARs is defined as the VCALENDAR of
-// the first event naming it defines it.
+// the first event naming it that defines it.
 func groupTimezones(group []importedEvent, calendarZones []calendarTimezones) [][]string {
 	var definitions [][]string
-	seen := make(map[string]struct{})
+	defined := make(map[string]struct{})
 	for _, event := range group {
 		for _, tzid := range timezoneReferences(event.lines) {
-			if _, ok := seen[tzid]; ok {
+			if _, ok := defined[tzid]; ok {
 				continue
 			}
-			seen[tzid] = struct{}{}
 			if definition, ok := calendarZones[event.calendar][tzid]; ok {
+				defined[tzid] = struct{}{}
 				definitions = append(definitions, definition)
 			}
 		}

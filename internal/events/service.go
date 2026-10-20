@@ -11,6 +11,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/calobject"
+	"github.com/jw6ventures/calcard/internal/httpcond"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
@@ -24,12 +25,27 @@ var (
 	ErrConflict           = errors.New("conflict")
 	ErrPreconditionFailed = errors.New("precondition failed")
 
+	// ErrLocked refuses a write to an event, or to a calendar that is to hold
+	// it, that a WebDAV lock covers. The API submits no lock token, so it
+	// cannot write under one; the lock's holder writes over CalDAV.
+	ErrLocked = errors.New("locked")
+
+	// ErrChangedConcurrently is a write given up because the event or the
+	// access that decided it kept changing while the write was retried. It is
+	// ErrConflict.
+	ErrChangedConcurrently = fmt.Errorf("%w: the event or its access kept changing", ErrConflict)
+
 	// ErrUnwritableName refuses a write that would keep an event under a name
 	// no href carries, such as "." as a 1.1.x release could store it. Such an
 	// event can be read, deleted, or moved over CalDAV to another name. It is
 	// ErrBadRequest.
 	ErrUnwritableName = fmt.Errorf("%w: the event is stored under a name that cannot be kept; it can be read, deleted or moved to another name", ErrBadRequest)
 )
+
+// maxWriteAttempts bounds how often a write is read and decided afresh when
+// another writer changes the event, or the access that decided it, between the
+// decision and the write.
+const maxWriteAttempts = 3
 
 type Service struct {
 	store    *store.Store
@@ -344,7 +360,30 @@ func (s *Service) GetEvent(ctx context.Context, user *store.User, calendarID int
 	return ev, nil
 }
 
+// CreateEvent stores a new event under its UID. The write is conditional on
+// nothing holding the UID or the resource name, so an event another client
+// stores concurrently is not overwritten, and it fails with ErrLocked where a
+// WebDAV lock covers the new name or the calendar. A write that loses to a
+// concurrent change of the calendar's events or of the ACL is decided again,
+// which reports the event another client stored as a conflict and a withdrawn
+// grant as forbidden.
 func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID int64, input UpsertInput) (*store.Event, error) {
+	for attempt := 1; ; attempt++ {
+		event, err := s.createEventOnce(ctx, user, calendarID, input)
+		if !writeLost(err) {
+			return event, err
+		}
+		if attempt == maxWriteAttempts {
+			return nil, ErrChangedConcurrently
+		}
+	}
+}
+
+func (s *Service) createEventOnce(ctx context.Context, user *store.User, calendarID int64, input UpsertInput) (*store.Event, error) {
+	guard, err := s.pinACL(ctx, user, calendarID, "")
+	if err != nil {
+		return nil, err
+	}
 	cal, err := s.GetCalendar(ctx, user, calendarID)
 	if err != nil {
 		return nil, err
@@ -367,6 +406,16 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	if !store.ValidMemberName(uid) {
 		return nil, fmt.Errorf(`%w: uid must be one path segment, neither "." nor "..", without '/'`, ErrBadRequest)
 	}
+	collectionPath := calendarACLCollectionPath(calendarID)
+	lockPreconditions := []store.LockPrecondition{
+		store.NewLockPrecondition(store.MemberStatePath(collectionPath, uid)),
+		store.NewLockPrecondition(collectionPath),
+	}
+	if input.IfMatch != "" || input.IfNoneMatch != "" {
+		if err := writeFailure(s.store.CheckLocks(ctx, lockPreconditions)); err != nil {
+			return nil, err
+		}
+	}
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
 		return nil, err
@@ -382,88 +431,211 @@ func (s *Service) CreateEvent(ctx context.Context, user *store.User, calendarID 
 	// the resource name or the UID, as it does for a DAV PUT that creates: a
 	// create that loses a race to another is refused rather than overwriting
 	// the event the other stored, which needs DAV:write-content.
-	write := store.CalendarObjectWrite{
-		CalendarID:    calendarID,
-		UID:           uid,
-		ResourceName:  uid,
-		RawICAL:       object.Body,
-		ETag:          fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body))),
-		Metadata:      &object.Metadata,
-		ExpectedState: &store.CalendarObjectResourceState{Exists: false},
-	}
-	result, err := s.store.PutCalendarObject(ctx, write)
+	result, err := s.store.PutCalendarObject(ctx, store.CalendarObjectWrite{
+		CalendarID:        calendarID,
+		UID:               uid,
+		ResourceName:      uid,
+		RawICAL:           object.Body,
+		ETag:              fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body))),
+		Metadata:          &object.Metadata,
+		ExpectedState:     &store.CalendarObjectResourceState{Exists: false},
+		ExpectedACL:       guard,
+		LockPreconditions: lockPreconditions,
+	})
 	switch {
-	case errors.Is(err, store.ErrResourceStateChanged):
-		if input.IfNoneMatch == "*" {
-			return nil, ErrPreconditionFailed
-		}
-		return nil, ErrConflict
-	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
-		return nil, ErrConflict
 	case err != nil:
-		return nil, err
+		return nil, writeFailure(err)
 	case result == nil || result.Event == nil:
 		return nil, fmt.Errorf("calendar object write returned no event for %q in calendar %d", uid, calendarID)
 	}
 	return result.Event, nil
 }
 
+// UpdateEvent replaces the event uid names. The write is conditional on the
+// version the request was decided on: a request's If-Match or If-None-Match
+// is checked against the version each attempt reads, so it fails only when
+// the event itself changed, not when only the ACL did. An event removed
+// between the decision and the write is not stored again. A write that loses
+// to a concurrent change of the event or of the ACL is decided again, and
+// fails with ErrLocked where a WebDAV lock covers the event.
 func (s *Service) UpdateEvent(ctx context.Context, user *store.User, calendarID int64, uid string, input UpsertInput) (*store.Event, bool, error) {
+	for attempt := 1; ; attempt++ {
+		event, err := s.updateEventOnce(ctx, user, calendarID, uid, input)
+		if !writeLost(err) {
+			return event, false, err
+		}
+		if attempt == maxWriteAttempts {
+			return nil, false, ErrChangedConcurrently
+		}
+	}
+}
+
+func (s *Service) updateEventOnce(ctx context.Context, user *store.User, calendarID int64, uid string, input UpsertInput) (*store.Event, error) {
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
 	if err != nil {
-		return nil, false, err
+		return nil, err
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = eventResourceName(*existing)
+	}
+	guard, err := s.pinACL(ctx, user, calendarID, resourceName)
+	if err != nil {
+		return nil, err
 	}
 	cal, existing, err := s.AuthorizeEventWrite(ctx, user, calendarID, existing, "write-content")
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if existing == nil {
-		return nil, false, ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err := writableEventName(*existing); err != nil {
-		return nil, false, err
+		return nil, err
+	}
+	lockPreconditions := []store.LockPrecondition{store.NewLockPrecondition(store.MemberStatePath(calendarACLCollectionPath(calendarID), resourceName))}
+	if input.IfMatch != "" || input.IfNoneMatch != "" {
+		if err := writeFailure(s.store.CheckLocks(ctx, lockPreconditions)); err != nil {
+			return nil, err
+		}
 	}
 	if !checkConditionalHeaders(input.IfMatch, input.IfNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
+		return nil, ErrPreconditionFailed
 	}
 
 	object, err := s.normalizeEventPayload(input, uid, cal)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	event, created, err := s.saveEvent(ctx, calendarID, uid, eventResourceName(*existing), object, input.IfMatch, input.IfNoneMatch)
-	return event, created, err
+	result, err := s.store.PutCalendarObject(ctx, store.CalendarObjectWrite{
+		CalendarID:   calendarID,
+		UID:          uid,
+		ResourceName: resourceName,
+		RawICAL:      object.Body,
+		ETag:         fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body))),
+		Metadata:     &object.Metadata,
+		// The version read is the one the request's own conditions were checked
+		// against, so holding the write to it holds them too.
+		Precondition:      store.CalendarObjectPrecondition{IfMatch: &store.ETagCondition{ETags: []string{existing.ETag}}},
+		ExpectedState:     &store.CalendarObjectResourceState{Exists: true},
+		ExpectedACL:       guard,
+		LockPreconditions: lockPreconditions,
+	})
+	switch {
+	case err != nil:
+		return nil, writeFailure(err)
+	case result == nil || result.Event == nil:
+		return nil, fmt.Errorf("calendar object write returned no event for %q in calendar %d", uid, calendarID)
+	}
+	return result.Event, nil
 }
 
+// DeleteEvent removes the event uid names, honouring If-Match and
+// If-None-Match. It is decided as a DAV DELETE of the event is: see
+// AuthorizeEventRemoval, and it fails with ErrLocked where a WebDAV lock
+// covers the event or the calendar. An event that is not there, or that the
+// user is answered about as if it were not, is ErrNotFound whatever the
+// preconditions, which RFC 9110 section 13.2.1 has a server ignore when its
+// answer without them would be neither 2xx nor 412. A delete that loses to a
+// concurrent change of the event or of the ACL is decided again, and the
+// caller's preconditions are checked again against the event as it then reads.
 func (s *Service) DeleteEvent(ctx context.Context, user *store.User, calendarID int64, uid, ifMatch, ifNoneMatch string) error {
+	for attempt := 1; ; attempt++ {
+		err := s.deleteEventOnce(ctx, user, calendarID, uid, ifMatch, ifNoneMatch)
+		if !writeLost(err) {
+			return err
+		}
+		if attempt == maxWriteAttempts {
+			return ErrChangedConcurrently
+		}
+	}
+}
+
+func (s *Service) deleteEventOnce(ctx context.Context, user *store.User, calendarID int64, uid, ifMatch, ifNoneMatch string) error {
 	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
+	if err != nil {
+		return err
+	}
+	resourceName := ""
+	if existing != nil {
+		resourceName = eventResourceName(*existing)
+	}
+	guard, err := s.pinACL(ctx, user, calendarID, resourceName)
 	if err != nil {
 		return err
 	}
 	if existing, err = s.AuthorizeEventRemoval(ctx, user, calendarID, existing); err != nil {
 		return err
 	}
-	// RFC 9110 §13.2.1: a precondition is not evaluated where the request
-	// would otherwise answer neither 2xx nor 412, as it does for an event
-	// that is not there.
 	if existing == nil {
 		return ErrNotFound
+	}
+	resourcePaths := calendarACLResourcePaths(calendarID, resourceName)
+	if len(resourcePaths) == 0 {
+		return ErrNotFound
+	}
+	lockPreconditions := []store.LockPrecondition{
+		store.NewLockPrecondition(resourcePaths[0]),
+		store.NewLockPrecondition(calendarACLCollectionPath(calendarID)),
+	}
+	if ifMatch != "" || ifNoneMatch != "" {
+		if err := writeFailure(s.store.CheckLocks(ctx, lockPreconditions)); err != nil {
+			return err
+		}
 	}
 	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
 		return ErrPreconditionFailed
 	}
-	resourcePaths := calendarACLResourcePaths(calendarID, eventResourceName(*existing))
-	if len(resourcePaths) == 0 {
-		return ErrNotFound
-	}
-	err = s.store.DeleteEventAndState(ctx, calendarID, store.EventDAVResourceState(existing), resourcePaths[0], nil)
-	if errors.Is(err, store.ErrResourceStateChanged) {
-		if ifMatch != "" || ifNoneMatch != "" {
-			return ErrPreconditionFailed
-		}
+	expected := store.EventDAVResourceState(existing)
+	expected.ACL = guard
+	err = s.store.DeleteEventAndState(ctx, calendarID, expected, resourcePaths[0], lockPreconditions)
+	return writeFailure(err)
+}
+
+// writeLost reports whether err means the write found the event, or the ACL
+// it was decided on, other than the decision read them, so the caller reads
+// and decides again.
+func writeLost(err error) bool {
+	return errors.Is(err, store.ErrResourceStateChanged) || errors.Is(err, store.ErrPreconditionFailed)
+}
+
+// writeFailure maps the store's refusal of an event write onto this API's
+// errors, leaving a write that lost to a concurrent change for the caller to
+// decide again.
+func writeFailure(err error) error {
+	switch {
+	case errors.Is(err, store.ErrLockConflict):
+		return ErrLocked
+	case errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrConflict):
 		return ErrConflict
 	}
 	return err
+}
+
+// pinACL pins the ACL entries that decide user's access to calendarID and, when
+// resourceName is set, to the event it names, for the store to check again
+// under the write's locks: an ACL change landing between the decision and the
+// write fails the write with store.ErrResourceStateChanged, and the caller
+// decides again on the new ACL. Pin before deciding, so that the guard cannot
+// hold entries newer than the decision's. A calendar the user owns has none,
+// since an owner's privileges do not come from the ACL, and the guard is nil.
+func (s *Service) pinACL(ctx context.Context, user *store.User, calendarID int64, resourceName string) (*store.ACLGuard, error) {
+	if s.store.ACLEntries == nil || s.store.Calendars == nil {
+		return nil, nil
+	}
+	cal, err := s.store.Calendars.GetByID(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	if cal == nil || (user != nil && cal.UserID == user.ID) {
+		return nil, nil
+	}
+	paths := append(calendarACLResourcePaths(calendarID, resourceName), calendarACLCollectionPath(calendarID))
+	entries, err := s.store.ACLEntries.ListByResources(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+	return store.NewACLGuard(paths, entries), nil
 }
 
 // AuthorizeEventRemoval decides taking existing out of calendarID, by deleting
@@ -858,42 +1030,6 @@ func calendarObjectError(err error) error {
 	return fmt.Errorf("%w: %s", ErrBadRequest, conditions)
 }
 
-func (s *Service) saveEvent(ctx context.Context, calendarID int64, uid, resourceName string, object *calobject.Object, ifMatch, ifNoneMatch string) (*store.Event, bool, error) {
-	existingByResource, err := s.store.Events.GetByResourceName(ctx, calendarID, resourceName)
-	if err != nil {
-		return nil, false, err
-	}
-	if existingByResource != nil && existingByResource.UID != uid {
-		return nil, false, ErrConflict
-	}
-
-	existing, err := s.store.Events.GetByUID(ctx, calendarID, uid)
-	if err != nil {
-		return nil, false, err
-	}
-	if existing != nil && existing.ResourceName != "" && existing.ResourceName != resourceName {
-		return nil, false, ErrConflict
-	}
-	if !checkConditionalHeaders(ifMatch, ifNoneMatch, existing) {
-		return nil, false, ErrPreconditionFailed
-	}
-
-	etag := fmt.Sprintf("%x", sha256.Sum256([]byte(object.Body)))
-	created := existing == nil
-	ev, err := s.store.Events.Upsert(ctx, store.Event{
-		CalendarID:    calendarID,
-		UID:           uid,
-		ResourceName:  resourceName,
-		RawICAL:       object.Body,
-		ETag:          etag,
-		WriteMetadata: &object.Metadata,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	return ev, created, nil
-}
-
 func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, string, error) {
 	summary := strings.TrimSpace(input.Summary)
 	if summary == "" {
@@ -976,23 +1112,14 @@ func buildStructuredEvent(input *StructuredInput, expectedUID string) (string, s
 	return body, uid, nil
 }
 
+// checkConditionalHeaders evaluates a request's If-Match and If-None-Match
+// against the event it writes, which is nil where there is none.
 func checkConditionalHeaders(ifMatch, ifNoneMatch string, existing *store.Event) bool {
-	if ifNoneMatch == "*" {
-		return existing == nil
+	etag := ""
+	if existing != nil {
+		etag = existing.ETag
 	}
-	if ifMatch != "" {
-		if existing == nil {
-			return false
-		}
-		return strings.Trim(ifMatch, "\"") == existing.ETag
-	}
-	if ifNoneMatch != "" {
-		if existing == nil {
-			return true
-		}
-		return strings.Trim(ifNoneMatch, "\"") != existing.ETag
-	}
-	return true
+	return httpcond.Check(ifMatch, ifNoneMatch, etag, existing != nil)
 }
 
 func ensureCRLF(body string) string {
@@ -1008,6 +1135,8 @@ func StatusCode(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, ErrForbidden):
 		return http.StatusForbidden
+	case errors.Is(err, ErrLocked):
+		return http.StatusLocked
 	case errors.Is(err, ErrConflict):
 		return http.StatusConflict
 	case errors.Is(err, ErrPreconditionFailed):
