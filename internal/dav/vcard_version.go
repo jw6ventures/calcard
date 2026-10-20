@@ -148,8 +148,9 @@ var (
 // vcardLine is one unfolded content line: an optional group prefix, the
 // property name as it was written, its parameters in the order they were
 // written, and the raw (still escaped) value. Property names are compared
-// case-insensitively but kept verbatim, so conversion never rewrites a
-// spelling a client may recognise by sight (Apple's X-ABLabel, say).
+// case-insensitively but kept verbatim, so conversion never rewrites the
+// spelling of a name it does not map, which a client may recognise by sight
+// (Apple's X-ABLabel, say).
 type vcardLine struct {
 	group  string
 	name   string
@@ -241,10 +242,9 @@ func convertVCardVersion(raw, target string) (string, bool) {
 		// back converted as far as it goes: refusing it would hide the resource
 		// from the client for good, since the sync token advances either way
 		// and the card is never asked for again. A *valid* card that will not
-		// convert is the real
-		// CARDDAV:supported-address-data-conversion precondition, and with the
-		// repairs above nothing should reach it -- which is what makes this
-		// worth checking rather than assuming.
+		// convert is the real CARDDAV:supported-address-data-conversion
+		// precondition, and with the repairs above nothing should reach it --
+		// which is what makes this worth checking rather than assuming.
 		if validateVCardForVersion(raw, source) == nil {
 			return "", false
 		}
@@ -459,9 +459,9 @@ func upgradeBinaryValue(line *vcardLine, name string) {
 	line.value = "data:" + mediaType + ";base64," + withoutBase64Whitespace(line.value)
 }
 
-// withoutBase64Whitespace drops the whitespace a folded inline base64 value
-// keeps after unfolding -- every indentation character past the first -- which
-// a data: URI may not hold (RFC 2397).
+// withoutBase64Whitespace drops every white space character from an inline
+// base64 value, such as the indentation a folded value keeps after unfolding,
+// which a data: URI may not hold (RFC 2397).
 func withoutBase64Whitespace(value string) string {
 	return strings.Map(func(r rune) rune {
 		switch r {

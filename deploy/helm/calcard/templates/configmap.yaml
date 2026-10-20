@@ -87,4 +87,10 @@ data:
   {{- if hasKey . "syncHistoryRetention" }}
   APP_DAV_SYNC_HISTORY_RETENTION: {{ .syncHistoryRetention | quote }}
   {{- end }}
+  {{- if hasKey . "reportTimeout" }}
+  {{- if not (regexMatch "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" (toString .reportTimeout)) }}
+  {{- fail (printf "app.dav.reportTimeout must be a Go duration such as 10s, or 0, got %v" .reportTimeout) }}
+  {{- end }}
+  APP_DAV_REPORT_TIMEOUT: {{ .reportTimeout | quote }}
+  {{- end }}
   {{- end }}

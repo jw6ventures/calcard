@@ -50,7 +50,7 @@ func TestObjectTimesResolveATZIDAsTheMatcherDoes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := NewObjectTimes(tt.lines).ResolvePropertyTime(tt.keyPart, tt.value)
+			got, ok := NewObjectTimes(tt.lines, nil, nil).ResolvePropertyTime(tt.keyPart, tt.value)
 			if !ok {
 				t.Fatalf("ResolvePropertyTime(%s:%s) ok = false", tt.keyPart, tt.value)
 			}
@@ -59,7 +59,7 @@ func TestObjectTimesResolveATZIDAsTheMatcherDoes(t *testing.T) {
 			}
 		})
 	}
-	if _, ok := NewObjectTimes(outlookEasternObject).ResolvePropertyTime("DTSTART", "not a date"); ok {
+	if _, ok := NewObjectTimes(outlookEasternObject, nil, nil).ResolvePropertyTime("DTSTART", "not a date"); ok {
 		t.Error("an unparseable value resolved")
 	}
 }
@@ -114,14 +114,14 @@ type countingOnsets struct {
 	asked    int
 }
 
-func (c *countingOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
+func (c *countingOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string, work *ObservanceWork) (time.Time, bool, bool) {
 	c.asked++
-	return c.listings.LatestOnOrBefore(dtstart, before, rrule)
+	return c.listings.LatestOnOrBefore(dtstart, before, rrule, work)
 }
 
-func (c *countingOnsets) StartsBetween(dtstart, after, through time.Time, rrule string) ([]time.Time, bool) {
+func (c *countingOnsets) StartsBetween(dtstart, after, through time.Time, rrule string, work *ObservanceWork) ([]time.Time, bool) {
 	c.asked++
-	return c.listings.StartsBetween(dtstart, after, through, rrule)
+	return c.listings.StartsBetween(dtstart, after, through, rrule, work)
 }
 
 // The recurrence-limit check and the recurrence bounds read an object's dates
@@ -140,7 +140,7 @@ func TestRecurrenceReadersShareTheObjectsTimes(t *testing.T) {
 		"BEGIN:VEVENT\r\nUID:x\r\nRECURRENCE-ID;TZID=\"Eastern Standard Time\":20240325T090000\r\n" +
 		"DTSTART;TZID=\"Eastern Standard Time\":20240325T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
 	onsets := &countingOnsets{listings: onsetListings{}}
-	times := NewObjectTimesSharingOnsets(lines, onsets)
+	times := NewObjectTimes(lines, onsets, nil)
 	if _, ok := times.ResolvePropertyTime(`DTSTART;TZID="Eastern Standard Time"`, "20240304T090000"); !ok {
 		t.Fatal("DTSTART does not resolve")
 	}

@@ -45,7 +45,13 @@
             "maxAddressDataProperties": { "type": "integer", "minimum": 0 },
             "maxRequestedProperties": { "type": "integer", "minimum": 0 },
             "maxMultigetHrefs": { "type": "integer", "minimum": 0 },
-            "maxReportCandidateRows": { "type": "integer", "minimum": 0 }
+            "maxReportCandidateRows": { "type": "integer", "minimum": 0 },
+            "reportTimeout": {
+              "oneOf": [
+                { "type": "string", "pattern": "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" },
+                { "type": "integer", "const": 0 }
+              ]
+            }
           }
         }
       }

@@ -57,18 +57,19 @@ const grammarVEventFilter = `<C:comp-filter name="VCALENDAR"><C:comp-filter name
 // test about placement or cardinality has to carry a real definition.
 var grammarVTimezone = grammarVTimezoneFor("Etc/UTC")
 
-// grammarVTimezoneFor builds that definition for any TZID. The observance is a
-// zero-offset placeholder, which is all a test about the element itself needs;
-// a test about how values resolve names an IANA zone and lets the host's tzdata
-// supply the real offsets.
-// grammarChicagoVTimezone is chicagoVTimezone with the line breaks written as
-// the XML character references a CALDAV:timezone element carries them as.
+// grammarChicagoVTimezone is chicagoVTimezone in a VCALENDAR, with the line
+// breaks written as the XML character references a CALDAV:timezone element
+// carries them as.
 func grammarChicagoVTimezone() string {
 	return `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
 		strings.ReplaceAll(chicagoVTimezone(), "\r\n", "&#13;&#10;") +
 		`END:VCALENDAR&#13;&#10;`
 }
 
+// grammarVTimezoneFor builds that definition for any TZID. The observance is a
+// zero-offset placeholder, which is all a test about the element itself needs;
+// a test about how values resolve names an IANA zone and lets the host's tzdata
+// supply the real offsets.
 func grammarVTimezoneFor(tzid string) string {
 	return `BEGIN:VCALENDAR&#13;&#10;VERSION:2.0&#13;&#10;PRODID:-//test//EN&#13;&#10;` +
 		`BEGIN:VTIMEZONE&#13;&#10;TZID:` + tzid + `&#13;&#10;BEGIN:STANDARD&#13;&#10;DTSTART:19700101T000000&#13;&#10;` +
@@ -996,8 +997,8 @@ func TestRFC4791_ReportPropertySelectorsSelectDifferentBodies(t *testing.T) {
 		ms := decodeMultistatus(t, runCalendarReport(t, query(`<D:allprop/>`)))
 		resp := ms.responseForHref(t, href)
 		resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag"`)
-		// §5.2.x and §9.6: allprop carries neither the CalDAV limit properties
-		// nor the calendar-data selector.
+		// §7.5.1 and §9.6: allprop carries neither supported-collation-set nor
+		// the calendar-data selector.
 		resp.assertPropAbsent(t, calQN("calendar-data"))
 		resp.assertPropAbsent(t, calQN("supported-collation-set"))
 	})
@@ -1080,7 +1081,7 @@ func TestFilterOverTheElementLimitFailsValidFilter(t *testing.T) {
 
 func TestFilterAtTheElementLimitIsEvaluated(t *testing.T) {
 	// The filter, its two comp-filters and the prop-filters below it are all
-	// counted, so the body stops just short of the default limit.
+	// counted, so the body lands exactly on the default limit.
 	var props strings.Builder
 	for i := 0; i < defaultMaxFilterElements-3; i++ {
 		fmt.Fprintf(&props, `<C:prop-filter name="SUMMARY-%d"/>`, i)

@@ -170,19 +170,20 @@ func TestIndexedTimezoneObservancesSearchTheOnsetsTheyState(t *testing.T) {
 }
 
 // Every lookup through the definitions one reading of an object holds walks a
-// rule no listing answers on the reading's one budget. A zone that moves its
-// clock forward at every second costs a day of candidates for each walk, and a
-// series asks for one per instance, so walks on budgets of their own would cost
-// a budget per instance. The reading answers lookups as each walk on its own
-// budget answers them until its budget is spent, and every lookup after that,
-// through any of the object's zones, is incomplete without walking again.
-func TestAReadingWalksItsObservanceRulesOnOneBudget(t *testing.T) {
+// rule no listing answers on the reading's one budget for that rule. A zone
+// that moves its clock forward at every second costs a day of candidates for
+// each walk, and a series asks for one per instance, so walks on budgets of
+// their own would cost a budget per instance. The reading answers lookups as
+// each walk on its own budget answers them until the rule's budget is spent,
+// and every lookup of that rule after, through any of the object's zones, is
+// incomplete without walking again.
+func TestAReadingWalksItsObservanceRulesOnOneBudgetEach(t *testing.T) {
 	every := "FREQ=DAILY;BYHOUR=" + everyValue(0, 23) + ";BYMINUTE=" + everyValue(0, 59) + ";BYSECOND=" + everyValue(0, 59)
 	observances := TimezoneObservances{
 		observanceAt(wallAt(1601, 1, 1, 0), 0, 0, nil),
 		observanceAt(wallAt(1601, 1, 1, 2), 0, time.Second, nil, every),
 	}
-	work := NewObservanceWork()
+	work := NewObservanceWork(nil)
 	reading := IndexTimezoneObservances(observances, work)
 	answered := 0
 	for day := range 1000 {
@@ -202,8 +203,8 @@ func TestAReadingWalksItsObservanceRulesOnOneBudget(t *testing.T) {
 	if answered == 0 || answered >= 1000 {
 		t.Fatalf("answered %d of 1000 lookups, want the reading's budget spent partway", answered)
 	}
-	if work.work.remaining >= 0 {
-		t.Fatalf("%d units left after the reading stopped answering", work.work.remaining)
+	if spent := work.ruleWalks[ruleKey(observances[1].Start, every)]; spent < recurrenceWorkLimit-dayOfCandidates || spent > recurrenceWorkLimit {
+		t.Fatalf("the rule's walks spent %d units, want what one evaluation may spend, %d", spent, recurrenceWorkLimit)
 	}
 	if _, known := reading.Skips(time.Date(2030, 1, 1, 9, 30, 0, 0, time.UTC), nil); known {
 		t.Error("Skips walked the rule on a spent budget")
@@ -214,5 +215,33 @@ func TestAReadingWalksItsObservanceRulesOnOneBudget(t *testing.T) {
 	otherZone := IndexTimezoneObservances(observances, work)
 	if _, ok := otherZone.OffsetAtWall(time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC), nil); ok {
 		t.Error("another zone of the same reading walked the rule on the spent budget")
+	}
+}
+
+// dayOfCandidates is the most one walk of the rule above spends past the last
+// unit the rule's budget holds: a day of its candidates, 86,400 and the day
+// list.
+const dayOfCandidates = 2 * 86_401
+
+// A rule that has spent its budget leaves the reading's walks to the others: a
+// definition of many observances is followed rule by rule, and one dense rule
+// among them ends only its own lookups.
+func TestADenseObservanceRuleSpendsOnlyItsOwnWalks(t *testing.T) {
+	every := "FREQ=DAILY;BYHOUR=" + everyValue(0, 23) + ";BYMINUTE=" + everyValue(0, 59) + ";BYSECOND=" + everyValue(0, 59)
+	observances := TimezoneObservances{
+		observanceAt(wallAt(1601, 1, 1, 0), 0, 0, nil),
+		observanceAt(wallAt(1601, 1, 1, 2), 0, time.Second, nil, every),
+		observanceAt(wallAt(1601, 1, 1, 3), 0, time.Hour, nil, "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU"),
+	}
+	reading := IndexTimezoneObservances(observances, NewObservanceWork(nil))
+	for day := range 100 {
+		reading.OffsetAtWall(time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC).AddDate(0, 0, day), nil)
+	}
+	if _, known := reading.Skips(time.Date(2030, 1, 1, 9, 30, 0, 0, time.UTC), nil); known {
+		t.Error("the dense rule was walked on after its budget was spent")
+	}
+	other := TimezoneObservances{observances[0], observanceAt(wallAt(1601, 1, 1, 4), 0, time.Hour, nil, "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU")}
+	if _, known := IndexTimezoneObservances(other, reading.work).Skips(time.Date(2030, 1, 1, 9, 30, 0, 0, time.UTC), nil); !known {
+		t.Error("a rule that had spent nothing was refused for the dense one's spending")
 	}
 }

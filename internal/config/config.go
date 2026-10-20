@@ -109,6 +109,14 @@ type Config struct {
 		// whose tombstones the old window already pruned, and the deletions
 		// between the two windows are then never reported.
 		SyncHistoryRetention time.Duration
+		// ReportTimeout is how long one REPORT may run before the server
+		// stops it and answers DAV:number-of-matches-within-limits (a
+		// calendar-multiget answers 507, as it does for its href limit).
+		// It is the time the report's queries and its recurrence work share,
+		// and is kept below HTTP.WriteTimeout so the answer can still be
+		// written. Zero turns the deadline off, as it does for the other DAV
+		// limits.
+		ReportTimeout time.Duration
 	}
 
 	// PprofEnabled exposes net/http/pprof on a dedicated debug listener
@@ -228,6 +236,10 @@ func Load() (*Config, error) {
 	// as its own example of a retention a server may hold, so a client syncing
 	// anything like regularly is never sent back for a full synchronization.
 	cfg.DAV.SyncHistoryRetention, err = getenvWindowDefault("APP_DAV_SYNC_HISTORY_RETENTION", 90*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DAV.ReportTimeout, err = getenvWindowDefault("APP_DAV_REPORT_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return nil, err
 	}

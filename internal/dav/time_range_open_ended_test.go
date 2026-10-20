@@ -126,9 +126,9 @@ func TestOpenTimeRangeEndIsUnreachableFromASpelledValue(t *testing.T) {
 	}
 }
 
-// The same range against the frequency that makes expansion expensive. The
+// An omitted end against the frequency that makes expansion expensive. The
 // budget still has to hold: an omitted attribute widens the range, so it must
-// not become a way to ask for work a spelled range would be refused.
+// not become a way to ask for unbounded work.
 func TestOpenEndedTimeRangeStaysBoundedForSubSecondRecurrence(t *testing.T) {
 	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:subject\r\n" +
 		"DTSTAMP:20240101T000000Z\r\nDTSTART:20240101T000000Z\r\nDTEND:20240101T000001Z\r\nRRULE:FREQ=SECONDLY\r\n" +

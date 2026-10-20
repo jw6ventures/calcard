@@ -16,7 +16,7 @@ import (
 // §1.2 reserves the namespace for exactly these, so anything CalCard invents
 // belongs in a namespace of its own.
 var calDAVSpecifiedElements = map[string]string{
-	// §4.2, §5.2 properties.
+	// §4.2, §5.2, §6.2.1 and §7.5.1 properties, and the §9.4 collation element.
 	"calendar":                         "RFC 4791 §4.2",
 	"calendar-description":             "RFC 4791 §5.2.1",
 	"calendar-timezone":                "RFC 4791 §5.2.2",
@@ -168,8 +168,8 @@ var namespaceAudits = []namespaceAudit{
 	},
 }
 
-// cPrefixUse finds the hand-written error bodies that bind the prefix "C" and
-// then spell an element with it. Both namespaces use that prefix, so the
+// cPrefixBinding and cPrefixElement find the hand-written bodies that bind the
+// prefix "C" and then spell an element with it. Both namespaces use that prefix, so the
 // binding decides which audit the name belongs to; attributing it by prefix
 // alone would let a CardDAV element hide inside a CalDAV body and the reverse.
 var (

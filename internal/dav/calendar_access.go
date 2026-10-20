@@ -61,11 +61,11 @@ var calendarCurrentPrivilegeNames = []string{
 	"write", "write-content", "write-properties", "bind", "unbind", "write-acl", "unlock",
 }
 
-// calendarPrivilegeContext carries one resolution of everything a calendar
-// privilege decision depends on — canonical path, ownership, and the ACL
-// entries for the resource and its collection — so callers evaluating several
-// privileges (privilege sets, any-privilege probes) resolve the path and read
-// the entries once instead of once per privilege.
+// calendarPrivilegeContext carries what a calendar privilege decision depends
+// on once the canonical path is resolved — ownership, the applicable
+// principals, and the ACL entries for the resource and its collection — so
+// callers evaluating several privileges (privilege sets, any-privilege probes)
+// resolve the path and read the entries once instead of once per privilege.
 type calendarPrivilegeContext struct {
 	owner                bool
 	principals           map[string]struct{}

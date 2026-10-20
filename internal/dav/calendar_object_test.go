@@ -27,7 +27,7 @@ func writableCalendarServer() (*DavServer, *fakeEventRepo) {
 	return &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}, eventRepo
 }
 
-// buildVTimezone returns the smallest VTIMEZONE RFC 5545 §3.6.5 admits, so a
+// buildVTimezone returns a minimal VTIMEZONE, one zero-offset observance, so a
 // case exercising a TZID parameter rule is not also exercising the §4.1 rule
 // that every referenced TZID is defined.
 func buildVTimezone(tzid string) string {
@@ -233,8 +233,6 @@ func TestSubmittedVTimezoneResolverAppliesRecurringObservances(t *testing.T) {
 	}
 }
 
-// submittedOffset is the offset the definition the object ships for tzid reads
-// wall with.
 func submittedOffset(root *icalNode, tzid string, wall time.Time) (time.Duration, bool) {
 	observances, ok := submittedTimezoneObservances(root, tzid)
 	if !ok {
@@ -359,7 +357,6 @@ func TestRFC4791_DateLimitsIncludeExplicitlyTypedExtensionProperties(t *testing.
 	}
 }
 
-// fixedOffsetVTimezone defines tzid as a zone at one constant UTC offset.
 func fixedOffsetVTimezone(tzid, offset string) string {
 	return buildComponent("VTIMEZONE", "TZID:"+tzid,
 		buildComponent("STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:"+offset, "TZOFFSETTO:"+offset))
@@ -824,7 +821,7 @@ func TestRFC4791_PutSupportsInlineAttachmentsBoundedByMaxResourceSize(t *testing
 // Section 5.3.3 (RFC 2445 §4.2): a non-standard property the server itself puts
 // into calendar data carries a vendor id, so it cannot collide with another
 // implementation's property of the same name. The generated birthday collection
-// is the only calendar data CalCard authors.
+// is the server-authored calendar data this checks.
 func TestRFC4791_ServerAuthoredNonStandardPropertiesCarryVendorID(t *testing.T) {
 	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
 	name := "Jane Doe"
@@ -1009,7 +1006,7 @@ func TestRFC7986_CalendarPropertiesOutsideRFC5545AreKeptAsWritten(t *testing.T) 
 	if stored := eventRepo.events[eventRepo.key(1, "kept")]; stored == nil || stored.RawICAL != raw {
 		t.Fatalf("stored %#v, want the submitted octets", stored)
 	}
-	if _, fault := validateTransferredCalendarObject(raw, nil); fault != nil {
+	if _, fault := validateTransferredCalendarObject(raw, nil, nil); fault != nil {
 		t.Errorf("transfer refused the object: %+v", fault)
 	}
 }
@@ -1051,7 +1048,7 @@ func TestRFC7986_StoredCalendarPropertiesAreTransferredAsTheyAre(t *testing.T) {
 			if _, fault := validateCalendarObjectForStorage(raw, nil); fault == nil {
 				t.Fatal("PUT accepts the fixture, so it does not exercise a stored object")
 			}
-			validated, fault := validateTransferredCalendarObject(raw, nil)
+			validated, fault := validateTransferredCalendarObject(raw, nil, nil)
 			if fault != nil {
 				t.Fatalf("transfer refused the stored object: %+v", fault)
 			}

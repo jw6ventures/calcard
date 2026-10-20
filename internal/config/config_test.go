@@ -83,6 +83,12 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	if cfg.DAV.SyncHistoryRetention != 90*24*time.Hour {
 		t.Fatalf("DAV.SyncHistoryRetention = %s, want 90 days", cfg.DAV.SyncHistoryRetention)
 	}
+	if cfg.DAV.ReportTimeout != 10*time.Second {
+		t.Fatalf("DAV.ReportTimeout = %s, want 10s", cfg.DAV.ReportTimeout)
+	}
+	if cfg.DAV.ReportTimeout >= cfg.HTTP.WriteTimeout {
+		t.Fatalf("DAV.ReportTimeout = %s, want less than the %s write timeout so the answer can be written", cfg.DAV.ReportTimeout, cfg.HTTP.WriteTimeout)
+	}
 	if cfg.TrafficCaptureFile != "" {
 		t.Fatalf("TrafficCaptureFile = %q, want disabled by default", cfg.TrafficCaptureFile)
 	}
@@ -121,6 +127,7 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	t.Setenv("APP_DAV_MAX_MULTIGET_HREFS", "42")
 	t.Setenv("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", "9876")
 	t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", "36h")
+	t.Setenv("APP_DAV_REPORT_TIMEOUT", "2500ms")
 
 	cfg, err := Load()
 	if err != nil {
@@ -152,6 +159,9 @@ func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
 	}
 	if cfg.DAV.SyncHistoryRetention != 36*time.Hour {
 		t.Fatalf("DAV.SyncHistoryRetention = %s, want 36h", cfg.DAV.SyncHistoryRetention)
+	}
+	if cfg.DAV.ReportTimeout != 2500*time.Millisecond {
+		t.Fatalf("DAV.ReportTimeout = %s, want 2.5s", cfg.DAV.ReportTimeout)
 	}
 }
 
@@ -257,6 +267,30 @@ func TestLoadRejectsNegativeAndNonDurationSyncHistoryRetention(t *testing.T) {
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), "APP_DAV_SYNC_HISTORY_RETENTION must be a non-negative duration") {
 				t.Fatalf("Load() error = %v, want non-negative validation for %q", err, value)
+			}
+		})
+	}
+}
+
+// The REPORT deadline turns off at 0, as every other DAV limit does, and a
+// negative or unreadable value is refused rather than replaced by the default.
+func TestLoadReportTimeoutZeroTurnsItOffAndBadValuesAreRefused(t *testing.T) {
+	for _, value := range []string{"0", "0s"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_REPORT_TIMEOUT", value)
+			cfg, err := Load()
+			if err != nil || cfg.DAV.ReportTimeout != 0 {
+				t.Fatalf("Load() = %v, %v; want the deadline off", cfg, err)
+			}
+		})
+	}
+	for _, value := range []string{"-1s", "invalid", "10"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_REPORT_TIMEOUT", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "APP_DAV_REPORT_TIMEOUT must be a non-negative duration") {
+				t.Fatalf("Load() error = %v, want validation for %q", err, value)
 			}
 		})
 	}

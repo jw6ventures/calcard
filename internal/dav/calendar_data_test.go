@@ -1772,9 +1772,9 @@ func TestCalendarDataSelectionCostIsIndependentOfSelectorCount(t *testing.T) {
 			t.Fatal("projection returned nothing")
 		}
 	}
-	// The scan cost this replaces was seconds; the indexed cost is tens of
-	// milliseconds. The bound is wide enough that only a return to scanning
-	// trips it.
+	// Scanning the selectors per resource costs seconds at this size; the
+	// indexed lookup costs tens of milliseconds. The bound is wide enough that
+	// only a per-resource cost growing with the selector count trips it.
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("2,000 resources against %d selectors took %s, want the per-resource cost to be independent of the selector count",
 			len(selectors), elapsed)
@@ -1786,8 +1786,8 @@ func TestCalendarDataSelectionCostIsIndependentOfSelectorCount(t *testing.T) {
 	})
 }
 
-// A name repeated among siblings resolves to its first occurrence, which is
-// where a scan in document order stopped.
+// A name repeated among siblings resolves to its first occurrence in document
+// order.
 func TestCalendarDataDuplicateSelectorNamesKeepTheFirst(t *testing.T) {
 	t.Run("prop", func(t *testing.T) {
 		got := projectFor(projectionFixture, &calendarDataEl{Comp: &calendarComp{

@@ -3105,7 +3105,7 @@ func parseICalFields(raw string) (summary, description, location *string, dtstar
 	if component == nil {
 		return nil, nil, nil, nil, nil, false
 	}
-	times := icalpkg.NewObjectTimes(icalpkg.UnfoldLines(raw))
+	times := icalpkg.NewObjectTimes(icalpkg.UnfoldLines(raw), nil, nil)
 	if property, ok := icalpkg.ComponentProperty(component, "SUMMARY"); ok {
 		summary = util.StrPtr(unescapeICalValue(property.Value))
 	}

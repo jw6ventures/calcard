@@ -80,7 +80,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range res {
-				res[i] = filterNonPrincipalPropfindResponse(res[i], propfindReq)
+				res[i] = filterPropfindResponse(res[i], propfindReq)
 			}
 		}
 		return res, nil
@@ -101,7 +101,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+				responses[i] = filterPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
@@ -141,7 +141,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+				responses[i] = filterPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
@@ -181,7 +181,7 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+				responses[i] = filterPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
@@ -208,17 +208,17 @@ func (h *DavServer) buildPropfindResponses(ctx context.Context, r *http.Request,
 		}
 		if propfindReq != nil && propfindReq.Prop != nil {
 			for i := range responses {
-				responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindReq)
+				responses[i] = filterPropfindResponse(responses[i], propfindReq)
 			}
 		}
 		return responses, nil
 	}
 }
 
-// lockNullResourceResponse answers a Depth 0 PROPFIND of cleanPath when it is a
-// lock-null resource. href is the href the answer for an absent member at
-// cleanPath carries, which names the resource as a mapped member at the same
-// spelling is named; without one, the lock's root names it.
+// lockNullResourceResponse answers a PROPFIND of cleanPath when it is a
+// lock-null resource. A non-empty href is the one the answer for an absent
+// member at cleanPath carried, so the resource is named as a mapped member at
+// that spelling would be; with none, the lock's root names it.
 func (h *DavServer) lockNullResourceResponse(ctx context.Context, user *store.User, cleanPath, href string) (*response, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil || user == nil {
 		return nil, nil
@@ -390,7 +390,6 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 			}
 			principalHref := h.principalURL(user)
 
-			// Add the virtual birthday calendar first
 			birthdayHref := birthdayCalendarHref()
 			birthdayState, err := h.birthdayCollectionState(ctx, user.ID)
 			if err != nil {
@@ -405,7 +404,6 @@ func (h *DavServer) calendarResponses(ctx context.Context, cleanPath, depth stri
 				res = h.appendMultistatusResponses(res, calendarResourceResponsesFilteredLimit(birthdayHref, events, calendarDataProjection{}, h.multistatusBuildLimit()-len(res)))
 			}
 
-			// Add regular calendars
 			for i := range cals {
 				if h.multistatusBuildComplete(res) {
 					break

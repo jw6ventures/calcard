@@ -159,12 +159,13 @@ func TestEventsJSONListsTheInstancesCalDAVExpands(t *testing.T) {
 			want: []string{"2026-06-01T00:00:00Z", "2026-06-02T00:00:00Z", "2026-06-04T00:00:00Z", "2026-06-05T00:00:00Z"},
 		},
 		{
-			// 29 March 2026 has no 02:30 in Berlin, so it is no instance and
-			// does not count, while 22 March is one the EXDATE removes.
+			// 29 March 2026's 02:30 in Berlin is an instance, read at the
+			// offset before the gap, while 22 March is one the EXDATE
+			// removes.
 			name:       "a skipped local time and an EXDATE in one series",
 			components: []string{berlin("20260315", "023000") + "RRULE:FREQ=WEEKLY;COUNT=4\r\nEXDATE;TZID=Europe/Berlin:20260322T023000\r\n"},
 			start:      "2026-03-01", end: "2026-04-30",
-			want: []string{"2026-03-15T01:30:00Z", "2026-04-05T00:30:00Z", "2026-04-12T00:30:00Z"},
+			want: []string{"2026-03-15T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"},
 		},
 		{
 			name:       "a repeated local time is its first occurrence",
@@ -176,13 +177,14 @@ func TestEventsJSONListsTheInstancesCalDAVExpands(t *testing.T) {
 			name:       "daily 02:30 across the New York spring change",
 			components: []string{"DTSTART;TZID=America/New_York:20260307T023000\r\nRRULE:FREQ=DAILY;COUNT=3\r\n"},
 			start:      "2026-03-01", end: "2026-04-01",
-			want: []string{"2026-03-07T07:30:00Z", "2026-03-09T06:30:00Z", "2026-03-10T06:30:00Z"},
+			want: []string{"2026-03-07T07:30:00Z", "2026-03-08T07:30:00Z", "2026-03-09T06:30:00Z"},
 		},
 		{
+			// 29 March's instant, 01:30Z, is at or before the UNTIL.
 			name:       "a UTC UNTIL bounds the series on its instants",
 			components: []string{berlin("20260315", "023000") + "RRULE:FREQ=WEEKLY;UNTIL=20260405T003000Z\r\n"},
 			start:      "2026-03-01", end: "2026-04-30",
-			want: []string{"2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-04-05T00:30:00Z"},
+			want: []string{"2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"},
 		},
 		{
 			// A DATE UNTIL ends where its day ends in the series' zone: 22:00
@@ -239,11 +241,11 @@ func TestEventsJSONListsTheInstancesCalDAVExpands(t *testing.T) {
 			want: []string{"2024-03-04T14:00:00Z", "2024-03-11T13:00:00Z", "2024-03-18T13:00:00Z", "2024-03-25T13:00:00Z"},
 		},
 		{
-			name:       "a zone only the object defines leaves out its skipped hour",
+			name:       "a zone only the object defines keeps its skipped hour",
 			timezones:  outlookEastern,
 			components: []string{eastern("20240309", "023000") + "RRULE:FREQ=DAILY;COUNT=4\r\n"},
 			start:      "2024-03-01", end: "2024-04-01",
-			want: []string{"2024-03-09T07:30:00Z", "2024-03-11T06:30:00Z", "2024-03-12T06:30:00Z", "2024-03-13T06:30:00Z"},
+			want: []string{"2024-03-09T07:30:00Z", "2024-03-10T07:30:00Z", "2024-03-11T06:30:00Z", "2024-03-12T06:30:00Z"},
 		},
 		{
 			name:       "a zone only the object defines repeats an hour",
@@ -258,6 +260,14 @@ func TestEventsJSONListsTheInstancesCalDAVExpands(t *testing.T) {
 			components: []string{"DTSTART;TZID=Not/AZone:20260302T233000\r\nRRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3\r\n"},
 			start:      "2026-03-01", end: "2026-04-01",
 			want: []string{"2026-03-02T23:30:00Z", "2026-03-09T23:30:00Z", "2026-03-16T23:30:00Z"},
+		},
+		{
+			// A TZID padded with white space inside its quotes resolves, and
+			// finds its gaps, exactly as the unpadded spelling does.
+			name:       "a padded TZID crosses the spring change like the unpadded spelling",
+			components: []string{`DTSTART;TZID=" Europe/Berlin":20260315T023000` + "\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n"},
+			start:      "2026-03-01", end: "2026-04-30",
+			want: []string{"2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"},
 		},
 	}
 	for _, tt := range tests {

@@ -848,7 +848,7 @@ func (ms davMultistatus) responseForHref(t *testing.T, want string) davResponse 
 }
 
 // assertHrefs fails unless the multistatus carries exactly these hrefs, in any
-// order. This replaces counting "<d:response>" occurrences in the raw body.
+// order.
 func (ms davMultistatus) assertHrefs(t *testing.T, want ...string) {
 	t.Helper()
 	got := ms.hrefs()
@@ -977,8 +977,7 @@ func isThreeDigitStatusCode(field string) bool {
 }
 
 // findProp locates name across r's propstats. It fails when the property
-// appears in more than one propstat, which RFC 4918 §9.1 forbids and which is
-// the defect class commit 89d7538 had to fix by hand.
+// appears in more than one propstat, which RFC 4918 §9.1 forbids.
 func (r davResponse) findProp(t *testing.T, name xml.Name) (davElement, int, bool) {
 	t.Helper()
 	var (
@@ -1746,13 +1745,10 @@ func TestCanonicalHref(t *testing.T) {
 }
 
 // TestCanonicalHrefDistinguishesDistinctURIs pins the negative half: each pair
-// below denotes a different resource, so the helper backing roughly 150 href
-// assertions must not fold them together. Most compared equal under the
-// path.Clean-based normalization this replaced; "collection versus resource"
-// guards the one distinction that one did preserve; and the last four pin
-// authority and whitespace handling, each of which collapsed a pair when
-// canonicalHref serialized the host without its userinfo, dropped a
-// non-hierarchical URI's opaque part, and trimmed its input.
+// below denotes a different resource, so canonicalHref must not fold them
+// together. "collection versus resource" guards the trailing slash, and the
+// last four guard the userinfo of the authority, a non-hierarchical URI's
+// opaque part, and the white space around the input.
 func TestCanonicalHrefDistinguishesDistinctURIs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1984,9 +1980,8 @@ func parseACE(t *testing.T, body string) davElement {
 
 // TestACEModelChecksRejectMalformedACEs pins the negative half of the ACL
 // helpers. Every ACE below yields a clean principal and privilege set under a
-// "take the first matching child" reading, which is what acePrincipals and
-// acePrivileges did before they checked the content model, and every one of
-// them says something RFC 3744 §5.5 gives an ACE no way to say.
+// "take the first matching child" reading, yet every one of them says
+// something RFC 3744 §5.5 gives an ACE no way to say.
 func TestACEModelChecksRejectMalformedACEs(t *testing.T) {
 	const (
 		open      = `<d:ace xmlns:d="DAV:">`
@@ -2090,8 +2085,7 @@ func TestACEHelpersReadAConformingACE(t *testing.T) {
 // resolution is decided by the document's declarations rather than by the shape
 // of the namespace name. A namespace name is any URI, so a dead property stored
 // under an RFC 4151 tag: URI or a bare-scheme URI resolves exactly as the
-// http:// and urn: forms the DAV specifications use, and a syntactic
-// "contains ://" heuristic reported both as unresolved prefixes.
+// http:// and urn: forms the DAV specifications use.
 func TestParseDAVDocumentAcceptsAnyDeclaredNamespaceURI(t *testing.T) {
 	body := `<d:multistatus xmlns:d="DAV:" xmlns:t="tag:example.com,2026:props" xmlns:m="mid:calcard">` +
 		`<d:response><d:href>/dav/calendars/1/</d:href><d:propstat><d:prop>` +
@@ -2363,7 +2357,7 @@ func TestParseStatusLineRejectsMalformedLines(t *testing.T) {
 		{"no Reason-Phrase separator", "HTTP/1.1 200"},
 		{"empty", ""},
 		// The separators are one SP each, so none of these is a Status-Line
-		// however readable it looks. strings.Fields accepted all four.
+		// however readable it looks.
 		{"tab separators", "HTTP/1.1\t200\tOK"},
 		{"repeated space before the code", "HTTP/1.1  200 OK"},
 		{"leading whitespace", " HTTP/1.1 200 OK"},

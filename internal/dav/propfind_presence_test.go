@@ -99,7 +99,7 @@ func TestFilterPropfindThreeStatePresence(t *testing.T) {
 				src := prop{ResourceType: tc.rtype()}
 				apply(&src)
 				resp := response{Href: tc.href, Propstat: []propstat{{Prop: src, Status: httpStatusOK}}}
-				filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{propertySelection: tc.sel}})
+				filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{propertySelection: tc.sel}})
 				okXML = marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusOK))
 				nfXML = marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusNotFound))
 				// The property must appear in exactly one propstat.
@@ -133,8 +133,7 @@ func TestFilterPropfindThreeStatePresence(t *testing.T) {
 // TestFilterCurrentUserPrivilegeSetPresence verifies the explicit three-state
 // contract for current-user-privilege-set at the filter: a nil source is absent
 // (404), a zero-length set is present-empty (200 empty element), and a populated
-// set is present-nonempty (200 value). A resource kind outside the mask is always
-// 404 regardless of the source value.
+// set is present-nonempty (200 value), on every resource kind.
 func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 	const element = "d:current-user-privilege-set"
 	const emptyEl = "<d:current-user-privilege-set></d:current-user-privilege-set>"
@@ -143,7 +142,7 @@ func TestFilterCurrentUserPrivilegeSetPresence(t *testing.T) {
 	filter := func(href string, rtype *resourceType, set *currentUserPrivilegeSet) (okXML, nfXML string) {
 		src := prop{ResourceType: rtype, CurrentUserPrivilegeSet: set}
 		resp := response{Href: href, Propstat: []propstat{{Prop: src, Status: httpStatusOK}}}
-		filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{propertySelection: sel}})
+		filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{propertySelection: sel}})
 		return marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusOK)),
 			marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusNotFound))
 	}
@@ -250,9 +249,9 @@ func TestPropfindOwnedPrincipalCurrentUserPrivilegeSetIncludesAll(t *testing.T) 
 	}
 }
 
-// TestPropfindCalendarDescriptionPresentEmptyRendersIn200 is an end-to-end
-// regression for H2: a calendar with an explicitly-empty description must not
-// have calendar-description vanish from both propstats. It is a present-empty
+// TestPropfindCalendarDescriptionPresentEmptyRendersIn200 checks end to end
+// that a calendar with an explicitly-empty description does not have
+// calendar-description vanish from both propstats. It is a present-empty
 // 200, never a 404 and never omitted.
 func TestPropfindCalendarDescriptionPresentEmptyRendersIn200(t *testing.T) {
 	user := &store.User{ID: 1}
@@ -280,14 +279,9 @@ func TestPropfindCalendarDescriptionPresentEmptyRendersIn200(t *testing.T) {
 	if rr.Code != http.StatusMultiStatus {
 		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<cal:calendar-description></cal:calendar-description>") {
-		t.Fatalf("expected present-empty calendar-description empty element, got %s", respBody)
-	}
-	// It must be in the 200 propstat, not the 404 one.
-	if strings.Contains(respBody, "404") && !strings.Contains(respBody, "200 OK") {
-		t.Fatalf("expected a 200 propstat carrying the property, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, calQN("calendar-description"), http.StatusOK, "")
+	resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 }
 
 // TestPrincipalResponseDisplayNameNonEmpty verifies the RFC 3744 requirement
@@ -305,11 +299,10 @@ func TestPrincipalResponseDisplayNameNonEmpty(t *testing.T) {
 	}
 }
 
-// TestCurrentUserPrivilegeSetZeroPrivilegesIsPresentEmpty verifies that a
-// resource the user can reach but on which they hold no privileges yields a
-// present-empty set (non-nil, zero children) rather than nil, so the property
-// is answered with a 200 empty element instead of a 404.
-func TestCurrentUserPrivilegeSetZeroPrivilegesIsPresentEmpty(t *testing.T) {
+// TestCurrentUserPrivilegeSetZeroPrivilegeShareIsAbsent verifies that a
+// shared calendar on which the delegate holds no privileges is not visible to
+// them, so it yields no privilege set at all (nil) rather than an empty one.
+func TestCurrentUserPrivilegeSetZeroPrivilegeShareIsAbsent(t *testing.T) {
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{

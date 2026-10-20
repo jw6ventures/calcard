@@ -1,6 +1,11 @@
 package dav
 
-import "strings"
+import (
+	"errors"
+	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
+)
 
 // supportedCalendarDataRequest reports whether a CALDAV:calendar-data in a
 // calendaring REPORT names a media type the server can return. RFC 4791 §7.8
@@ -37,6 +42,9 @@ type calendarDataProjection struct {
 	// to every resource it matches, so building it per resource would multiply
 	// the request body against the collection.
 	index *calendarCompIndex
+	// pool, when set, is the request-wide budget the projection's reparse of
+	// each resource draws on besides its own per-evaluation cap.
+	pool *ical.RequestWork
 }
 
 // newCalendarDataProjection resolves the §9.6 selection by name once, for the
@@ -47,6 +55,13 @@ func newCalendarDataProjection(selection *calendarDataEl, zone floatingZone) cal
 		projection.index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
 	}
 	return projection
+}
+
+// withPool returns the projection sharing every other field, with pool as the
+// request-wide budget its reparse of each resource draws on.
+func (p calendarDataProjection) withPool(pool *ical.RequestWork) calendarDataProjection {
+	p.pool = pool
+	return p
 }
 
 // requested reports whether the response carries CALDAV:calendar-data at all,
@@ -75,10 +90,18 @@ func reportCalendarData(report reportRequest) *calendarDataEl {
 // same reading calendar-query matched it by, and one holding no VCALENDAR is
 // likewise returned as it stands, since a projection cannot be derived from a
 // tree that was never built.
+//
+// A recurrence transform the request's work cannot afford is an error rather
+// than a projection read through zones the work could not follow: the resource
+// is answered with a 500 of its own inside the multistatus.
 func filterICalendarData(raw string, projection calendarDataProjection) (string, error) {
 	selection := projection.selection
 	if selection == nil || selection.empty() {
 		return raw, nil
+	}
+	transforms := selection.Expand != nil || selection.LimitRecurrenceSet != nil
+	if transforms && projection.pool.Exhausted() {
+		return "", errRecurrenceWorkSpent
 	}
 	root, err := parseStoredICalendarObject(raw)
 	if err != nil {
@@ -90,12 +113,19 @@ func filterICalendarData(raw string, projection calendarDataProjection) (string,
 		// correctly, at the per-resource cost the index exists to avoid.
 		index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
 	}
-	projected, err := projectCalendarData(root, raw, selection, index, projection.zone)
+	projected, err := projectCalendarData(root, raw, selection, index, projection.zone, projection.pool)
 	if err != nil {
 		return "", err
 	}
+	if transforms && projection.pool.Exhausted() {
+		return "", errRecurrenceWorkSpent
+	}
 	return writeICalendarObject(projected), nil
 }
+
+// errRecurrenceWorkSpent is why a resource's recurrence transform was refused:
+// the request's recurrence and observance work ran out.
+var errRecurrenceWorkSpent = errors.New("the request's recurrence work is spent")
 
 // projectCalendarData applies the recurrence transform, then the free-busy
 // trim, then the component and property selection. That is not the order the
@@ -107,8 +137,8 @@ func filterICalendarData(raw string, projection calendarDataProjection) (string,
 // it was stored. A transform hands the next one the tree it produced, which is
 // not the document any more -- expansion removes the VTIMEZONE a later value
 // may still name -- so the zone lookups have to keep answering from the parse.
-func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone) (*icalNode, error) {
-	m := newCalendarTimeRangeMatcher(raw, root, zone)
+func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone, pool *ical.RequestWork) (*icalNode, error) {
+	m := newCalendarTimeRangeMatcher(raw, root, zone).withPool(pool)
 	source := root
 	switch {
 	case selection.Expand != nil:

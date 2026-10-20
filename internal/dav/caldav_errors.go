@@ -18,12 +18,10 @@ func isValidConditionName(s string) bool {
 	}
 	for i, ch := range s {
 		if i == 0 {
-			// First character must be lowercase letter
 			if ch < 'a' || ch > 'z' {
 				return false
 			}
 		} else {
-			// Subsequent characters: lowercase letter, digit, or hyphen
 			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
 				return false
 			}

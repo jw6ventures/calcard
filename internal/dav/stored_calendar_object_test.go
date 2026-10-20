@@ -48,7 +48,7 @@ func TestReportsReadAnEventInANestedVCALENDAR(t *testing.T) {
 	if filterMatches(t, event, calQueryWithTimeRange("20260113T000000Z", "20260114T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched a day without the nested event")
 	}
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil),
 		&timeRange{Start: "20260112T000000Z", End: "20260113T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{"FREEBUSY:20260112T090000Z/20260112T100000Z"})
 }
@@ -231,8 +231,8 @@ func TestPropertyReadingToleratesTheParametersProducersWrite(t *testing.T) {
 // RFC 5545 §3.1 and §3.2 make a parameter a name, "=" and a value. A client's
 // line holding anything else is refused: left out, a TZID would place the
 // value as a floating time, hours from where the client meant it. Objects
-// stored without that check may hold such lines, and those are read, and
-// written again by COPY and MOVE, with the parameter left out.
+// stored without that check may hold such lines: those are read with the
+// parameter left out, and COPY and MOVE carry them over as stored.
 func TestMalformedParametersAreRefusedOnlyFromClients(t *testing.T) {
 	tests := []struct {
 		line       string
@@ -433,7 +433,7 @@ func TestCalendarQueryKeepsAStoredObjectWithNoCalendarToRead(t *testing.T) {
 		if !filterMatches(t, event, filter, floatingZone{}) {
 			t.Errorf("%q: left out by matchEventFilter", raw)
 		}
-		kept, err := applyCalendarFilter(t.Context(), []store.Event{event}, filter, floatingZone{})
+		kept, err := applyCalendarFilter(t.Context(), []store.Event{event}, filter, floatingZone{}, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", raw, err)
 		}

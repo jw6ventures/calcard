@@ -380,7 +380,7 @@ func TestObjectDefinedZoneDoesNotAskTheHost(t *testing.T) {
 	if got, want := zone.instant(time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)), time.Date(2026, 1, 5, 14, 0, 0, 0, time.UTC); !got.Equal(want) {
 		t.Fatalf("instant = %s, want %s", got, want)
 	}
-	if gaps, ok := seriesLocalTimeGaps(NewObjectTimes(lines), "DTSTART;TZID="+tzid, "20260105T090000"); !ok || gaps == nil {
+	if gaps, ok := seriesLocalTimeGaps(NewObjectTimes(lines, nil, nil), "DTSTART;TZID="+tzid, "20260105T090000"); !ok || gaps == nil {
 		t.Fatal("the object's definition lists no gaps")
 	}
 	if hostLocations.missed(tzid) {

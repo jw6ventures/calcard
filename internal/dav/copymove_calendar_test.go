@@ -153,7 +153,7 @@ func TestCalendarObjectCopyMoveKeepAStoredUIDPastTheSubmittedBound(t *testing.T)
 	if _, fault := validateCalendarObjectForStorage(raw, nil); fault == nil {
 		t.Fatal("the submitted UID past the bound was accepted")
 	}
-	if _, fault := validateTransferredCalendarObject(raw, nil); fault != nil {
+	if _, fault := validateTransferredCalendarObject(raw, nil, nil); fault != nil {
 		t.Fatalf("validateTransferredCalendarObject() fault = %+v, want the stored UID kept", fault)
 	}
 

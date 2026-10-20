@@ -33,49 +33,182 @@ type TimezoneObservances []TimezoneObservance
 // reader then follows the rule itself, on the ObservanceWork of the object it
 // is reading, so what following one object's definitions costs that reading
 // is bounded by the reading.
+//
+// work is the ObservanceWork of the reading asking. Building or extending a
+// listing to answer is charged to it, and through it to the request pool, so a
+// listing costs the reading that causes it and a lookup a listing already
+// answers costs nothing. Each build or extension is one evaluation of the rule,
+// capped at what one evaluation may spend. A listing that cannot be built or
+// extended on what work has left is not held against the rule: a later reading
+// with budget of its own lists it, and this question is answered
+// listed == false.
 type ObservanceOnsets interface {
-	LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, listed bool)
-	StartsBetween(dtstart, after, through time.Time, rrule string) (starts []time.Time, listed bool)
+	LatestOnOrBefore(dtstart, before time.Time, rrule string, work *ObservanceWork) (latest time.Time, found, listed bool)
+	StartsBetween(dtstart, after, through time.Time, rrule string, work *ObservanceWork) (starts []time.Time, listed bool)
 }
 
-// ObservanceWork is the work one reading of a calendar object may spend
-// following VTIMEZONE observance rules where no listing answers: every walk,
-// and every pass over a span, through any of the definitions the reading holds
-// draws on it. A definition whose rules are costly to follow -- one generating
-// a transition every second costs a few milliseconds a walk, and a series asks
-// for one per instance -- costs the reading at most what one
-// LatestRecurrenceOnOrBefore may spend. Once it runs out, a question no listing
-// answers is incomplete, as a walk that ran out of work is, and the reader
-// falls back as it does for any definition that cannot be followed. A question
-// a listing answers costs nothing here, and the listings answer every question
-// about the rules real zones use; what a shared listing costs to make is the
-// listing's own. Create one with NewObservanceWork; it is safe for concurrent
+// observanceWalkLimit bounds the work one reading of one object may spend
+// following VTIMEZONE observance rules where no listing answers them, summed
+// over every rule of every definition the object holds; no one rule may take
+// more than recurrenceWorkLimit of it. Walking back from an instant costs a
+// rule real zones use a few thousand units. A rule too sparse for a listing to
+// reach the present, the 29th of February when it is a Monday, costs about
+// 30,000 a lookup, and a definition of 200 such observances, each from a
+// DTSTART of its own, about 5 million for the 200; the limit admits that with
+// three times to spare. A definition of a thousand of them spends the whole
+// limit and is refused after about 2 seconds. A single rule dense enough to
+// cost more than recurrenceWorkLimit, a transition every second, is given up
+// on after about a quarter of a second.
+const observanceWalkLimit = 16_000_000
+
+// observanceListingLimit bounds the work one reading may spend building and
+// extending listings of its definitions' rules, and onsetListingWorkLimit what
+// one build or extension may spend. A rule real zones use lists from Exchange's
+// 1601 DTSTART through the present in a few thousand units, and a rule too
+// sparse or too dense for a listing to be worth making is found out in the
+// first fifty thousand: a definition of 200 observances, each from a DTSTART
+// of its own, costs the reading ten million in listings that are not made, and
+// is walked rule by rule instead. A listing is shared by every later reading
+// of the rule, so what a rule costs here is paid once.
+const (
+	observanceListingLimit = 16_000_000
+	onsetListingWorkLimit  = 50_000
+)
+
+// ObjectWorkBudget is the pool one write validating a single object, or one
+// member of a collection transfer, draws on: the walks and listings of the
+// object's zones, and the walk of its recurrence rule beside them. The write
+// reads the object twice, the parsed tree's reading and the ObjectTimes the
+// analysis goes through, each with observanceWalkLimit of walks of its own, so
+// the pool holds both: a pool smaller than the readings' limits together would
+// end one of them for want of work it was entitled to, and an object whose
+// answer does not depend on the pool would be refused for it.
+const ObjectWorkBudget = 2*observanceWalkLimit + observanceListingLimit + recurrenceWorkLimit
+
+// ObservanceWork is the work one reading of a calendar object may spend on its
+// VTIMEZONE observance rules, in two parts.
+//
+// Walks follow a rule where no listing answers: every walk, and every pass over
+// a span, through any of the definitions the reading holds draws on
+// observanceWalkLimit, and the walks of any one rule on no more than one
+// evaluation may spend. A definition whose rules are costly to follow -- one
+// generating a transition every second costs a few milliseconds a walk, and a
+// series asks for one per instance -- costs the reading at most what one
+// LatestRecurrenceOnOrBefore may spend for each such rule. Once that runs out,
+// a question no listing answers is incomplete, as a walk that ran out of work
+// is, and the reader falls back as it does for any definition that cannot be
+// followed.
+//
+// Listings are built and extended where a lookup finds none that answers: each
+// is one evaluation of its rule, capped at onsetListingWorkLimit, and all of
+// them draw on observanceListingLimit. A question a listing answers costs
+// nothing, and the listings answer every question about the rules real zones
+// use.
+//
+// Both parts also draw on the pool of the request the reading answers, when
+// there is one. Create one with NewObservanceWork; it is safe for concurrent
 // use.
 type ObservanceWork struct {
-	mu   sync.Mutex
-	work recurrenceWork
+	mu       sync.Mutex
+	walks    recurrenceWork
+	listings recurrenceWork
+	// ruleWalks is what the walks of each rule have spent so far.
+	ruleWalks map[onsetListingKey]int
+	// walkStarved reports that a walk was refused for want of the request's
+	// pool, rather than for want of the reading's own walks.
+	walkStarved bool
 }
 
-// NewObservanceWork returns the budget for one reading of one object.
-func NewObservanceWork() *ObservanceWork {
-	return &ObservanceWork{work: recurrenceWork{remaining: recurrenceWorkLimit}}
+// Starved reports that a walk of one of the reading's rules was refused because
+// the pool of its request had run out, not because the rule was too large. A
+// question that walk would have answered was then answered as a definition that
+// cannot be followed is -- for a zone the object defines, as UTC -- so the times
+// the reading resolved may be wrong.
+func (w *ObservanceWork) Starved() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.walkStarved
 }
 
-// use runs follow on the budget, which it holds until follow returns. A nil
+// NewObservanceWork returns the budget for one reading of one object. Its walks
+// and listings also draw on pool, when it is not nil, which bounds what every
+// reading and evaluation of the same request spend together.
+func NewObservanceWork(pool *RequestWork) *ObservanceWork {
+	work := &ObservanceWork{
+		walks:    recurrenceWork{remaining: observanceWalkLimit, limit: observanceWalkLimit},
+		listings: recurrenceWork{remaining: observanceListingLimit, limit: observanceListingLimit},
+	}
+	if pool != nil {
+		work.walks.source = pool
+		work.listings.source = pool
+	}
+	return work
+}
+
+// useWalk runs follow on a budget for a walk of the rule key names, capped at
+// what one evaluation may spend less what walks of the rule have spent, and
+// drawn from the reading's walks, which it holds until follow returns. A nil
 // budget gives follow one of its own.
-func (w *ObservanceWork) use(follow func(*recurrenceWork)) {
+func (w *ObservanceWork) useWalk(key onsetListingKey, follow func(*recurrenceWork)) {
 	if w == nil {
-		follow(newRecurrenceWork())
+		follow(newRecurrenceWork(nil))
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	follow(&w.work)
+	allowed := recurrenceWorkLimit - w.ruleWalks[key]
+	evaluation := w.walks.evaluation(max(allowed, 0))
+	if allowed <= 0 {
+		evaluation.remaining = -1
+	}
+	defer evaluation.release()
+	follow(evaluation)
+	if used := evaluation.used(); used > 0 || evaluation.remaining < 0 {
+		if w.ruleWalks == nil {
+			w.ruleWalks = make(map[onsetListingKey]int)
+		}
+		w.ruleWalks[key] += used
+		if evaluation.remaining < 0 && !evaluation.starved {
+			// The rule asked for more than its allowance. A budget that has
+			// refused once stays exhausted, so later lookups of the rule are
+			// refused before they generate the candidates they would be
+			// refused for.
+			w.ruleWalks[key] = recurrenceWorkLimit
+		}
+	}
+	w.refuse(&w.walks, evaluation)
+	if evaluation.requestStarved {
+		w.walkStarved = true
+	}
+}
+
+// useListing is useWalk for building or extending a listing, capped at
+// onsetListingWorkLimit and drawn from the reading's listings.
+func (w *ObservanceWork) useListing(follow func(*recurrenceWork)) {
+	if w == nil {
+		follow(newRecurrenceWork(nil))
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	evaluation := w.listings.evaluation(onsetListingWorkLimit)
+	defer evaluation.release()
+	follow(evaluation)
+	w.refuse(&w.listings, evaluation)
+}
+
+// refuse spends budget when evaluation, drawn from it, was refused by it. A
+// budget that has refused once stays exhausted, so later lookups are refused
+// before they generate the candidates they would be refused for.
+func (w *ObservanceWork) refuse(budget, evaluation *recurrenceWork) {
+	if evaluation.starved {
+		budget.remaining = -1
+	}
 }
 
 // walk is LatestRecurrenceOnOrBefore drawing on the budget.
 func (w *ObservanceWork) walk(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
-	w.use(func(work *recurrenceWork) {
+	w.useWalk(ruleKey(dtstart, rrule), func(work *recurrenceWork) {
 		latest, found, complete = latestRecurrenceOnOrBefore(dtstart, before, rrule, work)
 	})
 	return latest, found, complete
@@ -83,17 +216,21 @@ func (w *ObservanceWork) walk(dtstart, before time.Time, rrule string) (latest t
 
 // startsBetween is recurrenceStartsBetween drawing on the budget.
 func (w *ObservanceWork) startsBetween(dtstart time.Time, rrule string, after, through time.Time, limit int) (starts []time.Time, ok bool) {
-	w.use(func(work *recurrenceWork) {
+	w.useWalk(ruleKey(dtstart, rrule), func(work *recurrenceWork) {
 		starts, ok = recurrenceStartsBetween(dtstart, rrule, after, through, limit, work)
 	})
 	return starts, ok
+}
+
+func ruleKey(dtstart time.Time, rrule string) onsetListingKey {
+	return onsetListingKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule}
 }
 
 // latestOnset answers from onsets where a listing does, and walks the rule on
 // work where none does.
 func latestOnset(onsets ObservanceOnsets, work *ObservanceWork, dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
 	if onsets != nil {
-		if latest, found, listed := onsets.LatestOnOrBefore(dtstart, before, rrule); listed {
+		if latest, found, listed := onsets.LatestOnOrBefore(dtstart, before, rrule, work); listed {
 			return latest, found, true
 		}
 	}
@@ -107,7 +244,7 @@ func latestOnset(onsets ObservanceOnsets, work *ObservanceWork, dtstart, before 
 // otherwise list without end -- or the rule cannot be followed that far.
 func startsBetween(onsets ObservanceOnsets, work *ObservanceWork, dtstart time.Time, rrule string, after, through time.Time) ([]time.Time, bool) {
 	if onsets != nil {
-		if starts, listed := onsets.StartsBetween(dtstart, after, through, rrule); listed {
+		if starts, listed := onsets.StartsBetween(dtstart, after, through, rrule, work); listed {
 			return starts, len(starts) <= maxListedObservanceOnsets
 		}
 	}
@@ -117,7 +254,8 @@ func startsBetween(onsets ObservanceOnsets, work *ObservanceWork, dtstart time.T
 // onsetListings answers onset questions for one reading from a listing of
 // each rule, so resolving many wall clocks through a definition walks each of
 // its rules once rather than once per wall clock. An instant past what a
-// rule's listing can reach is left to the reader to walk.
+// rule's listing can reach is left to the reader to walk. Building or
+// extending a listing draws on the reading's work, not a budget of its own.
 type onsetListings map[onsetListingKey]*RecurrenceStartLister
 
 type onsetListingKey struct {
@@ -132,27 +270,29 @@ type onsetListingKey struct {
 // listing, and a listing is extended from where it stopped.
 const onsetListingHorizonYears = 1
 
-func (l onsetListings) LatestOnOrBefore(dtstart, before time.Time, rrule string) (time.Time, bool, bool) {
+func (l onsetListings) LatestOnOrBefore(dtstart, before time.Time, rrule string, work *ObservanceWork) (time.Time, bool, bool) {
 	if before.Before(dtstart) {
 		return time.Time{}, false, true
 	}
 	key := onsetListingKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule}
 	lister, ok := l[key]
 	if !ok {
-		lister = NewRecurrenceStartLister(dtstart, rrule)
+		if lister = NewRecurrenceStartLister(dtstart, rrule, work); lister == nil {
+			return time.Time{}, false, false
+		}
 		l[key] = lister
 	}
 	if !lister.Covers(before) {
-		lister.ListThrough(before.AddDate(onsetListingHorizonYears, 0, 0), maxListedObservanceOnsets)
+		lister.ListThrough(before.AddDate(onsetListingHorizonYears, 0, 0), maxListedObservanceOnsets, work)
 	}
 	return lister.LatestOnOrBefore(before)
 }
 
-func (l onsetListings) StartsBetween(dtstart, after, through time.Time, rrule string) ([]time.Time, bool) {
+func (l onsetListings) StartsBetween(dtstart, after, through time.Time, rrule string, work *ObservanceWork) ([]time.Time, bool) {
 	if through.Before(dtstart) {
 		return nil, true
 	}
-	if _, _, listed := l.LatestOnOrBefore(dtstart, through, rrule); !listed {
+	if _, _, listed := l.LatestOnOrBefore(dtstart, through, rrule, work); !listed {
 		return nil, false
 	}
 	return l[onsetListingKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule}].StartsBetween(after, through)

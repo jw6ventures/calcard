@@ -36,8 +36,9 @@ func TestPutStoresControlCharactersAsSent(t *testing.T) {
 	}
 }
 
-// COPY and MOVE validate the stored object as PUT would, so an object stored
-// with control characters is not stranded where it is.
+// COPY and MOVE validate the stored object with the transferred reading, not
+// PUT's, so an object stored with control characters is not stranded where it
+// is.
 func TestCopyMoveTransferAStoredObjectWithControlCharacters(t *testing.T) {
 	for _, method := range []string{"COPY", "MOVE"} {
 		t.Run(method, func(t *testing.T) {

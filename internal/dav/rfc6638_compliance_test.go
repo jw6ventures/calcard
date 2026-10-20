@@ -53,7 +53,8 @@ func TestRFC6638_ScheduleCalendarTranspIsOpaqueOrTransparent(t *testing.T) {
 	}
 }
 
-// Extension: Schedule-Tag Header (RFC 6638 - CalDAV Scheduling)
+// RFC 6638 Schedule-Tag response header. CalCard need not send it, so the test
+// only logs it.
 func TestRFC6638_ScheduleTagHeader(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{

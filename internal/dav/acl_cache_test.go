@@ -54,8 +54,8 @@ func TestEnsureRequestCachesInstallsOnce(t *testing.T) {
 	if aclEntryCacheFromContext(cached.Context()) == nil {
 		t.Fatal("ensureRequestCaches must install the ACL entry cache")
 	}
-	// A second call (ServeHTTP followed by the method handler) must reuse the
-	// installed caches instead of replacing them mid-request.
+	// Calling it again on a request that already carries the caches must reuse
+	// them instead of replacing them mid-request.
 	again := ensureRequestCaches(cached)
 	if again != cached {
 		t.Fatal("ensureRequestCaches must be idempotent for a request that already carries the caches")

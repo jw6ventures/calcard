@@ -525,7 +525,7 @@ func TestEventInASkippedLocalTimeKeepsTheEnteredWallClock(t *testing.T) {
 	if metadata == nil || metadata.DTStart == nil || metadata.DTEnd == nil || !metadata.DTStart.Equal(want) || !metadata.DTEnd.Equal(want) {
 		t.Errorf("the DAV layer reads the stored times as %+v, want both at %s", metadata, want)
 	}
-	payload := unfoldedEventJSON(unfoldedEvent{event: *stored, lines: utils.UnfoldLines(stored.RawICAL)}, time.Time{}, time.Time{}, nil)
+	payload := unfoldedEventJSON(unfoldedEvent{event: *stored, lines: utils.UnfoldLines(stored.RawICAL)}, time.Time{}, time.Time{}, nil, nil)
 	if payload["dtstart"] != "2024-03-10T07:30:00Z" || payload["dtend"] != "2024-03-10T07:30:00Z" {
 		t.Errorf("view model dtstart = %v dtend = %v, want both at %s", payload["dtstart"], payload["dtend"], want.Format(time.RFC3339))
 	}
@@ -841,6 +841,11 @@ func TestEditDropsOnlyTheServersDefinitions(t *testing.T) {
 		"BEGIN:STANDARD", "DTSTART:19701025T030000", "TZOFFSETFROM:+0200", "TZOFFSETTO:+0100", "END:VTIMEZONE"}
 	client := []string{"BEGIN:VTIMEZONE", "TZID:Custom/Zone",
 		"BEGIN:STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:+0300", "TZOFFSETTO:+0300", "END:STANDARD", "END:VTIMEZONE"}
+	// falseMarked carries the marker property with a value other than TRUE, as
+	// a client that copies it without copying its meaning might, and is the
+	// object's own definition, not the server's, so an edit keeps it.
+	falseMarked := []string{"BEGIN:VTIMEZONE", "TZID:Europe/Berlin", ical.HostDefinitionProperty + ":FALSE",
+		"BEGIN:STANDARD", "DTSTART:19701025T030000", "TZOFFSETFROM:+0200", "TZOFFSETTO:+0100", "END:STANDARD", "END:VTIMEZONE"}
 	event := []string{"BEGIN:VEVENT", "UID:x", "DTSTART;TZID=Europe/Berlin:20260105T090000", "END:VEVENT"}
 	join := func(parts ...[]string) []string { return slices.Concat(parts...) }
 	head, tail := []string{"BEGIN:VCALENDAR", "VERSION:2.0"}, []string{"END:VCALENDAR"}
@@ -848,6 +853,9 @@ func TestEditDropsOnlyTheServersDefinitions(t *testing.T) {
 	tests := map[string]struct{ lines, want []string }{
 		"observance left open": {join(head, unclosed, client, event, tail), join(head, client, event, tail)},
 		"after the events":     {join(head, event, client, unclosed, tail), join(head, event, client, tail)},
+		"marker other than TRUE": {
+			join(head, falseMarked, event, tail), join(head, falseMarked, event, tail),
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

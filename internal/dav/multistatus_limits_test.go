@@ -245,10 +245,10 @@ func TestCalendarMultigetAtTheHrefLimitAnswersEveryHref(t *testing.T) {
 }
 
 // hostileRecurrenceServer stores a resource whose recurrence rule terminates at
-// neither COUNT nor UNTIL and fires once a second. PUT refuses that shape
-// today, so the only way it reaches a report is as data already in the
-// collection -- a row stored before a limit existed, or written around the DAV
-// layer. The reports still have to answer it in bounded time.
+// neither COUNT nor UNTIL and fires once a second. PUT refuses that shape, so
+// it reaches a report only as data already in the collection -- a row an
+// earlier release stored, or one written around the DAV layer. The reports
+// still have to answer it in bounded time.
 func hostileRecurrenceServer() *DavServer {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -318,7 +318,7 @@ func TestFreeBusyOfAnUnboundedSubSecondRecurrenceStaysBounded(t *testing.T) {
 	}
 }
 
-// A body at the size cap is refused on its Content-Length rather than read,
+// A body over the size cap is refused on its Content-Length rather than read,
 // parsed and then measured.
 func TestOversizedReportBodyIsRefusedBeforeParsing(t *testing.T) {
 	h := hostileRecurrenceServer()
@@ -1102,8 +1102,7 @@ func limitsTombstoneAddressBookServer(cfg *config.Config, contacts, tombstones i
 	return h
 }
 
-// Every bounded read reaches its repository through collectBoundedPages, so a
-// repository that fails has to arrive as the report's own fixed message: the
+// A repository that fails has to arrive as the report's own fixed message: the
 // error a repository returns names storage detail a client has no business
 // reading.
 func TestSyncCollectionRepositoryFailureCarriesNoStorageDetail(t *testing.T) {
@@ -1256,10 +1255,9 @@ func TestReportReadFailureLogsItsCause(t *testing.T) {
 	}
 }
 
-// A collection larger than one keyset page has to be read whole: every other
-// case here stops on the first page, at or over its budget, which leaves the
-// resume between pages untested. Free-busy is the report that drains a
-// collection through collectBoundedPages.
+// A collection larger than one keyset page has to be read whole, resuming
+// between pages. Free-busy is the report that drains a collection through
+// collectBoundedPages.
 func TestBoundedReadAccumulatesEveryKeysetPage(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.DAV.MaxReportCandidateRows = 50000

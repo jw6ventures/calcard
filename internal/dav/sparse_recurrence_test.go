@@ -107,7 +107,8 @@ func TestRecurrenceReportsHandleIncompleteExpansion(t *testing.T) {
 }
 
 // requirePrompt runs evaluate and fails the test unless it returns within half
-// a second, the most one evaluation of a recurrence or zone may cost.
+// a second, the most one evaluation of a recurrence or zone may cost. A
+// race-detector build is held only to requirePromptWithin's hard limit.
 func requirePrompt(t *testing.T, evaluate func()) {
 	t.Helper()
 	requirePromptWithin(t, 500*time.Millisecond, evaluate)
@@ -140,9 +141,9 @@ func requirePromptWithin(t *testing.T, budget time.Duration, evaluate func()) {
 // A rule whose BY parts can never hold together -- the twenty-sixth weekday of
 // a year always falls after the 23rd of June -- describes the DTSTART alone. On
 // the PUT gate, as a VTIMEZONE observance, and stored under free-busy and an
-// open-ended calendar-query, that has to be answered exactly and promptly: the
-// 316-byte object once took ten minutes of CPU on each, and repeating its BYDAY
-// list multiplied that. A daily or hourly rule for a date that does not exist,
+// open-ended calendar-query, that has to be answered exactly and promptly: a
+// few hundred bytes of such a rule can cost minutes of CPU on each when every
+// candidate day is tried, and repeating its BYDAY list multiplies that. A daily or hourly rule for a date that does not exist,
 // the 30th of February, is the same answer reached through the scan that
 // follows a rule day by day.
 func TestNeverMatchingRecurrenceIsAnsweredPromptly(t *testing.T) {

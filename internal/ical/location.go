@@ -157,9 +157,10 @@ func WallClockIn(loc *time.Location, wall time.Time) time.Time {
 }
 
 // WallClockExists reports whether a wall-clock reading names any instant in
-// loc. A reading a transition skips names none: WallClockIn still reads it, as
-// RFC 5545 §3.3.5 requires, but §3.3.10 leaves an instance a recurrence rule
-// generates on it out of the set. wall is read as WallClockIn reads it.
+// loc. A reading a transition skips names none, though WallClockIn still
+// reads it, at the offset before the gap (RFC 5545 §3.3.5): a recurrence rule
+// uses this to find which of its candidates may collide with a neighbor at
+// the same instant (§3.8.5.3). wall is read as WallClockIn reads it.
 func WallClockExists(loc *time.Location, wall time.Time) bool {
 	local := WallClockIn(loc, wall)
 	return local.Year() == wall.Year() && local.Month() == wall.Month() && local.Day() == wall.Day() &&

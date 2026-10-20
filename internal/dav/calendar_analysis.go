@@ -34,7 +34,7 @@ type calendarTopLevelComponent struct {
 
 func analyzeICalendar(raw string) (calendarAnalysis, error) {
 	lines := ical.UnfoldLines(raw)
-	return analyzeUnfoldedICalendar(raw, lines, ical.NewObjectTimesSharingOnsets(lines, sharedTimezoneOnsets))
+	return analyzeUnfoldedICalendar(raw, lines, ical.NewObjectTimes(lines, sharedTimezoneOnsets, nil))
 }
 
 // analyzeUnfoldedICalendar is analyzeICalendar for a caller that already

@@ -69,7 +69,7 @@ func seriesStarts(t *testing.T, body string) []time.Time {
 		if through.After(maxDate) {
 			through = maxDate
 		}
-		expansion := dav.EventInstances(body, from, through)
+		expansion := dav.EventInstances(body, from, through, nil)
 		if !expansion.Recurs || !expansion.Complete {
 			t.Fatalf("expansion from %s to %s: recurs = %t, complete = %t", from, through, expansion.Recurs, expansion.Complete)
 		}

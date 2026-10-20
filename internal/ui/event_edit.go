@@ -597,7 +597,7 @@ func newSeriesMove(previous, edited, object []string) (move seriesMove, moved bo
 	if from.date == to.date && from.utc == to.utc && from.tzid == to.tzid && from.timeOfDay() == to.timeOfDay() {
 		return seriesMove{}, false
 	}
-	return seriesMove{from: from, to: to, fromZone: utils.EventZoneIn(from.tzid, object), times: ical.NewObjectTimes(object)}, true
+	return seriesMove{from: from, to: to, fromZone: utils.EventZoneIn(from.tzid, object), times: ical.NewObjectTimes(object, nil, nil)}, true
 }
 
 // restate rewrites an EXDATE, RDATE or RECURRENCE-ID line so that each date

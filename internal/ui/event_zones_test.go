@@ -23,9 +23,9 @@ import (
 func TestCalendarViewReadsAnUndefinedTZIDAsTheDAVLayerDoes(t *testing.T) {
 	lines := ical.UnfoldLines("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260105T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
 	wall := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
-	zones := &calendarEventZones{times: ical.NewObjectTimes(lines)}
+	zones := &calendarEventZones{times: ical.NewObjectTimes(lines, nil, nil)}
 	for _, tzid := range []string{"US/Eastern", "America/New_York", "Nowhere/Zone"} {
-		want, ok := ical.NewObjectTimes(lines).ResolvePropertyTime("DTSTART;TZID="+tzid, "20260105T090000")
+		want, ok := ical.NewObjectTimes(lines, nil, nil).ResolvePropertyTime("DTSTART;TZID="+tzid, "20260105T090000")
 		if !ok {
 			t.Fatalf("%s: the DAV layer's reading does not resolve", tzid)
 		}

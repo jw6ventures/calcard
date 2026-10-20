@@ -86,8 +86,8 @@ func privilegeKindsHandler(delegateGrants ...string) *DavServer {
 	}}
 }
 
-// TestPropfindCurrentUserPrivilegeSetResourceKinds is the H3 regression: RFC 3744
-// §5.4 makes current-user-privilege-set the property clients use to discover the
+// TestPropfindCurrentUserPrivilegeSetResourceKinds pins that RFC 3744 §5.4
+// makes current-user-privilege-set the property clients use to discover the
 // privileges they hold on a resource, so address-book collections and both object
 // kinds must answer 200 with the computed privileges instead of a property-level
 // 404.
@@ -95,8 +95,8 @@ func TestPropfindCurrentUserPrivilegeSetResourceKinds(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 
-	// DAV:write aggregates write-content and write-properties. Bind and unbind
-	// remain independent privileges and are granted explicitly for editors.
+	// DAV:write aggregates write-content, write-properties, bind and unbind
+	// (RFC 3744 §3.2), so an editor holds each of them beside it.
 	writePrivileges := []string{"<d:write>", "<d:write-content>", "<d:write-properties>", "<d:bind>", "<d:unbind>"}
 	allPrivileges := append([]string{"<d:read>"}, writePrivileges...)
 
@@ -262,7 +262,7 @@ func TestPropfindObjectPrivilegeSetRequiresReadCurrentUserPrivilegeSet(t *testin
 			if err := h.decoratePropfindResponses(ctx, nil, stranger, responses, decorationMaskFor(req)); err != nil {
 				t.Fatalf("decorate responses: %v", err)
 			}
-			filtered := filterNonPrincipalPropfindResponse(responses[0], req)
+			filtered := filterPropfindResponse(responses[0], req)
 			forbiddenXML := marshalPropstatXML(t, propstatWithStatus(filtered.Propstat, httpStatusForbidden))
 			if !strings.Contains(forbiddenXML, "<d:current-user-privilege-set") {
 				t.Fatalf("expected current-user-privilege-set in the 403 propstat, got %q", forbiddenXML)

@@ -35,7 +35,7 @@ func TestRecurrenceOverrideLengthIsTheOneItStates(t *testing.T) {
 	rangeStart, rangeEnd := utc(2026, 1, 1, 0, 0), utc(2026, 2, 1, 0, 0)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			slots := requireRecurrenceResult[RecurrenceSlot](t)(RecurrenceSlots(override(";RANGE=THISANDFUTURE:20260112T090000Z", tt.length), "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 100, nil))
+			slots := requireRecurrenceResult[RecurrenceSlot](t)(RecurrenceSlots(override(";RANGE=THISANDFUTURE:20260112T090000Z", tt.length), "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, 100, nil, nil))
 			if len(slots) != 4 {
 				t.Fatalf("slots = %d, want 4: %+v", len(slots), slots)
 			}
@@ -46,7 +46,7 @@ func TestRecurrenceOverrideLengthIsTheOneItStates(t *testing.T) {
 				}
 			}
 
-			periods, err := RecurringBusyPeriods(override(":20260112T090000Z", tt.length), dtstart, time.Hour, rangeStart, rangeEnd, 100, nil)
+			periods, err := RecurringBusyPeriods(override(":20260112T090000Z", tt.length), dtstart, time.Hour, rangeStart, rangeEnd, 100, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

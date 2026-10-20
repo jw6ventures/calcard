@@ -315,6 +315,7 @@ func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 		"--set", "app.dav.maxRequestedProperties=250",
 		"--set", "app.dav.maxReportCandidateRows=0",
 		"--set", "app.dav.syncHistoryRetention=504h",
+		"--set", "app.dav.reportTimeout=30s",
 	)
 	configmap := requireDocument(t, documents, "configmap.yaml")
 	for _, want := range []string{
@@ -324,6 +325,7 @@ func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
 		`APP_DAV_MAX_REQUESTED_PROPERTIES: "250"`,
 		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`,
 		`APP_DAV_SYNC_HISTORY_RETENTION: "504h"`,
+		`APP_DAV_REPORT_TIMEOUT: "30s"`,
 	} {
 		if !hasLine(configmap, want) {
 			t.Errorf("configmap is missing %s:\n%s", want, configmap)
@@ -913,5 +915,42 @@ func TestHelmChartRendersOverReusedV1_1Values(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The server reads APP_DAV_REPORT_TIMEOUT as a Go duration, in which a bare
+// number other than 0 is an error at startup, so the chart refuses one at
+// render: the schema first, and the template again for installs run with
+// --skip-schema-validation. 0, which turns the deadline off, and a duration
+// with a unit render.
+func TestHelmChartReportTimeoutIsADuration(t *testing.T) {
+	for _, value := range []string{"10s", "1m30s", "250ms", "1.5h", "0"} {
+		documents := renderChart(t, "--set-string", "app.dav.reportTimeout="+value)
+		want := `APP_DAV_REPORT_TIMEOUT: "` + value + `"`
+		if configmap := requireDocument(t, documents, "configmap.yaml"); !hasLine(configmap, want) {
+			t.Errorf("reportTimeout %q did not render %s:\n%s", value, want, configmap)
+		}
+	}
+	if configmap := requireDocument(t, renderChart(t, "--set", "app.dav.reportTimeout=0"), "configmap.yaml"); !hasLine(configmap, `APP_DAV_REPORT_TIMEOUT: "0"`) {
+		t.Errorf("the integer 0 did not render as the duration 0:\n%s", configmap)
+	}
+	for _, bad := range [][]string{
+		{"--set", "app.dav.reportTimeout=30"},
+		{"--set-string", "app.dav.reportTimeout=30"},
+		{"--set", "app.dav.reportTimeout=1.5"},
+		{"--set-string", "app.dav.reportTimeout=ten seconds"},
+		{"--set-string", "app.dav.reportTimeout=-5s"},
+		{"--set-string", "app.dav.reportTimeout="},
+	} {
+		args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+		for _, skip := range []bool{false, true} {
+			run := append(append([]string{}, args...), bad...)
+			if skip {
+				run = append(run, "--skip-schema-validation")
+			}
+			if output, err := runHelm(t, run...); err == nil {
+				t.Errorf("helm rendered %v (skip schema %t) although the server refuses it at startup:\n%.300s", bad, skip, output)
+			}
+		}
 	}
 }

@@ -2,10 +2,7 @@ package store_test
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -16,6 +13,7 @@ import (
 
 	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/dav"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -32,6 +30,16 @@ type tzidRepairCase struct {
 	// refused marks a body the PUT validator refuses before the repair, so
 	// nothing is asserted of what it says after it.
 	refused bool
+	// held marks a body a VTIMEZONE of its own holds back from the UTC
+	// rewrite, as heldUTCTZIDs and the repair's own zone_held CTE agree: the write
+	// path trims it exactly as the repair does, and no more, so it is held
+	// to the same after as the repair computes, whether or not that line is
+	// also reported. A reported case that is not held is one the repair's
+	// own structural limits -- a fold, a list or period, a spaced parameter
+	// name, a repeated TZID -- leave for the write path to finish, which the
+	// write path then does fully: writing the result again changes nothing
+	// more.
+	held bool
 }
 
 func tzidRepairEvent(uid, timezones, properties string) string {
@@ -104,6 +112,58 @@ func tzidRepairCases() []tzidRepairCase {
 			before: tzidRepairEvent("utc-defined-zero", utcZero("UTC"), "DTSTART;TZID=UTC:20260701T100000\r\nDTEND;TZID=UTC:20260701T110000\r\n"),
 			after:  tzidRepairEvent("utc-defined-zero", utcZero("UTC"), "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
 
+		// UTC is matched without regard to case, so a lowercase, mixed-case or
+		// quoted lowercase spelling, with no VTIMEZONE of its own, is rewritten
+		// exactly as the uppercase spelling is.
+		{uid: "utc-lowercase",
+			before: tzidRepairEvent("utc-lowercase", "", "DTSTART;TZID=utc:20260701T100000\r\nDTEND;TZID=utc:20260701T110000\r\n"),
+			after:  tzidRepairEvent("utc-lowercase", "", "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		{uid: "utc-mixed-case",
+			before: tzidRepairEvent("utc-mixed-case", "", "DTSTART;TZID=Utc:20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
+			after:  tzidRepairEvent("utc-mixed-case", "", "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		{uid: "utc-lowercase-quoted",
+			before: tzidRepairEvent("utc-lowercase-quoted", "", "DTSTART;TZID=\"utc\":20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
+			after:  tzidRepairEvent("utc-lowercase-quoted", "", "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		{uid: "utc-lowercase-padded",
+			before: tzidRepairEvent("utc-lowercase-padded", "", "DTSTART;TZID= utc :20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
+			after:  tzidRepairEvent("utc-lowercase-padded", "", "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		// A lowercase definition whose offsets are all zero is kept, matching
+		// utc-defined-zero's uppercase one.
+		{uid: "utc-lowercase-defined-zero",
+			before: tzidRepairEvent("utc-lowercase-defined-zero", utcZero("utc"), "DTSTART;TZID=utc:20260701T100000\r\nDTEND;TZID=utc:20260701T110000\r\n"),
+			after:  tzidRepairEvent("utc-lowercase-defined-zero", utcZero("utc"), "DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		// A lowercase definition that moves its clock holds its times back,
+		// matching utc-defined-shifted's uppercase one.
+		{uid: "utc-lowercase-defined-shifted", reported: 2, held: true,
+			before: tzidRepairEvent("utc-lowercase-defined-shifted",
+				"BEGIN:VTIMEZONE\r\nTZID:utc\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=utc:20260701T100000\r\nDTEND;TZID=utc:20260701T110000\r\n")},
+		// A definition holds the values naming its own spelling, and no
+		// other: readers answer a TZID from the definition spelled as it is,
+		// and take any other UTC name for UTC itself, so a value naming utc
+		// beside a definition of UTC that moves its clock is rewritten, as
+		// is one naming UTC beside a definition of utc that does.
+		{uid: "utc-defined-shifted-other-spelling",
+			before: tzidRepairEvent("utc-defined-shifted-other-spelling", "BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=utc:20260701T100000\r\nDTEND;TZID=utc:20260701T110000\r\n"),
+			after: tzidRepairEvent("utc-defined-shifted-other-spelling", "BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+		{uid: "utc-lowercase-defined-shifted-other-spelling",
+			before: tzidRepairEvent("utc-lowercase-defined-shifted-other-spelling", "BEGIN:VTIMEZONE\r\nTZID:utc\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=UTC:20260701T100000\r\nDTEND;TZID=UTC:20260701T110000\r\n"),
+			after: tzidRepairEvent("utc-lowercase-defined-shifted-other-spelling", "BEGIN:VTIMEZONE\r\nTZID:utc\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+
+		// Only an offset on a STANDARD or DAYLIGHT directly inside the
+		// VTIMEZONE places anything, as readers read a definition: one in a
+		// component nested in an observance moves no clock, so a definition
+		// of UTC whose observance is at zero holds nothing back.
+		{uid: "utc-defined-zero-nested-offset",
+			before: tzidRepairEvent("utc-defined-zero-nested-offset", "BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nBEGIN:X-NOTE\r\nTZOFFSETTO:+0100\r\nEND:X-NOTE\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=UTC:20260701T100000\r\nDTEND;TZID=UTC:20260701T110000\r\n"),
+			after: tzidRepairEvent("utc-defined-zero-nested-offset", "BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nBEGIN:X-NOTE\r\nTZOFFSETTO:+0100\r\nEND:X-NOTE\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n")},
+
 		// The UTC rewrite applies to lines the repair can only rewrite by
 		// re-folding or by rewriting several values; those are reported and
 		// left untouched, while the other lines of the body are rewritten.
@@ -121,6 +181,16 @@ func tzidRepairCases() []tzidRepairCase {
 		{uid: "utc-spaced-name", reported: 1,
 			before: tzidRepairEvent("utc-spaced-name", "", "DTSTART; TZID=UTC:20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
 			after:  tzidRepairEvent("utc-spaced-name", "", "DTSTART; TZID=UTC:20260701T100000\r\nDTEND:20260701T110000Z\r\n")},
+		// White space outside a quoted TZID's quotes is white space the
+		// server trims too, but the repair rewrites a quoted value only
+		// written exactly in its quotes, so it reports the line for the write
+		// path to trim.
+		{uid: "tzid-space-before-quote", reported: 1,
+			before: tzidRepairEvent("tzid-space-before-quote", "", "DTSTART;TZID= \"Europe/Berlin\":20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
+			after:  tzidRepairEvent("tzid-space-before-quote", "", "DTSTART;TZID= \"Europe/Berlin\":20260701T100000\r\nDTEND:20260701T110000Z\r\n")},
+		{uid: "tzid-space-after-quote", reported: 1,
+			before: tzidRepairEvent("tzid-space-after-quote", "", "DTSTART;TZID=\"Europe/Berlin\" ;X-A=1:20260701T100000\r\nDTEND:20260701T110000Z\r\n"),
+			after:  tzidRepairEvent("tzid-space-after-quote", "", "DTSTART;TZID=\"Europe/Berlin\" ;X-A=1:20260701T100000\r\nDTEND:20260701T110000Z\r\n")},
 		// The series' DTSTART and its override's RECURRENCE-ID must keep one
 		// form, so a RECURRENCE-ID the repair cannot rewrite keeps every
 		// DTSTART and RECURRENCE-ID of the body in theirs; the DTENDs are
@@ -136,15 +206,29 @@ func tzidRepairCases() []tzidRepairCase {
 				"DTSTART;TZID=UTC:20260708T120000\r\nDTEND:20260708T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"},
 		// A definition named UTC that moves its clock reads a local time as
 		// another instant than the UTC form names.
-		{uid: "utc-defined-shifted", reported: 2,
+		{uid: "utc-defined-shifted", reported: 2, held: true,
 			before: tzidRepairEvent("utc-defined-shifted",
 				"BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
 				"DTSTART;TZID=UTC:20260701T100000\r\nDTEND;TZID=UTC:20260701T110000\r\n")},
+		// A held definition's TZID still trims: DAVx5 keeps a TZID's white
+		// space whatever defines the zone, so an untrimmed one resolves to
+		// nothing even where a VTIMEZONE of the object's own would otherwise
+		// place it. The line is rewritten (trimmed) and still reported: it
+		// is corrected, but ical4j drops a parameter named exactly UTC
+		// whether or not a same-named VTIMEZONE is present, so DAVx5 still
+		// floats the time this held zone defines.
+		{uid: "utc-defined-shifted-padded", reported: 2, held: true,
+			before: tzidRepairEvent("utc-defined-shifted-padded",
+				"BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=\" UTC\":20260701T100000\r\nDTEND;TZID=\"UTC \":20260701T110000\r\n"),
+			after: tzidRepairEvent("utc-defined-shifted-padded",
+				"BEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
+				"DTSTART;TZID=\"UTC\":20260701T100000\r\nDTEND;TZID=\"UTC\":20260701T110000\r\n")},
 		// A definition's name and offsets are its values after the first
 		// colon outside quotes, as ical.SplitContentLine reads them, so a
 		// quoted parameter holding a colon neither hides that this one is
 		// named UTC and moves the clock, nor that the next keeps it at zero.
-		{uid: "utc-defined-quoted-colon", reported: 2,
+		{uid: "utc-defined-quoted-colon", reported: 2, held: true,
 			before: tzidRepairEvent("utc-defined-quoted-colon",
 				"BEGIN:VTIMEZONE\r\nTZID;X-A=\"a:b\":UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n",
 				"DTSTART;TZID=UTC:20260701T100000\r\nDTEND;TZID=UTC:20260701T110000\r\n")},
@@ -185,9 +269,6 @@ func tzidRepairCases() []tzidRepairCase {
 		// RFC 5545 section 3.2.19 forbids TZID on either, and PUT refuses both.
 		{uid: "utc-already-z", properties: "DTSTART;TZID=UTC:20260701T100000Z\r\nDTEND:20260701T110000Z\r\n", refused: true},
 		{uid: "utc-date", properties: "DTSTART;VALUE=DATE;TZID=UTC:20260701\r\nDTEND;VALUE=DATE:20260702\r\n", refused: true},
-		// ical4j drops only a parameter whose value is exactly UTC, matched
-		// with regard to case; another spelling names another zone.
-		{uid: "utc-lowercase", timezones: utcZero("utc"), properties: "DTSTART;TZID=utc:20260701T100000\r\nDTEND;TZID=utc:20260701T110000\r\n"},
 		// The text appears only inside another parameter's quoted value.
 		{uid: "tzid-in-quoted-value", properties: "DTSTART;X-LABEL=\"TZID=UTC\":20260701T100000Z\r\nDTEND:20260701T110000Z\r\n"},
 		// A zone name with white space inside it, which is not trimmed.
@@ -370,6 +451,40 @@ VALUES ($1, 'unrelated', 'unrelated.ics', $2, 'etag-unrelated', '2026-07-01T08:0
 			t.Errorf("%s: a write of the rewritten body bounds its recurrence by %v, %v, want %v, %v", test.uid,
 				after.Metadata.RecurrenceStart, after.Metadata.RecurrenceUntil, before.Metadata.RecurrenceStart, before.Metadata.RecurrenceUntil)
 		}
+		// Go and the SQL repair apply the same TZID rule; this proves it,
+		// over the same bodies, by comparing the write path's own rewrite of
+		// the pre-repair body (before.Body, which validateCalendarObject
+		// just computed) against the repair's -- less any VTIMEZONE the
+		// write path generated for a zone the host defines, a separate
+		// feature the repair does not touch at all.
+		rewritten := withoutHostGeneratedTimezones(t, before.Body)
+		switch {
+		case test.reported == 0:
+			// The repair's own rewrite is final: the write path, given the
+			// same pre-repair body, computes byte-for-byte the same text.
+			if rewritten != test.after {
+				t.Errorf("%s: the write path rewrites the pre-repair body to\n%q\nwant the repair's own\n%q", test.uid, rewritten, test.after)
+			}
+		case test.held:
+			// A zone of the body's own holds the write path back exactly as
+			// it holds the repair back: the same text either way, trimmed
+			// or not.
+			if rewritten != test.after {
+				t.Errorf("%s: the write path's held rewrite is\n%q\nwant the repair's own\n%q", test.uid, rewritten, test.after)
+			}
+		default:
+			// The repair's own structural limits -- a fold, a list or
+			// period, a spaced parameter name, a repeated TZID -- leave the
+			// line for the write path to finish, which it does fully:
+			// writing the result again changes nothing more.
+			if rewritten == test.before {
+				t.Errorf("%s: the write path leaves the pre-repair body exactly as the repair reported it, unrewritten:\n%q", test.uid, rewritten)
+			}
+			again := validateCalendarObject(t, test.uid, before.Body)
+			if withoutHostGeneratedTimezones(t, again.Body) != rewritten {
+				t.Errorf("%s: a second write of the write path's own rewrite changes it again, from\n%q\nto\n%q", test.uid, rewritten, again.Body)
+			}
+		}
 	}
 
 	// One move of the repaired calendar's CTag and sync token, none of the
@@ -395,7 +510,7 @@ VALUES ($1, 'unrelated', 'unrelated.ics', $2, 'etag-unrelated', '2026-07-01T08:0
 	}
 
 	// The lines left untouched are reported in the server log, with the
-	// events that carry them, and the operator's query finds the same events.
+	// events that carry them.
 	var wantIDs []int64
 	for _, uid := range reported {
 		wantIDs = append(wantIDs, ids[uid])
@@ -405,9 +520,6 @@ VALUES ($1, 'unrelated', 'unrelated.ics', $2, 'etag-unrelated', '2026-07-01T08:0
 	gotWarnings := slices.Clone(warnings)
 	mu.Unlock()
 	assertTZIDRepairWarning(t, gotWarnings, len(changed), reportedLines, wantIDs)
-	if pending := pendingTZIDRepairs(t, pool); !slices.Equal(pending, wantIDs) {
-		t.Errorf("the operator query lists %v, want the reported events %v", pending, wantIDs)
-	}
 
 	// A second run finds nothing more to rewrite: no body, ETag, CTag or sync
 	// token moves, and the untouched lines are reported again.
@@ -471,34 +583,6 @@ func assertTZIDRepairWarning(t *testing.T, warnings []*pq.Error, rewritten, line
 	}
 }
 
-// pendingTZIDRepairs runs the operator's query for the events the TZID repair
-// left as stored, read from the file the README and the repair's hint name.
-func pendingTZIDRepairs(t *testing.T, pool *sql.DB) []int64 {
-	t.Helper()
-	query, err := os.ReadFile(filepath.Join("..", "..", "docs", "upgrade-1.2.0", "tzid-repair-pending.sql"))
-	if err != nil {
-		t.Fatalf("read the operator query: %v", err)
-	}
-	rows, err := pool.Query(string(query))
-	if err != nil {
-		t.Fatalf("run the operator query: %v", err)
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id, calendarID int64
-		var resourceName string
-		if err := rows.Scan(&id, &calendarID, &resourceName); err != nil {
-			t.Fatalf("scan id: %v", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("run the operator query: %v", err)
-	}
-	return ids
-}
-
 func validateCalendarObject(t *testing.T, uid, body string) *calobject.Object {
 	t.Helper()
 	object, err := dav.ValidateCalendarObject(body, nil)
@@ -506,6 +590,32 @@ func validateCalendarObject(t *testing.T, uid, body string) *calobject.Object {
 		t.Fatalf("%s: the PUT validator refuses\n%q\n: %v", uid, body, err)
 	}
 	return object
+}
+
+// withoutHostGeneratedTimezones removes every VTIMEZONE the write path wrote
+// for a zone the host defines (RFC 4791 section 4.1) -- a feature of its own
+// the SQL repair does not touch at all -- so comparing the write path's
+// rewrite against the repair's is a comparison of the one rule both apply to
+// TZID, not of this unrelated one.
+func withoutHostGeneratedTimezones(t *testing.T, body string) string {
+	t.Helper()
+	lines := ical.UnfoldLines(body)
+	var kept []string
+	keptThrough := 0
+	for _, timezone := range ical.TimezoneComponents(lines) {
+		if !timezone.HostDefinition {
+			continue
+		}
+		kept = append(kept, lines[keptThrough:timezone.Start]...)
+		keptThrough = timezone.End
+	}
+	if keptThrough == 0 {
+		return body
+	}
+	kept = append(kept, lines[keptThrough:]...)
+	// UnfoldLines splits a final line ending as one more, empty, line, so
+	// joining on "\r\n" alone restores it without adding another.
+	return strings.Join(kept, "\r\n")
 }
 
 func sameInstant(a, b *time.Time) bool {

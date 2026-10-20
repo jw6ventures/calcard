@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -54,7 +55,9 @@ type Expansion struct {
 	// Override is the zero time.
 	Overrides []Instance
 	// Complete is false when the range holds more instances than the
-	// expansion lists, so Instances are only some of them.
+	// expansion lists, so Instances are only some of them, when it holds more
+	// overrides than the expansion lists, or when the expansion ran out of
+	// work.
 	Complete bool
 }
 
@@ -63,7 +66,11 @@ type Expansion struct {
 // calendar-query with CALDAV:expand over that range returns for it (§9.6.5),
 // less each an override replaces, which stands for itself and is placed among
 // the expansion's Overrides. Floating times are read in UTC.
-type Expander func(raw string, start, end time.Time) Expansion
+//
+// work is the recurrence and observance budget of the request the expansion
+// answers, shared with every other expansion of it, and nil for an expansion
+// that stands alone. An expansion that runs out of it is incomplete.
+type Expander func(raw string, start, end time.Time, work *ical.RequestWork) Expansion
 
 // ErrUndefinedTimezone is the reason a calendar object is refused when it
 // names a TZID that neither one of its VTIMEZONE components nor the host's time

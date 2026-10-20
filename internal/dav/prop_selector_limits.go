@@ -71,7 +71,7 @@ func (c *requestedPropertyCounter) start(element xml.StartElement, depth int) bo
 	return len(c.names) > c.limit
 }
 
-// end records the end element closing the given document depth.
+// end leaves the DAV:prop scope when the element at its depth closes.
 func (c *requestedPropertyCounter) end(depth int) {
 	if depth == c.propDepth {
 		c.propDepth = 0

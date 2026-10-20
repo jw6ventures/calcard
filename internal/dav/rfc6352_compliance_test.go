@@ -253,8 +253,8 @@ func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate
 }
 
 // RevokePrincipalGrants mirrors the repository contract: drop the
-// principal's grants on the collection and every resource beneath it, keeping
-// denies.
+// principal's grants of collectionPrivileges on the collection and every grant
+// on a resource beneath it, keeping denies.
 func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
 	kept := f.entries[:0:0]
 	for _, entry := range f.entries {
@@ -1115,7 +1115,6 @@ func TestRFC6352_AddressBookCollectionProperties(t *testing.T) {
 			t.Errorf("RFC 6352 Section 6.2.1: addressbook-description SHOULD NOT be protected against user updates, got %s", rr.Body.String())
 		}
 
-		// Verify the update actually persisted by doing a follow-up PROPFIND
 		propfindBody := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -3825,8 +3824,8 @@ func TestRFC6352_UnicodeCollation(t *testing.T) {
 	})
 
 	t.Run("AsciiCasemapDoesNotFoldUnicode", func(t *testing.T) {
-		// i;ascii-casemap only does ASCII uppercasing; 'é' != 'É' via ToUpper for non-ASCII
-		// but more importantly, ß does NOT fold to SS under ASCII-only rules
+		// i;ascii-casemap folds only US-ASCII letters (RFC 4790), so ß does not
+		// fold to ss and "Straße" does not match "strasse".
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
   <D:prop><D:getetag/></D:prop>
@@ -3917,7 +3916,6 @@ func TestRFC6352_UIDConflictIncludesHref(t *testing.T) {
 	}
 
 	t.Run("Section6_3_2_1_NoUIDConflictIncludesHref", func(t *testing.T) {
-		// Try to PUT a new contact at a different path but with the same UID
 		newVCard := buildVCard("3.0", "UID:duplicate-uid", "FN:New Contact Same UID")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/different-resource.vcf", strings.NewReader(newVCard))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4022,7 +4020,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	t.Run("ExclusiveLockByUser1BlocksUser2Lock", func(t *testing.T) {
-		// User 1 takes an exclusive lock
 		lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/contact.vcf", strings.NewReader(lockBody))
 		req.Header.Set("Timeout", "Second-3600")
@@ -4034,7 +4031,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected user1 LOCK to succeed with 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// User 2 attempts an exclusive lock on the same resource
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/contact.vcf", strings.NewReader(lockBody))
 		req2.Header.Set("Timeout", "Second-3600")
 		req2 = req2.WithContext(auth.WithUser(req2.Context(), user2))
@@ -4061,7 +4057,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected shared lock to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// User 2 takes another shared lock — should succeed
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/shared.vcf", strings.NewReader(sharedBody))
 		req2.Header.Set("Timeout", "Second-3600")
 		req2 = req2.WithContext(auth.WithUser(req2.Context(), user2))
@@ -4088,7 +4083,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected shared lock to succeed, got %d", rr.Code)
 		}
 
-		// User 2 requests an exclusive lock — should be blocked
 		exclusiveBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/mixed.vcf", strings.NewReader(exclusiveBody))
 		req2.Header.Set("Timeout", "Second-3600")
@@ -4183,7 +4177,6 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
-	// User 1 creates a lock
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
 	req.Header.Set("Timeout", "Second-3600")
@@ -4200,7 +4193,6 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 		t.Fatal("expected Lock-Token header in response")
 	}
 
-	// User 2 attempts to UNLOCK the resource — should be forbidden
 	unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	unlockReq.Header.Set("Lock-Token", lockToken)
 	unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user2))
@@ -4211,7 +4203,6 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 		t.Fatalf("RFC 4918: UNLOCK by a different user MUST be forbidden, got %d: %s", unlockRR.Code, unlockRR.Body.String())
 	}
 
-	// User 1 can successfully UNLOCK
 	unlockReq2 := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	unlockReq2.Header.Set("Lock-Token", lockToken)
 	unlockReq2 = unlockReq2.WithContext(auth.WithUser(unlockReq2.Context(), user1))
@@ -4233,7 +4224,6 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
-	// Create a lock with a short timeout
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/refresh.vcf", strings.NewReader(lockBody))
 	req.Header.Set("Timeout", "Second-600")
@@ -4246,7 +4236,6 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 	}
 
 	lockToken := rr.Header().Get("Lock-Token")
-	// Strip angle brackets
 	token := strings.TrimPrefix(strings.TrimSuffix(lockToken, ">"), "<")
 
 	t.Run("RefreshExtensdsTimeout", func(t *testing.T) {
@@ -4262,7 +4251,6 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 			t.Fatalf("RFC 4918: lock refresh via If header MUST succeed, got %d: %s", refreshRR.Code, refreshRR.Body.String())
 		}
 
-		// Verify the lock still exists and timeout was updated
 		refreshed, _ := lockRepo.GetByToken(context.Background(), token)
 		if refreshed == nil {
 			t.Fatal("expected lock to still exist after refresh")
@@ -4628,7 +4616,7 @@ func TestRFC6352_LockTimeoutParsing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Incremental sync-collection (RFC 6578 Section 3)
+// Incremental sync-collection (RFC 6578 Section 3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
@@ -4706,7 +4694,7 @@ func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. DELETE of address book collection (RFC 6352 Section 6.3 / RFC 4918 Section 9.6)
+// DELETE of address book collection (RFC 6352 Section 6.3 / RFC 4918 Section 9.6)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
@@ -4735,7 +4723,6 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 			t.Fatalf("RFC 4918 Section 9.6: DELETE on an address object resource MUST return 204, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// Verify the contact was actually removed
 		c, _ := contactRepo.GetByResourceName(context.Background(), 5, "alice")
 		if c != nil {
 			t.Error("RFC 4918 Section 9.6: DELETE must actually remove the resource from the store")
@@ -4790,7 +4777,7 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. addressbook-query with empty filter (RFC 6352 Section 8.6)
+// addressbook-query with empty filter (RFC 6352 Section 8.6)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_AddressbookQueryEmptyFilter(t *testing.T) {
@@ -4856,7 +4843,7 @@ func TestRFC6352_AddressbookQueryEmptyFilter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. PROPPATCH on address object resources (RFC 6352 Section 6.3.2.3)
+// PROPPATCH on address object resources (RFC 6352 Section 6.3.2.3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
@@ -4892,7 +4879,6 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 			t.Errorf("RFC 4918 Section 9.2: successful PROPPATCH should include 200 propstat, got: %s", rr.Body.String())
 		}
 
-		// Verify the update took effect
 		book := bookRepo.books[5]
 		if book.Name != "Renamed Book" {
 			t.Errorf("PROPPATCH should update the display name, got %q", book.Name)
@@ -4968,7 +4954,7 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Depth:infinity for addressbook-query (RFC 6352 Section 8.6.1)
+// Depth:infinity for addressbook-query (RFC 6352 Section 8.6.1)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_DepthInfinityAddressbookQuery(t *testing.T) {
@@ -5011,7 +4997,7 @@ func TestRFC6352_DepthInfinityAddressbookQuery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. COPY/MOVE cross-collection integration (RFC 4918 Sections 9.8/9.9)
+// COPY/MOVE cross-collection integration (RFC 4918 Sections 9.8/9.9)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_CopyMoveIntegration(t *testing.T) {
@@ -5151,7 +5137,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. ACL enforcement on writes (RFC 3744)
+// ACL enforcement on writes (RFC 3744)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
@@ -5245,7 +5231,7 @@ func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Multiple shared locks (RFC 4918 Section 6.2)
+// Multiple shared locks (RFC 4918 Section 6.2)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
@@ -5295,7 +5281,6 @@ func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
 	t.Run("SharedLockHolderCanWriteWithToken", func(t *testing.T) {
 		vcard := buildVCard("3.0", "UID:shared-contact", "FN:Shared Contact")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/shared-contact.vcf", strings.NewReader(vcard))
-		// Strip angle brackets from lock token for If header
 		cleanToken := strings.TrimPrefix(strings.TrimSuffix(token1, ">"), "<")
 		req.Header.Set("If", "(<"+cleanToken+">)")
 		req = req.WithContext(auth.WithUser(req.Context(), user1))
@@ -5336,7 +5321,7 @@ func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Lock timeout capping integration test
+// Lock timeout capping integration test
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_LockTimeoutCappingIntegration(t *testing.T) {
@@ -5390,7 +5375,7 @@ func TestRFC6352_LockTimeoutCappingIntegration(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. content-type/version in address-data responses (RFC 6352 Section 10.3)
+// content-type/version in address-data responses (RFC 6352 Section 10.3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
@@ -5465,11 +5450,9 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 		}
 		respBody := rr.Body.String()
 
-		// Verify the response contains the vCard data
 		if !strings.Contains(respBody, "BEGIN:VCARD") {
 			t.Errorf("RFC 6352 Section 10.3: addressbook-query response MUST include vCard data when address-data is requested, got: %s", respBody)
 		}
-		// Verify the content type is indicated in the response
 		if !strings.Contains(respBody, "text/vcard") {
 			t.Logf("Note: address-data element may not include explicit content-type attribute — acceptable if vCard is returned correctly")
 		}
@@ -5494,9 +5477,9 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 	})
 }
 
-// propstatHasStatus and extractPropInt are regex probes retained for the RFC
-// 6352 suite. The RFC 4791 suite has moved to the namespace-aware helpers in
-// dav_xml_assert_test.go; this suite has not been converted yet.
+// propstatHasStatus and extractPropInt probe response XML with regular
+// expressions and match element names without their namespaces; the
+// namespace-aware helpers in dav_xml_assert_test.go do not.
 func propstatHasStatus(body, prop string, statusCode int) bool {
 	pattern := fmt.Sprintf(`(?s)<[^>]*propstat[^>]*>.*?<[^>]*%s[^>]*>.*?<[^>]*status[^>]*>HTTP/1.1 %d`,
 		regexp.QuoteMeta(prop), statusCode)

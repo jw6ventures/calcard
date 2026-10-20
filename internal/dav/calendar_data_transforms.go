@@ -47,7 +47,8 @@ var utcDateProperties = nameSet("DTSTART", "DTEND", "DUE", "COMPLETED", "CREATED
 // expandCalendarData replaces every recurring component of root with the
 // individual instances whose scheduled time intersects the range, per RFC 4791
 // §9.6.5. The output carries no recurrence property and no VTIMEZONE, and every
-// zoned value is rewritten as a date with UTC time.
+// zoned value loses its TZID: one a zone places is rewritten as a date with UTC
+// time.
 //
 // The instance cap bounds the whole object rather than each component of it, so
 // a resource carrying several masters cannot multiply the limit by how many it
@@ -55,8 +56,8 @@ var utcDateProperties = nameSet("DTSTART", "DTEND", "DUE", "COMPLETED", "CREATED
 func expandCalendarData(m calendarTimeRangeMatcher, root *icalNode, r calendarRange) *icalNode {
 	expanded := &icalNode{name: root.name, properties: expandedProperties(m, root.properties, noShift)}
 	for _, child := range root.children {
-		// §9.6.5 forbids the output referring to a VTIMEZONE, and every value
-		// that referred to one has been rewritten as UTC by now.
+		// §9.6.5 forbids the output referring to a VTIMEZONE, and expansion
+		// drops the TZID of every value that refers to one.
 		if child.name == "VTIMEZONE" {
 			continue
 		}
@@ -243,7 +244,7 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 			for i, property := range expanded.properties {
 				switch property.name {
 				case "DTEND", "DUE":
-					if end, ok := utcProperty(m, property, durationShift(delta)); ok {
+					if end, ok := addDurationToRenderedProperty(property, delta); ok {
 						expanded.properties[i] = end
 						adjusted = true
 					}
@@ -259,10 +260,12 @@ func expandedInstance(m calendarTimeRangeMatcher, root, master *icalNode, instan
 				}
 			} else if !adjusted && master.name == "VTODO" {
 				property, _ := firstICalProperty(content, "DTSTART")
-				if end, ok := utcProperty(m, property, contentShift.plus(durationShift(instance.duration))); ok {
-					end.name = "DUE"
-					end.keyPart = end.name + propertyParameterPart(end.keyPart)
-					expanded.properties = append(expanded.properties, end)
+				if placed, ok := utcProperty(m, property, contentShift); ok {
+					if end, ok := addDurationToRenderedProperty(placed, instance.duration); ok {
+						end.name = "DUE"
+						end.keyPart = end.name + propertyParameterPart(end.keyPart)
+						expanded.properties = append(expanded.properties, end)
+					}
 				}
 			}
 		}
@@ -291,7 +294,11 @@ func timedEndProperty(m calendarTimeRangeMatcher, start icalProperty, shift inst
 	if length <= 0 {
 		return icalProperty{}, false
 	}
-	end, ok := utcProperty(m, start, shift.plus(durationShift(length)))
+	placed, ok := utcProperty(m, start, shift)
+	if !ok {
+		return icalProperty{}, false
+	}
+	end, ok := addDurationToRenderedProperty(placed, length)
 	if !ok {
 		return icalProperty{}, false
 	}
@@ -619,13 +626,68 @@ func utcComponent(m calendarTimeRangeMatcher, node *icalNode, shift instantShift
 
 func expandedProperties(m calendarTimeRangeMatcher, properties []icalProperty, shift instantShift) []icalProperty {
 	projected := make([]icalProperty, 0, len(properties))
+	start, haveStart := firstNamedProperty(properties, "DTSTART")
 	for _, property := range properties {
 		if recurrencePropertyNames.contains(property.name) {
 			continue
 		}
+		if haveStart && shift != noShift && property.name != "DTSTART" && shiftedDateProperties.contains(property.name) {
+			if moved, ok := relativeShiftedProperty(m, start, property, shift); ok {
+				projected = append(projected, moved)
+				continue
+			}
+		}
 		projected = append(projected, expandedProperty(m, property, shift))
 	}
 	return projected
+}
+
+// firstNamedProperty finds the first of properties carrying name.
+func firstNamedProperty(properties []icalProperty, name string) (icalProperty, bool) {
+	for _, property := range properties {
+		if property.name == name {
+			return property, true
+		}
+	}
+	return icalProperty{}, false
+}
+
+// relativeShiftedProperty places property -- DTEND or DUE -- at the occurrence
+// shift gives: start, the component's DTSTART, placed as utcProperty places it,
+// plus the length from start to property as written. Placing property's own
+// value by the full shift instead can land a floating end on a local time the
+// zone repeats and read it back as the first occurrence, before or on its own
+// start. ok is false when either value does not resolve.
+func relativeShiftedProperty(m calendarTimeRangeMatcher, start, property icalProperty, shift instantShift) (icalProperty, bool) {
+	startValue := strings.TrimSpace(start.value)
+	startForm, ok := parseICalDateForm(startValue)
+	if !ok || startForm == icalDateOnly {
+		return icalProperty{}, false
+	}
+	startInstant, ok := m.resolveInstant(start.parameters["TZID"], startValue, startForm)
+	if !ok {
+		return icalProperty{}, false
+	}
+	propertyValue := strings.TrimSpace(property.value)
+	propertyForm, ok := parseICalDateForm(propertyValue)
+	if !ok || propertyForm == icalDateOnly {
+		return icalProperty{}, false
+	}
+	propertyInstant, ok := m.resolveInstant(property.parameters["TZID"], propertyValue, propertyForm)
+	if !ok {
+		return icalProperty{}, false
+	}
+	placedStart, ok := utcProperty(m, start, shift)
+	if !ok {
+		return icalProperty{}, false
+	}
+	moved, ok := addDurationToRenderedProperty(placedStart, propertyInstant.Sub(startInstant))
+	if !ok {
+		return icalProperty{}, false
+	}
+	moved.name = property.name
+	moved.keyPart = moved.name + propertyParameterPart(moved.keyPart)
+	return moved, true
 }
 
 // expandedProperty is one property as expanded output carries it. §9.6.5 puts
@@ -690,6 +752,34 @@ func utcProperty(m calendarTimeRangeMatcher, property icalProperty, shift instan
 	}
 	rewritten.keyPart, rewritten.parameters = propertyWithoutParameter(property, "TZID")
 	return rewritten, true
+}
+
+// addDurationToRenderedProperty moves a property utcProperty placed forward by
+// length, on the scale utcProperty gave it: real seconds for a UTC value, the
+// wall clock for a floating one, which no zone defines.
+//
+// A floating end that straddles a repeated hour is therefore length of wall
+// clock after its start, which the zone reads as longer: a one-hour DTEND over
+// a fall change is two real hours, where free-busy and calendar-query take the
+// exact instant. No wall-clock DTEND can name the second occurrence of a
+// repeated hour, so that disagreement cannot be removed.
+func addDurationToRenderedProperty(rendered icalProperty, length time.Duration) (icalProperty, bool) {
+	value := strings.TrimSpace(rendered.value)
+	moved := rendered
+	if strings.HasSuffix(value, "Z") {
+		instant, err := ical.ParseDateTime(value)
+		if err != nil {
+			return icalProperty{}, false
+		}
+		moved.value = instant.Add(length).UTC().Format(utcDateTimeLayout)
+		return moved, true
+	}
+	wall, err := ical.ParseDateTime(value)
+	if err != nil {
+		return icalProperty{}, false
+	}
+	moved.value = wall.Add(length).Format(floatingDateTimeLayout)
+	return moved, true
 }
 
 // propertyWithoutParameter rebuilds a content line's name-and-parameter part
@@ -786,7 +876,7 @@ func (s *rangeSlots) of(master *icalNode) ([]ical.RecurrenceSlot, bool) {
 	}
 	window := s.m.occurrenceWindow(master, dtstart)
 	slots, err := ical.RecurrenceSlots(s.m.raw, master.name, dtstart.instant, window,
-		s.r.Start, s.r.End, ical.MaxRecurrenceInstances, s.m)
+		s.r.Start, s.r.End, ical.MaxRecurrenceInstances, s.m, s.m.pool)
 	if err != nil {
 		*s.m.expansionError = err
 		return nil, false

@@ -19,7 +19,8 @@ const (
 	// (listedRule.latest), and otherwise not listed.
 	maxListedOnsetsPerRule = 2048
 	// maxHeldOnsets bounds what the cache keeps across every rule, counted in
-	// onsets, about three megabytes. Real zone definitions share a few hundred
+	// the room its listings have for onsets rather than the onsets they list,
+	// about three megabytes. Real zone definitions share a few hundred
 	// rules, each a few hundred onsets long.
 	maxHeldOnsets = 1 << 17
 	// onsetRuleOverhead is what one cached rule is charged beyond its onsets
@@ -66,7 +67,12 @@ func SharedTimezoneOnsets() ical.ObservanceOnsets {
 // A question no listing answers is left to the reader, which walks the rule on
 // the work budget of the object it is reading (ical.ObservanceWork), so one
 // object whose rules every listing misses spends its own budget and no more.
-// A nil cache lists nothing.
+// Building or extending a listing is the reading's work too: the lookup that
+// causes it passes the reading's ObservanceWork, which pays for it and, through
+// it, the pool of the request. A lookup a listing answers costs nothing, and a
+// listing the reading cannot afford is left unmade rather than held against its
+// rule, so a later reading with work of its own makes it. A nil cache lists
+// nothing.
 type timezoneOnsets struct {
 	rules *lru.Cache[observanceRuleKey, *listedRule]
 
@@ -110,15 +116,16 @@ type listedRule struct {
 	walked bool
 }
 
-// listed is how many onsets the rule's listings hold. The caller holds the
-// rule's lock, or has not yet handed the rule to any other lookup.
+// listed is how many onsets the rule's listings have room for, which is what
+// they occupy. The caller holds the rule's lock, or has not yet handed the rule
+// to any other lookup.
 func (r *listedRule) listed() int {
 	held := 0
 	if r.lister != nil {
-		held += r.lister.Len()
+		held += r.lister.Held()
 	}
 	if r.window != nil {
-		held += r.window.Len()
+		held += r.window.Held()
 	}
 	return held
 }
@@ -144,7 +151,7 @@ var _ ical.ObservanceOnsets = (*timezoneOnsets)(nil)
 // LatestOnOrBefore answers what ical.LatestRecurrenceOnOrBefore answers for
 // the same arguments, from a listing of the rule's onsets where one reaches
 // before. listed is false where none does.
-func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, listed bool) {
+func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule string, work *ical.ObservanceWork) (latest time.Time, found, listed bool) {
 	if before.Before(dtstart) {
 		return time.Time{}, false, true
 	}
@@ -159,7 +166,7 @@ func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule strin
 		return time.Time{}, false, false
 	}
 	rule := o.rule(observanceRuleKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule})
-	if latest, found, listed = rule.latest(o, dtstart, before); !listed {
+	if latest, found, listed = rule.latest(o, dtstart, before, work); !listed {
 		o.walks.Add(1)
 	}
 	return latest, found, listed
@@ -169,7 +176,7 @@ func (o *timezoneOnsets) LatestOnOrBefore(dtstart, before time.Time, rrule strin
 // leaving out the DTSTART, from a listing that holds them all, extending it
 // as LatestOnOrBefore does. listed is false where none does. The starts are
 // the listing's own and must not be modified.
-func (o *timezoneOnsets) StartsBetween(dtstart, after, through time.Time, rrule string) (starts []time.Time, listed bool) {
+func (o *timezoneOnsets) StartsBetween(dtstart, after, through time.Time, rrule string, work *ical.ObservanceWork) (starts []time.Time, listed bool) {
 	if !through.After(dtstart) || !through.After(after) {
 		return nil, true
 	}
@@ -182,7 +189,7 @@ func (o *timezoneOnsets) StartsBetween(dtstart, after, through time.Time, rrule 
 		return nil, false
 	}
 	rule := o.rule(observanceRuleKey{seconds: dtstart.Unix(), nanoseconds: dtstart.Nanosecond(), rrule: rrule})
-	if starts, listed = rule.between(o, dtstart, after, through); !listed {
+	if starts, listed = rule.between(o, dtstart, after, through, work); !listed {
 		o.walks.Add(1)
 	}
 	return starts, listed
@@ -223,8 +230,8 @@ func countedRule(rrule string) bool {
 	return counted
 }
 
-// ruleCost is what a cached rule with this RRULE text and held onsets is
-// charged against the cache's budget.
+// ruleCost is what a cached rule with this RRULE text and room for held onsets
+// is charged against the cache's budget.
 func ruleCost(rrule string, held int) int {
 	return onsetRuleOverhead + (len(rrule)+onsetBytes-1)/onsetBytes + held
 }
@@ -246,18 +253,18 @@ func ruleCost(rrule string, held int) int {
 //
 // A listing that changed is charged before the rule's lock is let go, so two
 // lookups growing it in turn cannot record their sizes out of order.
-func (r *listedRule) latest(cache *timezoneOnsets, dtstart, before time.Time) (latest time.Time, found, listed bool) {
+func (r *listedRule) latest(cache *timezoneOnsets, dtstart, before time.Time, work *ical.ObservanceWork) (latest time.Time, found, listed bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.latestLocked(cache, dtstart, before)
+	return r.latestLocked(cache, dtstart, before, work)
 }
 
 // between lists the starts in (after, through] from whichever of the rule's
 // listings holds them all, once latest has extended them to through.
-func (r *listedRule) between(cache *timezoneOnsets, dtstart, after, through time.Time) ([]time.Time, bool) {
+func (r *listedRule) between(cache *timezoneOnsets, dtstart, after, through time.Time, work *ical.ObservanceWork) ([]time.Time, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, _, listed := r.latestLocked(cache, dtstart, through); !listed {
+	if _, _, listed := r.latestLocked(cache, dtstart, through, work); !listed {
 		return nil, false
 	}
 	for _, listing := range []*ical.RecurrenceStartLister{r.lister, r.window} {
@@ -272,7 +279,15 @@ func (r *listedRule) between(cache *timezoneOnsets, dtstart, after, through time
 }
 
 // latestLocked is latest for a caller holding the rule's lock.
-func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Time) (latest time.Time, found, listed bool) {
+//
+// Building or extending a listing is charged to work, the reading that asked.
+// A listing the reading could not afford -- work's request pool ran out, as
+// opposed to the rule exceeding what one evaluation may spend -- records
+// nothing about the rule: not walked, not windowless, and no listing dropped,
+// because none of those is a fact about the rule. A listing that was started
+// keeps the periods it completed and nothing of the one it was in, so the next
+// reading with budget of its own lists it to the starts an unstarved one would.
+func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Time, work *ical.ObservanceWork) (latest time.Time, found, listed bool) {
 	if r.walked {
 		return time.Time{}, false, false
 	}
@@ -280,7 +295,11 @@ func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Ti
 	// yet counted.
 	previous := 0
 	if r.lister == nil {
-		r.lister = ical.NewRecurrenceStartLister(dtstart, r.key.rrule)
+		lister := ical.NewRecurrenceStartLister(dtstart, r.key.rrule, work)
+		if lister == nil {
+			return time.Time{}, false, false
+		}
+		r.lister = lister
 	} else {
 		previous = r.listed()
 	}
@@ -296,11 +315,13 @@ func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Ti
 	horizon := before.AddDate(onsetListingHorizonYears, 0, 0)
 	windowHeld := 0
 	if r.window != nil {
-		windowHeld = r.window.Len()
+		windowHeld = r.window.Held()
 	}
 	if !r.lister.Covers(before) {
 		listing = true
-		r.lister.ListThrough(horizon, cache.listLimit(r, windowHeld))
+		if r.lister.ListThrough(horizon, cache.listLimit(r, windowHeld), work); r.lister.Starved() {
+			return time.Time{}, false, false
+		}
 	}
 	if latest, found, listed = r.lister.LatestOnOrBefore(before); listed || r.windowless {
 		return latest, found, listed
@@ -314,16 +335,25 @@ func (r *listedRule) latestLocked(cache *timezoneOnsets, dtstart, before time.Ti
 	if r.window != nil {
 		if !r.window.Covers(before) {
 			listing = true
-			r.window.ListThrough(horizon, cache.listLimit(r, r.lister.Len()))
+			if r.window.ListThrough(horizon, cache.listLimit(r, r.lister.Held()), work); r.window.Starved() {
+				return time.Time{}, false, false
+			}
 		}
 		if latest, found, listed = r.window.LatestOnOrBefore(before); listed || r.window.Covers(before) {
 			return latest, found, listed
 		}
 	}
+	window := ical.NewRecurrenceStartListerFrom(dtstart, r.key.rrule, before.AddDate(-onsetListingMarginYears, 0, 0), work)
+	if window == nil {
+		return time.Time{}, false, false
+	}
 	listing = true
 	cache.relists.Add(1)
-	r.window = ical.NewRecurrenceStartListerFrom(dtstart, r.key.rrule, before.AddDate(-onsetListingMarginYears, 0, 0))
-	r.window.ListThrough(horizon, cache.listLimit(r, r.lister.Len()))
+	if window.ListThrough(horizon, cache.listLimit(r, r.lister.Held()), work); window.Starved() {
+		// The window the rule holds is still right for the instants it reaches.
+		return time.Time{}, false, false
+	}
+	r.window = window
 	if latest, found, listed = r.window.LatestOnOrBefore(before); !listed {
 		r.window, r.windowless = nil, true
 	}

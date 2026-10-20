@@ -76,8 +76,9 @@ func removalHolding(err error) (acl.Holding, error) {
 	}
 }
 
-// privilegeHeld turns a privilege check's answer into whether the privilege
-// is held.
+// privilegeHeld turns a privilege check's error into whether the privilege is
+// held: a refusal or a missing object is not held, and any other error is
+// returned.
 func privilegeHeld(err error) (bool, error) {
 	switch {
 	case err == nil:

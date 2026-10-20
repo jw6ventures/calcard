@@ -412,8 +412,8 @@ func calendarCurrentUserPrivilegeSetForCalendar(privileges store.CalendarPrivile
 
 // calendarTimezoneValue returns the CALDAV:calendar-timezone value to serve.
 // RFC 4791 §5.2.2 makes the value an iCalendar object, so a stored bare
-// VTIMEZONE component -- what CalCard wrote before the wrapper was required --
-// is enveloped on the way out rather than served as a fragment.
+// VTIMEZONE component is enveloped on the way out rather than served as a
+// fragment.
 func calendarTimezoneValue(tz *string) *string {
 	if tz == nil || strings.TrimSpace(*tz) == "" {
 		defaultTZ := defaultCalendarTimezone

@@ -127,7 +127,7 @@ func TestExpandedDateInstanceKeepsItsDaysAcrossATransition(t *testing.T) {
 // RFC 5545 §3.8.2.5 has a DURATION beside a DATE DTSTART count whole days or
 // weeks. One that counts hours is read as the whole days it reaches into, so
 // the event occupies every day it was written to touch, and an override taking
-// its length is written with an end in days.
+// its length is written with an end in days, or with none when that is one day.
 func TestDateStartWithAnHourDurationLastsTheWholeDaysItReaches(t *testing.T) {
 	for _, tt := range []struct {
 		name, duration, rule string
@@ -191,7 +191,7 @@ func TestExpandedDateInstanceRewritesItsDurationInDays(t *testing.T) {
 
 // Expansion writes a DURATION beside a DATE in the days the event spans, as
 // RFC 5545 §3.8.2.5 requires, whether its instance comes from the series or
-// is an override, and on an ordinary day as on one a transition shortens.
+// is an override.
 func TestExpandedDateDurationIsWrittenInDays(t *testing.T) {
 	raw := zeroLengthCalendar(
 		componentLines("VEVENT", "UID:instant", "DTSTAMP:20250101T000000Z",
@@ -395,10 +395,10 @@ func TestEventInstancesOfADateOverrideAcrossATransitionAreTheExpandedOnes(t *tes
 		"DTSTART;TZID=America/New_York:20260305T023000\r\nDTEND;TZID=America/New_York:20260305T033000\r\nRRULE:FREQ=DAILY;COUNT=7\r\n",
 		"RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=America/New_York:20260306T023000\r\nDTSTART;VALUE=DATE:20260306\r\nSUMMARY:Later\r\n")
 	start, end := mustUTC(t, "20260305T000000Z"), mustUTC(t, "20260315T000000Z")
-	got := EventInstances(raw, start, end)
+	got := EventInstances(raw, start, end, nil)
 	want := expandedInstances(t, raw, start, end)
 	if len(got.Instances) != len(want) {
-		t.Fatalf("EventInstances() = %v, CalDAV expands %v", got.Instances, want)
+		t.Fatalf("EventInstances(, nil) = %v, CalDAV expands %v", got.Instances, want)
 	}
 	for i, w := range want {
 		g := got.Instances[i]

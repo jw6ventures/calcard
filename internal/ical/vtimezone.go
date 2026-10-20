@@ -40,6 +40,27 @@ var vtimezones = newVTimezoneCache(maxCachedVTimezones)
 // definition is the only one there is.
 const HostDefinitionProperty = "X-CALCARD-HOST-ZONE"
 
+// HostDefinitionMarked reports whether a HostDefinitionProperty value marks
+// its VTIMEZONE as one the server wrote. Only TRUE does, compared without
+// regard to case after trimming surrounding white space, since that is the
+// only value VTimezone's definitions carry; FALSE, an empty value or anything
+// else leaves the VTIMEZONE read as one with no such property, so a client
+// that copies the property onto its own definition without copying its value
+// does not have that definition mistaken for the server's.
+func HostDefinitionMarked(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "TRUE")
+}
+
+// UTCName reports whether tzid, compared without regard to case after
+// trimming surrounding white space, is UTC itself: the one name the server
+// resolves without a definition, host or the object's own, and the name the
+// write path rewrites a value naming it to that value's "...Z" form, unless
+// the object defines its own UTC-named zone away from zero. It is the one
+// rule the validator, the write path and REST and UI structured input share.
+func UTCName(tzid string) bool {
+	return strings.EqualFold(strings.TrimSpace(tzid), "UTC")
+}
+
 // V11GeneratedDefinition reports whether a VTIMEZONE, its unfolded lines from
 // BEGIN through END, has the shape of the definitions the v1.1 editor
 // generated from the host's database, which carry no HostDefinitionProperty:
@@ -544,8 +565,8 @@ func ruleObservance(run yearlyRun, openEnded bool) (vtimezoneObservance, bool) {
 	// No yearly onset follows another by less than a year less a week, so
 	// listing that far past the last onset shows whether the rule ends there.
 	through := onsets[len(onsets)-1].AddDate(0, 11, 0)
-	lister := NewRecurrenceStartLister(onsets[0], rule)
-	if !lister.ListThrough(through, len(onsets)+1) || !slices.EqualFunc(lister.starts, onsets, time.Time.Equal) {
+	lister := NewRecurrenceStartLister(onsets[0], rule, nil)
+	if !lister.ListThrough(through, len(onsets)+1, nil) || !slices.EqualFunc(lister.starts, onsets, time.Time.Equal) {
 		return vtimezoneObservance{}, false
 	}
 	return vtimezoneObservance{kind: first.kind(), start: first.at, onsets: onsets[:1], rule: rule}, true

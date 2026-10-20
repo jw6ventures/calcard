@@ -63,7 +63,6 @@ func TestExtractUIDFromVCard_Missing(t *testing.T) {
 	}
 }
 
-// Tests for calendar slug validation
 func TestIsValidCalendarSlug(t *testing.T) {
 	tests := []struct {
 		slug  string
@@ -105,7 +104,15 @@ func TestIsValidCalendarSlug(t *testing.T) {
 	}
 }
 
-// Tests for multi-UID extraction
+// extractUIDFromICalendar returns the UID of the first top-level component.
+func extractUIDFromICalendar(data string) (string, error) {
+	analysis, err := analyzeICalendar(data)
+	if err != nil {
+		return "", err
+	}
+	return analysis.uid()
+}
+
 func TestExtractUIDFromICalendar_SingleComponent(t *testing.T) {
 	ical := `BEGIN:VCALENDAR
 VERSION:2.0
@@ -209,7 +216,6 @@ END:VCALENDAR`
 }
 
 func TestExtractUIDFromICalendar_FoldedUID(t *testing.T) {
-	// Test line folding in UID
 	ical := `BEGIN:VCALENDAR
 VERSION:2.0
 BEGIN:VEVENT

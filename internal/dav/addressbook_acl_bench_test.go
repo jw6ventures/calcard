@@ -10,8 +10,9 @@ import (
 
 // BenchmarkFilterReadableAddressBookContacts exercises the shared-address-book
 // read path: a non-owner reading a book whose access is granted once at the
-// collection level. The prefetch makes this O(principals) in ACL repository
-// lookups regardless of the contact count, instead of O(contacts).
+// collection level. The prefetch reads the ACL entries for the collection and
+// every contact in one query, so repository lookups stay constant as the
+// contact count grows.
 func BenchmarkFilterReadableAddressBookContacts(b *testing.B) {
 	book := &store.AddressBook{ID: 1, UserID: 1, Name: "Shared"}
 	user := &store.User{ID: 2}

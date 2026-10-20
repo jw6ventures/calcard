@@ -35,7 +35,8 @@ const (
 	testProdID = "-//CalCard//Strict Suite//EN"
 	// testDTStamp and testDTStart are the DATE-TIME values a fixture carries
 	// when the test does not care what they are. Both sit inside the
-	// min-date-time and max-date-time window caldav_limits.go advertises.
+	// min-date-time and max-date-time window ical.MinDateTime and
+	// ical.MaxDateTime define.
 	testDTStamp = "20240601T000000Z"
 	testDTStart = "20240601T100000Z"
 )
@@ -296,9 +297,8 @@ func TestRFC4791_MKCALENDAR_ResourcetypeIsCollectionAndCalendar(t *testing.T) {
 }
 
 // Section 5.3.1: properties carried by a MKCALENDAR body are applied to the new
-// collection. The failure half of §5.3.1 — a 207 with a per-property propstat
-// and 424 dependencies — is not implemented, so this test covers only the
-// success path it exercises.
+// collection. TestRFC4791_MkcalendarFailedInstructionCreatesNothing covers the
+// failure half.
 func TestRFC4791_MKCALENDAR_BodySetsProperties(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: make(map[int64]*store.Calendar)}
 	h := &DavServer{store: &store.Store{Calendars: calRepo}}
@@ -633,7 +633,6 @@ func TestRFC4791_CalendarDiscoverySequence(t *testing.T) {
 		}
 	})
 
-	// Step 4: Verify individual calendar collection can be accessed
 	t.Run("Step4_AccessIndividualCalendar", func(t *testing.T) {
 		req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
 		req.Header.Set("Depth", "0")
@@ -695,7 +694,6 @@ func TestRFC4791_CalendarQueryReportBasic(t *testing.T) {
 
 // Sections 7.4 and 9.9: time-range filtering.
 func TestRFC4791_TimeRangeFilteringAccuracy(t *testing.T) {
-	// Test with specific time boundaries
 	tests := []struct {
 		name        string
 		eventStart  time.Time
@@ -1549,7 +1547,6 @@ func TestRFC4791_NoNestedCalendarCollections(t *testing.T) {
 	}
 }
 
-// Test Content-Type validation for PUT
 func TestRFC4791_PutContentTypeValidation(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -1660,13 +1657,13 @@ func TestRFC4791_CalendarDescriptionProperty(t *testing.T) {
 // collection that has never had one set.
 func TestRFC4791_CalendarCollection_CalendarTimezoneIsWrappedICalendarObject(t *testing.T) {
 	now := store.Now()
-	// What CalCard wrote before §5.2.2's envelope was required: a bare component,
-	// complete in itself, that only lacks the VCALENDAR around it.
+	// A 1.1.x release stored a bare component, complete in itself, that only
+	// lacks the VCALENDAR §5.2.2 requires around it.
 	stored := "BEGIN:VTIMEZONE\nTZID:America/Chicago\n" +
 		"BEGIN:STANDARD\nDTSTART:19701101T020000\nTZOFFSETFROM:-0500\nTZOFFSETTO:-0600\nEND:STANDARD\n" +
 		"END:VTIMEZONE"
-	// The old validator also accepted incomplete components. Those values cannot
-	// be made valid merely by adding a VCALENDAR envelope.
+	// A 1.1.x release also stored incomplete components, which a VCALENDAR
+	// envelope alone cannot make valid.
 	invalidStored := "BEGIN:VTIMEZONE\nTZID:America/Chicago\nEND:VTIMEZONE"
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -1977,9 +1974,8 @@ const newYorkVTimezone = "BEGIN:VTIMEZONE\r\n" +
 
 // tzidEventFixture builds a one-VEVENT calendar object whose DTSTART and DTEND
 // are RFC 5545 §3.3.5 form 3 values — date with local time and a time zone
-// reference. That and UTC are the only forms a DATE-TIME may take; the numeric
-// UTC-offset spelling iCalendar has no form for is what the date-limit
-// fixtures used to send.
+// reference. That and UTC are the only forms a DATE-TIME may take; iCalendar
+// has no numeric UTC-offset form.
 func tzidEventFixture(uid string, start, end time.Time) string {
 	return buildCalendarObject(newYorkVTimezone, buildVEvent(uid,
 		"DTSTART;TZID=America/New_York:"+start.Format("20060102T150405"),
@@ -2074,8 +2070,7 @@ func TestRFC4791_Precondition_MaxDateTime_RejectLaterDates(t *testing.T) {
 }
 
 // The max-date-time counterpart of the min-date-time TZID case above: the
-// limit is compared against the instant a form-3 DATE-TIME denotes, not against
-// its local wall-clock digits, which read as earlier than the limit here.
+// limit is compared against the instant a form-3 DATE-TIME denotes.
 func TestRFC4791_Precondition_MaxDateTime_RejectLaterDatesWithTZID(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
@@ -2779,7 +2774,6 @@ func TestRFC4791_LimitRecurrenceSetInCalendarData(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	// Recurring event
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
 			"1:recurring": {
@@ -3383,9 +3377,8 @@ func TestRFC4791_CalendarQueryWithMultipleFilters(t *testing.T) {
 // `(time-range)` and takes no timezone -- so this is a calendar-query test.
 //
 // The half this asserts is that a request carrying a timezone is accepted and
-// answered normally. The half it does not is §7.3 resolution: CalCard's
-// reportRequest carries the value, but the time-range evaluator does not yet
-// validate it or resolve floating values against it.
+// answered normally. §7.3 resolution of floating values against it is
+// asserted by TestRFC4791_ExpandResolvesFloatingValuesThroughTheReportTimezone.
 func TestRFC4791_TimezoneXMLElement(t *testing.T) {
 	start := time.Date(2024, 6, 15, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 15, 11, 0, 0, 0, time.UTC)
@@ -4347,7 +4340,6 @@ func TestRFC4791_PutPreservesComponentType(t *testing.T) {
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	user := &store.User{ID: 1}
 
-	// Store VTODO
 	todoData := buildCalendarObject(buildVTodo("task1", "SUMMARY:Task"))
 	req := newCalendarPutRequest("/dav/calendars/1/task1.ics", strings.NewReader(todoData))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4359,7 +4351,6 @@ func TestRFC4791_PutPreservesComponentType(t *testing.T) {
 		t.Fatalf("PUT failed: %d", rr.Code)
 	}
 
-	// Retrieve and verify it's still VTODO
 	req = httptest.NewRequest(http.MethodGet, "/dav/calendars/1/task1.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr = httptest.NewRecorder()
@@ -4738,7 +4729,7 @@ func TestRFC4791_SupportedCollationSetAdvertisedOnCalendarObjectResources(t *tes
 
 // Section 7.5.1: the property carries a SHOULD NOT for DAV:allprop, and that
 // applies wherever it is defined -- including the calendar object resources it
-// is now served on.
+// is served on.
 func TestRFC4791_AllpropOmitsSupportedCollationSetOnCalendarObjects(t *testing.T) {
 	h, _, user := calendarPropertyServer(store.Calendar{})
 	h.store.Events = &fakeEventRepo{events: map[string]*store.Event{

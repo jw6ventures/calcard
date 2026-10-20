@@ -118,14 +118,14 @@ func TestThisAndFutureOverrideOfAnotherValueTypeGivesItsInstancesItsOwnLength(t 
 			assertExpandedExtents(t, tt.raw, "20260106T000000Z", "20260108T000000Z", expandedExtents{unwanted: tt.unwanted, want: want})
 
 			override := want[0].RecurrenceID
-			got := EventInstances(tt.raw, mustUTC(t, "20260106T000000Z"), mustUTC(t, "20260108T000000Z"))
+			got := EventInstances(tt.raw, mustUTC(t, "20260106T000000Z"), mustUTC(t, "20260108T000000Z"), nil)
 			if len(got.Instances) != len(want) {
-				t.Fatalf("EventInstances() = %v, want %v", got.Instances, want)
+				t.Fatalf("EventInstances(, nil) = %v, want %v", got.Instances, want)
 			}
 			for i, w := range want {
 				g := got.Instances[i]
 				if !g.RecurrenceID.Equal(w.RecurrenceID) || !g.Start.Equal(w.Start) || !g.End.Equal(w.End) || !g.Override.Equal(override) {
-					t.Errorf("EventInstances() instance %d = %v, want %v governed by %s", i, g, w, override.Format(time.RFC3339))
+					t.Errorf("EventInstances(, nil) instance %d = %v, want %v governed by %s", i, g, w, override.Format(time.RFC3339))
 				}
 			}
 		})
@@ -154,8 +154,8 @@ func TestFreeBusyPublishesADateOverrideForItsSeriesDaysInTheZone(t *testing.T) {
 }
 
 // An all-day RANGE=THISANDFUTURE override of an all-day series whose DURATION
-// counts an hour gives the instances it governs the whole day that series
-// lasts. Free-busy, expansion and the views' instances place them alike, and
+// counts an hour gives the instances it governs whole days, as its DATE
+// DTSTART makes each a day long. Free-busy, expansion and the views' instances place them alike, and
 // expansion writes no DURATION in hours beside their dates.
 func TestThisAndFutureDateOverrideOfAnHourDurationSeriesLastsWholeDays(t *testing.T) {
 	raw := zeroLengthCalendar(
@@ -175,13 +175,13 @@ func TestThisAndFutureDateOverrideOfAnHourDurationSeriesLastsWholeDays(t *testin
 		want = append(want, calobject.Instance{RecurrenceID: start, Start: start, End: start.AddDate(0, 0, 1)})
 	}
 	assertExpandedExtents(t, raw, "20260106T000000Z", "20260109T000000Z", expandedExtents{unwanted: []string{"DURATION:PT"}, want: want})
-	got := EventInstances(raw, mustUTC(t, "20260106T000000Z"), mustUTC(t, "20260109T000000Z"))
+	got := EventInstances(raw, mustUTC(t, "20260106T000000Z"), mustUTC(t, "20260109T000000Z"), nil)
 	if len(got.Instances) != len(want) {
-		t.Fatalf("EventInstances() = %v, want %v", got.Instances, want)
+		t.Fatalf("EventInstances(, nil) = %v, want %v", got.Instances, want)
 	}
 	for i, w := range want {
 		if g := got.Instances[i]; !g.Start.Equal(w.Start) || !g.End.Equal(w.End) {
-			t.Errorf("EventInstances() instance %d = %v, want %v", i, g, w)
+			t.Errorf("EventInstances(, nil) instance %d = %v, want %v", i, g, w)
 		}
 	}
 }

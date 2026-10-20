@@ -146,12 +146,16 @@ type icalTimeValue struct {
 // trusting that, since it also runs over stored data the grammar never saw.
 type calendarTimeRangeMatcher struct {
 	// Copies made during the component walk share expansion failures and the
-	// per-resource indexes, which are built only when a recurrence set is.
+	// per-resource indexes, whose maps are filled on first use.
 	expansionError *error
 	indexes        *matcherIndexes
 	raw            string
 	root           *icalNode
 	zone           floatingZone
+	// pool, when set, is the request-wide recurrence and observance budget
+	// every resource this matcher evaluates draws on in addition to its own
+	// per-evaluation cap.
+	pool *ical.RequestWork
 }
 
 // matcherIndexes holds what a matcher derives from its resource once and
@@ -176,6 +180,19 @@ func newCalendarTimeRangeMatcher(raw string, root *icalNode, zone floatingZone) 
 		expansionError: new(error),
 		indexes:        &matcherIndexes{},
 	}
+}
+
+// withPool returns m sharing every other field, with pool as the request-wide
+// budget every resource it evaluates draws on besides its own per-evaluation
+// cap, and the tree's zones are read on it as well. A copy made during the
+// component walk carries it on unchanged. It is called before m's tree is
+// first read.
+func (m calendarTimeRangeMatcher) withPool(pool *ical.RequestWork) calendarTimeRangeMatcher {
+	m.pool = pool
+	if m.root != nil && pool != nil {
+		m.root.drawOn(pool)
+	}
+	return m
 }
 
 // instantShift is the distance between two instants, carried as whole seconds
@@ -229,7 +246,7 @@ func (m calendarTimeRangeMatcher) dateValue(node *icalNode, name string, shift i
 	if !ok {
 		return icalTimeValue{}, false
 	}
-	tzid := property.parameters["TZID"]
+	tzid := strings.TrimSpace(property.parameters["TZID"])
 	instant, ok := m.resolveInstant(tzid, value, form)
 	if !ok {
 		return icalTimeValue{}, false
@@ -348,14 +365,12 @@ func (m calendarTimeRangeMatcher) ResolvePropertyTime(keyPart, value string) (ti
 	return m.resolveInstant(tzid, value, form)
 }
 
-// LocalTimeExists reports whether wall is a local time the zone tzid names
-// actually has, which RFC 5545 §3.3.10 needs to leave an instance a rule
-// generates on a skipped time out of the set. It asks the definition
-// resolveInstant reads the TZID through, in the same order: the VTIMEZONE the
-// resource ships, else the host's zone of that name. A gap the shipped
-// definition cannot be followed to is not assumed: the instance is kept. A
-// TZID neither defines is read in the RFC 4791 §7.3 zone, which is no zone the
-// object defines, so it skips nothing.
+// LocalTimeExists reports whether wall is a local time the zone tzid names has.
+// It asks the definition resolveInstant reads the TZID through, in the same
+// order: the VTIMEZONE the resource ships, else the host's zone of that name. A
+// gap the shipped definition cannot be followed to is not assumed: the wall
+// clock is reported to exist. A TZID neither defines is read in the RFC 4791
+// §7.3 zone, which is no zone the object defines, so it skips nothing.
 func (m calendarTimeRangeMatcher) LocalTimeExists(tzid string, wall time.Time) bool {
 	tzid = strings.TrimSpace(tzid)
 	if observances := m.timezoneObservances(tzid); observances != nil {
@@ -506,9 +521,9 @@ type thisAndFutureSlot struct {
 // standsAlone reports whether override is a RANGE=THISANDFUTURE override of
 // series that stands for itself in the range series was expanded over: the
 // range places it, by the §9.9 test of its own component, and the set does
-// not carry it. One naming a slot the set never generates -- a wall clock its
-// zone skips, or a date its EXDATEs leave out -- is carried by no instance,
-// and stands for itself as calendar-query and free-busy read it.
+// not carry it. One naming a slot the set never generates -- a date its
+// EXDATEs leave out, or one no period of the rule reaches -- is carried by no
+// instance, and stands for itself as calendar-query and free-busy read it.
 func (m calendarTimeRangeMatcher) standsAlone(root *icalNode, series *seriesExpansion, override *icalNode) bool {
 	slot, ok := series.thisAndFuture[override]
 	return ok && slot.answer == ical.RecurrenceSlotNotGenerated && m.slotPlaced(root, series, slot)
@@ -621,7 +636,7 @@ func (m calendarTimeRangeMatcher) visitRecurrenceSet(node, master *icalNode, sta
 	if !ical.SupportedRecurrenceRule(master.value("RRULE")) {
 		if ok && len(ids) > 0 {
 			answers, _ = ical.VisitRecurrenceInstancesAndSlots(m.raw, master.name, dtstart.instant, m.occurrenceWindow(master, dtstart),
-				start, end, ical.MaxRecurrenceInstances+2, m, ids, needed, func(ical.RecurrenceInstance) bool { return false })
+				start, end, ical.MaxRecurrenceInstances+2, m, ids, needed, m.pool, func(ical.RecurrenceInstance) bool { return false })
 		}
 		return answers, false, false
 	}
@@ -637,7 +652,7 @@ func (m calendarTimeRangeMatcher) visitRecurrenceSet(node, master *icalNode, sta
 	// Inclusive candidate bounds can add an instance at each endpoint that the
 	// component-specific test excludes. The output budget is checked after that test.
 	answers, err := ical.VisitRecurrenceInstancesAndSlots(m.raw, master.name, dtstart.instant, window,
-		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m, ids, needed,
+		scanStart, scanEnd, ical.MaxRecurrenceInstances+2, m, ids, needed, m.pool,
 		func(instance ical.RecurrenceInstance) bool {
 			return visit(recurrenceInstance{
 				shift:     shiftBetween(dtstart.instant, instance.Start),
@@ -977,7 +992,7 @@ func (m calendarTimeRangeMatcher) alarmInTimeRange(node, parent *icalNode, start
 }
 
 // alarmRepeats is how many further times an alarm fires after its initial
-// trigger, and how far apart. RFC 5545 §3.8.5.3 pairs REPEAT with DURATION, so
+// trigger, and how far apart. RFC 5545 §3.6.6 pairs REPEAT with DURATION, so
 // one without the other fires once. ok is false for a REPEAT value that is no
 // count at all, which is a malformed alarm rather than one that never fires.
 func alarmRepeats(node *icalNode) (int, time.Duration, bool) {

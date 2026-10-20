@@ -15,8 +15,8 @@ type syncTokenInfo struct {
 	Kind      string
 	ID        int64
 	Timestamp time.Time
-	// State is the optional trailing segment a collection with no change
-	// history carries, naming the whole state the token was issued against.
+	// State is the optional trailing segment: the whole state a collection with
+	// no change history was in, or the position of a truncated page.
 	State string
 }
 
@@ -119,7 +119,7 @@ type syncPosition struct {
 	anchor time.Time
 }
 
-// syncPageStateKinds name the two kinds of truncated page a token resumes.
+// The two kinds of truncated page a token resumes.
 const (
 	syncPageListing = "listing"
 	syncPageChanges = "changes"

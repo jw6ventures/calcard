@@ -12,7 +12,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// freeBusyRange is the window every fixture in this file publishes into.
+// freeBusyRange is the window publishedFreeBusy reports over.
 var freeBusyRange = &timeRange{Start: "20240601T000000Z", End: "20240602T000000Z"}
 
 // vEventObject builds a one-VEVENT resource carrying the given extra property
@@ -47,7 +47,7 @@ func publishedFreeBusyOver(t *testing.T, tr *timeRange, events ...store.Event) [
 // in, which RFC 5545 §3.8.2.6 constrains and the sorted view above discards.
 func publishedFreeBusyInEmissionOrder(t *testing.T, tr *timeRange, events ...store.Event) []string {
 	t.Helper()
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates(events, floatingZone{}), tr))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates(events, floatingZone{}, nil), tr))
 	return parsedFreeBusyLines(t, body)
 }
 
@@ -556,11 +556,12 @@ func TestFreeBusyCoalescesAcrossStoredAndDerivedPeriods(t *testing.T) {
 
 // --- the whole report over a collection that mixes every contributor shape ---
 
-// heterogeneousFreeBusyServer answers a free-busy-query against one collection
-// holding every shape §7.10 has a rule for: a recurring master with a tentative
-// override, a resource abutting one of its instances, a transparent one, a
-// cancelled one, a stored VFREEBUSY declaring a busy and a free period, and a
-// floating value that only the collection's own timezone places correctly.
+// heterogeneousFreeBusyServer serves one collection holding the shapes §7.10
+// has rules for: a recurring master with a tentative override, a resource
+// abutting one of its instances, a transparent one, a cancelled one, a stored
+// VFREEBUSY declaring a busy and a free period, a floating value that only the
+// collection's own timezone places correctly, a THISANDFUTURE-shifted series,
+// and a resource holding only overrides.
 func heterogeneousFreeBusyServer(t *testing.T) *DavServer {
 	t.Helper()
 	if _, err := time.LoadLocation("America/Chicago"); err != nil {
@@ -656,8 +657,8 @@ func TestFreeBusyQueryOverAHeterogeneousCollection(t *testing.T) {
 	}
 	published := parsedFreeBusyLines(t, rr.Body.String())
 	// Emission order, not a sorted view: RFC 5545 §3.8.2.6 asks for ascending
-	// start then end, and the tentative instance is what a result grouped by
-	// FBTYPE would put last instead of third.
+	// start then end, where a result grouped by FBTYPE would move every
+	// BUSY-TENTATIVE line after the BUSY ones.
 	assertPublishedFreeBusy(t, published, []string{
 		// The third shifted-range slot, typed by the override governing its
 		// recurrence ID even though its scheduled start moved before that ID.

@@ -75,7 +75,7 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 		return "", fmt.Errorf("failed to list events: %w", err)
 	}
 
-	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, zone), tr)
+	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, zone, davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget)), tr)
 	if err != nil {
 		return "", freeBusyReportError(err)
 	}
@@ -87,6 +87,11 @@ func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *st
 	body, err := h.generateFreeBusy(ctx, candidates, tr)
 	if err != nil {
 		return "", freeBusyReportError(err)
+	}
+	if davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget).Exhausted() {
+		// A period read through a zone the request's work could not follow is
+		// a guess, and this report must not publish a guessed hour as free.
+		return "", errNumberOfMatchesExceeded
 	}
 	return body, nil
 }
@@ -125,10 +130,10 @@ type freeBusyCandidate struct {
 // VCALENDAR carries no component to read a period, a TRANSP or a STATUS off, so
 // it is left out here rather than carried forward as a candidate every later
 // stage would have to keep excluding.
-func freeBusyCandidates(events []store.Event, zone floatingZone) []freeBusyCandidate {
+func freeBusyCandidates(events []store.Event, zone floatingZone, pool *ical.RequestWork) []freeBusyCandidate {
 	candidates := make([]freeBusyCandidate, 0, len(events))
 	for _, event := range events {
-		matcher, parsed := newEventTimeRangeMatcher(event, zone)
+		matcher, parsed := newEventTimeRangeMatcher(event, zone, pool)
 		if !parsed {
 			continue
 		}
@@ -434,7 +439,7 @@ func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, range
 	// The expansion reads its EXDATEs and RDATEs through the same resolver that
 	// placed the start, so an exception still names an occurrence the zone moved.
 	periods, err := ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
-		rangeStart, rangeEnd, expansionBudget, extent.resolve)
+		rangeStart, rangeEnd, expansionBudget, extent.resolve, candidate.matcher.pool)
 	if err != nil {
 		// Publishing the periods collected so far would report the hours they
 		// cover and leave the rest of the range looking free, which is the one
@@ -463,7 +468,8 @@ func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode
 	if !ok {
 		return freeBusyInterval{}, false
 	}
-	end := candidate.matcher.eventOccurrenceEnd(node, dtstart, noShift)
+	end := withStoredDTEndFallback(candidate.matcher, node, candidate.event, dtstart,
+		candidate.matcher.eventOccurrenceEnd(node, dtstart, noShift))
 	if !periodInTimeRange(dtstart.instant, end, rangeStart, rangeEnd) {
 		return freeBusyInterval{}, false
 	}
@@ -592,9 +598,11 @@ type freeBusyExtent struct {
 // different components of one resource.
 func (c freeBusyCandidate) extent(master *icalNode) (freeBusyExtent, bool) {
 	if dtstart, ok := c.matcher.dateValue(master, "DTSTART", noShift); ok {
+		length := c.matcher.occurrenceWindow(master, dtstart)
+		end := withStoredDTEndFallback(c.matcher, master, c.event, dtstart, dtstart.instant.Add(length))
 		return freeBusyExtent{
 			start:   dtstart.instant,
-			length:  c.matcher.occurrenceWindow(master, dtstart),
+			length:  end.Sub(dtstart.instant),
 			resolve: c.matcher,
 		}, true
 	}
@@ -620,6 +628,65 @@ func freeBusyMasterComponent(root *icalNode) *icalNode {
 		}
 	}
 	return nil
+}
+
+// withStoredDTEndFallback is end, as the caller already placed it with
+// eventOccurrenceEnd or occurrenceWindow, except when node carries a DTEND
+// that does not read and no usable DURATION, and dtstart is a DATE-TIME
+// rather than a DATE: both readers then place end at dtstart itself, RFC 5545
+// §3.6.1's rule for an event that states no end at all, but a DTEND present
+// and unreadable is not that absence. The length the event's stored dtstart
+// and dtend columns keep for such a row -- what ical.StoredEventEnd and the
+// v1.2.0 repair carry forward from a 1.1.x release's own reading of it --
+// answers instead, so the row's busy time is not lost to a column read as
+// empty only because this reader is stricter than the one that stored it.
+//
+// The columns describe the one component the store derives them from, the
+// primary VEVENT (primaryEventNode), so only that node takes their length;
+// any other component of the resource, an override with its own unreadable
+// DTEND among them, is left at the end its own octets place. The length is
+// placed from dtstart, the instant this reader resolves for the node, which
+// differs from the column's for a floating start, read in the collection's
+// zone here and as UTC wall time there.
+func withStoredDTEndFallback(matcher calendarTimeRangeMatcher, node *icalNode, event store.Event, dtstart icalTimeValue, end time.Time) time.Time {
+	if dtstart.isDate || !end.Equal(dtstart.instant) || node.count("DTEND") == 0 {
+		return end
+	}
+	if event.DTStart == nil || event.DTEnd == nil || node != primaryEventNode(matcher.root) {
+		return end
+	}
+	if _, ok := matcher.dateValue(node, "DTEND", noShift); ok {
+		return end
+	}
+	if _, ok := componentDuration(node, "DURATION"); ok {
+		return end
+	}
+	if length := event.DTEnd.Sub(*event.DTStart); length > 0 {
+		return dtstart.instant.Add(length)
+	}
+	return end
+}
+
+// primaryEventNode is the VEVENT the store derives an object's denormalized
+// columns from, chosen as primaryEventMetadata and ical.PrimaryVEventComponent
+// choose it: the first carrying no RECURRENCE-ID, else the first.
+func primaryEventNode(root *icalNode) *icalNode {
+	if root == nil {
+		return nil
+	}
+	var first *icalNode
+	for _, child := range root.children {
+		if child.name != "VEVENT" {
+			continue
+		}
+		if child.count("RECURRENCE-ID") == 0 {
+			return child
+		}
+		if first == nil {
+			first = child
+		}
+	}
+	return first
 }
 
 // freeBusyColumnLength reads the length off the denormalized columns, for an

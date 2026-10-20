@@ -16,8 +16,8 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// birthdaySyncServer holds one address book whose state versions the generated
-// birthday collection, and one contact in it carrying a birthday.
+// birthdaySyncServer serves the birthday collection generated from book, whose
+// state versions it, and the given contacts.
 func birthdaySyncServer(book store.AddressBook, contacts map[string]*store.Contact) *DavServer {
 	return &DavServer{store: &store.Store{
 		Calendars:        &fakeCalendarRepo{},
@@ -531,8 +531,9 @@ func eventUIDs(events []store.Event) []string {
 	return uids
 }
 
-// A token issued before the generator changed names bodies and hrefs that no
-// longer exist, so it is refused and the client resynchronizes once.
+// A token carrying another generator version names bodies and hrefs the
+// current generator does not produce, so it is refused and the client
+// resynchronizes once.
 func TestBirthdayCalendarTokenCarriesTheGeneratorVersion(t *testing.T) {
 	user := &store.User{ID: 1}
 	created := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)

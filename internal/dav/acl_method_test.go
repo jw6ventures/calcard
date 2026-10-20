@@ -58,7 +58,7 @@ func TestRFC3744RequiredACLPropertiesAndProtectedOwnerACE(t *testing.T) {
 	if got := qnList(acePrivileges(t, owner, davQN("grant"))); got != qnList([]xml.Name{davQN("all")}) {
 		t.Errorf("owner ACE grants %s, want DAV:all", got)
 	}
-	// §5.5.3 marks an ACE the server will not let a client remove DAV:protected.
+	// §5.5.3: DAV:protected marks an ACE a client cannot change or remove.
 	owner.child(t, davQN("protected"))
 	restrictions := resp.assertPropStatus(t, davQN("acl-restrictions"), http.StatusOK)
 	if got := qnList(restrictions.childNames()); got != qnList([]xml.Name{davQN("no-invert")}) {

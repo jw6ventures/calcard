@@ -253,7 +253,7 @@ func TestRecurringBusyPeriodsExpandsWeeklyRuleWithExdate(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
+	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(recurringEvent, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil, nil))
 
 	// Mondays Jan 6, 13, 27 (Jan 20 excluded by EXDATE).
 	want := []time.Time{
@@ -293,7 +293,7 @@ func TestRecurringBusyPeriodsAppliesOverride(t *testing.T) {
 	rangeStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil))
+	periods := requireRecurrenceResult[BusyPeriod](t)(RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, 1000, nil, nil))
 
 	overridden := time.Date(2025, 1, 13, 15, 0, 0, 0, time.UTC)
 	foundOverride := false
@@ -671,7 +671,7 @@ func TestRecurrenceSlotsExposeOverridePrecedence(t *testing.T) {
 	dtstart := time.Date(2025, 1, 6, 10, 0, 0, 0, time.UTC)
 	slots := requireRecurrenceResult[RecurrenceSlot](t)(RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour,
 		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil))
+		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 1000, nil, nil))
 	if len(slots) != 4 {
 		t.Fatalf("slots = %d, want 4: %#v", len(slots), slots)
 	}
@@ -979,7 +979,7 @@ func TestVisitRecurrenceCandidatesDedupesDayListByCalendarDate(t *testing.T) {
 	periodStart := recurrencePeriodStart(dtstart, rule)
 
 	var got []time.Time
-	visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(current time.Time) bool {
+	visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(nil), func(current time.Time) bool {
 		got = append(got, current)
 		return false
 	})
@@ -1029,7 +1029,7 @@ func TestVisitRecurrenceCandidatesBySetPosOverDeduplicatedDayList(t *testing.T) 
 			periodStart := recurrencePeriodStart(dtstart, rule)
 
 			var got []time.Time
-			visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(current time.Time) bool {
+			visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(nil), func(current time.Time) bool {
 				got = append(got, current)
 				return false
 			})
@@ -1073,7 +1073,8 @@ func TestFinishSparseRecurrenceFailsClosedWhenADayIsOverBudget(t *testing.T) {
 	}
 
 	occurrences := 0
-	exceeds, handled := finishSparseRecurrence(dtstart, dtstart, rule, newRecurrenceWork(), &occurrences, func(time.Time) bool {
+	counter := newRecurrenceInstantCounter(func(wall time.Time) (time.Time, bool) { return wall, true }, nil, dtstart)
+	exceeds, handled := finishSparseRecurrence(dtstart, dtstart, rule, newRecurrenceWork(nil), &counter, &occurrences, func(time.Time) bool {
 		return false
 	})
 	if !handled || !exceeds {
@@ -1124,7 +1125,7 @@ func TestSparseRecurrenceReadsPreserveCountAndExceptions(t *testing.T) {
 			t.Run(freq+"/"+test.name, func(t *testing.T) {
 				raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:sparse\r\nDTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\nRRULE:FREQ=" + freq + ";BYMONTH=1;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0;BYSECOND=0;COUNT=2\r\n" + test.extra + "END:VEVENT\r\n" + test.override + "END:VCALENDAR\r\n"
 				from := time.Date(test.year, 1, 1, test.hour, 0, 0, 0, time.UTC)
-				periods, err := RecurringBusyPeriods(raw, start, time.Hour, from, from.Add(time.Hour), 1000, nil)
+				periods, err := RecurringBusyPeriods(raw, start, time.Hour, from, from.Add(time.Hour), 1000, nil, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1221,7 +1222,7 @@ func TestRecurringBusyPeriodsTerminatesForAFinishedSubDailyRule(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)
+		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 		done <- result{periods: periods, err: err}
 	}()
 	select {
@@ -1344,7 +1345,7 @@ func TestUnreachableBySetPosIsAnsweredWithoutScanning(t *testing.T) {
 			}
 
 			started = time.Now()
-			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, rangeEnd, MaxRecurrenceInstances, nil)
+			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 			if elapsed := time.Since(started); elapsed > budget {
 				t.Errorf("RecurringBusyPeriods took %v, want at most %v", elapsed, budget)
 			}
@@ -1445,7 +1446,7 @@ func TestNeverMatchingRuleIsAnsweredWithinOneCalendarCycle(t *testing.T) {
 			})
 			t.Run("free-busy", func(t *testing.T) {
 				finishesWithin(t, budget, func() string {
-					periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(100, 0, 0), MaxRecurrenceInstances, nil)
+					periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(100, 0, 0), MaxRecurrenceInstances, nil, nil)
 					if err != nil || len(periods) != 1 || !periods[0].Start.Equal(dtstart) {
 						return fmt.Sprintf("RecurringBusyPeriods() = (%v, %v), want the DTSTART alone", periods, err)
 					}
@@ -1556,7 +1557,7 @@ func TestRecurrenceWorkIsBoundedAcrossPeriods(t *testing.T) {
 	})
 	t.Run("expansion", func(t *testing.T) {
 		finishesWithin(t, budget, func() string {
-			_, err := RecurringBusyPeriods(raw, dtstart, time.Hour, farAhead, farAhead.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+			_, err := RecurringBusyPeriods(raw, dtstart, time.Hour, farAhead, farAhead.AddDate(1, 0, 0), MaxRecurrenceInstances, nil, nil)
 			if !errors.Is(err, ErrRecurrenceScanLimit) {
 				return fmt.Sprintf("RecurringBusyPeriods() err = %v, want ErrRecurrenceScanLimit", err)
 			}
@@ -1624,7 +1625,7 @@ func TestReachableBySetPosStillSelects(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			periods, err := RecurringBusyPeriods(recurringTestComponent(tt.rrule), dtstart, time.Hour,
-				dtstart, rangeEnd, MaxRecurrenceInstances, nil)
+				dtstart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -1658,7 +1659,7 @@ func TestRecurringBusyPeriodsCoversTheWholeRequestedRange(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			rangeEnd := dtstart.AddDate(tt.years, 0, 0)
 			periods, err := RecurringBusyPeriods(recurringTestComponent(tt.rrule), dtstart, time.Hour,
-				dtstart, rangeEnd, 50_000, nil)
+				dtstart, rangeEnd, 50_000, nil, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -1675,7 +1676,7 @@ func TestRecurringBusyPeriodsCoversTheWholeRequestedRange(t *testing.T) {
 func TestRecurringBusyPeriodsReturnsThePeriodsCollectedBeforeTheBudgetRanOut(t *testing.T) {
 	dtstart := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
 	periods, err := RecurringBusyPeriods(recurringTestComponent("FREQ=DAILY"), dtstart, time.Hour,
-		dtstart, dtstart.AddDate(3, 0, 0), 10, nil)
+		dtstart, dtstart.AddDate(3, 0, 0), 10, nil, nil)
 	if !errors.Is(err, ErrRecurrenceExpansionLimit) {
 		t.Fatalf("err = %v, want ErrRecurrenceExpansionLimit", err)
 	}
@@ -1695,7 +1696,7 @@ func TestRecurrenceExpansionDistinguishesScanFromOutputExhaustion(t *testing.T) 
 	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	_, err := RecurringBusyPeriods(recurringTestComponent("FREQ=DAILY"), dtstart, time.Hour,
-		dtstart, dtstart.AddDate(1, 0, 0), 10, nil)
+		dtstart, dtstart.AddDate(1, 0, 0), 10, nil, nil)
 	if !errors.Is(err, ErrRecurrenceExpansionLimit) || errors.Is(err, ErrRecurrenceScanLimit) {
 		t.Fatalf("output budget exhaustion err = %v, want ErrRecurrenceExpansionLimit alone", err)
 	}
@@ -1703,7 +1704,7 @@ func TestRecurrenceExpansionDistinguishesScanFromOutputExhaustion(t *testing.T) 
 	dense := "FREQ=YEARLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=" + enumeratedInts(24) +
 		";BYMINUTE=" + enumeratedInts(60) + ";BYSECOND=" + enumeratedInts(60) + ";BYSETPOS=-1"
 	_, err = RecurringBusyPeriods(recurringTestComponent(dense), dtstart, time.Second,
-		dtstart, dtstart.AddDate(1, 0, 0), 10_000_000, nil)
+		dtstart, dtstart.AddDate(1, 0, 0), 10_000_000, nil, nil)
 	if !errors.Is(err, ErrRecurrenceScanLimit) {
 		t.Fatalf("scan work exhaustion err = %v, want ErrRecurrenceScanLimit", err)
 	}
@@ -1782,7 +1783,7 @@ func TestContentLinesSplitAtTheFirstColonOutsideQuotes(t *testing.T) {
 		return ParsePropertyDateTimeLocal(keyPart, value)
 	})
 	start := time.Date(2024, 1, 8, 9, 0, 0, 0, eastern)
-	periods, err := RecurringBusyPeriods(raw, start, time.Hour, start.AddDate(0, 0, -1), start.AddDate(0, 0, 7), MaxRecurrenceInstances, resolve)
+	periods, err := RecurringBusyPeriods(raw, start, time.Hour, start.AddDate(0, 0, -1), start.AddDate(0, 0, 7), MaxRecurrenceInstances, resolve, nil)
 	if err != nil {
 		t.Fatalf("RecurringBusyPeriods() err = %v", err)
 	}
@@ -1844,7 +1845,7 @@ func TestRecurringBusyPeriodsScalesWithManyExDates(t *testing.T) {
 	dtstart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	expand := func(t *testing.T, raw string, n int) []BusyPeriod {
 		t.Helper()
-		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 0, n), n, nil)
+		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 0, n), n, nil, nil)
 		if err != nil {
 			t.Fatalf("RecurringBusyPeriods() err = %v", err)
 		}
@@ -1942,7 +1943,7 @@ func cancelledOverridesWithGoverningShift(n int) string {
 func busyPeriodsOverDays(t *testing.T, raw string, days int) []BusyPeriod {
 	t.Helper()
 	dtstart := time.Date(1900, 1, 1, 9, 0, 0, 0, time.UTC)
-	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 0, days), 4*days, nil)
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 0, days), 4*days, nil, nil)
 	if err != nil {
 		t.Fatalf("RecurringBusyPeriods() err = %v", err)
 	}
@@ -2027,7 +2028,7 @@ func TestRecurrenceSetKeepsADTStartAfterUntil(t *testing.T) {
 		t.Run(rrule, func(t *testing.T) {
 			raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:late\r\nDTSTART:20240101T090000Z\r\n" +
 				"RRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart.AddDate(-1, 0, 0), dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart.AddDate(-1, 0, 0), dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -2052,7 +2053,7 @@ func TestRecurrenceSetCollectsTheDTStartBeforeAScanLimit(t *testing.T) {
 	dense := "FREQ=YEARLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=" + enumeratedInts(24) +
 		";BYMINUTE=" + enumeratedInts(60) + ";BYSECOND=" + enumeratedInts(60) + ";BYSETPOS=-1"
 	periods, err := RecurringBusyPeriods(recurringTestComponent(dense), dtstart, time.Second,
-		dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+		dtstart, dtstart.AddDate(1, 0, 0), MaxRecurrenceInstances, nil, nil)
 	if !errors.Is(err, ErrRecurrenceScanLimit) {
 		t.Fatalf("err = %v, want ErrRecurrenceScanLimit", err)
 	}
@@ -2118,7 +2119,7 @@ func TestRecurrenceSetIncludesAnUnsynchronizedDTStart(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:unsynchronized\r\n" +
 				"DTSTART:20240101T090000Z\r\nRRULE:" + tt.rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-			periods, err := RecurringBusyPeriods(raw, day(1, 1), time.Hour, day(1, 1), day(3, 20), MaxRecurrenceInstances, nil)
+			periods, err := RecurringBusyPeriods(raw, day(1, 1), time.Hour, day(1, 1), day(3, 20), MaxRecurrenceInstances, nil, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -2149,7 +2150,7 @@ func TestRecurrenceSetExceedsLimitCountsAnUnsynchronizedDTStartOnce(t *testing.T
 		t.Fatalf("RecurrenceSetExceedsLimit() = %t, %t, want false, true", exceeds, valid)
 	}
 	dtstart := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
-	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(5, 0, 0), MaxRecurrenceInstances, nil)
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(5, 0, 0), MaxRecurrenceInstances, nil, nil)
 	if err != nil {
 		t.Fatalf("RecurringBusyPeriods() err = %v", err)
 	}
@@ -2165,7 +2166,7 @@ func TestRecurringBusyPeriodsAppliesExDates(t *testing.T) {
 		"DTSTART:20240101T090000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\n" +
 		"EXDATE:20240102T090000Z,20240104T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	dtstart := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
-	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 1, 0), MaxRecurrenceInstances, nil)
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 1, 0), MaxRecurrenceInstances, nil, nil)
 	if err != nil {
 		t.Fatalf("RecurringBusyPeriods() err = %v", err)
 	}
@@ -2206,7 +2207,7 @@ func TestSparseCalendarRulesStillGenerateTheirRareDays(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			periods, err := RecurringBusyPeriods(recurringTestComponent(tt.rrule), dtstart, time.Hour,
-				dtstart, rangeEnd, MaxRecurrenceInstances, nil)
+				dtstart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -2265,7 +2266,7 @@ func TestRecurrenceCandidateBoundIsNeverBelowWhatAPeriodOffers(t *testing.T) {
 			// differs from the first one is covered too.
 			for period := 0; period < 40; period++ {
 				offered := 0
-				_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(), func(time.Time) bool {
+				_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, newRecurrenceWork(nil), func(time.Time) bool {
 					offered++
 					return false
 				})
@@ -2298,7 +2299,7 @@ func TestThisAndFutureOverrideMovesInstancesCenturiesAway(t *testing.T) {
 		"DTSTART:20220601T130000Z\r\nDTEND:20220601T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	dtstart := time.Date(1700, 6, 1, 13, 0, 0, 0, time.UTC)
 	rangeStart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeStart.AddDate(10, 0, 0), MaxRecurrenceInstances, nil)
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeStart.AddDate(10, 0, 0), MaxRecurrenceInstances, nil, nil)
 	if err != nil {
 		t.Fatalf("RecurringBusyPeriods() err = %v", err)
 	}
@@ -2369,20 +2370,20 @@ func TestRecurrenceStartListerAgreesWithLatestRecurrenceOnOrBefore(t *testing.T)
 	through := time.Date(2041, 1, 1, 0, 0, 0, 0, time.UTC)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			whole := NewRecurrenceStartLister(tt.dtstart, tt.rrule)
-			if !whole.ListThrough(through, 4096) {
+			whole := NewRecurrenceStartLister(tt.dtstart, tt.rrule, nil)
+			if !whole.ListThrough(through, 4096, nil) {
 				t.Fatal("ListThrough() = false, want the whole range listed")
 			}
 			if !slices.IsSortedFunc(whole.starts, time.Time.Compare) {
 				t.Fatalf("listed %v, want ascending", whole.starts)
 			}
-			grown := NewRecurrenceStartLister(tt.dtstart, tt.rrule)
+			grown := NewRecurrenceStartLister(tt.dtstart, tt.rrule, nil)
 			for bound := tt.dtstart; bound.Before(through); bound = bound.Add(3*365*24*time.Hour + 17*time.Hour) {
-				if !grown.ListThrough(bound, 4096) {
+				if !grown.ListThrough(bound, 4096, nil) {
 					t.Fatalf("ListThrough(%v) = false while growing, want true", bound)
 				}
 			}
-			if !grown.ListThrough(through, 4096) {
+			if !grown.ListThrough(through, 4096, nil) {
 				t.Fatal("ListThrough() = false at the end of growing, want true")
 			}
 
@@ -2462,14 +2463,14 @@ func TestRecurrenceStartsBetweenAreTheStartsWalkingBackFinds(t *testing.T) {
 			for _, span := range spans {
 				after, through := span[0], span[1]
 				want := walkedBack(t, tt.dtstart, tt.rrule, after, through)
-				got, ok := recurrenceStartsBetween(tt.dtstart, tt.rrule, after, through, 4096, newRecurrenceWork())
+				got, ok := recurrenceStartsBetween(tt.dtstart, tt.rrule, after, through, 4096, newRecurrenceWork(nil))
 				if !ok {
 					t.Fatalf("starts in (%v, %v]: ok = false", after, through)
 				}
 				if !slices.EqualFunc(got, want, time.Time.Equal) {
 					t.Fatalf("starts in (%v, %v] = %v, walking back finds %v", after, through, got, want)
 				}
-				listed, ok := listings.StartsBetween(tt.dtstart, after, through, tt.rrule)
+				listed, ok := listings.StartsBetween(tt.dtstart, after, through, tt.rrule, nil)
 				if !ok {
 					continue
 				}
@@ -2494,7 +2495,7 @@ func TestRecurrenceStartsBetweenStopsAtTheLimitAfterOnePass(t *testing.T) {
 	rrule := "FREQ=DAILY;BYHOUR=" + everyValue(0, 23) + ";BYMINUTE=" + everyValue(0, 59) + ";BYSECOND=" + everyValue(0, 59)
 	after := time.Date(2024, 1, 5, 9, 30, 0, 0, time.UTC)
 	spent := func(follow func(*recurrenceWork)) int {
-		work := newRecurrenceWork()
+		work := newRecurrenceWork(nil)
 		follow(work)
 		if work.remaining < 0 {
 			t.Fatal("the work budget ran out")
@@ -2523,7 +2524,7 @@ func TestRecurrenceStartsBetweenOfARetiredRuleCostsNothing(t *testing.T) {
 	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
 	const rrule = "FREQ=DAILY;BYHOUR=2;UNTIL=17000101T000000"
 	after := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	work := newRecurrenceWork()
+	work := newRecurrenceWork(nil)
 	starts, ok := recurrenceStartsBetween(dtstart, rrule, after, after.Add(gapListingWindow), maxListedObservanceOnsets, work)
 	if !ok || len(starts) != 0 {
 		t.Fatalf("starts in 2024 of a rule retired in 1700 = %v, %t; want none", starts, ok)
@@ -2552,7 +2553,7 @@ func TestRecurrenceStartListerResumesWhereItStopped(t *testing.T) {
 	through := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	spent := func(list func(*RecurrenceStartLister)) int {
-		lister := NewRecurrenceStartLister(dtstart, rrule)
+		lister := NewRecurrenceStartLister(dtstart, rrule, nil)
 		list(lister)
 		if !lister.Covers(through) {
 			t.Fatal("the listing does not reach the bound")
@@ -2560,13 +2561,13 @@ func TestRecurrenceStartListerResumesWhereItStopped(t *testing.T) {
 		return recurrenceWorkLimit - lister.work.remaining
 	}
 	once := spent(func(l *RecurrenceStartLister) {
-		l.ListThrough(through, 4096)
+		l.ListThrough(through, 4096, nil)
 	})
 	yearly := spent(func(l *RecurrenceStartLister) {
 		for bound := dtstart; bound.Before(through); bound = bound.AddDate(1, 0, 0) {
-			l.ListThrough(bound, 4096)
+			l.ListThrough(bound, 4096, nil)
 		}
-		l.ListThrough(through, 4096)
+		l.ListThrough(through, 4096, nil)
 	})
 	if yearly > 3*once {
 		t.Fatalf("growing a year at a time spent %d units, listing at once %d", yearly, once)
@@ -2595,8 +2596,8 @@ func TestRecurrenceStartListerReportsWhetherTheSetEnded(t *testing.T) {
 	dtstart := time.Date(2007, 3, 11, 2, 0, 0, 0, time.UTC)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lister := NewRecurrenceStartLister(dtstart, tt.rrule)
-			if !lister.ListThrough(tt.through, 4096) {
+			lister := NewRecurrenceStartLister(dtstart, tt.rrule, nil)
+			if !lister.ListThrough(tt.through, 4096, nil) {
 				t.Fatal("ListThrough() = false, want true")
 			}
 			if ended := lister.Covers(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)); ended != tt.ended {
@@ -2637,11 +2638,11 @@ func TestRecurrenceStartListerAnswersOnlyWhatOneWalkAnswers(t *testing.T) {
 		t.Fatalf("walking %q to %v = %v, %t, %t; want a complete answer", rrule, near, want, wantFound, wantComplete)
 	}
 
-	lister := NewRecurrenceStartLister(dtstart, rrule)
+	lister := NewRecurrenceStartLister(dtstart, rrule, nil)
 	for bound := dtstart; bound.Before(far); bound = bound.AddDate(25, 0, 0) {
-		lister.ListThrough(bound, 4096)
+		lister.ListThrough(bound, 4096, nil)
 	}
-	lister.ListThrough(far, 4096)
+	lister.ListThrough(far, 4096, nil)
 	if got, found, ok := lister.LatestOnOrBefore(near); !ok || !found || !got.Equal(want) {
 		t.Fatalf("listing answered %v with %v, %t, %t; want %v as walking it does", near, got, found, ok, want)
 	}
@@ -2684,19 +2685,19 @@ func TestRecurrenceStartsIncludeWeeksBegunInThePreviousYear(t *testing.T) {
 
 	for _, rrule := range []string{"FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU", "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO,TU;COUNT=20"} {
 		t.Run(rrule, func(t *testing.T) {
-			grown := NewRecurrenceStartLister(dtstart, rrule)
+			grown := NewRecurrenceStartLister(dtstart, rrule, nil)
 			for _, bound := range bounds {
 				if latest, found, complete := LatestRecurrenceOnOrBefore(dtstart, bound.before, rrule); !found || !complete || !latest.Equal(bound.want) {
 					t.Errorf("LatestRecurrenceOnOrBefore(%v) = %v, %t, %t, want %v", bound.before, latest, found, complete, bound.want)
 				}
-				if !grown.ListThrough(bound.before, 4096) {
+				if !grown.ListThrough(bound.before, 4096, nil) {
 					t.Fatalf("ListThrough(%v) = false, want true", bound.before)
 				}
 				if latest, found, ok := grown.LatestOnOrBefore(bound.before); !ok || !found || !latest.Equal(bound.want) {
 					t.Errorf("listing grown to %v answered %v, %t, %t, want %v", bound.before, latest, found, ok, bound.want)
 				}
 			}
-			if !grown.ListThrough(end, 4096) {
+			if !grown.ListThrough(end, 4096, nil) {
 				t.Fatalf("ListThrough(%v) = false, want true", end)
 			}
 			if !slices.EqualFunc(grown.starts, want, time.Time.Equal) {
@@ -2920,7 +2921,7 @@ func TestWeekNumberedSeriesNearNewYearAgreesWithADayByDayWalk(t *testing.T) {
 						if got := expanded(t, event(dtstart, rrule), dtstart, dtstart.AddDate(-1, 0, 0), last.AddDate(1, 0, 0)); !slices.EqualFunc(got, want, time.Time.Equal) {
 							t.Errorf("%s: expansion = %v, want %v", rrule, got, want)
 						}
-						periods, err := RecurringBusyPeriods(event(dtstart, rrule), dtstart, time.Hour, dtstart.AddDate(-1, 0, 0), last.AddDate(1, 0, 0), MaxRecurrenceInstances, nil)
+						periods, err := RecurringBusyPeriods(event(dtstart, rrule), dtstart, time.Hour, dtstart.AddDate(-1, 0, 0), last.AddDate(1, 0, 0), MaxRecurrenceInstances, nil, nil)
 						if err != nil {
 							t.Fatalf("%s: RecurringBusyPeriods() err = %v", rrule, err)
 						}
@@ -2937,11 +2938,11 @@ func TestWeekNumberedSeriesNearNewYearAgreesWithADayByDayWalk(t *testing.T) {
 						if exceeds, ok := RecurrenceSetExceedsLimit(event(dtstart, rrule), count); !ok || exceeds {
 							t.Errorf("%s: RecurrenceSetExceedsLimit(limit %d) = %t, %t, want the %d instances within it", rrule, count, exceeds, ok, count)
 						}
-						lister := NewRecurrenceStartLister(dtstart, rrule)
-						if !lister.ListThrough(last.AddDate(1, 0, 0), 4096) || !slices.EqualFunc(lister.starts, want, time.Time.Equal) {
+						lister := NewRecurrenceStartLister(dtstart, rrule, nil)
+						if !lister.ListThrough(last.AddDate(1, 0, 0), 4096, nil) || !slices.EqualFunc(lister.starts, want, time.Time.Equal) {
 							t.Errorf("%s: listed %v, want %v", rrule, lister.starts, want)
 						}
-						if between, ok := recurrenceStartsBetween(dtstart, rrule, dtstart, last, 4096, newRecurrenceWork()); !ok || !slices.EqualFunc(between, want[1:], time.Time.Equal) {
+						if between, ok := recurrenceStartsBetween(dtstart, rrule, dtstart, last, 4096, newRecurrenceWork(nil)); !ok || !slices.EqualFunc(between, want[1:], time.Time.Equal) {
 							t.Errorf("%s: starts after the DTSTART = %v, %t, want %v", rrule, between, ok, want[1:])
 						}
 					}
@@ -2975,12 +2976,12 @@ func TestWeekNumberedSeriesNearNewYearAgreesWithADayByDayWalk(t *testing.T) {
 func TestRecurrenceStartListerHaltsAtItsLimit(t *testing.T) {
 	dtstart := time.Date(1601, 1, 1, 2, 0, 0, 0, time.UTC)
 	const rrule = "FREQ=YEARLY;BYDAY=1SU;BYMONTH=11"
-	lister := NewRecurrenceStartLister(dtstart, rrule)
-	if lister.ListThrough(time.Date(4050, 1, 1, 0, 0, 0, 0, time.UTC), 1024) {
+	lister := NewRecurrenceStartLister(dtstart, rrule, nil)
+	if lister.ListThrough(time.Date(4050, 1, 1, 0, 0, 0, 0, time.UTC), 1024, nil) {
 		t.Fatal("ListThrough() = true for 2,450 yearly starts with a limit of 1024, want false")
 	}
-	if lister.Len() != 1024 {
-		t.Fatalf("kept %d starts, want 1024", lister.Len())
+	if len(lister.starts) != 1024 {
+		t.Fatalf("kept %d starts, want 1024", len(lister.starts))
 	}
 	for _, before := range []time.Time{
 		time.Date(1700, 6, 1, 0, 0, 0, 0, time.UTC),
@@ -2997,8 +2998,8 @@ func TestRecurrenceStartListerHaltsAtItsLimit(t *testing.T) {
 	if _, _, ok := lister.LatestOnOrBefore(past); ok {
 		t.Fatalf("LatestOnOrBefore(%v) answered past the halted listing", past)
 	}
-	if lister.ListThrough(past, 4096) || lister.Len() != 1024 {
-		t.Fatalf("a halted listing was extended to %d starts", lister.Len())
+	if lister.ListThrough(past, 4096, nil) || len(lister.starts) != 1024 {
+		t.Fatalf("a halted listing was extended to %d starts", len(lister.starts))
 	}
 }
 
@@ -3180,8 +3181,8 @@ func TestLatestRecurrenceOnOrBeforeAnswersWhatItReachedWhenWorkRunsOut(t *testin
 	dtstart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	before := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	whole := NewRecurrenceStartLister(dtstart, rule)
-	if whole.ListThrough(before, math.MaxInt) {
+	whole := NewRecurrenceStartLister(dtstart, rule, nil)
+	if whole.ListThrough(before, math.MaxInt, nil) {
 		t.Fatal("the rule was followed to the bound; the case tests nothing")
 	}
 	lastWhole := whole.starts[len(whole.starts)-1]
@@ -3229,8 +3230,8 @@ func TestRecurrenceStartListerFromAnInstantAgreesWithLatestRecurrenceOnOrBefore(
 	for _, tt := range tests {
 		for _, from := range []time.Time{time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)} {
 			t.Run(tt.name+"/"+from.Format("2006-01-02"), func(t *testing.T) {
-				lister := NewRecurrenceStartListerFrom(tt.dtstart, tt.rrule, from)
-				if !lister.ListThrough(through, 2048) {
+				lister := NewRecurrenceStartListerFrom(tt.dtstart, tt.rrule, from, nil)
+				if !lister.ListThrough(through, 2048, nil) {
 					t.Fatal("ListThrough() = false, want the window listed")
 				}
 				for _, start := range lister.starts {

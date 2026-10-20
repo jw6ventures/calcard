@@ -762,10 +762,15 @@ func (h *Handler) GetCalendarEventsJSON(w http.ResponseWriter, r *http.Request) 
 
 	// Build JSON response
 	viewStart, viewEnd := eventViewWindow(rangeStart, rangeEndExclusive)
+	work := ical.NewRequestWork(r.Context(), eventsJSONWorkBudget)
 	eventsJSONData := make([]map[string]any, 0, len(relevantEvents))
 	for _, ev := range relevantEvents {
-		payload := unfoldedEventJSON(ev, viewStart, viewEnd, h.timezoneOnsets)
-		h.addSeriesInstances(payload, ev, viewStart, viewEnd)
+		if r.Context().Err() != nil {
+			return
+		}
+		eventWork := work.Allowance(eventsJSONEventWork)
+		payload := unfoldedEventJSON(ev, viewStart, viewEnd, h.timezoneOnsets, eventWork)
+		h.addSeriesInstances(payload, ev, viewStart, viewEnd, eventWork)
 		eventsJSONData = append(eventsJSONData, payload)
 	}
 
@@ -839,6 +844,26 @@ func (h *Handler) ViewAllCalendars(w http.ResponseWriter, r *http.Request) {
 
 const maxAllCalendarRangeDays = 62
 
+// eventsJSONWorkBudget bounds the recurrence and observance work expanding
+// every series one events.json response lists may spend together, on top of
+// the cap each evaluation has of its own and of each event's allowance. It is
+// the size of a REPORT's: thirty series in zones that each cost several million
+// units to follow are answered in about two seconds with it.
+const eventsJSONWorkBudget = 20_000_000
+
+// eventsJSONEventWork is the allowance each event an events.json response
+// lists keeps beside the shared eventsJSONWorkBudget: the work its zone reading
+// and expansion may spend whether or not the events listed before it have spent
+// the shared budget. The browser places a series by the instances it is served,
+// so a series served none is not shown. Measured on a month view, a weekly
+// UTC series costs 15 units, a weekly series in Outlook's "Eastern Standard
+// Time" 18 once the zone's rules are listed and 5,400 when its zone reading and
+// expansion list them, and an hourly series of 770 instances there 4,200 cold.
+// 10,000 leaves the costliest of them nearly twice its cost, and the shared
+// budget serves whatever a series needs beyond it. A response of hostile events
+// costs the shared budget and this many units for each event listed.
+const eventsJSONEventWork = 10_000
+
 // eventViewWindow is the span of instants a view showing the dates [start,
 // endExclusive) can show, each given as its UTC midnight: the browser shows
 // its own local dates, which begin up to maxUTCOffset either side of the UTC
@@ -863,11 +888,11 @@ type calendarEventInstance struct {
 // where each override replacing one instance falls. An event whose master
 // does not recur, or whose recurrence the server cannot expand, gets none of
 // them, and stands for itself.
-func (h *Handler) addSeriesInstances(payload map[string]any, unfolded unfoldedEvent, viewStart, viewEnd time.Time) {
+func (h *Handler) addSeriesInstances(payload map[string]any, unfolded unfoldedEvent, viewStart, viewEnd time.Time, work *ical.RequestWork) {
 	if !unfolded.series.recurs() {
 		return
 	}
-	expansion := h.expandEvent(unfolded.event.RawICAL, viewStart, viewEnd)
+	expansion := h.expandEvent(unfolded.event.RawICAL, viewStart, viewEnd, work)
 	if !expansion.Recurs {
 		return
 	}
@@ -946,8 +971,12 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 	rangeEnd := rangeEndExclusive.Add(-time.Nanosecond)
 	viewStart, viewEnd := eventViewWindow(rangeStart, rangeEndExclusive)
 
+	work := ical.NewRequestWork(r.Context(), eventsJSONWorkBudget)
 	var result = make([]map[string]any, 0)
 	for i, cal := range calendars {
+		if r.Context().Err() != nil {
+			return
+		}
 		allEvents, err := h.store.Events.ListForCalendar(r.Context(), cal.ID)
 		if err != nil {
 			continue
@@ -978,8 +1007,9 @@ func (h *Handler) GetAllCalendarEventsJSON(w http.ResponseWriter, r *http.Reques
 				continue
 			}
 
-			payload := unfoldedEventJSON(unfoldedEv, viewStart, viewEnd, h.timezoneOnsets)
-			h.addSeriesInstances(payload, unfoldedEv, viewStart, viewEnd)
+			eventWork := work.Allowance(eventsJSONEventWork)
+			payload := unfoldedEventJSON(unfoldedEv, viewStart, viewEnd, h.timezoneOnsets, eventWork)
+			h.addSeriesInstances(payload, unfoldedEv, viewStart, viewEnd, eventWork)
 			payload["calendarId"] = cal.ID
 			payload["calendarName"] = cal.Name
 			payload["calendarColor"] = color
@@ -2435,8 +2465,11 @@ func rawICalCalendarDate(value string, params map[string]string, isEnd bool) *fi
 // unfoldedEventJSON is the view model of an event shown from viewStart to
 // viewEnd, the instants the browser's view can show (eventViewWindow), reading the rules of the zones the
 // object defines through onsets, or through listings of its own when onsets is
-// nil.
-func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, onsets ical.ObservanceOnsets) map[string]any {
+// nil. Reading the object's zones draws on work, the budget of the request,
+// when it is not nil. An event read after the budget ran out is placed as UTC
+// where its zone could not be followed, and its payload says so with
+// "zoneComplete": false.
+func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, onsets ical.ObservanceOnsets, work *ical.RequestWork) map[string]any {
 	ev, lines := unfolded.event, unfolded.lines
 	payload := map[string]any{
 		"uid":     ev.UID,
@@ -2444,7 +2477,7 @@ func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, ons
 		"lastMod": ev.LastModified.Format(time.RFC3339),
 	}
 
-	zones := calendarEventZones{times: ical.NewObjectTimesSharingOnsets(lines, onsets)}
+	zones := calendarEventZones{times: ical.NewObjectTimes(lines, onsets, work)}
 	parsed := parseCalendarEventMetadata(ev, lines, &zones)
 	parsed.addToPayload(payload)
 	if parsed.RRule != "" {
@@ -2454,6 +2487,12 @@ func unfoldedEventJSON(unfolded unfoldedEvent, viewStart, viewEnd time.Time, ons
 	}
 	if offsets := calendarEventTimezoneOffsets(parsed, viewStart, viewEnd, &zones); len(offsets) > 0 {
 		payload["timezoneOffsets"] = offsets
+	}
+	if zones.times.Starved() {
+		// The request's work ran out before the object's zone could be followed,
+		// so its times were read as UTC. The page says so beside them rather than
+		// showing them as right, as it does for a series with instancesComplete.
+		payload["zoneComplete"] = false
 	}
 	return payload
 }
@@ -2938,7 +2977,7 @@ func parseICalProperty(line string) (string, map[string]string, string, bool) {
 		if !ok {
 			continue
 		}
-		params[strings.ToUpper(strings.TrimSpace(name))] = strings.Trim(strings.TrimSpace(val), `"`)
+		params[strings.ToUpper(strings.TrimSpace(name))] = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), `"`))
 	}
 	return key, params, value, key != ""
 }

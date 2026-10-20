@@ -174,9 +174,9 @@ type principalPropertySearchRequest struct {
 	ApplyToPrincipalCollectionSet *struct{}                        `xml:"DAV: apply-to-principal-collection-set"`
 }
 
-// reportACL dispatches the four RFC 3744 principal reports. All four are
-// defined on a single resource rather than over a collection's members, so a
-// Depth other than 0 is a malformed request rather than a deeper traversal.
+// reportACL dispatches the four RFC 3744 principal reports. Each fixes its own
+// traversal and is defined only for Depth 0, so any other Depth is a malformed
+// request rather than a deeper traversal.
 func (h *DavServer) reportACL(w http.ResponseWriter, r *http.Request, user *store.User, cleanPath string, body []byte) {
 	if depth := strings.TrimSpace(r.Header.Get("Depth")); depth != "" && depth != "0" {
 		http.Error(w, "ACL reports require Depth: 0", http.StatusBadRequest)
@@ -512,7 +512,7 @@ func (h *DavServer) selectACLReportProperties(r *http.Request, user *store.User,
 	}
 	for i := range responses {
 		if len(responses[i].Propstat) != 0 {
-			responses[i] = filterNonPrincipalPropfindResponse(responses[i], propfindRequest)
+			responses[i] = filterPropfindResponse(responses[i], propfindRequest)
 		}
 	}
 	return responses, nil

@@ -80,7 +80,8 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}
 
-	// Check that UIDs are properly formatted
+	// Each birthday event has a birthday- UID, a yearly recurrence and
+	// transparent time.
 	for _, ev := range events {
 		if !strings.HasPrefix(ev.UID, "birthday-") {
 			t.Errorf("expected birthday event UID to start with 'birthday-', got %q", ev.UID)
@@ -434,7 +435,6 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
 	}
-	// Check that deleted event has 404 status
 	found := false
 	for _, r := range responses {
 		if strings.Contains(r.Href, "deleted-resource") {
@@ -1706,7 +1706,6 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 		t.Fatalf("expected 403 without editor, got %d", rr.Code)
 	}
 
-	// Grant editor and delete
 	calRepo.accessible[0].Editor = true
 	aclRepo.entries = append(aclRepo.entries, store.ACLEntry{
 		ResourcePath:  "/dav/calendars/2",
@@ -2291,7 +2290,6 @@ func TestPutTooLarge(t *testing.T) {
 func TestMkcolValidatesPathAndName(t *testing.T) {
 	h := &DavServer{}
 	u := &store.User{ID: 1}
-	// unsupported path
 	req := httptest.NewRequest("MKCOL", "/dav/calendars/bad", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -2300,7 +2298,6 @@ func TestMkcolValidatesPathAndName(t *testing.T) {
 		t.Fatalf("expected 400 for unsupported mkcol path, got %d", rr.Code)
 	}
 
-	// missing name
 	req = httptest.NewRequest("MKCOL", "/dav/addressbooks/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr = httptest.NewRecorder()
@@ -8701,11 +8698,9 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 	oldKey := f.key(fromAddressBookID, uid)
 	contact, ok := f.contacts[oldKey]
 	if !ok {
-		return nil // Contact not found
+		return nil
 	}
-	// Remove from old location
 	delete(f.contacts, oldKey)
-	// Update address book ID
 	contact.AddressBookID = toAddressBookID
 	if destResourceName != "" {
 		contact.ResourceName = destResourceName
@@ -8731,7 +8726,6 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 			delete(f.contacts, key)
 		}
 	}
-	// Add to new location
 	newKey := f.key(toAddressBookID, uid)
 	f.contacts[newKey] = contact
 	return nil
@@ -9120,7 +9114,8 @@ func fakeChangesAfter[T any](members []T, stamp func(T) time.Time, id func(T) in
 		tombstone *store.DeletedResource
 	}
 	// The store's zero cursor precedes every row, whose ids and stamps are
-	// never zero; fixtures here leave both unset.
+	// never zero; fixtures here may leave either unset, so the zero cursor
+	// admits every row outright.
 	first := after == store.SyncCursor{}
 	held := make(map[string]struct{}, len(members))
 	var changes []change
@@ -9154,7 +9149,8 @@ func fakeChangesAfter[T any](members []T, stamp func(T) time.Time, id func(T) in
 	return page
 }
 
-// syncCursorBefore orders two positions of a change stream.
+// syncCursorBefore reports whether position a of a change stream precedes b:
+// by stamp, then members before removals at one stamp, then by id.
 func syncCursorBefore(a, b store.SyncCursor) bool {
 	if !a.Stamp.Equal(b.Stamp) {
 		return a.Stamp.Before(b.Stamp)
@@ -9195,11 +9191,11 @@ func TestCalendarDataUseCDATA(t *testing.T) {
 		t.Fatalf("failed to marshal: %v", err)
 	}
 	xmlStr := string(out)
-	// Check that calendar data is wrapped in CDATA and contains raw CRLF
+	// calendar-data is written as a CDATA section, so its CRLF line endings are
+	// not escaped.
 	if !strings.Contains(xmlStr, "<![CDATA[BEGIN:VCALENDAR") {
 		t.Errorf("expected CDATA wrapper, got: %s", xmlStr)
 	}
-	// Check that CRLF is not escaped
 	if strings.Contains(xmlStr, "&#xD;") || strings.Contains(xmlStr, "&#xA;") {
 		t.Errorf("CRLF should not be escaped, got: %s", xmlStr)
 	}
@@ -9323,7 +9319,6 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	}
 	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	// Query for events in June 2024 - filter should apply to VEVENT component
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
 			<cal:comp-filter name="VCALENDAR">
@@ -10203,10 +10198,9 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 	}
 }
 
-func TestValidateICalendarDetectsVEVENT(t *testing.T) {
-	h := &DavServer{}
+func TestAnalyzeICalendarAcceptsVEVENT(t *testing.T) {
 	data := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	if err := h.validateICalendar(data); err != nil {
+	if _, err := analyzeICalendar(data); err != nil {
 		t.Fatalf("expected valid iCalendar, got error: %v", err)
 	}
 }
@@ -10290,8 +10284,6 @@ func TestParseICalDateTime(t *testing.T) {
 func ptrTime(t time.Time) *time.Time {
 	return &t
 }
-
-// Tests for new medium priority features
 
 func TestFreeBusyQueryReport(t *testing.T) {
 	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)

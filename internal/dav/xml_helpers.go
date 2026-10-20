@@ -19,8 +19,8 @@ func safeUnmarshalXML(data []byte, v interface{}) error {
 	return expectXMLDocumentEnd(decoder)
 }
 
-// expectXMLDocumentEnd reports whether the decoder is positioned at the end of
-// the document. An XML document holds exactly one root element (XML 1.0 §2.1),
+// expectXMLDocumentEnd fails unless the decoder reaches the end of the
+// document with nothing but misc content after its root. An XML document holds exactly one root element (XML 1.0 §2.1),
 // so a second one after it is a second document smuggled into the body -- which
 // a decoder that stops at the first root would silently accept. Comments,
 // processing instructions and whitespace are the misc content the production

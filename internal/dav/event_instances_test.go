@@ -198,16 +198,16 @@ func TestEventInstancesAreTheInstancesCalDAVExpands(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := EventInstances(tt.raw, tt.start, tt.end)
+			got := EventInstances(tt.raw, tt.start, tt.end, nil)
 			if !got.Recurs || !got.Complete {
-				t.Fatalf("EventInstances() recurs = %v, complete = %v, want both", got.Recurs, got.Complete)
+				t.Fatalf("EventInstances(, nil) recurs = %v, complete = %v, want both", got.Recurs, got.Complete)
 			}
 			want := expandedInstances(t, tt.raw, tt.start, tt.end, tt.overridden...)
 			if len(want) != tt.want {
 				t.Fatalf("CalDAV expands %d instances, the fixture expects %d: %v", len(want), tt.want, want)
 			}
 			if len(got.Instances) != len(want) {
-				t.Fatalf("EventInstances() lists %d instances, CalDAV expands %d:\n got %v\nwant %v", len(got.Instances), len(want), got.Instances, want)
+				t.Fatalf("EventInstances(, nil) lists %d instances, CalDAV expands %d:\n got %v\nwant %v", len(got.Instances), len(want), got.Instances, want)
 			}
 			for i := range want {
 				g, w := got.Instances[i], want[i]
@@ -224,7 +224,7 @@ func TestEventInstancesAreTheInstancesCalDAVExpands(t *testing.T) {
 func TestEventInstancesNameTheOverrideGoverningThem(t *testing.T) {
 	raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
 		"RECURRENCE-ID;RANGE=THISANDFUTURE:20261019T090000Z\r\nDTSTART:20261019T110000Z\r\nDTEND:20261019T130000Z\r\nSUMMARY:Later\r\n")
-	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), nil)
 	override := mustUTC(t, "20261019T090000Z")
 	for _, instance := range got.Instances {
 		governed := !instance.RecurrenceID.Before(override)
@@ -260,7 +260,7 @@ func TestEventInstancesPlaceAThisAndFutureOverrideOnlyWhereNoInstanceCarriesIt(t
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n"+tt.exdate, later)
-			got := EventInstances(raw, october[0], october[1])
+			got := EventInstances(raw, october[0], october[1], nil)
 			var starts, placed []string
 			for _, instance := range got.Instances {
 				starts = append(starts, instance.Start.Format("20060102T150405Z"))
@@ -272,7 +272,7 @@ func TestEventInstancesPlaceAThisAndFutureOverrideOnlyWhereNoInstanceCarriesIt(t
 				placed = append(placed, override.Start.Format("20060102T150405Z"))
 			}
 			if !slices.Equal(starts, tt.instances) || !slices.Equal(placed, tt.placed) {
-				t.Errorf("EventInstances() lists instances at %v and places overrides at %v, want %v and %v", starts, placed, tt.instances, tt.placed)
+				t.Errorf("EventInstances(, nil) lists instances at %v and places overrides at %v, want %v and %v", starts, placed, tt.instances, tt.placed)
 			}
 			expanded := expandedInstances(t, raw, october[0], october[1], tt.overridden...)
 			if len(expanded) != len(tt.instances) {
@@ -299,13 +299,13 @@ func TestThisAndFutureOverridesFarApartOnADenseSeriesAreEachMatchedToTheirSlot(t
 		"RECURRENCE-ID;RANGE=THISANDFUTURE:20300101T000000Z\r\nDTSTART:20300101T000000Z\r\nDURATION:PT30S\r\nSUMMARY:Late\r\n",
 		"RECURRENCE-ID;RANGE=THISANDFUTURE:20300101T001030Z\r\nDTSTART:20300101T001030Z\r\nDURATION:PT15S\r\nSUMMARY:Between\r\n")
 	from, to := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 2, 0, 0, time.UTC)
-	got := EventInstances(raw, from, to)
+	got := EventInstances(raw, from, to, nil)
 	if len(got.Instances) != 2 || len(got.Overrides) != 0 {
-		t.Errorf("EventInstances() lists %+v and places %+v, want the two minutes alone", got.Instances, got.Overrides)
+		t.Errorf("EventInstances(, nil) lists %+v and places %+v, want the two minutes alone", got.Instances, got.Overrides)
 	}
-	between := EventInstances(raw, time.Date(2030, 1, 1, 0, 10, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 11, 0, 0, time.UTC))
+	between := EventInstances(raw, time.Date(2030, 1, 1, 0, 10, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 11, 0, 0, time.UTC), nil)
 	if len(between.Overrides) != 1 || !between.Overrides[0].Start.Equal(mustUTC(t, "20300101T001030Z")) {
-		t.Errorf("EventInstances() places %+v, want the override naming no minute", between.Overrides)
+		t.Errorf("EventInstances(, nil) places %+v, want the override naming no minute", between.Overrides)
 	}
 	code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="20300101T000000Z" end="20300101T000200Z"/>`))
 	if code != 207 {
@@ -323,9 +323,9 @@ func TestEventInstancesPlaceNoCancelledThisAndFutureOverride(t *testing.T) {
 	raw := instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
 		"RECURRENCE-ID;RANGE=THISANDFUTURE:20261012T090000Z\r\nDTSTART:20261012T090000Z\r\nDTEND:20261012T100000Z\r\nSTATUS:CANCELLED\r\n")
 	october := []time.Time{time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
-	got := EventInstances(raw, october[0], october[1])
+	got := EventInstances(raw, october[0], october[1], nil)
 	if len(got.Instances) != 1 || !got.Instances[0].Start.Equal(mustUTC(t, "20261005T090000Z")) || len(got.Overrides) != 0 {
-		t.Errorf("EventInstances() lists %+v and places %+v, want the first instance alone", got.Instances, got.Overrides)
+		t.Errorf("EventInstances(, nil) lists %+v and places %+v, want the first instance alone", got.Instances, got.Overrides)
 	}
 	code, body := zeroLengthReport(t, raw, calendarDataQuery(`<C:expand start="20261001T000000Z" end="20261101T000000Z"/>`))
 	if code != 207 {
@@ -341,12 +341,12 @@ func TestEventInstancesPlaceNoCancelledThisAndFutureOverride(t *testing.T) {
 func TestEventInstancesPlaceAnAllDayOverrideOverItsDay(t *testing.T) {
 	raw := instancesObject("", "DTSTART;VALUE=DATE:20261005\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
 		"RECURRENCE-ID;VALUE=DATE:20261012\r\nDTSTART;VALUE=DATE:20261012\r\nSUMMARY:Renamed\r\n")
-	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), nil)
 	want := []calobject.Instance{{RecurrenceID: mustUTC(t, "20261012T000000Z"), Start: mustUTC(t, "20261012T000000Z"), End: mustUTC(t, "20261013T000000Z")}}
 	if !slices.EqualFunc(got.Overrides, want, func(a, b calobject.Instance) bool {
 		return a.RecurrenceID.Equal(b.RecurrenceID) && a.Start.Equal(b.Start) && a.End.Equal(b.End)
 	}) {
-		t.Errorf("EventInstances() places overrides at %+v, want %+v", got.Overrides, want)
+		t.Errorf("EventInstances(, nil) places overrides at %+v, want %+v", got.Overrides, want)
 	}
 }
 
@@ -355,12 +355,12 @@ func TestEventInstancesPlaceAnAllDayOverrideOverItsDay(t *testing.T) {
 func TestEventInstancesPlaceAnOverrideInItsOwnStartsZone(t *testing.T) {
 	raw := instancesObject("", "DTSTART;TZID=America/New_York:20261005T090000\r\nDTEND;TZID=America/New_York:20261005T100000\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
 		"RECURRENCE-ID;TZID=America/New_York:20261012T090000\r\nDTSTART;TZID=Europe/Berlin:20261012T090000\r\nDTEND;TZID=Europe/Berlin:20261012T100000\r\nSUMMARY:Moved\r\n")
-	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), nil)
 	want := []calobject.Instance{{RecurrenceID: mustUTC(t, "20261012T130000Z"), Start: mustUTC(t, "20261012T070000Z"), End: mustUTC(t, "20261012T080000Z")}}
 	if !slices.EqualFunc(got.Overrides, want, func(a, b calobject.Instance) bool {
 		return a.RecurrenceID.Equal(b.RecurrenceID) && a.Start.Equal(b.Start) && a.End.Equal(b.End)
 	}) {
-		t.Errorf("EventInstances() places overrides at %+v, want %+v", got.Overrides, want)
+		t.Errorf("EventInstances(, nil) places overrides at %+v, want %+v", got.Overrides, want)
 	}
 }
 
@@ -368,12 +368,12 @@ func TestEventInstancesPlaceAnOverrideInItsOwnStartsZone(t *testing.T) {
 // returns. The listing stops at the expansion's limit and says it is partial.
 func TestEventInstancesStopAtTheExpansionLimit(t *testing.T) {
 	raw := instancesObject("", "DTSTART:20261001T000000Z\r\nDTEND:20261001T000030Z\r\nRRULE:FREQ=MINUTELY\r\n")
-	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), nil)
 	if !got.Recurs || got.Complete {
-		t.Fatalf("EventInstances() recurs = %v, complete = %v, want a partial listing", got.Recurs, got.Complete)
+		t.Fatalf("EventInstances(, nil) recurs = %v, complete = %v, want a partial listing", got.Recurs, got.Complete)
 	}
 	if len(got.Instances) != ical.MaxRecurrenceInstances {
-		t.Fatalf("EventInstances() lists %d instances, want %d", len(got.Instances), ical.MaxRecurrenceInstances)
+		t.Fatalf("EventInstances(, nil) lists %d instances, want %d", len(got.Instances), ical.MaxRecurrenceInstances)
 	}
 	if first := got.Instances[0].Start; !first.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("the first listed instance starts %s, want the series' start", first)
@@ -386,8 +386,87 @@ func TestEventInstancesOfWhatDoesNotRecur(t *testing.T) {
 		"single":     instancesObject("", "DTSTART:20261005T090000Z\r\nDTEND:20261005T100000Z\r\n"),
 		"unreadable": "not a calendar",
 	} {
-		if got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)); got.Recurs || len(got.Instances) != 0 {
-			t.Errorf("%s: EventInstances() = %+v, want nothing", name, got)
+		if got := EventInstances(raw, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), nil); got.Recurs || len(got.Instances) != 0 {
+			t.Errorf("%s: EventInstances(, nil) = %+v, want nothing", name, got)
 		}
+	}
+}
+
+// overriddenSeriesObject is a yearly series of two instances and n ordinary
+// overrides, one for each day from its first, each starting an hour after the
+// slot it names. PUT refuses more than
+// 10,000 override components, and objects a 1.1.x release stored may hold more
+// than an expansion lists.
+func overriddenSeriesObject(n int) string {
+	first := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:overridden\r\nDTSTAMP:20260101T000000Z\r\n" +
+		"DTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\nRRULE:FREQ=YEARLY;COUNT=2\r\nEND:VEVENT\r\n")
+	for i := range n {
+		slot := first.AddDate(0, 0, i)
+		b.WriteString("BEGIN:VEVENT\r\nUID:overridden\r\nDTSTAMP:20260101T000000Z\r\nRECURRENCE-ID:" + slot.Format("20060102T150405Z") +
+			"\r\nDTSTART:" + slot.Add(time.Hour).Format("20060102T150405Z") + "\r\nDTEND:" + slot.Add(2*time.Hour).Format("20060102T150405Z") + "\r\nEND:VEVENT\r\n")
+	}
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+// An expansion lists at most ical.MaxRecurrenceInstances of the instances and
+// the overrides placed beside them together, as CALDAV:expand writes at most
+// that many components, and is incomplete when it left any out.
+func TestEventInstancesCountsOverridesAgainstTheInstanceBudget(t *testing.T) {
+	from, to := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	t.Run("within the budget", func(t *testing.T) {
+		got := EventInstances(overriddenSeriesObject(20), from, to, nil)
+		if !got.Recurs || len(got.Overrides) != 20 || !got.Complete {
+			t.Errorf("recurs %v, %d overrides placed, complete %v; want all 20 of them, complete", got.Recurs, len(got.Overrides), got.Complete)
+		}
+	})
+	t.Run("past the budget", func(t *testing.T) {
+		got := EventInstances(overriddenSeriesObject(ical.MaxRecurrenceInstances+500), from, to, nil)
+		if !got.Recurs {
+			t.Fatal("the series is not expanded")
+		}
+		if listed := len(got.Instances) + len(got.Overrides); listed != ical.MaxRecurrenceInstances {
+			t.Errorf("%d instances and %d overrides listed, want %d together", len(got.Instances), len(got.Overrides), ical.MaxRecurrenceInstances)
+		}
+		if got.Complete {
+			t.Error("an expansion that left overrides out is complete")
+		}
+		for i := 1; i < len(got.Overrides); i++ {
+			if got.Overrides[i].Start.Before(got.Overrides[i-1].Start) {
+				t.Fatal("the overrides kept are not the earliest by start")
+			}
+		}
+	})
+}
+
+// Past the budget an expansion keeps the earliest of the instances and the
+// overrides together, in time order, not every instance first: an override
+// early in the range is listed beside the instances around it, and the later
+// instances are what is left out.
+func TestEventInstancesKeepsTheEarliestOfInstancesAndOverridesTogether(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:long\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T090000Z\r\nDTEND:20260101T100000Z\r\nRRULE:FREQ=DAILY;COUNT=1500\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:long\r\nDTSTAMP:20260101T000000Z\r\nRECURRENCE-ID:20260103T090000Z\r\nDTSTART:20260103T110000Z\r\nDTEND:20260103T120000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:long\r\nDTSTAMP:20260101T000000Z\r\nRECURRENCE-ID:20260105T090000Z\r\nDTSTART:20260105T110000Z\r\nDTEND:20260105T120000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	got := EventInstances(raw, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+	if !got.Recurs || got.Complete {
+		t.Fatalf("recurs %v, complete %v; want a series cut at the budget", got.Recurs, got.Complete)
+	}
+	if len(got.Overrides) != 2 || len(got.Instances) != ical.MaxRecurrenceInstances-2 {
+		t.Fatalf("%d instances and %d overrides listed, want 998 and the 2 overrides, 1000 together", len(got.Instances), len(got.Overrides))
+	}
+	last := got.Instances[len(got.Instances)-1].Start
+	for _, override := range got.Overrides {
+		if override.Start.After(last) {
+			t.Errorf("override at %v is listed past the last instance kept, %v", override.Start, last)
+		}
+	}
+	// 1,000 entries in time order: the instances of the first 1,000 days less
+	// the two an override replaces, and the two overrides.
+	if want := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC).AddDate(0, 0, 1000-1); !last.Equal(want) {
+		t.Errorf("the last instance kept is %v, want %v", last, want)
 	}
 }

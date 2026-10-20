@@ -55,7 +55,6 @@ func (h *DavServer) acl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify user has write-acl privilege
 	allowed, err := h.checkACLPrivilege(r.Context(), user, requestPathForCanonical(canonicalPath), "write-acl")
 	if err != nil {
 		http.Error(w, "failed to evaluate ACL", http.StatusInternalServerError)
@@ -478,7 +477,9 @@ func extractACEPrivilegeNames(priv acePrivilege) []string {
 	return names
 }
 
-// checkACLPrivilege verifies a user has a specific privilege on a resource.
+// checkACLPrivilege reports whether user holds privilege on resourcePath. The
+// owner holds every privilege; otherwise the resource's own ACL decides, and
+// its collection's ACL decides when none of the resource's entries applies.
 func (h *DavServer) checkACLPrivilege(ctx context.Context, user *store.User, resourcePath, privilege string) (bool, error) {
 	if h == nil || h.store == nil || h.store.ACLEntries == nil {
 		return true, nil
@@ -497,7 +498,7 @@ func (h *DavServer) checkACLPrivilege(ctx context.Context, user *store.User, res
 		return slices.Contains(birthdayCalendarPrivilegeNames, privilege), nil
 	}
 
-	// Check if user is the resource owner — owners always have all privileges
+	// Owners hold every privilege whatever the ACL says.
 	if h.isResourceOwner(ctx, user, resourcePath) {
 		return true, nil
 	}

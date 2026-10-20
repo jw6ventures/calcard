@@ -73,6 +73,9 @@ func ParseDateTime(s string) (time.Time, error) {
 	}
 	s = normalizeLeapSecond(s)
 
+	if t, ok := parseBasicDateTime(s); ok {
+		return t, nil
+	}
 	for _, format := range icalDateTimeFormats {
 		if t, err := time.Parse(format, s); err == nil {
 			return t.UTC(), nil
@@ -80,6 +83,62 @@ func ParseDateTime(s string) (time.Time, error) {
 	}
 
 	return time.Time{}, fmt.Errorf("invalid datetime format: %s", s)
+}
+
+// parseBasicDateTime reads the three forms RFC 5545 writes a date or a
+// date-time in -- 20060102, 20060102T150405 and 20060102T150405Z -- as the first
+// three of icalDateTimeFormats read them, without the cost of time.Parse, which
+// is most of what a report spends on a calendar of recurring events. ok is
+// false for anything else, which the caller reads in full, and for a value
+// those layouts refuse: a month or day the calendar does not have, a time of
+// day past 23:59:59. The value is read in UTC, and the form ending in Z is the
+// same instant.
+func parseBasicDateTime(s string) (time.Time, bool) {
+	switch len(s) {
+	case 8, 15, 16:
+	default:
+		return time.Time{}, false
+	}
+	digits := func(from, to int) (n int, ok bool) {
+		for i := from; i < to; i++ {
+			c := s[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n, true
+	}
+	year, ok1 := digits(0, 4)
+	month, ok2 := digits(4, 6)
+	day, ok3 := digits(6, 8)
+	if !ok1 || !ok2 || !ok3 {
+		return time.Time{}, false
+	}
+	var hour, minute, second int
+	if len(s) > 8 {
+		if s[8] != 'T' {
+			return time.Time{}, false
+		}
+		var okH, okM, okS bool
+		hour, okH = digits(9, 11)
+		minute, okM = digits(11, 13)
+		second, okS = digits(13, 15)
+		if !okH || !okM || !okS || hour > 23 || minute > 59 || second > 59 {
+			return time.Time{}, false
+		}
+		if len(s) == 16 && s[15] != 'Z' {
+			return time.Time{}, false
+		}
+	}
+	if month < 1 || month > 12 || day < 1 {
+		return time.Time{}, false
+	}
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC)
+	if t.Day() != day || int(t.Month()) != month {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // ParseDateTimeInLocation parses a floating DATE or DATE-TIME value in loc,
@@ -91,6 +150,12 @@ func ParseDateTimeInLocation(s string, loc *time.Location) (time.Time, error) {
 	}
 	s = normalizeLeapSecond(s)
 
+	if wall, ok := parseBasicDateTime(s); ok {
+		if loc == time.UTC {
+			return wall, nil
+		}
+		return WallClockIn(loc, wall).UTC(), nil
+	}
 	for _, format := range icalLocalFormats {
 		if wall, err := time.Parse(format, s); err == nil {
 			if loc == time.UTC {

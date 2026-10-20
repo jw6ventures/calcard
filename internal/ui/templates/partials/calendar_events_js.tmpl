@@ -445,6 +445,14 @@
         return summary;
     }
 
+    // A notice for event when the server could not read its time zone before the
+    // request's work ran out, which it read as UTC: the times shown for the event
+    // may be wrong, and the page says so rather than showing them as right.
+    function zoneNotice(event) {
+        if (event.zoneComplete !== false) return '';
+        return 'Its time zone could not be read in time, so the times shown may be wrong.';
+    }
+
     // An all-day value names a date, not an instant: the server parses the DATE
     // as UTC midnight and sends it as RFC3339, while every reader here takes
     // local calendar parts off the result. West of UTC that instant lands on the

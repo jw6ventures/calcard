@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/ical"
@@ -20,11 +21,22 @@ type icalNode struct {
 	name       string
 	properties []icalProperty
 	children   []*icalNode
-	// zones holds, on the root of a parsed object, the zones its VTIMEZONEs
-	// define, read once on first use by submittedZones. Nothing else in a tree
-	// changes once it is parsed, so a tree may be read concurrently.
+	// root is set on the root of a parsed object only, and holds what is read
+	// from the object as a whole.
+	root *icalRoot
+}
+
+// icalRoot is what the root of a parsed object holds beside its components.
+// Nothing else in a tree changes once it is parsed, so a tree may be read
+// concurrently.
+type icalRoot struct {
+	// zones are the zones the object's VTIMEZONEs define, read once on first
+	// use by submittedZones.
 	zonesOnce sync.Once
 	zones     *submittedZones
+	// requestWork is the request-wide budget the reading of the zones draws
+	// on, if any. It is set before the tree is first read.
+	requestWork *ical.RequestWork
 }
 
 func (n *icalNode) count(name string) int {
@@ -104,7 +116,9 @@ func parseICalendarTree(lines []string, reading icalReading) (*icalNode, error) 
 				return nil, fmt.Errorf("invalid component name %q", name)
 			}
 			node := &icalNode{name: name}
-			if parent != nil {
+			if parent == nil {
+				node.root = &icalRoot{}
+			} else {
 				parent.children = append(parent.children, node)
 			}
 			return node, nil
@@ -157,7 +171,7 @@ var scheduledComponentTypes = map[string]struct{}{
 //
 // The model is RFC 5545's where departing from it would change an answer, and
 // what calendar applications write where it would not. DTSTAMP is not required,
-// since nothing the server answers reads it; withRequiredCalendarProperties
+// since nothing the server answers reads it; requiredPropertyEdits
 // adds it to an accepted object that lacks it. A scheduling component holds a
 // property to one exactly when the server reads that property to answer: to
 // identify the component (UID, RECURRENCE-ID), to place it in time (DTSTART,
@@ -194,7 +208,7 @@ func nameSet(names ...string) icalNameSet {
 var icalObjectComponentRules = map[string]icalComponentRules{
 	// Nothing the server answers reads PRODID, so like DTSTAMP it is not
 	// required, and validateCalendarObject decides VERSION itself;
-	// withRequiredCalendarProperties adds either to an accepted object that
+	// requiredPropertyEdits adds either to an accepted object that
 	// lacks it. RFC 7986 §4 adds the properties of the calendar as a whole.
 	// Those RFC 5545 defines are admitted here: UID, which names the calendar
 	// an object came from rather than the resource -- the RFC 4791 §4.1 UID of
@@ -480,7 +494,7 @@ func recurrenceSignature(property icalProperty) (recurrenceIdentitySignature, bo
 // the library of definitions a client chooses to ship with them.
 //
 // A TZID the host's time zone database defines is admitted without one, and
-// withHostTimezones stores the host's definition with the object unless the
+// hostTimezoneEdits stores the host's definition with the object unless the
 // name is one of UTC itself (utcTZID). Plenty of clients and scripts name an
 // IANA zone and ship no definition, so refusing it would lose the event without
 // making any answer more exact. A name neither the object nor the host defines
@@ -514,6 +528,15 @@ func validateTimezoneReferences(root *icalNode) *calendarObjectFault {
 			}
 			tzid = strings.TrimSpace(tzid)
 			if _, checked := defined[tzid]; checked {
+				continue
+			}
+			// UTC in any case resolves without a definition of its own
+			// (zonedWallInstant): the write path rewrites such a value to
+			// its "...Z" form, unless heldUTCTZIDs holds that very name back
+			// for an object defining a zone of it away from zero, which is
+			// already in defined through the loop above.
+			if ical.UTCName(tzid) {
+				defined[tzid] = struct{}{}
 				continue
 			}
 			if _, known := ical.HostLocation(tzid); !known {
@@ -569,10 +592,15 @@ func applyBodyEdits(raw string, edits []bodyEdit) string {
 
 // completeCalendarObject is the body a submitted object that the validator
 // accepted is stored as: raw, whose unfolded content lines are lines and whose
-// components are root, with the edits oneDayDateEndEdits,
-// requiredPropertyEdits and hostTimezoneEdits describe, the latter two each
-// made only while the object stays within limit octets, so a client can always
-// write back what it read. Everything else in raw is kept octet for octet.
+// components are root, with the edits oneDayDateEndEdits, tzidRewriteEdits,
+// requiredPropertyEdits and hostTimezoneEdits describe. tzidRewriteEdits'
+// trims are made unconditionally, like oneDayDateEndEdits: trimming a TZID
+// only shrinks a line. Its UTC rewrites, like requiredPropertyEdits' and
+// hostTimezoneEdits', are made only while the object stays within limit
+// octets, so a client can always write back what it read: rewriting a value
+// naming UTC removes a whole ";TZID=..." parameter while adding one "Z" per
+// value it qualifies, which grows a line with more values in its list than
+// the parameter held letters. Everything else in raw is kept octet for octet.
 // generate has ical.VTimezone's contract, and countedEnd is as
 // hostTimezoneSpans reads it.
 func completeCalendarObject(raw string, lines []string, root *icalNode, countedEnd, now time.Time, generate func(tzid string, first, last time.Time) (string, bool), limit int64) string {
@@ -581,7 +609,13 @@ func completeCalendarObject(raw string, lines []string, root *icalNode, countedE
 		return raw
 	}
 	edits := oneDayDateEndEdits(raw, lines, offsets)
+	trims, utcRewrites := tzidRewriteEdits(raw, lines, offsets, root)
+	edits = append(edits, trims...)
 	size := int64(len(raw)) + editsDelta(edits)
+	if size+editsDelta(utcRewrites) <= limit {
+		edits = append(edits, utcRewrites...)
+		size += editsDelta(utcRewrites)
+	}
 	if required := requiredPropertyEdits(raw, lines, offsets, now); size+editsDelta(required) <= limit {
 		edits = append(edits, required...)
 		size += editsDelta(required)
@@ -753,6 +787,232 @@ func oneDayDateEndEdits(raw string, lines []string, offsets []int) []bodyEdit {
 		}
 	}
 	return edits
+}
+
+// tzidRewrittenProperties are the properties RFC 5545 §3.2.19 lets a TZID
+// qualify that the write path rewrites outside every VTIMEZONE, matching the
+// v1.2.0 repair's own scope.
+var tzidRewrittenProperties = nameSet("DTSTART", "DTEND", "DUE", "RECURRENCE-ID", "EXDATE", "RDATE")
+
+// tzidRewriteEdits rewrites, on every DTSTART, DTEND, DUE, RECURRENCE-ID,
+// EXDATE and RDATE outside every VTIMEZONE, the TZID parameter DAVx5's
+// relaxed ical4j parsing misreads:
+//   - a value equal to UTC, compared without regard to case after trimming
+//     and unquoting (ical.UTCName), is written in its UTC form, a "Z"
+//     appended to each date-time it qualifies -- every value of a list, and
+//     both parts of a period whose own part is a date-time rather than a
+//     duration -- with the TZID parameter removed, unless root defines a
+//     zone of that very name, as the readers look a TZID up, away from zero
+//     (heldUTCTZIDs);
+//   - every other value, including one naming UTC that a hold keeps, is
+//     trimmed of surrounding white space, its quoting kept.
+//
+// It is one linear pass over lines, the logical lines logicalLineOffsets
+// already split raw into, reading only the property lines named above and
+// rewriting a whole logical line at once so a fold never has to be
+// re-written in place.
+func tzidRewriteEdits(raw string, lines []string, offsets []int, root *icalNode) (trims, utcRewrites []bodyEdit) {
+	held := heldUTCTZIDs(root)
+	depth := 0
+	timezoneDepth := 0 // 0 outside every VTIMEZONE, else the depth it was opened at.
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		switch {
+		case ical.HasPrefixFold(line, "BEGIN:"):
+			depth++
+			if timezoneDepth == 0 && strings.EqualFold(strings.TrimSpace(line[len("BEGIN:"):]), "VTIMEZONE") {
+				timezoneDepth = depth
+			}
+		case ical.HasPrefixFold(line, "END:"):
+			if timezoneDepth != 0 && depth == timezoneDepth {
+				timezoneDepth = 0
+			}
+			depth--
+		case timezoneDepth != 0:
+			// Inside a VTIMEZONE: an observance's DTSTART is a local time by
+			// definition, and ical4j ignores a TZID there, so nothing is
+			// rewritten.
+		default:
+			if edit, isUTCRewrite, ok := tzidRewriteLineEdit(raw, line, offsets[i], offsets[i+1], held); ok {
+				if isUTCRewrite {
+					utcRewrites = append(utcRewrites, edit)
+				} else {
+					trims = append(trims, edit)
+				}
+			}
+		}
+	}
+	return trims, utcRewrites
+}
+
+// tzidRewriteLineEdit is the edit tzidRewriteEdits makes to one property line,
+// spanning [lineStart, lineEnd) in raw, or ok false when the line needs none:
+// it does not name one of tzidRewrittenProperties, carries no TZID
+// parameter, or every TZID parameter it carries already has nothing to trim
+// and, unless it is one of the names held holds, does not name UTC.
+// It returns isUTCRewrite true for an edit that removes a
+// TZID parameter and appends "Z" to the values it qualified -- the one shape
+// that can grow a line, on an EXDATE or RDATE list with more values than the
+// removed parameter held letters -- and false for one that only trims a
+// TZID's value, which never does.
+func tzidRewriteLineEdit(raw, line string, lineStart, lineEnd int, held map[string]struct{}) (edit bodyEdit, isUTCRewrite, ok bool) {
+	property, ok := readICalProperty(line, readSubmitted)
+	if !ok || !tzidRewrittenProperties.contains(property.name) {
+		return bodyEdit{}, false, false
+	}
+	tzid, hasTZID := property.parameters["TZID"]
+	if !hasTZID {
+		return bodyEdit{}, false, false
+	}
+	// readICalProperty admits TZID repeated with the same value
+	// (conflictingICalendarParameter refuses only a differing repeat), so
+	// every occurrence on the line is rewritten the same way, not only the
+	// first: leaving a later repeat as submitted would store a line PUT's own
+	// revalidation then refuses -- a conflicting repeat, for a trim, or a
+	// value validICalDateValue no longer admits once the first is in UTC
+	// form and the rest still names it.
+	parameters := tzidParameters(property.keyPart)
+	if len(parameters) == 0 {
+		return bodyEdit{}, false, false
+	}
+	newline := lineEndingBefore(raw, lineEnd)
+	// property.parameters["TZID"] is trimmed of white space outside its
+	// quotes, as readICalProperty reads a parameter, but not, for a quoted
+	// value, of white space just inside them, which every reader that places
+	// a value by this TZID trims again on its own (icalInstants among them).
+	// This rewrite does too, trimming to what those readers already use.
+	trimmed := strings.TrimSpace(tzid)
+	_, isHeld := held[trimmed]
+	if ical.UTCName(trimmed) && !isHeld {
+		isPeriods := property.name == "RDATE" && strings.EqualFold(property.parameters["VALUE"], "PERIOD")
+		newKeyPart := withoutTZIDParameters(property.keyPart, parameters)
+		newValue := utcRewrittenValue(property.value, isPeriods)
+		return bodyEdit{start: lineStart, end: lineEnd, text: newKeyPart + ":" + newValue + newline}, true, true
+	}
+	// Every other value is trimmed, its quoting kept -- a name other than
+	// UTC, and one naming UTC that a private definition of that very name holds back:
+	// the value stays what it was, but DAVx5 still keeps its white space, so
+	// an untrimmed one still names no zone it has.
+	if newKeyPart := withTZIDValuesReplaced(property.keyPart, parameters, trimmed); newKeyPart != property.keyPart {
+		return bodyEdit{start: lineStart, end: lineEnd, text: newKeyPart + ":" + property.value + newline}, false, true
+	}
+	return bodyEdit{}, false, false
+}
+
+// tzidParameter is one TZID parameter found on a date-valued property's key
+// part, as tzidParameters finds it.
+type tzidParameter struct {
+	// paramStart and paramEnd delimit the whole parameter, its leading ";"
+	// included, so removing keyPart[paramStart:paramEnd] drops it entirely.
+	paramStart, paramEnd int
+	// valueStart and valueEnd delimit what replacing
+	// keyPart[valueStart:valueEnd] with a value rewrites in place: the whole
+	// text after "=" up to the parameter's end, white space included, since
+	// nothing else marks where the value ends and none of the white space
+	// around it, quoted or not, belongs once the value is trimmed.
+	valueStart, valueEnd int
+	// quoted is whether the value is in double quotes, which a replacement
+	// writes again around the new value.
+	quoted bool
+}
+
+// tzidParameters finds every TZID parameter on a date-valued property's key
+// part, matched the way readICalProperty matches a parameter name: split on
+// ";" outside quotes, without regard to case or surrounding white space.
+// RFC 5545 §3.2.19 admits at most one, but readICalProperty accepts it
+// repeated with the same value, so every occurrence is returned, in order,
+// for the caller to rewrite alike.
+func tzidParameters(keyPart string) []tzidParameter {
+	var parameters []tzidParameter
+	segmentStart := 0
+	inQuotes := false
+	for i := 0; i <= len(keyPart); i++ {
+		switch {
+		case i < len(keyPart) && keyPart[i] == '"':
+			inQuotes = !inQuotes
+		case i == len(keyPart) || (!inQuotes && keyPart[i] == ';'):
+			name, value, found := strings.Cut(keyPart[segmentStart:i], "=")
+			if found && strings.EqualFold(strings.TrimSpace(name), "TZID") {
+				trimmed := strings.TrimFunc(value, unicode.IsSpace)
+				parameters = append(parameters, tzidParameter{
+					paramStart: segmentStart - 1, paramEnd: i,
+					valueStart: segmentStart + len(name) + 1, valueEnd: i,
+					quoted: len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"',
+				})
+			}
+			segmentStart = i + 1
+		}
+	}
+	return parameters
+}
+
+// withoutTZIDParameters returns keyPart with every one of parameters removed
+// entirely.
+func withoutTZIDParameters(keyPart string, parameters []tzidParameter) string {
+	var b strings.Builder
+	cursor := 0
+	for _, parameter := range parameters {
+		b.WriteString(keyPart[cursor:parameter.paramStart])
+		cursor = parameter.paramEnd
+	}
+	b.WriteString(keyPart[cursor:])
+	return b.String()
+}
+
+// withTZIDValuesReplaced returns keyPart with every one of parameters' value
+// replaced by value, each parameter's own quoting, if any, kept and the white
+// space around it dropped.
+func withTZIDValuesReplaced(keyPart string, parameters []tzidParameter, value string) string {
+	var b strings.Builder
+	cursor := 0
+	for _, parameter := range parameters {
+		b.WriteString(keyPart[cursor:parameter.valueStart])
+		if parameter.quoted {
+			b.WriteString(`"` + value + `"`)
+		} else {
+			b.WriteString(value)
+		}
+		cursor = parameter.valueEnd
+	}
+	b.WriteString(keyPart[cursor:])
+	return b.String()
+}
+
+// utcRewrittenValue rewrites value, a property value whose TZID naming UTC is
+// being removed, to its UTC form: a "Z" appended to each date-time it holds,
+// across a comma-separated list and, within a period's two parts when
+// isPeriods, both -- a period's duration part is left as it is, since RFC
+// 5545 §3.3.9 reads neither a Z nor a TZID into it.
+func utcRewrittenValue(value string, isPeriods bool) string {
+	items := strings.Split(value, ",")
+	for i, item := range items {
+		if !isPeriods {
+			items[i] = utcRewrittenDateTime(item)
+			continue
+		}
+		start, end, hasSlash := strings.Cut(item, "/")
+		rewritten := utcRewrittenDateTime(start)
+		if hasSlash {
+			if _, isDateTime := parseICalDateForm(strings.TrimSpace(end)); isDateTime {
+				end = utcRewrittenDateTime(end)
+			}
+			rewritten += "/" + end
+		}
+		items[i] = rewritten
+	}
+	return strings.Join(items, ",")
+}
+
+// utcRewrittenDateTime appends "Z" to value's date-time, keeping any white
+// space around it exactly as written.
+func utcRewrittenDateTime(value string) string {
+	trimmedLeft := strings.TrimLeftFunc(value, unicode.IsSpace)
+	leading := value[:len(value)-len(trimmedLeft)]
+	trimmed := strings.TrimRightFunc(trimmedLeft, unicode.IsSpace)
+	trailing := trimmedLeft[len(trimmed):]
+	return leading + trimmed + "Z" + trailing
 }
 
 // lineEndingBefore is the line ending raw holds just before offset, or "" when
@@ -966,12 +1226,67 @@ func hostTimezoneSpans(root *icalNode, countedEnd time.Time) map[string]*wallClo
 	return spans
 }
 
-// utcTZID reports whether tzid is a name of UTC itself, which Exchange and
-// scripts write as a TZID. Calendar clients read those names as UTC without a
-// definition, as the server does, so one generated for them would only make the
-// stored object differ from the submitted one, and cost the client its ETag.
+// utcTZID reports whether tzid is a name of UTC itself, in any case
+// (ical.UTCName), or of Etc/UTC, which Exchange and scripts write as a TZID.
+// Neither needs a generated VTIMEZONE: a value naming plain UTC is rewritten
+// to carry no TZID at all wherever heldUTCTZIDs does not hold its name back, and
+// Etc/UTC resolves through Java's own zone database, which DAVx5 reads
+// correctly as it is. Etc/UTC is matched exactly, since no other spelling of
+// it resolves on the host either. Generating either would only make the
+// stored object differ from the submitted one where the write path leaves it
+// as sent, costing the client its ETag for nothing read any differently.
 func utcTZID(tzid string) bool {
-	return tzid == "UTC" || tzid == "Etc/UTC"
+	return ical.UTCName(tzid) || strings.TrimSpace(tzid) == "Etc/UTC"
+}
+
+// heldUTCTZIDs returns the trimmed TZIDs, spelled exactly, of the UTC-named
+// zones (ical.UTCName) root defines away from zero: a VTIMEZONE whose trimmed
+// TZID is UTC in any case and which states a TZOFFSETFROM or TZOFFSETTO other
+// than ±0000 or ±000000 on any of its observances. Readers look a value's
+// TZID up among the object's definitions by its trimmed spelling, the first
+// VTIMEZONE of that spelling answering, and only then take a UTC name for UTC
+// itself, so a value is that private zone's own time, not UTC, exactly when
+// its trimmed TZID is in this set; the write path leaves such a value as the
+// object wrote it, its TZID trimmed. Any other UTC-named value, whatever
+// zone of another spelling the object defines, is UTC. This is the hold the
+// v1.2.0 repair applies (migrations/v1.2.0.sql).
+func heldUTCTZIDs(root *icalNode) map[string]struct{} {
+	var held map[string]struct{}
+	seen := make(map[string]struct{})
+	for _, child := range root.children {
+		if child.name != "VTIMEZONE" {
+			continue
+		}
+		name := strings.TrimSpace(child.value("TZID"))
+		if _, earlier := seen[name]; earlier || !ical.UTCName(name) {
+			continue
+		}
+		seen[name] = struct{}{}
+		for _, observance := range child.children {
+			if observance.name != "STANDARD" && observance.name != "DAYLIGHT" {
+				continue
+			}
+			if !zeroUTCOffset(observance.value("TZOFFSETFROM")) || !zeroUTCOffset(observance.value("TZOFFSETTO")) {
+				if held == nil {
+					held = make(map[string]struct{})
+				}
+				held[name] = struct{}{}
+				break
+			}
+		}
+	}
+	return held
+}
+
+// zeroUTCOffset reports whether offset, a TZOFFSETFROM or TZOFFSETTO value,
+// is zero: a sign followed by 0000 or 000000, with surrounding white space
+// trimmed.
+func zeroUTCOffset(offset string) bool {
+	switch strings.TrimSpace(offset) {
+	case "+0000", "-0000", "+000000", "-000000":
+		return true
+	}
+	return false
 }
 
 // includeWallClocks adds the date-times of a property value to span: a single
@@ -1429,7 +1744,7 @@ func icalRecurrenceUntil(root, node *icalNode, property icalProperty) ([]time.Ti
 	// RFC 5545 §3.3.10 ties UNTIL's representation to DTSTART: DATE uses
 	// DATE, floating time uses floating time, and UTC or TZID-qualified time
 	// uses UTC. A timed series ending on a DATE is admitted too: RFC 2445
-	// allowed it, and clients write it, CalCard's own UI among them. UNTIL is
+	// allowed it, and clients write it. UNTIL is
 	// inclusive, so the series runs through that whole day in DTSTART's zone,
 	// as the expansion reads it. The limits admit the day when any instant of
 	// it lies within them, as they admit a DATE value on its date: its last
@@ -1539,12 +1854,20 @@ func icalInstants(root *icalNode, property icalProperty, value string) ([]time.T
 // zonedWallInstant resolves a wall clock in the zone tzid names, whose
 // definition in the object is observances, or nil when it ships none that can
 // be read: through that definition, which RFC 4791 §4.1 makes authoritative,
-// where it can place the wall clock, else through the host's zone of that
-// name, as ical.ObjectTimes resolves it for the stored columns. ok is false
-// when neither can.
+// where it can place the wall clock; else, when tzid names UTC itself in any
+// case (ical.UTCName), as that wall clock already in UTC, which is what the
+// write path rewrites such a value to and what a row the rewrite left as
+// stored, or one a 1.1.x release stored, still names; else through the host's
+// zone of that name, as ical.ObjectTimes resolves it for the stored columns.
+// ok is false when none of those can. This is the one reader every caller in
+// this package and time_range.go's report matcher shares, so a submitted
+// object and a stored row agree on what such a name places.
 func zonedWallInstant(observances *ical.IndexedTimezoneObservances, tzid string, wall time.Time) (time.Time, bool) {
 	if offset, ok := observanceOffsetAtWall(observances, wall); ok {
 		return wall.Add(-offset).UTC(), true
+	}
+	if ical.UTCName(tzid) {
+		return wall.UTC(), true
 	}
 	if loc, ok := ical.HostLocation(tzid); ok {
 		return ical.WallClockIn(loc, wall).UTC(), true
@@ -1585,14 +1908,26 @@ type submittedZones struct {
 
 // submittedZones returns root's zones, reading its VTIMEZONEs the first time.
 func (root *icalNode) submittedZones() *submittedZones {
-	root.zonesOnce.Do(func() { root.zones = readSubmittedZones(root) })
-	return root.zones
+	if root.root == nil {
+		// A tree that was not parsed has nowhere to keep them.
+		return readSubmittedZones(root, nil)
+	}
+	root.root.zonesOnce.Do(func() { root.root.zones = readSubmittedZones(root, root.root.requestWork) })
+	return root.root.zones
 }
 
-func readSubmittedZones(root *icalNode) *submittedZones {
+// drawOn has the reading of root's zones, a parsed object's, draw on pool, the
+// budget of the request it answers. It is called before the tree is first read.
+func (root *icalNode) drawOn(pool *ical.RequestWork) {
+	if root.root != nil {
+		root.root.requestWork = pool
+	}
+}
+
+func readSubmittedZones(root *icalNode, pool *ical.RequestWork) *submittedZones {
 	zones := &submittedZones{
 		timezones:   make(map[string]*icalNode),
-		work:        ical.NewObservanceWork(),
+		work:        ical.NewObservanceWork(pool),
 		observances: make(map[string]*ical.IndexedTimezoneObservances),
 	}
 	for _, child := range root.children {
@@ -1665,13 +2000,19 @@ func readSubmittedTimezone(timezone *icalNode) (ical.TimezoneObservances, bool) 
 
 // hostGeneratedTimezone reports whether the server wrote a VTIMEZONE from the
 // host's database for a zone the host defines: whether it carries
-// ical.HostDefinitionProperty or has the shape ical.V11GeneratedDefinition
-// recognises, as ical.TimezoneComponents decides for the same component.
+// ical.HostDefinitionProperty marked TRUE (ical.HostDefinitionMarked) or has
+// the shape ical.V11GeneratedDefinition recognises, as ical.TimezoneComponents
+// decides for the same component.
 func hostGeneratedTimezone(timezone *icalNode) bool {
 	if _, known := ical.HostLocation(strings.TrimSpace(timezone.value("TZID"))); !known {
 		return false
 	}
-	return timezone.count(ical.HostDefinitionProperty) > 0 || v11GeneratedTimezone(timezone)
+	for _, property := range timezone.properties {
+		if property.name == ical.HostDefinitionProperty && ical.HostDefinitionMarked(property.value) {
+			return true
+		}
+	}
+	return v11GeneratedTimezone(timezone)
 }
 
 // v11GeneratedTimezone writes a VTIMEZONE back as content lines, its
@@ -1698,12 +2039,7 @@ func v11GeneratedTimezone(timezone *icalNode) bool {
 }
 
 func firstICalProperty(node *icalNode, name string) (icalProperty, bool) {
-	for _, property := range node.properties {
-		if property.name == name {
-			return property, true
-		}
-	}
-	return icalProperty{}, false
+	return firstNamedProperty(node.properties, name)
 }
 
 func icalDateList(root *icalNode, property icalProperty) ([]time.Time, bool) {

@@ -468,7 +468,7 @@ func TestFreeBusyExpansionBudgetChargesUnpublishedPeriods(t *testing.T) {
 		"DTSTART:20240603T090000Z\r\nDTEND:20240603T100000Z\r\nTRANSP:OPAQUE\r\nEND:VEVENT\r\n" +
 		"END:VCALENDAR\r\n"
 	event := store.Event{CalendarID: 1, UID: "transparent", ResourceName: "transparent", RawICAL: raw}
-	matcher, parsed := newEventTimeRangeMatcher(event, floatingZone{})
+	matcher, parsed := newEventTimeRangeMatcher(event, floatingZone{}, nil)
 	if !parsed {
 		t.Fatal("fixture did not parse")
 	}
@@ -507,7 +507,7 @@ func TestFreeBusyDoesNotExpandASetPublishingNoBusyTime(t *testing.T) {
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
 			event := store.Event{CalendarID: 1, UID: "quiet", ResourceName: "quiet", RawICAL: raw}
-			matcher, parsed := newEventTimeRangeMatcher(event, floatingZone{})
+			matcher, parsed := newEventTimeRangeMatcher(event, floatingZone{}, nil)
 			if !parsed {
 				t.Fatal("fixture did not parse")
 			}
@@ -602,9 +602,9 @@ func TestFreeBusyRefusesARuleItCannotScan(t *testing.T) {
 }
 
 // Every generated birthday is TRANSP:TRANSPARENT, so the birthday collection
-// publishes no busy time over any range. Each one recurs yearly from this year
-// or next, so a range reaching CALDAV:max-date-time holds some seventy
-// occurrences per contact, and enough contacts put their sum past the report's
+// publishes no busy time over any range. Each one recurs yearly from its birth
+// year or a stand-in year, so a range reaching CALDAV:max-date-time holds at
+// least seventy occurrences per contact, and enough contacts put their sum past the report's
 // expansion budget. The answer is still the empty VFREEBUSY: occurrences that
 // can never publish busy time are not expanded into a budget at all.
 func TestBirthdayFreeBusyOverTheStorableSpanPublishesNothing(t *testing.T) {

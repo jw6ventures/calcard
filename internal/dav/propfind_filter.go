@@ -612,10 +612,9 @@ func filterPropfindResponseForKind(resp response, req *propfindRequest, kind pro
 	return resp
 }
 
-// filterNonPrincipalPropfindResponse routes a response to the property table
-// with the right resource kind. (The name predates principal support; it is
-// the filter for every response kind.)
-func filterNonPrincipalPropfindResponse(resp response, req *propfindRequest) response {
+// filterPropfindResponse routes a response to the property table with the
+// right resource kind.
+func filterPropfindResponse(resp response, req *propfindRequest) response {
 	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
 		return resp
 	}

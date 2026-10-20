@@ -875,15 +875,14 @@ func TestProppatchRejectsInvalidCalendarTimezoneAtomically(t *testing.T) {
 	}
 }
 
-// RFC 4791 §5.2.2 makes a CALDAV:calendar-timezone value an iCalendar object
-// containing exactly one VTIMEZONE, so the VCALENDAR envelope is required and a
-// bare component is not a valid value.
 // standardObservance is the minimal RFC 5545 §3.6.5 STANDARD sub-component: the
 // three properties an observance must declare and nothing else.
 const standardObservance = "BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\n"
 
 // wrapTimezoneValue builds a calendar-timezone value: a complete VCALENDAR
-// holding one VTIMEZONE whose sub-components are the given body.
+// holding one VTIMEZONE whose sub-components are the given body. RFC 4791
+// §5.2.2 makes the value an iCalendar object containing exactly one VTIMEZONE,
+// so the envelope is required and a bare component is not a valid value.
 func wrapTimezoneValue(observances string) string {
 	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalCard//EN\r\n" +
 		"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\n" + observances +

@@ -160,9 +160,11 @@ func TestFloatingUntilBesideAZonedDTStartIsReadInTheDTStartsZone(t *testing.T) {
 	newYork := requireHostZone(t, "America/New_York")
 	tokyo := requireHostZone(t, "Asia/Tokyo")
 	// 02:30 on 12 March is 06:30Z in New York; read as UTC, or in Tokyo, it is
-	// earlier and would end the series an instance sooner.
+	// earlier and would end the series an instance sooner. 10 March is the
+	// spring change, whose 02:30 is still an instance, read at the offset
+	// before the gap (RFC 5545 §3.3.5).
 	raw := untilEvent("DTSTART;TZID=America/New_York:20240308T023000", "FREQ=DAILY;UNTIL=20240312T023000")
-	want := []time.Time{utc(2024, 3, 8, 7, 30), utc(2024, 3, 9, 7, 30), utc(2024, 3, 11, 6, 30), utc(2024, 3, 12, 6, 30)}
+	want := []time.Time{utc(2024, 3, 8, 7, 30), utc(2024, 3, 9, 7, 30), utc(2024, 3, 10, 7, 30), utc(2024, 3, 11, 6, 30), utc(2024, 3, 12, 6, 30)}
 	dtstart := WallClockIn(newYork, utc(2024, 3, 8, 2, 30))
 	floatingInTokyo := PropertyTimeResolver(func(keyPart, value string) (time.Time, bool) {
 		if _, zoned := PropertyParam(keyPart, "TZID"); zoned || hasZoneSuffix(value) {

@@ -244,8 +244,8 @@ func TestSyncCollectionPagesRemovalsWithChanges(t *testing.T) {
 	}
 }
 
-// A collection whose changes fit one page is answered in full, as before, with
-// the collection's own token.
+// A collection whose changes fit one page is answered in full with the
+// collection's own token.
 func TestSyncCollectionAtThePageLimitIsAnsweredInFull(t *testing.T) {
 	for _, kind := range syncCollectionKinds {
 		t.Run(kind.name, func(t *testing.T) {

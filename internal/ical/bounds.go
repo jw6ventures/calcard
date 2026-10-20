@@ -35,7 +35,7 @@ func ConservativeRecurrenceBounds(raw string) RecurrenceBounds {
 // without unfolding the payload again when a caller already performed that
 // step as part of a broader calendar analysis.
 func ConservativeRecurrenceBoundsFromUnfoldedLines(lines []string) RecurrenceBounds {
-	return ConservativeRecurrenceBoundsOf(NewObjectTimes(lines))
+	return ConservativeRecurrenceBoundsOf(NewObjectTimes(lines, nil, nil))
 }
 
 // ConservativeRecurrenceBoundsOf computes the same safe bounds for the object
@@ -175,11 +175,35 @@ func (c recurringComponent) overrideUntil() *time.Time {
 	return &until
 }
 
+// mayRecur reports that component carries a property that can make it recur:
+// an RRULE, an RDATE, malformed or not, or a RECURRENCE-ID.
+func mayRecur(component Component) bool {
+	for _, line := range component.malformedProperties {
+		if strings.EqualFold(PropertyName(strings.TrimSpace(line)), "RDATE") {
+			return true
+		}
+	}
+	for _, property := range component.properties {
+		switch strings.ToUpper(PropertyName(strings.TrimSpace(property.KeyPart))) {
+		case "RRULE", "RDATE", "RECURRENCE-ID":
+			return true
+		}
+	}
+	return false
+}
+
 func recurringComponentsFromLines(times *ObjectTimes) []recurringComponent {
 	parsedComponents := times.recurringComponents()
 	components := make([]recurringComponent, 0, len(parsedComponents))
 	for _, parsed := range parsedComponents {
 		current := recurringComponent{}
+		if !mayRecur(parsed) {
+			// Nothing here reads a component that does not recur, so its
+			// dates are not resolved: through a zone of many observances each
+			// one is a walk of the zone's rules.
+			components = append(components, current)
+			continue
+		}
 		for _, line := range parsed.malformedProperties {
 			if strings.EqualFold(PropertyName(strings.TrimSpace(line)), "RDATE") {
 				current.hasRDate = true
@@ -297,9 +321,12 @@ const recurrenceBoundDefaultDuration = time.Hour
 
 // boundedRecurrenceUntil bounds the end of the last instance of the recurrence
 // set a DTSTART and rule describe.
-// skipped lists the local times the series' zone skips, which RFC 5545 §3.3.10
-// leaves out of a counted series without counting them; it reports false when
-// the zone's definition cannot say.
+// skipped lists the local times the series' zone skips. A candidate on one of
+// them is still counted, read at the offset before the gap (RFC 5545 §3.3.5),
+// but where its reading repeats the instant of the candidate that follows it,
+// the two collapse into one instance (§3.8.5.3): extendPastSkippedLocalTimes
+// bounds how much further that can carry the COUNT-th instance. skipped
+// reports false when the zone's definition cannot say.
 func boundedRecurrenceUntil(dtstart time.Time, dtend *time.Time, durationProperty *time.Duration, allDay bool, rrule string, dtstartWall wallClockResolver, skipped func() (localTimeGaps, bool)) (*time.Time, bool) {
 	duration := recurrenceBoundDefaultDuration
 	durationResolved := false
@@ -379,18 +406,22 @@ type LocalTimeGap struct {
 type localTimeGaps func(after, through time.Time) (gaps []LocalTimeGap, ok bool)
 
 // extendPastSkippedLocalTimes moves last, the COUNT-th start of a series
-// repeating every stepDays days at one time of day, past the instances the
-// zone's gaps take out of it, each of which carries the series a step further.
-// A gap is shorter than two days, so it takes out at most ceil(length/step) of
-// those instances; counting every gap as taking that many, whether or not the
-// series' time of day falls inside it, can only move the bound later. The gaps
-// the extension itself runs into are walked in turn, up to CALDAV:max-date-time,
-// past which no range reaches.
+// repeating every stepDays days at one time of day, past the point a gap can
+// carry it to: where the series' candidate inside a gap reads the same
+// instant (RFC 5545 §3.3.5) as the candidate stepDays later, the two collapse
+// into one (§3.8.5.3 "duplicate instances are ignored"), and the series needs
+// a further step to still reach COUNT. That can only happen where the gap's
+// length is a whole number of steps, so the candidate at the far side of it
+// falls on the series' own day-of-week grid too; a gap shorter than two days
+// can then carry the series at most ceil(length/step) steps further. The gaps
+// the extension itself runs into are walked in turn, up to
+// CALDAV:max-date-time, past which no range reaches.
 //
 // first and last are compared with the gaps' wall clocks with a margin of a day
 // either side, which covers the UTC offset either may have been read with.
 func extendPastSkippedLocalTimes(first, last time.Time, stepDays int, gaps localTimeGaps) (time.Time, bool) {
 	_, maxDate := DateLimits()
+	stepDuration := time.Duration(stepDays) * 24 * time.Hour
 	after := first.Add(-3 * 24 * time.Hour)
 	for !last.After(maxDate) {
 		through := last.Add(2 * 24 * time.Hour)
@@ -401,8 +432,16 @@ func extendPastSkippedLocalTimes(first, last time.Time, stepDays int, gaps local
 		if len(found) == 0 {
 			return last, true
 		}
+		extended := false
 		for _, gap := range found {
+			if gap.Length%stepDuration != 0 {
+				continue
+			}
 			last = last.AddDate(0, 0, stepDays*instancesInGap(gap.Length, stepDays))
+			extended = true
+		}
+		if !extended {
+			return last, true
 		}
 		after = through
 	}
@@ -478,7 +517,7 @@ type tzidDefinition struct {
 }
 
 func resolveTZID(lines []string, tzid string) tzidDefinition {
-	return resolveTZIDIn(objectTimezones(lines), tzid, nil, NewObservanceWork())
+	return resolveTZIDIn(objectTimezones(lines), tzid, nil, NewObservanceWork(nil))
 }
 
 // resolveTZIDIn is resolveTZID for an object whose VTIMEZONEs objectTimezones
@@ -569,9 +608,10 @@ type TimezoneComponent struct {
 	// space, or "" when it has none.
 	TZID string
 	// HostDefinition reports that the server wrote it from the host's time
-	// zone database: it carries HostDefinitionProperty, as VTimezone's
-	// definitions do, or it has the shape V11GeneratedDefinition recognises.
-	// It speaks for that database wherever the host defines TZID.
+	// zone database: it carries HostDefinitionProperty marked TRUE
+	// (HostDefinitionMarked), as VTimezone's definitions do, or it has the
+	// shape V11GeneratedDefinition recognises. It speaks for that database
+	// wherever the host defines TZID.
 	HostDefinition bool
 	// Start and End delimit it within the lines it was read from: lines[Start]
 	// is its BEGIN line, and lines[End-1] the line that closes it.
@@ -626,7 +666,7 @@ func TimezoneComponents(lines []string) []TimezoneComponent {
 			switch name := strings.TrimSpace(PropertyName(keyPart)); {
 			case strings.EqualFold(name, "TZID") && !timezone.named:
 				timezone.TZID, timezone.named = strings.TrimSpace(value), true
-			case strings.EqualFold(name, HostDefinitionProperty):
+			case strings.EqualFold(name, HostDefinitionProperty) && HostDefinitionMarked(value):
 				timezone.HostDefinition = true
 			}
 			return nil

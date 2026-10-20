@@ -10,7 +10,6 @@ import (
 // response embeds. Those octets reach here unchanged from a PUT, and what
 // RFC 5545 and RFC 6350 admit is wider than what XML does.
 
-// cdataString wraps string content in CDATA for raw XML output.
 type cdataString string
 
 // MarshalXML writes the value as a CDATA section. RFC 4791 §9.6 requires the
@@ -68,8 +67,8 @@ func wellFormedXMLCharData(value string) bool {
 }
 
 // validXMLChar reports whether r is admitted by the XML 1.0 §2.2 Char
-// production: tab, newline, carriage return, and the printable ranges above
-// them, minus the surrogate block.
+// production: tab, newline, carriage return, and every code point from U+0020
+// to U+10FFFF except the surrogates, U+FFFE and U+FFFF.
 func validXMLChar(r rune) bool {
 	switch {
 	case r == 0x09, r == 0x0A, r == 0x0D:

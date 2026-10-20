@@ -54,7 +54,6 @@ func etagListMatches(headerValue, etag string, allowWeak bool) bool {
 	return headerValue == "*" || slices.Contains(entityTags(headerValue, allowWeak), etag)
 }
 
-// checkConditionalHeaders validates If-Match and If-None-Match headers for events
 func (h *DavServer) checkConditionalHeaders(r *http.Request, existing *store.Event) bool {
 	etag := ""
 	if existing != nil {
@@ -63,7 +62,6 @@ func (h *DavServer) checkConditionalHeaders(r *http.Request, existing *store.Eve
 	return checkConditional(r, etag, existing != nil)
 }
 
-// checkConditionalHeadersContact validates If-Match and If-None-Match headers for contacts
 func (h *DavServer) checkConditionalHeadersContact(r *http.Request, existing *store.Contact) bool {
 	etag := ""
 	if existing != nil {
@@ -230,12 +228,13 @@ func (h *DavServer) putCalendarObject(w http.ResponseWriter, r *http.Request, us
 	// The store keeps the body the validator returns: the submitted octets
 	// less a leading byte order mark, completed as completeCalendarObject
 	// describes. A DATE DTEND on its DTSTART's date is written as the next
-	// day and, while the object stays within the resource size limit,
-	// VERSION, PRODID and DTSTAMP are added where missing and the host's
-	// definition of each zone the object names without defining is added,
-	// replacing any definition of that zone the server wrote before. The ETag
-	// names the stored octets, and the response withholds it when they differ
-	// from the submitted ones.
+	// day, and a TZID parameter on a date property is trimmed of white space.
+	// While the object stays within the resource size limit, a TZID naming
+	// UTC is rewritten as the UTC value, VERSION, PRODID and DTSTAMP are added
+	// where missing, and the host's definition of each zone the object names
+	// without defining is added, replacing any definition of that zone the
+	// server wrote before. The ETag names the stored octets, and the response
+	// withholds it when they differ from the submitted ones.
 	storedText := validated.Body
 	if storedText != bodyText {
 		body = []byte(storedText)
@@ -581,7 +580,6 @@ func (h *DavServer) putContactWithRetry(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Check if another resource already uses this UID
 	existingByUID, err := h.store.Contacts.GetByUID(r.Context(), req.addressBookID, req.uid)
 	if err != nil {
 		http.Error(w, "failed to load contact", http.StatusInternalServerError)

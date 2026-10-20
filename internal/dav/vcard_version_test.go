@@ -437,12 +437,11 @@ func TestConvertVCardVersionRoundTripPreservesContactData(t *testing.T) {
 	}
 }
 
-// Conversion rewrote content lines one at a time and never asked whether the
-// result was a valid card of the version it claimed. RFC 2426 Section 3.1.2
-// requires N, which RFC 6350 made optional, and Section 4 defaults PHOTO, LOGO,
-// SOUND and KEY to a binary value -- so a 4.0 card with no N and a remote URI
-// photo downgraded into a 3.0 card that clients reject or read as a corrupt
-// inline image.
+// A converted card has to be valid for the version it claims. RFC 2426 Section
+// 3.1.2 requires N, which RFC 6350 made optional, and Section 4 defaults PHOTO,
+// LOGO, SOUND and KEY to a binary value -- so a 4.0 card with no N and a remote
+// URI photo, downgraded line by line, is a 3.0 card that clients reject or read
+// as a corrupt inline image.
 func TestDowngradedVCardIsValidForItsVersion(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -667,7 +666,7 @@ func TestConvertVCardVersionPreservesVersionSpecificProperties(t *testing.T) {
 
 // BEGIN:VCARD and END:VCARD are content lines, not text. A display name or note
 // that merely spells one out is escaped into a value by every writer here, so
-// counting the octets rather than the lines refuses a perfectly ordinary card
+// matching the octets rather than whole lines refuses a perfectly ordinary card
 // -- and refuses it for good, since the client can never PUT an edit back.
 func TestVCardEnvelopeCountsContentLinesNotSubstrings(t *testing.T) {
 	tests := []struct {

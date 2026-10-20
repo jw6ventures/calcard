@@ -18,7 +18,7 @@ import (
 // can state the resource it is about rather than the parse the report path
 // carries between its passes.
 func resourceInTimeRange(event store.Event, tr *timeRange, zone floatingZone) bool {
-	matcher, _ := newEventTimeRangeMatcher(event, zone)
+	matcher, _ := newEventTimeRangeMatcher(event, zone, nil)
 	return matcherInTimeRange(matcher, tr)
 }
 
@@ -398,12 +398,12 @@ func TestFreeBusyOmitsZeroDurationEventAtRangeStart(t *testing.T) {
 	}
 
 	h := &DavServer{}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"}))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240601T100000Z", End: "20240601T110000Z"}))
 	if periods := parsedFreeBusyLines(t, body); len(periods) != 0 {
 		t.Fatalf("zero-duration event published periods %v", periods)
 	}
 
-	before := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240601T110000Z", End: "20240601T120000Z"}))
+	before := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240601T110000Z", End: "20240601T120000Z"}))
 	if periods := parsedFreeBusyLines(t, before); len(periods) != 0 {
 		t.Fatalf("zero-duration event before the range published periods %v", periods)
 	}
@@ -420,7 +420,7 @@ func TestGenerateFreeBusyExpandsRecurringEventsInRequestedRange(t *testing.T) {
 	}
 	tr := &timeRange{Start: "20240617T000000Z", End: "20240618T000000Z"}
 
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240617T100000Z/20240617T110000Z",
@@ -511,7 +511,7 @@ func TestGenerateFreeBusyExpandsRRuleByParts(t *testing.T) {
 			if !resourceInTimeRange(event, tt.rangeTR, floatingZone{}) {
 				t.Fatalf("expected event to match range %+v", tt.rangeTR)
 			}
-			body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tt.rangeTR))
+			body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tt.rangeTR))
 			assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{tt.wantBusy})
 		})
 	}
@@ -564,7 +564,7 @@ func TestGenerateFreeBusyExpandsSubDailyRecurringEvents(t *testing.T) {
 				DTEnd:   &tt.end,
 			}
 
-			body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tt.rangeTR))
+			body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tt.rangeTR))
 			assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{tt.wantBusy})
 		})
 	}
@@ -589,7 +589,7 @@ func TestGenerateFreeBusyExpandsCountedSubDailyBeyondScanLimit(t *testing.T) {
 	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected counted secondly recurrence beyond scan limit to match requested range")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	// A secondly recurrence of ten-second occurrences overlaps itself, and
 	// RFC 4791 §7.10 has the server coalesce consecutive or overlapping busy
 	// periods of the same type. The instance is therefore published inside one
@@ -652,7 +652,7 @@ func TestGenerateFreeBusyExpandsSubDailyByParts(t *testing.T) {
 			if !resourceInTimeRange(event, tt.rangeTR, floatingZone{}) {
 				t.Fatalf("expected event to match range %+v", tt.rangeTR)
 			}
-			body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tt.rangeTR))
+			body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tt.rangeTR))
 			if !strings.Contains(body, tt.wantBusy) {
 				t.Fatalf("expected busy period %q, got %s", tt.wantBusy, body)
 			}
@@ -676,7 +676,7 @@ func TestRecurringOverrideMovesInstanceIntoRange(t *testing.T) {
 	if !resourceInTimeRange(event, movedRange, floatingZone{}) {
 		t.Fatal("expected override instance to match its moved range")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), movedRange))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), movedRange))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240602T150000Z/20240602T160000Z",
 	})
@@ -685,7 +685,7 @@ func TestRecurringOverrideMovesInstanceIntoRange(t *testing.T) {
 	if resourceInTimeRange(event, originalRange, floatingZone{}) {
 		t.Fatal("expected overridden original instance to be suppressed")
 	}
-	originalBody := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), originalRange))
+	originalBody := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), originalRange))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, originalBody), nil)
 }
 
@@ -721,7 +721,7 @@ func TestCancelledRecurrenceOverrideSuppressesBusyPeriod(t *testing.T) {
 		if !resourceInTimeRange(event, tr, floatingZone{}) {
 			t.Fatal("expected the cancelled override to intersect the range it occupies")
 		}
-		body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+		body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 		assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), nil)
 	})
 
@@ -733,7 +733,7 @@ func TestCancelledRecurrenceOverrideSuppressesBusyPeriod(t *testing.T) {
 		if resourceInTimeRange(event, tr, floatingZone{}) {
 			t.Fatal("expected the overridden slot to be judged by the override")
 		}
-		body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+		body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 		assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), nil)
 	})
 }
@@ -753,7 +753,7 @@ func TestRecurringTimeRangeHonorsRDateAndExDate(t *testing.T) {
 	if !resourceInTimeRange(rdateEvent, tr, floatingZone{}) {
 		t.Fatal("expected RDATE instance to match requested range")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240605T090000Z/20240605T100000Z",
 	})
@@ -764,7 +764,7 @@ func TestRecurringTimeRangeHonorsRDateAndExDate(t *testing.T) {
 		DTStart: &start,
 		DTEnd:   &end,
 	}
-	exdateBody := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
+	exdateBody := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}, nil), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, exdateBody), nil)
 }
 
@@ -783,7 +783,7 @@ func TestGenerateFreeBusyExpandsYearlyByWeekNo(t *testing.T) {
 	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected BYWEEKNO recurrence to match requested week")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240513T090000Z/20240513T100000Z",
 	})
@@ -806,7 +806,7 @@ func TestYearlyByWeekNoInstanceBeforeItsPeriodStart(t *testing.T) {
 	if !filterMatches(t, event, calQueryWithTimeRange(tr.Start, tr.End), floatingZone{}) {
 		t.Error("calendar-query missed the instance on 2024-12-30")
 	}
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20241230T090000Z/20241230T100000Z",
 	})
@@ -848,7 +848,7 @@ func TestGenerateFreeBusyExpandsMonthlyAndYearlyRecurringEvents(t *testing.T) {
 				DTEnd:   &tt.end,
 			}
 
-			body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tt.rangeTR))
+			body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tt.rangeTR))
 			assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{tt.wantBusy})
 		})
 	}
@@ -864,12 +864,12 @@ func TestGenerateFreeBusyHonorsRecurrenceUntil(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	inRangeBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240603T000000Z", End: "20240604T000000Z"}))
+	inRangeBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240603T000000Z", End: "20240604T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, inRangeBody), []string{
 		"FREEBUSY:20240603T090000Z/20240603T100000Z",
 	})
 
-	afterUntilBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240604T000000Z", End: "20240605T000000Z"}))
+	afterUntilBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240604T000000Z", End: "20240605T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, afterUntilBody), nil)
 }
 
@@ -886,7 +886,7 @@ func TestUnsupportedRecurrenceFrequencyIsPermissiveForFiltering(t *testing.T) {
 	if !resourceInTimeRange(event, &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}, floatingZone{}) {
 		t.Fatal("expected unsupported recurrence frequency to be permissively included by filtering")
 	}
-	got := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}))
+	got := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20250101T000000Z", End: "20250102T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, got), nil)
 }
 
@@ -905,7 +905,7 @@ func TestMalformedRRuleFallsBackToMasterInstance(t *testing.T) {
 	if !resourceInTimeRange(event, masterRange, floatingZone{}) {
 		t.Fatal("expected malformed recurrence to fall back to the master instance")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), masterRange))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), masterRange))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240601T090000Z/20240601T100000Z",
 	})
@@ -929,7 +929,7 @@ func TestRecurringDurationDefinesBusyPeriodEnd(t *testing.T) {
 	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected DURATION-backed recurrence to overlap the requested range")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240602T090000Z/20240602T110000Z",
 	})
@@ -943,7 +943,7 @@ func TestRDatePeriodWithExplicitEnd(t *testing.T) {
 		DTStart: &start,
 	}
 
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"}))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240605T090000Z/20240605T113000Z",
 	})
@@ -957,7 +957,7 @@ func TestRDatePeriodWithDuration(t *testing.T) {
 		DTStart: &start,
 	}
 
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240605T110000Z", End: "20240605T120000Z"}))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240605T110000Z", End: "20240605T120000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240605T090000Z/20240605T113000Z",
 	})
@@ -973,7 +973,7 @@ func TestRDateAndExDateHonorTZID(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}), &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"}))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{rdateEvent}, floatingZone{}, nil), &timeRange{Start: "20240605T000000Z", End: "20240606T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240605T130000Z/20240605T140000Z",
 	})
@@ -984,7 +984,7 @@ func TestRDateAndExDateHonorTZID(t *testing.T) {
 		DTStart: &start,
 		DTEnd:   &end,
 	}
-	exdateBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
+	exdateBody := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{exdateEvent}, floatingZone{}, nil), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, exdateBody), nil)
 }
 
@@ -1111,7 +1111,7 @@ func TestRecurringAllDayWithoutDTEndUsesOneDayDuration(t *testing.T) {
 	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected recurring all-day event to overlap the afternoon of the generated day")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240602T000000Z/20240603T000000Z",
 	})
@@ -1133,7 +1133,7 @@ func TestThisAndFutureOverrideShiftsFollowingInstances(t *testing.T) {
 	if !resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected RANGE=THISANDFUTURE override to shift later generated instances")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240604T150000Z/20240604T160000Z",
 	})
@@ -1155,7 +1155,7 @@ func TestCancelledThisAndFutureOverrideSuppressesFollowingInstances(t *testing.T
 	if resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected RANGE=THISANDFUTURE cancellation to suppress following generated instances")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), nil)
 }
 
@@ -1169,7 +1169,7 @@ func TestLowercaseRRuleIsExpanded(t *testing.T) {
 		DTEnd:   &end,
 	}
 
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), &timeRange{Start: "20240602T000000Z", End: "20240603T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{
 		"FREEBUSY:20240602T090000Z/20240602T100000Z",
 	})
@@ -1192,7 +1192,7 @@ func TestRecurrenceParsingIsScopedToVEvent(t *testing.T) {
 	if resourceInTimeRange(event, tr, floatingZone{}) {
 		t.Fatal("expected VTIMEZONE RRULE not to make a non-recurring VEVENT match")
 	}
-	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}), tr))
+	body := mustReportText(h.generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), nil)
 }
 
@@ -1220,8 +1220,8 @@ const filterEventICAL = "BEGIN:VCALENDAR\r\n" +
 	"END:VCALENDAR\r\n"
 
 // RFC 4791 §9.7.2 scopes a prop-filter's text-match to the named property's
-// value. Matching the whole object instead lets an unrelated property satisfy
-// the filter, which is the defect this pins closed.
+// value. Matching the whole object instead would let an unrelated property
+// satisfy the filter.
 func TestTextMatchIsScopedToTheNamedProperty(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1447,8 +1447,8 @@ func TestTextMatchUsesTheLogicalPropertyValueWithoutTrimmingTheNeedle(t *testing
 	}
 }
 
-// The virtual birthday collection is the only calendar data CalCard authors, so
-// it never passes through PUT validation. Filtering it goes through the same
+// The virtual birthday collection is generated by the server rather than
+// written by a client, so it never passes through PUT validation. Filtering it goes through the same
 // parsed-tree matcher as stored data, which this pins: a generated event has to
 // stay parseable and its properties addressable by name.
 func TestBirthdayCalendarEventsMatchScopedFilters(t *testing.T) {
@@ -1534,9 +1534,9 @@ func TestBirthdayCalendarQueryResolvesDatesThroughTheRequestTimezone(t *testing.
 	if err != nil {
 		t.Fatalf("generateBirthdayEvents() error = %v", err)
 	}
-	// The generated DTSTART rolls to next year once this year's birthday has
-	// passed, so the range is built from the value the collection actually
-	// carries rather than from a fixed date.
+	// The generated DTSTART depends on whether the birth year is known, so the
+	// range is built from the value the collection actually carries rather than
+	// from a fixed date.
 	root, err := parseICalendarObject(events[0].RawICAL)
 	if err != nil {
 		t.Fatalf("parseICalendarObject() = %v", err)
@@ -1636,7 +1636,7 @@ func TestBirthdayCalendarReportsAgreeOnTheResourceHref(t *testing.T) {
 // test if a recurrence expansion errored while judging it.
 func filterMatches(t testing.TB, event store.Event, filter *calFilter, zone floatingZone) bool {
 	t.Helper()
-	matched, err := matchEventFilter(event, filter, zone)
+	matched, err := matchEventFilter(event, filter, zone, nil)
 	if err != nil {
 		t.Fatalf("matchEventFilter() error = %v", err)
 	}

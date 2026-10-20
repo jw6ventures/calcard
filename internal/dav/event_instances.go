@@ -17,19 +17,21 @@ var _ calobject.Expander = EventInstances
 // as the reports read the object, with floating times in UTC, each placed
 // where the RANGE=THISANDFUTURE override governing it puts it, and with the
 // instances an override replaces left out. It lists at most
-// ical.MaxRecurrenceInstances of them, the most one expansion returns. It is a
-// calobject.Expander.
+// ical.MaxRecurrenceInstances of them and of the overrides placed beside them
+// together, the most one expansion returns, and is incomplete when it left any
+// out. It is a calobject.Expander. Its work draws on work, when it is not nil,
+// and an expansion that runs out of it is incomplete.
 //
 // Each instance is placed from the period the expansion generates for it,
 // which is the extent the §9.6.5 expansion gives the instance it writes out,
 // rather than by writing it out: a view lists every instance of a month for
 // each series it shows.
-func EventInstances(raw string, start, end time.Time) calobject.Expansion {
+func EventInstances(raw string, start, end time.Time, work *ical.RequestWork) calobject.Expansion {
 	root, err := parseStoredICalendarObject(raw)
 	if err != nil {
 		return calobject.Expansion{}
 	}
-	m := newCalendarTimeRangeMatcher(raw, root, floatingZone{})
+	m := newCalendarTimeRangeMatcher(raw, root, floatingZone{}).withPool(work)
 	var master *icalNode
 	for _, child := range root.children {
 		if child.name == "VEVENT" && child.count("RECURRENCE-ID") == 0 {
@@ -75,12 +77,33 @@ func EventInstances(raw string, start, end time.Time) calobject.Expansion {
 		}
 		return a.RecurrenceID.Compare(b.RecurrenceID)
 	})
-	if len(expansion.Instances) > ical.MaxRecurrenceInstances {
-		expansion.Instances = expansion.Instances[:ical.MaxRecurrenceInstances]
+	// The overrides share the instances' budget, as the §9.6.5 expansion counts
+	// the components it writes out, so one expansion lists at most
+	// ical.MaxRecurrenceInstances of the two together: the earliest of them.
+	expansion.Overrides = placedOverrides(m, root, overrides, series, start, end)
+	if len(expansion.Instances)+len(expansion.Overrides) > ical.MaxRecurrenceInstances {
+		expansion.Instances, expansion.Overrides = earliest(expansion.Instances, expansion.Overrides, ical.MaxRecurrenceInstances)
 		expansion.Complete = false
 	}
-	expansion.Overrides = placedOverrides(m, root, overrides, series, start, end)
+	if work.Exhausted() {
+		expansion.Complete = false
+	}
 	return expansion
+}
+
+// earliest keeps the first limit of instances and overrides together, in the
+// order each is sorted in, an instance before an override placed at the same
+// instant.
+func earliest(instances, overrides []calobject.Instance, limit int) ([]calobject.Instance, []calobject.Instance) {
+	i, j := 0, 0
+	for i+j < limit && (i < len(instances) || j < len(overrides)) {
+		if j == len(overrides) || i < len(instances) && instances[i].Start.Compare(overrides[j].Start) <= 0 {
+			i++
+		} else {
+			j++
+		}
+	}
+	return instances[:i], overrides[:j]
 }
 
 // placedOverrides are the overrides of the recurrence set series expands over
@@ -122,9 +145,10 @@ func placedOverrides(m calendarTimeRangeMatcher, root *icalNode, index recurrenc
 func overrideStart(m calendarTimeRangeMatcher, override recurrenceOverride) (icalTimeValue, bool) {
 	start, startOK := firstICalProperty(override.node, "DTSTART")
 	id, idOK := firstICalProperty(override.node, "RECURRENCE-ID")
+	startTZID, idTZID := strings.TrimSpace(start.parameters["TZID"]), strings.TrimSpace(id.parameters["TZID"])
 	if value := strings.TrimSpace(start.value); startOK && idOK && value == strings.TrimSpace(id.value) &&
-		start.parameters["TZID"] == id.parameters["TZID"] {
-		resolved := icalTimeValue{instant: override.recurrenceID, tzid: start.parameters["TZID"]}
+		startTZID == idTZID {
+		resolved := icalTimeValue{instant: override.recurrenceID, tzid: startTZID}
 		if date, ok := ical.DateOf(value); ok && len(value) == len(ical.DateLayout) {
 			resolved.isDate, resolved.date = true, date
 		}

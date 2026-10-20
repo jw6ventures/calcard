@@ -1698,6 +1698,8 @@ func TestStructuredEventsRefuseAZoneOrUntilTheServerCannotRead(t *testing.T) {
 		"no zone":                             {input: timed("", nil), stored: "DTSTART:20260320T100000Z"},
 		"blank zone":                          {input: timed("  ", nil), stored: "DTSTART:20260320T100000Z"},
 		"UTC":                                 {input: timed("UTC", nil), stored: "DTSTART:20260320T100000Z"},
+		"utc lowercase":                       {input: timed("utc", nil), stored: "DTSTART:20260320T100000Z"},
+		"utc padded":                          {input: timed(" Utc ", nil), stored: "DTSTART:20260320T100000Z"},
 		"IANA zone":                           {input: timed("America/Chicago", nil), zone: "America/Chicago", stored: "DTSTART;TZID=America/Chicago:20260320T100000"},
 		"until not a date":                    {input: timed("", daily("June", 0)), want: ErrBadRequest},
 		"until in basic format":               {input: timed("", daily("20260630", 0)), want: ErrBadRequest},

@@ -231,8 +231,8 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 	if components := strings.Count(expand(t, raw), "BEGIN:VEVENT"); components != overrides {
 		t.Fatalf("expanded %d components, want %d", components, overrides)
 	}
-	if got := EventInstances(raw, from, to); len(got.Instances) != overrides/2 || len(got.Overrides) != overrides/2 {
-		t.Fatalf("EventInstances() lists %d instances and places %d overrides, want %d of each", len(got.Instances), len(got.Overrides), overrides/2)
+	if got := EventInstances(raw, from, to, nil); len(got.Instances) != overrides/2 || len(got.Overrides) != overrides/2 {
+		t.Fatalf("EventInstances(, nil) lists %d instances and places %d overrides, want %d of each", len(got.Instances), len(got.Overrides), overrides/2)
 	}
 
 	t.Run("expand", func(t *testing.T) {
@@ -244,7 +244,7 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 	t.Run("EventInstances", func(t *testing.T) {
 		assertScalesLinearly(t, overrides, func(n int) func() {
 			raw := thisAndFutureDateOverridesObject(n)
-			return func() { EventInstances(raw, from, to) }
+			return func() { EventInstances(raw, from, to, nil) }
 		})
 	})
 	// A day apart on a series of every minute, too many slots lie between
@@ -252,12 +252,12 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 	// found on its own.
 	t.Run("far apart on a dense series", func(t *testing.T) {
 		const farApart = 100
-		if got := EventInstances(farApartThisAndFutureOverridesObject(farApart), from, from.AddDate(0, 0, farApart)); len(got.Overrides) != 0 {
-			t.Fatalf("EventInstances() places %d overrides, want none: each names a minute of the series", len(got.Overrides))
+		if got := EventInstances(farApartThisAndFutureOverridesObject(farApart), from, from.AddDate(0, 0, farApart), nil); len(got.Overrides) != 0 {
+			t.Fatalf("EventInstances(, nil) places %d overrides, want none: each names a minute of the series", len(got.Overrides))
 		}
 		assertScalesLinearly(t, farApart, func(n int) func() {
 			raw := farApartThisAndFutureOverridesObject(n)
-			return func() { EventInstances(raw, from, from.AddDate(0, 0, n)) }
+			return func() { EventInstances(raw, from, from.AddDate(0, 0, n), nil) }
 		})
 	})
 	// Each instance lasting days of a series repeating hourly, scores of
@@ -266,12 +266,12 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 		const long = 60
 		raw := longInstancesThisAndFutureOverridesObject(long)
 		from, to := longInstancesFirst, longInstancesFirst.Add(2*long*time.Hour)
-		if got := EventInstances(raw, from, to); len(got.Instances) != 2*long || len(got.Overrides) != long {
-			t.Fatalf("EventInstances() lists %d instances and places %d overrides, want %d and %d", len(got.Instances), len(got.Overrides), 2*long, long)
+		if got := EventInstances(raw, from, to, nil); len(got.Instances) != 2*long || len(got.Overrides) != long {
+			t.Fatalf("EventInstances(, nil) lists %d instances and places %d overrides, want %d and %d", len(got.Instances), len(got.Overrides), 2*long, long)
 		}
 		assertScalesLinearly(t, long, func(n int) func() {
 			raw := longInstancesThisAndFutureOverridesObject(n)
-			return func() { EventInstances(raw, from, longInstancesFirst.Add(2*time.Duration(n)*time.Hour)) }
+			return func() { EventInstances(raw, from, longInstancesFirst.Add(2*time.Duration(n)*time.Hour), nil) }
 		})
 	})
 	// A COUNT rule the expansion cannot jump through is walked from its
@@ -291,9 +291,9 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 		} {
 			t.Run(r.name, func(t *testing.T) {
 				from := countedSeriesFirst
-				got := EventInstances(raw, from, r.to)
+				got := EventInstances(raw, from, r.to, nil)
 				if len(got.Instances) != r.instances || len(got.Overrides) != r.overrides {
-					t.Fatalf("EventInstances() lists %d instances and places %d overrides, want %d and %d", len(got.Instances), len(got.Overrides), r.instances, r.overrides)
+					t.Fatalf("EventInstances(, nil) lists %d instances and places %d overrides, want %d and %d", len(got.Instances), len(got.Overrides), r.instances, r.overrides)
 				}
 				expanded, err := filterICalendarData(raw, newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: from, End: r.to}}, floatingZone{}))
 				if err != nil {
@@ -303,8 +303,8 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 					t.Fatalf("expanded %d components, want %d", components, r.instances+r.overrides)
 				}
 				assertCostsAsMuchAsTheSeriesAlone(t,
-					func() { EventInstances(raw, from, r.to) },
-					func() { EventInstances(alone, from, r.to) })
+					func() { EventInstances(raw, from, r.to, nil) },
+					func() { EventInstances(alone, from, r.to, nil) })
 			})
 		}
 	})
@@ -327,9 +327,9 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 		} {
 			t.Run(name, func(t *testing.T) {
 				raw := object(cancelled)
-				got := EventInstances(raw, week[0], week[1])
+				got := EventInstances(raw, week[0], week[1], nil)
 				if !got.Complete || len(got.Overrides) != cancelled {
-					t.Fatalf("EventInstances() places %d overrides, complete = %v, want all %d of a complete listing", len(got.Overrides), got.Complete, cancelled)
+					t.Fatalf("EventInstances(, nil) places %d overrides, complete = %v, want all %d of a complete listing", len(got.Overrides), got.Complete, cancelled)
 				}
 				expanded, err := filterICalendarData(raw, newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: week[0], End: week[1]}}, floatingZone{}))
 				if err != nil {
@@ -340,7 +340,7 @@ func TestThisAndFutureOverridesStandingForThemselvesScaleWithTheirNumber(t *test
 				}
 				assertScalesLinearly(t, cancelled, func(n int) func() {
 					raw := object(n)
-					return func() { EventInstances(raw, week[0], week[1]) }
+					return func() { EventInstances(raw, week[0], week[1], nil) }
 				})
 			})
 		}
@@ -400,8 +400,8 @@ func TestThisAndFutureOverrideWhoseSlotCannotBeLookedUpLeavesTheExpansionUnsettl
 	raw := instancesObject("", "DTSTART:20000101T000000Z\r\nDURATION:PT30S\r\nRRULE:FREQ=MINUTELY;BYSECOND=0;COUNT=50000000\r\n",
 		"RECURRENCE-ID;RANGE=THISANDFUTURE:20100101T000030Z\r\nDTSTART:20000102T000030Z\r\nDURATION:PT5M\r\nSTATUS:CANCELLED\r\n")
 	from, to := time.Date(2000, 1, 2, 0, 0, 0, 0, time.UTC), time.Date(2000, 1, 2, 0, 10, 0, 0, time.UTC)
-	if got := EventInstances(raw, from, to); got.Complete || len(got.Overrides) != 0 {
-		t.Errorf("EventInstances() places %+v, complete = %v, want a partial listing", got.Overrides, got.Complete)
+	if got := EventInstances(raw, from, to, nil); got.Complete || len(got.Overrides) != 0 {
+		t.Errorf("EventInstances(, nil) places %+v, complete = %v, want a partial listing", got.Overrides, got.Complete)
 	}
 	if _, err := filterICalendarData(raw, newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: from, End: to}}, floatingZone{})); !errors.Is(err, ical.ErrRecurrenceExpansionLimit) {
 		t.Errorf("filterICalendarData() err = %v, want ErrRecurrenceExpansionLimit", err)
@@ -501,8 +501,8 @@ func TestThisAndFutureOverrideNamingNoSlotStandsForItselfWhereItIsPlaced(t *test
 		{"around where it starts", time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC), time.Date(2026, 3, 21, 0, 0, 0, 0, time.UTC), 1},
 	} {
 		t.Run(r.name, func(t *testing.T) {
-			if got := EventInstances(raw, r.from, r.to); len(got.Overrides) != r.placed {
-				t.Errorf("EventInstances() places %+v, want %d overrides", got.Overrides, r.placed)
+			if got := EventInstances(raw, r.from, r.to, nil); len(got.Overrides) != r.placed {
+				t.Errorf("EventInstances(, nil) places %+v, want %d overrides", got.Overrides, r.placed)
 			}
 			expanded, err := filterICalendarData(raw, newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: r.from, End: r.to}}, floatingZone{}))
 			if err != nil {
@@ -544,8 +544,8 @@ func TestThisAndFutureOverrideNamingNoSlotOfALongFrequentSeriesStandsForItself(t
 			if _, fault := validateCalendarObjectForStorage(raw, nil); fault != nil {
 				t.Fatalf("validateCalendarObjectForStorage() = %+v, want the object stored", fault)
 			}
-			if got := EventInstances(raw, from, to); len(got.Overrides) != 1 {
-				t.Errorf("EventInstances() places %+v, want the override", got.Overrides)
+			if got := EventInstances(raw, from, to, nil); len(got.Overrides) != 1 {
+				t.Errorf("EventInstances(, nil) places %+v, want the override", got.Overrides)
 			}
 			expanded, err := filterICalendarData(raw, newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: from, End: to}}, floatingZone{}))
 			if err != nil {
@@ -596,7 +596,7 @@ func BenchmarkThisAndFutureOverridesStandingForThemselves(b *testing.B) {
 	b.Run("EventInstances", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			EventInstances(raw, from, to)
+			EventInstances(raw, from, to, nil)
 		}
 	})
 }

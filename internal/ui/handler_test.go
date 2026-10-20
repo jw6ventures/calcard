@@ -2722,7 +2722,7 @@ func TestCalendarEventJSONPrefersRawTimezoneDateOverStoredDate(t *testing.T) {
 		DTStart: &storedStart,
 		DTEnd:   &storedEnd,
 	}
-	payload := unfoldedEventJSON(unfoldedEvent{event: event, lines: utils.UnfoldLines(event.RawICAL)}, time.Time{}, time.Time{}, nil)
+	payload := unfoldedEventJSON(unfoldedEvent{event: event, lines: utils.UnfoldLines(event.RawICAL)}, time.Time{}, time.Time{}, nil, nil)
 
 	if got := payload["dtstart"]; got != "2026-04-15T00:15:00Z" {
 		t.Fatalf("dtstart = %v, want raw timezone-adjusted time", got)

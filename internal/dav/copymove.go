@@ -172,7 +172,6 @@ func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
 	// after resolving and authorizing the resources involved.
 	r = h.prefetchCopyMoveLocks(r, srcPath, destPath)
 
-	// Handle calendar event copy
 	if srcCalID, srcUID, srcMatched, err := h.parseCalendarResourcePath(r.Context(), user, srcPath); err != nil {
 		writeSourceResolutionError(w, err)
 		return
@@ -181,7 +180,6 @@ func (h *DavServer) copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle contact copy
 	if srcBookID, srcUID, srcMatched, err := h.parseAddressBookResourcePath(r.Context(), user, srcPath); err != nil {
 		writeSourceResolutionError(w, err)
 		return
@@ -294,7 +292,7 @@ func (h *DavServer) copyCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
-	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal)
+	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal, nil)
 	if fault != nil {
 		writeCalendarObjectFault(w, fault)
 		return
@@ -538,7 +536,6 @@ func (h *DavServer) move(w http.ResponseWriter, r *http.Request) {
 	// after resolving and authorizing the resources involved.
 	r = h.prefetchCopyMoveLocks(r, srcPath, destPath)
 
-	// Handle calendar event move
 	if srcCalID, srcUID, srcMatched, err := h.parseCalendarResourcePath(r.Context(), user, srcPath); err != nil {
 		writeSourceResolutionError(w, err)
 		return
@@ -547,7 +544,6 @@ func (h *DavServer) move(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle contact move
 	if srcBookID, srcUID, srcMatched, err := h.parseAddressBookResourcePath(r.Context(), user, srcPath); err != nil {
 		writeSourceResolutionError(w, err)
 		return
@@ -673,7 +669,7 @@ func (h *DavServer) moveCalendarEventWithRetry(w http.ResponseWriter, r *http.Re
 		http.Error(w, "destination exists", http.StatusPreconditionFailed)
 		return
 	}
-	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal)
+	validated, fault := validateTransferredCalendarObject(src.RawICAL, destCal, nil)
 	if fault != nil {
 		writeCalendarObjectFault(w, fault)
 		return

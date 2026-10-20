@@ -212,11 +212,10 @@ func addressBookPrivilegeDecisionFromEntries(user *store.User, book *store.Addre
 	return granted, denied
 }
 
-// prefetchAddressBookACLEntries loads the ACL entries relevant to a book's
-// collection and the supplied contact resource names in a single sweep over the
-// user's principals, mirroring prefetchCalendarACLEntries. This replaces the
-// per-contact ListByResource lookups that otherwise make a single REPORT/sync
-// O(N) in ACL repository queries.
+// prefetchAddressBookACLEntries loads the ACL entries for a book's collection
+// and the supplied contact resource names in one query, mirroring
+// prefetchCalendarACLEntries, so a REPORT or sync does not issue one ACL query
+// per contact.
 func (h *DavServer) prefetchAddressBookACLEntries(ctx context.Context, user *store.User, bookID int64, resourceNames []string) (map[string][]store.ACLEntry, error) {
 	collectionPath := addressBookCollectionResourcePath(bookID)
 	relevantPaths := make([]string, 0, 1+len(resourceNames))

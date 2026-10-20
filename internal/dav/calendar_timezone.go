@@ -80,7 +80,6 @@ func parseICalProperty(line string) (icalProperty, bool) {
 // the readers free to disagree on which one counts.
 var singleValuedParameters = nameSet("TZID", "VALUE", "RANGE", "RELATED", "FBTYPE")
 
-// readICalProperty reads one content line as reading describes.
 func readICalProperty(line string, reading icalReading) (icalProperty, bool) {
 	keyPart, value, ok := ical.SplitContentLine(line)
 	if !ok || keyPart == "" {

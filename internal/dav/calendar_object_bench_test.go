@@ -16,8 +16,8 @@ func benchCalendarObject(components ...string) string {
 		strings.Join(components, "") + "END:VCALENDAR\r\n"
 }
 
-// benchVEvent builds one VEVENT of a recurring meeting, carrying attendees
-// distinct ATTENDEE lines and any extra property lines.
+// benchVEvent builds one VEVENT carrying attendees distinct ATTENDEE lines and
+// any extra property lines, an RRULE among them when the caller passes one.
 func benchVEvent(attendees int, lines ...string) string {
 	var b strings.Builder
 	b.WriteString("BEGIN:VEVENT\r\nUID:bench\r\nDTSTAMP:20260301T000000Z\r\nSUMMARY:Planning\r\n")
@@ -70,9 +70,9 @@ func benchZonedExdateObject(exdates int) string {
 }
 
 // BenchmarkValidateCalendarObjectForStorage measures the validator every
-// calendar object write passes through -- DAV PUT, COPY and MOVE, the REST API
-// and UI imports -- across attendee scale, a recurrence set at the instance
-// cap, and zoned exceptions resolved without a VTIMEZONE.
+// submitted calendar object passes through -- DAV PUT, the REST API and UI
+// imports -- across attendee scale, a recurrence set at the instance cap, and
+// zoned exceptions resolved without a VTIMEZONE.
 func BenchmarkValidateCalendarObjectForStorage(b *testing.B) {
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Bench"}, Editor: true}
 	cases := []struct {

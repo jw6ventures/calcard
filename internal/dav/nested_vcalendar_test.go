@@ -20,7 +20,7 @@ func TestReportsExpandARecurringEventInsideANestedVCalendar(t *testing.T) {
 	if filterMatches(t, event, calQueryWithTimeRange("20260126T000000Z", "20260127T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched past the rule's COUNT")
 	}
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil),
 		&timeRange{Start: "20260112T000000Z", End: "20260113T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{"FREEBUSY:20260112T090000Z/20260112T100000Z"})
 }

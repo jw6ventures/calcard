@@ -293,11 +293,9 @@ func vcardNameMatches(fullName, requested string) bool {
 	if fullName == requested {
 		return true
 	}
-	// If the requested name is grouped (contains a dot), only exact match.
 	if strings.ContainsRune(requested, '.') {
 		return false
 	}
-	// Ungrouped request: also match if the base name (after dot) equals it.
 	return vcardPropertyBaseName(fullName) == requested
 }
 

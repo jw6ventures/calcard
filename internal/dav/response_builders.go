@@ -171,7 +171,7 @@ func (h *DavServer) finishReportResponses(ctx context.Context, user *store.User,
 	default:
 		for i := range responses {
 			if len(responses[i].Propstat) != 0 {
-				responses[i] = filterNonPrincipalPropfindResponse(responses[i], request)
+				responses[i] = filterPropfindResponse(responses[i], request)
 			}
 		}
 	}

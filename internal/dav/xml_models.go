@@ -60,8 +60,9 @@ type propstatError struct {
 type propstat struct {
 	Prop prop `xml:"d:prop"`
 	// PropNames renders the prop element as a list of empty property
-	// elements instead of Prop — used for 404 propstats and propname
-	// responses, where RFC 4918 requires names without values.
+	// elements instead of Prop, for propstats that carry names without
+	// values: propname responses, 404 propstats, and the results of PROPPATCH
+	// and MKCOL.
 	PropNames []xml.Name `xml:"-"`
 	// requested follows PropNames with the request-wide names a property
 	// filter answers here. It is a pointer so that a response answering none
@@ -334,9 +335,9 @@ type xmlNamespaceBinding struct {
 
 var errUnboundXMLPrefix = errors.New("XML prefix is not bound to a namespace")
 
-// newXMLFragmentWriter writes a fragment into enc. enclosingNS is the default
-// namespace in force at the insertion point, and inherited the bindings the
-// fragment's own ancestors declared.
+// newXMLFragmentWriter returns a writer of a fragment into enc. enclosingNS is
+// the default namespace in force at the insertion point, and inherited holds
+// the bindings the fragment's own ancestors declared.
 func newXMLFragmentWriter(enc *xml.Encoder, enclosingNS string, inherited []xmlNamespaceBinding, rejectUnbound bool) *xmlFragmentWriter {
 	return &xmlFragmentWriter{
 		enc:           enc,
@@ -738,7 +739,7 @@ type propfindRequest struct {
 	selection *propfindSelection
 }
 
-// propfindPropQuery lists specific properties requested
+// propfindPropQuery is the DAV:prop element of a PROPFIND body.
 type propfindPropQuery struct {
 	propertySelection
 	CalendarData *struct{}         `xml:"urn:ietf:params:xml:ns:caldav calendar-data"`
@@ -779,7 +780,7 @@ type paramFilter struct {
 	TextMatch    *textMatch `xml:"urn:ietf:params:xml:ns:caldav text-match"`
 }
 
-// textMatch filters by text content
+// textMatch is the text-match element the CalDAV and CardDAV filters share.
 type textMatch struct {
 	Text            string `xml:",chardata"`
 	Collation       string `xml:"collation,attr,omitempty"`

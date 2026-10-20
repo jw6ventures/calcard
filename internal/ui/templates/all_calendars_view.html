@@ -1718,6 +1718,9 @@
         if (event.rrule || event.instances) {
             body += '<p><strong>Recurrence:</strong> ' + escapeHtml(recurrenceSummary(event.seriesEvent || event)) + '</p>';
         }
+        if (zoneNotice(event)) {
+            body += '<p><strong>Time zone:</strong> ' + escapeHtml(zoneNotice(event)) + '</p>';
+        }
         if (event.htmlDescription) {
             // The sanitized description is appended below as a node. Serializing
             // it back into this string would have it parsed a second time, and

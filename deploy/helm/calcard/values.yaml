@@ -85,6 +85,7 @@ app:
     # maxReportCandidateRows: 50000 # Stored resources one report will read and parse while looking for matches.
     # syncHistoryRetention: 2160h # How far back sync deletion history is kept. Tombstones older than this are pruned, and a DAV:sync-token naming an earlier instant is refused with DAV:valid-sync-token so the client re-syncs in full (RFC 6578 Section 3.2). Set 0 to prune nothing, at the cost of a table that only grows.
     # Narrow this freely. Widening it re-admits tokens whose tombstones the old window already pruned, which loses those deletions silently, so widen only when no client holds a token older than the previous window.
+    # reportTimeout: 10s # How long one REPORT may run before the server stops it and answers DAV:number-of-matches-within-limits (calendar-multiget answers 507). Keep it below the HTTP write timeout (15s) so the answer can still be written. Set 0 to turn the deadline off.
 
 # Kubernetes Service that fronts the app pods.
 service:

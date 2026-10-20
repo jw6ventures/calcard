@@ -346,8 +346,7 @@ func TestAddressBookObjectQueryAppliesTheFilterToTheResource(t *testing.T) {
 	}
 }
 
-// A Request-URI naming no stored resource answers an empty multistatus, which is
-// what the collection path answered for the same name.
+// A Request-URI naming no stored resource answers an empty multistatus.
 func TestAddressBookObjectQueryOnAMissingResourceAnswersNothing(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.DAV.MaxMultistatusResponses = defaultMaxMultistatusResponses

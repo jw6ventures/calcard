@@ -18,9 +18,14 @@ import (
 // walked, where no listing answers them, on one ObservanceWork. It is not safe
 // for concurrent use.
 type ObjectTimes struct {
-	lines     []string
-	onsets    ObservanceOnsets
-	work      *ObservanceWork
+	lines  []string
+	onsets ObservanceOnsets
+	work   *ObservanceWork
+	// pool, when set, is the request-wide budget that work and every
+	// recurrence-set walk this reading does on its own, outside work, draw
+	// on: a single write validates one object through two readings, the
+	// parsed tree's and this one, and pool is how both spend from one budget.
+	pool      *RequestWork
 	timezones map[string]objectTimezone
 	zones     map[string]tzidDefinition
 	// components holds the object's top-level VEVENT, VTODO and VJOURNAL
@@ -31,17 +36,22 @@ type ObjectTimes struct {
 
 // NewObjectTimes resolves the dates of the object whose unfolded content lines
 // are lines.
-func NewObjectTimes(lines []string) *ObjectTimes {
-	return &ObjectTimes{lines: lines, work: NewObservanceWork()}
+//
+// onsets, when not nil, is a listing shared beyond this object, such as one
+// serving every object a process reads, through which the rules of the object's
+// VTIMEZONEs are read: definitions starting centuries back, as Exchange's do
+// from 1601, are then listed once rather than once per object. pool, when not
+// nil, is the budget of the request this reading answers, which its walks and
+// the listings its lookups cause draw on besides the reading's own limits.
+func NewObjectTimes(lines []string, onsets ObservanceOnsets, pool *RequestWork) *ObjectTimes {
+	return &ObjectTimes{lines: lines, onsets: onsets, work: NewObservanceWork(pool), pool: pool}
 }
 
-// NewObjectTimesSharingOnsets is NewObjectTimes reading the rules of the
-// object's VTIMEZONEs through onsets, a listing shared beyond this object, such
-// as one serving every object a process reads. Definitions starting centuries
-// back, as Exchange's do from 1601, are then listed once rather than once per
-// object.
-func NewObjectTimesSharingOnsets(lines []string, onsets ObservanceOnsets) *ObjectTimes {
-	return &ObjectTimes{lines: lines, onsets: onsets, work: NewObservanceWork()}
+// Starved reports that resolving the object's dates was cut short for want of
+// the request's pool, so a date in a zone the object defines may have been read
+// as UTC.
+func (o *ObjectTimes) Starved() bool {
+	return o.work.Starved()
 }
 
 // ResolvePropertyTime resolves one date-valued content line of the object. It
@@ -73,6 +83,7 @@ func (o *ObjectTimes) recurringComponents() []Component {
 }
 
 func (o *ObjectTimes) zone(tzid string) tzidDefinition {
+	tzid = strings.TrimSpace(tzid)
 	if zone, ok := o.zones[tzid]; ok {
 		return zone
 	}

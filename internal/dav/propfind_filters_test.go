@@ -256,7 +256,7 @@ func TestFilterPrincipalPropfindResponseSupportsMixedRequests(t *testing.T) {
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{
 			DisplayName:             &struct{}{},
 			ResourceType:            &struct{}{},
@@ -302,7 +302,7 @@ func TestFilterAddressBookCollectionPropfindResponseSupportsMixedRequests(t *tes
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{
 			DisplayName:          &struct{}{},
 			SupportedAddressData: &struct{}{},
@@ -346,7 +346,7 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 		Status: httpStatusOK,
 	}}}
 
-	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{
 			DisplayName:             &struct{}{},
 			CalendarDescription:     &struct{}{},
@@ -378,8 +378,8 @@ func TestFilterCalendarCollectionPropfindResponseSupportsMixedRequests(t *testin
 	}
 }
 
-// A17 regression: 404 propstats must contain empty property elements, not
-// sentinel values like <d:getetag>getetag</d:getetag>.
+// 404 propstats must contain empty property elements, not sentinel values
+// like <d:getetag>getetag</d:getetag>.
 func TestPropfindNotFoundPropstatHasNoSentinelValues(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
@@ -431,7 +431,7 @@ func calendarObjectPropfindResponse() response {
 }
 
 func TestFilterCalendarObjectPropfindReportsCrossKindPropertiesNotFound(t *testing.T) {
-	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{
 			GetETag:              &struct{}{},
 			SupportedAddressData: &struct{}{},
@@ -465,7 +465,7 @@ func TestFilterAddressObjectPropfindReportsCalendarDataNotFound(t *testing.T) {
 		}},
 	}
 
-	filtered := filterNonPrincipalPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(resp, &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{GetETag: &struct{}{}},
 		CalendarData:      &struct{}{},
 	}})
@@ -481,7 +481,7 @@ func TestFilterAddressObjectPropfindReportsCalendarDataNotFound(t *testing.T) {
 }
 
 func TestFilterObjectPropfindOnlyUnsupportedPropertyReturnsOnly404(t *testing.T) {
-	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
 		AddressData: &addressDataQuery{},
 	}})
 
@@ -495,7 +495,7 @@ func TestFilterObjectPropfindOnlyUnsupportedPropertyReturnsOnly404(t *testing.T)
 }
 
 func TestFilterPropfindOmitsUnrequestedResourceType(t *testing.T) {
-	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{GetETag: &struct{}{}},
 	}})
 
@@ -518,7 +518,7 @@ func TestFilterPropfindOmitsUnrequestedResourceType(t *testing.T) {
 // RFC 4918 §15.9: resourcetype is defined on every resource; object resources
 // answer it with an empty value, not a 404.
 func TestFilterObjectPropfindReturnsEmptyResourceType(t *testing.T) {
-	filtered := filterNonPrincipalPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
+	filtered := filterPropfindResponse(calendarObjectPropfindResponse(), &propfindRequest{Prop: &propfindPropQuery{
 		propertySelection: propertySelection{GetETag: &struct{}{}, ResourceType: &struct{}{}},
 	}})
 
@@ -580,7 +580,7 @@ func TestPropfindGetETagOnlyOnObjectOmitsResourceType(t *testing.T) {
 	}
 }
 
-// A4 regression: <propname/> must return property names without values.
+// <propname/> must return property names without values.
 func TestPropfindPropnameReturnsNamesWithoutValues(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{

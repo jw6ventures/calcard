@@ -283,7 +283,7 @@ func escapeDAVPath(decoded string) string {
 // isLocalOrigin reports whether an absolute URI or network-path reference with
 // this scheme and authority names this server. Every URI reference a client
 // sends to name a resource here -- a Destination, a DAV:href in a request body,
-// an If header resource tag, an ACE principal -- is judged by it.
+// an ACE principal -- is judged by it.
 //
 // Two authorities are local: the Host the request reached, and the one the
 // configured base URL publishes. A reverse proxy commonly rewrites Host to the
@@ -554,7 +554,6 @@ func isValidCalendarSlug(slug string) bool {
 	if len(slug) == 0 || len(slug) > 64 {
 		return false
 	}
-	// Must start and end with alphanumeric (not hyphen)
 	if slug[0] == '-' || slug[len(slug)-1] == '-' {
 		return false
 	}

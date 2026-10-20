@@ -386,7 +386,7 @@ func TestPropertyFilterKeepsRequestOrderAroundAnsweredCustomProperties(t *testin
 		CustomXML:   []xml.Name{x("a"), x("b"), x("c"), x("a"), x("d"), x("e"), x("b")},
 	}}}
 
-	filtered := filterNonPrincipalPropfindResponse(resp, req)
+	filtered := filterPropfindResponse(resp, req)
 
 	if got, want := strings.Join(propstatNamesInOrder(t, filtered, "200"), " "), "{DAV:}getetag {urn:x}b {urn:x}d"; got != want {
 		t.Errorf("200 propstat = %s, want %s", got, want)
@@ -425,7 +425,7 @@ func filterRequestHeap(customNames, responses int) float64 {
 		}}}
 		copy(work, base)
 		for i := range work {
-			work[i] = filterNonPrincipalPropfindResponse(work[i], req)
+			work[i] = filterPropfindResponse(work[i], req)
 		}
 	}
 	runtime.ReadMemStats(&after)
@@ -521,8 +521,8 @@ func benchmarkPropfindBody(b *testing.B, events int, body string) {
 	b.ReportMetric(float64(status), "status")
 }
 
-// The reviewer's shape: a ~9 MB PROPFIND whose property list repeats a set of
-// distinct names, answered over a calendar of 100 events.
+// A ~9 MB PROPFIND whose property list repeats a set of distinct names,
+// answered over a calendar of 100 events.
 func BenchmarkPropfindDepth1LargePropertyList(b *testing.B) {
 	for _, distinct := range []int{1000, 50000} {
 		b.Run(fmt.Sprintf("9MB/distinct=%d", distinct), func(b *testing.B) {

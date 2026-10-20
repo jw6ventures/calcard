@@ -157,3 +157,36 @@ func TestTimezoneComponents(t *testing.T) {
 		t.Error("a VTIMEZONE without a TZID defines a zone")
 	}
 }
+
+// HostDefinitionProperty is read for its value, not merely its presence: only
+// TRUE, trimmed of white space and matched without regard to case, marks a
+// VTIMEZONE as the server's. FALSE, an empty value or any other spelling
+// leaves it read as though it carried no such property.
+func TestTimezoneComponentsOnlyTrueMarksTheServersDefinition(t *testing.T) {
+	lines := []string{
+		"BEGIN:VCALENDAR",
+		"BEGIN:VTIMEZONE", "TZID:Asia/Tokyo", HostDefinitionProperty + ":FALSE",
+		"BEGIN:STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:+0900", "TZOFFSETTO:+0900", "END:STANDARD",
+		"END:VTIMEZONE",
+		"BEGIN:VTIMEZONE", "TZID:Asia/Seoul", HostDefinitionProperty + ":",
+		"BEGIN:STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:+0900", "TZOFFSETTO:+0900", "END:STANDARD",
+		"END:VTIMEZONE",
+		"BEGIN:VTIMEZONE", "TZID:Asia/Shanghai", HostDefinitionProperty + ": true ",
+		"BEGIN:STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:+0800", "TZOFFSETTO:+0800", "END:STANDARD",
+		"END:VTIMEZONE",
+		"END:VCALENDAR",
+	}
+	got := TimezoneComponents(lines)
+	if len(got) != 3 {
+		t.Fatalf("TimezoneComponents = %+v, want 3 components", got)
+	}
+	if got[0].HostDefinition {
+		t.Errorf("FALSE marked %+v as the server's", got[0])
+	}
+	if got[1].HostDefinition {
+		t.Errorf("an empty marker value marked %+v as the server's", got[1])
+	}
+	if !got[2].HostDefinition {
+		t.Errorf("a trimmed, lower-cased TRUE did not mark %+v as the server's", got[2])
+	}
+}

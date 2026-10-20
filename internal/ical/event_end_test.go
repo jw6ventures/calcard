@@ -42,7 +42,7 @@ func TestDateSeriesInstancesSpanWholeDaysOfTheirLength(t *testing.T) {
 		"RRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	dtstart := utc(2026, 3, 8, 0, 0)
 	for _, length := range []time.Duration{23 * time.Hour, 24 * time.Hour, 25 * time.Hour} {
-		periods, err := RecurringBusyPeriods(raw, dtstart, length, dtstart, dtstart.AddDate(0, 0, 3), 10, nil)
+		periods, err := RecurringBusyPeriods(raw, dtstart, length, dtstart, dtstart.AddDate(0, 0, 3), 10, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

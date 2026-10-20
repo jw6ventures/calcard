@@ -81,17 +81,15 @@ func TestPostgres_PropfindListsAndDescribesEachMemberAsItsOwnRequestDoes(t *test
 		grant(acl.PrincipalAuthenticated, "read"),
 	)
 
-	// Each domain lists its members by stored resource name, with the ACLs
-	// stored for them. ext is the extension the store strips from a member's
-	// identity, spelled here in other cases too.
+	// Each domain creates a collection and adds members to it by stored
+	// resource name; ext is the extension a member's href carries.
 	domains := []struct {
-		name       string
-		prefix     string
-		ext        string
-		create     func() int64
-		addMember  func(collectionID int64, resourceName string)
-		reports    []string
-		memberACLs map[string][]memberACL
+		name      string
+		prefix    string
+		ext       string
+		create    func() int64
+		addMember func(collectionID int64, resourceName string)
+		reports   []string
 	}{
 		{
 			name:   "calendar",

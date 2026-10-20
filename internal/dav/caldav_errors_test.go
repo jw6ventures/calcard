@@ -222,7 +222,6 @@ func TestWriteCalDAVErrorMulti_SingleCondition(t *testing.T) {
 	writeCalDAVErrorMulti(w, 403, "max-resource-size")
 
 	body := w.Body.String()
-	// Should call writeCalDAVError for single condition
 	if !strings.Contains(body, "<C:max-resource-size/>") {
 		t.Errorf("expected condition in response, got: %s", body)
 	}
@@ -280,9 +279,10 @@ func TestProppatchProtectedPropertyReportsCannotModifyProtectedProperty(t *testi
 	}
 }
 
-// A 403 that names no condition does not borrow one: only the protected-property
-// refusal has a precondition, so the two share a status but not a propstat.
-func TestProppatchUnnamedForbiddenCarriesNoPrecondition(t *testing.T) {
+// A 409 in the same PROPPATCH does not borrow the precondition the 403
+// protected-property refusal carries: only that refusal names a condition, and
+// the two sit in separate propstats.
+func TestProppatchConflictDoesNotBorrowProtectedPropertyPrecondition(t *testing.T) {
 	h, _, user := calendarPropertyServer(store.Calendar{})
 
 	body := `<?xml version="1.0" encoding="utf-8"?>

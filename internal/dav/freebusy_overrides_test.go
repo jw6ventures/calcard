@@ -22,7 +22,6 @@ const maxLinearScalingRatio = 12
 // shown none.
 const linearScalingFloor = 200 * time.Millisecond
 
-// linearScalingRuns is how many timed runs of each size are interleaved.
 const linearScalingRuns = 5
 
 // assertScalesLinearly times the work prepare builds for n and for 4n and fails

@@ -213,7 +213,6 @@ END $$;
 -- submit.
 --
 -- Each report is a WARNING, which the server log records.
--- docs/upgrade-1.2.0/leftover-state.sql lists what was left in place.
 --
 -- Every join below is on equal paths, so each step is linear in the rows it
 -- reads.
@@ -918,10 +917,12 @@ UPDATE events
 -- ical.ConservativeRecurrenceBounds writes a finite bound only for a rule with
 -- UNTIL, or with COUNT, FREQ=DAILY or WEEKLY and no BY parts, and the sentinel
 -- for every other. Two of those series run past a bound read from the rule
--- alone. RFC 5545 section 3.3.10 leaves an instance whose local start time a
--- timezone transition skips out of the set without counting it, so a COUNT
--- series whose DTSTART names a zone reaches its last instance one step later
--- per instance skipped: a day or more for DAILY, a week or more for WEEKLY.
+-- alone. An instance whose local start time a timezone transition skips is
+-- read at the offset before the gap (RFC 5545 section 3.3.5), and where that
+-- reading names the instant of the next instance, as across a skipped day, the
+-- two are one instance (section 3.8.5.3), so a COUNT series whose DTSTART
+-- names a zone can reach its last instance a step or more later than the rule
+-- alone says.
 -- And UNTIL is inclusive, so a date UNTIL on a timed series admits that day's
 -- instances, up to a day past the day's start. Neither can be left to the
 -- candidate filter's 48-hour margin, which covers the zones the column and the
@@ -1071,12 +1072,11 @@ UPDATE events
 --     again. White space is what strings.TrimSpace removes, the class
 --     [\t\v\f \x85\xa0\x1680\x2000-\x200a\x2028\x2029\x202f\x205f\x3000] once
 --     line breaks are gone.
---   - A TZID whose value is exactly UTC on a line whose value holds a local
---     DATE-TIME (YYYYMMDDTHHMMSS with no Z) is removed, and the DATE-TIME is
---     written with Z appended: the instant the server read, which every reader
---     reads as UTC. A DATE and a value already in UTC are left, since no zone
---     places them, and so is another spelling of UTC, which ical4j keeps and
---     every reader takes for the zone name it is.
+--   - A TZID whose value is UTC, compared without regard to case, on a line
+--     whose value holds a local DATE-TIME (YYYYMMDDTHHMMSS with no Z) is
+--     removed, and the DATE-TIME is written with Z appended: the instant the
+--     server read, which every reader reads as UTC. A DATE and a value
+--     already in UTC are left, since no zone places them.
 --   - Any other TZID written as anything but its trimmed value, bare or in
 --     quotes, is written as that value, in quotes if it was quoted.
 --
@@ -1095,9 +1095,18 @@ UPDATE events
 --     series' DTSTART, so where a DTSTART or RECURRENCE-ID naming UTC cannot
 --     be rewritten, none of the body's DTSTARTs and RECURRENCE-IDs naming UTC
 --     is.
---   - A definition of its own named UTC whose offsets are not all zero reads a
---     local time as another instant than the UTC form names, so a body
---     carrying one keeps every time naming UTC.
+--   - A definition of its own, whose trimmed TZID is UTC in any case and whose
+--     offsets are not all zero, reads a local time naming that very spelling
+--     as another instant than the UTC form names, so a value whose trimmed
+--     TZID is spelled exactly as such a definition is keeps its TZID rather
+--     than losing it for a Z. A value naming UTC in another spelling is
+--     answered by no definition, every reader takes it for UTC itself, and it
+--     is rewritten. DAVx5 keeps a TZID's white space whatever defines the
+--     zone, so a held line is still trimmed, but is reported regardless of
+--     whether trimming changed it: ical4j drops a parameter named exactly UTC
+--     whether or not a same-named VTIMEZONE is present, so DAVx5 floats the
+--     time this held zone defines however the line reads, and only a client
+--     resaving it, or the zone's own definition changing, settles it.
 -- A VTIMEZONE named UTC stays, used or not: RFC 5545 section 3.6.5 asks for a
 -- definition of every TZID an object uses, not that every definition be used,
 -- the PUT validator leaves an unused one alone, and DAVx5 discards a
@@ -1116,9 +1125,8 @@ UPDATE events
 --
 -- The events rewritten and the lines left as stored are counted in a WARNING,
 -- with the ids of the events holding the lines left, which PostgreSQL writes to
--- its log and the server to its own; docs/upgrade-1.2.0/tzid-repair-pending.sql
--- lists those events afterwards. A run that finds nothing to do says so in a
--- NOTICE. A run over rows already rewritten changes nothing, and reports the
+-- its log and the server to its own. A run that finds nothing to do says so in
+-- a NOTICE. A run over rows already rewritten changes nothing, and reports the
 -- same lines.
 --
 -- Cost: every body is unfolded and searched once for a TZID parameter whose
@@ -1222,17 +1230,80 @@ repaired AS (
             FROM began
         ),
         scoped AS (
-            SELECT closing.position, closing.text, closing.unfolded, closing.timezone,
+            SELECT closing.position, closing.text, closing.unfolded, closing.timezone, closing.kind, closing.component,
                    COALESCE(closing.timezone > max(closing.position) FILTER (WHERE closing.closes) OVER (ORDER BY closing.position),
                             closing.timezone IS NOT NULL) AS in_timezone
             FROM closing
         ),
+        -- The lines of each VTIMEZONE, each with how deep it stands inside it:
+        -- 1 for a line of the VTIMEZONE itself, 2 for a line of a component
+        -- directly inside it, and so on. A BEGIN opens a level and an END
+        -- closes one, counted as ical.ReadComponents counts them for every
+        -- well-formed definition; an END naming no open component, which the
+        -- reader skips, is counted here, so a definition holding one misreads.
+        zone_depth AS (
+            SELECT scoped.position, scoped.timezone, scoped.unfolded, scoped.kind,
+                   sum(CASE scoped.kind WHEN 'B' THEN 1 WHEN 'E' THEN -1 ELSE 0 END)
+                       OVER (PARTITION BY scoped.timezone ORDER BY scoped.position) AS depth
+            FROM scoped
+            WHERE scoped.in_timezone
+        ),
+        -- ... and the line that opened the component directly inside the
+        -- VTIMEZONE that each line is in, if any.
+        zone_child AS (
+            SELECT zone_depth.*,
+                   max(zone_depth.position) FILTER (WHERE zone_depth.kind = 'B' AND zone_depth.depth = 2)
+                       OVER (PARTITION BY zone_depth.timezone ORDER BY zone_depth.position) AS child
+            FROM zone_depth
+        ),
+        -- The names of the zones the body defines away from zero that are
+        -- UTC, compared without regard to case: each a VTIMEZONE both named
+        -- UTC, by a TZID of its own, and carrying an offset other than zero
+        -- on a STANDARD or DAYLIGHT directly inside it, as readers read a
+        -- definition; an offset line elsewhere in it, in a component of some
+        -- other name or nested deeper, places nothing. A name is spelled as
+        -- its trimmed TZID. Readers look a value's TZID up among the
+        -- definitions by its trimmed spelling, the first VTIMEZONE of that
+        -- spelling answering, and take a name no definition answers for UTC
+        -- itself, so a value is held exactly when its trimmed TZID is one of
+        -- these names. Computed ahead of applies, which reads it to decide
+        -- whether a value naming UTC is rewritten to its UTC form or only
+        -- trimmed.
+        zone_held AS MATERIALIZED (
+            SELECT COALESCE(array_agg(chosen.name), ARRAY[]::text[]) AS names
+            FROM (
+                SELECT DISTINCT ON (zone.name) zone.name, zone.moves
+                FROM (
+                    SELECT line.timezone,
+                           (array_agg(regexp_replace(definition.value, pattern.trim, '', 'g') ORDER BY line.position)
+                               FILTER (WHERE line.depth = 1 AND line.unfolded ~* pattern.timezone_name))[1] AS name,
+                           COALESCE(bool_or(line.depth = 2 AND opener.component IN ('STANDARD', 'DAYLIGHT')
+                               AND line.unfolded ~* pattern.timezone_offset
+                               AND definition.value !~ pattern.zero_offset), FALSE) AS moves
+                    FROM zone_child AS line
+                    LEFT JOIN scoped AS opener ON opener.position = line.child
+                    -- Each property's value follows the first colon outside
+                    -- quotes, as for the lines the rule applies to.
+                    CROSS JOIN LATERAL (SELECT substring(line.unfolded FROM $re$^(?:[^:"]|"[^"]*")*$re$) AS key OFFSET 0) AS definition_key
+                    CROSS JOIN LATERAL (
+                        SELECT CASE WHEN substr(line.unfolded, length(definition_key.key) + 1, 1) = ':'
+                                    THEN substr(line.unfolded, length(definition_key.key) + 2)
+                               END AS value
+                        OFFSET 0
+                    ) AS definition
+                    GROUP BY line.timezone
+                ) AS zone
+                WHERE zone.name IS NOT NULL
+                ORDER BY zone.name, zone.timezone
+            ) AS chosen
+            WHERE chosen.moves AND upper(chosen.name) = 'UTC'
+        ),
         -- Each line the rule applies to, read as the server reads it, and
         -- whether it has the form the repair rewrites.
         applies AS (
-            SELECT scoped.position, property.name, params.utc,
+            SELECT scoped.position, property.name, params.utc, params.held,
                    property.written_name || params.rebuilt || ':' || property.value
-                       || CASE WHEN params.utc THEN 'Z' ELSE '' END
+                       || CASE WHEN params.utc AND NOT params.held THEN 'Z' ELSE '' END
                        || substr(scoped.text, length(scoped.unfolded) + 1) AS rewritten,
                    left(scoped.text, length(scoped.unfolded)) = scoped.unfolded
                        AND substr(scoped.text, length(scoped.unfolded) + 1) IN ('', E'\r\n', E'\r', E'\n')
@@ -1240,8 +1311,14 @@ repaired AS (
                        AND params.strict
                        AND params.tzids = 1
                        AND params.written ~ $re$^(?:"[^"]*"|[^";:,]*)$$re$
-                       AND (NOT params.utc OR (property.value ~ '^[0-9]{8}T[0-9]{6}$' AND params.date_time)) AS rewritable
+                       -- UTC held by a zone of the object's own (zone_held) is
+                       -- only trimmed, never given a "Z", so the value's own
+                       -- shape -- which only the "Z" rewrite has to respect --
+                       -- does not bound whether such a line is rewritable.
+                       AND (NOT params.utc OR params.held
+                            OR (property.value ~ '^[0-9]{8}T[0-9]{6}$' AND params.date_time)) AS rewritable
             FROM scoped
+            CROSS JOIN zone_held
             -- The key runs to the first colon outside quotes, as
             -- ical.SplitContentLine reads it.
             CROSS JOIN LATERAL (SELECT substring(scoped.unfolded FROM $re$^(?:[^:"]|"[^"]*")*$re$) AS key OFFSET 0) AS key_part
@@ -1253,7 +1330,8 @@ repaired AS (
             ) AS property
             CROSS JOIN LATERAL (
                 SELECT (array_agg(param.written ORDER BY param.position) FILTER (WHERE param.tzid))[1] AS written,
-                       (array_agg(param.effective = 'UTC' ORDER BY param.position) FILTER (WHERE param.tzid))[1]
+                       (array_agg(param.effective = ANY(zone_held.names) ORDER BY param.position) FILTER (WHERE param.tzid))[1] AS held,
+                       (array_agg(upper(param.effective) = 'UTC' ORDER BY param.position) FILTER (WHERE param.tzid))[1]
                            AND property.value ~ '[0-9]{8}T[0-9]{6}(?![0-9Z])' AS utc,
                        (array_agg(param.written NOT IN (param.effective, '"' || param.effective || '"') ORDER BY param.position)
                            FILTER (WHERE param.tzid))[1] AS untrimmed,
@@ -1262,7 +1340,8 @@ repaired AS (
                        COALESCE(bool_and(upper(param.name) <> 'VALUE' OR upper(param.written) IN ('DATE-TIME', '"DATE-TIME"')), TRUE) AS date_time,
                        string_agg(CASE
                            WHEN NOT param.tzid THEN ';' || param.text
-                           WHEN param.effective = 'UTC' AND property.value ~ '[0-9]{8}T[0-9]{6}(?![0-9Z])' THEN ''
+                           WHEN upper(param.effective) = 'UTC' AND NOT (param.effective = ANY(zone_held.names))
+                                AND property.value ~ '[0-9]{8}T[0-9]{6}(?![0-9Z])' THEN ''
                            WHEN param.written LIKE '"%' THEN ';' || param.name || '="' || param.effective || '"'
                            ELSE ';' || param.name || '=' || param.effective
                        END, '' ORDER BY param.position) AS rebuilt
@@ -1290,45 +1369,41 @@ repaired AS (
         ),
         held AS MATERIALIZED (
             SELECT
-                -- A definition of its own named UTC that moves the clock: a
-                -- VTIMEZONE both named UTC and carrying an offset other than
-                -- zero.
-                -- Each property's value follows the first colon outside
-                -- quotes, as for the lines the rule applies to.
-                (SELECT COALESCE(
-                            array_agg(scoped.timezone) FILTER (WHERE scoped.unfolded ~* pattern.timezone_name
-                                AND regexp_replace(definition.value, pattern.trim, '', 'g') = 'UTC')
-                            && array_agg(scoped.timezone) FILTER (WHERE scoped.unfolded ~* pattern.timezone_offset
-                                AND definition.value !~ pattern.zero_offset),
-                            FALSE)
-                 FROM scoped
-                 CROSS JOIN LATERAL (SELECT substring(scoped.unfolded FROM $re$^(?:[^:"]|"[^"]*")*$re$) AS key OFFSET 0) AS definition_key
-                 CROSS JOIN LATERAL (
-                     SELECT CASE WHEN substr(scoped.unfolded, length(definition_key.key) + 1, 1) = ':'
-                                 THEN substr(scoped.unfolded, length(definition_key.key) + 2)
-                            END AS value
-                     OFFSET 0
-                 ) AS definition
-                 WHERE scoped.in_timezone AND scoped.unfolded IS NOT NULL) AS utc,
                 -- A DTSTART or RECURRENCE-ID naming UTC that cannot be
                 -- rewritten.
                 EXISTS (
                     SELECT 1
                     FROM applies
-                    WHERE applies.utc AND applies.name IN ('DTSTART', 'RECURRENCE-ID') AND NOT applies.rewritable
+                    WHERE applies.utc AND NOT applies.held AND applies.name IN ('DTSTART', 'RECURRENCE-ID') AND NOT applies.rewritable
                 ) AS identity
         ),
-        -- The lines rewritten: those of the form the repair rewrites, less
-        -- the ones held back above.
+        -- The lines rewritten: those of the form the repair rewrites, less a
+        -- DTSTART or RECURRENCE-ID the series' own identity holds back
+        -- (held.identity), unless zone_held holds its name: zone_held already
+        -- decided, inside applies.rewritten itself, whether such a line gets
+        -- its UTC form or only a trim, and a trim changes no line's form, so
+        -- the series' identity has nothing to keep of it.
         rewrite AS (
             SELECT applies.position, applies.rewritten
             FROM applies, held
             WHERE applies.rewritable
-              AND (NOT applies.utc OR (NOT held.utc
-                   AND (applies.name NOT IN ('DTSTART', 'RECURRENCE-ID') OR NOT held.identity)))
+              AND (applies.name NOT IN ('DTSTART', 'RECURRENCE-ID') OR NOT applies.utc OR applies.held OR NOT held.identity)
+        ),
+        -- The lines DAVx5 may still show wrong once this runs: one the repair
+        -- cannot rewrite at all, or one naming UTC that zone_held holds to
+        -- a definition of that name -- trimmed above, perhaps, but ical4j drops a
+        -- parameter named exactly UTC whether or not a same-named VTIMEZONE
+        -- is present, so the line floats regardless -- or one a DTSTART or
+        -- RECURRENCE-ID elsewhere in the series keeps in its own form.
+        reported AS (
+            SELECT applies.position
+            FROM applies, held
+            WHERE NOT applies.rewritable
+               OR (applies.utc AND applies.held)
+               OR (applies.utc AND NOT applies.held AND applies.name IN ('DTSTART', 'RECURRENCE-ID') AND held.identity)
         )
         SELECT string_agg(COALESCE(rewrite.rewritten, scoped.text), '' ORDER BY scoped.position) AS text,
-               (SELECT count(*) FROM applies) - (SELECT count(*) FROM rewrite) AS untouched_lines
+               (SELECT count(*) FROM reported) AS untouched_lines
         FROM scoped
         LEFT JOIN rewrite ON rewrite.position = scoped.position
     ) AS body
@@ -1359,7 +1434,7 @@ IF tzid_untouched_lines > 0 THEN
               HINT = 'DAVx5 may show these events at the device''s local time. Each line is folded, '
                      'names UTC on an EXDATE or RDATE list or period, spells its parameters in a form '
                      'the repair does not rewrite, or is held with its series or by a definition of UTC '
-                     'that moves the clock. docs/upgrade-1.2.0/tzid-repair-pending.sql lists the events.';
+                     'that moves the clock. Saving an event from a client rewrites it.';
 ELSIF tzid_rewritten_events > 0 THEN
     RAISE WARNING 'v1.2.0 TZID repair: rewrote % events, and left 0 content lines in 0 events as stored',
         tzid_rewritten_events;

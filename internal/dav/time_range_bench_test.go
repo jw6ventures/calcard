@@ -54,7 +54,7 @@ func BenchmarkCalendarQueryTimeRange(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		applyCalendarFilter(b.Context(), events, filter, floatingZone{})
+		applyCalendarFilter(b.Context(), events, filter, floatingZone{}, ical.NewRequestWork(b.Context(), reportWorkBudget))
 	}
 }
 
@@ -76,7 +76,7 @@ func BenchmarkCalendarQueryTimeRangeNestedAlarm(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		applyCalendarFilter(b.Context(), events, filter, floatingZone{})
+		applyCalendarFilter(b.Context(), events, filter, floatingZone{}, ical.NewRequestWork(b.Context(), reportWorkBudget))
 	}
 }
 
@@ -90,7 +90,7 @@ func BenchmarkFreeBusyPeriods(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		budget := newFreeBusyBudget()
-		for _, candidate := range freeBusyCandidates(events, floatingZone{}) {
+		for _, candidate := range freeBusyCandidates(events, floatingZone{}, ical.NewRequestWork(b.Context(), reportWorkBudget)) {
 			if _, err := freeBusyIntervals(candidate, rangeStart, rangeEnd, budget); err != nil {
 				b.Fatal(err)
 			}
@@ -124,7 +124,7 @@ func BenchmarkCalendarQueryOpenEndedOutlookZone(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := applyCalendarFilter(b.Context(), events, filter, reportFloatingZone("", nil)); err != nil {
+		if _, err := applyCalendarFilter(b.Context(), events, filter, reportFloatingZone("", nil), ical.NewRequestWork(b.Context(), reportWorkBudget)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -182,7 +182,7 @@ func BenchmarkCalendarQueryCountedSubDailyZoned(b *testing.B) {
 			events := benchCountedSubDailyEvents(b, 50, definition)
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := applyCalendarFilter(b.Context(), events, filter, floatingZone{}); err != nil {
+				if _, err := applyCalendarFilter(b.Context(), events, filter, floatingZone{}, ical.NewRequestWork(b.Context(), reportWorkBudget)); err != nil {
 					b.Fatal(err)
 				}
 			}

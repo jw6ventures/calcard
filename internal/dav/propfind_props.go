@@ -28,8 +28,7 @@ type propDecorationMask struct {
 
 // decorationMaskFor derives the set of expensive properties worth computing for
 // a PROPFIND request. A specific <prop> request only needs the properties it
-// names; allprop and compatibility (nil) requests retain the previous
-// behavior of computing every value.
+// names; allprop and compatibility (nil) requests compute every value.
 func decorationMaskFor(req *propfindRequest) propDecorationMask {
 	if req != nil && req.PropName != nil {
 		return propDecorationMask{}

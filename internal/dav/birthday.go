@@ -57,8 +57,8 @@ func (s birthdayCollectionState) syncToken() string {
 }
 
 // birthdayCollectionState reads the version of the generated collection. A
-// store with no address books behind it leaves the zero state, which is the
-// version of a collection that generates nothing.
+// store with no address books behind it counts no books and no ctags, which is
+// the version of a collection that generates nothing.
 func (h *DavServer) birthdayCollectionState(ctx context.Context, userID int64) (birthdayCollectionState, error) {
 	state := birthdayCollectionState{year: birthdayGenerationYear()}
 	if h == nil || h.store == nil || h.store.AddressBooks == nil {
@@ -177,7 +177,6 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 		dtstart, rrule := birthdayRecurrence(*c.Birthday, currentYear)
 		dtstartStr := dtstart.Format("20060102")
 
-		// Build the iCal event with yearly recurrence
 		var sb strings.Builder
 		writeFoldedContentLine(&sb, "BEGIN:VCALENDAR")
 		writeFoldedContentLine(&sb, "VERSION:2.0")
@@ -229,7 +228,7 @@ func (h *DavServer) generateBirthdayEvents(ctx context.Context, userID int64) ([
 
 // escapeICalText escapes a string for use as an RFC 5545 §3.3.11 TEXT value. A
 // line break becomes the literal \n escape sequence, and every other control
-// character is dropped: a raw CR or LF would end the content line the value is
+// character but tab is dropped: a raw CR or LF would end the content line the value is
 // written into, leaving the remainder to be read as properties -- or whole
 // components -- of its own.
 func escapeICalText(s string) string {
@@ -395,15 +394,15 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 
 	switch report.XMLName.Local {
 	case "calendar-multiget":
-		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, birthdayCalendarDataProjection(report), request)
+		res, err := h.birthdayCalendarMultiGet(ctx, user, events, report.Hrefs, collectionPath, targetResource, report.selector, birthdayCalendarDataProjection(ctx, report), request)
 		return res, "", err
 	case "calendar-query":
-		projection := birthdayCalendarDataProjection(report)
+		projection := birthdayCalendarDataProjection(ctx, report)
 		if report.Filter != nil {
 			// The entries are DTSTART;VALUE=DATE, so the zone decides which
 			// instants the implied day covers; the filter and the projection
 			// resolve through the same one.
-			events, err = applyCalendarFilter(ctx, events, report.Filter, projection.zone)
+			events, err = applyCalendarFilter(ctx, events, report.Filter, projection.zone, projection.pool)
 			if err != nil {
 				return nil, "", err
 			}
@@ -413,7 +412,7 @@ func (h *DavServer) birthdayCalendarReportResponses(ctx context.Context, user *s
 	case "sync-collection":
 		collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 		syncToken := state.syncToken()
-		projection := birthdayCalendarDataProjection(report)
+		projection := birthdayCalendarDataProjection(ctx, report)
 		responses := []response{
 			birthdayCalendarCollection(collectionHref, principalHref, state),
 		}
@@ -450,7 +449,7 @@ func (h *DavServer) birthdayCalendarSyncFromToken(ctx context.Context, user *sto
 	}
 	collectionHref := strings.TrimSuffix(cleanPath, "/") + "/"
 	responses := []response{birthdayCalendarCollection(collectionHref, principalHref, state)}
-	projection := birthdayCalendarDataProjection(report)
+	projection := birthdayCalendarDataProjection(ctx, report)
 	responses, err = h.finishCalendarReportResponses(ctx, user, responses, propertySelector{Prop: report.Prop}, projection.requested())
 	if err != nil {
 		return nil, "", err
@@ -461,8 +460,8 @@ func (h *DavServer) birthdayCalendarSyncFromToken(ctx context.Context, user *sto
 // birthdayCalendarDataProjection is the §9.6 selection for the generated
 // collection. It defines no CALDAV:calendar-timezone of its own, so §7.3 leaves
 // the request's CALDAV:timezone as the only source ahead of UTC.
-func birthdayCalendarDataProjection(report reportRequest) calendarDataProjection {
-	return newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, nil))
+func birthdayCalendarDataProjection(ctx context.Context, report reportRequest) calendarDataProjection {
+	return newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, nil)).withPool(davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget))
 }
 
 func (h *DavServer) birthdayCalendarMultiGet(ctx context.Context, user *store.User, events []store.Event, hrefs []string, collectionPath, targetResource string, selector propertySelector, projection calendarDataProjection, request *http.Request) ([]response, error) {

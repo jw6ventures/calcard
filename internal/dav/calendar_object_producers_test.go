@@ -370,7 +370,7 @@ func TestReportsPlaceAnUndefinedIANAZoneByTheHostDefinition(t *testing.T) {
 	if filterMatches(t, event, calQueryWithTimeRange("20260112T000000Z", "20260113T000000Z"), floatingZone{}) {
 		t.Error("calendar-query matched the excluded 2026-01-12 instance")
 	}
-	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}),
+	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(), freeBusyCandidates([]store.Event{event}, floatingZone{}, nil),
 		&timeRange{Start: "20260119T000000Z", End: "20260120T000000Z"}))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{"FREEBUSY:20260119T080000Z/20260119T090000Z"})
 }
@@ -397,7 +397,7 @@ func TestCalendarQuerySelectsAZeroLengthEventAtItsInstant(t *testing.T) {
 var dtstampLine = regexp.MustCompile(`^DTSTAMP:\d{8}T\d{6}Z$`)
 
 // requireStamp checks that line is a DTSTAMP the validator added at a time
-// within [before, after], and returns the time it names.
+// within [before, after].
 func requireStamp(t *testing.T, line string, before, after time.Time) {
 	t.Helper()
 	if !dtstampLine.MatchString(line) {
@@ -743,7 +743,7 @@ func TestValidatorStoresAOneDayEventsDateEndAsTheNextDay(t *testing.T) {
 		}
 	})
 	t.Run("transfer", func(t *testing.T) {
-		validated, fault := validateTransferredCalendarObject(raw, nil)
+		validated, fault := validateTransferredCalendarObject(raw, nil, nil)
 		if fault != nil || validated.Body != raw {
 			t.Errorf("transfer stored %v, %+v; want the object as stored", validated, fault)
 		}

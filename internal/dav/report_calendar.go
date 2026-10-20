@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -33,7 +34,8 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 	// two cannot be given different readings of the same request. Only
 	// calendar-query carries a CALDAV:timezone of its own; the other reports
 	// fall back to the collection property, as §7.3 orders.
-	projection := newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, cal.Timezone))
+	pool := davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget)
+	projection := newCalendarDataProjection(reportCalendarData(report), reportFloatingZone(report.Timezone, cal.Timezone)).withPool(pool)
 	req := calendarReportRequest{
 		user:           user,
 		cal:            cal,
@@ -63,9 +65,8 @@ func (h *DavServer) calendarReportResponses(ctx context.Context, user *store.Use
 // calendarReportRequest is what every calendar REPORT entry point needs to know
 // about one request: who is asking, the collection it runs against, where the
 // responses it builds are rooted, and how a matching resource is projected and
-// selected from. It is built once per report so a value that has to reach all
-// four entry points -- as the §7.3 zone on the projection already does --
-// arrives through one field rather than a fourth positional argument.
+// selected from. It is built once per report so a value every entry point needs
+// -- such as the §7.3 zone on the projection -- arrives through one field.
 type calendarReportRequest struct {
 	user *store.User
 	cal  *store.CalendarAccess
@@ -89,8 +90,10 @@ type calendarReportRequest struct {
 // floating values through zone, which RFC 4791 §7.3 orders ahead of UTC. A
 // recurring resource can take milliseconds to judge, so the request is checked
 // before each one: a client that gave up on a large collection stops the work
-// rather than leaving it to run to the end unread.
-func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calFilter, zone floatingZone) ([]store.Event, error) {
+// rather than leaving it to run to the end unread. pool is the request's
+// recurrence and observance budget; once it is spent the remaining resources
+// are kept without being judged.
+func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calFilter, zone floatingZone, pool *ical.RequestWork) ([]store.Event, error) {
 	if filter == nil {
 		return events, nil
 	}
@@ -100,11 +103,21 @@ func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calF
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		matched, err := matchEventFilter(event, filter, zone)
+		if pool.Exhausted() {
+			// The request's recurrence work is spent, so no further walk or
+			// zone listing can be afforded. The resource is kept unevaluated,
+			// as one whose expansion ran out of work is, which costs a client
+			// a fetch where leaving it out would cost the client the resource.
+			filtered = append(filtered, event)
+			continue
+		}
+		matched, err := matchEventFilter(event, filter, zone, pool)
 		if err != nil {
 			return nil, err
 		}
-		if matched {
+		// A verdict reached while the work ran out is not one: the zones it
+		// was read through could not be followed.
+		if matched || pool.Exhausted() {
 			filtered = append(filtered, event)
 		}
 	}
@@ -124,8 +137,8 @@ func applyCalendarFilter(ctx context.Context, events []store.Event, filter *calF
 // calendar-query result deletes what the result leaves out: reporting a
 // resource the filter would not have selected costs the client a fetch, while
 // leaving it out costs the client the resource.
-func matchEventFilter(event store.Event, filter *calFilter, zone floatingZone) (bool, error) {
-	matcher, ok := newEventTimeRangeMatcher(event, zone)
+func matchEventFilter(event store.Event, filter *calFilter, zone floatingZone, pool *ical.RequestWork) (bool, error) {
+	matcher, ok := newEventTimeRangeMatcher(event, zone, pool)
 	if !ok {
 		return true, nil
 	}
@@ -137,13 +150,14 @@ func matchEventFilter(event store.Event, filter *calFilter, zone floatingZone) (
 // §9.9 time-range test and the free-busy period derivation can share a single
 // parse. It reads the object as parseStoredICalendarObject does, so ok is false
 // only when there is no VCALENDAR to read; the matcher is then returned with no
-// tree for a caller to judge by.
-func newEventTimeRangeMatcher(event store.Event, zone floatingZone) (calendarTimeRangeMatcher, bool) {
+// tree for a caller to judge by. pool, when set, is the request-wide budget
+// the matcher's evaluation draws on besides its own per-evaluation cap.
+func newEventTimeRangeMatcher(event store.Event, zone floatingZone, pool *ical.RequestWork) (calendarTimeRangeMatcher, bool) {
 	root, err := parseStoredICalendarObject(event.RawICAL)
 	if err != nil {
-		return newCalendarTimeRangeMatcher(event.RawICAL, nil, zone), false
+		return newCalendarTimeRangeMatcher(event.RawICAL, nil, zone).withPool(pool), false
 	}
-	return newCalendarTimeRangeMatcher(event.RawICAL, root, zone), true
+	return newCalendarTimeRangeMatcher(event.RawICAL, root, zone).withPool(pool), true
 }
 
 // matcherMatchesFilter is matchEventFilter over an object already parsed.
@@ -432,7 +446,7 @@ func (h *DavServer) calendarQuery(ctx context.Context, req calendarReportRequest
 
 		matching := events
 		if filter != nil {
-			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone, req.projection.pool)
 			if err != nil {
 				return nil, err
 			}
@@ -581,7 +595,7 @@ func (h *DavServer) calendarObjectQuery(ctx context.Context, req calendarReportR
 	if event != nil {
 		matching = []store.Event{*event}
 		if filter != nil {
-			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone)
+			matching, err = applyCalendarFilter(ctx, matching, filter, req.projection.zone, req.projection.pool)
 			if err != nil {
 				return nil, err
 			}

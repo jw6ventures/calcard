@@ -20,14 +20,12 @@ func TestCalendarCurrentUserPrivilegeSet_Writable(t *testing.T) {
 	}
 	output := string(data)
 
-	// Writable calendars must include write privileges
 	for _, expected := range []string{"d:write>", "d:write-content>", "d:write-properties>", "d:bind>", "d:unbind>"} {
 		if !strings.Contains(output, expected) {
 			t.Errorf("writable calendar missing privilege %q in: %s", expected, output)
 		}
 	}
 
-	// Must also include read privileges
 	if !strings.Contains(output, "d:read") {
 		t.Error("writable calendar missing read privilege")
 	}
@@ -45,14 +43,12 @@ func TestCalendarCurrentUserPrivilegeSet_ReadOnly(t *testing.T) {
 	}
 	output := string(data)
 
-	// Read-only calendars must NOT include write privileges
 	for _, forbidden := range []string{"d:write>", "d:write-content>", "d:write-properties>", "d:bind>", "d:unbind>", "d:write-acl>", "d:unlock>"} {
 		if strings.Contains(output, forbidden) {
 			t.Errorf("read-only calendar should not have privilege %q in: %s", forbidden, output)
 		}
 	}
 
-	// Must still include read privileges
 	if !strings.Contains(output, "d:read") {
 		t.Error("read-only calendar missing read privilege")
 	}

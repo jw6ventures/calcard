@@ -13,8 +13,8 @@
 // Beyond the built-in modules, behaviour is pluggable through a [Registry]:
 // callers pass [Extension] values in [Options], and each extension registers
 // additional methods, REPORTs, PUT validators, collection contributors and
-// PROPFIND decorators (see registry.go). ServeHTTP falls back to
-// handleRegisteredMethod for any method it does not handle natively.
+// PROPFIND decorators (see registry.go). ServeHTTP offers every request to
+// handleRegisteredMethod before its built-in method dispatch.
 //
 // # File layout
 //
@@ -32,7 +32,8 @@
 //	propfind_props.go     PROPFIND property serialization
 //	propfind_responses.go PROPFIND/principal response building
 //	report.go             REPORT dispatch
-//	report_calendar.go    calendar REPORTs, filters, free/busy
+//	report_calendar.go    calendar REPORTs and filters
+//	report_freebusy.go    free-busy-query REPORT
 //	report_addressbook.go address-book REPORTs
 //	copymove.go           COPY, MOVE
 //	lock.go               LOCK, UNLOCK
@@ -41,7 +42,7 @@
 // Domain logic lives in parallel calendar/address-book files that share a set of
 // primitives. calendar_access.go and addressbook_access.go hold loading,
 // privilege and ACL-prefetch logic; the shared building blocks they delegate to
-// (collection/object path builders, the ACL prefetch sweep and the privilege
-// decision core) live in dav_paths.go and the cross-domain helpers in
-// calendar_access.go.
+// live in dav_paths.go (collection/object path builders and the privilege
+// decision core) and calendar_access.go (the ACL prefetch sweep and the other
+// cross-domain helpers).
 package dav

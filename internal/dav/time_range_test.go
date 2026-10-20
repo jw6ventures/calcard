@@ -359,7 +359,7 @@ func TestTimeRangeVAlarmScanReachesInstancesOutsideTheRange(t *testing.T) {
 
 // §9.9 requires the server to "infer an effective value for DTSTART, DTEND,
 // DURATION, and DUE properties for an instance", so a prop-filter time-range on
-// one of those three reads each instance's value rather than the master's. The
+// one of those four reads each instance's value rather than the master's. The
 // other four properties §9.9 names are metadata of the component as a whole and
 // carry the same value for every instance.
 func TestTimeRangePropFilterConsidersRecurrenceInstances(t *testing.T) {
@@ -1736,7 +1736,7 @@ func TestTimezoneOnsetsDoNotKeepTheObjectARuleWasReadFrom(t *testing.T) {
 		if !ok {
 			t.Fatal("the padded definition has no usable observance")
 		}
-		if _, found, listed := onsets.LatestOnOrBefore(observances.TimezoneObservances[0].Start, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances.TimezoneObservances[0].RRules[0]); !found || !listed {
+		if _, found, listed := onsets.LatestOnOrBefore(observances.TimezoneObservances[0].Start, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), observances.TimezoneObservances[0].RRules[0], nil); !found || !listed {
 			t.Fatal("the padded definition's rule did not resolve")
 		}
 	}
@@ -1759,11 +1759,11 @@ func TestTimezoneOnsetsAnswerAListedInstantWithoutAllocating(t *testing.T) {
 	onsets := newTimezoneOnsets(maxHeldOnsets)
 	rule := exchangeStandardRule
 	before := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	if _, found, listed := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule); !found || !listed {
+	if _, found, listed := onsets.LatestOnOrBefore(rule.dtstart, before, rule.rrule, nil); !found || !listed {
 		t.Fatal("the rule did not resolve")
 	}
 	if allocs := testing.AllocsPerRun(100, func() {
-		onsets.LatestOnOrBefore(rule.dtstart, before.Add(time.Hour), rule.rrule)
+		onsets.LatestOnOrBefore(rule.dtstart, before.Add(time.Hour), rule.rrule, nil)
 	}); allocs != 0 {
 		t.Fatalf("a listed lookup allocated %v times, want none", allocs)
 	}
@@ -1777,12 +1777,12 @@ func TestTimezoneOnsetsListASpanTheListingHoldsWithoutAllocating(t *testing.T) {
 	rule := exchangeStandardRule
 	after := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	through := after.AddDate(1, 0, 0)
-	starts, listed := onsets.StartsBetween(rule.dtstart, after, through, rule.rrule)
+	starts, listed := onsets.StartsBetween(rule.dtstart, after, through, rule.rrule, nil)
 	if want := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC); !listed || len(starts) != 1 || !starts[0].Equal(want) {
 		t.Fatalf("starts in 2026 = %v, %t, want [%v] listed", starts, listed, want)
 	}
 	if allocs := testing.AllocsPerRun(100, func() {
-		onsets.StartsBetween(rule.dtstart, after.Add(time.Hour), through, rule.rrule)
+		onsets.StartsBetween(rule.dtstart, after.Add(time.Hour), through, rule.rrule, nil)
 	}); allocs != 0 {
 		t.Fatalf("a listed span allocated %v times, want none", allocs)
 	}
@@ -1813,8 +1813,8 @@ func TestTimezoneOnsetsDoNotRetryAHaltedListing(t *testing.T) {
 	if !ok {
 		t.Fatal("the rule was not cached")
 	}
-	if rule.lister.Len() != maxListedOnsetsPerRule {
-		t.Fatalf("listed %d onsets, want the %d a rule may keep", rule.lister.Len(), maxListedOnsetsPerRule)
+	if held := rule.lister.Held(); held < maxListedOnsetsPerRule || held > 2*maxListedOnsetsPerRule {
+		t.Fatalf("the listing has room for %d onsets, want the %d a rule may keep, and the room they grow into", held, maxListedOnsetsPerRule)
 	}
 	if walks := onsets.walks.Load(); walks != 2 {
 		t.Fatalf("walked the rule %d times, want twice, once for each instant past the listing", walks)
@@ -1851,7 +1851,7 @@ func TestTimezoneOnsetsChargeWhatEachListingHolds(t *testing.T) {
 				defer wg.Done()
 				for i := range befores {
 					for _, rule := range rules {
-						onsets.LatestOnOrBefore(rule.dtstart, befores[min(i+worker%3, len(befores)-1)], rule.rrule)
+						onsets.LatestOnOrBefore(rule.dtstart, befores[min(i+worker%3, len(befores)-1)], rule.rrule, nil)
 					}
 				}
 			}()
@@ -1866,6 +1866,7 @@ func TestTimezoneOnsetsChargeWhatEachListingHolds(t *testing.T) {
 		if counted := onsets.rules.Held(); counted != held {
 			t.Fatalf("round %d: the cache counts %d units, its listings hold %d", round, counted, held)
 		}
+		requireCacheWithinBudget(t, onsets)
 		onsets = newTimezoneOnsets(maxHeldOnsets)
 	}
 }
@@ -1930,14 +1931,14 @@ func TestReportLoopsStopForACancelledRequest(t *testing.T) {
 		Name:       "VCALENDAR",
 		CompFilter: []compFilter{{Name: "VEVENT", TimeRange: &timeRange{Start: "20240601T000000Z"}}},
 	}}
-	if matched, err := applyCalendarFilter(ctx, events, filter, floatingZone{}); !errors.Is(err, context.Canceled) || matched != nil {
+	if matched, err := applyCalendarFilter(ctx, events, filter, floatingZone{}, nil); !errors.Is(err, context.Canceled) || matched != nil {
 		t.Fatalf("applyCalendarFilter() = %d events, %v; want none and context.Canceled", len(matched), err)
 	}
-	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, floatingZone{}), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"})
+	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, floatingZone{}, nil), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"})
 	if !errors.Is(err, context.Canceled) || candidates != nil {
 		t.Fatalf("filterFreeBusyCandidatesByTimeRange() = %d candidates, %v; want none and context.Canceled", len(candidates), err)
 	}
-	if body, err := (&DavServer{}).generateFreeBusy(ctx, freeBusyCandidates(events, floatingZone{}), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"}); !errors.Is(err, context.Canceled) || body != "" {
+	if body, err := (&DavServer{}).generateFreeBusy(ctx, freeBusyCandidates(events, floatingZone{}, nil), &timeRange{Start: "20240601T000000Z", End: "20240701T000000Z"}); !errors.Is(err, context.Canceled) || body != "" {
 		t.Fatalf("generateFreeBusy() = %q, %v; want nothing and context.Canceled", body, err)
 	}
 	expand := newCalendarDataProjection(&calendarDataEl{Expand: &calendarRange{Start: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC), End: time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC)}}, floatingZone{})
@@ -1957,7 +1958,6 @@ func (r *levelRecorder) Log(_, _ string, level jw6_utils.LogLevel, message strin
 	r.messages = append(r.messages, message)
 }
 
-// logged reports whether a line at level carries text.
 func (r *levelRecorder) logged(level jw6_utils.LogLevel, text string) bool {
 	for i, logged := range r.levels {
 		if logged == level && strings.Contains(r.messages[i], text) {
@@ -2136,10 +2136,11 @@ func TestReportAbandonedWhileFindingItsCollectionIsNotAServerFailure(t *testing.
 	}
 }
 
-// A deadline the server puts on a request ends its context too, but the client
-// is still waiting for the answer the server failed to finish in time: that is
-// the server's failure, answered and logged as one, not a client that left.
-func TestReportCutShortByAServerDeadlineIsAServerFailure(t *testing.T) {
+// A deadline ends a request's context too, but the client is still waiting for
+// the answer the server failed to finish in time: that is the report's
+// number-of-matches-within-limits answer, logged as the server's failure, not a
+// client that left.
+func TestReportCutShortByADeadlineIsAnswered(t *testing.T) {
 	h := hostileRecurrenceServer()
 	recorder := &levelRecorder{}
 	h.log = logging.New(recorder, logClass)
@@ -2154,8 +2155,8 @@ func TestReportCutShortByAServerDeadlineIsAServerFailure(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
 
-	if rr.Code == statusClientClosedRequest || rr.Code < 500 {
-		t.Fatalf("status = %d, want a server error", rr.Code)
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "number-of-matches-within-limits") {
+		t.Fatalf("status = %d: %s, want 403 DAV:number-of-matches-within-limits", rr.Code, rr.Body.String())
 	}
 	if !recorder.logged(jw6_utils.Error, context.DeadlineExceeded.Error()) {
 		t.Fatalf("logged %q, want the deadline at the error level", recorder.messages)

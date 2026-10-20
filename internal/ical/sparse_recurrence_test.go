@@ -41,7 +41,7 @@ func sparseRecurrenceObject(tzid, dtstart, rrule string) (string, time.Time) {
 
 func sparseRecurrenceDigest(t testing.TB, tzid, dtstart, rrule string) string {
 	raw, start := sparseRecurrenceObject(tzid, dtstart, rrule)
-	periods, err := RecurringBusyPeriods(raw, start, time.Hour, start, start.AddDate(60, 0, 0), math.MaxInt32, nil)
+	periods, err := RecurringBusyPeriods(raw, start, time.Hour, start, start.AddDate(60, 0, 0), math.MaxInt32, nil, nil)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d %v\n", len(periods), err)
 	for _, period := range periods {
@@ -59,6 +59,10 @@ func sparseRecurrenceDigest(t testing.TB, tzid, dtstart, rrule string) string {
 // and the onset search answered for each sparse rule when every one of them
 // built the rule's day mask afresh. Building it once per parsed rule changes
 // none of it.
+//
+// "counted hourly at 02:30 in March, New York" crosses the spring change: its
+// 8 March candidate is an instance, read at the offset before the gap (RFC
+// 5545 §3.3.5), so COUNT counts it among the 40 instances the digest covers.
 var sparseRecurrenceDigests = map[string]string{
 	"hourly at 03:00":                            "21915:e3b8acf630459e2dce83a3a097e952b0365a59483a4f6e4dd196d5d7f23d580a",
 	"hourly at 03:00, New York":                  "21915:b54444d57b89e9e4274a4d253afa1d875fe53f8ca0a4077cc9164e32b4aa52cf",
@@ -66,7 +70,7 @@ var sparseRecurrenceDigests = map[string]string{
 	"one second on Mondays that are 29 February": "3:709c21c1af71cfc2ddd2507571746305bcb3e58982a4e7df497285049106faa2",
 	"every third day on the 31st":                "136:bfa648df9313b49d3e3108395f766f94e9406f4c4573b4949a2be30056cd6b95",
 	"every 5 hours on June Mondays, New York":    "1234:385b2a9a342d59a2ac3e2c93701ba682f67b7f06772e33de352638b187911969",
-	"counted hourly at 02:30 in March, New York": "40:4f8772911e91556b071bedd913e322652be9b59e7ef526a0ad51802a58fc985d",
+	"counted hourly at 02:30 in March, New York": "40:4913c8529f4d155ff584a3a4db9386d8fe5f5e98c73bc37e89fb2f67cb5ff246",
 }
 
 func TestSparseRecurrenceAnswersAreUnchanged(t *testing.T) {
@@ -89,7 +93,7 @@ func BenchmarkSparseHourlyRecurrence(b *testing.B) {
 	raw, start := sparseRecurrenceObject("", "20260105T030000", "FREQ=HOURLY;BYHOUR=3")
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := RecurringBusyPeriods(raw, start, time.Hour, start, start.AddDate(60, 0, 0), math.MaxInt32, nil); err != nil {
+		if _, err := RecurringBusyPeriods(raw, start, time.Hour, start, start.AddDate(60, 0, 0), math.MaxInt32, nil, nil); err != nil {
 			b.Fatal(err)
 		}
 	}

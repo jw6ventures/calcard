@@ -1,6 +1,7 @@
 package ical
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -145,6 +146,116 @@ func TestReadComponentsRecognisesBeginAndEndInAnyCase(t *testing.T) {
 	if want := []string{"summary:lower", "BEGINNING:x", "END :VEVENT"}; len(contents) != len(want) ||
 		contents[0] != want[0] || contents[1] != want[1] || contents[2] != want[2] {
 		t.Errorf("content lines = %q, want %q", contents, want)
+	}
+}
+
+// nestedComponentLines builds n components opened one inside another beneath
+// a VCALENDAR root, so the deepest nests n+1 levels with VCALENDAR as the
+// first.
+func nestedComponentLines(n int, name string) string {
+	var raw strings.Builder
+	raw.WriteString("BEGIN:VCALENDAR\r\n")
+	for range n {
+		raw.WriteString("BEGIN:" + name + "\r\n")
+	}
+	for range n {
+		raw.WriteString("END:" + name + "\r\n")
+	}
+	raw.WriteString("END:VCALENDAR\r\n")
+	return raw.String()
+}
+
+func readNested(t *testing.T, raw string, strict bool) ([]string, []string, error) {
+	t.Helper()
+	var opened, contents []string
+	_, err := ReadComponents(UnfoldLines(raw), strict,
+		func(_ *int, name string) (*int, error) { opened = append(opened, name); return new(int), nil },
+		func(_ *int, line string) error { contents = append(contents, line); return nil })
+	return opened, contents, err
+}
+
+// Strictly read, a body nesting exactly maxComponentDepth levels, VCALENDAR
+// counting as the first, is accepted; one level deeper is refused, since
+// real objects nest about four deep and nothing legitimate needs sixteen.
+func TestReadComponentsStrictAcceptsTheDepthLimitRefusesOneMore(t *testing.T) {
+	if _, _, err := readNested(t, nestedComponentLines(maxComponentDepth-1, "X-DEEP"), true); err != nil {
+		t.Fatalf("a body nesting %d levels was refused: %v", maxComponentDepth, err)
+	}
+	if _, _, err := readNested(t, nestedComponentLines(maxComponentDepth, "X-DEEP"), true); err == nil {
+		t.Fatalf("a body nesting %d levels was accepted", maxComponentDepth+1)
+	}
+}
+
+// Read leniently, as a stored row is, a subtree nested past the limit is
+// skipped rather than built: nothing inside it is opened or passed as
+// content, its BEGIN and END lines balance by count alone, and the shallow
+// components around it -- those before it, and those after its over-deep
+// subtree finally closes -- read as if it were not there.
+func TestReadComponentsLeniencySkipsPastTheDepthLimitButKeepsSiblings(t *testing.T) {
+	const beyond = 5 // overflow levels past the limit, on top of the kept ones
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:before\r\nEND:VEVENT\r\n" +
+		strings.Repeat("BEGIN:X-DEEP\r\n", maxComponentDepth-1+beyond) +
+		"SHOULD-NOT-APPEAR:x\r\n" +
+		strings.Repeat("END:X-DEEP\r\n", maxComponentDepth-1+beyond) +
+		"BEGIN:VEVENT\r\nUID:after\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	opened, contents, err := readNested(t, raw, false)
+	if err != nil {
+		t.Fatalf("lenient reading refused a deep body: %v", err)
+	}
+	deepOpens := 0
+	for _, name := range opened {
+		if name == "X-DEEP" {
+			deepOpens++
+		}
+	}
+	// The "before" VEVENT closes before the X-DEEP chain opens, so the chain
+	// starts its own nesting at level 2, beneath VCALENDAR alone, and keeps
+	// maxComponentDepth-1 levels of it within the limit.
+	if want := maxComponentDepth - 1; deepOpens != want {
+		t.Errorf("X-DEEP opens = %d, want %d kept within the limit", deepOpens, want)
+	}
+	if opened[0] != "VCALENDAR" || opened[len(opened)-1] != "VEVENT" {
+		t.Errorf("opened = %q, want VCALENDAR first and the trailing VEVENT last", opened)
+	}
+	for _, line := range contents {
+		if line == "SHOULD-NOT-APPEAR:x" {
+			t.Error("a content line inside the skipped subtree was read")
+		}
+	}
+	want := map[string]bool{"UID:before": false, "UID:after": false}
+	for _, line := range contents {
+		if _, ok := want[line]; ok {
+			want[line] = true
+		}
+	}
+	for line, seen := range want {
+		if !seen {
+			t.Errorf("%q was not read; the siblings around the skipped subtree should still read", line)
+		}
+	}
+}
+
+// A lenient read's cost past the depth limit is bounded by the limit, not by
+// how much deeper the body nests: an 8.5 MB body nested hundreds of thousands
+// of levels deep allocates no more than one nested to the limit, since nothing
+// past the limit is built or has its name upper-cased.
+func TestReadComponentsDeeplyNestedBodyCostsNoMoreThanAShallowOne(t *testing.T) {
+	read := func(raw string) func() {
+		lines := UnfoldLines(raw)
+		return func() {
+			_, _ = ReadComponents(lines, false,
+				func(_ *int, _ string) (*int, error) { return new(int), nil },
+				func(_ *int, _ string) error { return nil })
+		}
+	}
+	shallow := read(nestedComponentLines(maxComponentDepth-1, "X-DEEP"))
+	deep := read(nestedComponentLines(400000, "X-DEEP"))
+	shallowAllocs := testing.AllocsPerRun(20, shallow)
+	deepAllocs := testing.AllocsPerRun(5, deep)
+	if deepAllocs > shallowAllocs+20 {
+		t.Errorf("allocations reading 400,000 nested levels = %.0f, want close to the %d-level body's %.0f",
+			deepAllocs, maxComponentDepth-1, shallowAllocs)
 	}
 }
 

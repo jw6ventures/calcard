@@ -633,42 +633,6 @@ func TestPostgres_UpgradeGivesEachMemberItsOwnACL(t *testing.T) {
 				t.Errorf("the upgrade does not report the dead property no member reads:\n%s", warnings)
 			}
 
-			// The query docs/upgrade-1.2.0 gives operators lists exactly what
-			// the repair left at a path no member is stored under, and the
-			// members it reports by name.
-			query, err := os.ReadFile(filepath.Join("..", "..", "docs", "upgrade-1.2.0", "leftover-state.sql"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			leftovers, err := f.pool.Query(string(query))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var left []string
-			for leftovers.Next() {
-				var finding, resourcePath string
-				var count int
-				if err := leftovers.Scan(&finding, &resourcePath, &count); err != nil {
-					t.Fatal(err)
-				}
-				left = append(left, fmt.Sprintf("%s %s %d", finding, resourcePath, count))
-			}
-			leftovers.Close()
-			wantLeft := []string{
-				"acl_entries " + s.calendarPath + "/Gone 1",
-			}
-			if release.deadProps {
-				wantLeft = append(wantLeft, "dav_dead_properties "+s.calendarPath+"/Solo 1")
-			}
-			wantLeft = append(wantLeft,
-				"name resolves elsewhere "+s.calendarPath+"/. 1",
-				"name resolves elsewhere "+s.calendarPath+"/q?x 1",
-				"shared state path "+s.calendarPath+"/Dup 2",
-			)
-			if !slices.Equal(left, wantLeft) {
-				t.Errorf("the leftover query lists %q, want %q", left, wantLeft)
-			}
-
 			// Every member whose decisions the repair changed is stamped --
 			// one that read entries at another path, or whose own entries a
 			// reader passed over -- and the calendar moves once, so a client

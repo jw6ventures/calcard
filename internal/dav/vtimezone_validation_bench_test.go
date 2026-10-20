@@ -146,7 +146,7 @@ func BenchmarkTimezoneOnsetsDenseRule(b *testing.B) {
 			for b.Loop() {
 				onsets := newTimezoneOnsets(maxHeldOnsets)
 				for i := range 1000 {
-					onsets.LatestOnOrBefore(dtstart, start.AddDate(0, 6*i, 0), rrule)
+					onsets.LatestOnOrBefore(dtstart, start.AddDate(0, 6*i, 0), rrule, nil)
 				}
 			}
 		})

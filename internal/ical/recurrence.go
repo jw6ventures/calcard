@@ -129,10 +129,12 @@ func (resolve PropertyTimeResolver) LocalTimeExists(tzid string, wall time.Time)
 // set in the zones the caller holds. ResolvePropertyTime is a
 // PropertyTimeResolver. LocalTimeExists reports whether wall, a wall-clock
 // reading held as the UTC time with the same fields, is a local time the zone
-// tzid names actually has: RFC 5545 §3.3.10 leaves an instance the RRULE
-// generates on a time a transition skips out of the set, uncounted, and only
-// the definition ResolvePropertyTime reads the TZID through can say which times
-// those are. A nil RecurrenceTimeResolver is PropertyTimeResolver(nil).
+// tzid names actually has. An RRULE candidate it reports false for is a gap a
+// transition opens: still an instance, read at the offset before the gap
+// (RFC 5545 §3.3.5), and merged with a neighbor that reads the same instant
+// (§3.8.5.3). Only the definition ResolvePropertyTime reads the TZID through
+// can say which times those are. A nil RecurrenceTimeResolver is
+// PropertyTimeResolver(nil).
 type RecurrenceTimeResolver interface {
 	ResolvePropertyTime(keyPart, value string) (time.Time, bool)
 	LocalTimeExists(tzid string, wall time.Time) bool
@@ -294,8 +296,11 @@ type recurrenceExpansion struct {
 	// slice and ends the expansion by returning true.
 	visit func(recurrenceOccurrence) bool
 	// work, when set, is the budget the rule is walked on, which then
-	// outlasts the expansion; a fresh one otherwise.
+	// outlasts the expansion; a fresh one otherwise, drawing on pool when
+	// that is set.
 	work *recurrenceWork
+	// pool, when set, is the request-wide budget a fresh work draws on.
+	pool *RequestWork
 	// walk, when set, records what the walk of the rule passes.
 	walk *rruleWalk
 }
@@ -319,12 +324,17 @@ type recurrenceExpansion struct {
 // later one. A caller that owes the complete set -- free-busy does, since a
 // dropped period publishes an hour as free that is not -- has to treat the
 // error as fatal rather than publish them.
-func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver) ([]BusyPeriod, error) {
+//
+// Every evaluation the expansion does draws on pool as well, besides its own
+// recurrenceWorkLimit, so a report over many resources bounds them together; a
+// nil pool leaves each evaluation its own limit alone.
+func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, pool *RequestWork) ([]BusyPeriod, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:    "VEVENT",
 		includeOverrides: true,
 		maxInstances:     maxInstances,
 		resolve:          resolve,
+		pool:             pool,
 		reaches: func(_ BusyPeriod, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
 			return !suppressed && periodOverlaps(effective.Start, effective.End, rangeStart, rangeEnd)
 		},
@@ -365,16 +375,16 @@ func RecurringBusyPeriods(raw string, dtstart time.Time, duration time.Duration,
 // answer from them; one that owes the complete set has to treat the error as
 // fatal.
 func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, visit func(RecurrenceInstance) bool) error {
-	_, err := VisitRecurrenceInstancesAndSlots(raw, componentName, dtstart, duration, rangeStart, rangeEnd, maxInstances, resolve, nil, nil, visit)
+	_, err := VisitRecurrenceInstancesAndSlots(raw, componentName, dtstart, duration, rangeStart, rangeEnd, maxInstances, resolve, nil, nil, nil, visit)
 	return err
 }
 
 // VisitRecurrenceInstancesAndSlots is VisitRecurrenceInstances, answering as
 // well, for each of ids, whether the set generates the slot it names, whatever
-// override then replaces or moves it: one its EXDATEs leave out, or a wall
-// clock its zone skips, it does not. A slot is matched to an id by where it
-// starts, never by how far its instance reaches, as the walk of the rule the
-// range asks for passes it, so an id that walk passes costs nothing more.
+// override then replaces or moves it: one its EXDATEs leave out it does not. A
+// slot is matched to an id by where it starts, never by how far its instance
+// reaches, as the walk of the rule the range asks for passes it, so an id that
+// walk passes costs nothing more.
 //
 // needed is called only for an id the walk did not pass -- before where the
 // walk starts, for a rule it starts part way through, or past where it stops
@@ -385,12 +395,13 @@ func VisitRecurrenceInstances(raw, componentName string, dtstart time.Time, dura
 // furthest id looked up, which only that budget bounds. An id not looked up is
 // answered RecurrenceSlotNotLookedUp, and one still unanswered when the budget
 // is spent RecurrenceSlotUnanswered.
-func VisitRecurrenceInstancesAndSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, ids []RecurrenceSlotID, needed func(int) bool, visit func(RecurrenceInstance) bool) ([]RecurrenceSlotAnswer, error) {
+func VisitRecurrenceInstancesAndSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, ids []RecurrenceSlotID, needed func(int) bool, pool *RequestWork, visit func(RecurrenceInstance) bool) ([]RecurrenceSlotAnswer, error) {
 	expansion := recurrenceExpansion{
 		componentName:    componentName,
 		includeOverrides: false,
 		maxInstances:     maxInstances,
 		resolve:          resolve,
+		pool:             pool,
 		reaches: func(_ BusyPeriod, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
 			return !suppressed && periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
 		},
@@ -413,7 +424,8 @@ func VisitRecurrenceInstancesAndSlots(raw, componentName string, dtstart time.Ti
 	query := newSlotQuery(ids)
 	set.markListedSlots(query)
 	walk := &rruleWalk{slots: query, fromFirst: true, toLast: true}
-	expansion.work, expansion.walk = newRecurrenceWork(), walk
+	expansion.work, expansion.walk = newRecurrenceWork(pool), walk
+	defer expansion.work.release()
 	_, err := set.expand(rangeStart, rangeEnd, expansion)
 	set.lookUpUnpassedSlots(query, walk, needed, expansion)
 	return query.answers, err
@@ -423,13 +435,15 @@ func VisitRecurrenceInstancesAndSlots(raw, componentName string, dtstart time.Ti
 // retains suppressed slots and both placements so callers can decide which
 // RANGE=THISANDFUTURE component impacts a requested window without reimplementing
 // recurrence rules or override precedence. Work budget exhaustion returns
-// ErrRecurrenceExpansionLimit.
-func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver) ([]RecurrenceSlot, error) {
+// ErrRecurrenceExpansionLimit. Its evaluations draw on pool as
+// RecurringBusyPeriods' do.
+func RecurrenceSlots(raw, componentName string, dtstart time.Time, duration time.Duration, rangeStart, rangeEnd time.Time, maxInstances int, resolve RecurrenceTimeResolver, pool *RequestWork) ([]RecurrenceSlot, error) {
 	occurrences, err := expandRecurrenceSet(raw, dtstart, duration, rangeStart, rangeEnd, recurrenceExpansion{
 		componentName:     componentName,
 		includeSuppressed: true,
 		maxInstances:      maxInstances,
 		resolve:           resolve,
+		pool:              pool,
 		reaches: func(original, effective BusyPeriod, suppressed bool, rangeStart, rangeEnd time.Time) bool {
 			return periodTouches(original.Start, original.End, rangeStart, rangeEnd) ||
 				periodTouches(effective.Start, effective.End, rangeStart, rangeEnd)
@@ -977,7 +991,7 @@ func RecurrenceSetExceedsLimit(raw string, limit int) (bool, bool) {
 // RecurrenceSetExceedsLimitFromUnfoldedLines is RecurrenceSetExceedsLimit for
 // a caller that already unfolded the object's content lines.
 func RecurrenceSetExceedsLimitFromUnfoldedLines(lines []string, limit int) (bool, bool) {
-	return RecurrenceSetExceedsLimitOf(NewObjectTimes(lines), limit)
+	return RecurrenceSetExceedsLimitOf(NewObjectTimes(lines, nil, nil), limit)
 }
 
 // RecurrenceSetExceedsLimitOf is RecurrenceSetExceedsLimit for the object times
@@ -1055,11 +1069,11 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	var dtstart time.Time
 	var zone tzidDefinition
 	// civil reports that the rule is followed on the wall clocks of the zone
-	// the DTSTART names, held as UTC fields, as the expansion follows it. A
-	// candidate on a local time that zone skips is then never generated or
-	// counted, as RFC 5545 §3.3.10 requires, and the rest are counted as the
-	// instants they resolve to, a repeated local time as its first occurrence
-	// (§3.3.5).
+	// the DTSTART names, held as UTC fields, as the expansion follows it. Every
+	// candidate is counted as the instant it resolves to: one on a local time
+	// that zone skips reads the offset before the gap, and a repeated one its
+	// first occurrence (RFC 5545 §3.3.5), and two that read the same instant
+	// are one instance, not two (§3.8.5.3 "duplicate instances are ignored").
 	civil := false
 	if hasDTStart {
 		var ok bool
@@ -1114,8 +1128,13 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	pastUntil := func(resolved time.Time) bool {
-		return rule.Until != nil && resolved.After(*rule.Until)
+	// pastUntil reports whether the candidate on wall, read as resolved, is
+	// past UNTIL, and whether that ends the walk.
+	pastUntil := func(wall, resolved time.Time) (past, ends bool) {
+		if rule.Until == nil || !resolved.After(*rule.Until) {
+			return false, false
+		}
+		return true, rule.pastUntilEndsWalk(wall)
 	}
 	// untilWall bounds the wall clocks a rule ending at UNTIL can generate. A
 	// wall clock is less than a day from the instant it names.
@@ -1135,10 +1154,14 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 			skipped, known := zone.skips(wall)
 			return !known || !skipped
 		}, zone.object)
+		rule.resolveCandidate = func(wall time.Time) (time.Time, bool) { return instant(wall), true }
+		rule.gaps = zone.object
 	case civil:
 		rule.localTimeExists = existenceFromGaps(func(wall time.Time) bool {
 			return WallClockExists(zone.host, wall)
 		}, hostLocalTimeGaps(zone.host))
+		rule.resolveCandidate = func(wall time.Time) (time.Time, bool) { return instant(wall), true }
+		rule.gaps = hostLocalTimeGaps(zone.host)
 	}
 	if add(instant(dtstart)) {
 		return true, true
@@ -1146,7 +1169,8 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
 		return len(instances) > limit, true
 	}
-	work := newRecurrenceWork()
+	work := newRecurrenceWork(times.pool)
+	defer work.release()
 	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
 	if overBudget {
 		return true, true
@@ -1172,22 +1196,32 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 
 	periodStart := recurrencePeriodStart(dtstart, rule)
 	occurrences := 0
+	counter := newRecurrenceInstantCounter(func(wall time.Time) (time.Time, bool) { return instant(wall), true }, rule.localTimeExists, dtstart)
 	barren := newBarrenPeriodRun(rule)
 	for scanned := 0; scanned < recurrenceScanLimit; scanned++ {
 		bounded, exceeded, offered := false, false, false
 		_, overBudget := visitRecurrenceCandidates(periodStart, dtstart, rule, work, func(current time.Time) bool {
 			offered = true
-			if current.Before(dtstart) {
+			if rule.precedesStart(current, dtstart) {
 				return false
 			}
-			resolved := instant(current)
-			if pastUntil(resolved) {
-				bounded = true
-				return true
+			resolved, ok := counter.resolveInstant(current)
+			if !ok {
+				return false
+			}
+			if past, ends := pastUntil(current, resolved); past {
+				if ends {
+					bounded = true
+					return true
+				}
+				return false
 			}
 			if unbounded && current.After(horizon) {
 				bounded = true
 				return true
+			}
+			if counter.duplicate(current, resolved) {
+				return false
 			}
 			occurrences++
 			if countLimit > 0 && occurrences > countLimit {
@@ -1235,9 +1269,10 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 	countedRule.Until = untilWall
 	addCandidate := func(candidate time.Time) bool {
 		resolved := instant(candidate)
-		return !pastUntil(resolved) && add(resolved)
+		past, _ := pastUntil(candidate, resolved)
+		return !past && add(resolved)
 	}
-	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &occurrences, addCandidate); handled {
+	if exceeds, handled := finishSparseRecurrence(periodStart, dtstart, countedRule, work, &counter, &occurrences, addCandidate); handled {
 		return exceeds, true
 	}
 	// The scan guard ran out before the horizon above was reached, so how many
@@ -1254,9 +1289,8 @@ func RecurrenceSetExceedsLimitOf(times *ObjectTimes, limit int) (bool, bool) {
 // from one whose filters can never select a recurrence period. Gregorian dates
 // repeat every 400 years. Reducing the recurrence interval against that cycle
 // also accounts for sub-daily clock alignment without visiting every second in
-// the cycle. Which local times a zone skips is not considered: a daily rule
-// generating only skipped times is followed until the range or the work budget
-// ends, and running out of the budget fails closed.
+// the cycle. The local times a zone skips do not matter: a candidate on one is
+// still an instance (RFC 5545 §3.3.5).
 func recurrenceRuleMayProduceCandidate(dtstart time.Time, rule recurrenceRule) bool {
 	switch rule.Freq {
 	case "SECONDLY", "MINUTELY", "HOURLY", "DAILY":
@@ -1708,9 +1742,11 @@ var ErrRecurrenceExpansionLimit = errors.New("recurrence expansion work limit ex
 var ErrRecurrenceScanLimit = fmt.Errorf("%w: recurrence rule scan work exhausted", ErrRecurrenceExpansionLimit)
 
 // finishSparseRecurrence carries on a sub-daily or daily rule the period scan
-// gave up on, one admitted day at a time, while work remains. Running out of work fails
-// closed on max-instances.
-func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule, work *recurrenceWork, occurrences *int, add func(time.Time) bool) (bool, bool) {
+// gave up on, one admitted day at a time, while work remains. Running out of
+// work fails closed on max-instances. counter is the one the scan before it
+// counted candidates with, so a gap candidate at the scan's own boundary is
+// still recognized when its match falls on this side of it.
+func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule, work *recurrenceWork, counter *recurrenceInstantCounter, occurrences *int, add func(time.Time) bool) (bool, bool) {
 	if rule.Until == nil && (rule.Count == 0 || *occurrences == 0) {
 		return false, false
 	}
@@ -1728,6 +1764,10 @@ func finishSparseRecurrence(periodStart, dtstart time.Time, rule recurrenceRule,
 	complete := false
 	addCandidate := func(current time.Time) bool {
 		if rule.Until != nil && current.After(until) {
+			return false
+		}
+		resolved, ok := counter.resolveInstant(current)
+		if !ok || counter.duplicate(current, resolved) {
 			return false
 		}
 		if rule.Count > 0 {
@@ -1782,7 +1822,7 @@ func visitSparseRecurrence(periodStart, dtstart, until time.Time, rule recurrenc
 				continue
 			}
 			stopped, overBudget := visitRecurrenceCandidates(day, dtstart, rule, work, func(current time.Time) bool {
-				if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
+				if rule.precedesStart(current, dtstart) || (!until.IsZero() && current.After(until)) {
 					return false
 				}
 				return add(current)
@@ -1828,7 +1868,7 @@ func visitSparseSubDailyPeriods(day, periodStart, dtstart, until time.Time, rule
 	for periodUnix := firstUnix; periodUnix < lastUnix; {
 		period := time.Unix(periodUnix, 0).In(day.Location())
 		stopped, periodOverBudget := visitRecurrenceCandidates(period, dtstart, rule, work, func(current time.Time) bool {
-			if current.Before(dtstart) || (!until.IsZero() && current.After(until)) {
+			if rule.precedesStart(current, dtstart) || (!until.IsZero() && current.After(until)) {
 				return false
 			}
 			return add(current)
@@ -1908,7 +1948,7 @@ func recurrenceInstantKey(value time.Time) string {
 // half-generated period names the wrong UTC offset, and nothing downstream can
 // tell.
 func LatestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string) (latest time.Time, found, complete bool) {
-	return latestRecurrenceOnOrBefore(dtstart, before, rrule, newRecurrenceWork())
+	return latestRecurrenceOnOrBefore(dtstart, before, rrule, newRecurrenceWork(nil))
 }
 
 // latestRecurrenceOnOrBefore is LatestRecurrenceOnOrBefore drawing on work.
@@ -1943,7 +1983,7 @@ func latestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string, work *r
 		lister.latestOnly = true
 		// An incomplete listing holds the latest start reached, which may lie
 		// past what it covers.
-		complete := lister.ListThrough(before, math.MaxInt)
+		complete := lister.ListThrough(before, math.MaxInt, nil)
 		if len(lister.starts) == 0 {
 			return time.Time{}, false, complete
 		}
@@ -2015,10 +2055,12 @@ func latestRecurrenceOnOrBefore(dtstart, before time.Time, rrule string, work *r
 // observance can look each one up rather than walk the rule again per instant.
 //
 // The listing grows on demand, and each extension continues from where the last
-// one stopped rather than from the DTSTART. Every extension draws on one work
-// budget, the one a single LatestRecurrenceOnOrBefore spends, so growing a
-// listing in steps cannot carry it further than one walk of the rule may go. A
-// lister is not safe for concurrent use.
+// one stopped rather than from the DTSTART. An extension is one evaluation of
+// the rule and draws on the work it is given, the reading's, or, for a listing
+// kept on a budget of its own, on that budget, which a single
+// LatestRecurrenceOnOrBefore spends: it is capped at recurrenceWorkLimit, and an
+// extension that exceeds the cap halts the listing for good. A lister is not
+// safe for concurrent use.
 type RecurrenceStartLister struct {
 	dtstart time.Time
 	rule    recurrenceRule
@@ -2031,6 +2073,8 @@ type RecurrenceStartLister struct {
 	// rule needed more work than this package undertakes, or the set held
 	// more starts than the caller's limit.
 	halted bool
+	// starved reports that the last extension stopped for want of work.
+	starved bool
 	// latestOnly keeps only the latest start listed, for a caller that asks
 	// nothing else of the listing and may follow a rule through hundreds of
 	// thousands of starts to reach it.
@@ -2050,22 +2094,52 @@ type RecurrenceStartLister struct {
 
 // NewRecurrenceStartLister prepares a listing of the set dtstart and rrule
 // describe. Nothing past the DTSTART is generated until ListThrough asks.
-func NewRecurrenceStartLister(dtstart time.Time, rrule string) *RecurrenceStartLister {
+//
+// The one check its construction makes -- whether the rule generates the
+// DTSTART -- is charged to work, the ObservanceWork of the reading whose lookup
+// causes the listing to be built; it is one evaluation, capped at what a
+// listing may spend. When work, the reading's budget or the pool of its request,
+// runs out before that cap does the result is nil: a caller keeping listings
+// does not keep one that says nothing about the rule, and a later reading with
+// its own share builds it. A nil work gives the listing a budget of its own,
+// and a result that is never nil.
+func NewRecurrenceStartLister(dtstart time.Time, rrule string, work *ObservanceWork) *RecurrenceStartLister {
+	if work == nil {
+		lister, _ := buildRecurrenceStartLister(dtstart, rrule, newRecurrenceWork(nil))
+		return lister
+	}
+	var lister *RecurrenceStartLister
+	work.useListing(func(w *recurrenceWork) {
+		lister, _ = buildRecurrenceStartLister(dtstart, rrule, w)
+	})
+	if lister != nil {
+		// The budget it was built on is the reading's, released with this
+		// call; the listing is extended on whichever the extension is given.
+		lister.work = nil
+	}
+	return lister
+}
+
+// buildRecurrenceStartLister parses rrule and, when the rule could select from a period at
+// all, checks on work whether it generates the DTSTART.
+func buildRecurrenceStartLister(dtstart time.Time, rrule string, work *recurrenceWork) (*RecurrenceStartLister, bool) {
 	rule, ok := parseRecurrenceRule(rrule, dtstart.Location(), nil, wallClockIn(dtstart.Location()))
 	if !ok {
 		// LatestRecurrenceOnOrBefore finds nothing in a rule it cannot parse,
 		// not even the DTSTART.
-		return &RecurrenceStartLister{dtstart: dtstart, ended: true}
+		return &RecurrenceStartLister{dtstart: dtstart, ended: true}, false
 	}
 	if !recurrenceBySetPosMaySelect(dtstart, rule) {
-		return &RecurrenceStartLister{dtstart: dtstart, starts: []time.Time{dtstart}, ended: true}
+		return &RecurrenceStartLister{dtstart: dtstart, starts: []time.Time{dtstart}, ended: true}, false
 	}
-	work := newRecurrenceWork()
 	generatesStart, overBudget := recurrenceRuleGeneratesStart(dtstart, rule, work)
 	if overBudget {
-		return &RecurrenceStartLister{dtstart: dtstart, halted: true}
+		if work.poolStarved() {
+			return nil, true
+		}
+		return &RecurrenceStartLister{dtstart: dtstart, halted: true}, false
 	}
-	return newRecurrenceStartLister(dtstart, rule, generatesStart, work)
+	return newRecurrenceStartLister(dtstart, rule, generatesStart, work), false
 }
 
 // NewRecurrenceStartListerFrom prepares a listing of the same set that keeps
@@ -2074,9 +2148,13 @@ func NewRecurrenceStartLister(dtstart time.Time, rrule string) *RecurrenceStartL
 // before it. The rule is followed from its DTSTART, drawing on the listing's
 // work budget, but the starts before from are neither kept nor counted against
 // ListThrough's limit, so a rule too dense to list from its DTSTART within
-// that limit is listed around the instants asked about.
-func NewRecurrenceStartListerFrom(dtstart time.Time, rrule string, from time.Time) *RecurrenceStartLister {
-	lister := NewRecurrenceStartLister(dtstart, rrule)
+// that limit is listed around the instants asked about. work is as
+// NewRecurrenceStartLister has it, and the result nil when it ran out.
+func NewRecurrenceStartListerFrom(dtstart time.Time, rrule string, from time.Time, work *ObservanceWork) *RecurrenceStartLister {
+	lister := NewRecurrenceStartLister(dtstart, rrule, work)
+	if lister == nil {
+		return nil
+	}
 	lister.keepFrom = from
 	lister.dropBefore(len(lister.starts))
 	return lister
@@ -2124,7 +2202,7 @@ func recurrenceStartsBetween(dtstart time.Time, rrule string, after, through tim
 			barren:      newBarrenPeriodRun(rule),
 		}
 	}
-	if !lister.ListThrough(through, limit) {
+	if !lister.ListThrough(through, limit, nil) {
 		return nil, false
 	}
 	return lister.starts, true
@@ -2136,7 +2214,9 @@ func (l *RecurrenceStartLister) dropBefore(n int) {
 	kept := sort.Search(min(n, len(l.starts)), func(i int) bool { return !l.starts[i].Before(l.keepFrom) })
 	if kept > 0 {
 		l.dropped, l.hasDropped = l.starts[kept-1], true
-		l.starts = l.starts[kept:]
+		// Copied, so the array holding the dropped starts is released rather
+		// than kept alive behind the ones that remain.
+		l.starts = slices.Clone(l.starts[kept:])
 	}
 }
 
@@ -2155,9 +2235,11 @@ func newRecurrenceStartLister(dtstart time.Time, rule recurrenceRule, generatesS
 	return lister
 }
 
-// Len is the number of starts listed so far.
-func (l *RecurrenceStartLister) Len() int {
-	return len(l.starts)
+// Held is the number of starts the listing has room for, which is what it
+// occupies: the array its starts are kept in is released when they are dropped
+// or the listing halts, and grows by more than one start at a time.
+func (l *RecurrenceStartLister) Held() int {
+	return cap(l.starts)
 }
 
 // Covers reports whether the listing holds every start at or before through.
@@ -2217,28 +2299,60 @@ func (l *RecurrenceStartLister) StartsBetween(after, through time.Time) (starts 
 // keeping at most limit starts in all, and reports whether it now does. A
 // listing that halts keeps what it listed exactly, but is not extended again:
 // the work or the starts it would take have already been found to be too many.
-func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
+//
+// One extension is one evaluation, drawn from work, the ObservanceWork of the
+// reading whose lookup causes the listing to grow, so a listing kept beyond one
+// reading -- the shared onset cache's -- charges whichever reading's lookup
+// extends it. When work, the reading's budget or the pool of its request, ran
+// out before the evaluation's own cap did, Starved reports it: the listing
+// keeps the periods this call completed, forgets the one it was in, and is not
+// marked unable to grow further, so a later reading with budget of its own
+// extends it to the starts an unstarved listing would hold. A nil work draws on
+// the budget the listing was built with.
+func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int, work *ObservanceWork) bool {
+	var ok bool
+	if work == nil {
+		if l.work == nil {
+			l.work = newRecurrenceWork(nil)
+		}
+		ok, l.starved = l.listThrough(through, limit, l.work)
+		return ok
+	}
+	work.useListing(func(w *recurrenceWork) {
+		ok, l.starved = l.listThrough(through, limit, w)
+	})
+	return ok
+}
+
+// Starved reports that the last ListThrough stopped because the work it drew on
+// ran out, not because the listing's rule was found too large.
+func (l *RecurrenceStartLister) Starved() bool {
+	return l.starved
+}
+
+func (l *RecurrenceStartLister) listThrough(through time.Time, limit int, work *recurrenceWork) (ok, starved bool) {
 	if through.Before(l.dtstart) {
 		through = l.dtstart
 	}
 	if l.Covers(through) {
-		return true
+		return true, false
 	}
 	if l.halted {
-		return false
+		return false, false
 	}
 	for ; l.scanned < recurrenceScanLimit; l.scanned++ {
 		if l.rule.Count > 0 && l.occurrences >= l.rule.Count {
 			l.ended = true
-			return true
+			return true, false
 		}
 		if recurrencePeriodEarliestCandidate(l.periodStart, l.rule).After(through) {
 			l.covered = through
-			return true
+			return true, false
 		}
 		offered, finished, passed := false, false, false
 		var overflow time.Time
-		_, overBudget := visitRecurrenceCandidates(l.periodStart, l.dtstart, l.rule, l.work, func(candidate time.Time) bool {
+		before := l.snapshot()
+		_, overBudget := visitRecurrenceCandidates(l.periodStart, l.dtstart, l.rule, work, func(candidate time.Time) bool {
 			offered = true
 			// A period the last extension stopped partway through is visited
 			// again from its start, and what it listed then is skipped.
@@ -2276,26 +2390,37 @@ func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
 		})
 		switch {
 		case overBudget:
-			// Only the periods before this one were visited whole.
-			l.halt(l.periodStart.Add(-time.Nanosecond))
-			return false
+			// Only the periods before this one were visited whole. Running
+			// out of the shared pool is not a reason to refuse this rule for
+			// good: only work's own recurrenceWorkLimit, which bounds what
+			// the rule itself may cost, is. The listing keeps those periods
+			// and forgets this one, which the next extension visits afresh.
+			if work.poolStarved() {
+				l.restore(before)
+				if covered := l.beforePeriod(); covered.After(l.covered) {
+					l.covered = covered
+				}
+				return false, true
+			}
+			l.halt(l.beforePeriod(), true)
+			return false, false
 		case !overflow.IsZero():
-			l.halt(overflow.Add(-time.Nanosecond))
-			return false
+			l.halt(overflow.Add(-time.Nanosecond), true)
+			return false, false
 		case finished:
 			l.ended = true
-			return true
+			return true, false
 		case passed:
 			l.covered = through
-			return true
+			return true, false
 		case l.barren.settles(offered):
 			l.ended = true
-			return true
+			return true, false
 		}
 		next := advanceRecurrencePeriod(l.periodStart, l.rule)
 		if !next.After(l.periodStart) {
-			l.halt(l.periodStart.Add(-time.Nanosecond))
-			return false
+			l.halt(l.beforePeriod(), true)
+			return false, false
 		}
 		l.periodStart = next
 	}
@@ -2303,26 +2428,72 @@ func (l *RecurrenceStartLister) ListThrough(through time.Time, limit int) bool {
 	// what was reached is not the end of it.
 	if !recurrenceRuleMayProduceCandidate(l.dtstart, l.rule) {
 		l.ended = true
-		return true
+		return true, false
 	}
-	l.halt(l.periodStart.Add(-time.Nanosecond))
-	return false
+	l.halt(l.beforePeriod(), true)
+	return false, false
+}
+
+// beforePeriod is the last instant before anything the period at periodStart
+// can generate, so a listing that has visited every period before it holds
+// every start at or before it. A yearly BYWEEKNO period generates from the
+// start of its first week, which can fall before periodStart.
+func (l *RecurrenceStartLister) beforePeriod() time.Time {
+	return recurrencePeriodEarliestCandidate(l.periodStart, l.rule).Add(-time.Nanosecond)
+}
+
+// listingState is what visiting one period of a rule changes in a listing, to
+// be put back when the work to finish the period is refused.
+type listingState struct {
+	starts      int
+	first       time.Time
+	occurrences int
+	dropped     time.Time
+	hasDropped  bool
+}
+
+func (l *RecurrenceStartLister) snapshot() listingState {
+	state := listingState{starts: len(l.starts), occurrences: l.occurrences, dropped: l.dropped, hasDropped: l.hasDropped}
+	if len(l.starts) > 0 {
+		state.first = l.starts[0]
+	}
+	return state
+}
+
+// restore puts the listing back as snapshot found it: the starts the period
+// listed, the occurrences it counted and the start it dropped are forgotten, so
+// that visiting the period again lists and counts them once.
+func (l *RecurrenceStartLister) restore(state listingState) {
+	l.starts = l.starts[:state.starts]
+	if l.latestOnly && state.starts > 0 {
+		l.starts[0] = state.first
+	}
+	l.occurrences, l.dropped, l.hasDropped = state.occurrences, state.dropped, state.hasDropped
 }
 
 // halt stops the listing, which holds every start at or before covered, and
-// drops whatever it listed past that. A latestOnly listing keeps its one start,
-// the latest reached, which LatestRecurrenceOnOrBefore answers with when the
-// listing is incomplete.
-func (l *RecurrenceStartLister) halt(covered time.Time) {
+// drops whatever it listed past that. permanent marks the listing unable to
+// extend further: false when what stopped this extension was its caller's
+// shared pool rather than the rule needing more than recurrenceWorkLimit or
+// exceeding the caller's limit, so a later caller with its own budget may
+// still extend it. A latestOnly listing keeps its one start, the latest
+// reached, which LatestRecurrenceOnOrBefore answers with when the listing is
+// incomplete.
+func (l *RecurrenceStartLister) halt(covered time.Time, permanent bool) {
 	if covered.After(l.covered) {
 		l.covered = covered
 	}
-	l.halted = true
+	l.halted = l.halted || permanent
 	if l.latestOnly {
 		return
 	}
 	kept := sort.Search(len(l.starts), func(i int) bool { return l.starts[i].After(l.covered) })
-	l.starts = l.starts[:kept]
+	if kept < len(l.starts) {
+		// Copied, so the array holding the starts past covered is released
+		// rather than kept alive behind the ones that remain. A start already
+		// handed out by StartsBetween lies before covered and stays valid.
+		l.starts = slices.Clone(l.starts[:kept])
+	}
 }
 
 func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Time {
@@ -2355,6 +2526,84 @@ func retreatRecurrencePeriod(periodStart time.Time, rule recurrenceRule) time.Ti
 // than 24 hours.
 const recurrenceCivilScanPad = 24 * time.Hour
 
+// pastUntilEndsWalk reports whether a candidate whose instant is past UNTIL
+// ends the walk of the rule. The candidates after a wall clock the zone has
+// read no earlier than it does; those after one inside a gap can read earlier,
+// since it is read at the offset before the gap and the candidates just past
+// the gap are not.
+func (rule recurrenceRule) pastUntilEndsWalk(wall time.Time) bool {
+	return rule.localTimeExists == nil || rule.localTimeExists(wall)
+}
+
+// recurrenceInstantCounter decides which candidates of a rule are instances,
+// for every walk of them -- rruleBusyPeriods's, the max-instances validator's
+// and the sparse scan that continues either: none precedes the DTSTART's
+// instant, and of candidates sharing an instant only the first counts (RFC
+// 5545 §3.8.5.3). Candidates are offered period by period. A gap candidate is
+// held pending until the candidate that reads its instant arrives, which can
+// be many candidates later; orderedByInstant settles pairs within one period,
+// so pending holds the pairs that straddle periods.
+type recurrenceInstantCounter struct {
+	resolve         func(time.Time) (time.Time, bool)
+	localTimeExists func(time.Time) bool
+	dtstartWall     time.Time
+	dtstartResolved time.Time
+	pending         map[time.Time]struct{}
+}
+
+// newRecurrenceInstantCounter resolves dtstartWall once, through resolve, so
+// resolveInstant has it to compare every later candidate against.
+func newRecurrenceInstantCounter(resolve func(time.Time) (time.Time, bool), localTimeExists func(time.Time) bool, dtstartWall time.Time) recurrenceInstantCounter {
+	c := recurrenceInstantCounter{resolve: resolve, localTimeExists: localTimeExists, dtstartWall: dtstartWall}
+	c.dtstartResolved, _ = resolve(dtstartWall)
+	return c
+}
+
+// resolveInstant resolves current, reporting its instant together with
+// whether it is one RFC 5545 §3.8.5.3 admits: ok is false where current does
+// not resolve, or where its instant is not after the DTSTART's own -- which a
+// whole local day or period the zone skips can read a later wall clock onto,
+// and which a candidate on a skipped local time reads onto as well. The
+// DTSTART is the first instance, so another candidate naming its instant is
+// that instance again.
+func (c *recurrenceInstantCounter) resolveInstant(current time.Time) (resolved time.Time, ok bool) {
+	resolved, ok = c.resolve(current)
+	if !ok {
+		return resolved, false
+	}
+	if !resolved.After(c.dtstartResolved) && !current.Equal(c.dtstartWall) {
+		return resolved, false
+	}
+	return resolved, true
+}
+
+// duplicate reports whether resolved, current's already-resolved instant,
+// repeats one still pending a match from inside a gap, consuming that match;
+// current's own wall clock decides whether it is itself such a candidate,
+// held pending instead.
+func (c *recurrenceInstantCounter) duplicate(current, resolved time.Time) bool {
+	if c.localTimeExists != nil && !c.localTimeExists(current) {
+		// The DTSTART's instant is settled by resolveInstant, which admits no
+		// other candidate to it.
+		if resolved.Equal(c.dtstartResolved) {
+			return false
+		}
+		if c.pending == nil {
+			c.pending = make(map[time.Time]struct{}, 1)
+		}
+		c.pending[resolved] = struct{}{}
+		return false
+	}
+	if len(c.pending) == 0 {
+		return false
+	}
+	if _, pending := c.pending[resolved]; pending {
+		delete(c.pending, resolved)
+		return true
+	}
+	return false
+}
+
 func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLength, rrule string, exdates exclusions, rangeStart, rangeEnd time.Time, expansion recurrenceExpansion, add func(time.Time, BusyPeriod, occurrenceDays) bool) (bool, error) {
 	duration := length.duration
 	resolve := propertyTimeResolver(expansion.resolve)
@@ -2379,8 +2628,11 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 	if candidateExists != nil && gaps != nil {
 		rule.localTimeExists = existenceFromGaps(candidateExists, gaps)
 	}
+	rule.resolveCandidate = resolveCandidate
+	rule.gaps = gaps
 
 	occurrences := 0
+	counter := newRecurrenceInstantCounter(resolveCandidate, rule.localTimeExists, recurrenceStart)
 	// done ends the walk, when add asks it to or, ended, when the rule has no
 	// candidate left.
 	done := false
@@ -2389,7 +2641,7 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 		return true
 	}
 	visit := func(current time.Time) bool {
-		if current.Before(recurrenceStart) {
+		if rule.precedesStart(current, recurrenceStart) {
 			return false
 		}
 		// A DATE candidate is its date, placed through the expansion's
@@ -2399,8 +2651,8 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 		if length.onDate {
 			period, dates = length.instance(current, CivilDate(current))
 		} else {
-			resolvedCurrent, resolved := resolveCandidate(current)
-			if !resolved {
+			resolvedCurrent, ok := counter.resolveInstant(current)
+			if !ok {
 				return false
 			}
 			period = BusyPeriod{Start: resolvedCurrent, End: resolvedCurrent.Add(duration)}
@@ -2409,11 +2661,17 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 		resolvedCurrent := period.Start
 		// The DTSTART is an instance even past UNTIL (RFC 5545 §3.8.5.3).
 		if rule.Until != nil && resolvedCurrent.After(*rule.Until) && !current.Equal(recurrenceStart) {
-			return ended()
+			if rule.pastUntilEndsWalk(current) {
+				return ended()
+			}
+			return false
 		}
-		occurrences++
-		if rule.Count > 0 && occurrences > rule.Count {
-			return ended()
+		duplicate := !length.onDate && counter.duplicate(current, resolvedCurrent)
+		if !duplicate {
+			occurrences++
+			if rule.Count > 0 && occurrences > rule.Count {
+				return ended()
+			}
 		}
 		// resolvedCurrent is the slot the rule generated, which is matched
 		// to the slots asked about by where it starts; the shared expansion
@@ -2456,7 +2714,8 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 	// does generate it visits it below like any other candidate.
 	work := expansion.work
 	if work == nil {
-		work = newRecurrenceWork()
+		work = newRecurrenceWork(expansion.pool)
+		defer work.release()
 	}
 	selects := recurrenceBySetPosMaySelect(recurrenceStart, rule)
 	generatesStart := false
@@ -2563,17 +2822,42 @@ func rruleBusyPeriods(component *Component, dtstart time.Time, length seriesLeng
 // recurrenceRuleGeneratesStart reports whether rule itself generates dtstart,
 // which only the period containing it can. overBudget reports that the period
 // was too large to decide within recurrencePeriodWorkLimit.
+//
+// Candidates arrive in the order of their instants, which is the order of their
+// wall clocks except around a gap: a candidate on a skipped local time reads the
+// offset before the gap, so it comes after later wall clocks of its own day. In
+// a zone the search therefore goes on past a candidate whose wall clock is after
+// dtstart's until one reads an instant after dtstart's own, which nothing
+// further on can equal. That is the next candidate unless dtstart lies in a gap.
 func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule, work *recurrenceWork) (generates, overBudget bool) {
 	// A rule with no BY part derives every candidate from the DTSTART itself.
 	if !recurrenceRuleHasOtherByPart(rule) && len(rule.BySetPos) == 0 {
 		return true, false
 	}
+	var startInstant time.Time
+	resolves := false
+	if rule.localTimeExists != nil && rule.resolveCandidate != nil {
+		startInstant, resolves = rule.resolveCandidate(dtstart)
+	}
 	_, overBudget = visitRecurrenceCandidates(recurrencePeriodStart(dtstart, rule), dtstart, rule, work, func(candidate time.Time) bool {
-		if candidate.Before(dtstart) {
+		if candidate.Equal(dtstart) {
+			generates = true
+			return true
+		}
+		if !candidate.After(dtstart) {
 			return false
 		}
-		generates = candidate.Equal(dtstart)
-		return true
+		if rule.localTimeExists == nil {
+			return true
+		}
+		if resolves {
+			if instant, ok := rule.resolveCandidate(candidate); ok {
+				return instant.After(startInstant)
+			}
+		}
+		year, month, day := candidate.Date()
+		startYear, startMonth, startDay := dtstart.Date()
+		return year != startYear || month != startMonth || day != startDay
 	})
 	return generates && !overBudget, overBudget
 }
@@ -2583,9 +2867,9 @@ func recurrenceRuleGeneratesStart(dtstart time.Time, rule recurrenceRule, work *
 // clock, so its candidates are generated on wall clocks, held as UTC fields, and
 // each is resolved through resolver the way the DTSTART was; civil reports that
 // scale. candidateExists, when set, reports whether a candidate's wall clock is
-// a local time the DTSTART's zone has (RFC 5545 §3.3.10), and gaps, when the
-// resolver can list them, where that zone skips local times. Both are set only
-// for a
+// a local time the DTSTART's zone has, and gaps, when the resolver can list
+// them, where that zone skips local times; a candidate on a skipped one is
+// read at the offset before the gap (RFC 5545 §3.3.5). Both are set only for a
 // DATE-TIME carrying a TZID: a UTC value and a DATE name no local time, and a
 // floating value is defined in no zone at all -- the zone RFC 4791 §7.3 reads
 // it in for one request does not make the object's instances depend on that
@@ -2666,12 +2950,15 @@ func existenceFromGaps(exists func(time.Time) bool, gaps localTimeGaps) func(tim
 // reaches remaining, the instances the rule still had to give, the jump may
 // stop short of threshold: the series ends inside it.
 //
-// Each period of such a rule offers one candidate, which is an instance unless
-// it falls on a local time the series' zone skips (RFC 5545 §3.3.10). Where the
-// rule can meet such a time, gaps lists the zone's skipped local times, and
-// each candidate inside one is tested as the period-by-period walk tests it;
-// every candidate outside them exists. ok is false when the rule cannot be
-// jumped this way, and the caller walks its periods.
+// Each period of such a rule offers one candidate, read at the offset before
+// a gap it falls in (RFC 5545 §3.3.5). Where two periods' candidates read the
+// same instant that way, they are one instance, not two (§3.8.5.3): that only
+// happens where the gap's length is a whole number of periods, so the
+// candidate right after it repeats the one inside. Where the rule can meet
+// such a gap, gaps lists the zone's skipped local times, and the candidates
+// inside one are tested for a repeat as the period-by-period walk tests them;
+// every candidate outside a gap is its own instance. ok is false when the
+// rule cannot be jumped this way, and the caller walks its periods.
 func fastForwardCountedSubDailyRecurrence(periodStart, threshold, dtstart time.Time, rule recurrenceRule, remaining int, gaps localTimeGaps) (time.Time, int, bool) {
 	stepSeconds, ok := subDailyRecurrenceSeconds(rule)
 	if !ok || !fixedStepSubDailyRecurrence(rule) || (rule.localTimeExists != nil && gaps == nil) {
@@ -2690,12 +2977,12 @@ func fastForwardCountedSubDailyRecurrence(periodStart, threshold, dtstart time.T
 		// those a gap can take an instance from, so the gaps listed span
 		// the series' end rather than everything up to threshold.
 		steps = min(steps, int64(remaining-passed)+periodsWithinMaxGap(stepSeconds))
-		skipped, ok := skippedSubDailyCandidates(periodStart, steps, stepSeconds, dtstart, rule, gaps)
+		collided, ok := collidingSubDailyCandidates(periodStart, steps, stepSeconds, dtstart, rule, gaps)
 		if !ok {
 			break
 		}
 		periodStart = addSeconds(periodStart, steps*stepSeconds)
-		passed += int(steps) - skipped
+		passed += int(steps) - collided
 	}
 	return periodStart, passed, true
 }
@@ -2724,11 +3011,17 @@ func periodsWithinMaxGap(stepSeconds int64) int64 {
 	return int64(maxLocalTimeGap/time.Second)/stepSeconds + 1
 }
 
-// skippedSubDailyCandidates counts the candidates of the steps periods from
-// periodStart of a fixed-step sub-daily rule that existingLocalTimes leaves
-// out. The candidates are steps apart from the first period's, so only those
-// inside a gap are tested.
-func skippedSubDailyCandidates(periodStart time.Time, steps, stepSeconds int64, dtstart time.Time, rule recurrenceRule, gaps localTimeGaps) (int, bool) {
+// collidingSubDailyCandidates counts the candidates among the steps periods
+// from periodStart of a fixed-step sub-daily rule that read the same instant
+// as the candidate stepSeconds later: one inside a gap whose length is a whole
+// number of periods reads the instant of the first candidate past it (RFC 5545
+// §3.3.5), and the two are one instance (§3.8.5.3).
+//
+// ok is false where the answer needs the per-candidate decisions of the period
+// walk: a gap holding the DTSTART, past which candidates can read before the
+// DTSTART's instant, which no instance may (§3.8.5.3), and a gap whose
+// colliding pair is not wholly within the steps tested.
+func collidingSubDailyCandidates(periodStart time.Time, steps, stepSeconds int64, dtstart time.Time, rule recurrenceRule, gaps localTimeGaps) (int, bool) {
 	firsts := subDailyCandidatesForPeriod(periodStart, dtstart, rule)
 	if len(firsts) != 1 {
 		return 0, false
@@ -2740,22 +3033,38 @@ func skippedSubDailyCandidates(periodStart time.Time, steps, stepSeconds int64, 
 		return 0, false
 	}
 	slices.SortFunc(found, func(a, b LocalTimeGap) int { return a.Start.Compare(b.Start) })
-	skipped := 0
+	collided := 0
+	stepDuration := time.Duration(stepSeconds) * time.Second
 	// tested is the first candidate index no gap has covered yet, so a
 	// candidate inside gaps that overlap is tested once.
 	var tested int64
 	for _, gap := range found {
+		if !dtstart.Before(gap.Start) && dtstart.Before(gap.Start.Add(gap.Length)) {
+			return 0, false
+		}
+		if gap.Length%stepDuration != 0 {
+			continue
+		}
 		from := max(tested, ceilDivide(gap.Start.Unix()-first.Unix(), stepSeconds))
+		if from >= steps {
+			continue
+		}
+		// gapSteps is how many periods later the candidate that reads the
+		// same instant as one inside the gap falls.
+		gapSteps := int64(gap.Length / stepDuration)
 		through := min(steps, ceilDivide(gap.Start.Add(gap.Length).Unix()-first.Unix(), stepSeconds))
+		if through+gapSteps > steps {
+			return 0, false
+		}
 		for index := from; index < through; index++ {
 			candidate := addSeconds(first, index*stepSeconds)
-			if !candidate.Equal(dtstart) && !rule.localTimeExists(candidate) {
-				skipped++
+			if !rule.localTimeExists(candidate) {
+				collided++
 			}
 		}
 		tested = max(tested, through)
 	}
-	return skipped, true
+	return collided, true
 }
 
 // ceilDivide is numerator/denominator rounded toward positive infinity, for a
@@ -3368,9 +3677,10 @@ func componentHasProperty(component *Component, name string) bool {
 // colon, a semicolon or a comma, and some clients quote unconditionally --
 // Exchange writes every TZID that way. The quotes delimit the value rather than
 // belonging to it, so a separator inside them does not start another parameter
-// and they are stripped from what is returned: a caller handed
-// `"America/New_York"` resolves no zone at all and silently places every value
-// it reads a whole UTC offset away from where the property named.
+// and they are stripped from what is returned, along with any white space the
+// quotes themselves enclosed: a caller handed `"America/New_York"` or
+// `" America/New_York"` resolves no zone at all and silently places every
+// value it reads a whole UTC offset away from where the property named.
 func PropertyParam(keyPart, param string) (string, bool) {
 	for _, part := range propertyParameterParts(keyPart) {
 		name, value, found := strings.Cut(part, "=")
@@ -3378,7 +3688,7 @@ func PropertyParam(keyPart, param string) (string, bool) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(name), param) {
-			return unquotePropertyParam(strings.TrimSpace(value)), true
+			return strings.TrimSpace(unquotePropertyParam(strings.TrimSpace(value))), true
 		}
 	}
 	return "", false
@@ -3592,12 +3902,20 @@ type recurrenceRule struct {
 	dayMask *lazyRecurrenceDayMask
 
 	// localTimeExists, when set, reports whether a candidate's wall clock is a
-	// local time the series' zone has. RFC 5545 §3.3.10 requires a candidate
-	// on a time a transition skips to be "ignored" and not "counted as part of
-	// the recurrence set", so visitRecurrenceCandidates never offers one. It is
-	// left nil for a VTIMEZONE observance rule, whose onsets are transitions
-	// stated in the offset they leave rather than instances of a series.
+	// local time the series' zone has; a candidate it reports false for is read
+	// at the offset before the gap (RFC 5545 §3.3.5). It is nil for a VTIMEZONE
+	// observance rule, whose onsets are transitions rather than instances of a
+	// series.
 	localTimeExists func(wall time.Time) bool
+	// resolveCandidate, when set, resolves a candidate's wall clock, held as
+	// the UTC time with the same fields, to the instant it names: the offset
+	// before a gap it falls in, or its first occurrence where it is repeated.
+	resolveCandidate func(wall time.Time) (time.Time, bool)
+	// gaps, when set, lists where the series' zone skips local times, which
+	// lets orderedByInstant order and merge a batch's candidates by instant
+	// without resolving them. It is nil where the resolver can say whether a
+	// wall clock exists but not list the gaps.
+	gaps localTimeGaps
 }
 
 type weekdaySpecifier struct {
@@ -3936,16 +4254,22 @@ func recurrencePeriodStart(dtstart time.Time, rule recurrenceRule) time.Time {
 }
 
 // weekNumberedPeriodYear is the year of the yearly period a series begins
-// with. A BYWEEKNO period generates its year's numbered weeks, which can begin
-// up to three days before January 1 and end up to three days after December
-// 31, so the year whose weeks hold a DTSTART near the turn of the year can be
-// the one before or after its calendar year. With an INTERVAL of one every year
-// is a period of the series, and the series begins with that week-numbering
-// year: begun with the calendar year, the period after it would generate the
-// DTSTART a second time, counted against COUNT, and the period before it,
-// never visited, would leave out the days its last week holds after the
-// DTSTART. A longer INTERVAL counts from the DTSTART's calendar year, whose
-// neighbours are not periods of the series.
+// with. RFC 5545 §3.3.10 does not say, for a YEARLY rule naming BYWEEKNO,
+// which year a period's candidates spill into at the turn of the year: a
+// BYWEEKNO period generates its year's numbered weeks, which can begin up to
+// three days before January 1 and end up to three days after December 31, so
+// the year whose weeks hold a DTSTART near the turn of the year can be the
+// one before or after its calendar year. python-dateutil and libical both
+// take the calendar year's own days there instead of the week-numbering
+// year's; CalCard keeps the week-numbering year, so a period's spill-over
+// days are the ones its own BYWEEKNO and BYSETPOS number, not a neighbouring
+// period's. With an INTERVAL of one every year is a period of the series, and
+// the series begins with that week-numbering year: begun with the calendar
+// year, the period after it would generate the DTSTART a second time, counted
+// against COUNT, and the period before it, never visited, would leave out the
+// days its last week holds after the DTSTART. A longer INTERVAL counts from
+// the DTSTART's calendar year, whose neighbours are not periods of the
+// series.
 func weekNumberedPeriodYear(dtstart time.Time, rule recurrenceRule) int {
 	year := dtstart.Year()
 	if len(rule.ByWeekNo) == 0 || rule.Interval > 1 {
@@ -4143,24 +4467,174 @@ const recurrencePeriodWorkLimit = 100_000
 // can ask for to a few tenths of a second.
 const recurrenceWorkLimit = 2_000_000
 
-// recurrenceWork is the budget one evaluation of a rule draws on.
-type recurrenceWork struct {
-	remaining int
+// workSource is a budget a recurrenceWork draws from in chunks: a RequestWork
+// shared by every evaluation of a request, or the recurrenceWork of the
+// reading an evaluation is part of.
+type workSource interface {
+	// draw removes up to want, and returns how many it removed; the caller
+	// needs at least need of them.
+	draw(want, need int) int
+	// refund returns units drawn and not spent.
+	refund(units int)
+	// short reports that a draw on the source was granted less than it needed
+	// because the request's pool at the root of the chain of sources could not
+	// give it, and not because a limit of a budget between did not allow it.
+	short() bool
 }
 
-func newRecurrenceWork() *recurrenceWork {
-	return &recurrenceWork{remaining: recurrenceWorkLimit}
+// recurrenceWork is the budget one evaluation of a rule draws on: remaining
+// caps what this evaluation alone may spend, and source, when set, additionally
+// caps what it and every other evaluation drawing on the same source spend
+// together.
+type recurrenceWork struct {
+	remaining int
+	// limit is what remaining started as.
+	limit  int
+	source workSource
+	// held is units drawn from source and not yet spent.
+	held int
+	// spent is what the budget had spent when it first refused.
+	spent int
+	// starved reports that the last refusal came from source running out,
+	// rather than remaining: a rule refused for that reason has not been
+	// shown to exceed recurrenceWorkLimit, only to be unaffordable to the
+	// reading or request this evaluation is part of, and a later evaluation
+	// with a budget of its own may still succeed where this one did not.
+	starved bool
+	// requestStarved is starved narrowed to the request's pool: the last refusal
+	// came from source running out, and source was refused by the pool its
+	// own chain of sources ends in rather than by a limit of its own.
+	requestStarved bool
+	// poolShort reports that a draw on source was granted less than it needed
+	// by the request's pool.
+	poolShort bool
+}
+
+// newRecurrenceWork is the budget for one evaluation of a rule, capped at
+// recurrenceWorkLimit and also drawing on pool when it is not nil. The caller
+// releases it when the evaluation is done, which returns the units drawn and
+// not spent: a request of many cheap evaluations is charged what they spent,
+// not a chunk apiece.
+func newRecurrenceWork(pool *RequestWork) *recurrenceWork {
+	work := &recurrenceWork{remaining: recurrenceWorkLimit, limit: recurrenceWorkLimit}
+	if pool != nil {
+		work.source = pool
+	}
+	return work
+}
+
+// evaluation returns a budget for one evaluation of a rule, capped at limit
+// and drawing on w, so that what the evaluation spends is spent by w's holder
+// as well. The caller releases it when the evaluation is done.
+func (w *recurrenceWork) evaluation(limit int) *recurrenceWork {
+	return &recurrenceWork{remaining: limit, limit: limit, source: w}
+}
+
+// used is what the budget has spent.
+func (w *recurrenceWork) used() int {
+	if w.remaining < 0 {
+		return w.spent
+	}
+	return w.limit - w.remaining
+}
+
+// release returns to the source the units drawn and not spent.
+func (w *recurrenceWork) release() {
+	if w.source != nil && w.held > 0 {
+		w.source.refund(w.held)
+		w.held = 0
+	}
 }
 
 // spend takes units from the budget and reports whether it held them. A budget
 // that has refused once stays exhausted.
 func (w *recurrenceWork) spend(units int) bool {
-	if units > w.remaining {
-		w.remaining = -1
+	if units <= w.remaining {
+		if w.source == nil {
+			w.remaining -= units
+			return true
+		}
+		if units <= w.held || w.fill(units) {
+			w.held -= units
+			w.remaining -= units
+			return true
+		}
+		w.refuse(true)
 		return false
 	}
-	w.remaining -= units
+	w.refuse(false)
+	return false
+}
+
+// refuse ends the budget, for source running out when starved and otherwise for
+// its own limit.
+func (w *recurrenceWork) refuse(starved bool) {
+	if w.remaining >= 0 {
+		w.spent = w.limit - w.remaining
+	}
+	w.remaining = -1
+	if starved {
+		w.starved = true
+		w.requestStarved = w.source.short()
+	}
+}
+
+// fill draws from the source, a chunk at a time, until w holds units, and
+// reports whether it does.
+func (w *recurrenceWork) fill(units int) bool {
+	for w.held < units {
+		want := max(units-w.held, min(requestWorkChunk, w.remaining-w.held))
+		got := w.source.draw(want, units-w.held)
+		if got == 0 {
+			return false
+		}
+		w.held += got
+	}
 	return true
+}
+
+// draw lets w be the source of an evaluation within the reading it budgets. It
+// holds nothing back: what the evaluation takes comes from w's own source at
+// once, and what it returns goes back there, so a reading that has finished
+// holds no part of its request's pool.
+func (w *recurrenceWork) draw(want, need int) int {
+	units := min(want, w.remaining)
+	if units <= 0 {
+		return 0
+	}
+	if w.source != nil {
+		granted := w.source.draw(units, need)
+		if granted < min(units, need) && w.source.short() {
+			w.poolShort = true
+		}
+		units = granted
+	}
+	w.remaining -= units
+	return units
+}
+
+// short reports that the pool of the request w draws on refused it work it
+// needed. A refusal by a limit of w's own is not one.
+func (w *recurrenceWork) short() bool {
+	return w.poolShort
+}
+
+// refund returns units an evaluation drew and did not spend. A budget that
+// has refused stays exhausted, but its source gets the units back all the same.
+func (w *recurrenceWork) refund(units int) {
+	if w.remaining >= 0 {
+		w.remaining += units
+	}
+	if w.source != nil {
+		w.source.refund(units)
+	}
+}
+
+// poolStarved reports that spend's last refusal came from the budget's source
+// running out rather than this evaluation's own recurrenceWorkLimit. Only a
+// refusal by the request's pool is a requestStarved one.
+func (w *recurrenceWork) poolStarved() bool {
+	return w.starved
 }
 
 // visitRecurrenceCandidates hands visit each of the period's candidate starts in
@@ -4186,9 +4660,9 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 		if !work.spend(len(candidates)) {
 			return false, true
 		}
-		candidates = rule.existingLocalTimes(candidates, dtstart)
 		sortTimes(candidates)
-		for _, candidate := range uniqueTimes(candidates) {
+		candidates = rule.orderedByInstant(uniqueTimes(candidates), dtstart)
+		for _, candidate := range candidates {
 			if selector.offer(candidate) {
 				return true, false
 			}
@@ -4251,9 +4725,9 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 				}
 			}
 		}
-		dayTimes = rule.existingLocalTimes(dayTimes, dtstart)
 		sortTimes(dayTimes)
-		for _, candidate := range uniqueTimes(dayTimes) {
+		dayTimes = rule.orderedByInstant(uniqueTimes(dayTimes), dtstart)
+		for _, candidate := range dayTimes {
 			if selector.offer(candidate) {
 				return true, false
 			}
@@ -4265,24 +4739,110 @@ func visitRecurrenceCandidates(periodStart, dtstart time.Time, rule recurrenceRu
 	return selector.finish(), false
 }
 
-// existingLocalTimes drops the candidates whose wall clock the series' zone
-// skips, per recurrenceRule.localTimeExists, reusing the slice. They are dropped
-// before BYSETPOS numbers the period, just as appendValidTime drops an invalid
-// date before it: §3.3.10 treats the two alike, and the idiom
-// BYMONTHDAY=28,29,30,31;BYSETPOS=-1 for "the last day of the month" relies on
-// BYSETPOS counting only the instances that exist. The DTSTART is kept whatever
-// it names, being the first instance of the set (§3.8.5.3).
-func (rule recurrenceRule) existingLocalTimes(candidates []time.Time, dtstart time.Time) []time.Time {
-	if rule.localTimeExists == nil {
+// precedesStart reports whether candidate, a wall clock, is before the series
+// that starts at dtstart. One before dtstart's wall clock precedes the series
+// unless it is on a local time the zone skips: such a candidate is read at the
+// offset before the gap (RFC 5545 §3.3.5), which can be after dtstart's own
+// instant when dtstart lies past the gap. A caller keeps those and compares the
+// instants.
+func (rule recurrenceRule) precedesStart(candidate, dtstart time.Time) bool {
+	return candidate.Before(dtstart) && (rule.localTimeExists == nil || rule.localTimeExists(candidate))
+}
+
+// orderedByInstant orders candidates, sorted and unique by wall clock, by the
+// instant each resolves to, and merges those that share one. A gap puts the
+// candidates inside it out of wall order with the ones past it, and RFC 5545
+// §3.3.10 numbers BYSETPOS over the period's instances. A candidate on a
+// skipped wall clock is read at the offset before the gap (§3.3.5); of two at
+// one instant (§3.8.5.3) the one kept is the one equal to dtstart if either
+// is, the set's first instance. The order comes from the zone's gaps when they
+// can be listed, else from resolving each candidate once.
+func (rule recurrenceRule) orderedByInstant(candidates []time.Time, dtstart time.Time) []time.Time {
+	if rule.localTimeExists == nil || rule.resolveCandidate == nil {
 		return candidates
 	}
-	kept := candidates[:0]
+	hasGap := false
 	for _, candidate := range candidates {
-		if candidate.Equal(dtstart) || rule.localTimeExists(candidate) {
-			kept = append(kept, candidate)
+		if !rule.localTimeExists(candidate) {
+			hasGap = true
+			break
 		}
 	}
-	return kept
+	if !hasGap {
+		return candidates
+	}
+	if rule.gaps != nil {
+		if keys, ok := candidateInstantKeys(candidates, rule.gaps); ok {
+			return mergeCandidatesByKey(candidates, keys, dtstart)
+		}
+	}
+	resolved := make([]time.Time, len(candidates))
+	for i, candidate := range candidates {
+		if instant, ok := rule.resolveCandidate(candidate); ok {
+			resolved[i] = instant
+		} else {
+			resolved[i] = candidate
+		}
+	}
+	return mergeCandidatesByKey(candidates, resolved, dtstart)
+}
+
+// candidateInstantKeys orders the sorted candidates as the instants they
+// resolve to order them, without resolving any: a gap carries every local time
+// at or past its end forward by its length, so a candidate's key is its wall
+// clock less the lengths of the gaps it is at or past the end of, and two
+// candidates share a key exactly when they share an instant. ok is false when
+// the zone's gaps cannot be listed that far.
+func candidateInstantKeys(candidates []time.Time, gaps localTimeGaps) ([]time.Time, bool) {
+	found, ok := gaps(candidates[0].Add(-maxLocalTimeGap), candidates[len(candidates)-1])
+	if !ok {
+		return nil, false
+	}
+	slices.SortFunc(found, func(a, b LocalTimeGap) int { return a.Start.Compare(b.Start) })
+	keys := make([]time.Time, len(candidates))
+	var passed time.Duration
+	gapIndex := 0
+	for i, candidate := range candidates {
+		for gapIndex < len(found) && !candidate.Before(found[gapIndex].Start.Add(found[gapIndex].Length)) {
+			passed += found[gapIndex].Length
+			gapIndex++
+		}
+		keys[i] = candidate.Add(-passed)
+	}
+	return keys, true
+}
+
+// mergeCandidatesByKey reorders candidates by key, ascending, merging the
+// ones that share a key into one: of such a pair, the one kept is the one
+// equal to dtstart if either is, so a caller comparing a later candidate
+// against dtstart's own wall clock still finds it. candidates and keys are
+// the same length.
+func mergeCandidatesByKey(candidates, keys []time.Time, dtstart time.Time) []time.Time {
+	order := make([]int, len(candidates))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		if c := keys[a].Compare(keys[b]); c != 0 {
+			return c
+		}
+		switch {
+		case candidates[a].Equal(dtstart):
+			return -1
+		case candidates[b].Equal(dtstart):
+			return 1
+		default:
+			return 0
+		}
+	})
+	merged := make([]time.Time, 0, len(candidates))
+	for i, idx := range order {
+		if i > 0 && keys[order[i-1]].Equal(keys[idx]) {
+			continue
+		}
+		merged = append(merged, candidates[idx])
+	}
+	return merged
 }
 
 // bySetPosSelector applies BYSETPOS to a streamed period.

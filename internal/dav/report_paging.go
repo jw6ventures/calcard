@@ -7,9 +7,9 @@ import (
 )
 
 // collectBoundedPages drains a keyset-paged repository read into one slice
-// under a report's candidate-row budget: a page at a time, so the resident cost
-// is a page rather than the whole collection, and past the budget the report
-// cannot answer over the complete set, which is errTooManyCandidateRows. It is
+// under a report's candidate-row budget: a page at a time, so no repository
+// call returns more than a page, and past the budget the report cannot answer
+// over the complete set, which is errTooManyCandidateRows. It is
 // for the reports that need the complete set before they can answer;
 // calendarQuery pages against the same budget inline instead, since it stops on
 // the response count as it builds.

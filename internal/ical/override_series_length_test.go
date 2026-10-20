@@ -29,7 +29,7 @@ func TestRecurringBusyPeriodsScalesWithOverridesWrittenBeforeTheirMaster(t *test
 	dtstart := time.Date(2020, 1, 1, 9, 0, 0, 0, time.UTC)
 	expand := func(t *testing.T, raw string) []BusyPeriod {
 		t.Helper()
-		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 1, 0), MaxRecurrenceInstances, nil)
+		periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, dtstart, dtstart.AddDate(0, 1, 0), MaxRecurrenceInstances, nil, nil)
 		if err != nil {
 			t.Fatalf("RecurringBusyPeriods() err = %v", err)
 		}

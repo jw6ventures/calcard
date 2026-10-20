@@ -25,7 +25,7 @@ type validatedCalendarObject struct {
 // an object the store already holds, go through
 // validateTransferredCalendarObject.
 func validateCalendarObjectForStorage(raw string, cal *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault) {
-	return validateCalendarObjectReadAs(raw, cal, readSubmitted)
+	return validateCalendarObjectReadAs(raw, cal, readSubmitted, nil)
 }
 
 // validateTransferredCalendarObject is validateCalendarObjectForStorage for an
@@ -37,22 +37,56 @@ func validateCalendarObjectForStorage(raw string, cal *store.CalendarAccess) (*v
 // change the ETag of every member a collection MOVE carries. Nor is its UID
 // held to store.MaxIdentifierOctets: the store already holds it, and a longer
 // UID a 1.1.x release stored must still be copyable and movable.
-func validateTransferredCalendarObject(raw string, cal *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault) {
-	return validateCalendarObjectReadAs(raw, cal, readTransferred)
+//
+// pool is the budget the object's recurrence and observance work draws on
+// when it is one of many validated for one request, as a collection transfer's
+// members are; nil gives the object a pool of its own.
+func validateTransferredCalendarObject(raw string, cal *store.CalendarAccess, pool *ical.RequestWork) (*validatedCalendarObject, *calendarObjectFault) {
+	return validateCalendarObjectReadAs(raw, cal, readTransferred, pool)
 }
 
-func validateCalendarObjectReadAs(raw string, cal *store.CalendarAccess, reading icalReading) (*validatedCalendarObject, *calendarObjectFault) {
+// validateCalendarObjectReadAs validates raw as reading reads it. Both of its
+// readings of the object, the parsed tree's and the ObjectTimes' that the
+// analysis and the recurrence check go through, draw on pool, so what one
+// object may cost is bounded as a whole and not once per reading.
+//
+// A reading that pool ran out on while it followed a zone the object defines
+// read that zone as UTC, so what either reading answered may be wrong, the
+// metadata it produced included. An object whose pool ran out with either
+// reading starved is therefore refused with max-instances, as one whose
+// recurrence exceeds the work a validation may spend is, whatever else the
+// validation found. A reading that stopped at its own limit with the pool
+// still funded is not: it stops there on any pool, so its answer does not
+// depend on this one.
+func validateCalendarObjectReadAs(raw string, cal *store.CalendarAccess, reading icalReading, pool *ical.RequestWork) (*validatedCalendarObject, *calendarObjectFault) {
 	if int64(len(raw)) > maxDAVBodyBytes {
 		return nil, &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-resource-size"}}
 	}
 	stored := raw
 	raw = ical.TrimByteOrderMark(raw)
 
+	if pool == nil {
+		pool = ical.NewRequestWork(nil, ical.ObjectWorkBudget)
+	}
 	lines := ical.UnfoldLines(raw)
 	root, err := parseICalendarTree(lines, reading)
 	if err != nil {
 		return nil, invalidCalendarData()
 	}
+	root.drawOn(pool)
+	times := ical.NewObjectTimes(lines, sharedTimezoneOnsets, pool)
+	validated, fault := validateReadCalendarObject(raw, stored, lines, root, times, cal, reading)
+	if pool.Exhausted() && (times.Starved() || root.submittedZones().work.Starved()) {
+		return nil, &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-instances"}}
+	}
+	return validated, fault
+}
+
+// validateReadCalendarObject is the validation of a parsed calendar object,
+// raw less its byte order mark and stored as the store holds it, through the
+// tree root and the dates times resolves. It does not know whether either
+// reading was starved of the pool; validateCalendarObjectReadAs does.
+func validateReadCalendarObject(raw, stored string, lines []string, root *icalNode, times *ical.ObjectTimes, cal *store.CalendarAccess, reading icalReading) (*validatedCalendarObject, *calendarObjectFault) {
 	if fault := validateCalendarObject(root); fault != nil {
 		return nil, fault
 	}
@@ -61,7 +95,6 @@ func validateCalendarObjectReadAs(raw string, cal *store.CalendarAccess, reading
 			return nil, fault
 		}
 	}
-	times := ical.NewObjectTimesSharingOnsets(lines, sharedTimezoneOnsets)
 	analysis, err := analyzeUnfoldedICalendar(raw, lines, times)
 	if err != nil {
 		return nil, invalidCalendarData()

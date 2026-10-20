@@ -153,7 +153,7 @@ func TestVisitRecurrenceInstancesAndSlotsMatchesSlotsByWhereTheyStart(t *testing
 				t.Fatal("unreadable DTSTART")
 			}
 			got, _ := VisitRecurrenceInstancesAndSlots(raw, "VEVENT", resolved, tt.duration, at(tt.from), at(tt.to),
-				MaxRecurrenceInstances, nil, tt.ids, func(i int) bool { return !tt.unneeded[i] }, func(RecurrenceInstance) bool { return tt.stopsFirst })
+				MaxRecurrenceInstances, nil, tt.ids, func(i int) bool { return !tt.unneeded[i] }, nil, func(RecurrenceInstance) bool { return tt.stopsFirst })
 			if len(got) != len(tt.ids) {
 				t.Fatalf("answered %d slots, want %d", len(got), len(tt.ids))
 			}

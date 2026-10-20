@@ -28,7 +28,7 @@ func TestV11GeneratedDefinitionsReadAsTheHostZone(t *testing.T) {
 	if len(timezones) != 1 || !timezones[0].HostDefinition {
 		t.Fatalf("TimezoneComponents() = %+v, want the v1.1 definition read as the server's", timezones)
 	}
-	got, ok := NewObjectTimes(lines).ResolvePropertyTime("DTSTART;TZID=America/New_York", "20260705T100000")
+	got, ok := NewObjectTimes(lines, nil, nil).ResolvePropertyTime("DTSTART;TZID=America/New_York", "20260705T100000")
 	if want, _ := ParseDateTime("20260705T140000Z"); !ok || !got.Equal(want) {
 		t.Errorf("2026-07-05 10:00 in America/New_York = %v (%v), want %v", got, ok, want)
 	}
@@ -36,7 +36,7 @@ func TestV11GeneratedDefinitionsReadAsTheHostZone(t *testing.T) {
 	// A zone the host does not define has no other definition than the
 	// object's, whatever its shape.
 	custom := objectWithTimezone(strings.Split(strings.ReplaceAll(legacyNewYork2025, "America/New_York", "Custom/Zone"), "\r\n")...)
-	got, ok = NewObjectTimes(custom).ResolvePropertyTime("DTSTART;TZID=Custom/Zone", "20260705T100000")
+	got, ok = NewObjectTimes(custom, nil, nil).ResolvePropertyTime("DTSTART;TZID=Custom/Zone", "20260705T100000")
 	if want, _ := ParseDateTime("20260705T150000Z"); !ok || !got.Equal(want) {
 		t.Errorf("2026-07-05 10:00 in Custom/Zone = %v (%v), want %v", got, ok, want)
 	}

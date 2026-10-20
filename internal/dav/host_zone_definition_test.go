@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -260,7 +261,7 @@ func TestServerReadsAHostDefinitionByTheHostsDatabase(t *testing.T) {
 	}
 	tr := &timeRange{Start: "20260105T000000Z", End: "20260106T000000Z"}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(),
-		freeBusyCandidates([]store.Event{{UID: "stored", RawICAL: raw}}, floatingZone{}), tr))
+		freeBusyCandidates([]store.Event{{UID: "stored", RawICAL: raw}}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{"FREEBUSY:20260105T140000Z/20260105T150000Z"})
 
 	// A write of it replaces the definition with the host's.
@@ -276,26 +277,106 @@ func TestServerReadsAHostDefinitionByTheHostsDatabase(t *testing.T) {
 	}
 }
 
+// Only a marker value of TRUE, compared without regard to case after
+// trimming white space, has the server speak for the host's database about a
+// definition; FALSE, an empty value or any other spelling leaves it the
+// object's own, read and stored as written. The validator (through PUT,
+// which is also how the REST API and the UI editor write) and the report
+// matcher (readsAt) must agree on which it is.
+func TestHostDefinitionMarkerOnlyTrueCountsAsTheServers(t *testing.T) {
+	requireHostZones(t, "America/New_York")
+	generated := hostVTimezone(t, "America/New_York", time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC), time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC))
+	outdated := strings.NewReplacer("TZOFFSETFROM:-0500", "TZOFFSETFROM:-0600", "TZOFFSETTO:-0500", "TZOFFSETTO:-0600").Replace(generated)
+	if outdated == generated {
+		t.Fatalf("the New York definition states no -0500 offset:\n%s", generated)
+	}
+	hostsWant := time.Date(2026, 1, 5, 14, 0, 0, 0, time.UTC)
+	writtenWant := time.Date(2026, 1, 5, 15, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		marker string
+		speaks bool // whether the marker has the server speak for the host's database
+	}{
+		{"TRUE", true},
+		{"FALSE", false},
+		{"false", false},
+		{"", false},
+		{" TRUE ", true},
+		{"garbage", false},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("marker %q", tt.marker), func(t *testing.T) {
+			timezone := strings.Replace(outdated, ical.HostDefinitionProperty+":TRUE\r\n",
+				ical.HostDefinitionProperty+":"+tt.marker+"\r\n", 1)
+			if !strings.Contains(timezone, ical.HostDefinitionProperty+":"+tt.marker+"\r\n") {
+				t.Fatalf("marker property not substituted in\n%s", timezone)
+			}
+			raw := buildCalendarObject(timezone, buildComponent("VEVENT", "UID:stored", "DTSTAMP:20250101T000000Z",
+				"DTSTART;TZID=America/New_York:20260105T090000", "DTEND;TZID=America/New_York:20260105T100000"))
+
+			want := writtenWant
+			if tt.speaks {
+				want = hostsWant
+			}
+			if got := readsAt(t, raw); !got.Equal(want) {
+				t.Errorf("matcher places the event at %s, want %s", got, want)
+			}
+
+			validated, fault := validateCalendarObjectForStorage(raw, nil)
+			if fault != nil {
+				t.Fatalf("refused: %+v", fault)
+			}
+			replaced := !strings.Contains(validated.Body, "-0600")
+			if replaced != tt.speaks {
+				t.Errorf("the outdated offset was replaced = %v, want %v", replaced, tt.speaks)
+			}
+			if got := readsAt(t, clientReading(validated.Body)); !got.Equal(want) {
+				t.Errorf("the stored object places the event at %s for a client, want %s", got, want)
+			}
+		})
+	}
+}
+
 // Exchange and scripts write UTC times as TZID=UTC. The name places a time
-// where a UTC value does for every reader, so the object needs no definition
-// for it: it is stored as sent, with its ETag, and read in UTC.
-func TestUTCTZIDIsStoredAsSentAndReadInUTC(t *testing.T) {
-	for _, tzid := range []string{"UTC", "Etc/UTC"} {
-		t.Run(tzid, func(t *testing.T) {
-			requireHostZones(t, tzid)
+// where a UTC value does for every reader, so the write path rewrites it to
+// that value's own UTC form and withholds the ETag, since the stored body
+// then differs from the one sent. Etc/UTC is read the same way, but DAVx5
+// reads it correctly as it is, so it needs no rewrite: it is stored as sent,
+// with its ETag.
+func TestUTCTZIDIsRewrittenEtcUTCIsStoredAsSent(t *testing.T) {
+	for _, tt := range []struct {
+		tzid      string
+		rewritten bool
+	}{
+		{tzid: "UTC", rewritten: true},
+		{tzid: "Etc/UTC", rewritten: false},
+	} {
+		t.Run(tt.tzid, func(t *testing.T) {
+			requireHostZones(t, tt.tzid)
 			h, eventRepo := writableCalendarServer()
 			raw := producerObject("VEVENT", "UID:utc", "DTSTAMP:20250101T000000Z",
-				"DTSTART;TZID="+tzid+":20260105T090000", "DTEND;TZID="+tzid+":20260105T100000")
+				"DTSTART;TZID="+tt.tzid+":20260105T090000", "DTEND;TZID="+tt.tzid+":20260105T100000")
 			rr := putCalendarObject(t, h, "utc.ics", raw)
 			if rr.Code != http.StatusCreated {
 				t.Fatalf("PUT = %d: %s", rr.Code, rr.Body.String())
 			}
-			if rr.Header().Get("ETag") == "" {
-				t.Error("PUT withheld the ETag of an object it should store as sent")
-			}
 			stored := storedEventByUID(eventRepo, "utc").RawICAL
-			if stored != raw {
-				t.Fatalf("stored\n%s\nwant the object as sent", stored)
+			if tt.rewritten {
+				if rr.Header().Get("ETag") != "" {
+					t.Error("PUT returned an ETag for a body it rewrote")
+				}
+				wantStored := producerObject("VEVENT", "UID:utc", "DTSTAMP:20250101T000000Z",
+					"DTSTART:20260105T090000Z", "DTEND:20260105T100000Z")
+				if stored != wantStored {
+					t.Fatalf("stored\n%s\nwant the rewritten body\n%s", stored, wantStored)
+				}
+			} else {
+				if rr.Header().Get("ETag") == "" {
+					t.Error("PUT withheld the ETag of an object it should store as sent")
+				}
+				if stored != raw {
+					t.Fatalf("stored\n%s\nwant the object as sent", stored)
+				}
 			}
 
 			want := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
@@ -461,7 +542,7 @@ func TestHostDefinitionsChangeNothingTheValidatorReads(t *testing.T) {
 			read := func(body string) (calendarAnalysis, [2]bool) {
 				t.Helper()
 				lines := ical.UnfoldLines(body)
-				times := ical.NewObjectTimesSharingOnsets(lines, sharedTimezoneOnsets)
+				times := ical.NewObjectTimes(lines, sharedTimezoneOnsets, nil)
 				analysis, err := analyzeUnfoldedICalendar(body, lines, times)
 				if err != nil {
 					t.Fatalf("analysis: %v", err)
@@ -565,7 +646,10 @@ func TestUnfollowableDefinitionOfAHostZoneIsReadThroughTheHostZone(t *testing.T)
 		t.Errorf("matcher places the event at %s, want the host's %s", got, want)
 	}
 	for name, validate := range map[string]func(string, *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault){
-		"submitted": validateCalendarObjectForStorage, "transferred": validateTransferredCalendarObject,
+		"submitted": validateCalendarObjectForStorage,
+		"transferred": func(raw string, cal *store.CalendarAccess) (*validatedCalendarObject, *calendarObjectFault) {
+			return validateTransferredCalendarObject(raw, cal, nil)
+		},
 	} {
 		validated, fault := validate(raw, nil)
 		if fault != nil {

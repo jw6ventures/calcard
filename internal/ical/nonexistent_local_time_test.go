@@ -3,6 +3,8 @@ package ical
 import (
 	"errors"
 	"fmt"
+	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -77,15 +79,16 @@ func utcStrings(values []time.Time) []string {
 	return out
 }
 
-// RFC 5545 §3.3.10: "Recurrence rules may generate recurrence instances with
-// an invalid date ... or nonexistent local time ... Such recurrence instances
-// MUST be ignored and MUST NOT be counted as part of the recurrence set." A
-// COUNT series in a zone whose clocks skip its time of day therefore ends one
-// occurrence later, while the DTSTART -- the first instance whatever it names
-// (§3.8.5.3) -- and an RDATE, which no rule generated, keep the §3.3.5 reading.
-func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
+// A recurrence instance on a local time a transition skips is read at the
+// offset before the gap (RFC 5545 §3.3.5) and counted like any other
+// instance, as the DTSTART -- the first instance whatever it names
+// (§3.8.5.3) -- and an RDATE are. Where that reading repeats the instant of
+// another candidate, the two are one instance, not two (§3.8.5.3 "duplicate
+// instances are ignored").
+func TestRecurrenceMovesInstancesForwardOnSkippedLocalTimes(t *testing.T) {
 	requireHostZone(t, "Europe/Berlin")
 	requireHostZone(t, "America/New_York")
+	requireHostZone(t, "Australia/Lord_Howe")
 	berlin := requireHostZone(t, "Europe/Berlin")
 	private := privateZoneResolver{tzid: "Private/Berlin", loc: berlin}
 	floatingInBerlin := PropertyTimeResolver(func(keyPart, value string) (time.Time, bool) {
@@ -105,18 +108,18 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 		{
 			name:  "weekly Sunday 02:30 across the Berlin spring change, host zone",
 			lines: []string{"DTSTART;TZID=Europe/Berlin:20260315T023000", "RRULE:FREQ=WEEKLY;COUNT=4"},
-			want:  utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-04-05T00:30:00Z", "2026-04-12T00:30:00Z"),
+			want:  utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"),
 		},
 		{
 			name:    "weekly Sunday 02:30 across the spring change, zone the object defines",
 			lines:   []string{"DTSTART;TZID=Private/Berlin:20260315T023000", "RRULE:FREQ=WEEKLY;COUNT=4"},
 			resolve: private,
-			want:    utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-04-05T00:30:00Z", "2026-04-12T00:30:00Z"),
+			want:    utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"),
 		},
 		{
 			name:  "weekly Sunday 02:30 with BYDAY across the spring change",
 			lines: []string{"DTSTART;TZID=Europe/Berlin:20260315T023000", "RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=4"},
-			want:  utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-04-05T00:30:00Z", "2026-04-12T00:30:00Z"),
+			want:  utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"),
 		},
 		{
 			name:  "a repeated 02:30 stays, as its first occurrence",
@@ -126,7 +129,7 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 		{
 			name:  "daily 02:30 across the New York spring change",
 			lines: []string{"DTSTART;TZID=America/New_York:20260307T023000", "RRULE:FREQ=DAILY;COUNT=3"},
-			want:  utcInstants("2026-03-07T07:30:00Z", "2026-03-09T06:30:00Z", "2026-03-10T06:30:00Z"),
+			want:  utcInstants("2026-03-07T07:30:00Z", "2026-03-08T07:30:00Z", "2026-03-09T06:30:00Z"),
 		},
 		{
 			name:  "a DTSTART on the skipped time is still the first instance",
@@ -139,15 +142,21 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 			want:  utcInstants("2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z", "2026-04-12T00:30:00Z"),
 		},
 		{
-			name: "an RDATE on the skipped time is kept",
+			// The RRULE's own second instance names the same slot the RDATE
+			// does, so the RDATE adds nothing past what the rule generates.
+			name: "an RDATE on the already-generated skipped time adds nothing",
 			lines: []string{
 				"DTSTART;TZID=Europe/Berlin:20260322T023000", "RRULE:FREQ=WEEKLY;COUNT=2",
 				"RDATE;TZID=Europe/Berlin:20260329T023000",
 			},
-			want: utcInstants("2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z"),
+			want: utcInstants("2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z"),
 		},
 		{
-			name:  "an hourly series is counted past the skipped hour",
+			// The hour inside the gap and the hour right after it read the
+			// same instant, so the series still counts four in five hours of
+			// wall clock -- the same set a drop would have produced, since an
+			// hourly step is exactly the gap's length.
+			name:  "an hourly series merges the hour a collision produces",
 			lines: []string{"DTSTART;TZID=Europe/Berlin:20260329T003000", "RRULE:FREQ=HOURLY;COUNT=4"},
 			want:  utcInstants("2026-03-28T23:30:00Z", "2026-03-29T00:30:00Z", "2026-03-29T01:30:00Z", "2026-03-29T02:30:00Z"),
 		},
@@ -171,12 +180,94 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 			want:  utcInstants("2026-01-30T08:00:00Z", "2026-03-30T07:00:00Z", "2026-04-30T07:00:00Z"),
 		},
 		{
-			// BYSETPOS numbers the instances that exist, as it numbers only
-			// the valid dates of BYMONTHDAY=28,29,30,31;BYSETPOS=-1, so the
-			// last Sunday at 02:30 in March 2026 Berlin is the 22nd.
-			name:  "BYSETPOS selects among the instances that exist",
+			// 02:45 on the New York spring change is skipped and reads 03:45
+			// EDT, the instant the rule's own 03:45 also names, so the two
+			// are one instance -- and it follows the 03:15 DTSTART, so it is
+			// in the set, read at that existing 03:45.
+			name:  "a skipped candidate merged into a later existing time on the DTSTART's day",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=DAILY;BYHOUR=2,3;BYMINUTE=15,45;COUNT=6"},
+			want: utcInstants("2026-03-08T07:15:00Z", "2026-03-08T07:45:00Z",
+				"2026-03-09T06:15:00Z", "2026-03-09T06:45:00Z", "2026-03-09T07:15:00Z", "2026-03-09T07:45:00Z"),
+		},
+		{
+			// Lord Howe skips 02:00-02:30 on 4 October 2026, so the 02:15
+			// DTSTART reads 15:45Z at +10:30, after the 02:30 candidate's
+			// 15:30Z at +11:00, which therefore precedes the series. The
+			// DTSTART is the rule's own 02:15 candidate and is counted once.
+			name:  "a DTSTART on a skipped time the rule generates, after a later wall clock's instant",
+			lines: []string{"DTSTART;TZID=Australia/Lord_Howe:20261004T021500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=15,30;COUNT=3"},
+			want:  utcInstants("2026-10-03T15:45:00Z", "2026-10-04T15:15:00Z", "2026-10-04T15:30:00Z"),
+		},
+		{
+			// 02:45 on the New York spring change reads 07:45Z, after the
+			// 03:15 EDT DTSTART's 07:15Z though its wall clock is before it,
+			// and nothing else in the rule names that instant.
+			name:  "a skipped candidate before the DTSTART's wall clock but after its instant",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=45;COUNT=3"},
+			want:  utcInstants("2026-03-08T07:15:00Z", "2026-03-08T07:45:00Z", "2026-03-09T06:45:00Z"),
+		},
+		{
+			// The rule's 02:45 reads the DTSTART's own 03:45 EDT instant, so
+			// it is the DTSTART again and not a second instance.
+			name:  "a skipped candidate reading the DTSTART's instant is the DTSTART",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T034500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=45;COUNT=3"},
+			want:  utcInstants("2026-03-08T07:45:00Z", "2026-03-09T06:45:00Z", "2026-03-10T06:45:00Z"),
+		},
+		{
+			name:  "a skipped candidate merged into a later existing time, host Berlin",
+			lines: []string{"DTSTART;TZID=Europe/Berlin:20260329T031500", "RRULE:FREQ=DAILY;BYHOUR=2,3;BYMINUTE=15,45;COUNT=6"},
+			want: utcInstants("2026-03-29T01:15:00Z", "2026-03-29T01:45:00Z",
+				"2026-03-30T00:15:00Z", "2026-03-30T00:45:00Z", "2026-03-30T01:15:00Z", "2026-03-30T01:45:00Z"),
+		},
+		{
+			name:    "a skipped candidate merged into a later existing time, zone the object defines",
+			lines:   []string{"DTSTART;TZID=Private/Berlin:20260329T031500", "RRULE:FREQ=DAILY;BYHOUR=2,3;BYMINUTE=15,45;COUNT=6"},
+			resolve: private,
+			want: utcInstants("2026-03-29T01:15:00Z", "2026-03-29T01:45:00Z",
+				"2026-03-30T00:15:00Z", "2026-03-30T00:45:00Z", "2026-03-30T01:15:00Z", "2026-03-30T01:45:00Z"),
+		},
+		{
+			// 02:00 on the New York spring change is skipped and reads 07:00Z,
+			// before the 03:05 EDT DTSTART's 07:05Z although its wall clock
+			// is not, so it precedes the series and is not an instance.
+			name:  "a skipped candidate whose instant precedes the DTSTART's is not an instance",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T030500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=0;COUNT=3"},
+			want:  utcInstants("2026-03-08T07:05:00Z", "2026-03-09T06:00:00Z", "2026-03-10T06:00:00Z"),
+		},
+		{
+			// 02:30 reads 07:30Z, after the DTSTART's 07:05Z, so it is the
+			// second instance although its wall clock precedes the DTSTART's.
+			name:  "a skipped candidate whose instant follows the DTSTART's is the second instance",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T030500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=30;COUNT=3"},
+			want:  utcInstants("2026-03-08T07:05:00Z", "2026-03-08T07:30:00Z", "2026-03-09T06:30:00Z"),
+		},
+		{
+			// The skipped 02:30 reads 07:30Z, the UNTIL, and ends the series
+			// with the existing 03:30 EDT it shares that instant with.
+			name:  "UNTIL ending on a skipped candidate kept past the DTSTART's wall clock",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T030500", "RRULE:FREQ=DAILY;BYHOUR=2,3;BYMINUTE=30;UNTIL=20260308T073000Z"},
+			want:  utcInstants("2026-03-08T07:05:00Z", "2026-03-08T07:30:00Z"),
+		},
+		{
+			name:  "a weekly series whose skipped candidate follows the DTSTART's instant",
+			lines: []string{"DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=WEEKLY;BYDAY=SU;BYHOUR=2,3;BYMINUTE=45;COUNT=3"},
+			want:  utcInstants("2026-03-08T07:15:00Z", "2026-03-08T07:45:00Z", "2026-03-15T06:45:00Z"),
+		},
+		{
+			// An hourly period holds the 02:15 DTSTART and the 02:30 after
+			// it on the wall clock, which reads 15:30Z at +11:00 and so comes
+			// before the DTSTART's 15:45Z at +10:30.
+			name:  "an hourly DTSTART on a skipped time, after a later wall clock's instant",
+			lines: []string{"DTSTART;TZID=Australia/Lord_Howe:20261004T021500", "RRULE:FREQ=HOURLY;BYMINUTE=15,30;COUNT=3"},
+			want:  utcInstants("2026-10-03T15:45:00Z", "2026-10-03T16:15:00Z", "2026-10-03T16:30:00Z"),
+		},
+		{
+			// BYSETPOS numbers every candidate of the period, so the last
+			// Sunday at 02:30 in March 2026 Berlin is still the 29th, read at
+			// the offset before the gap it falls in.
+			name:  "BYSETPOS selects the period's actual last candidate",
 			lines: []string{"DTSTART;TZID=Europe/Berlin:20260222T023000", "RRULE:FREQ=MONTHLY;BYDAY=SU;BYSETPOS=-1;COUNT=3"},
-			want:  utcInstants("2026-02-22T01:30:00Z", "2026-03-22T01:30:00Z", "2026-04-26T00:30:00Z"),
+			want:  utcInstants("2026-02-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-26T00:30:00Z"),
 		},
 	}
 
@@ -203,7 +294,7 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 				t.Errorf("VisitRecurrenceInstances() = %v, want %v", utcStrings(instances), utcStrings(tt.want))
 			}
 
-			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, tt.resolve)
+			periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, tt.resolve, nil)
 			if err != nil {
 				t.Fatalf("RecurringBusyPeriods() err = %v", err)
 			}
@@ -216,7 +307,7 @@ func TestRecurrenceLeavesOutInstancesOnSkippedLocalTimes(t *testing.T) {
 				t.Errorf("RecurringBusyPeriods() = %v, want %v", utcStrings(busy), utcStrings(tt.want))
 			}
 
-			slots, err := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, tt.resolve)
+			slots, err := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, tt.resolve, nil)
 			if err != nil {
 				t.Fatalf("RecurrenceSlots() err = %v", err)
 			}
@@ -310,6 +401,9 @@ func TestCountedSubDailyFastForwardMatchesThePeriodWalkAcrossTransitions(t *test
 	add("Pacific/Apia", "20111229T200000", counted(55)...)
 	// A DTSTART inside the gap is an instance whatever it names.
 	add("America/New_York", "20260308T023000", "FREQ=MINUTELY;INTERVAL=10;COUNT=186", "FREQ=HOURLY;COUNT=31")
+	// A step that does not divide the gap, from a DTSTART inside it: the
+	// candidates past the gap that read before the DTSTART are no instances.
+	add("America/New_York", "20260308T025000", "FREQ=MINUTELY;INTERVAL=40;COUNT=55", "FREQ=MINUTELY;INTERVAL=7;COUNT=400")
 
 	for _, tt := range cases {
 		t.Run(tt.tzid+"/"+tt.dtstart+"/"+tt.rrule, func(t *testing.T) {
@@ -413,11 +507,11 @@ func TestCountedSubDailyFastForwardJumpsAZonedRule(t *testing.T) {
 }
 
 // The validator counts CALDAV:max-instances on the calendar of the series'
-// zone, which leaves the skipped instance out of the count just as the
-// expansion leaves it out of the set: a daily 02:30 series through the Berlin
-// spring change has five instances in six days, whether the zone is the host's
-// or one only the object defines.
-func TestRecurrenceSetExceedsLimitDoesNotCountSkippedLocalTimes(t *testing.T) {
+// zone the same way the expansion counts the set: a daily 02:30 series
+// through the Berlin spring change has six instances in six days, its 29
+// March one read at the offset before the gap, whether the zone is the
+// host's or one only the object defines.
+func TestRecurrenceSetExceedsLimitCountsTheSkippedLocalTimeAsAnInstance(t *testing.T) {
 	berlin := requireHostZone(t, "Europe/Berlin")
 	tests := []struct {
 		name    string
@@ -446,14 +540,80 @@ func TestRecurrenceSetExceedsLimitDoesNotCountSkippedLocalTimes(t *testing.T) {
 			dtstart, _ := resolver.ResolvePropertyTime(dtstartProperty.KeyPart, dtstartProperty.Value)
 			instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(tt.raw, "VEVENT", dtstart, time.Hour,
 				time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), MaxRecurrenceInstances, tt.resolve))
-			if len(instances) != 5 {
-				t.Fatalf("expansion = %v, want five instances", utcStrings(instanceStarts(instances)))
+			if len(instances) != 6 {
+				t.Fatalf("expansion = %v, want six instances", utcStrings(instanceStarts(instances)))
 			}
-			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, 5); !valid || exceeds {
-				t.Errorf("RecurrenceSetExceedsLimit(raw, 5) = %v, %v; want false, true", exceeds, valid)
+			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, 6); !valid || exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, 6) = %v, %v; want false, true", exceeds, valid)
 			}
-			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, 4); !valid || !exceeds {
-				t.Errorf("RecurrenceSetExceedsLimit(raw, 4) = %v, %v; want true, true", exceeds, valid)
+			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, 5); !valid || !exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, 5) = %v, %v; want true, true", exceeds, valid)
+			}
+		})
+	}
+}
+
+// The validator counts a skipped candidate that names the instant of an
+// existing one once, and counts a DTSTART the rule generates once, as the
+// expansion does: COUNT=6 and COUNT=3 below are exactly six and three
+// instances, so a limit one below each is exceeded and the count itself is
+// not.
+func TestRecurrenceSetExceedsLimitCountsMergedGapCandidatesAsTheExpansionDoes(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	requireHostZone(t, "Australia/Lord_Howe")
+	tests := []struct {
+		name      string
+		raw       string
+		instances int
+	}{
+		{
+			name:      "skipped candidate merged into a later existing time",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=DAILY;BYHOUR=2,3;BYMINUTE=15,45;COUNT=6"),
+			instances: 6,
+		},
+		{
+			name:      "DTSTART on a skipped time the rule generates",
+			raw:       recurringObject("DTSTART;TZID=Australia/Lord_Howe:20261004T021500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=15,30;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "skipped candidate before the DTSTART's wall clock but after its instant",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=45;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "skipped candidate whose instant precedes the DTSTART's",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T030500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=0;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "skipped candidate whose instant follows the DTSTART's",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T030500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=30;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "weekly skipped candidate following the DTSTART's instant",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T031500", "RRULE:FREQ=WEEKLY;BYDAY=SU;BYHOUR=2,3;BYMINUTE=45;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "hourly DTSTART on a skipped time the rule generates",
+			raw:       recurringObject("DTSTART;TZID=Australia/Lord_Howe:20261004T021500", "RRULE:FREQ=HOURLY;BYMINUTE=15,30;COUNT=3"),
+			instances: 3,
+		},
+		{
+			name:      "skipped candidate reading the DTSTART's instant",
+			raw:       recurringObject("DTSTART;TZID=America/New_York:20260308T034500", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=45;COUNT=3"),
+			instances: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, tt.instances); !valid || exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want false, true", tt.instances, exceeds, valid)
+			}
+			if exceeds, valid := RecurrenceSetExceedsLimit(tt.raw, tt.instances-1); !valid || !exceeds {
+				t.Errorf("RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want true, true", tt.instances-1, exceeds, valid)
 			}
 		})
 	}
@@ -478,19 +638,37 @@ func TestRecurrenceSetExceedsLimitCountsTheInstantsTheExpansionGenerates(t *test
 		{"New York, DTSTART on the repeated hour", "DTSTART;TZID=America/New_York:20241103T013000", "FREQ=DAILY;COUNT=5"},
 		{"New York, daily through the repeated hour", "DTSTART;TZID=America/New_York:20241101T013000", "FREQ=DAILY;UNTIL=20241105T235959Z"},
 		{"New York, hourly through the repeated hour", "DTSTART;TZID=America/New_York:20241103T003000", "FREQ=HOURLY;COUNT=5"},
+		// The candidates just before, inside and after the gap read 07:00Z,
+		// 07:45Z and 07:30Z: the interval's step does not divide the gap's
+		// length, so none of the three collide, but the one past the gap
+		// reads earlier than the one inside it.
+		{"New York, a 45-minute interval crossing the skipped hour out of wall order", "DTSTART;TZID=America/New_York:20260307T221500", "FREQ=MINUTELY;INTERVAL=45;COUNT=40"},
 		{"Berlin, DTSTART on the skipped hour", "DTSTART;TZID=Europe/Berlin:20240331T023000", "FREQ=DAILY;COUNT=5"},
 		{"Berlin, weekly through the skipped hour", "DTSTART;TZID=Europe/Berlin:20240317T023000", "FREQ=WEEKLY;COUNT=5"},
+		{"Berlin, hourly through the skipped hour", "DTSTART;TZID=Europe/Berlin:20240331T003000", "FREQ=HOURLY;COUNT=5"},
 		{"Berlin, DTSTART on the repeated hour", "DTSTART;TZID=Europe/Berlin:20241027T023000", "FREQ=DAILY;COUNT=5"},
 		{"Berlin, daily through the repeated hour", "DTSTART;TZID=Europe/Berlin:20241025T023000", "FREQ=DAILY;COUNT=5"},
 		{"Berlin, hourly through the repeated hour", "DTSTART;TZID=Europe/Berlin:20241027T003000", "FREQ=HOURLY;UNTIL=20241027T040000Z"},
 		// Samoa skipped the whole of 30 December 2011.
 		{"Apia, daily through the skipped day", "DTSTART;TZID=Pacific/Apia:20111227T100000", "FREQ=DAILY;COUNT=6"},
+		{"Apia, hourly through the skipped day", "DTSTART;TZID=Pacific/Apia:20111229T200000", "FREQ=HOURLY;COUNT=56"},
 		// Lord Howe Island's clocks move by half an hour: 02:00 to 02:30 in
 		// October, and 02:00 back to 01:30 in April.
 		{"Lord Howe, quarter hours of 02:00 through the skipped half hour", "DTSTART;TZID=Australia/Lord_Howe:20241006T020000", "FREQ=DAILY;BYHOUR=2;BYMINUTE=0,15,30,45;COUNT=12"},
 		{"Lord Howe, every 15 minutes through the repeated half hour", "DTSTART;TZID=Australia/Lord_Howe:20240407T010000", "FREQ=MINUTELY;INTERVAL=15;COUNT=20"},
+		// BYSETPOS must number the period's candidates by the instant each
+		// reads, not by wall clock: 20 minutes past the gap reads earlier
+		// than 0 and 40 minutes do.
+		{"Lord Howe, BYSETPOS over a gap day's reordered candidates", "DTSTART;TZID=Australia/Lord_Howe:20261003T020000", "FREQ=DAILY;BYHOUR=2;BYMINUTE=0,20,40;BYSETPOS=2;COUNT=10"},
 		// Havana's clocks skip from midnight to 01:00 on 10 March 2024.
 		{"Havana, daily at midnight through the skipped hour", "DTSTART;TZID=America/Havana:20240308T000000", "FREQ=DAILY;COUNT=5"},
+		// A DTSTART on a skipped time that the rule does not generate itself is
+		// still the first instance, and the candidate after the gap that reads
+		// its instant is the same instance, not a second one.
+		{"New York, DTSTART on the skipped hour of a rule generating 03:30", "DTSTART;TZID=America/New_York:20260308T023000", "FREQ=DAILY;BYHOUR=3;BYMINUTE=30;COUNT=3"},
+		{"Santiago, DTSTART on the skipped hour of a rule generating 01:00 to 04:30", "DTSTART;TZID=America/Santiago:20260906T003000", "FREQ=DAILY;BYHOUR=1,3,4;BYMINUTE=0,30;COUNT=8"},
+		{"Lord Howe, DTSTART on the skipped half hour of an hourly rule", "DTSTART;TZID=Australia/Lord_Howe:20261004T021000", "FREQ=HOURLY;BYMINUTE=0,20,40;COUNT=9"},
+		{"Apia, DTSTART on the skipped day of a weekly BYSETPOS rule", "DTSTART;TZID=Pacific/Apia:20111230T024000", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYSETPOS=-2;COUNT=6"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -553,11 +731,13 @@ func TestRecurrenceSetExceedsLimitReadsTheObjectsOwnDefinitionOfAHostZone(t *tes
 				"RRULE:FREQ=DAILY;COUNT=5", "EXDATE;TZID=America/New_York:20260308T023000"),
 		},
 		{
-			// This definition skips 02:30 on 1 March, which carries the
-			// fifth instance to 4 March, where the EXDATE removes it.
+			// This definition's onset falls on 1 March; the object's own
+			// reading of it keeps that instance, read at the offset before
+			// the gap, rather than skipping it, so COUNT's fifth instance is
+			// 3 March, where the EXDATE removes it.
 			name: "the object skips a time the host does not",
 			raw: withTimezone(earlySpring, "DTSTART;TZID=America/New_York:20260227T023000",
-				"RRULE:FREQ=DAILY;COUNT=5", "EXDATE;TZID=America/New_York:20260304T023000"),
+				"RRULE:FREQ=DAILY;COUNT=5", "EXDATE;TZID=America/New_York:20260303T023000"),
 		},
 	}
 	for _, tt := range tests {
@@ -601,11 +781,11 @@ func TestRecurrenceSetExceedsLimitCountsAShippedZonesInstantsAsUTCValuesNameThem
 	}
 }
 
-// An override naming the slot of an instance the rule's zone skips names no
-// instance of the set. It is matched the way any such override is: free-busy
-// publishes it as the period it states, and the master's own pattern neither
-// generates the slot nor carries it as an overridden one.
-func TestOverrideOfASkippedInstanceNamesNoGeneratedSlot(t *testing.T) {
+// An override naming the slot of an instance a transition skips names the
+// slot the master generates there, read at the offset before the gap
+// (RFC 5545 §3.3.5): it replaces that instance exactly as an override of an
+// ordinary slot does, rather than standing alone.
+func TestOverrideOfASkippedInstanceReplacesTheGeneratedSlot(t *testing.T) {
 	requireHostZone(t, "Europe/Berlin")
 	raw := "BEGIN:VCALENDAR\r\n" +
 		"BEGIN:VEVENT\r\nUID:series\r\nDTSTART;TZID=Europe/Berlin:20260322T023000\r\nRRULE:FREQ=WEEKLY;COUNT=2\r\nEND:VEVENT\r\n" +
@@ -614,7 +794,7 @@ func TestOverrideOfASkippedInstanceNamesNoGeneratedSlot(t *testing.T) {
 	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=Europe/Berlin", "20260322T023000")
 	rangeStart, rangeEnd := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 
-	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,37 +803,49 @@ func TestOverrideOfASkippedInstanceNamesNoGeneratedSlot(t *testing.T) {
 		busy = append(busy, period.Start)
 	}
 	sortTimes(busy)
-	if want := utcInstants("2026-03-22T01:30:00Z", "2026-03-29T08:00:00Z", "2026-04-05T00:30:00Z"); !sameInstants(busy, want) {
+	// COUNT=2 is satisfied by 22 and 29 March; the override moves the second
+	// of those rather than adding a third.
+	if want := utcInstants("2026-03-22T01:30:00Z", "2026-03-29T08:00:00Z"); !sameInstants(busy, want) {
 		t.Errorf("RecurringBusyPeriods() = %v, want %v", utcStrings(busy), utcStrings(want))
 	}
 
-	slots, err := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)
+	slots, err := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	skipped := utcInstants("2026-03-29T01:30:00Z")[0]
+	found := false
 	for _, slot := range slots {
-		if slot.ExactOverride || slot.RecurrenceID.Equal(utcInstants("2026-03-29T01:30:00Z")[0]) {
-			t.Errorf("slot %v: the skipped instance is no slot of the master", slot)
+		if !slot.RecurrenceID.Equal(skipped) {
+			continue
 		}
+		found = true
+		if !slot.ExactOverride {
+			t.Errorf("slot %v: the override of the generated slot should replace it", slot)
+		}
+	}
+	if !found {
+		t.Error("the master's generated slot for 29 March is missing")
 	}
 	if len(slots) != 2 {
 		t.Errorf("RecurrenceSlots() = %d slots, want 2", len(slots))
 	}
 }
 
-// A rule whose every candidate past the DTSTART is a local time the zone skips
-// -- the last Sunday of March at 02:30 in Berlin, which is exactly the hour the
-// clocks jump -- generates nothing past the DTSTART. Each entry point has to
-// recognize that within the scan budgets, the way it recognizes a rule whose BY
-// parts never hold together, rather than follow it for ever.
-func TestRuleGeneratingOnlySkippedLocalTimesTerminates(t *testing.T) {
+// A rule whose only candidate every period is a local time the zone skips --
+// the last Sunday of March at 02:30 in Berlin, which is exactly the hour the
+// clocks jump -- generates that instance every period, read at the offset
+// before the gap: a COUNT of two reaches it as the second instance. Each entry
+// point has to decide that within the scan budgets, the way it decides any
+// other rule, rather than follow it for ever.
+func TestRuleWhoseOnlyCandidateIsASkippedLocalTimeStillTerminates(t *testing.T) {
 	requireHostZone(t, "Europe/Berlin")
 	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=Europe/Berlin", "20260301T023000")
 	rangeStart := RecurrenceStartSentinel
 	rangeEnd := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	want := utcInstants("2026-03-01T01:30:00Z", "2026-03-29T01:30:00Z")
 	for _, rrule := range []string{
 		"FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=2;BYMINUTE=30;COUNT=2",
-		"FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=2;BYMINUTE=30",
 		"FREQ=MONTHLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=2;COUNT=2",
 		"FREQ=DAILY;BYMONTH=3;BYDAY=SU;BYMONTHDAY=25,26,27,28,29,30,31;BYHOUR=2;COUNT=2",
 	} {
@@ -661,14 +853,11 @@ func TestRuleGeneratingOnlySkippedLocalTimesTerminates(t *testing.T) {
 			raw := recurringObject("DTSTART;TZID=Europe/Berlin:20260301T023000", "RRULE:"+rrule)
 			finishesWithin(t, 2*time.Second, func() string {
 				instances, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)
-				// A daily rule's calendar cycle is more periods than the scan
-				// covers, so it may instead run its budget out, which fails
-				// closed like any rule the budget cannot finish.
-				if err != nil && !(strings.HasPrefix(rrule, "FREQ=DAILY") && errors.Is(err, ErrRecurrenceScanLimit)) {
+				if err != nil {
 					return "VisitRecurrenceInstances() err = " + err.Error()
 				}
-				if starts := instanceStarts(instances); !sameInstants(starts, []time.Time{dtstart}) {
-					return "VisitRecurrenceInstances() = " + strings.Join(utcStrings(starts), ",") + ", want the DTSTART alone"
+				if starts := instanceStarts(instances); !sameInstants(starts, want) {
+					return "VisitRecurrenceInstances() = " + strings.Join(utcStrings(starts), ",") + ", want " + strings.Join(utcStrings(want), ",")
 				}
 				if exceeds, valid := RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances); !valid || exceeds {
 					return "RecurrenceSetExceedsLimit() refused the set"
@@ -677,6 +866,26 @@ func TestRuleGeneratingOnlySkippedLocalTimesTerminates(t *testing.T) {
 			})
 		})
 	}
+}
+
+// The same rule without a COUNT is an ordinary unbounded yearly series,
+// generating one instance a year: a request spanning every year
+// CALDAV:max-date-time admits terminates within the scan budgets, failing
+// closed on the output limit rather than hanging. The validator
+// measures an unbounded rule over one year from DTSTART regardless, which
+// this reaches within -- it is not what fails closed here.
+func TestUnboundedRuleWhoseOnlyCandidateIsASkippedLocalTimeTerminates(t *testing.T) {
+	requireHostZone(t, "Europe/Berlin")
+	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=Europe/Berlin", "20260301T023000")
+	raw := recurringObject("DTSTART;TZID=Europe/Berlin:20260301T023000", "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU;BYHOUR=2;BYMINUTE=30")
+	finishesWithin(t, 2*time.Second, func() string {
+		_, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+			RecurrenceStartSentinel, time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC), MaxRecurrenceInstances, nil)
+		if !errors.Is(err, ErrRecurrenceExpansionLimit) {
+			return fmt.Sprintf("VisitRecurrenceInstances() err = %v, want ErrRecurrenceExpansionLimit", err)
+		}
+		return ""
+	})
 }
 
 const privateBerlinTimezone = "BEGIN:VTIMEZONE\r\n" +
@@ -756,7 +965,7 @@ func TestRecurrenceBoundsCoverTheInstanceAfterASkippedLocalTime(t *testing.T) {
 			if !ok {
 				t.Fatal("DTSTART did not resolve")
 			}
-			periods, err := RecurringBusyPeriods(tt.raw, dtstart, time.Hour, RecurrenceStartSentinel, RecurrenceUntilSentinel, MaxRecurrenceInstances, tt.resolve)
+			periods, err := RecurringBusyPeriods(tt.raw, dtstart, time.Hour, RecurrenceStartSentinel, RecurrenceUntilSentinel, MaxRecurrenceInstances, tt.resolve, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -796,13 +1005,14 @@ func daylightObservance(lines ...string) string {
 	return "BEGIN:DAYLIGHT\r\n" + strings.Join(lines, "\r\n") + "\r\nEND:DAYLIGHT\r\n"
 }
 
-// However the object's definition states the transition that skips the 29
-// March instance -- a rule ended by a UTC UNTIL and its successor, a counted
-// rule, an RDATE -- the bound reaches the series' last instance, 12 April at
-// 02:30 CEST. A definition the bound cannot read leaves it unknown rather than
-// assuming the zone skips nothing.
+// However the object's definition states the transition at 29 March -- a rule
+// ended by a UTC UNTIL and its successor, a counted rule, an RDATE -- the
+// bound reaches the series' last instance: COUNT=4 is satisfied by 15, 22, 29
+// March and 5 April, the 29th read at the offset before the gap, so the series
+// ends on 5 April. A definition the bound
+// cannot read leaves it unknown rather than assuming the zone skips nothing.
 func TestRecurrenceBoundsReadEveryFormOfAnObservance(t *testing.T) {
-	lastEnd := utcInstants("2026-04-12T01:30:00Z")[0]
+	lastEnd := utcInstants("2026-04-05T01:30:00Z")[0]
 	tests := []struct {
 		name    string
 		raw     string
@@ -869,5 +1079,476 @@ func TestRecurrenceBoundsReadEveryFormOfAnObservance(t *testing.T) {
 				t.Errorf("Until = %v, %v past the last instance's end", bounds.Until.UTC(), slack)
 			}
 		})
+	}
+}
+
+// A TZID padded with white space inside its quotes -- a space Microsoft
+// clients write, among others -- resolves, and finds its gaps, exactly as the
+// unpadded spelling does: the expansion, the recurrence-limit count and the
+// stored bound all read the same series, crossing the same spring gap, the
+// same way under either spelling.
+func TestPaddedTZIDCrossesAGapLikeTheUnpaddedSpelling(t *testing.T) {
+	requireHostZone(t, "Europe/Berlin")
+	padded := recurringObject(`DTSTART;TZID=" Europe/Berlin":20260315T023000`, "RRULE:FREQ=WEEKLY;COUNT=4")
+	unpadded := recurringObject("DTSTART;TZID=Europe/Berlin:20260315T023000", "RRULE:FREQ=WEEKLY;COUNT=4")
+
+	master := PrimaryVEventComponent(padded)
+	dtstartProperty, _ := ComponentProperty(master, "DTSTART")
+	dtstart, ok := PropertyTimeResolver(nil).ResolvePropertyTime(dtstartProperty.KeyPart, dtstartProperty.Value)
+	if !ok {
+		t.Fatal("padded DTSTART did not resolve")
+	}
+	rangeStart, rangeEnd := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	want := utcInstants("2026-03-15T01:30:00Z", "2026-03-22T01:30:00Z", "2026-03-29T01:30:00Z", "2026-04-05T00:30:00Z")
+
+	instances := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(
+		collectRecurrenceInstances(padded, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)))
+	sortTimes(instances)
+	if !sameInstants(instances, want) {
+		t.Errorf("padded TZID: VisitRecurrenceInstances() = %v, want %v", utcStrings(instances), utcStrings(want))
+	}
+
+	if exceeds, valid := RecurrenceSetExceedsLimit(padded, 4); !valid || exceeds {
+		t.Errorf("padded TZID: RecurrenceSetExceedsLimit(raw, 4) = %v, %v; want false, true", exceeds, valid)
+	}
+	if exceeds, valid := RecurrenceSetExceedsLimit(padded, 3); !valid || !exceeds {
+		t.Errorf("padded TZID: RecurrenceSetExceedsLimit(raw, 3) = %v, %v; want true, true", exceeds, valid)
+	}
+
+	boundsPadded := ConservativeRecurrenceBounds(padded)
+	boundsUnpadded := ConservativeRecurrenceBounds(unpadded)
+	if boundsPadded.UntilUnknown || boundsPadded.Until == nil {
+		t.Fatal("padded TZID: Until unknown")
+	}
+	if !boundsPadded.Until.Equal(*boundsUnpadded.Until) {
+		t.Errorf("padded TZID: Until = %v, want %v (the unpadded spelling's)", boundsPadded.Until.UTC(), boundsUnpadded.Until.UTC())
+	}
+}
+
+// gapCrossingBatchRule is a DAILY rule enumerating every hour, minute and the
+// first seconds seconds of the minute, so one day's candidate batch holds
+// 1440*seconds entries. DTSTART the day before New York's spring change puts
+// the request's range on the change's own day, the one batch a gap touches.
+func gapCrossingBatchRule(seconds int) (raw string, dtstart time.Time) {
+	rrule := "FREQ=DAILY;BYHOUR=" + enumeratedInts(24) + ";BYMINUTE=" + enumeratedInts(60) + ";BYSECOND=" + enumeratedInts(seconds)
+	raw = recurringObject("DTSTART;TZID=America/New_York:20260307T000000", "RRULE:"+rrule)
+	dtstart, _ = ParsePropertyDateTimeLocal("DTSTART;TZID=America/New_York", "20260307T000000")
+	return raw, dtstart
+}
+
+// orderedByInstant charges no work budget, so ordering and merging a batch
+// that holds a gap must cost no more than generating the batch does: a
+// client-chosen BYHOUR/BYMINUTE/BYSECOND enumeration landing one day on a
+// spring change must not cost minutes of CPU answering one request.
+func TestOrderedByInstantOfAGapBatchScalesLinearly(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	rangeStart := time.Date(2026, 3, 8, 0, 0, 0, 0, time.UTC)
+	rangeEnd := time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC)
+	assertScalesLinearly(t, 10080, func(n int) func() {
+		raw, dtstart := gapCrossingBatchRule(n / 1440)
+		return func() {
+			if _, err := RecurringBusyPeriods(raw, dtstart, time.Second, rangeStart, rangeEnd, 2*n, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
+// RecurrenceSetExceedsLimit walks the same batch to decide CALDAV:max-instances,
+// so it must scale the same way. DTSTART is the gap day itself, so the batch
+// the merge costs is the first and only one COUNT needs.
+func TestRecurrenceSetExceedsLimitOfAGapBatchScalesLinearly(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	assertScalesLinearly(t, 10080, func(n int) func() {
+		rrule := "FREQ=DAILY;COUNT=900;BYHOUR=" + enumeratedInts(24) + ";BYMINUTE=" + enumeratedInts(60) + ";BYSECOND=" + enumeratedInts(n/1440)
+		raw := recurringObject("DTSTART;TZID=America/New_York:20260308T000000", "RRULE:"+rrule)
+		return func() {
+			RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances)
+		}
+	})
+}
+
+// RFC 5545 §3.3.10 numbers BYSETPOS over a period's instances, not its wall
+// clocks, so a gap that reorders a period's candidates against their own
+// wall order must reorder what BYSETPOS counts them by too. Lord Howe moves
+// its clocks forward half an hour at 02:00 on 4 October 2026: the period's
+// three candidates read 02:00, 02:20 and 02:40, whose instants are
+// 15:30Z, 15:50Z and 15:40Z -- 02:40 falls chronologically between the other
+// two, not after them. BYSETPOS=2 on 3 October, an ordinary day, picks
+// 02:20; on 4 October it must pick the period's second instant, 02:40, not
+// the second by wall clock, 02:20.
+func TestBySetPosNumbersAGapDaysCandidatesByInstant(t *testing.T) {
+	requireHostZone(t, "Australia/Lord_Howe")
+	raw := recurringObject("DTSTART;TZID=Australia/Lord_Howe:20261003T020000",
+		"RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=0,20,40;BYSETPOS=2;COUNT=3")
+	dtstart, ok := ParsePropertyDateTimeLocal("DTSTART;TZID=Australia/Lord_Howe", "20261003T020000")
+	if !ok {
+		t.Fatal("DTSTART did not resolve")
+	}
+	// The DTSTART is always the set's first instance (RFC 5545 §3.8.5.3),
+	// whether or not BYSETPOS would itself select it; 3 October's own
+	// BYSETPOS pick is the second; 4 October's, the gap day, is the third.
+	want := utcInstants("2026-10-02T15:30:00Z", "2026-10-02T15:50:00Z", "2026-10-03T15:40:00Z")
+	rangeStart := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	rangeEnd := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+
+	instances := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(
+		collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil)))
+	sortTimes(instances)
+	if !sameInstants(instances, want) {
+		t.Errorf("VisitRecurrenceInstances() = %v, want %v", utcStrings(instances), utcStrings(want))
+	}
+
+	periods, err := RecurringBusyPeriods(raw, dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := make([]time.Time, 0, len(periods))
+	for _, period := range periods {
+		busy = append(busy, period.Start)
+	}
+	sortTimes(busy)
+	if !sameInstants(busy, want) {
+		t.Errorf("RecurringBusyPeriods() = %v, want %v", utcStrings(busy), utcStrings(want))
+	}
+
+	slots, err := RecurrenceSlots(raw, "VEVENT", dtstart, time.Hour, rangeStart, rangeEnd, MaxRecurrenceInstances, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotStarts := make([]time.Time, 0, len(slots))
+	for _, slot := range slots {
+		slotStarts = append(slotStarts, slot.RecurrenceID)
+	}
+	sortTimes(slotStarts)
+	if !sameInstants(slotStarts, want) {
+		t.Errorf("RecurrenceSlots() = %v, want %v", utcStrings(slotStarts), utcStrings(want))
+	}
+
+	if exceeds, valid := RecurrenceSetExceedsLimit(raw, 3); !valid || exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(raw, 3) = %v, %v; want false, true", exceeds, valid)
+	}
+	if exceeds, valid := RecurrenceSetExceedsLimit(raw, 2); !valid || !exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(raw, 2) = %v, %v; want true, true", exceeds, valid)
+	}
+}
+
+// A DTSTART on a skipped time that the rule does not generate itself, with a
+// COUNT past the instance limit, is refused: the expansion yields COUNT
+// instances, so the count cannot treat the candidate that reads the DTSTART's
+// instant as a second one.
+func TestRecurrenceSetExceedsLimitRefusesACountPastTheLimitFromASkippedDTStart(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	raw := recurringObject("DTSTART;TZID=America/New_York:20260308T023000",
+		fmt.Sprintf("RRULE:FREQ=DAILY;BYHOUR=3;BYMINUTE=30;COUNT=%d", MaxRecurrenceInstances+1))
+	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=America/New_York", "20260308T023000")
+	instances := requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Hour,
+		dtstart.AddDate(0, 0, -1), dtstart.AddDate(4, 0, 0), 10*MaxRecurrenceInstances, nil))
+	if len(instances) != MaxRecurrenceInstances+1 {
+		t.Fatalf("expansion has %d instances, want %d", len(instances), MaxRecurrenceInstances+1)
+	}
+	if exceeds, valid := RecurrenceSetExceedsLimit(raw, MaxRecurrenceInstances); !valid || !exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want true, true", MaxRecurrenceInstances, exceeds, valid)
+	}
+}
+
+// gapZone is a zone with a transition that skips local times, anchored at the
+// wall clock where the skipped stretch begins.
+type gapZone struct {
+	tzid   string
+	anchor string
+	length time.Duration
+}
+
+var gapZones = []gapZone{
+	{"America/New_York", "20260308T020000", time.Hour},
+	{"Australia/Lord_Howe", "20261004T020000", 30 * time.Minute},
+	{"Pacific/Apia", "20111230T000000", 24 * time.Hour},
+	{"Asia/Tehran", "20210322T000000", time.Hour},
+	{"America/Santiago", "20260906T000000", time.Hour},
+	{"America/Havana", "20240310T000000", time.Hour},
+	{"Europe/Berlin", "20260329T020000", time.Hour},
+}
+
+// randomGapSeries is a series in zone whose DTSTART falls somewhere from a few
+// hours before the skipped stretch to its last minute, so a series starts on
+// the stretch itself as often as it crosses it.
+func randomGapSeries(t *testing.T, random *rand.Rand, zone gapZone) (tzid, dtstartText string, dtstartWall time.Time) {
+	t.Helper()
+	anchor, err := ParseDateTime(zone.anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := time.Duration(random.Intn(int((6*time.Hour+zone.length)/time.Minute))) * time.Minute
+	dtstartWall = anchor.Add(-6 * time.Hour).Add(offset)
+	return zone.tzid, dtstartWall.Format("20060102T150405"), dtstartWall
+}
+
+// firstDifference describes where two sorted lists of instants part.
+func firstDifference(got, want []time.Time) string {
+	for i := 0; i < len(got) || i < len(want); i++ {
+		switch {
+		case i >= len(got):
+			return fmt.Sprintf("%d instances, want %d; first missing %s", len(got), len(want), want[i].UTC().Format(time.RFC3339))
+		case i >= len(want):
+			return fmt.Sprintf("%d instances, want %d; first extra %s", len(got), len(want), got[i].UTC().Format(time.RFC3339))
+		case !got[i].Equal(want[i]):
+			return fmt.Sprintf("%d instances, want %d; at index %d got %s, want %s", len(got), len(want), i, got[i].UTC().Format(time.RFC3339), want[i].UTC().Format(time.RFC3339))
+		}
+	}
+	return "none"
+}
+
+// oracleSubDailyInstants lists the instants of a fixed-step sub-daily series by
+// its definition rather than the walk's: every wall clock stepped from the
+// DTSTART is read with WallClockIn (RFC 5545 §3.3.5), the DTSTART is the first
+// instance and none precedes it, instances at the same instant are one
+// (§3.8.5.3), and the instants UNTIL or COUNT leaves out are dropped.
+func oracleSubDailyInstants(loc *time.Location, dtstartWall time.Time, step time.Duration, count int, until *time.Time) []time.Time {
+	start := WallClockIn(loc, dtstartWall)
+	seen := map[time.Time]bool{}
+	var instants []time.Time
+	for k := 0; ; k++ {
+		wall := dtstartWall.Add(time.Duration(k) * step)
+		instant := WallClockIn(loc, wall)
+		if until != nil && wall.After(until.Add(3*24*time.Hour)) {
+			break
+		}
+		if count > 0 && len(instants) == count {
+			break
+		}
+		if k > 0 && (instant.Before(start) || (until != nil && instant.After(*until))) {
+			continue
+		}
+		if seen[instant.UTC()] {
+			continue
+		}
+		seen[instant.UTC()] = true
+		instants = append(instants, instant.UTC())
+	}
+	sortTimes(instants)
+	return instants
+}
+
+// A fixed-step sub-daily series over a gap is the instants the oracle names
+// however the series ends: the expansion, the same expansion read through a
+// window anywhere in it, and the max-instances count all agree with it. A
+// candidate on the far side of a gap can read an instant before one inside it,
+// so neither UNTIL nor a window may end the walk at the first one that passes.
+func TestSubDailySeriesAcrossAGapMatchesTheOracleInEveryReader(t *testing.T) {
+	random := rand.New(rand.NewSource(20260308))
+	cases := 0
+	for _, zone := range gapZones {
+		loc := requireHostZone(t, zone.tzid)
+		for i := 0; i < 40; i++ {
+			tzid, dtstartText, dtstartWall := randomGapSeries(t, random, zone)
+			var rrule string
+			step := time.Duration(1+2*random.Intn(60)) * time.Minute
+			interval := int(step / time.Minute)
+			if random.Intn(3) == 0 {
+				step = time.Duration(1+random.Intn(7)) * time.Hour
+				rrule = fmt.Sprintf("FREQ=HOURLY;INTERVAL=%d", step/time.Hour)
+			} else {
+				rrule = fmt.Sprintf("FREQ=MINUTELY;INTERVAL=%d", interval)
+			}
+			var until *time.Time
+			count := 0
+			if random.Intn(2) == 0 {
+				count = 1 + random.Intn(150)
+				rrule += fmt.Sprintf(";COUNT=%d", count)
+			} else {
+				bound := WallClockIn(loc, dtstartWall).Add(time.Duration(random.Intn(40*60)) * time.Minute).UTC()
+				until = &bound
+				rrule += ";UNTIL=" + bound.Format("20060102T150405Z")
+			}
+			name := fmt.Sprintf("%s/%s/%s", tzid, dtstartText, rrule)
+			raw := recurringObject("DTSTART;TZID="+tzid+":"+dtstartText, "RRULE:"+rrule)
+			dtstart, ok := ParsePropertyDateTimeLocal("DTSTART;TZID="+tzid, dtstartText)
+			if !ok {
+				t.Fatalf("%s: DTSTART did not resolve", name)
+			}
+			want := oracleSubDailyInstants(loc, dtstartWall, step, count, until)
+			rangeStart, rangeEnd := dtstart.Add(-24*time.Hour), dtstart.Add(60*24*time.Hour)
+			expand := func(from, to time.Time) []time.Time {
+				instances, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Minute, from, to, 100*MaxRecurrenceInstances, nil)
+				if err != nil {
+					t.Fatalf("%s: expansion over [%v, %v): %v", name, from, to, err)
+				}
+				starts := instanceStarts(instances)
+				sortTimes(starts)
+				return starts
+			}
+			if got := expand(rangeStart, rangeEnd); !sameInstants(got, want) {
+				t.Fatalf("%s: expansion differs: %s", name, firstDifference(got, want))
+			}
+			if n := len(want); n <= MaxRecurrenceInstances {
+				if exceeds, valid := RecurrenceSetExceedsLimit(raw, n); !valid || exceeds {
+					t.Fatalf("%s: RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want false, true", name, n, exceeds, valid)
+				}
+				if exceeds, valid := RecurrenceSetExceedsLimit(raw, n-1); !valid || !exceeds {
+					t.Fatalf("%s: RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want true, true", name, n-1, exceeds, valid)
+				}
+			}
+			// A window around some of the instances finds the instances the
+			// full expansion has there.
+			for _, instant := range want {
+				if random.Intn(4) != 0 {
+					continue
+				}
+				from := instant.Add(-time.Duration(random.Intn(40)) * time.Minute)
+				to := instant.Add(time.Minute + time.Duration(random.Intn(40))*time.Minute)
+				var wantWindow []time.Time
+				for _, candidate := range want {
+					if !candidate.Add(time.Minute).Before(from) && !candidate.After(to) {
+						wantWindow = append(wantWindow, candidate)
+					}
+				}
+				if got := expand(from, to); !sameInstants(got, wantWindow) {
+					t.Fatalf("%s: window [%v, %v) differs: %s", name, from, to, firstDifference(got, wantWindow))
+				}
+			}
+			cases++
+		}
+	}
+	if cases == 0 {
+		t.Fatal("no case ran")
+	}
+}
+
+// The max-instances count and the expansion agree on a rule whose candidates a
+// gap reorders and collides, however the rule is written: random daily,
+// weekly and sub-daily rules with BY parts, from a DTSTART before, on or after
+// the skipped stretch.
+func TestRecurrenceSetExceedsLimitAgreesWithTheExpansionAcrossGaps(t *testing.T) {
+	random := rand.New(rand.NewSource(5545))
+	pick := func(values ...string) string { return values[random.Intn(len(values))] }
+	for _, zone := range gapZones {
+		requireHostZone(t, zone.tzid)
+		for i := 0; i < 150; i++ {
+			tzid, dtstartText, _ := randomGapSeries(t, random, zone)
+			rrule := pick(
+				"FREQ=DAILY;BYHOUR="+pick("1,3", "2", "0,2,4", "3")+";BYMINUTE="+pick("0,30", "10,40", "20", "0,20,40"),
+				"FREQ=DAILY;BYHOUR="+pick("1,2,3", "2")+";BYMINUTE="+pick("0,20,40", "15,45")+";BYSETPOS="+pick("1", "2", "-1", "-2", "1,-1"),
+				"FREQ=HOURLY;BYMINUTE="+pick("0,20,40", "10,50", "30"),
+				"FREQ=HOURLY;INTERVAL="+pick("2", "3", "5")+";BYMINUTE="+pick("0,30", "10"),
+				"FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR="+pick("1,3", "2", "0,4")+";BYMINUTE="+pick("0", "30", "10,40"),
+				"FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYSETPOS="+pick("-2", "2", "1,-1"),
+				"FREQ=MINUTELY;INTERVAL="+pick("10", "20", "25", "40", "45", "50"),
+			)
+			rrule += fmt.Sprintf(";COUNT=%d", 1+random.Intn(80))
+			name := fmt.Sprintf("%s/%s/%s", tzid, dtstartText, rrule)
+			raw := recurringObject("DTSTART;TZID="+tzid+":"+dtstartText, "RRULE:"+rrule)
+			dtstart, ok := ParsePropertyDateTimeLocal("DTSTART;TZID="+tzid, dtstartText)
+			if !ok {
+				t.Fatalf("%s: DTSTART did not resolve", name)
+			}
+			instances, err := collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Minute, dtstart.Add(-24*time.Hour), dtstart.AddDate(2, 0, 0), 100*MaxRecurrenceInstances, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			n := len(instances)
+			if exceeds, valid := RecurrenceSetExceedsLimit(raw, n); !valid || exceeds {
+				t.Fatalf("%s: RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want false, true for the expansion's %v", name, n, exceeds, valid, utcStrings(instanceStarts(instances)))
+			}
+			if exceeds, valid := RecurrenceSetExceedsLimit(raw, n-1); !valid || !exceeds {
+				t.Fatalf("%s: RecurrenceSetExceedsLimit(raw, %d) = %v, %v; want true, true for the expansion's %v", name, n-1, exceeds, valid, utcStrings(instanceStarts(instances)))
+			}
+		}
+	}
+}
+
+// The candidate right after a gap reads before the ones inside it, so UNTIL
+// ends a series at the first candidate past it that the zone has, not at one
+// inside a gap: at 02:20 EST the 40-minute series below reads 07:20Z, past
+// UNTIL, and 03:00 EDT after it is 07:00Z, before it.
+func TestUntilDoesNotEndASeriesAtACandidateInsideAGap(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	raw := recurringObject("DTSTART;TZID=America/New_York:20260308T010000", "RRULE:FREQ=MINUTELY;INTERVAL=40;UNTIL=20260308T071000Z")
+	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=America/New_York", "20260308T010000")
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Minute,
+		dtstart.Add(-time.Hour), dtstart.Add(48*time.Hour), MaxRecurrenceInstances, nil)))
+	sortTimes(got)
+	want := utcInstants("2026-03-08T06:00:00Z", "2026-03-08T06:40:00Z", "2026-03-08T07:00:00Z")
+	if !sameInstants(got, want) {
+		t.Errorf("expansion = %v, want %v", utcStrings(got), utcStrings(want))
+	}
+	if exceeds, valid := RecurrenceSetExceedsLimit(raw, 3); !valid || exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(raw, 3) = %v, %v; want false, true", exceeds, valid)
+	}
+	if exceeds, valid := RecurrenceSetExceedsLimit(raw, 2); !valid || !exceeds {
+		t.Errorf("RecurrenceSetExceedsLimit(raw, 2) = %v, %v; want true, true", exceeds, valid)
+	}
+}
+
+// A window over the end of a counted sub-daily series whose DTSTART is on a
+// skipped time finds the series' last instances, which the jump over the
+// periods before the window must not count past: the candidates after the gap
+// that read before the DTSTART's instant are no instances.
+func TestWindowOverTheEndOfACountedSeriesStartingInAGapFindsItsLastInstance(t *testing.T) {
+	requireHostZone(t, "America/New_York")
+	raw := recurringObject("DTSTART;TZID=America/New_York:20260308T025000", "RRULE:FREQ=MINUTELY;INTERVAL=40;COUNT=55")
+	dtstart, _ := ParsePropertyDateTimeLocal("DTSTART;TZID=America/New_York", "20260308T025000")
+	got := instanceStarts(requireRecurrenceResult[RecurrenceInstance](t)(collectRecurrenceInstances(raw, "VEVENT", dtstart, time.Minute,
+		time.Date(2026, 3, 9, 19, 20, 0, 0, time.UTC), time.Date(2026, 3, 9, 20, 0, 0, 0, time.UTC), MaxRecurrenceInstances, nil)))
+	want := utcInstants("2026-03-09T19:30:00Z")
+	if !sameInstants(got, want) {
+		t.Errorf("window = %v, want %v", utcStrings(got), utcStrings(want))
+	}
+}
+
+// orderedByInstant orders a day's candidates by the gaps' lengths alone, and
+// that is the order and the merging resolving each one gives, on every day of
+// a year in the zones with a gap -- including the days a fall change repeats
+// an hour, which the gaps do not list: no host zone has a gap and an overlap
+// within a week of each other, so a day's batch never spans both.
+func TestOrderedByInstantMatchesResolvingEveryCandidate(t *testing.T) {
+	random := rand.New(rand.NewSource(20261004))
+	checked := 0
+	for _, zone := range append(gapZones, gapZone{"America/Sao_Paulo", "20181104T000000", time.Hour}, gapZone{"Africa/Cairo", "20230428T000000", time.Hour}) {
+		loc := requireHostZone(t, zone.tzid)
+		anchor, _ := ParseDateTime(zone.anchor)
+		rule := recurrenceRule{
+			localTimeExists:  func(wall time.Time) bool { return WallClockExists(loc, wall) },
+			resolveCandidate: func(wall time.Time) (time.Time, bool) { return WallClockIn(loc, wall).UTC(), true },
+			gaps:             hostLocalTimeGaps(loc),
+		}
+		for day := anchor.AddDate(0, 0, -200); day.Before(anchor.AddDate(0, 0, 200)); day = day.AddDate(0, 0, 1) {
+			var candidates []time.Time
+			for i := 0; i < 30; i++ {
+				candidates = append(candidates, day.Add(time.Duration(random.Intn(24*12))*5*time.Minute))
+			}
+			if day.Equal(anchor.Truncate(24 * time.Hour)) {
+				// Every five-minute wall clock of the gap's own day.
+				candidates = candidates[:0]
+				for at := day; at.Before(day.AddDate(0, 0, 1)); at = at.Add(5 * time.Minute) {
+					candidates = append(candidates, at)
+				}
+			}
+			sortTimes(candidates)
+			candidates = uniqueTimes(candidates)
+			dtstart := candidates[0].AddDate(-1, 0, 0)
+
+			wantOrder := slices.Clone(candidates)
+			instants := map[time.Time]time.Time{}
+			for _, wall := range wantOrder {
+				instants[wall] = WallClockIn(loc, wall).UTC()
+			}
+			slices.SortStableFunc(wantOrder, func(a, b time.Time) int { return instants[a].Compare(instants[b]) })
+			var want []time.Time
+			for i, wall := range wantOrder {
+				if i > 0 && instants[wantOrder[i-1]].Equal(instants[wall]) {
+					continue
+				}
+				want = append(want, wall)
+			}
+			got := rule.orderedByInstant(slices.Clone(candidates), dtstart)
+			if !sameInstants(got, want) {
+				t.Fatalf("%s, day %s: ordered %v, want %v", zone.tzid, day.Format("2006-01-02"), got, want)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no day checked")
 	}
 }

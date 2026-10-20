@@ -524,6 +524,8 @@ func TestResolveEventZoneSaysWhetherTheNameIsKnown(t *testing.T) {
 		{"no name", "", nil, true, "", "2024-07-01T10:00:00Z"},
 		{"blank name", "  ", nil, true, "", "2024-07-01T10:00:00Z"},
 		{"UTC", "UTC", nil, true, "", "2024-07-01T10:00:00Z"},
+		{"utc lowercase", "utc", nil, true, "", "2024-07-01T10:00:00Z"},
+		{"Utc padded", " Utc ", nil, true, "", "2024-07-01T10:00:00Z"},
 		{"host zone", "America/New_York", nil, true, "America/New_York", "2024-07-01T14:00:00Z"},
 		{"host zone with surrounding space", " America/New_York ", nil, true, "America/New_York", "2024-07-01T14:00:00Z"},
 		{"zone the object defines", exchange, object, true, exchange, "2024-07-01T15:00:00Z"},

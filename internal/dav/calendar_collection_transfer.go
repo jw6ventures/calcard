@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -266,6 +267,10 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 	if err != nil {
 		return nil, nil, err
 	}
+	// One pool serves every member of this attempt, so the recurrence and
+	// observance work of the whole collection is bounded, not each member's
+	// alone.
+	pool := ical.NewRequestWork(r.Context(), transferWorkBudget(len(events)))
 	var readDecider *batchedObjectACLDecider
 	if operation == store.CalendarCollectionCopy {
 		entries, err := h.prefetchCalendarACLEntries(r.Context(), user, source.ID, events)
@@ -277,6 +282,9 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 	members := make([]store.CalendarCollectionMember, 0, len(events))
 	var failures []calendarCollectionMemberFailure
 	for i := range events {
+		if err := r.Context().Err(); err != nil {
+			return nil, nil, err
+		}
 		event := &events[i]
 		if operation == store.CalendarCollectionCopy {
 			allowed, denied := calendarPrivilegeDecisionWithDecider(source, eventResourceName(*event), "read", readDecider)
@@ -290,7 +298,13 @@ func (h *DavServer) preflightCalendarCollectionMembers(r *http.Request, user *st
 				continue
 			}
 		}
-		validated, fault := validateTransferredCalendarObject(event.RawICAL, source)
+		validated, fault := validateTransferredCalendarObject(event.RawICAL, source, pool)
+		if fault != nil && pool.Exhausted() {
+			// A member refused once the transfer's work ran out was not
+			// shown invalid; it is one this transfer cannot afford to
+			// validate, which max-instances names.
+			fault = &calendarObjectFault{status: http.StatusForbidden, conditions: []string{"max-instances"}}
+		}
 		if fault != nil {
 			failures = append(failures, calendarCollectionMemberFailure{href: calendarObjectConflictHref(source.ID, event), fault: fault})
 			continue

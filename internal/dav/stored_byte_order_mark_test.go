@@ -7,8 +7,8 @@ import (
 	"github.com/jw6ventures/calcard/internal/ical"
 )
 
-// An object stored before PUT stripped byte order marks, or kept with one by a
-// COPY or MOVE, is read past its leading mark by every report, as the
+// An object stored with a leading byte order mark, as a 1.1.x release or a
+// COPY or MOVE may have left it, is read past the mark by every report, as the
 // validator reads it: calendar-query matches it by its times and components,
 // free-busy publishes its busy time, and an expansion writes its instances.
 func TestReportsReadAStoredObjectPastItsByteOrderMark(t *testing.T) {

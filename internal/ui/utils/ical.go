@@ -196,11 +196,11 @@ func EventZoneIn(tzid string, object []string) EventZone {
 }
 
 // ResolveEventZone is EventZoneIn, also reporting whether tzid names a zone
-// rather than falling back to UTC: known holds for no name, for UTC, and for a
-// name the object or the host defines.
+// rather than falling back to UTC: known holds for no name, for UTC in any
+// case, and for a name the object or the host defines.
 func ResolveEventZone(tzid string, object []string) (zone EventZone, known bool) {
 	tzid = strings.TrimSpace(tzid)
-	if tzid == "" || tzid == "UTC" {
+	if tzid == "" || ical.UTCName(tzid) {
 		return EventZone{}, true
 	}
 	if !validParamValue(tzid) {

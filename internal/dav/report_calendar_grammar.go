@@ -105,8 +105,9 @@ func applyCalendarReportGrammar(report *reportRequest, body []byte) *reportGramm
 	}
 	// §9.6 binds a CALDAV:calendar-data selector wherever one appears, including
 	// in a report whose own body this pass does not walk -- sync-collection is the
-	// one CalCard answers. The three walks above raise the fault through
-	// decodePropertySelector and leave none behind, so this reaches the rest.
+	// one CalCard answers. The calendar-query and calendar-multiget walks above
+	// raise the fault through decodePropertySelector, and free-busy-query admits
+	// no selector, so this reaches the rest.
 	if calData := reportCalendarData(*report); calData != nil && calData.fault != nil {
 		return calData.fault
 	}

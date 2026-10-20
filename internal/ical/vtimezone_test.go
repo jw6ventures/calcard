@@ -214,8 +214,8 @@ func statedOnsets(t *testing.T, text string, through time.Time) map[time.Time][2
 			}
 			stated := append([]time.Time{dtstart}, rdates...)
 			if rrule != "" {
-				lister := NewRecurrenceStartLister(dtstart, rrule)
-				if !lister.ListThrough(through, 1<<16) {
+				lister := NewRecurrenceStartLister(dtstart, rrule, nil)
+				if !lister.ListThrough(through, 1<<16, nil) {
 					t.Fatalf("rule %s from %s cannot be listed", rrule, dtstart)
 				}
 				stated = lister.starts
@@ -383,8 +383,8 @@ func readGeneratedVTimezone(t *testing.T, text string, through time.Time) []gene
 				case "TZNAME":
 					observance.name = property.Value
 				case "RRULE":
-					lister := NewRecurrenceStartLister(read[0].Start, property.Value)
-					if !lister.ListThrough(through, 1<<16) {
+					lister := NewRecurrenceStartLister(read[0].Start, property.Value, nil)
+					if !lister.ListThrough(through, 1<<16, nil) {
 						t.Fatalf("rule %s cannot be listed", property.Value)
 					}
 					observance.onsets = append(observance.onsets, lister.starts...)

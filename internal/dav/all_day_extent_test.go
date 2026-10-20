@@ -83,7 +83,7 @@ func TestDateEventWithEndBeforeStartOccupiesItsDay(t *testing.T) {
 	}
 	tr := &timeRange{Start: oneDayRangeStart, End: oneDayRangeEnd}
 	body := mustReportText((&DavServer{}).generateFreeBusy(t.Context(),
-		freeBusyCandidates([]store.Event{{UID: "instant", RawICAL: raw}}, floatingZone{}), tr))
+		freeBusyCandidates([]store.Event{{UID: "instant", RawICAL: raw}}, floatingZone{}, nil), tr))
 	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, body), []string{"FREEBUSY:20250301T000000Z/" + oneDayRangeEnd})
 }
 

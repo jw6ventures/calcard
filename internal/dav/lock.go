@@ -181,7 +181,6 @@ func (h *DavServer) parseIfHeader(r *http.Request) *ifHeaderState {
 	return &parsed
 }
 
-// submitsLockToken reports whether the If header submits token.
 func (state *ifHeaderState) submitsLockToken(token string) bool {
 	_, ok := state.seen[token]
 	return ok
@@ -434,7 +433,8 @@ func lockScopeIncludes(lock *store.Lock, canonicalPath string) bool {
 
 // ownLockRootedAt returns an unexpired lock of user's rooted at canonicalPath
 // whose token r's If header submits, or nil. It reads the locks at
-// canonicalPath in one query however many tokens the header carries.
+// canonicalPath and its ancestors in one query however many tokens the header
+// carries.
 func (h *DavServer) ownLockRootedAt(r *http.Request, user *store.User, canonicalPath string) (*store.Lock, error) {
 	locks, err := h.locksForLookupPaths(r.Context(), lockLookupPaths(canonicalPath))
 	if err != nil {
@@ -1162,10 +1162,11 @@ func defaultSupportedLock() *supportedLockProp {
 	}
 }
 
-// revealToken carries whether DAV:locktoken may be reported. RFC 4918 Section
-// 15.8 leaves the token optional in DAV:lockdiscovery, and it has to stay out
-// of a response to any principal but the creator: the write check treats a
-// submitted token as proof the request comes from the lock's owner.
+// activeLockFromStoreLock renders lock as a DAV:activelock, reporting its
+// DAV:locktoken only when revealToken is set. RFC 4918 Section 15.8 leaves the
+// token optional in DAV:lockdiscovery, and it has to stay out of a response to
+// any principal but the creator: the write check treats a submitted token as
+// proof the request comes from the lock's owner.
 func activeLockFromStoreLock(lock *store.Lock, revealToken bool) activeLock {
 	scopeEl := activeLockScope{Exclusive: &struct{}{}}
 	if lock.LockScope == "shared" {

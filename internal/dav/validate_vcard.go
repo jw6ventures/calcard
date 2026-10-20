@@ -6,7 +6,8 @@ import (
 	"github.com/jw6ventures/calcard/internal/vcard"
 )
 
-// extractUIDFromVCard returns the card's UID, parameters and group allowed.
+// extractUIDFromVCard returns the card's UID, accepting a UID line that
+// carries parameters or a group.
 func extractUIDFromVCard(vcardData string) (string, error) {
 	structure := vcard.ReadStructure(vcardData)
 	if structure.UIDCount == 0 {

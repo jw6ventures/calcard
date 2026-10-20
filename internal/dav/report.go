@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -19,6 +21,15 @@ func (h *DavServer) report(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		http.Error(w, "missing user", http.StatusUnauthorized)
 		return
+	}
+
+	// The deadline covers everything the report does: the queries and the
+	// recurrence work, which stops when the pool built on this context sees it
+	// end, not only between resources.
+	if timeout := h.reportTimeout(); timeout > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 	}
 
 	cleanPath := path.Clean(r.URL.Path)
@@ -186,7 +197,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 			http.Error(w, "calendar not found", http.StatusNotFound)
 			return
 		}
-		if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+		if h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 			return
 		}
 		h.logger().Error("Report", "failed to resolve calendar for %s: %v", cleanPath, err)
@@ -200,7 +211,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	if resourceName != "" && report.XMLName.Local == "calendar-multiget" {
 		equivalent, err := h.calendarMultigetHrefIdentifiesResource(r.Context(), user, calID, resourceName, report.Hrefs[0], r)
 		if err != nil {
-			if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+			if h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 				return
 			}
 			http.Error(w, "failed to resolve calendar-multiget href", http.StatusInternalServerError)
@@ -223,7 +234,7 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 	}
 	cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calID, cleanPath, loadPrivilege)
 	if err != nil {
-		if !collectionLoadRefused(err) && h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+		if !collectionLoadRefused(err) && h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 			return
 		}
 		if report.XMLName.Local == "free-busy-query" {
@@ -260,6 +271,9 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 				return
 			}
 		}
+		if h.reportDeadlineExpired(w, r, report.XMLName.Local) {
+			return
+		}
 		w.Header().Set("Content-Type", "text/calendar")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(freeBusyData))
@@ -282,6 +296,9 @@ func (h *DavServer) reportCalendar(w http.ResponseWriter, r *http.Request, user 
 // indistinguishable in the log from one the client mishandled, and the report
 // name and response count are what separate the two.
 func (h *DavServer) writeReportMultiStatus(w http.ResponseWriter, r *http.Request, reportName string, responses []response, syncToken string) {
+	if h.reportDeadlineExpired(w, r, reportName) {
+		return
+	}
 	h.logger().Debug("Report", "%s %s returned %d responses", reportName, r.URL.Path, len(responses))
 	h.writeBoundedMultiStatus(w, newMultistatus(responses, syncToken))
 }
@@ -299,6 +316,9 @@ type reportAnswer struct {
 // writeReportAnswer answers a collection REPORT, from its encoding when it
 // carries one.
 func (h *DavServer) writeReportAnswer(w http.ResponseWriter, r *http.Request, reportName string, answer reportAnswer) {
+	if h.reportDeadlineExpired(w, r, reportName) {
+		return
+	}
 	if answer.encoded == nil {
 		h.writeReportMultiStatus(w, r, reportName, answer.responses, answer.syncToken)
 		return
@@ -313,34 +333,87 @@ func (h *DavServer) writeReportAnswer(w http.ResponseWriter, r *http.Request, re
 // answered ones use, so a client that received no responses and one that
 // received a refusal are told apart in the log.
 func (h *DavServer) writeReportFailure(w http.ResponseWriter, r *http.Request, reportName string, err error) {
-	if h.answerAbandonedReport(w, r, reportName, err) {
+	if h.answerInterruptedReport(w, r, reportName, err) {
 		return
 	}
 	h.logger().Error("Report", "%s failed for %s: %v", reportName, r.URL.Path, err)
 	writeReportError(w, err)
 }
 
-// answerAbandonedReport answers a REPORT that failed after its client closed
-// the request, and reports whether it did. Nobody reads that answer, so the
-// status only records why the report stopped. Only the cancellation itself is
-// not the server's failure: one that merely coincided with the client leaving
-// is still logged as the failure it is.
+// reportTimeout is how long one REPORT may run, zero for no limit.
+func (h *DavServer) reportTimeout() time.Duration {
+	if h == nil || h.cfg == nil {
+		return 0
+	}
+	return h.cfg.DAV.ReportTimeout
+}
+
+// answerInterruptedReport answers a REPORT that stopped because its context
+// ended, and reports whether it did.
 //
 // net/http ends a request's context with context.Canceled when the client goes
-// away. A deadline ends it with context.DeadlineExceeded instead, and a client
-// still waiting on a report the server could not finish in time is owed the
-// server's failure, so that is left to the caller.
-func (h *DavServer) answerAbandonedReport(w http.ResponseWriter, r *http.Request, reportName string, err error) bool {
-	if !errors.Is(r.Context().Err(), context.Canceled) {
+// away. Nobody reads that answer, so the status only records why the report
+// stopped, and only the cancellation itself is not the server's failure: one
+// that merely coincided with the client leaving is still logged as the failure
+// it is.
+//
+// The deadline report derives ends it with context.DeadlineExceeded instead.
+// The client is still waiting on a report the server will not finish, so it is
+// owed the answer the report gives a request it will not compute in full:
+// DAV:number-of-matches-within-limits, or 507 for the two multiget reports,
+// which answer their href limit so. sync-collection is answered the same way rather
+// than as a truncated page (RFC 6578 §3.6): a page cut by time can hold no
+// change at all, and a client given a continuation token that makes no
+// progress asks again forever.
+func (h *DavServer) answerInterruptedReport(w http.ResponseWriter, r *http.Request, reportName string, err error) bool {
+	switch cause := r.Context().Err(); {
+	case errors.Is(cause, context.Canceled):
+		if errors.Is(err, context.Canceled) || store.IsQueryCanceled(err) {
+			h.logger().Debug("Report", "%s abandoned by the client for %s: %v", reportName, r.URL.Path, err)
+		} else {
+			h.logger().Error("Report", "%s failed for %s after the client left: %v", reportName, r.URL.Path, err)
+		}
+		w.WriteHeader(statusClientClosedRequest)
+		return true
+	case errors.Is(cause, context.DeadlineExceeded):
+		if err != nil && !isDeadlineSymptom(err) {
+			return false
+		}
+		h.logger().Error("Report", "%s for %s stopped at its %s deadline: %v", reportName, r.URL.Path, h.reportTimeout(), cause)
+		writeReportDeadlineExceeded(w, reportName)
+		return true
+	}
+	return false
+}
+
+// isDeadlineSymptom reports whether err is what a report that ran past its
+// deadline meets: the context's own error, the database cancelling a query for
+// it, a recurrence expansion refused work by a pool whose context ended, or the
+// postcondition error a report that owes the whole range turns that refusal
+// into (free-busy-query).
+func isDeadlineSymptom(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || store.IsQueryCanceled(err) ||
+		errors.Is(err, ical.ErrRecurrenceExpansionLimit) || errors.Is(err, errNumberOfMatchesExceeded)
+}
+
+// writeReportDeadlineExceeded answers a REPORT stopped by its deadline.
+func writeReportDeadlineExceeded(w http.ResponseWriter, reportName string) {
+	if reportName == "calendar-multiget" || reportName == "addressbook-multiget" {
+		writeInsufficientStorage(w)
+		return
+	}
+	writeNumberOfMatchesWithinLimits(w)
+}
+
+// reportDeadlineExpired answers a REPORT whose deadline passed while it was
+// being answered, whether or not anything it ran reported an error: work the
+// deadline stopped is answered as unsettled, which is no error, so the report
+// that built its answer from it must not be written as a complete one.
+func (h *DavServer) reportDeadlineExpired(w http.ResponseWriter, r *http.Request, reportName string) bool {
+	if !errors.Is(r.Context().Err(), context.DeadlineExceeded) {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || store.IsQueryCanceled(err) {
-		h.logger().Debug("Report", "%s abandoned by the client for %s: %v", reportName, r.URL.Path, err)
-	} else {
-		h.logger().Error("Report", "%s failed for %s after the client left: %v", reportName, r.URL.Path, err)
-	}
-	w.WriteHeader(statusClientClosedRequest)
-	return true
+	return h.answerInterruptedReport(w, r, reportName, nil)
 }
 
 // collectionLoadRefused reports whether loading a report's collection failed
@@ -418,7 +491,7 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 			// generated birthday collection defines no
 			// CALDAV:calendar-timezone, so §7.3 leaves UTC as the only source
 			// for a floating value.
-			candidates, err = filterFreeBusyCandidatesByTimeRange(r.Context(), freeBusyCandidates(events, floatingZone{}), report.TimeRange)
+			candidates, err = filterFreeBusyCandidatesByTimeRange(r.Context(), freeBusyCandidates(events, floatingZone{}, davRequestStateFromContext(r.Context()).requestWork(r.Context(), reportWorkBudget)), report.TimeRange)
 			if err != nil {
 				h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
 				return
@@ -427,6 +500,9 @@ func (h *DavServer) reportBirthdayCalendar(w http.ResponseWriter, r *http.Reques
 		freeBusyData, err := h.generateFreeBusy(r.Context(), candidates, report.TimeRange)
 		if err != nil {
 			h.writeReportFailure(w, r, report.XMLName.Local, freeBusyReportError(err))
+			return
+		}
+		if h.reportDeadlineExpired(w, r, report.XMLName.Local) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/calendar")
@@ -500,7 +576,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 			http.Error(w, "address book not found", http.StatusNotFound)
 			return
 		}
-		if h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+		if h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 			return
 		}
 		http.Error(w, "failed to resolve address book", http.StatusInternalServerError)
@@ -532,7 +608,7 @@ func (h *DavServer) reportAddressBook(w http.ResponseWriter, r *http.Request, us
 
 	book, err := h.loadAddressBookWithPrivilege(r.Context(), user, bookID, cleanPath, "read")
 	if err != nil {
-		if !collectionLoadRefused(err) && h.answerAbandonedReport(w, r, report.XMLName.Local, err) {
+		if !collectionLoadRefused(err) && h.answerInterruptedReport(w, r, report.XMLName.Local, err) {
 			return
 		}
 		if errors.Is(err, errForbidden) || isPrivilegeNotGranted(err) {

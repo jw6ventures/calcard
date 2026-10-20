@@ -8,9 +8,9 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-// benchACLEntries builds a representative ACL set: one grant for the user's own
-// principal plus n unrelated entries, mimicking a shared resource with a long
-// access list. The unrelated entries exercise the normalize + principal-match
+// benchACLEntries builds a representative ACL set: a write grant for the user's
+// own principal, a read grant for DAV:authenticated and n unrelated entries,
+// mimicking a shared resource with a long access list. The unrelated entries exercise the normalize + principal-match
 // path that runs for every entry on every privilege check.
 func benchACLEntries(userID int64, n int) []store.ACLEntry {
 	entries := []store.ACLEntry{
@@ -47,8 +47,8 @@ func BenchmarkACLDecisionForPrivilege_Read(b *testing.B) {
 }
 
 // Write is the costliest decision: it fans out across the four sub-privileges,
-// re-scanning every entry each time. This is the hot path the ACL performance
-// work targeted, so it's the most informative thing to profile.
+// re-scanning every entry each time, so it is the most informative thing to
+// profile.
 func BenchmarkACLDecisionForPrivilege_Write(b *testing.B) {
 	user := &store.User{ID: 42}
 	principals := acl.ApplicablePrincipals(user)

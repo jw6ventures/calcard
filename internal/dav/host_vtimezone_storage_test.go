@@ -101,7 +101,7 @@ func TestValidatorStoresAZoneWhoseNameAloneChangedAsAnObjectThatValidatesAgain(t
 			if fault != nil || again.Body != validated.Body {
 				t.Fatalf("a write of the stored body stores something else: %+v", fault)
 			}
-			if _, fault := validateTransferredCalendarObject(validated.Body, nil); fault != nil {
+			if _, fault := validateTransferredCalendarObject(validated.Body, nil, nil); fault != nil {
 				t.Fatalf("the stored body cannot be copied or moved: %+v", fault)
 			}
 		})

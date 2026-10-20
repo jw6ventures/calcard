@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// maxComponentDepth bounds how many components may nest inside one another,
+// VCALENDAR counting as the first level. A real calendar object nests at most
+// about four deep (VCALENDAR, VEVENT, VALARM, and an RFC 9073 PARTICIPANT or
+// VLOCATION inside that); sixteen leaves ample room above that while keeping
+// a maliciously deep body, whose nesting a strict reader would otherwise walk
+// and a lenient one would otherwise build, cheap to read.
+const maxComponentDepth = 16
+
 // ReadComponents reads the component structure of an iCalendar object from its
 // unfolded lines. open is called for each component the reader keeps, with the
 // kept component it is nested in, or nil for the root VCALENDAR, and with the
@@ -26,6 +34,13 @@ import (
 //
 // It fails, whatever strict says, when there is no VCALENDAR, and with the
 // first error open or content returns.
+//
+// Nesting past maxComponentDepth levels, VCALENDAR counting as the first, is
+// refused with strict set. Read leniently, a component at that depth is kept,
+// but nothing BEGIN opens past it is: open and content are not called for it
+// or anything nested inside it, and its END, and every END and BEGIN inside
+// it, are matched by count rather than by name, so a component before or
+// after it, at or above the limit, still reads normally.
 func ReadComponents[N any](lines []string, strict bool, open func(parent *N, name string) (*N, error), content func(component *N, line string) error) (*N, error) {
 	return readComponents(lines, strict,
 		func(parent *N, name string, _ int) (*N, error) { return open(parent, name) },
@@ -55,11 +70,32 @@ func readComponents[N any](lines []string, strict bool, open func(parent *N, nam
 		}
 		stack = stack[:depth]
 	}
+	// skippedDepth counts, in lenient mode, the BEGIN lines nested past
+	// maxComponentDepth that have not yet been closed. Nothing in that
+	// subtree is built or passed to content, so neither open nor the ToUpper
+	// a BEGIN line's name would otherwise cost is paid for it; its END lines,
+	// and any BEGIN and END nested inside it, only balance the count, since
+	// nothing there is read well enough to match them by name.
+	skippedDepth := 0
 	for at, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
+		if skippedDepth > 0 {
+			switch {
+			case HasPrefixFold(line, "BEGIN:"):
+				skippedDepth++
+			case HasPrefixFold(line, "END:"):
+				skippedDepth--
+			}
+			continue
+		}
 		switch {
+		case HasPrefixFold(line, "BEGIN:") && len(stack) >= maxComponentDepth:
+			if strict {
+				return nil, fmt.Errorf("component nesting deeper than %d levels", maxComponentDepth)
+			}
+			skippedDepth = 1
 		case HasPrefixFold(line, "BEGIN:"):
 			name := strings.TrimSpace(strings.ToUpper(line[len("BEGIN:"):]))
 			var node *N
