@@ -1,4 +1,4 @@
-# CalCard - Community Edition 📅
+# CalCard
 
 CalCard makes it easy to self-host and share calendars, reminders, and contacts.
 
@@ -26,7 +26,7 @@ CalCard requires:
 
 ### Docker (Recommended)
 
-Copy the .env.template file from the root of this repository, rename to .env, and modify the values to match your environment.
+Copy the .env.example file from the root of this repository, rename to .env, and modify the values to match your environment.
 
 | Image | Published from | Notes |
 | --- | --- | --- |
@@ -37,7 +37,7 @@ Copy the .env.template file from the root of this repository, rename to .env, an
 
 #### Docker Run
 
-```docker run -p 8080 --env-file .env ghcr.io/jw6ventures/calcard:latest```
+```docker run -p 8080:8080 --env-file .env ghcr.io/jw6ventures/calcard:latest```
 You'll also need a postgres 16 server:
 
 #### Docker Compose
@@ -86,17 +86,76 @@ Notes:
 - When using an existing database secret, set `app.db.existingSecret.name`. The secret must contain `APP_DB_DSN`, `APP_DB_USER`, and `APP_DB_PASSWORD` by default, or the keys configured under `app.db.existingSecret`.
 - When using an external database without `app.db.existingSecret.name`, set `app.db.host`.
 - Secrets are stored in Kubernetes Secrets (`APP_OAUTH_CLIENT_SECRET`, `APP_SESSION_SECRET`, `APP_DB_DSN`, `APP_DB_USER`, `APP_DB_PASSWORD`) unless the corresponding existing-secret settings are used.
-- The app Deployment uses the `Recreate` strategy: an upgrade stops the running pod before the new one starts, and the new pod applies schema migrations before it serves. Expect downtime on every upgrade for the migration plus startup.
-- `replicaCount` must be `0` or `1`. Every pod runs the schema migration on startup and the migration runner takes no lock, so the chart (and its values schema) refuses anything else. An upgrade of a release that set `replicaCount` above 1 fails until it is set back to 1. `kubectl scale` and a HorizontalPodAutoscaler bypass the chart, so do not use either on this Deployment. Set `0` to stop the app without uninstalling the release.
-- Migrations run before the listener opens, under a startup probe. The default budget is `startupProbe.periodSeconds` 10 x `startupProbe.failureThreshold` 60 = 10 minutes. A migration that overruns it is killed and rolled back, and the pod restarts into the same work and never becomes ready. Above roughly 500,000 events (or 250,000 when event bodies are large, around 10 KB), raise `startupProbe.failureThreshold` before upgrading (for example `180` for 30 minutes).
+- The app uses the `Recreate` strategy, so expect a short outage on every upgrade while the new pod updates the database and starts.
+- `replicaCount` must be `0` or `1`, because every pod updates the database when it starts. Don't scale the Deployment with `kubectl scale` or an autoscaler. Set `0` to stop the app without uninstalling it.
+- Database updates must finish within the startup probe's budget, 10 minutes by default (`startupProbe.periodSeconds` × `startupProbe.failureThreshold`). If one runs longer, the pod restarts and never becomes ready. For a large database, raise `startupProbe.failureThreshold` before upgrading. See [Upgrading to 1.2.0](#upgrading-to-120).
 - `priorityClassName` schedules the app pods with an existing PriorityClass, making them a later candidate for eviction under node pressure. Leave it empty for the cluster default.
 
 ### Linux Installs
 A linux binary is published as a github release for each version. You'll need a postgres 16 server.
 ```
-source .env
+set -a; . ./.env; set +a
 ./calcard-linux-amd64
 ```
+
+## Upgrading to 1.2.0
+Read this before upgrading from 1.1.x.
+
+### Before you upgrade
+- **Back up your database.** 1.2.0 changes your data, and there's no downgrade. To go back to 1.1.x, restore the backup. Don't start 1.1.x against an upgraded database, because upgrading again won't repair what it writes.
+- **Put HTTPS in front of CalCard.** DAV clients can no longer sign in over plain HTTP. See [Basic authentication requires HTTPS](#basic-authentication-requires-https).
+- **Check `APP_BASE_URL`.** It must match the public URL your clients use, including the port. If it's wrong behind a proxy, moving, copying and editing locked items can fail.
+- **Kubernetes:** see [Helm](#helm) below.
+
+### The first start
+The first start updates the database before CalCard starts serving. This takes about 30 seconds per 100,000 events, and longer when events are large.
+
+When it's done, check CalCard's log for lines starting with `PostgreSQL WARNING:`. They list anything the upgrade changed or couldn't fix on its own.
+
+If you run `migrations/v1.2.0.sql` yourself, stop every CalCard instance first.
+
+### Sharing permissions on events and contacts
+1.1.x sometimes applied the permissions set on one event or contact to others with a similar name (`X`, `X.ics` and `X.ICS`). 1.2.0 treats each as its own item. The upgrade:
+- keeps every deny that applied before;
+- removes grants that no longer belong to a single item, and saves them in the `acl_entries_v120_removed` table;
+- has clients re-sync the items whose access changed.
+
+If someone lost access they should have, share the item with them again, then drop the table. The upgrade's warnings also list items with unusual names (containing `?`, `#`, `%` escapes, or `.` and `..` segments) for you to look over.
+
+### Events stored in UTC
+DAVx5 showed times stored with `TZID=UTC` at the device's local time instead of UTC. The upgrade rewrites these times as plain UTC, and every new save is stored the same way. Clients re-sync the events it changes.
+
+A few unusual events can't be rewritten automatically. The upgrade's warning lists them, and saving one from any client fixes it.
+
+### Basic authentication requires HTTPS
+DAV clients and the REST API now use Basic authentication only over HTTPS. Over plain HTTP, such as on localhost or your LAN, clients aren't asked for a password and report a failed login.
+
+CalCard doesn't serve HTTPS itself. Put it behind a reverse proxy, or the Helm chart's ingress (`ingress.tls.enabled`), that:
+- terminates TLS;
+- sends `X-Forwarded-Proto: https` (nginx: `proxy_set_header X-Forwarded-Proto $scheme;`);
+- connects from an address listed in `APP_TRUSTED_PROXIES`.
+
+Once the proxy is set up, existing app passwords work again. There's no need to replace them.
+
+If you must keep plain HTTP, set `APP_DAV_INSECURE_BASIC_ENABLED=true` (Helm: `app.dav.insecureBasicEnabled`). This isn't recommended: app passwords and all your data cross the network unencrypted, and CalCard logs a warning on every start.
+
+### Helm
+- **Large databases:** the first start must finish within the startup probe budget. Above about 400,000 events (200,000 if your events are large), set `startupProbe.failureThreshold` to `180` (30 minutes) before upgrading.
+- **The Service must be `ClusterIP` when the ingress is on.** The chart refuses to render otherwise, because a NodePort or LoadBalancer beside the ingress would expose plain HTTP. Set `service.type: ClusterIP`, or turn off `ingress.enabled` and terminate TLS yourself.
+- **Releases first installed with Helm 4** fail to upgrade with `spec.strategy.rollingUpdate: Forbidden`. Run this one upgrade with `--server-side=false`. Later upgrades need no flag.
+  ```
+  helm upgrade calcard oci://ghcr.io/jw6ventures/calcard-helm --reuse-values --server-side=false
+  ```
+
+### Other changes
+- **Locks apply everywhere.** When a CalDAV or CardDAV client locks an event, contact, calendar or address book, the web UI and REST API can't change it until the lock is released. The REST API answers `423 Locked`, and imports skip locked items. Owners can still unshare people, and people can still leave a shared calendar or address book, whatever is locked.
+- **No more lost edits.** The web UI saves an event only if nobody changed it since you opened it. Reload any page left open during the upgrade before saving. The REST API applies `If-Match` in the same step as the write.
+- **Long UIDs.** A UID longer than 1,024 bytes is refused. Older events with a longer UID can still be deleted, copied and moved, but not edited in the web UI or REST API.
+- **Floating times.** The web calendar shows events with no time zone at their written time, wherever you are, and keeps them that way when you edit them. Editing a series you organize increments its `SEQUENCE`, so attendees' clients pick up the change.
+- **Daylight saving.** An occurrence in the hour skipped when clocks spring forward moves later: `02:30` becomes `03:30`. 1.1.x moved it earlier.
+- **Week-numbered rules.** Yearly rules with `BYWEEKNO` follow ISO week numbering, so around New Year they may differ from other calendar software.
+- **Slow searches stop.** A calendar search (REPORT) stops after `APP_DAV_REPORT_TIMEOUT`, 10 seconds by default. A calendar with very heavy recurring events may get partial results, and the web UI marks the series it couldn't list in full.
+- **PROPFIND without `Depth`** is treated as `Depth: infinity`, as RFC 4918 requires. 1.1.x treated it as `Depth: 1`. Set `APP_DAV_PROPFIND_INFINITY_ENABLED=false` to refuse these requests.
 
 ## Configuration
 Environment variables:
@@ -144,7 +203,8 @@ CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a 
 | Name | Required | Notes |
 | --- | --- | --- |
 | `APP_DAV_PROPFIND_INFINITY_ENABLED` | false | (Default `true`) Allow `Depth: infinity` PROPFIND. Disable where deep listings are a DoS concern. |
-| `APP_DAV_DIGEST_ENABLED` | false | (Default `false`) Offer and accept HTTP Digest on `/dav`. See [Connecting a CalDAV/CardDAV client](#connecting-a-caldavcarddav-client). |
+| `APP_DAV_DIGEST_ENABLED` | false | (Default `false`) Offer and accept HTTP Digest on `/dav` and `/api`. See [Connecting a CalDAV/CardDAV client](#connecting-a-caldavcarddav-client). |
+| `APP_DAV_INSECURE_BASIC_ENABLED` | false | (Default `false`) Accept HTTP Basic on `/dav` and `/api` over plain HTTP. Not recommended: app passwords and all data cross the network unencrypted, and CalCard logs a warning on every start. See [Basic authentication requires HTTPS](#basic-authentication-requires-https). |
 | `APP_DAV_MAX_MULTISTATUS_RESPONSES` | false | (Default `10000`) `DAV:response` elements one multistatus may carry. |
 | `APP_DAV_MAX_MULTISTATUS_BYTES` | false | (Default `67108864`) Encoded size of one multistatus response. |
 | `APP_DAV_MAX_FILTER_ELEMENTS` | false | (Default `100`) Elements one `CALDAV:filter` or `CARDDAV:filter` may carry. |
@@ -155,19 +215,22 @@ CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a 
 | `APP_DAV_MAX_MULTIGET_HREFS` | false | (Default `5000`) `DAV:href` elements one calendar-multiget may carry. |
 | `APP_DAV_MAX_REPORT_CANDIDATE_ROWS` | false | (Default `50000`) Stored resources one report will read and parse while looking for matches. |
 | `APP_DAV_SYNC_HISTORY_RETENTION` | false | (Default `2160h`, 90 days; Go duration) How far back sync deletion history is kept. A sync token older than this is refused with `DAV:valid-sync-token` and the client re-syncs in full. `0` prunes nothing. Widening it re-admits tokens whose deletions were already pruned, so widen only when no client holds a token older than the previous window. |
+| `APP_DAV_REPORT_TIMEOUT` | false | (Default `10s`; Go duration) How long one REPORT may run before it is stopped and refused. Keep it below `APP_HTTP_WRITE_TIMEOUT`. `0` turns it off. |
 
 
 ## Connecting a CalDAV/CardDAV client
 - Sign in to the web UI
-- Generate an app-password to use in your DAV client
+- Create an app password at `/app-passwords`. You can revoke it at any time.
 - Start service discovery from the DAV root at `<base-url>/dav` (recommended) or from the collection homes at `/dav/calendars/` and `/dav/addressbooks/`. Calendar collections live at `/dav/calendars/<calendar-id>/` (numeric IDs are visible in the web UI and PROPFIND responses).
-- Authenticate with HTTP Basic over HTTPS, or HTTP Digest (SHA-256 or MD5) where the server offers it, using your **primary email address** as the username and the generated **App Password** as the password. Other identifiers (display names, OAuth subject, etc.) are not accepted.
-- When TLS terminates at a reverse proxy, forward `X-Forwarded-Proto: https` and include the proxy's peer address or CIDR in `APP_TRUSTED_PROXIES`. Basic authentication is rejected when CalCard cannot verify that the request used HTTPS.
-- Digest is off by default and is enabled with `APP_DAV_DIGEST_ENABLED=true`. Digest verifies against a stored HA1, which is password-equivalent for the DAV realm. CalCard seals it with a key derived from `APP_SESSION_SECRET`, so a copy of the database plus a copy of the configuration recovers it, while a bcrypt token hash on its own is worth nothing to whoever holds the database. Leaving Digest off keeps app passwords stored as bcrypt hashes alone: no HA1 is computed or written, not when a password is issued and not when one authenticates. Any HA1 an earlier run stored is cleared in the background right after startup and again every hour, so a pass that fails (for example while the database is unreachable) is retried rather than dropped; an app password that authenticates over Basic in the meantime has its HA1 cleared at that moment.
-- Turning Digest on does not require replacing app passwords. One issued from then on gets its HA1 when it is issued; an existing one gets it the first time it authenticates over Basic, which CalCard accepts only over HTTPS -- a bcrypt hash cannot be converted into an HA1, but a successful Basic authentication supplies the password itself. If DAV is served without HTTPS, existing passwords cannot catch up this way; revoke and reissue any that need Digest. While Digest is on, `/app-passwords` marks each active password **Digest ready** or **Basic only** so you can see which have caught up; clients holding a **Basic only** password keep working over Basic in the meantime.
-- Keep `APP_SESSION_SECRET` stable and identical on every instance, because it protects stored Digest credentials. Rotating it leaves every stored HA1 unreadable: those passwords go back to **Basic only** and the server logs once that it could not open them. Over HTTPS, each is re-sealed the next time it authenticates over Basic; without HTTPS, Basic is refused, so affected app passwords must be revoked and reissued. Instances running with different secrets keep re-sealing each other's credentials.
-- Correcting proxy forwarding restores Basic access without replacing passwords.
-- Create and manage App Passwords from the web UI at `/app-passwords` after signing in through OAuth. Passwords can be revoked at any time; make sure the one you use is not expired or revoked.
+- Sign in with your **primary email address** as the username and the **App Password** as the password. Other identifiers (display names, OAuth subject, etc.) are not accepted.
+- Clients use HTTP Basic over HTTPS. Behind a reverse proxy, send `X-Forwarded-Proto: https` and list the proxy in `APP_TRUSTED_PROXIES`. See [Basic authentication requires HTTPS](#basic-authentication-requires-https).
+
+### Digest authentication
+HTTP Digest (SHA-256 or MD5) is off by default. Turn it on with `APP_DAV_DIGEST_ENABLED=true`.
+- Digest needs a password-equivalent secret for each app password. CalCard stores it encrypted with a key from `APP_SESSION_SECRET`, so anyone with both your database and your configuration can recover it. With Digest off, CalCard stores only bcrypt hashes and clears any Digest secrets left from earlier runs.
+- New app passwords work with Digest right away. Existing ones catch up the next time they sign in with Basic. `/app-passwords` shows each as **Digest ready** or **Basic only**. Where Basic isn't allowed, create new passwords instead.
+- Some clients always choose Digest when it's offered and won't fall back to Basic, so a **Basic only** password won't work for them. Create a new password for those clients, or sign in once with the old one from a client that uses Basic.
+- Keep `APP_SESSION_SECRET` the same across restarts and on every instance. If it changes, every password goes back to **Basic only** until it signs in with Basic again.
 
 ## Health probes
 - Liveness: `GET /healthz` returns immediately when the HTTP server is running, without touching dependencies.
@@ -175,4 +238,4 @@ CalDAV/CardDAV resource limits. Each bounds the work one request can provoke; a 
 
 ## License
 
-CalCard Community Edition is licensed using the GNU Affero General Public License (AGPL).
+CalCard is licensed using the GNU Affero General Public License (AGPL).
