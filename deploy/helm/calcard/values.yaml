@@ -16,7 +16,7 @@ image:
 nameOverride: "" # Overrides the chart name used for resource names/labels.
 fullnameOverride: "" # Overrides the full resource name (takes precedence over nameOverride).
 
-replicaCount: 1 # HA is theoretically possible, but untested at this point. Recommend 1 until the release notes say otherwise.
+replicaCount: 1 # Number of app pods. Must be 1 (or 0 to stop the app without deleting the release); the chart refuses anything higher. Every pod runs the schema migration on startup and the migration runner takes no lock, so a second replica applies the same migrations to the same database at the same time. HA needs that solved first; the release notes will say when. Only helm is held to this: kubectl scale or an HPA targeting the Deployment bypasses it, so do neither.
 
 # Application configuration. These map directly to the APP_* environment
 # variables the container reads.
@@ -24,6 +24,7 @@ app:
   baseUrl: "http://localhost:8080" # Public URL the app is served from. Required. Used for OAuth redirects and to derive ingress.host when that is unset.
   trustedProxies: "" # Comma-separated CIDRs/IPs to trust for X-Forwarded-* headers (e.g. your ingress/load balancer). Leave empty if not behind a proxy.
   logLevel: "Info" # Minimum log level to emit: Trace, Debug, Info, Warn, or Error.
+  trafficCaptureFile: "" # Optional JSONL request capture path. Contains sensitive request bodies; disabled when empty. Use a mounted writable path for persistent captures.
 
   # OAuth / OIDC single sign-on settings. CalCard delegates login to an
   # external identity provider.
@@ -51,15 +52,45 @@ app:
     user: "postgres" # Database user.
     password: "" # Database password. Stored in a generated Secret. Ignored if existingSecret.name is set.
     sslmode: "disable" # Postgres sslmode (disable, require, verify-ca, verify-full). Use a stronger mode for external databases.
+    maxOpenConns: 25 # Maximum number of open database connections.
+    maxIdleConns: 10 # Maximum number of idle database connections.
+    connMaxLifetime: "30m" # Maximum lifetime for a database connection.
     existingSecret: # Reference an existing Secret holding the DB credentials instead of generating one from the values above.
       name: "" # Name of the existing Secret. Leave empty to generate one.
       dsnKey: "APP_DB_DSN" # Key holding the full connection string (postgres://user:pass@host:port/db?sslmode=...).
       userKey: "APP_DB_USER" # Key holding the database user.
       passwordKey: "APP_DB_PASSWORD" # Key holding the database password.
 
+  http:
+    readTimeout: "15s" # Maximum duration for reading the full HTTP request.
+    writeTimeout: "15s" # Maximum duration before timing out HTTP response writes.
+    idleTimeout: "60s" # Maximum time to wait for the next request on keep-alive connections.
+
+  # CalDAV/CardDAV resource limits (RFC 4791 Section 11). Each bounds the work
+  # one request can provoke; a report past a limit is refused rather than
+  # answered with a partial result. Leave a key unset to use the server default,
+  # shown in the comment. Every value must be a non-negative integer, where 0
+  # turns that limit off entirely.
+  dav: {}
+    # propfindInfinityEnabled: true # Allow Depth: infinity PROPFIND (RFC 4918 Section 9.1). Disable where deep listings are a DoS concern.
+    # digestEnabled: false # Offer and accept HTTP Digest on /dav (RFC 7616). Off by default because Digest needs a stored, password-equivalent HA1 (see README). While off, no HA1 is written and any already stored is cleared. When on, each app password gains its HA1 when issued or on its next Basic authentication over HTTPS; the App Passwords page shows which are ready. A client that prefers Digest may not fall back to Basic, so it may be unable to use an app password that is not ready yet; reissue it, or authenticate once over Basic, first.
+    # insecureBasicEnabled: false # Accept HTTP Basic on /dav and /api over plain HTTP, and offer the Basic challenge there. Off by default: RFC 4791 Section 11 forbids Basic without TLS, so the app password and all calendar and contact data cross the network in cleartext. The server logs it at Warn level on every start while this is on (app.logLevel Error or Fatal hides it). Prefer terminating TLS at the ingress.
+    # maxMultistatusResponses: 10000 # DAV:response elements one multistatus may carry.
+    # maxMultistatusBytes: 67108864 # Encoded size of one multistatus response.
+    # maxFilterElements: 100 # Elements one CALDAV:filter or CARDDAV:filter may carry; each is evaluated against every candidate resource.
+    # maxCardDAVQueryBytes: 65536 # Combined serialized CARDDAV:filter and CARDDAV:address-data bytes per REPORT. Set 0 to disable.
+    # maxAddressDataProperties: 100 # CARDDAV:address-data property selectors per REPORT. Set 0 to disable.
+    # maxRequestedProperties: 1000 # Distinct property names one PROPFIND or REPORT may request; each is answered for every resource the request reaches.
+    # maxReportElementDepth: 20 # Element nesting one REPORT body may reach.
+    # maxMultigetHrefs: 5000 # DAV:href elements one calendar-multiget may carry.
+    # maxReportCandidateRows: 50000 # Stored resources one report will read and parse while looking for matches.
+    # syncHistoryRetention: 2160h # How far back sync deletion history is kept. Tombstones older than this are pruned, and a DAV:sync-token naming an earlier instant is refused with DAV:valid-sync-token so the client re-syncs in full (RFC 6578 Section 3.2). Set 0 to prune nothing, at the cost of a table that only grows.
+    # Narrow this freely. Widening it re-admits tokens whose tombstones the old window already pruned, which loses those deletions silently, so widen only when no client holds a token older than the previous window.
+    # reportTimeout: 10s # How long one REPORT may run before the server stops it and answers DAV:number-of-matches-within-limits (calendar-multiget answers 507). Keep it below the HTTP write timeout (15s) so the answer can still be written. Set 0 to turn the deadline off.
+
 # Kubernetes Service that fronts the app pods.
 service:
-  type: ClusterIP # Service type: ClusterIP, NodePort, or LoadBalancer.
+  type: ClusterIP # Service type. Must stay ClusterIP while ingress.enabled is true: the app refuses HTTP Basic over plain HTTP unless app.dav.insecureBasicEnabled is set (RFC 4791 Section 11), and this guard applies either way, because a cleartext route beside the TLS ingress is wrong whatever the app accepts, so no route may publish the cleartext port beside the ingress. Set NodePort or LoadBalancer only with ingress.enabled=false, terminating TLS yourself.
   port: 80 # Port the Service listens on (the container always listens on 8080).
 
 # Ingress for external HTTP(S) access.
@@ -83,7 +114,19 @@ postgres:
     storageClassName: "" # StorageClass for the PVC. Leave empty to use the cluster default.
   resources: {} # CPU/memory requests and limits for the Postgres container.
 
+# Startup gate for the app container. Schema migrations run before the server
+# starts listening, and the liveness probe is held off until this one succeeds,
+# so this budget is what keeps a long migration from being killed and rolled
+# back part way -- which on the next restart simply starts the migration again.
+# The default allows 10 minutes. Raise it if an upgrade has to rebuild indexes
+# over a large events table; the cost of a larger value is only that a process
+# that wedges during startup takes that long to be restarted.
+startupProbe:
+  periodSeconds: 10 # Seconds between startup checks.
+  failureThreshold: 60 # Consecutive failures tolerated before the container is restarted. Startup budget is periodSeconds x failureThreshold.
+
 resources: {} # CPU/memory requests and limits for the app container.
 nodeSelector: {} # Constrain app pods to nodes with matching labels.
 tolerations: [] # Tolerations allowing app pods to schedule onto tainted nodes.
 affinity: {} # Affinity/anti-affinity rules for app pod scheduling.
+priorityClassName: "" # PriorityClass to schedule app pods with (e.g. system-cluster-critical). Raises their scheduling priority and makes them a later candidate for eviction when a node runs out of resources. The class must already exist in the cluster. Leave empty to use the cluster default priority.

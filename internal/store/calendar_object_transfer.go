@@ -1,0 +1,304 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"slices"
+)
+
+// CalendarObjectTransferOperation names which of the two RFC 4918 rebinding
+// methods a transfer carries out. COPY and MOVE share every precondition and
+// differ only in whether the source binding survives.
+type CalendarObjectTransferOperation string
+
+const (
+	// CalendarObjectCopy leaves the source resource bound where it is.
+	CalendarObjectCopy CalendarObjectTransferOperation = "copy"
+	// CalendarObjectMove unbinds the source once the destination is written.
+	CalendarObjectMove CalendarObjectTransferOperation = "move"
+)
+
+// CalendarObjectTransferState is the destination as the HTTP layer found it
+// when it decided which privileges the request needed and whether Overwrite
+// applied. The store re-reads the destination under lock and refuses the
+// transfer when it no longer matches, so an authorization made against a create
+// cannot silently be applied to an overwrite.
+type CalendarObjectTransferState struct {
+	Exists bool
+	UID    string
+	ETag   string
+}
+
+// CalendarObjectTransfer is one COPY or MOVE of a calendar object resource,
+// stated so the whole of it commits or none of it does. Every Expected field is
+// an optimistic precondition the store verifies under lock; a mismatch is
+// ErrResourceStateChanged rather than a write against state nobody authorized.
+type CalendarObjectTransfer struct {
+	Operation CalendarObjectTransferOperation
+
+	SourceCalendarID   int64
+	SourceUID          string
+	SourceResourceName string
+	ExpectedSourceETag string
+
+	DestinationCalendarID   int64
+	DestinationResourceName string
+	ExpectedDestination     CalendarObjectTransferState
+	Overwrite               bool
+
+	// ExpectedACL pins the ACL entries the source and destination privilege
+	// checks read.
+	ExpectedACL *ACLGuard
+
+	// RawICAL is the source's octets as they were read, which the store
+	// guards on and a COPY stores. A MOVE keeps the row's octets and ETag.
+	RawICAL string
+	// ETag is the ETag a COPY stores its copy under.
+	ETag     string
+	Metadata *EventWriteMetadata
+
+	SourceStatePath      string
+	DestinationStatePath string
+	LockPreconditions    []LockPrecondition
+}
+
+// CalendarObjectTransferResult reports what the transfer did. Created
+// distinguishes the 201 and 204 answers RFC 4918 §9.8.5 requires, and Conflict
+// carries the resource already holding the UID so a CALDAV:no-uid-conflict
+// response can name it.
+type CalendarObjectTransferResult struct {
+	Event    *Event
+	Created  bool
+	Conflict *Event
+}
+
+// CalendarObjectTransferBackend is the seam a non-PostgreSQL store implements
+// to answer TransferCalendarObject itself.
+type CalendarObjectTransferBackend interface {
+	TransferCalendarObject(context.Context, CalendarObjectTransfer) (*CalendarObjectTransferResult, error)
+}
+
+// TransferCalendarObject performs one COPY or MOVE of a calendar object inside
+// a single transaction: lock preconditions, the source and destination rows,
+// the UID uniqueness rule, the DAV dead-property state and the sync tombstones
+// all move together or not at all.
+func (s *Store) TransferCalendarObject(ctx context.Context, transfer CalendarObjectTransfer) (*CalendarObjectTransferResult, error) {
+	if s == nil || s.Events == nil {
+		return nil, ErrNotFound
+	}
+	if transfer.Operation != CalendarObjectCopy && transfer.Operation != CalendarObjectMove {
+		return nil, fmt.Errorf("unsupported calendar object transfer operation %q", transfer.Operation)
+	}
+	if transfer.RawICAL == "" || (transfer.Operation == CalendarObjectCopy && transfer.ETag == "") {
+		return nil, errors.New("calendar object transfer has no body or ETag to store")
+	}
+	if transfer.SourceResourceName == "" {
+		transfer.SourceResourceName = transfer.SourceUID
+	}
+	if transfer.DestinationResourceName == "" {
+		transfer.DestinationResourceName = transfer.SourceUID
+	}
+	if s.pool == nil {
+		if s.CalendarTransfers == nil {
+			return nil, ErrAtomicStateUnsupported
+		}
+		if err := validateACLGuardFallback(ctx, s.ACLEntries, transfer.ExpectedACL); err != nil {
+			return nil, err
+		}
+		return s.CalendarTransfers.TransferCalendarObject(ctx, transfer)
+	}
+
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if err := validateLockPreconditionsTx(ctx, tx, transfer.LockPreconditions,
+		calendarCollectionLockPath(transfer.SourceCalendarID), calendarCollectionLockPath(transfer.DestinationCalendarID)); err != nil {
+		return nil, err
+	}
+	if err := validateACLGuardTx(ctx, tx, transfer.ExpectedACL); err != nil {
+		return nil, err
+	}
+	for _, key := range calendarObjectTransferLockKeys(transfer) {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, key); err != nil {
+			return nil, err
+		}
+	}
+	if err := lockCollectionRowsTx(ctx, tx, "calendars", transfer.SourceCalendarID, transfer.DestinationCalendarID); err != nil {
+		return nil, err
+	}
+
+	result, err := transferCalendarObjectTx(ctx, tx, transfer)
+	if err != nil {
+		return result, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func transferCalendarObjectTx(ctx context.Context, tx *sql.Tx, transfer CalendarObjectTransfer) (*CalendarObjectTransferResult, error) {
+	source, err := selectEventTx(ctx, tx, `resource_name`, transfer.SourceCalendarID, transfer.SourceResourceName)
+	if err != nil {
+		return nil, err
+	}
+	if source == nil {
+		return nil, ErrNotFound
+	}
+	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
+		return nil, ErrResourceStateChanged
+	}
+
+	destination, err := selectEventTx(ctx, tx, `resource_name`, transfer.DestinationCalendarID, transfer.DestinationResourceName)
+	if err != nil {
+		return nil, err
+	}
+	sameResource := source.ID == eventID(destination)
+	if !sameResource && !calendarObjectTransferStateMatches(transfer.ExpectedDestination, destination) {
+		return nil, ErrResourceStateChanged
+	}
+	if sameResource {
+		if !transfer.Overwrite {
+			return nil, ErrPreconditionFailed
+		}
+		return &CalendarObjectTransferResult{Event: source}, nil
+	}
+	if destination != nil && !transfer.Overwrite {
+		return nil, ErrPreconditionFailed
+	}
+
+	byUID, err := selectEventTx(ctx, tx, `uid`, transfer.DestinationCalendarID, source.UID)
+	if err != nil {
+		return nil, err
+	}
+	if byUID != nil && byUID.ID != source.ID && storedResourceName(*byUID) != transfer.DestinationResourceName {
+		return &CalendarObjectTransferResult{Conflict: byUID}, ErrUIDConflict
+	}
+	if transfer.Operation == CalendarObjectCopy && transfer.SourceCalendarID == transfer.DestinationCalendarID {
+		return &CalendarObjectTransferResult{Conflict: source}, ErrUIDConflict
+	}
+
+	created := destination == nil
+	if destination != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id=$1`, destination.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	var event *Event
+	switch transfer.Operation {
+	case CalendarObjectCopy:
+		metadata := calendarObjectTransferMetadata(transfer, source)
+		const insert = `
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+RETURNING ` + calendarObjectColumns
+		copied, err := scanEvent(tx.QueryRowContext(ctx, insert,
+			transfer.DestinationCalendarID, source.UID, transfer.DestinationResourceName,
+			transfer.RawICAL, transfer.ETag, metadata.Summary, metadata.Description,
+			metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay,
+			metadata.RecurrenceStart, metadata.RecurrenceUntil,
+		).Scan)
+		if err != nil {
+			if isEventIdentityConflict(err) {
+				return nil, ErrConflict
+			}
+			return nil, err
+		}
+		event = &copied
+		if err := copyDAVStateTx(ctx, tx, transfer.SourceStatePath, transfer.DestinationStatePath); err != nil {
+			return nil, err
+		}
+	case CalendarObjectMove:
+		moved, err := rebindEventTx(ctx, tx, source.ID, transfer.DestinationCalendarID, transfer.DestinationResourceName,
+			calendarObjectTransferMetadata(transfer, source))
+		if err != nil {
+			if isEventIdentityConflict(err) {
+				return nil, ErrConflict
+			}
+			return nil, err
+		}
+		event = &moved
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+VALUES ('event', $1, $2, $3)`, source.CalendarID, source.UID, storedResourceName(*source)); err != nil {
+			return nil, err
+		}
+		if source.CalendarID != transfer.DestinationCalendarID {
+			if _, err := tx.ExecContext(ctx, `UPDATE calendars SET ctag=ctag+1, updated_at=NOW() WHERE id=$1`, source.CalendarID); err != nil {
+				return nil, err
+			}
+		}
+		if err := moveDAVStateTx(ctx, tx, transfer.SourceStatePath, transfer.DestinationStatePath); err != nil {
+			return nil, err
+		}
+	}
+	if err := clearDestinationTombstonesTx(ctx, tx, "event", transfer.DestinationCalendarID, transfer.DestinationResourceName); err != nil {
+		return nil, err
+	}
+	return &CalendarObjectTransferResult{Event: event, Created: created}, nil
+}
+
+// rebindEventTx binds an existing events row to a calendar and resource name,
+// keeping its octets and ETag, and sets its columns to the metadata the
+// transfer read from them.
+func rebindEventTx(ctx context.Context, tx *sql.Tx, id, calendarID int64, resourceName string, metadata EventWriteMetadata) (Event, error) {
+	const update = `
+UPDATE events SET calendar_id=$2, resource_name=$3, summary=$4, description=$5, location=$6,
+        dtstart=$7, dtend=$8, all_day=$9, recurrence_start=$10, recurrence_until=$11, last_modified=NOW()
+WHERE id=$1
+RETURNING ` + calendarObjectColumns
+	return scanEvent(tx.QueryRowContext(ctx, update, id, calendarID, resourceName,
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay,
+		metadata.RecurrenceStart, metadata.RecurrenceUntil).Scan)
+}
+
+func eventID(event *Event) int64 {
+	if event == nil {
+		return 0
+	}
+	return event.ID
+}
+
+func calendarObjectTransferStateMatches(expected CalendarObjectTransferState, event *Event) bool {
+	if expected.Exists != (event != nil) {
+		return false
+	}
+	if event == nil {
+		return true
+	}
+	return expected.UID == event.UID && expected.ETag == event.ETag
+}
+
+func calendarObjectTransferMetadata(transfer CalendarObjectTransfer, source *Event) EventWriteMetadata {
+	if transfer.Metadata != nil {
+		return *transfer.Metadata
+	}
+	var metadata EventWriteMetadata
+	if source != nil && source.RawICAL == transfer.RawICAL {
+		metadata = EventWriteMetadata{
+			Summary: source.Summary, Description: source.Description, Location: source.Location,
+			DTStart: source.DTStart, DTEnd: source.DTEnd, AllDay: source.AllDay,
+		}
+	} else {
+		metadata.Summary, metadata.Description, metadata.Location, metadata.DTStart, metadata.DTEnd, metadata.AllDay = parseICalFields(transfer.RawICAL)
+	}
+	metadata.RecurrenceStart, metadata.RecurrenceUntil = recurrenceBoundsFromICal(transfer.RawICAL)
+	return metadata
+}
+
+func calendarObjectTransferLockKeys(transfer CalendarObjectTransfer) []string {
+	keys := []string{
+		fmt.Sprintf("calendar-object:%d:name:%s", transfer.SourceCalendarID, transfer.SourceResourceName),
+		fmt.Sprintf("calendar-object:%d:uid:%s", transfer.SourceCalendarID, transfer.SourceUID),
+		fmt.Sprintf("calendar-object:%d:name:%s", transfer.DestinationCalendarID, transfer.DestinationResourceName),
+		fmt.Sprintf("calendar-object:%d:uid:%s", transfer.DestinationCalendarID, transfer.SourceUID),
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
+}

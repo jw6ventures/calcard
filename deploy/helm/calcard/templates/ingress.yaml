@@ -34,7 +34,7 @@ spec:
               service:
                 name: {{ $fullname }}
                 port:
-                  number: {{ .Values.service.port }}
+                  number: {{ include "calcard.integer" (list "service.port" .Values.service.port 1 65535) }}
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:

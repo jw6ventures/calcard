@@ -15,6 +15,7 @@ import (
 	appauth "github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	httpserver "github.com/jw6ventures/calcard/internal/http"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
 	jw6_utils "github.com/jw6ventures/jw6-go-utils"
 	"github.com/jw6ventures/jw6-go-utils/database"
@@ -60,9 +61,25 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
+	if cfg.TrafficCaptureFile != "" && opts.Router.TrafficCaptureWriter == nil {
+		captureFile, err := openTrafficCaptureFile(cfg.TrafficCaptureFile)
+		if err != nil {
+			return fmt.Errorf("failed to open traffic capture file: %w", err)
+		}
+		defer func() {
+			if err := captureFile.Close(); err != nil {
+				jw6utils.Log("Main", "runServer", jw6_utils.Error, fmt.Sprintf("failed to close traffic capture file: %v", err))
+			}
+		}()
+		opts.Router.TrafficCaptureWriter = captureFile
+		jw6utils.Log("Main", "runServer", jw6_utils.Warn, fmt.Sprintf("request traffic capture enabled: %s", cfg.TrafficCaptureFile))
+	}
 
+	logInsecureBasicWarning(&jw6utils, cfg)
+
+	relayPostgresNotices(&jw6utils)
 	dbManager := database.NewManager(database.Config{
-		Driver:           "postgres",
+		Driver:           postgresDriverName,
 		ConnString:       cfg.DB.DSN,
 		MigrationsPath:   "migrations",
 		AppVersion:       version,
@@ -74,6 +91,9 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
 	defer dbManager.Close()
+	dbManager.DB.SetMaxOpenConns(cfg.DB.MaxOpenConns)
+	dbManager.DB.SetMaxIdleConns(cfg.DB.MaxIdleConns)
+	dbManager.DB.SetConnMaxLifetime(cfg.DB.ConnMaxLifetime)
 
 	store.SetLogger(&jw6utils)
 
@@ -83,8 +103,18 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth service: %w", err)
 	}
+	authService.SetLogger(&jw6utils)
 
+	// With Digest off, clears any HA1 an earlier run stored; repeating it
+	// retries a failed pass without waiting for a restart.
+	go store.StartDigestCredentialPurge(ctx, stor.AppPasswords, appauth.DigestEnabled(cfg), time.Hour)
 	go store.StartLockCleanup(ctx, stor.Locks, 5*time.Minute)
+	// Every authenticated Digest request writes one nonce count, and each stops
+	// being presentable one nonce lifetime after it was written.
+	go store.StartDigestNonceCleanup(ctx, stor.DigestNonces, 5*time.Minute)
+	// The retention window is measured in weeks, so an hourly pass keeps the
+	// table bounded without the prune ever being the reason a query is slow.
+	go store.StartDeletedResourceCleanup(ctx, stor.DeletedResources, time.Hour, cfg.DAV.SyncHistoryRetention)
 
 	if opts.Router.Logger == nil {
 		opts.Router.Logger = &jw6utils
@@ -94,9 +124,18 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.HTTP.ReadTimeout,
+		WriteTimeout: cfg.HTTP.WriteTimeout,
+		IdleTimeout:  cfg.HTTP.IdleTimeout,
+	}
+
+	if cfg.PprofEnabled {
+		pprofSrv := startPprofServer(cfg.PprofAddr, &jw6utils)
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(shutdownCtx)
+		}()
 	}
 
 	go func() {
@@ -119,4 +158,26 @@ func runServer(ctx context.Context, opts ServerOptions) error {
 		log.Printf("graceful shutdown failed: %v", err)
 	}
 	return nil
+}
+
+// logInsecureBasicWarning reports on every start that Basic is accepted over
+// plain HTTP, which RFC 4791 Section 11 forbids: the app password and all
+// calendar and contact data then cross the network in cleartext.
+func logInsecureBasicWarning(sink logging.Sink, cfg *config.Config) {
+	if !cfg.DAV.InsecureBasicEnabled {
+		return
+	}
+	logging.New(sink, "Main").Warn("runServer", "APP_DAV_INSECURE_BASIC_ENABLED is set: HTTP Basic is accepted on /dav and /api over plain HTTP, so app passwords and all calendar and contact data cross the network in cleartext. RFC 4791 Section 11 forbids Basic without TLS; terminate TLS in front of CalCard and unset it where you can")
+}
+
+func openTrafficCaptureFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }

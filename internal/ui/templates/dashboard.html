@@ -72,6 +72,18 @@
     .recent-icon.event {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: #fff;
+        flex-direction: column;
+        gap: 1px;
+        line-height: 1;
+    }
+    .recent-icon-month {
+        font-size: 0.5rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+    }
+    .recent-icon-day {
+        font-size: 1rem;
+        font-weight: 700;
     }
     .recent-icon.contact {
         background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
@@ -220,7 +232,7 @@
 </style>
 
 <h1>Dashboard</h1>
-<p>Welcome, {{.User.PrimaryEmail}}</p>
+<p>Welcome, {{.User.GreetingName}}</p>
 
 <div class="dashboard-grid">
     <div class="dashboard-card">
@@ -252,7 +264,14 @@
             {{else}}
             {{range .RecentEvents}}
             <a class="recent-item" href="{{.EventURL}}">
-                <div class="recent-icon event">&#128197;</div>
+                <div class="recent-icon event" aria-hidden="true">
+                    {{if .DTStart}}
+                    <span class="recent-icon-month">{{formatMonthAbbrev .DTStart}}</span>
+                    <span class="recent-icon-day">{{formatDayOfMonth .DTStart}}</span>
+                    {{else}}
+                    <span class="recent-icon-day">&ndash;</span>
+                    {{end}}
+                </div>
                 <div class="recent-info">
                     <div class="recent-title">{{.Summary}}</div>
                     <div class="recent-meta">
@@ -301,7 +320,7 @@
 
         <div class="tour-step active" data-step="0">
             <h2 id="tour-heading">Welcome to CalCard!</h2>
-            <p>Hi {{.User.PrimaryEmail}}, thanks for joining! CalCard hosts your calendars
+            <p>Hi {{.User.GreetingName}}, thanks for joining! CalCard hosts your calendars
             and contacts and syncs them to any CalDAV/CardDAV app. Let's get you set up in a few quick steps.</p>
             <p>Use the top navigation to reach your <strong>Dashboard</strong>, <strong>Calendars</strong>,
             <strong>Address Books</strong>, <strong>Birthdays</strong>, and <strong>App Passwords</strong> at any time.

@@ -10,6 +10,7 @@ servers:
   - url: /
 security:
   - basicAuth: []
+  - digestAuth: []
 tags:
   - name: Calendars
     description: Calendar metadata visible to the authenticated user.
@@ -37,6 +38,8 @@ paths:
                   $ref: "#/components/schemas/Calendar"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/calendars/{id}:
@@ -62,6 +65,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/calendars/{id}/events:
@@ -83,13 +88,26 @@ paths:
         - name: start
           in: query
           required: false
-          description: Include events ending at or after this instant (RFC3339 or YYYY-MM-DD).
+          description: |
+            Include events ending at or after this instant (RFC3339, or
+            YYYY-MM-DD for midnight UTC of that day), judged by the end the
+            server stores for indexing: for a recurring object the end of its
+            recurrence set, and otherwise the event's `dtend`. A timed event
+            without a `DTEND` ends at its `DTSTART`, so one that starts before
+            this instant is left out; an all-day one ends with its day. A
+            non-recurring event whose end a `DURATION` gives has no stored end
+            and is always included, as is any object with no stored end at
+            all, such as a non-recurring `VTODO`.
           schema:
             type: string
         - name: end
           in: query
           required: false
-          description: Include events starting at or before this instant (RFC3339 or YYYY-MM-DD).
+          description: |
+            Include events whose earliest instance starts at or before this
+            instant (RFC3339, or YYYY-MM-DD for midnight UTC of that day, so
+            events later that day are left out). Any object with no stored
+            start, such as a non-recurring `VTODO`, is always included.
           schema:
             type: string
         - name: title
@@ -152,28 +170,58 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     post:
       tags:
         - Events
       operationId: createEvent
-      summary: Create or upsert an event
+      summary: Create an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The body is decoded, before any privilege check. A `text/calendar`,
+           `application/ical` or `application/ics` body gets `400` here only
+           when it is over 10 MiB. Any other body is read as an
+           `EventWriteRequest` and gets `400` when it is empty, over 10 MiB
+           (the limit applies to the whole JSON document), not valid JSON,
+           names an unknown field, or lacks the input its `inputMode` needs,
+           such as a blank `rawIcal`.
+        2. `404` when the caller holds no grant on the calendar or on any of
+           its events, as when the calendar does not exist.
+        3. `403` when the caller lacks `DAV:bind` on the calendar, whatever
+           the body holds, the UID it names, or the conditional headers.
+        4. The event is built from the body and validated: `400` or `409`.
+           An empty or blank `text/calendar` body gets `400` here. `rawIcal`
+           under `inputMode` `raw_ical` is validated and stored by the same
+           rules as a `text/calendar` body. The UID is learned here, so a
+           body refused here is answered before any lock is looked at.
+        5. When the request carries `If-Match` or `If-None-Match`: `423` when
+           a WebDAV lock covers the new event's name or the calendar. The API
+           submits no lock token, so it cannot write under a lock; its holder
+           writes over CalDAV. A lock that has expired refuses nothing.
+        6. The conditional headers are evaluated: `412`.
+        7. `409` when the calendar already holds an event with the UID. A
+           create never updates an existing event: one that another request
+           stores while this one runs is refused too, with `409`, or `412`
+           under `If-None-Match: *`.
+        8. The event is stored once the store has checked it again under its
+           locks. A request that carried no conditional header meets a WebDAV
+           lock here, with `423`, after steps 4 and 7: a body refused, or an
+           event that already exists, is answered `400` or `409` before
+           the lock.
+
+        A create that keeps losing to concurrent changes of the calendar's
+        events or ACL gives up with `409`. A grant withdrawn while the create
+        runs fails it with `403`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
       requestBody:
         $ref: "#/components/requestBodies/EventWrite"
       responses:
-        "200":
-          description: Existing event updated by the create request.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Event"
         "201":
           description: Event created.
           headers:
@@ -195,8 +243,10 @@ paths:
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/calendars/{id}/events/{uid}:
@@ -226,6 +276,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     put:
@@ -233,6 +285,49 @@ paths:
         - Events
       operationId: updateEvent
       summary: Update an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The body is decoded, before any privilege check. A `text/calendar`,
+           `application/ical` or `application/ics` body gets `400` here only
+           when it is over 10 MiB. Any other body is read as an
+           `EventWriteRequest` and gets `400` when it is empty, over 10 MiB
+           (the limit applies to the whole JSON document), not valid JSON,
+           names an unknown field, or lacks the input its `inputMode` needs,
+           such as a blank `rawIcal`.
+        2. `DAV:write-content` is checked on the event, or on the calendar
+           when it holds no event with the UID. A caller who can neither read
+           the event nor hold the privilege on it is answered as though the
+           calendar held no event with the UID, so the answer does not reveal
+           that it exists. Without the privilege on the calendar, such a UID
+           gets `403` when the caller can read the calendar and `404`
+           otherwise; with it, the steps below go on.
+        3. `404` when the calendar holds no event with the UID, whatever the
+           conditional headers say (RFC 9110 §13.2.1).
+        4. When the request carries `If-Match` or `If-None-Match`: `423` when
+           a WebDAV lock covers the event, or a depth-infinity lock covers
+           the calendar. The API submits no lock token, so it cannot write
+           under a lock; its holder writes over CalDAV. A lock that has
+           expired refuses nothing. This precedes the checks below, a body
+           refused with `400` included.
+        5. The conditional headers are evaluated: `412`.
+        6. The event is built from the body and validated: `400` or `409`.
+           An empty or blank `text/calendar` body gets `400` here. `rawIcal`
+           under `inputMode` `raw_ical` is validated and stored by the same
+           rules as a `text/calendar` body.
+        7. The event is stored only if it is still the version steps 2 to 5
+           decided on, which the store checks under the event's row lock. A
+           request that carried no conditional header meets a WebDAV lock
+           here, with `423`, after steps 3 and 6: a missing event or a body
+           refused is answered `404` or `400` or `409` before the lock. An
+           event another request removes meanwhile is not stored again: the
+           request is decided again and answered `404`. One another request
+           replaces meanwhile is read again and the conditional headers
+           evaluated against it, so `If-Match` of the replaced version gets
+           `412`, and a request with no `If-Match` replaces the new version.
+           A grant withdrawn meanwhile fails the request with `403`, or
+           `404` when it leaves the caller unable to see the event. A request
+           that keeps losing to concurrent changes gives up with `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -260,8 +355,10 @@ paths:
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:
@@ -269,6 +366,39 @@ paths:
         - Events
       operationId: deleteEvent
       summary: Delete an event
+      description: |
+        The request is answered at the first of these steps that refuses it:
+
+        1. The caller needs `DAV:unbind` on the calendar, a privilege of the
+           collection an event leaves (RFC 3744 §3.10), and some privilege on
+           the event. A caller holding no privilege on the event, an
+           event-level deny of every privilege included, is answered as
+           though the calendar held no event with the UID, so the answer does
+           not reveal that it exists. For such a UID, a caller holding no
+           privilege on the calendar gets `404`, and one holding some but not
+           `DAV:unbind` gets `403`. A caller holding privilege on the event
+           but not `DAV:unbind` on the calendar gets `403`, whatever they hold
+           on the event. DAV DELETE decides the same way but for one case: a
+           caller whose ACEs on the calendar grant none of its privileges, or
+           deny every one, gets `403` from DAV, which confirms the calendar
+           exists, and `404` here, as `GET` answers them.
+        2. `404` when the calendar holds no event with the UID, whatever the
+           conditional headers say (RFC 9110 §13.2.1).
+        3. When the request carries `If-Match` or `If-None-Match`: `423` when
+           a WebDAV lock covers the event or the calendar. The API submits no
+           lock token, so it cannot delete under a lock; its holder deletes
+           over CalDAV. A lock that has expired refuses nothing.
+        4. The conditional headers are evaluated: `412`.
+        5. The event is removed only if it is still the version steps 1 to 4
+           decided on, which the store checks under the event's row lock. A
+           request that carried no conditional header meets a WebDAV lock
+           here, with `423`. If the event has changed, the request is decided
+           again on the new version: `404` when it is gone, `412` when the
+           request's `If-Match` or `If-None-Match` no longer holds, and a
+           request with no conditional header removes the new version. A
+           grant withdrawn meanwhile fails the request as step 1 would. A
+           request that keeps losing to concurrent changes gives up with
+           `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -283,8 +413,14 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/addressbooks:
@@ -304,6 +440,8 @@ paths:
                   $ref: "#/components/schemas/AddressBook"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/addressbooks/{id}:
@@ -327,6 +465,113 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /api/addressbooks/{id}/shares:
+    parameters:
+      - $ref: "#/components/parameters/AddressBookID"
+    get:
+      tags:
+        - Address Books
+      operationId: listAddressBookShares
+      summary: List the users an address book is shared with
+      description: |
+        Owner only. A caller who does not own the address book, or when it does
+        not exist, gets `404`.
+      responses:
+        "200":
+          description: The users that can read the address book, by user ID.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AddressBookShare"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    post:
+      tags:
+        - Address Books
+      operationId: shareAddressBook
+      summary: Share an address book with a user
+      description: |
+        Owner only. Grants the user read-only or editor access to the address
+        book and its contacts, or changes the role of a user it is already
+        shared with. The request is answered at the first of these steps that
+        refuses it:
+
+        1. `400` when the address book ID is not a number, or the body is
+           over 64 KiB, not valid JSON, or names an unknown field. This
+           precedes the ownership check.
+        2. `404` when the caller does not own the address book, as when it
+           does not exist.
+        3. `400` when `userId` is missing, zero, the caller's own, or names no
+           user.
+        4. `423` when a WebDAV lock covers the address book, as it refuses an
+           `ACL` request that changes who can access it without the lock
+           token. The API submits no lock token. A lock that has expired
+           refuses nothing. Removing a share is not refused for a lock: see
+           the `DELETE` operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShareAddressBookRequest"
+      responses:
+        "204":
+          description: The address book is shared with the user in that role.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /api/addressbooks/{id}/shares/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/AddressBookID"
+      - $ref: "#/components/parameters/ShareUserID"
+    delete:
+      tags:
+        - Address Books
+      operationId: unshareAddressBook
+      summary: Remove a share of an address book
+      description: |
+        The owner may remove the share of any user. Any other caller may
+        remove only their own share, which leaves the address book, and only if
+        they have one. Every grant the user holds on the address book and its
+        contacts is removed; denies stay. A caller who may not remove the
+        share of `userId`, and one who has no share to remove, gets `404`, as
+        when the address book does not exist.
+
+        A WebDAV lock on the address book does not refuse this operation.
+      responses:
+        "204":
+          description: The share is removed.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/addressbooks/{id}/contacts:
@@ -394,6 +639,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     post:
@@ -401,21 +648,21 @@ paths:
         - Contacts
       operationId: createContact
       summary: Create a contact
+      description: |
+        The caller needs `DAV:bind` on the address book. A caller who may not
+        see the address book gets `404`, and one who may see it but lacks
+        `DAV:bind` gets `403`. A contact the address book already holds under
+        the UID is never replaced: `409`, or `412` under `If-None-Match: *`.
+        A create that keeps losing to concurrent changes of the address book's
+        contacts or ACL gives up with `409`. A WebDAV lock on the address book,
+        or on the contact's name, refuses it with `423`, ahead of the
+        conditional headers.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
       requestBody:
         $ref: "#/components/requestBodies/ContactWrite"
       responses:
-        "200":
-          description: Existing contact updated by the create request.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Contact"
         "201":
           description: Contact created.
           headers:
@@ -429,12 +676,18 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /api/addressbooks/{id}/contacts/{uid}:
@@ -446,6 +699,12 @@ paths:
         - Contacts
       operationId: getContact
       summary: Get a contact
+      description: |
+        The caller needs `DAV:read` on the contact, which the contact's own
+        ACL decides ahead of the address book's. A contact the caller may not
+        read is answered `404`, as a contact the address book does not hold
+        is, so the answer does not reveal that it exists; CardDAV `GET`
+        answers it the same way.
       responses:
         "200":
           description: Contact details and raw vCard data.
@@ -462,6 +721,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     put:
@@ -469,6 +730,18 @@ paths:
         - Contacts
       operationId: updateContact
       summary: Update a contact
+      description: |
+        The caller needs `DAV:write-content` on the contact, which the
+        contact's own ACL decides ahead of the address book's. A caller
+        refused it who may read the contact gets `403`. One who may not read
+        it either is answered as for a UID the address book does not hold, so
+        the answer does not reveal that the contact exists: `403` when the
+        address book refuses them `DAV:write-content`, `404` otherwise. The
+        conditional headers are checked against the contact as each attempt
+        reads it, so `412` means the contact itself changed; an update that
+        keeps losing to concurrent changes gives up with `409`. A WebDAV lock
+        on the contact, or on the address book to its members, refuses it with
+        `423`, ahead of the conditional headers.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -488,12 +761,18 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:
@@ -501,6 +780,33 @@ paths:
         - Contacts
       operationId: deleteContact
       summary: Delete a contact
+      description: |
+        Decided and answered as CardDAV `DELETE` of the contact is. The
+        request is answered at the first of these steps that refuses it:
+
+        1. The caller needs `DAV:unbind` on the address book, a privilege of
+           the collection a contact leaves (RFC 3744 §3.10), and some
+           privilege on the contact, which the contact's own ACL decides ahead
+           of the address book's. The owner holds both. A grant on the
+           contact alone does not reach the address book.
+           - A caller holding some privilege on the contact but not
+             `DAV:unbind` gets `403`.
+           - A caller holding no privilege on the contact, and denied none,
+             gets `404`.
+           - A caller denied every privilege on the contact cannot read it,
+             and is answered as though the address book held no contact with
+             the UID, so the answer does not reveal that it exists.
+           - For such a UID, and for one the address book does not hold: a
+             caller denied every privilege by the address book's own ACL, or
+             holding some there but not `DAV:unbind`, gets `403`; one holding
+             none there and denied none gets `404`.
+        2. `404` when the address book holds no contact with the UID, whatever
+           the conditional headers say (RFC 9110 §13.2.1).
+        3. `423` when a WebDAV lock covers the contact or its address book.
+        4. The conditional headers are evaluated: `412`.
+        5. The contact is removed if neither it nor its ACL has changed since
+           step 1. Otherwise the steps run again against the new state, up to
+           three times in all, and the request gives up with `409`.
       parameters:
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/IfNoneMatch"
@@ -511,10 +817,18 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "412":
           $ref: "#/components/responses/PreconditionFailed"
+        "423":
+          $ref: "#/components/responses/Locked"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
 components:
@@ -522,7 +836,27 @@ components:
     basicAuth:
       type: http
       scheme: basic
-      description: DAV Basic authentication using the user's email and an app password.
+      description: |
+        HTTP Basic with the user's primary email address and an app password.
+        Accepted over HTTPS only: the request must reach CalCard over TLS, or
+        through a proxy listed in `APP_TRUSTED_PROXIES` that sends
+        `X-Forwarded-Proto: https`. Basic credentials sent over plain HTTP are
+        refused with `401`, unless the deployment sets
+        `APP_DAV_INSECURE_BASIC_ENABLED` (off by default; RFC 4791 Section 11
+        forbids Basic without TLS, and the credentials and all data then cross
+        the network in cleartext), which accepts Basic on every transport.
+    digestAuth:
+      type: http
+      scheme: digest
+      description: |
+        HTTP Digest (SHA-256 or MD5) with the user's primary email address and
+        an app password, accepted when `APP_DAV_DIGEST_ENABLED` is true. An app
+        password can answer Digest only once it is Digest ready: one issued
+        while Digest is enabled, or one that has since authenticated over Basic.
+        A client that prefers Digest picks it from the challenge and may not
+        fall back to Basic, so it may be unable to use an app password that is
+        not yet Digest ready; reissue the app password, or authenticate with it
+        once over Basic, before pointing such a client at it.
   parameters:
     CalendarID:
       name: id
@@ -550,6 +884,14 @@ components:
         type: integer
         format: int64
         minimum: 1
+    ShareUserID:
+      name: userId
+      in: path
+      required: true
+      description: Numeric identifier of the user the address book is shared with.
+      schema:
+        type: integer
+        format: int64
     ContactUID:
       name: uid
       in: path
@@ -562,7 +904,10 @@ components:
       name: If-Match
       in: header
       required: false
-      description: Only apply the write if the current event ETag matches.
+      description: |
+        Only apply the write if the current ETag matches (RFC 9110 §13.1.1): a
+        comma-separated list matches when any of its tags does, `*` matches a
+        resource that exists, and a weak tag (`W/"..."`) never matches.
       schema:
         type: string
       example: "\"abc123\""
@@ -570,7 +915,10 @@ components:
       name: If-None-Match
       in: header
       required: false
-      description: Only apply the write if the current event ETag does not match.
+      description: |
+        Only apply the write if the current ETag does not match (RFC 9110
+        §13.1.2): a comma-separated list fails when any of its tags matches,
+        weak tags included, and `*` fails when the resource exists.
       schema:
         type: string
       example: "*"
@@ -616,10 +964,18 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorText"
     Unauthorized:
-      description: Missing or invalid DAV Basic authentication.
+      description: |
+        Missing or invalid credentials, or Basic credentials sent over plain
+        HTTP while `APP_DAV_INSECURE_BASIC_ENABLED` is off.
       headers:
         WWW-Authenticate:
-          description: Basic authentication challenge.
+          description: |
+            A challenge for each scheme the request could use: `Basic` over
+            HTTPS (or over any transport when `APP_DAV_INSECURE_BASIC_ENABLED`
+            is set), and `Digest` with SHA-256 and with MD5 when Digest is
+            enabled. Over plain HTTP with Digest disabled and
+            `APP_DAV_INSECURE_BASIC_ENABLED` unset, the response carries no
+            challenge.
           schema:
             type: string
           example: Basic realm="CalCard DAV"
@@ -640,7 +996,13 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorText"
     Conflict:
-      description: The request conflicts with existing calendar data or resource constraints.
+      description: |
+        The request conflicts with the resource it writes: the calendar data is
+        a scheduling message (`METHOD`) or names more than one UID, its UID
+        belongs to another resource in the collection, or a contact's UID or
+        resource name is taken, or the write kept losing to concurrent changes
+        of the resource or of the access that decided it. Calendar data refused
+        for any other reason is a `400`.
       content:
         text/plain; charset=utf-8:
           schema:
@@ -651,8 +1013,24 @@ components:
         text/plain; charset=utf-8:
           schema:
             $ref: "#/components/schemas/ErrorText"
-    UnsupportedMediaType:
-      description: The request content type is unsupported for event writes.
+    Locked:
+      description: |
+        A WebDAV lock covers the resource or the collection it is written to or
+        removed from, and a REST request cannot submit the lock token that
+        would let the write through, whoever holds the lock. The write is
+        refused as a CalDAV or CardDAV `PUT` or `DELETE` without the token is:
+        by a lock on the contact or event itself, by a depth-infinity lock on
+        its address book or calendar, or, for a create or a delete, by any lock
+        on the address book or calendar or on the name the item is created at.
+        A lock that has expired refuses nothing.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    TooManyRequests:
+      description: |
+        The client has used up the rate limit that covers every `/api` request
+        from its address. Retry later.
       content:
         text/plain; charset=utf-8:
           schema:
@@ -739,8 +1117,12 @@ components:
           format: int64
         resourceName:
           type: string
-          description: Stored resource name for the calendar object.
-          example: example-event.ics
+          description: |
+            Stored resource name for the calendar object. CalDAV serves the
+            object at this name with `.ics` added. An event this API creates is
+            stored under its UID, so a create whose UID contains `/` is refused
+            with 400.
+          example: example-event
         summary:
           type: string
         description:
@@ -752,9 +1134,27 @@ components:
         dtstart:
           type: string
           format: date-time
+          description: |
+            The start of the event's master `VEVENT` (the first without a
+            `RECURRENCE-ID`, else the first `VEVENT`) as stored for indexing,
+            in UTC (RFC 3339 with `Z`). An all-day event's start is midnight
+            UTC of its first day. Absent when the object has no `VEVENT`, or
+            its `DTSTART` cannot be read.
         dtend:
           type: string
           format: date-time
+          description: |
+            The end of the event's master `VEVENT` as stored for indexing, in
+            UTC (RFC 3339 with `Z`). An all-day event's end is midnight UTC of
+            the day after its last day, the exclusive iCalendar `DTEND`. An
+            event without a `DTEND`, or with one that cannot end it, ends at its
+            `DTSTART`, or for an all-day event at midnight UTC after its one day
+            (RFC 5545 §3.6.1), and `dtend` is returned for it. Absent when a
+            `DURATION` gives the event's end instead, and when the object has
+            no `VEVENT`. An object stored without a readable `DTSTART` returns
+            its `DTEND`, if it has one. A row a 1.1.x release stored without a
+            `DTEND` has no `dtend` when any `DURATION` appears in it, an
+            alarm's included, and the `start` filter always includes it.
         allDay:
           type: boolean
         etag:
@@ -777,7 +1177,10 @@ components:
           description: Defaults to `structured` when omitted.
         rawIcal:
           type: string
-          description: Required when `inputMode` is `raw_ical`.
+          description: |
+            Required when `inputMode` is `raw_ical`. An iCalendar object,
+            validated and stored by the same rules as a `text/calendar` request
+            body.
         structured:
           $ref: "#/components/schemas/StructuredEventInput"
       oneOf:
@@ -804,24 +1207,63 @@ components:
           type: string
         dtstart:
           type: string
-          description: Event start. Accepted formats include local date-time and all-day date values.
+          description: |
+            Event start. For a timed event (`allDay` false or omitted) a local
+            date-time, `YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`, read as a
+            wall clock in `timezone`. A value carrying a UTC offset or `Z` is
+            refused with `400`; to give a UTC time, send the UTC wall clock and
+            omit `timezone`. For an all-day event a date, `YYYY-MM-DD`, the
+            event's first day. A value of the other shape than `allDay` calls
+            for is refused with `400`.
           examples:
             - "2026-03-20T10:00"
             - "2026-03-20"
         dtend:
           type: string
-          description: Event end. Accepted formats include local date-time and all-day date values.
+          description: |
+            Event end, in the same format as `dtstart` and read the same way. A
+            timed end may equal the start but not precede it, compared as the
+            instants both name in `timezone`; otherwise the request is refused
+            with `400`. For an all-day event it is the event's last day,
+            inclusive: `dtstart` and `dtend` both `2026-03-20` is a one-day
+            event, stored with the exclusive iCalendar `DTEND` of 2026-03-21.
           examples:
             - "2026-03-20T11:00"
             - "2026-03-21"
         allDay:
           type: boolean
+          description: |
+            Whether the event is all-day, its times being dates with no time of
+            day or zone (`VALUE=DATE`). Defaults to false.
         location:
           type: string
         description:
           type: string
         timezone:
           type: string
+          description: |
+            The time zone a timed event's `dtstart`, `dtend` and recurrence
+            `until` are wall clocks in, as an IANA name from the server's time
+            zone database, such as `America/Chicago`. The event is stored with
+            `DTSTART;TZID=<timezone>:<wall clock>` exactly as given, and the
+            server adds the `VTIMEZONE` defining the zone from its database.
+
+            When `timezone` is omitted, empty or `UTC`, the values are read as
+            UTC wall clocks and stored as UTC (`DTSTART:20260320T100000Z`).
+            Before 1.2.0 they were read in the time zone of the server process,
+            so a client of a server not running in UTC that omits `timezone` now
+            gets times that many hours from where it did. Any other name the
+            server's database does not define is refused with `400`, all-day
+            events included. A structured update replaces the whole event, so a
+            zone a stored event defines only by its own `VTIMEZONE`, such as
+            Outlook's `Eastern Standard Time`, is refused here as well; send
+            `rawIcal` to keep it.
+
+            A wall clock a daylight-saving change skips (02:30 on the morning
+            New York springs forward) is stored as given and names the instant
+            RFC 5545 §3.3.5 gives it, read with the offset before the change
+            (02:30 EST, which is 03:30 EDT); a wall clock a change repeats names
+            its first occurrence. An all-day event's dates are not read in it.
           example: America/Chicago
         url:
           type: string
@@ -874,6 +1316,16 @@ components:
           minimum: 0
         until:
           type: string
+          description: |
+            The last day of the series, `YYYY-MM-DD`, inclusive: an occurrence
+            on that day is part of it. For an all-day series it is stored as
+            the date `UNTIL`; for a timed one as the last second of that day
+            (23:59:59) in the event's `timezone`, or in UTC under the same rules
+            `timezone` describes, written as a UTC `UNTIL`. Ignored when
+            `count` is greater than zero. A value that is not a `YYYY-MM-DD`
+            calendar date is refused with `400`, whatever `count` or
+            `frequency` is.
+          example: "2026-06-30"
         byDay:
           type: array
           items:
@@ -917,6 +1369,41 @@ components:
           type: string
         description:
           type: string
+    AddressBookShare:
+      type: object
+      additionalProperties: false
+      required:
+        - userId
+        - email
+        - role
+      properties:
+        userId:
+          type: integer
+          format: int64
+        email:
+          type: string
+          description: Primary email address of the user, empty when it cannot be read.
+        role:
+          type: string
+          enum:
+            - read
+            - editor
+    ShareAddressBookRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - userId
+      properties:
+        userId:
+          type: integer
+          format: int64
+          description: The user to share with. It cannot be the caller.
+        role:
+          type: string
+          description: |
+            `editor` (also `write`, `read-write` or `readwrite`, in any case)
+            grants read and write access. Any other value, and an absent one,
+            grants read-only access.
     Contact:
       type: object
       additionalProperties: false

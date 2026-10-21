@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -11,8 +12,17 @@ import (
 
 const pendingCollectionSegment = ".pending"
 
-func (h *Handler) canonicalDAVPath(ctx context.Context, user *store.User, rawPath string) (string, error) {
-	cleanPath := normalizeDAVHref(rawPath)
+// canonicalDAVPath resolves an already-decoded path; canonicalDAVHref resolves
+// a percent-encoded href.
+func (h *DavServer) canonicalDAVPath(ctx context.Context, user *store.User, decodedPath string) (string, error) {
+	return h.resolveCanonicalDAVPath(ctx, user, cleanDAVPath(decodedPath))
+}
+
+func (h *DavServer) canonicalDAVHref(ctx context.Context, user *store.User, href string) (string, error) {
+	return h.resolveCanonicalDAVPath(ctx, user, normalizeDAVHref(href))
+}
+
+func (h *DavServer) resolveCanonicalDAVPath(ctx context.Context, user *store.User, cleanPath string) (string, error) {
 	switch {
 	case cleanPath == "", cleanPath == "/":
 		return cleanPath, nil
@@ -27,7 +37,7 @@ func (h *Handler) canonicalDAVPath(ctx context.Context, user *store.User, rawPat
 	}
 }
 
-func (h *Handler) canonicalCollectionPath(ctx context.Context, user *store.User, cleanPath, prefix string, resolve func(context.Context, *store.User, string) (int64, bool, error)) (string, error) {
+func (h *DavServer) canonicalCollectionPath(ctx context.Context, user *store.User, cleanPath, prefix string, resolve func(context.Context, *store.User, string) (int64, bool, error)) (string, error) {
 	trimmed := strings.Trim(strings.TrimPrefix(cleanPath, prefix), "/")
 	if trimmed == "" {
 		return prefix, nil
@@ -43,7 +53,7 @@ func (h *Handler) canonicalCollectionPath(ctx context.Context, user *store.User,
 
 	id, ok, err := resolve(ctx, user, segment)
 	if err != nil {
-		if err == store.ErrNotFound && len(parts) == 1 {
+		if errors.Is(err, store.ErrNotFound) && len(parts) == 1 {
 			if user != nil {
 				return pendingCollectionPath(prefix, user.ID, segment), nil
 			}
@@ -76,7 +86,7 @@ func pendingCollectionPath(prefix string, userID int64, segment string) string {
 }
 
 func publicPendingCollectionPath(canonicalPath string) (string, bool) {
-	cleanPath := normalizeDAVHref(canonicalPath)
+	cleanPath := cleanDAVPath(canonicalPath)
 	for _, prefix := range []string{"/dav/addressbooks", "/dav/calendars"} {
 		if !strings.HasPrefix(cleanPath, prefix+"/"+pendingCollectionSegment+"/") {
 			continue
@@ -89,66 +99,4 @@ func publicPendingCollectionPath(canonicalPath string) (string, bool) {
 		return path.Join(prefix, parts[2]), true
 	}
 	return "", false
-}
-
-func normalizeDAVResourceIdentity(rawPath string) string {
-	cleanPath := normalizeDAVHref(rawPath)
-	if segment, resource, ok := parseCalendarResourceSegments(cleanPath); ok {
-		resourcePart := path.Base(cleanPath)
-		if strings.EqualFold(path.Ext(resourcePart), ".ics") {
-			return path.Join("/dav/calendars", segment, resource)
-		}
-		return cleanPath
-	}
-	if segment, resource, ok := parseAddressBookResourceSegments(cleanPath); ok {
-		resourcePart := path.Base(cleanPath)
-		if strings.EqualFold(path.Ext(resourcePart), ".vcf") {
-			return path.Join("/dav/addressbooks", segment, resource)
-		}
-		return cleanPath
-	}
-	return cleanPath
-}
-
-func legacyDAVResourcePaths(canonicalPath string) []string {
-	switch {
-	case strings.HasPrefix(canonicalPath, "/dav/calendars/"):
-		if _, _, ok := parseCalendarResourceSegments(canonicalPath); ok {
-			return []string{canonicalPath + ".ics"}
-		}
-	case strings.HasPrefix(canonicalPath, "/dav/addressbooks/"):
-		if _, _, ok := parseAddressBookResourceSegments(canonicalPath); ok {
-			return []string{canonicalPath + ".vcf"}
-		}
-	}
-	return nil
-}
-
-func davStatePaths(resourcePath string) []string {
-	resourcePath = normalizeDAVHref(resourcePath)
-	if resourcePath == "" {
-		return nil
-	}
-
-	seen := map[string]struct{}{}
-	var paths []string
-	addPath := func(p string) {
-		p = normalizeDAVHref(p)
-		if p == "" {
-			return
-		}
-		if _, ok := seen[p]; ok {
-			return
-		}
-		seen[p] = struct{}{}
-		paths = append(paths, p)
-	}
-
-	addPath(resourcePath)
-	normalized := normalizeDAVResourceIdentity(resourcePath)
-	addPath(normalized)
-	for _, legacyPath := range legacyDAVResourcePaths(normalized) {
-		addPath(legacyPath)
-	}
-	return paths
 }

@@ -1,0 +1,136 @@
+{{define "safe_html_js"}}
+// The helpers every page uses to put stored calendar and contact data on the
+// page. There is one copy so a hardening applied to it reaches every page.
+
+// Makes a value safe in HTML text and inside a quoted attribute value, and
+// nowhere else. Quotes are escaped as well as the markup delimiters because
+// results land inside double-quoted attributes; the ampersand goes first so
+// the entities introduced after it are not escaped twice.
+//
+// It does NOT make a value safe inside an on* attribute, a <script> body, a
+// javascript: URL or a style attribute: the HTML parser decodes these entities
+// before the JavaScript engine sees such an attribute, so &#39; arrives there
+// as an apostrophe. Data reaches those positions only through
+// addEventListener and a closure, never by being built into markup.
+function escapeHtml(str) {
+    return (str === null || str === undefined ? '' : String(str))
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Undoes the TEXT value escapes iCalendar (RFC 5545 section 3.3.11) and vCard
+// (RFC 6350 section 3.4) share. It is one pass so an escaped backslash
+// followed by "n" stays a backslash and an "n" rather than becoming a newline.
+function unescapeText(str) {
+    return String(str).replace(/\\([\\;,nN])/g, function(match, escaped) {
+        return escaped === 'n' || escaped === 'N' ? '\n' : escaped;
+    });
+}
+
+// The parsed URL of an absolute URL whose scheme is allowed, or '' otherwise.
+// The scheme is read off the parse rather than the text: the URL parser drops
+// the tabs, newlines and leading control characters a scheme can be spelled
+// around, and the browser acts on the parsed URL. A relative URL is refused
+// because stored data would otherwise get a link into this site, with text of
+// its choosing, that looks like one of the page's own. The result is
+// unescaped: it is for assigning, not for building markup.
+function safeUrl(raw) {
+    if (!raw) return '';
+    var value = String(raw).trim();
+    if (!value) return '';
+    var url;
+    try {
+        url = new URL(value);
+    } catch (e) {
+        return '';
+    }
+    var protocol = url.protocol.toLowerCase();
+    if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:') {
+        return url.href;
+    }
+    return '';
+}
+
+// safeUrl for a value interpolated into href="..." in a markup string. The URL
+// parser percent-encodes quotes and control characters; escapeHtml covers the
+// rest.
+function safeHref(raw) {
+    var url = safeUrl(raw);
+    return url ? escapeHtml(url) : '';
+}
+
+// Returns an HTML description, which arrives over CalDAV or an ICS import as
+// attacker-authored markup, as a node for the caller to append.
+//
+// The markup is parsed in a document with no browsing context: a node of the
+// live document starts loading an <img src=x onerror=...> as soon as innerHTML
+// is assigned, before anything has been checked. Nothing parsed there is
+// returned. The result is built afresh in this document from the allowed tags,
+// so no attribute, custom-element "is" value or other parser state rides along
+// on it. A node is returned rather than markup because re-serializing and
+// parsing again can change what the markup means, and the allow list only saw
+// the first reading.
+function sanitizeHtml(html) {
+    var inert = document.implementation.createHTMLDocument('');
+    inert.body.innerHTML = unescapeText(html);
+
+    var allowedTags = ['p', 'br', 'b', 'i', 'u', 'strong', 'em', 'a', 'ul', 'ol', 'li',
+                       'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'code',
+                       'div', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody'];
+
+    // The attributes kept are a closed set: title everywhere, which the browser
+    // only ever shows as a tooltip, and href on <a>, once it passes safeUrl.
+    // id is never kept because the modal finds its own parts by id after the
+    // description is in the document, and a planted id earlier in tree order
+    // would be found first; class and style would let the description restyle
+    // the modal around it, covering controls it does not own.
+    function cleanCopy(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            return document.createTextNode(node.data);
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+            return null;
+        }
+        var tagName = node.tagName.toLowerCase();
+        if (allowedTags.indexOf(tagName) === -1) {
+            return document.createTextNode(node.textContent);
+        }
+        var copy = document.createElement(tagName);
+        var title = node.getAttribute('title');
+        if (title !== null) {
+            copy.setAttribute('title', title);
+        }
+        if (tagName === 'a') {
+            var href = safeUrl(node.getAttribute('href'));
+            // A link opens in a new tab with the rel this page chooses:
+            // noopener withholds the handle the opened page could navigate
+            // this one with, and noreferrer keeps this page's URL from a host
+            // the description chose. An <a> with no allowed href stays bare.
+            if (href) {
+                copy.setAttribute('href', href);
+                copy.setAttribute('target', '_blank');
+                copy.setAttribute('rel', 'noopener noreferrer');
+            }
+        }
+        Array.from(node.childNodes).forEach(function(child) {
+            var cleaned = cleanCopy(child);
+            if (cleaned) {
+                copy.appendChild(cleaned);
+            }
+        });
+        return copy;
+    }
+
+    var fragment = document.createDocumentFragment();
+    Array.from(inert.body.childNodes).forEach(function(child) {
+        var cleaned = cleanCopy(child);
+        if (cleaned) {
+            fragment.appendChild(cleaned);
+        }
+    });
+    return fragment;
+}
+{{end}}

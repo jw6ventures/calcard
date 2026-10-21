@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/http/clientip"
+	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
@@ -29,6 +31,19 @@ type Service struct {
 	userinfo string
 	provider *oidc.Provider
 	verifier *oidc.IDTokenVerifier
+
+	authMu    sync.Mutex
+	authCache map[string]authCacheEntry
+
+	digestMu             sync.Mutex
+	digestKey            []byte
+	digestNow            func() time.Time
+	digestUnreadableOnce sync.Once
+
+	log *logging.Logger
+
+	trustedProxiesOnce sync.Once
+	trustedProxies     clientip.TrustedProxies
 }
 
 func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (*Service, error) {
@@ -62,6 +77,19 @@ func NewService(cfg *config.Config, st *store.Store, sessions *SessionManager) (
 		Endpoint:     provider.Endpoint(),
 		Scopes:       []string{"openid", "email", "profile"},
 	}}, nil
+}
+
+// SetLogger installs the sink the service reports through. Call it before the
+// service handles traffic; until then, and with a nil sink, nothing is logged.
+func (s *Service) SetLogger(sink logging.Sink) {
+	s.log = logging.New(sink, "Auth")
+}
+
+func (s *Service) logger() *logging.Logger {
+	if s == nil {
+		return nil
+	}
+	return s.log
 }
 
 func (s *Service) BeginOAuth(w http.ResponseWriter, r *http.Request) {
@@ -105,18 +133,19 @@ func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oauthSubject, email, err := s.userIdentity(ctx, token)
+	identity, err := s.userIdentity(ctx, token)
 	if err != nil {
 		http.Error(w, "failed to fetch user identity", http.StatusBadRequest)
 		return
 	}
 
-	user, err := s.store.Users.UpsertOAuthUser(ctx, oauthSubject, email)
+	user, err := s.store.Users.UpsertOAuthUser(ctx, identity.Subject, identity.Email, identity.FullName, identity.FirstName)
 	if err != nil {
-		log.Printf("failed to persist user for subject %q: %v", oauthSubject, err)
+		s.logger().Error("oauth_callback", "failed to persist user for subject %q: %v", identity.Subject, err)
 		http.Error(w, "failed to persist user", http.StatusInternalServerError)
 		return
 	}
+	s.authCacheClearUser(user.ID)
 
 	if err := s.store.EnsureDefaultCollections(ctx, user.ID); err != nil {
 		http.Error(w, "failed to bootstrap user", http.StatusInternalServerError)
@@ -142,17 +171,32 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 		return "", nil, err
 	}
 	plaintext := base64.RawURLEncoding.EncodeToString(buf)
+	user, err := s.store.Users.GetByID(ctx, userID)
+	if err != nil {
+		return "", nil, err
+	}
+	if user == nil || user.PrimaryEmail == "" {
+		return "", nil, errors.New("user email required")
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
 	if err != nil {
 		return "", nil, err
 	}
 
+	// Both nil unless Digest is enabled and a session secret is configured,
+	// leaving the new app password Basic-only.
+	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, plaintext)
+	if err != nil {
+		return "", nil, err
+	}
 	created, err := s.store.AppPasswords.Create(ctx, store.AppPassword{
-		UserID:    userID,
-		Label:     label,
-		TokenHash: string(hash),
-		ExpiresAt: expiresAt,
+		UserID:          userID,
+		Label:           label,
+		TokenHash:       string(hash),
+		DigestMD5HA1:    md5HA1,
+		DigestSHA256HA1: sha256HA1,
+		ExpiresAt:       expiresAt,
 	})
 	if err != nil {
 		return "", nil, err
@@ -162,6 +206,14 @@ func (s *Service) CreateAppPassword(ctx context.Context, userID int64, label str
 }
 
 func (s *Service) ValidateAppPassword(ctx context.Context, username, password string) (*store.User, error) {
+	// Fast path: DAV clients re-send Basic credentials on every request, so a
+	// short-lived cache lets us skip the GetByEmail/FindValidByUser reads and,
+	// crucially, the per-request bcrypt comparison (the dominant CPU cost).
+	cacheKey := authCacheKey(username, password)
+	if user, ok := s.authCacheGet(cacheKey); ok {
+		return user, nil
+	}
+
 	user, err := s.store.Users.GetByEmail(ctx, username)
 	if err != nil {
 		return nil, err
@@ -183,12 +235,75 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 			continue
 		}
 		if bcrypt.CompareHashAndPassword([]byte(t.TokenHash), []byte(password)) == nil {
-			_ = s.store.AppPasswords.TouchLastUsed(ctx, t.ID)
+			s.backfillDigestCredentials(ctx, user, t, password)
+			s.touchLastUsedThrottled(t)
+			s.authCachePut(cacheKey, user, t.ID, t.ExpiresAt)
 			return user, nil
 		}
 	}
 
 	return nil, errors.New("invalid app password")
+}
+
+// backfillDigestCredentials brings an app password's stored HA1s in line with
+// the Digest setting after a successful Basic authentication, the only moment
+// the server holds the plaintext password. With Digest on, a password that has
+// no HA1 this server can open -- one issued while Digest was off, or one sealed
+// under a since-rotated session secret -- is sealed afresh. With Digest off,
+// any HA1 the row still holds is cleared, backing up the periodic purge.
+//
+// Every write is a compare-and-swap against the row as it was read, so a
+// request acting on a stale read loses rather than overwriting what a
+// concurrent request stored.
+//
+// Every failure here is logged and swallowed. The password has already been
+// verified, and refusing the request because a convenience write did not land
+// would turn a working credential into a broken one.
+func (s *Service) backfillDigestCredentials(ctx context.Context, user *store.User, token store.AppPassword, password string) {
+	if user == nil || user.PrimaryEmail == "" || s.store == nil || s.store.AppPasswords == nil {
+		return
+	}
+	stored := token.DigestMD5HA1 != nil || token.DigestSHA256HA1 != nil
+	if !s.digestEnabled() {
+		if stored && s.replaceDigestCredentials(ctx, token, nil, nil) {
+			s.logger().Info("dav_digest", "cleared the stored credentials on app password %d because APP_DAV_DIGEST_ENABLED is off", token.ID)
+		}
+		return
+	}
+	if stored && DigestReady(s.cfg, token) {
+		return
+	}
+	// Hashed over the account's own address rather than the spelling the
+	// request carried, so the value matches what issuing the password would
+	// have produced and what the Digest lookup resolves the username to.
+	md5HA1, sha256HA1, err := s.sealDigestCredentials(user.PrimaryEmail, password)
+	if err != nil {
+		s.logger().Error("dav_digest", "could not seal credentials for app password %d: %v", token.ID, err)
+		return
+	}
+	if md5HA1 == nil || sha256HA1 == nil {
+		// No session secret, so no key: the app password stays Basic-only.
+		return
+	}
+	if s.replaceDigestCredentials(ctx, token, md5HA1, sha256HA1) && stored {
+		s.logger().Info("dav_digest", "re-sealed the unreadable credentials on app password %d", token.ID)
+	}
+}
+
+// replaceDigestCredentials swaps the row's HA1s from what token holds to the
+// given values and reports whether the swap landed.
+func (s *Service) replaceDigestCredentials(ctx context.Context, token store.AppPassword, md5HA1, sha256HA1 *string) bool {
+	replaced, err := s.store.AppPasswords.ReplaceDigestCredentials(ctx, token.ID, md5HA1, sha256HA1, token.DigestMD5HA1, token.DigestSHA256HA1)
+	if err != nil {
+		s.logger().Error("dav_digest", "could not store credentials for app password %d: %v", token.ID, err)
+		return false
+	}
+	if !replaced {
+		// Another request changed the row after this one read it; its value
+		// stands, and this request's credential check is unaffected.
+		s.logger().Debug("dav_digest", "credentials for app password %d changed concurrently; left them as they are", token.ID)
+	}
+	return replaced
 }
 
 func (s *Service) RequireSession(next http.Handler) http.Handler {
@@ -213,25 +328,44 @@ func (s *Service) RequireSession(next http.Handler) http.Handler {
 
 func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		username, password, ok := r.BasicAuth()
-		if !ok {
-			w.Header().Set("WWW-Authenticate", "Basic realm=\"CalCard DAV\"")
-			http.Error(w, "authentication required", http.StatusUnauthorized)
-			return
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		scheme, _, _ := strings.Cut(authorization, " ")
+		var (
+			user  *store.User
+			err   error
+			stale bool
+		)
+		switch {
+		case strings.EqualFold(scheme, "Basic"):
+			if !s.basicAllowed(r) {
+				err = errors.New("basic authentication requires a secure transport")
+				break
+			}
+			username, password, ok := r.BasicAuth()
+			if !ok || username == "" || password == "" {
+				err = errors.New("invalid credentials")
+				break
+			}
+			user, err = s.ValidateAppPassword(r.Context(), username, password)
+		case strings.EqualFold(scheme, "Digest"):
+			if !s.digestEnabled() {
+				err = errors.New("digest authentication is not enabled")
+				break
+			}
+			user, stale, err = s.validateDAVDigest(r)
+		default:
+			err = errors.New("authentication required")
 		}
-		if username == "" || password == "" {
+		if err != nil || user == nil {
+			if challengeErr := s.writeDAVAuthChallenge(w, r, stale); challengeErr != nil {
+				http.Error(w, "failed to issue authentication challenge", http.StatusInternalServerError)
+				return
+			}
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
 
-		ctx := r.Context()
-		user, err := s.ValidateAppPassword(ctx, username, password)
-		if err != nil {
-			http.Error(w, "invalid credentials", http.StatusUnauthorized)
-			return
-		}
-
-		ctx = WithUser(ctx, user)
+		ctx := WithUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -240,14 +374,92 @@ func (s *Service) ClearSession(w http.ResponseWriter, r *http.Request) {
 	s.sessions.Clear(r.Context(), w, r)
 }
 
+// cookieSecure reports whether to mark cookies Secure. It is deliberately more
+// willing than secureRequest: a site addressed over https should set the flag
+// even on a request whose transport cannot be confirmed, because the cost of
+// setting it needlessly is a cookie the browser withholds over cleartext, while
+// the cost of omitting it is a cookie the browser sends there.
 func (s *Service) cookieSecure(r *http.Request) bool {
+	if s.secureRequest(r) {
+		return true
+	}
+	if s == nil || s.cfg == nil {
+		return false
+	}
+	base, err := url.Parse(s.cfg.BaseURL)
+	return err == nil && base.Scheme == "https"
+}
+
+// basicAllowed reports whether this request may authenticate with, and be
+// challenged for, HTTP Basic. RFC 4791 Section 11 forbids Basic unless TLS is
+// in effect, so that is the rule; APP_DAV_INSECURE_BASIC_ENABLED is the
+// operator's explicit exception for deployments that serve DAV over plain HTTP.
+func (s *Service) basicAllowed(r *http.Request) bool {
+	if s != nil && s.cfg != nil && s.cfg.DAV.InsecureBasicEnabled {
+		return true
+	}
+	return s.secureRequest(r)
+}
+
+func (s *Service) secureRequest(r *http.Request) bool {
+	if s == nil || s.cfg == nil {
+		return r != nil && r.TLS != nil
+	}
+	return requestIsSecure(r, s.trustedProxySet())
+}
+
+// trustedProxySet returns the Service's parsed trusted-proxy set, built once
+// and cached from then on -- this sits on the DAV auth hot path via
+// secureRequest, which runs for every Basic-authenticated DAV request, and
+// re-parsing the configured CIDRs on every call would allocate for no reason.
+//
+// Building it lazily here, rather than requiring callers to go through
+// NewService, keeps a Service assembled as a bare struct literal -- as most of
+// this package's tests do -- correct: the first call parses cfg.TrustedProxies
+// on demand instead of silently behaving as if none were configured.
+func (s *Service) trustedProxySet() clientip.TrustedProxies {
+	s.trustedProxiesOnce.Do(func() {
+		var configured []string
+		if s.cfg != nil {
+			configured = s.cfg.TrustedProxies
+		}
+		s.trustedProxies = clientip.NewTrustedProxies(configured)
+	})
+	return s.trustedProxies
+}
+
+// RequestIsSecure reports whether this request reached the server over TLS.
+//
+// A request forwarded by a proxy listed in trustedProxies (APP_TRUSTED_PROXIES)
+// is trusted to describe its own leg through X-Forwarded-Proto; a request from
+// anywhere else is not, so the header cannot be spoofed into unlocking Basic
+// over cleartext. Configuring no proxies at all trusts every peer's
+// X-Forwarded-Proto, matching how the forwarded client IP is resolved and the
+// warning the configuration loader prints at startup.
+//
+// The peer is read through PeerAddr, not r.RemoteAddr: the forwarded-address
+// middleware resolves the client into RemoteAddr, and the client is not the
+// proxy this is asking about.
+//
+// It is exported for internal/http, whose forwarded-address middleware runs
+// ahead of authentication and rewrites RemoteAddr: that package's tests hold
+// the middleware to leaving this answer unchanged.
+func RequestIsSecure(r *http.Request, trustedProxies []string) bool {
+	return requestIsSecure(r, clientip.NewTrustedProxies(trustedProxies))
+}
+
+func requestIsSecure(r *http.Request, trusted clientip.TrustedProxies) bool {
+	if r == nil {
+		return false
+	}
 	if r.TLS != nil {
 		return true
 	}
-	if base, err := url.Parse(s.cfg.BaseURL); err == nil && base.Scheme == "https" {
-		return true
+	if !trusted.AllowsPeer(clientip.PeerAddr(r)) {
+		return false
 	}
-	return false
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }
 
 func randomState() (string, error) {
@@ -320,18 +532,39 @@ func discoverOIDC(issuerOrDiscovery string) (*oidcConfiguration, error) {
 }
 
 type userInfo struct {
-	Subject string `json:"sub"`
-	Email   string `json:"email"`
+	Subject   string `json:"sub"`
+	Email     string `json:"email"`
+	FullName  string `json:"name"`
+	FirstName string `json:"given_name"`
 }
 
-func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string, string, error) {
+type oauthIdentity struct {
+	Subject   string
+	Email     string
+	FullName  string
+	FirstName string
+}
+
+func identityFromClaims(claims userInfo) (oauthIdentity, error) {
+	if claims.Subject == "" || claims.Email == "" {
+		return oauthIdentity{}, errors.New("identity missing subject or email")
+	}
+	return oauthIdentity{
+		Subject:   claims.Subject,
+		Email:     claims.Email,
+		FullName:  strings.TrimSpace(claims.FullName),
+		FirstName: strings.TrimSpace(claims.FirstName),
+	}, nil
+}
+
+func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (oauthIdentity, error) {
 	if s.provider != nil {
 		info, err := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
 		if err == nil {
 			var claims userInfo
 			if err := info.Claims(&claims); err == nil {
-				if claims.Subject != "" && claims.Email != "" {
-					return claims.Subject, claims.Email, nil
+				if identity, err := identityFromClaims(claims); err == nil {
+					return identity, nil
 				}
 			}
 		}
@@ -339,26 +572,22 @@ func (s *Service) userIdentity(ctx context.Context, token *oauth2.Token) (string
 
 	rawIDToken, _ := token.Extra("id_token").(string)
 	if rawIDToken == "" {
-		return "", "", errors.New("no userinfo or id_token available")
+		return oauthIdentity{}, errors.New("no userinfo or id_token available")
 	}
 
 	if s.verifier == nil {
-		return "", "", errors.New("id_token verification unavailable")
+		return oauthIdentity{}, errors.New("id_token verification unavailable")
 	}
 
 	idToken, err := s.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return "", "", err
+		return oauthIdentity{}, err
 	}
 
 	var claims userInfo
 	if err := idToken.Claims(&claims); err != nil {
-		return "", "", err
+		return oauthIdentity{}, err
 	}
 
-	if claims.Subject == "" || claims.Email == "" {
-		return "", "", errors.New("id_token missing subject or email")
-	}
-
-	return claims.Subject, claims.Email, nil
+	return identityFromClaims(claims)
 }

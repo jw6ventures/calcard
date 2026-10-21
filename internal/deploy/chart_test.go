@@ -1,0 +1,995 @@
+// Package deploy holds the guards on this repository's deployment assets. The
+// chart is rendered by helm rather than modelled in Go, so the only way to
+// assert what a release actually creates is to run the renderer and read what
+// it produced.
+package deploy
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// chartPath is the chart these tests render, relative to this package.
+const chartPath = "../../deploy/helm/calcard"
+
+// baseURLHost is the host the ingress must derive from app.baseUrl when
+// ingress.host is left empty. It is deliberately not the host the CI install
+// uses, so a template that hard-coded one could not pass.
+const baseURLHost = "calcard.example.test"
+
+// ciValues is the value set the deployment job installs with. The tests render
+// the same set so that a chart change which only breaks the CI install is
+// caught here, before the cluster is built.
+func ciValues() []string {
+	return []string{
+		"--set", "image.repository=calcard",
+		"--set", "image.tag=test",
+		"--set", "image.pullPolicy=IfNotPresent",
+		"--set", "app.baseUrl=https://" + baseURLHost,
+		"--set", "app.trustedProxies=10.244.0.0/16",
+		"--set", "app.oauth.clientId=test-client",
+		"--set", "app.oauth.clientSecret=test-client-secret",
+		"--set", "app.oauth.discoveryUrl=http://oidc-mock.default.svc.cluster.local/.well-known/openid-configuration",
+		"--set", "app.sessionSecret=this-is-a-very-long-session-secret-32chars",
+		"--set", "app.db.user=postgres",
+		"--set", "app.db.password=postgres",
+		"--set", "app.db.name=app",
+		"--set", "postgres.enabled=true",
+		"--set", "postgres.persistence.enabled=false",
+	}
+}
+
+// helmBinary returns the helm executable, skipping when the host has none. The
+// chart is verified by the real renderer or not at all; CI installs helm, so
+// the skip is a developer-machine convenience rather than a way for the gate to
+// pass without running.
+func helmBinary(t *testing.T) string {
+	t.Helper()
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm is not installed; install it to run the chart render tests")
+	}
+	return helm
+}
+
+func runHelm(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(helmBinary(t), args...)
+	// helm writes coverage of missing required values to stderr, so both
+	// streams are needed to explain a failure.
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// renderChart runs helm template over the CI value set and returns each
+// rendered document keyed by the template that produced it.
+func renderChart(t *testing.T, extra ...string) map[string]string {
+	t.Helper()
+	args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+	args = append(args, extra...)
+	output, err := runHelm(t, args...)
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, output)
+	}
+	return splitRenderedDocuments(output)
+}
+
+// splitRenderedDocuments indexes a helm render by the "# Source:" comment helm
+// writes ahead of each document. A template rendering nothing contributes no
+// document, which is what lets a test assert that a block is absent.
+func splitRenderedDocuments(rendered string) map[string]string {
+	documents := make(map[string]string)
+	source := ""
+	var body strings.Builder
+	flush := func() {
+		if source != "" {
+			documents[source] = body.String()
+		}
+		source = ""
+		body.Reset()
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.TrimSpace(line) == "---" {
+			flush()
+			continue
+		}
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "# Source:"); ok {
+			source = strings.TrimSpace(rest)
+			continue
+		}
+		body.WriteString(line)
+		body.WriteString("\n")
+	}
+	flush()
+	return documents
+}
+
+func requireDocument(t *testing.T, documents map[string]string, template string) string {
+	t.Helper()
+	document, ok := documents["calcard/templates/"+template]
+	if !ok {
+		t.Fatalf("chart rendered no %s; it rendered %v", template, renderedTemplates(documents))
+	}
+	return document
+}
+
+// renderedTemplates names what the chart did render, which is what makes a
+// missing template's failure readable.
+func renderedTemplates(documents map[string]string) []string {
+	names := make([]string, 0, len(documents))
+	for name := range documents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// hasLine reports whether the document carries want as a line of its own,
+// ignoring indentation. Comparing the trimmed line rather than a substring
+// keeps "type: ClusterIP" from being satisfied by a comment mentioning it, and
+// keeps the test from breaking when a template's indentation moves.
+func hasLine(document, want string) bool {
+	for _, line := range strings.Split(document, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// blockUnder returns the lines nested beneath the first line whose trimmed form
+// is key, so an assertion can be scoped to one part of a document rather than
+// matching anywhere in it.
+func blockUnder(document, key string) (string, bool) {
+	lines := strings.Split(document, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) != key {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		var block strings.Builder
+		for _, nested := range lines[i+1:] {
+			if strings.TrimSpace(nested) == "" {
+				continue
+			}
+			if len(nested)-len(strings.TrimLeft(nested, " ")) <= indent {
+				break
+			}
+			block.WriteString(nested)
+			block.WriteString("\n")
+		}
+		return block.String(), true
+	}
+	return "", false
+}
+
+func TestHelmChartLints(t *testing.T) {
+	args := append([]string{"lint", chartPath}, ciValues()...)
+	if output, err := runHelm(t, args...); err != nil {
+		t.Fatalf("helm lint failed: %v\n%s", err, output)
+	}
+}
+
+// TestHelmChartRendersEveryTemplate pins the set of objects a release creates,
+// so a template that stops rendering -- an `if` whose value moved, say -- fails
+// here rather than in a cluster that silently lost an object.
+func TestHelmChartRendersEveryTemplate(t *testing.T) {
+	documents := renderChart(t)
+	for _, template := range []string{
+		"app-deployment.yaml",
+		"app-service.yaml",
+		"configmap.yaml",
+		"db-secret.yaml",
+		"ingress.yaml",
+		"postgres-configmap.yaml",
+		"postgres-service.yaml",
+		"postgres-statefulset.yaml",
+		"secret.yaml",
+	} {
+		requireDocument(t, documents, template)
+	}
+}
+
+// TestHelmChartRequiresABaseURL guards the derive path below: the ingress host
+// falls back to app.baseUrl, so a release without one must fail to render
+// rather than publish an ingress routing an empty host.
+func TestHelmChartRequiresABaseURL(t *testing.T) {
+	args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+	args = append(args, "--set", "app.baseUrl=")
+	output, err := runHelm(t, args...)
+	if err == nil {
+		t.Fatalf("chart rendered without app.baseUrl:\n%s", output)
+	}
+	if !strings.Contains(output, "app.baseUrl is required") {
+		t.Fatalf("expected the render to name app.baseUrl, got:\n%s", output)
+	}
+}
+
+// TestHelmChartKeepsTheApplicationServiceInternal is the deployment half of
+// RFC 4791 §11: the application answers HTTP Basic only over a secure
+// transport, which holds only while every route to it runs through the
+// TLS-terminating ingress. A NodePort, a LoadBalancer or a hostPort would
+// publish the cleartext container port beside that ingress.
+func TestHelmChartKeepsTheApplicationServiceInternal(t *testing.T) {
+	documents := renderChart(t)
+	service := requireDocument(t, documents, "app-service.yaml")
+	if !hasLine(service, "type: ClusterIP") {
+		t.Fatalf("application Service is not ClusterIP:\n%s", service)
+	}
+	for template, document := range documents {
+		for _, forbidden := range []string{"NodePort", "LoadBalancer", "nodePort:", "hostPort:", "externalIPs:"} {
+			if strings.Contains(document, forbidden) {
+				t.Errorf("%s exposes the application outside the cluster (%q):\n%s", template, forbidden, document)
+			}
+		}
+	}
+}
+
+// TestHelmChartIngressTerminatesTLSOnTheBaseURLHost covers the other half: the
+// one published route carries a TLS block for exactly the host the application
+// is addressed by, so the transport the Basic gate requires is the transport
+// clients actually reach.
+func TestHelmChartIngressTerminatesTLSOnTheBaseURLHost(t *testing.T) {
+	documents := renderChart(t)
+	ingress := requireDocument(t, documents, "ingress.yaml")
+
+	rules, ok := blockUnder(ingress, "rules:")
+	if !ok {
+		t.Fatalf("ingress declares no rules:\n%s", ingress)
+	}
+	if !hasLine(rules, `- host: "`+baseURLHost+`"`) {
+		t.Fatalf("ingress does not route the app.baseUrl host %q:\n%s", baseURLHost, ingress)
+	}
+
+	tls, ok := blockUnder(ingress, "tls:")
+	if !ok {
+		t.Fatalf("ingress declares no TLS block:\n%s", ingress)
+	}
+	if !hasLine(tls, `- "`+baseURLHost+`"`) {
+		t.Fatalf("ingress TLS block does not cover the app.baseUrl host %q:\n%s", baseURLHost, ingress)
+	}
+}
+
+// TestHelmChartIngressPrefersAnExplicitHost keeps the derive above from being
+// the only path: an operator whose public host differs from app.baseUrl sets
+// ingress.host, and both the rule and the TLS block have to follow it.
+func TestHelmChartIngressPrefersAnExplicitHost(t *testing.T) {
+	const explicit = "dav.example.test"
+	documents := renderChart(t, "--set", "ingress.host="+explicit, "--set", "ingress.tls.secretName=calcard-tls")
+	ingress := requireDocument(t, documents, "ingress.yaml")
+
+	if strings.Contains(ingress, baseURLHost) {
+		t.Fatalf("ingress kept the app.baseUrl host after ingress.host was set:\n%s", ingress)
+	}
+	rules, _ := blockUnder(ingress, "rules:")
+	if !hasLine(rules, `- host: "`+explicit+`"`) {
+		t.Fatalf("ingress does not route ingress.host %q:\n%s", explicit, ingress)
+	}
+	tls, ok := blockUnder(ingress, "tls:")
+	if !ok {
+		t.Fatalf("ingress declares no TLS block:\n%s", ingress)
+	}
+	if !hasLine(tls, `- "`+explicit+`"`) {
+		t.Fatalf("ingress TLS block does not cover ingress.host %q:\n%s", explicit, ingress)
+	}
+	if !hasLine(tls, `secretName: "calcard-tls"`) {
+		t.Fatalf("ingress TLS block does not name the configured secret:\n%s", ingress)
+	}
+}
+
+// TestHelmChartIngressCanBeDisabled covers the deployment that fronts CalCard
+// with an ingress of its own: the chart must then create none rather than a
+// second route to the same Service.
+func TestHelmChartIngressCanBeDisabled(t *testing.T) {
+	documents := renderChart(t, "--set", "ingress.enabled=false")
+	if document, ok := documents["calcard/templates/ingress.yaml"]; ok {
+		t.Fatalf("ingress.enabled=false still rendered an Ingress:\n%s", document)
+	}
+}
+
+// TestHelmChartCarriesTrustedProxies pins the setting the transport check
+// depends on behind a terminating proxy: without it every peer's
+// X-Forwarded-Proto is believed, and a cleartext client can claim https.
+func TestHelmChartCarriesTrustedProxies(t *testing.T) {
+	documents := renderChart(t)
+	configmap := requireDocument(t, documents, "configmap.yaml")
+	if !hasLine(configmap, `APP_TRUSTED_PROXIES: "10.244.0.0/16"`) {
+		t.Fatalf("configmap does not carry app.trustedProxies:\n%s", configmap)
+	}
+}
+
+// TestHelmChartDAVLimitsReachTheConfigMap pins the wiring of the resource
+// bounds an operator tunes, including that an explicit 0 -- which turns a limit
+// off -- reaches the server rather than being dropped as an empty value.
+func TestHelmChartDAVLimitsReachTheConfigMap(t *testing.T) {
+	documents := renderChart(t,
+		"--set", "app.dav.maxFilterElements=25",
+		"--set", "app.dav.maxCardDAVQueryBytes=4096",
+		"--set", "app.dav.maxAddressDataProperties=0",
+		"--set", "app.dav.maxRequestedProperties=250",
+		"--set", "app.dav.maxReportCandidateRows=0",
+		"--set", "app.dav.syncHistoryRetention=504h",
+		"--set", "app.dav.reportTimeout=30s",
+	)
+	configmap := requireDocument(t, documents, "configmap.yaml")
+	for _, want := range []string{
+		`APP_DAV_MAX_FILTER_ELEMENTS: "25"`,
+		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "4096"`,
+		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "0"`,
+		`APP_DAV_MAX_REQUESTED_PROPERTIES: "250"`,
+		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`,
+		`APP_DAV_SYNC_HISTORY_RETENTION: "504h"`,
+		`APP_DAV_REPORT_TIMEOUT: "30s"`,
+	} {
+		if !hasLine(configmap, want) {
+			t.Errorf("configmap is missing %s:\n%s", want, configmap)
+		}
+	}
+	if hasLine(configmap, `APP_DAV_MAX_MULTIGET_HREFS: ""`) {
+		t.Errorf("an unset limit reached the server as an empty value:\n%s", configmap)
+	}
+}
+
+// The DAV Digest scheme is opt-in because an app password issued before Digest
+// existed cannot answer a Digest challenge. An operator has to be able to reach
+// the switch, and an unset value has to leave the server on its own default
+// rather than arriving as an empty string the loader would read as "off" by
+// coincidence.
+func TestHelmChartDAVDigestSwitchIsOptInAndReachable(t *testing.T) {
+	defaults := requireDocument(t, renderChart(t), "configmap.yaml")
+	if strings.Contains(defaults, "APP_DAV_DIGEST_ENABLED") {
+		t.Errorf("an unset app.dav.digestEnabled reached the server:\n%s", defaults)
+	}
+
+	enabled := requireDocument(t, renderChart(t, "--set", "app.dav.digestEnabled=true"), "configmap.yaml")
+	if !hasLine(enabled, `APP_DAV_DIGEST_ENABLED: "true"`) {
+		t.Errorf("configmap does not carry app.dav.digestEnabled:\n%s", enabled)
+	}
+}
+
+// Basic over plain HTTP is an operator's explicit exception to RFC 4791
+// Section 11, so an unset value must leave the server on its default (off) and
+// the switch must still be reachable.
+func TestHelmChartInsecureBasicSwitchIsOptInAndReachable(t *testing.T) {
+	defaults := requireDocument(t, renderChart(t), "configmap.yaml")
+	if strings.Contains(defaults, "APP_DAV_INSECURE_BASIC_ENABLED") {
+		t.Errorf("an unset app.dav.insecureBasicEnabled reached the server:\n%s", defaults)
+	}
+
+	enabled := requireDocument(t, renderChart(t, "--set", "app.dav.insecureBasicEnabled=true"), "configmap.yaml")
+	if !hasLine(enabled, `APP_DAV_INSECURE_BASIC_ENABLED: "true"`) {
+		t.Errorf("configmap does not carry app.dav.insecureBasicEnabled:\n%s", enabled)
+	}
+
+	disabled := requireDocument(t, renderChart(t, "--set", "app.dav.insecureBasicEnabled=false"), "configmap.yaml")
+	if !hasLine(disabled, `APP_DAV_INSECURE_BASIC_ENABLED: "false"`) {
+		t.Errorf("configmap does not carry an explicit app.dav.insecureBasicEnabled=false:\n%s", disabled)
+	}
+}
+
+// The schema types the switch as a boolean, so a misspelt value fails the
+// render instead of being read by the server as "off".
+func TestHelmChartRefusesANonBooleanInsecureBasicSwitch(t *testing.T) {
+	args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+	args = append(args, "--set-string", "app.dav.insecureBasicEnabled=yes please")
+	output, err := runHelm(t, args...)
+	if err == nil {
+		t.Fatalf("chart rendered a non-boolean app.dav.insecureBasicEnabled:\n%s", output)
+	}
+	if !strings.Contains(output, "insecureBasicEnabled") {
+		t.Fatalf("expected the render to name the value, got:\n%s", output)
+	}
+}
+
+// TestChartPathExists keeps a moved chart from turning every test above into a
+// helm error that reads like a chart defect.
+func TestChartPathExists(t *testing.T) {
+	if _, err := os.Stat(filepath.Join(chartPath, "Chart.yaml")); err != nil {
+		t.Fatalf("chart not found at %s: %v", chartPath, err)
+	}
+}
+
+// TestHelmChartRefusesAPublishedServiceBesideTheIngress is what makes the check
+// above a guard rather than a restatement of the default: ClusterIP being the
+// default value is not the same as the chart declining to publish the cleartext
+// port, and RFC 4791 §11 needs the second.
+func TestHelmChartRefusesAPublishedServiceBesideTheIngress(t *testing.T) {
+	for _, published := range []string{"NodePort", "LoadBalancer"} {
+		t.Run(published, func(t *testing.T) {
+			args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+			args = append(args, "--set", "service.type="+published)
+			output, err := runHelm(t, args...)
+			if err == nil {
+				t.Fatalf("chart rendered a %s Service beside the ingress:\n%s", published, output)
+			}
+			if !strings.Contains(output, "service.type must be ClusterIP") {
+				t.Fatalf("expected the render to name the constraint, got:\n%s", output)
+			}
+		})
+	}
+}
+
+// An operator terminating TLS in front of CalCard turns the chart's ingress
+// off, and the Service type is then theirs to choose: the rule is about a
+// cleartext route published beside the chart's own TLS one, not about the
+// Service type on its own.
+func TestHelmChartAllowsAPublishedServiceWithoutTheIngress(t *testing.T) {
+	documents := renderChart(t, "--set", "ingress.enabled=false", "--set", "service.type=LoadBalancer")
+	service := requireDocument(t, documents, "app-service.yaml")
+	if !hasLine(service, "type: LoadBalancer") {
+		t.Fatalf("service.type was not honoured with the ingress disabled:\n%s", service)
+	}
+}
+
+// Schema migrations run in the container before the HTTP listener opens, so
+// nothing answers /healthz until they finish. Without a startup probe the
+// liveness probe begins immediately and restarts the container about thirty
+// seconds in, rolling the migration back; the next attempt starts it over, so a
+// migration longer than that window can never complete. A startup probe
+// suspends liveness and readiness until it passes, which is what makes the
+// budget below the migration's, not the liveness probe's.
+func TestHelmChartGivesMigrationsAStartupBudget(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t), "app-deployment.yaml")
+
+	startup, ok := blockUnder(deployment, "startupProbe:")
+	if !ok {
+		t.Fatalf("app deployment has no startupProbe, so the liveness probe restarts the container during a migration:\n%s", deployment)
+	}
+	for _, want := range []string{"path: /healthz", "periodSeconds: 10", "failureThreshold: 60"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe is missing %q:\n%s", want, startup)
+		}
+	}
+
+	// The liveness probe must stay tight: once startup succeeds it is the only
+	// thing that restarts a process that wedges while serving.
+	liveness, ok := blockUnder(deployment, "livenessProbe:")
+	if !ok {
+		t.Fatalf("app deployment has no livenessProbe:\n%s", deployment)
+	}
+	for _, want := range []string{"periodSeconds: 10", "failureThreshold: 3"} {
+		if !hasLine(liveness, want) {
+			t.Errorf("livenessProbe is missing %q:\n%s", want, liveness)
+		}
+	}
+}
+
+// The v1.2.0 migration instructs that it be applied with the application
+// stopped, so only one version of the application may meet the database at a
+// time. A rolling update does the opposite, even with maxSurge 0: the
+// ReplicaSet does not count a Terminating pod, so the new pod starts and runs
+// migrations while the old one is still shutting down. Recreate waits for the
+// old pod to be gone, and carries no rollingUpdate block, which Kubernetes
+// rejects beside it.
+func TestHelmChartReplacesPodsRatherThanRollingThem(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t), "app-deployment.yaml")
+
+	strategy, ok := blockUnder(deployment, "strategy:")
+	if !ok {
+		t.Fatalf("app deployment declares no strategy, so a rolling update runs the old release against a half-migrated schema:\n%s", deployment)
+	}
+	if !hasLine(strategy, "type: Recreate") {
+		t.Errorf("strategy is not Recreate:\n%s", strategy)
+	}
+	if strings.Contains(strategy, "rollingUpdate") {
+		t.Errorf("strategy carries a rollingUpdate block, which Kubernetes rejects beside Recreate:\n%s", strategy)
+	}
+}
+
+// The startup budget scales with the events table, so an operator has to be
+// able to raise it without forking the chart.
+func TestHelmChartStartupBudgetIsConfigurable(t *testing.T) {
+	documents := renderChart(t, "--set", "startupProbe.failureThreshold=180", "--set", "startupProbe.periodSeconds=15")
+	startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+	if !ok {
+		t.Fatal("app deployment has no startupProbe")
+	}
+	for _, want := range []string{"periodSeconds: 15", "failureThreshold: 180"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe did not take the configured value %q:\n%s", want, startup)
+		}
+	}
+}
+
+// Schema migrations run in the app container on startup, and the runner takes
+// no lock: it reads the stored version, then applies every migration file past
+// it. The strategy above is Recreate, so a second replica does not trail the
+// first -- both start at once, read the same version and apply the same files against
+// one database. The chart refuses that rather than rendering it,
+// matching how service.type is handled: a value whose result is a corrupted
+// schema is not a value to warn about in a comment.
+//
+// values.schema.json is the first line of refusal and the template guard the
+// second, for installs run with --skip-schema-validation. Both are exercised,
+// including the values an int conversion would have let through: 1.5 truncates
+// to 1 and a non-numeric string converts to 0.
+func TestHelmChartRefusesConcurrentMigrators(t *testing.T) {
+	valuesFile := filepath.Join(t.TempDir(), "float-replicas.yaml")
+	if err := os.WriteFile(valuesFile, []byte("replicaCount: 1.5\n"), 0o600); err != nil {
+		t.Fatalf("write values file: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		values []string
+	}{
+		{"two", []string{"--set", "replicaCount=2"}},
+		{"negative", []string{"--set", "replicaCount=-1"}},
+		{"fractional string", []string{"--set", "replicaCount=1.5"}},
+		{"fractional number", []string{"-f", valuesFile}},
+		{"non-numeric", []string{"--set", "replicaCount=abc"}},
+	} {
+		for _, gate := range []struct {
+			name  string
+			flags []string
+			want  string
+		}{
+			{"schema", nil, "/replicaCount"},
+			{"template", []string{"--skip-schema-validation"}, "replicaCount must be 1 or 0"},
+		} {
+			t.Run(tc.name+"/"+gate.name, func(t *testing.T) {
+				args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+				args = append(args, gate.flags...)
+				args = append(args, tc.values...)
+				output, err := runHelm(t, args...)
+				if err == nil {
+					t.Fatalf("chart rendered %v, so pods other than a single migrator can start:\n%s", tc.values, output)
+				}
+				if !strings.Contains(output, gate.want) {
+					t.Fatalf("expected the refusal to name %q, got:\n%s", gate.want, output)
+				}
+			})
+		}
+	}
+}
+
+// Scaling to zero is how an operator stops the application without deleting the
+// release -- to take a backup, or to run a migration by hand -- and no pod
+// starting is the one case that cannot race another.
+func TestHelmChartAllowsScalingToZero(t *testing.T) {
+	deployment := requireDocument(t, renderChart(t, "--set", "replicaCount=0"), "app-deployment.yaml")
+	if !hasLine(deployment, "replicas: 0") {
+		t.Fatalf("replicaCount=0 was not honoured:\n%s", deployment)
+	}
+}
+
+// A priority class is how an operator keeps the calendar server from being the
+// pod a pressured node evicts first, so the configured class has to reach the
+// pod spec. renderChart fails the test on a render error, which is what makes
+// this case cover the whole path rather than the field's content alone: a
+// guard that rebinds the dot around this field leaves .Values unresolvable
+// inside it, which aborts the upgrade before it rolls instead of merely
+// omitting the field.
+func TestHelmChartAppliesAPriorityClassWhenSet(t *testing.T) {
+	const priorityClass = "system-cluster-critical"
+	documents := renderChart(t, "--set", "priorityClassName="+priorityClass)
+	deployment := requireDocument(t, documents, "app-deployment.yaml")
+	if !hasLine(deployment, `priorityClassName: "`+priorityClass+`"`) {
+		t.Fatalf("app deployment does not carry the configured priority class %q:\n%s", priorityClass, deployment)
+	}
+}
+
+// The other half of the same guard. The Priority admission plugin treats an
+// empty priorityClassName exactly like an absent one, so this is not about
+// admission: it pins that an unset or explicitly empty value leaves the pod
+// spec as it was before the field existed, so upgrading does not diff it.
+func TestHelmChartOmitsThePriorityClassWhenUnset(t *testing.T) {
+	for name, extra := range map[string][]string{
+		"default": nil,
+		"empty":   {"--set", "priorityClassName="},
+	} {
+		t.Run(name, func(t *testing.T) {
+			deployment := requireDocument(t, renderChart(t, extra...), "app-deployment.yaml")
+			for _, line := range strings.Split(deployment, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "priorityClassName:") {
+					t.Fatalf("app deployment declares %q with no priority class configured:\n%s", strings.TrimSpace(line), deployment)
+				}
+			}
+		})
+	}
+}
+
+// The v1.2.0 migration tells an operator to compare the startup budget against
+// the size of their events table before upgrading, and names the chart's default
+// to compare against. That figure is only useful while it is this chart's actual
+// default: the migration runs inside the budget, a run that overruns it is killed
+// and rolled back, and the container then restarts into the same work, so a
+// deployment that is too large for the budget never comes up rather than failing
+// loudly. The rendered default is pinned by
+// TestHelmChartGivesMigrationsAStartupBudget; this reads values.yaml directly so
+// the pairing is still checked where helm is absent.
+func TestHelmChartStartupBudgetMatchesTheMigrationsOperatorNote(t *testing.T) {
+	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "v1.2.0.sql"))
+	if err != nil {
+		t.Fatalf("read v1.2.0 migration: %v", err)
+	}
+	for _, want := range []string{
+		"startupProbe.periodSeconds 10 x failureThreshold 60",
+		"startupProbe.failureThreshold",
+	} {
+		if !strings.Contains(string(migration), want) {
+			t.Fatalf("v1.2.0 operator note does not mention %q, so an operator is not told to check the budget", want)
+		}
+	}
+
+	values, err := os.ReadFile(filepath.Join(chartPath, "values.yaml"))
+	if err != nil {
+		t.Fatalf("read chart values: %v", err)
+	}
+	startup, ok := blockUnder(withoutYAMLComments(string(values)), "startupProbe:")
+	if !ok {
+		t.Fatal("chart values declare no startupProbe block")
+	}
+	for _, want := range []string{"periodSeconds: 10", "failureThreshold: 60"} {
+		if !hasLine(startup, want) {
+			t.Fatalf("chart default startupProbe is not %q, so the v1.2.0 operator note quotes a stale budget:\n%s", want, startup)
+		}
+	}
+}
+
+// withoutYAMLComments drops every "#" comment, whole-line or trailing, so
+// hasLine and blockUnder can compare values.yaml keys exactly. It assumes no
+// value contains " #", which holds for the scalars these tests read.
+func withoutYAMLComments(document string) string {
+	lines := strings.Split(document, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			lines[i] = ""
+			continue
+		}
+		if before, _, found := strings.Cut(line, " #"); found {
+			lines[i] = strings.TrimRight(before, " ")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// chartIntegerValues is every integer the chart renders from a value, with the
+// smallest each accepts. The DAV limits take 0 to turn the limit off. A port is
+// also bounded above, and its schema accepts a string of digits as well as an
+// integer, because 1.1.x had no schema and so accepted a quoted port.
+var chartIntegerValues = []struct {
+	path    string
+	minimum int
+	port    bool
+}{
+	{"app.db.port", 1, true},
+	{"app.db.maxOpenConns", 0, false},
+	{"app.db.maxIdleConns", 0, false},
+	{"app.dav.maxMultistatusResponses", 0, false},
+	{"app.dav.maxMultistatusBytes", 0, false},
+	{"app.dav.maxFilterElements", 0, false},
+	{"app.dav.maxReportElementDepth", 0, false},
+	{"app.dav.maxCardDAVQueryBytes", 0, false},
+	{"app.dav.maxAddressDataProperties", 0, false},
+	{"app.dav.maxRequestedProperties", 0, false},
+	{"app.dav.maxMultigetHrefs", 0, false},
+	{"app.dav.maxReportCandidateRows", 0, false},
+	{"service.port", 1, true},
+	{"startupProbe.periodSeconds", 1, false},
+	{"startupProbe.failureThreshold", 1, false},
+}
+
+// quotedPortsValues is a values file quoting both ports, as a 1.1.x release
+// could, with values other than the defaults so the render shows they were read.
+const quotedPortsValues = `app:
+  db:
+    port: "5433"
+service:
+  port: "8080"
+`
+
+// requireQuotedPorts asserts that every place a port is rendered carries the
+// ports quotedPortsValues sets.
+func requireQuotedPorts(t *testing.T, documents map[string]string) {
+	t.Helper()
+	if service := requireDocument(t, documents, "app-service.yaml"); !hasLine(service, "- port: 8080") {
+		t.Errorf("service does not listen on the quoted service.port:\n%s", service)
+	}
+	if ingress := requireDocument(t, documents, "ingress.yaml"); !hasLine(ingress, "number: 8080") {
+		t.Errorf("ingress does not route to the quoted service.port:\n%s", ingress)
+	}
+	if healthz := requireDocument(t, documents, "tests/healthz.yaml"); !strings.Contains(healthz, ":8080/healthz") {
+		t.Errorf("helm test does not address the quoted service.port:\n%s", healthz)
+	}
+	if secret := requireDocument(t, documents, "db-secret.yaml"); !strings.Contains(secret, "-postgres:5433/") {
+		t.Errorf("database DSN does not carry the quoted app.db.port:\n%s", secret)
+	}
+}
+
+// nestedValuesYAML writes the one value at a dotted path as the nested YAML a
+// values file carries.
+func nestedValuesYAML(path, value string) string {
+	var document strings.Builder
+	keys := strings.Split(path, ".")
+	for depth, key := range keys {
+		document.WriteString(strings.Repeat("  ", depth))
+		document.WriteString(key)
+		document.WriteString(":")
+		if depth == len(keys)-1 {
+			document.WriteString(" ")
+			document.WriteString(value)
+		}
+		document.WriteString("\n")
+	}
+	return document.String()
+}
+
+func writeValuesFile(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write values file: %v", err)
+	}
+	return path
+}
+
+// Helm reads every number in a values file as a float64, and a float64 of a
+// million or more prints in exponent form: maxMultistatusBytes: 67108864
+// reaches the container as "6.7108864e+07", which the config loader refuses,
+// and the pod crash-loops. --set parses integers as integers, so only a values
+// file shows it. Each value here is past that threshold except the ports, which
+// cannot be.
+func TestHelmChartRendersValuesFileIntegersAsDecimal(t *testing.T) {
+	valuesFile := writeValuesFile(t, "large-integers.yaml", `app:
+  db:
+    port: 65535
+    maxOpenConns: 67108864
+    maxIdleConns: 67108864
+  dav:
+    maxMultistatusResponses: 67108864
+    maxMultistatusBytes: 67108864
+    maxFilterElements: 67108864
+    maxReportElementDepth: 67108864
+    maxCardDAVQueryBytes: 67108864
+    maxAddressDataProperties: 67108864
+    maxRequestedProperties: 67108864
+    maxMultigetHrefs: 67108864
+    maxReportCandidateRows: 67108864
+service:
+  port: 65535
+startupProbe:
+  periodSeconds: 1000000
+  failureThreshold: 67108864
+`)
+	documents := renderChart(t, "-f", valuesFile)
+
+	configmap := requireDocument(t, documents, "configmap.yaml")
+	for _, want := range []string{
+		`APP_DB_MAX_OPEN_CONNS: "67108864"`,
+		`APP_DB_MAX_IDLE_CONNS: "67108864"`,
+		`APP_DAV_MAX_MULTISTATUS_RESPONSES: "67108864"`,
+		`APP_DAV_MAX_MULTISTATUS_BYTES: "67108864"`,
+		`APP_DAV_MAX_FILTER_ELEMENTS: "67108864"`,
+		`APP_DAV_MAX_REPORT_ELEMENT_DEPTH: "67108864"`,
+		`APP_DAV_MAX_CARDDAV_QUERY_BYTES: "67108864"`,
+		`APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: "67108864"`,
+		`APP_DAV_MAX_REQUESTED_PROPERTIES: "67108864"`,
+		`APP_DAV_MAX_MULTIGET_HREFS: "67108864"`,
+		`APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "67108864"`,
+	} {
+		if !hasLine(configmap, want) {
+			t.Errorf("configmap is missing %s:\n%s", want, configmap)
+		}
+	}
+
+	startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+	if !ok {
+		t.Fatal("app deployment has no startupProbe")
+	}
+	for _, want := range []string{"periodSeconds: 1000000", "failureThreshold: 67108864"} {
+		if !hasLine(startup, want) {
+			t.Errorf("startupProbe is missing %q:\n%s", want, startup)
+		}
+	}
+
+	if service := requireDocument(t, documents, "app-service.yaml"); !hasLine(service, "- port: 65535") {
+		t.Errorf("service does not listen on service.port:\n%s", service)
+	}
+	if ingress := requireDocument(t, documents, "ingress.yaml"); !hasLine(ingress, "number: 65535") {
+		t.Errorf("ingress does not route to service.port:\n%s", ingress)
+	}
+	if healthz := requireDocument(t, documents, "tests/healthz.yaml"); !strings.Contains(healthz, ":65535/healthz") {
+		t.Errorf("helm test does not address service.port:\n%s", healthz)
+	}
+	if secret := requireDocument(t, documents, "db-secret.yaml"); !strings.Contains(secret, "-postgres:65535/") {
+		t.Errorf("database DSN does not carry app.db.port:\n%s", secret)
+	}
+
+	exponent := regexp.MustCompile(`[0-9]e\+[0-9]`)
+	for template, document := range documents {
+		if exponent.MatchString(document) {
+			t.Errorf("%s renders a number in exponent form:\n%s", template, document)
+		}
+	}
+}
+
+// The other end of the same conversion: 0 is what turns a DAV limit off, and a
+// values file's 0 is a float64 that has to reach the server as "0" rather than
+// be dropped.
+func TestHelmChartRendersAValuesFileZeroLimit(t *testing.T) {
+	valuesFile := writeValuesFile(t, "zero-limit.yaml", nestedValuesYAML("app.dav.maxReportCandidateRows", "0"))
+	configmap := requireDocument(t, renderChart(t, "-f", valuesFile), "configmap.yaml")
+	if !hasLine(configmap, `APP_DAV_MAX_REPORT_CANDIDATE_ROWS: "0"`) {
+		t.Fatalf("a values file's 0 did not reach the server:\n%s", configmap)
+	}
+}
+
+// A quoted port was valid in 1.1.x, so the schema keeps accepting one and the
+// template renders it as the integer it spells.
+func TestHelmChartAcceptsQuotedPortsFromAValuesFile(t *testing.T) {
+	valuesFile := writeValuesFile(t, "quoted-ports.yaml", quotedPortsValues)
+	requireQuotedPorts(t, renderChart(t, "-f", valuesFile))
+}
+
+// values.schema.json refuses a non-integer first, and the template guard
+// refuses it again for installs run with --skip-schema-validation. Rendering
+// through int64 alone would truncate 1.5 to 1 and turn "abc" into 0, which for
+// a DAV limit silently turns the limit off. A port's schema admits any string of
+// digits, so the template guard alone refuses a quoted port that is out of range
+// or not in plain decimal form, whether or not the schema is validated.
+func TestHelmChartRefusesNonIntegerNumbers(t *testing.T) {
+	for _, key := range chartIntegerValues {
+		valuesFile := func(name, value string) []string {
+			return []string{"-f", writeValuesFile(t, name+".yaml", nestedValuesYAML(key.path, value))}
+		}
+		type badValue struct {
+			name       string
+			values     []string
+			bySchema   bool
+			byTemplate bool
+		}
+		cases := []badValue{
+			{"fractional number", valuesFile("fractional", "1.5"), true, true},
+			{"fractional string", []string{"--set", key.path + "=1.5"}, true, true},
+			{"non-numeric", []string{"--set", key.path + "=abc"}, true, true},
+			{"below minimum", []string{"--set", key.path + "=" + strconv.Itoa(key.minimum-1)}, true, true},
+		}
+		if key.port {
+			cases = append(cases,
+				badValue{"above maximum", []string{"--set", key.path + "=70000"}, true, true},
+				badValue{"quoted below minimum", valuesFile("quoted-zero", `"0"`), false, true},
+				badValue{"quoted above maximum", valuesFile("quoted-large", `"70000"`), false, true},
+				badValue{"quoted leading zero", valuesFile("quoted-octal", `"010"`), false, true},
+			)
+		} else {
+			// The template renders a digit string as the integer it spells, so
+			// only the schema refuses a quoted value for a key that never had one.
+			cases = append(cases, badValue{"quoted integer", valuesFile("quoted", `"5"`), true, false})
+		}
+
+		schemaRefusal := "/" + strings.ReplaceAll(key.path, ".", "/")
+		templateRefusal := key.path + " must be an integer"
+		type gate struct {
+			name  string
+			flags []string
+			want  string
+		}
+		for _, tc := range cases {
+			// A value the schema admits reaches the template guard even with
+			// schema validation on, so the guard's message is what names it.
+			schemaGate := gate{"schema", nil, schemaRefusal}
+			if !tc.bySchema {
+				schemaGate.want = templateRefusal
+			}
+			gates := []gate{schemaGate}
+			if tc.byTemplate {
+				gates = append(gates, gate{"template", []string{"--skip-schema-validation"}, templateRefusal})
+			}
+			for _, gate := range gates {
+				t.Run(key.path+"/"+tc.name+"/"+gate.name, func(t *testing.T) {
+					args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+					args = append(args, gate.flags...)
+					args = append(args, tc.values...)
+					output, err := runHelm(t, args...)
+					if err == nil {
+						t.Fatalf("chart rendered %v:\n%s", tc.values, output)
+					}
+					if !strings.Contains(output, gate.want) {
+						t.Fatalf("expected the refusal to name %q, got:\n%s", gate.want, output)
+					}
+				})
+			}
+		}
+	}
+}
+
+// helm upgrade --reuse-values does not merge the new chart's values.yaml: it
+// replaces the chart's defaults with the previous release's, so every key a
+// later chart introduced is absent rather than defaulted. Rendering a copy of
+// this chart whose values.yaml is a released 1.1.x one reproduces exactly that.
+// v1.1.4 stands for v1.1.0 through v1.1.4 and v1.1.9 for v1.1.5 onward; the two
+// differ in app.logLevel.
+func TestHelmChartRendersOverReusedV1_1Values(t *testing.T) {
+	for _, release := range []string{"v1.1.4", "v1.1.9"} {
+		t.Run(release, func(t *testing.T) {
+			released, err := os.ReadFile(filepath.Join("testdata", "values-"+release+".yaml"))
+			if err != nil {
+				t.Fatalf("read %s values: %v", release, err)
+			}
+			chart := filepath.Join(t.TempDir(), "calcard")
+			if err := os.CopyFS(chart, os.DirFS(chartPath)); err != nil {
+				t.Fatalf("copy chart: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(chart, "values.yaml"), released, 0o600); err != nil {
+				t.Fatalf("write %s values: %v", release, err)
+			}
+
+			// The release's own values are re-validated against this chart's
+			// schema, and a 1.1.x release could quote its ports.
+			quotedPorts := writeValuesFile(t, "quoted-ports.yaml", quotedPortsValues)
+			args := append([]string{"template", "calcard-test", chart}, ciValues()...)
+			args = append(args, "-f", quotedPorts)
+			output, err := runHelm(t, args...)
+			if err != nil {
+				t.Fatalf("chart does not render over the %s values, so helm upgrade --reuse-values fails: %v\n%s", release, err, output)
+			}
+			documents := splitRenderedDocuments(output)
+
+			startup, ok := blockUnder(requireDocument(t, documents, "app-deployment.yaml"), "startupProbe:")
+			if !ok {
+				t.Fatalf("app deployment has no startupProbe over the %s values", release)
+			}
+			for _, want := range []string{"path: /healthz", "periodSeconds: 10", "failureThreshold: 60"} {
+				if !hasLine(startup, want) {
+					t.Errorf("startupProbe is missing the default %q:\n%s", want, startup)
+				}
+			}
+
+			requireQuotedPorts(t, documents)
+
+			configmap := requireDocument(t, documents, "configmap.yaml")
+			data, ok := blockUnder(configmap, "data:")
+			if !ok {
+				t.Fatalf("configmap carries no data:\n%s", configmap)
+			}
+			for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+				if strings.HasSuffix(strings.TrimSpace(line), ":") {
+					t.Errorf("configmap renders %q with no value, which is null rather than a string:\n%s", strings.TrimSpace(line), configmap)
+				}
+			}
+		})
+	}
+}
+
+// The server reads APP_DAV_REPORT_TIMEOUT as a Go duration, in which a bare
+// number other than 0 is an error at startup, so the chart refuses one at
+// render: the schema first, and the template again for installs run with
+// --skip-schema-validation. 0, which turns the deadline off, and a duration
+// with a unit render.
+func TestHelmChartReportTimeoutIsADuration(t *testing.T) {
+	for _, value := range []string{"10s", "1m30s", "250ms", "1.5h", "0"} {
+		documents := renderChart(t, "--set-string", "app.dav.reportTimeout="+value)
+		want := `APP_DAV_REPORT_TIMEOUT: "` + value + `"`
+		if configmap := requireDocument(t, documents, "configmap.yaml"); !hasLine(configmap, want) {
+			t.Errorf("reportTimeout %q did not render %s:\n%s", value, want, configmap)
+		}
+	}
+	if configmap := requireDocument(t, renderChart(t, "--set", "app.dav.reportTimeout=0"), "configmap.yaml"); !hasLine(configmap, `APP_DAV_REPORT_TIMEOUT: "0"`) {
+		t.Errorf("the integer 0 did not render as the duration 0:\n%s", configmap)
+	}
+	for _, bad := range [][]string{
+		{"--set", "app.dav.reportTimeout=30"},
+		{"--set-string", "app.dav.reportTimeout=30"},
+		{"--set", "app.dav.reportTimeout=1.5"},
+		{"--set-string", "app.dav.reportTimeout=ten seconds"},
+		{"--set-string", "app.dav.reportTimeout=-5s"},
+		{"--set-string", "app.dav.reportTimeout="},
+	} {
+		args := append([]string{"template", "calcard-test", chartPath}, ciValues()...)
+		for _, skip := range []bool{false, true} {
+			run := append(append([]string{}, args...), bad...)
+			if skip {
+				run = append(run, "--skip-schema-validation")
+			}
+			if output, err := runHelm(t, run...); err == nil {
+				t.Errorf("helm rendered %v (skip schema %t) although the server refuses it at startup:\n%.300s", bad, skip, output)
+			}
+		}
+	}
+}

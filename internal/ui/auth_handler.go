@@ -37,6 +37,7 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 		sessionData = append(sessionData, map[string]any{
 			"ID":         s.ID,
 			"UserAgent":  userAgent,
+			"DeviceKind": sessionDeviceKind(userAgent),
 			"IPAddress":  ipAddress,
 			"CreatedAt":  s.CreatedAt,
 			"ExpiresAt":  s.ExpiresAt,
@@ -51,6 +52,36 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 		"Sessions": sessionData,
 	})
 	h.render(w, r, "sessions.html", data)
+}
+
+// sessionDeviceKind classifies a session's user agent so the sessions page can
+// show what the session was opened from.
+//
+// The tablet check has to run first: an Android tablet's user agent is an
+// Android phone's minus the "Mobile" token, and an iPad's still carries the
+// "Mobile/<build>" token an iPhone's does. An unrecognized agent is treated as
+// a desktop, which is what a browser sending one is; only a missing agent is
+// reported as unknown. iPadOS Safari requesting a desktop site sends a
+// Macintosh agent with nothing left to tell it apart, so it reads as a desktop.
+func sessionDeviceKind(userAgent string) string {
+	agent := strings.ToLower(userAgent)
+	if strings.TrimSpace(agent) == "" {
+		return "unknown"
+	}
+	switch {
+	case strings.Contains(agent, "ipad"),
+		strings.Contains(agent, "tablet"),
+		strings.Contains(agent, "kindle"),
+		strings.Contains(agent, "playbook"),
+		strings.Contains(agent, "android") && !strings.Contains(agent, "mobile"):
+		return "tablet"
+	case strings.Contains(agent, "iphone"),
+		strings.Contains(agent, "ipod"),
+		strings.Contains(agent, "windows phone"),
+		strings.Contains(agent, "mobile"):
+		return "phone"
+	}
+	return "desktop"
 }
 
 // RevokeSession revokes a single session.
@@ -74,7 +105,7 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.redirect(w, r, "/sessions", map[string]string{"status": "revoked"})
+	h.redirect(w, r, "/sessions", map[string]string{"status": "session_revoked"})
 }
 
 // RevokeAllSessions revokes all sessions except the current one.
@@ -96,7 +127,7 @@ func (h *Handler) RevokeAllSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.redirect(w, r, "/sessions", map[string]string{"status": "all_revoked"})
+	h.redirect(w, r, "/sessions", map[string]string{"status": "sessions_revoked"})
 }
 
 // AppPasswords displays the app passwords page (GET only).
@@ -168,6 +199,9 @@ func (h *Handler) RevokeAppPassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A cached credential is served without reading the database, so the
+	// revocation only takes effect once the cache has been told about it.
+	h.authService.InvalidateAppPassword(id)
 
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
 }
@@ -201,6 +235,7 @@ func (h *Handler) DeleteAppPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to delete app password", http.StatusInternalServerError)
 		return
 	}
+	h.authService.InvalidateAppPassword(id)
 
 	http.Redirect(w, r, "/app-passwords", http.StatusFound)
 }
@@ -225,14 +260,15 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 			status = "expired"
 		}
 		view = append(view, map[string]any{
-			"id":         p.ID,
-			"label":      p.Label,
-			"created_at": p.CreatedAt,
-			"expires_at": p.ExpiresAt,
-			"last_used":  p.LastUsedAt,
-			"status":     status,
-			"revoked":    revoked,
-			"expired":    expired,
+			"id":           p.ID,
+			"label":        p.Label,
+			"created_at":   p.CreatedAt,
+			"expires_at":   p.ExpiresAt,
+			"last_used":    p.LastUsedAt,
+			"status":       status,
+			"revoked":      revoked,
+			"expired":      expired,
+			"digest_ready": auth.DigestReady(h.cfg, p),
 		})
 	}
 	data := h.withFlash(r, map[string]any{
@@ -240,10 +276,13 @@ func (h *Handler) renderAppPasswords(w http.ResponseWriter, r *http.Request, use
 		"User":         user,
 		"AppPasswords": view,
 		"DAVEndpoint":  h.davEndpoint(),
+		// With Digest off no app password holds an HA1 and none can, so the
+		// readiness badge would label every row alike and say nothing.
+		"DigestEnabled": auth.DigestEnabled(h.cfg),
 	})
 	if plaintext != "" {
 		data["PlainToken"] = plaintext
-		data["FlashMessage"] = "created"
+		data["FlashMessage"] = flashMessage("app_password_created")
 	}
 	h.render(w, r, "app_passwords.html", data)
 }

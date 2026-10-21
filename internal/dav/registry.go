@@ -164,16 +164,9 @@ func (r *Registry) HasCollection(prefix string) bool {
 	return false
 }
 
-func (r *Registry) methodHandler(method, requestPath string) (MethodHandler, bool) {
-	route, ok := r.methodRoute(method, requestPath)
-	if !ok {
-		return nil, false
-	}
-	return route.handler, true
-}
-
 func (r *Registry) methodRoute(method, requestPath string) (routeRegistration, bool) {
-	method = strings.ToUpper(strings.TrimSpace(method))
+	// Registered methods are normalized once at registration; HTTP methods
+	// arrive canonically uppercase, so no per-request normalization is needed.
 	cleanPath := normalizeRegistryPrefix(requestPath)
 	defaultPath := isDefaultDAVPath(cleanPath)
 	var selected routeRegistration

@@ -1,0 +1,293 @@
+package dav
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/store"
+)
+
+// cleanupBeforeEventChanges and cleanupBeforeContactChanges run a hook ahead
+// of each change-stream read, so a test can prune history between the
+// retention check a sync makes on arrival and the read itself.
+type cleanupBeforeEventChanges struct {
+	store.EventRepository
+	beforeRead func()
+}
+
+func (r cleanupBeforeEventChanges) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	r.beforeRead()
+	return r.EventRepository.ListChangesAfter(ctx, calendarID, after, removals, limit)
+}
+
+type cleanupBeforeContactChanges struct {
+	store.ContactRepository
+	beforeRead func()
+}
+
+func (r cleanupBeforeContactChanges) ListChangesAfter(ctx context.Context, addressBookID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	r.beforeRead()
+	return r.ContactRepository.ListChangesAfter(ctx, addressBookID, after, removals, limit)
+}
+
+func TestPostgres_SyncRejectsHistoryPrunedDuringTheRequest(t *testing.T) {
+	for _, kind := range []string{"cal", "card"} {
+		t.Run(kind, func(t *testing.T) {
+			database := newDAVPostgresStore(t)
+			ctx := t.Context()
+			user, err := database.Users.UpsertOAuthUser(ctx, "retention", "retention@example.test", "Retention", "Test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var id int64
+			var tokenTime time.Time
+			var collectionPath string
+			if kind == "card" {
+				book, err := database.AddressBooks.Create(ctx, store.AddressBook{UserID: user.ID, Name: "Retention"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = book.ID
+				if _, err := database.Contacts.Upsert(ctx, store.Contact{AddressBookID: id, UID: "gone", ResourceName: "gone", RawVCard: buildVCard("3.0", "UID:gone", "FN:Gone"), ETag: "e"}); err != nil {
+					t.Fatal(err)
+				}
+				book, err = database.AddressBooks.GetByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tokenTime = book.UpdatedAt
+				if err := database.Contacts.DeleteByUID(ctx, id, "gone"); err != nil {
+					t.Fatal(err)
+				}
+				collectionPath = fmt.Sprintf("/dav/addressbooks/%d/", id)
+			} else {
+				cal, err := database.Calendars.Create(ctx, store.Calendar{UserID: user.ID, Name: "Retention"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = cal.ID
+				if _, err := database.Events.Upsert(ctx, store.Event{CalendarID: id, UID: "gone", ResourceName: "gone", RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:gone\r\nDTSTART:20240101T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"}); err != nil {
+					t.Fatal(err)
+				}
+				cal, err = database.Calendars.GetByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tokenTime = cal.UpdatedAt
+				if err := database.Events.DeleteByUID(ctx, id, "gone"); err != nil {
+					t.Fatal(err)
+				}
+				collectionPath = fmt.Sprintf("/dav/calendars/%d/", id)
+			}
+			var history []store.DeletedResource
+			if kind == "card" {
+				var page store.SyncChanges[store.Contact]
+				page, err = database.Contacts.ListChangesAfter(ctx, id, store.SyncCursorAt(tokenTime), true, 10)
+				history = page.Removals
+			} else {
+				var page store.SyncChanges[store.Event]
+				page, err = database.Events.ListChangesAfter(ctx, id, store.SyncCursorAt(tokenTime), true, 10)
+				history = page.Removals
+			}
+			if err != nil || len(history) != 1 {
+				t.Fatalf("history = %v, error = %v", history, err)
+			}
+			cfg := syncWindowConfig(time.Second)
+			pruned := false
+			repo := database.DeletedResources
+			prune := func() {
+				time.Sleep(time.Until(history[0].DeletedAt.Add(cfg.DAV.SyncHistoryRetention + 10*time.Millisecond)))
+				n, err := repo.Cleanup(ctx, cfg.DAV.SyncHistoryRetention)
+				if err != nil || n != 1 {
+					t.Fatalf("pruned = %d, error = %v", n, err)
+				}
+				pruned = true
+			}
+			if kind == "card" {
+				database.Contacts = cleanupBeforeContactChanges{ContactRepository: database.Contacts, beforeRead: prune}
+			} else {
+				database.Events = cleanupBeforeEventChanges{EventRepository: database.Events, beforeRead: prune}
+			}
+			h := NewDavServer(Options{Store: database, Config: cfg})
+			req := httptest.NewRequest("REPORT", collectionPath, strings.NewReader(syncCollectionBody(buildSyncToken(kind, id, tokenTime))))
+			req.Header.Set("Depth", "0")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+			if !pruned {
+				t.Fatal("sync did not reach the concurrent cleanup")
+			}
+			assertErrorConditions(t, rr, http.StatusForbidden, davQN("valid-sync-token"))
+		})
+	}
+}
+
+// syncWindowCollections is the sync-collection report over each collection kind
+// that reads tombstones. The retention window is one value governing both, so
+// every case below runs against both: the calendar side is RFC 4791 scope and
+// the address book side RFC 6352, and neither may answer a token the other
+// refuses.
+var syncWindowCollections = []struct {
+	name string
+	kind string
+	id   int64
+	// resourceType, liveResourceName and liveHref name one resource the
+	// fixture stores, so a case can tombstone a name the collection still
+	// holds.
+	resourceType     string
+	liveResourceName string
+	liveHref         string
+	server           func(t *testing.T, cfg *config.Config) *DavServer
+	report           func(t *testing.T, h *DavServer, body string) *httptest.ResponseRecorder
+}{
+	{
+		name:             "calendar",
+		kind:             "cal",
+		id:               1,
+		resourceType:     "event",
+		liveResourceName: "event-1",
+		liveHref:         "/dav/calendars/1/event-1.ics",
+		server:           func(t *testing.T, cfg *config.Config) *DavServer { return limitsTestServer(t, cfg, 2) },
+		report:           limitsReportRequest,
+	},
+	{
+		name:             "address book",
+		kind:             "card",
+		id:               5,
+		resourceType:     "contact",
+		liveResourceName: "contact-00001",
+		liveHref:         "/dav/addressbooks/5/contact-00001.vcf",
+		server:           func(t *testing.T, cfg *config.Config) *DavServer { return cardLimitsTestServer(t, cfg, 2) },
+		report:           cardLimitsReportRequest,
+	},
+}
+
+// syncWindowConfig is the limits every case below shares: the response bounds at
+// their defaults, so the retention window is the only thing deciding the answer.
+func syncWindowConfig(retention time.Duration) *config.Config {
+	cfg := &config.Config{}
+	cfg.DAV.MaxMultistatusResponses = defaultMaxMultistatusResponses
+	cfg.DAV.MaxMultistatusBytes = defaultMaxMultistatusBytes
+	cfg.DAV.SyncHistoryRetention = retention
+	return cfg
+}
+
+// RFC 6578 §3.2 lets a server invalidate a sync token it can no longer answer,
+// naming the case directly: a server that "might only be able to maintain up to
+// 3 weeks worth of changes to a collection" refuses the token and the client
+// falls back to a full synchronization. CalCard's tombstone retention is that
+// window, so a token naming an instant before it is refused with
+// DAV:valid-sync-token rather than answered from a pruned history.
+func TestSyncCollectionOutsideTheRetentionWindowFailsValidSyncToken(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(24*time.Hour))
+
+			stale := time.Now().UTC().Add(-72 * time.Hour)
+			rr := collection.report(t, h, syncCollectionBody(buildSyncToken(collection.kind, collection.id, stale)))
+
+			assertErrorConditions(t, rr, http.StatusForbidden, davQN("valid-sync-token"))
+		})
+	}
+}
+
+// Inside the window every tombstone the report needs is still stored, so the
+// token is answered.
+func TestSyncCollectionInsideTheRetentionWindowIsAnswered(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(72*time.Hour))
+
+			recent := time.Now().UTC().Add(-24 * time.Hour)
+			rr := collection.report(t, h, syncCollectionBody(buildSyncToken(collection.kind, collection.id, recent)))
+
+			decodeMultistatus(t, rr)
+		})
+	}
+}
+
+// A token naming the collection's own last-change instant is answerable however
+// old it is: nothing has changed since, so there is no deletion to report and
+// none can have been pruned out from under it. Without this a collection nobody
+// has touched in longer than the window would force a full resync on every sync
+// forever, since the token the server hands back names that same instant.
+func TestSyncCollectionAtTheCollectionWatermarkIsAnsweredHoweverOld(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(time.Hour))
+
+			// limitsFixtureModified is the fixture collection's UpdatedAt and is
+			// years outside the window.
+			rr := collection.report(t, h, syncCollectionBody(buildSyncToken(collection.kind, collection.id, limitsFixtureModified)))
+
+			decodeMultistatus(t, rr)
+		})
+	}
+}
+
+// Retention off prunes nothing, so no token becomes unanswerable through age.
+func TestSyncCollectionWithRetentionOffAnswersAnyAge(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(0))
+
+			ancient := time.Now().UTC().Add(-10 * 365 * 24 * time.Hour)
+			rr := collection.report(t, h, syncCollectionBody(buildSyncToken(collection.kind, collection.id, ancient)))
+
+			decodeMultistatus(t, rr)
+		})
+	}
+}
+
+// A resource deleted and then recreated under the same name is live again, and
+// the tombstone the deletion left behind still names that href. RFC 6578 §3.2
+// fixes no order over the DAV:response elements a sync report returns, so a
+// report carrying both the addition and the removal lets the client apply them
+// in either order; one of those orders drops a resource the server still holds.
+// The live resource is the authority, so the removal is not reported at all.
+func TestSyncCollectionDoesNotReportALiveResourceAsDeleted(t *testing.T) {
+	for _, collection := range syncWindowCollections {
+		t.Run(collection.name, func(t *testing.T) {
+			h := collection.server(t, syncWindowConfig(0))
+			tombstones, ok := h.store.DeletedResources.(*fakeDeletedResourceRepo)
+			if !ok {
+				t.Fatalf("fixture deleted-resource repository = %T, want *fakeDeletedResourceRepo", h.store.DeletedResources)
+			}
+			tombstones.deleted = append(tombstones.deleted, store.DeletedResource{
+				ID:           1,
+				ResourceType: collection.resourceType,
+				CollectionID: collection.id,
+				UID:          collection.liveResourceName,
+				ResourceName: collection.liveResourceName,
+				DeletedAt:    limitsFixtureModified.Add(-time.Minute),
+			})
+
+			token := buildSyncToken(collection.kind, collection.id, limitsFixtureModified.Add(-time.Hour))
+			rr := collection.report(t, h, syncCollectionBody(token))
+			ms := decodeMultistatus(t, rr)
+
+			var live, removed int
+			for _, resp := range ms.Responses {
+				if len(resp.Hrefs) != 1 || resp.Hrefs[0] != collection.liveHref {
+					continue
+				}
+				if strings.Contains(resp.Status, "404") {
+					removed++
+					continue
+				}
+				live++
+			}
+			if live != 1 || removed != 0 {
+				t.Fatalf("%s reported live %d times and deleted %d times, want 1 and 0; body: %s",
+					collection.liveHref, live, removed, rr.Body.String())
+			}
+		})
+	}
+}

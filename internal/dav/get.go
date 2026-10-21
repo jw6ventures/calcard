@@ -11,10 +11,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
+func (h *DavServer) get(w http.ResponseWriter, r *http.Request) {
 	h.logger().Trace("Get", "handling GET %s", r.URL.Path)
 	cleanPath := path.Clean(r.URL.Path)
 	if !strings.HasPrefix(cleanPath, "/dav") {
@@ -36,7 +33,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if calendarID, uid, matched, err := h.parseCalendarResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -50,6 +47,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		if calendarID == birthdayCalendarID {
 			events, err := h.generateBirthdayEvents(r.Context(), user.ID)
 			if err != nil {
+				if errors.Is(err, errTooManyCandidateRows) {
+					writeInsufficientStorage(w)
+					return
+				}
 				http.Error(w, "failed to load birthday events", http.StatusInternalServerError)
 				return
 			}
@@ -74,13 +75,8 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cal, err := h.loadCalendarWithPrivilege(r.Context(), user, calendarID, cleanPath, "read")
-		if err != nil {
-			if err == store.ErrNotFound {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			if errors.Is(err, errForbidden) {
+		if _, err := h.loadCalendarForObjectRead(r.Context(), user, calendarID, uid, cleanPath); err != nil {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -97,15 +93,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		allowed, err := h.canReadCalendarObject(r.Context(), user, cal, uid)
-		if err != nil {
-			http.Error(w, "failed to evaluate calendar access", http.StatusInternalServerError)
-			return
-		}
-		if !allowed {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
 		w.Header().Set("Content-Type", "text/calendar")
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", event.ETag))
 		if !event.LastModified.IsZero() {
@@ -116,7 +103,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if addressBookID, resourceName, matched, err := h.parseAddressBookResourcePath(r.Context(), user, cleanPath); err != nil {
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -128,12 +115,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if matched {
 		if _, err := h.loadAddressBookWithPrivilege(r.Context(), user, addressBookID, cleanPath, "read"); err != nil {
-			if err == store.ErrNotFound {
+			if errors.Is(err, store.ErrNotFound) {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
 			if errors.Is(err, errForbidden) {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				// Non-disclosure: an unreadable resource looks like a missing one
+				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
 			http.Error(w, "failed to load address book", http.StatusInternalServerError)
@@ -143,11 +131,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("DAV", h.davHeaderForPath(cleanPath))
-	w.WriteHeader(http.StatusOK)
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
-func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
+func (h *DavServer) writeAddressBookContact(w http.ResponseWriter, r *http.Request, addressBookID int64, resourceName string) {
 	contact, err := h.store.Contacts.GetByResourceName(r.Context(), addressBookID, resourceName)
 	if err != nil {
 		h.logger().Error("writeAddressBookContact", "failed to load contact %q from address book %d: %v", resourceName, addressBookID, err)
@@ -158,7 +145,8 @@ func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if !acceptsVCardData(contact.RawVCard, r.Header.Get("Accept")) {
+	data, acceptable := vcardDataForAccept(contact.RawVCard, r.Header.Get("Accept"))
+	if !acceptable {
 		writeCardDAVPrecondition(w, http.StatusNotAcceptable, "supported-address-data-conversion")
 		return
 	}
@@ -167,5 +155,5 @@ func (h *Handler) writeAddressBookContact(w http.ResponseWriter, r *http.Request
 	if !contact.LastModified.IsZero() {
 		w.Header().Set("Last-Modified", contact.LastModified.UTC().Format(http.TimeFormat))
 	}
-	_, _ = w.Write([]byte(contact.RawVCard))
+	_, _ = w.Write([]byte(data))
 }

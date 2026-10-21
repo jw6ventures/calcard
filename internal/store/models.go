@@ -1,29 +1,109 @@
 package store
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // User represents a person authenticated via OAuth.
 type User struct {
 	ID                    int64
 	OAuthSubject          string
 	PrimaryEmail          string
+	FullName              string
+	FirstName             string
 	CreatedAt             time.Time
 	LastLoginAt           time.Time
 	OnboardingCompletedAt *time.Time
 }
 
+// DisplayName returns the OAuth full name, falling back to the login email.
+func (u User) DisplayName() string {
+	if name := strings.TrimSpace(u.FullName); name != "" {
+		return name
+	}
+	return u.PrimaryEmail
+}
+
+// GreetingName returns the user's first name when the OAuth provider supplies it.
+func (u User) GreetingName() string {
+	if name := strings.TrimSpace(u.FirstName); name != "" {
+		return name
+	}
+	return u.DisplayName()
+}
+
+// ReferenceName includes the email when a full name is available so users with
+// the same name remain distinguishable in sharing controls.
+func (u User) ReferenceName() string {
+	name := u.DisplayName()
+	if name == u.PrimaryEmail || u.PrimaryEmail == "" {
+		return name
+	}
+	return name + " (" + u.PrimaryEmail + ")"
+}
+
 // Calendar is a CalDAV calendar belonging to a user.
 type Calendar struct {
-	ID          int64
-	UserID      int64
-	Name        string
-	Slug        *string
-	Description *string
-	Timezone    *string
-	Color       *string
-	CTag        int64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID     int64
+	UserID int64
+	Name   string
+	Slug   *string
+	// Description and DescriptionLang carry the CALDAV:calendar-description
+	// value together with the xml:lang RFC 4918 section 4.3 requires a server to
+	// return with it. A nil DescriptionLang means the value has no language tag.
+	Description     *string
+	DescriptionLang *string
+	Timezone        *string
+	Color           *string
+	// SupportedComponents lists the component names this collection accepts, as
+	// set by MKCALENDAR. Nil means the collection carries no restriction of its
+	// own and the server default applies.
+	SupportedComponents []string
+	CTag                int64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// DefaultSupportedCalendarComponents is the component set a calendar collection
+// accepts when MKCALENDAR set none of its own. VTIMEZONE is deliberately
+// absent: RFC 4791 Section 5.2.3 admits it only from a server that stores
+// VTIMEZONE-only calendar object resources, which CalCard does not.
+var DefaultSupportedCalendarComponents = []string{"VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY"}
+
+// SupportedComponentsOrDefault returns the component names a collection
+// accepts. A nil stored set means the collection carries no restriction of its
+// own, which RFC 4791 Section 5.2.3 makes the meaning of an absent
+// CALDAV:supported-calendar-component-set, so the server default applies. An
+// empty non-nil set is a restriction that names nothing and is left as it is.
+func SupportedComponentsOrDefault(stored []string) []string {
+	if stored == nil {
+		return DefaultSupportedCalendarComponents
+	}
+	return stored
+}
+
+// AcceptsComponent reports whether this collection admits a calendar object
+// resource carrying the named top-level component. It lives on the model rather
+// than in one package because the DAV handlers and the UI both write into these
+// collections, and a restriction only one of them enforces is not a restriction.
+func (c Calendar) AcceptsComponent(name string) bool {
+	for _, allowed := range SupportedComponentsOrDefault(c.SupportedComponents) {
+		if strings.EqualFold(allowed, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// CalendarProperties is the mutable live-property set of a calendar collection,
+// as PROPPATCH may rewrite it.
+type CalendarProperties struct {
+	Name            string
+	Description     *string
+	DescriptionLang *string
+	Timezone        *string
+	Color           *string
 }
 
 // CalendarPrivileges captures the effective collection privileges available to the current user.
@@ -115,19 +195,34 @@ func (c CalendarAccess) EffectivePrivileges() CalendarPrivileges {
 
 // Event stores raw iCalendar payload and metadata.
 type Event struct {
-	ID           int64
-	CalendarID   int64
-	UID          string
-	ResourceName string
-	RawICAL      string
-	ETag         string
-	Summary      *string
-	Description  *string
-	Location     *string
-	DTStart      *time.Time
-	DTEnd        *time.Time
-	AllDay       bool
-	LastModified time.Time
+	ID            int64
+	CalendarID    int64
+	UID           string
+	ResourceName  string
+	RawICAL       string
+	ETag          string
+	Summary       *string
+	Description   *string
+	Location      *string
+	DTStart       *time.Time
+	DTEnd         *time.Time
+	AllDay        bool
+	LastModified  time.Time
+	WriteMetadata *EventWriteMetadata
+}
+
+// EventWriteMetadata contains fields derived from RawICAL during validation.
+// DAV callers can provide it to avoid reparsing an already-analyzed payload;
+// other callers may omit it and use the repository's parsing fallback.
+type EventWriteMetadata struct {
+	Summary         *string
+	Description     *string
+	Location        *string
+	DTStart         *time.Time
+	DTEnd           *time.Time
+	AllDay          bool
+	RecurrenceStart *time.Time
+	RecurrenceUntil *time.Time
 }
 
 // EventFilter narrows ListForCalendarFiltered. Zero-value fields are ignored,
@@ -151,6 +246,15 @@ func (f EventFilter) IsZero() bool {
 		f.Limit <= 0 && f.Offset == 0
 }
 
+// HasPredicate reports whether the filter constrains results by date or text,
+// as opposed to only paginating with Limit/Offset. Pagination-only filters must
+// preserve the ListForCalendar ordering (last_modified DESC), so callers route
+// them differently from filters that narrow the result set.
+func (f EventFilter) HasPredicate() bool {
+	return f.Start != nil || f.End != nil ||
+		f.Title != "" || f.Description != "" || f.Location != "" || f.Query != ""
+}
+
 // AddressBook belongs to a user for CardDAV.
 type AddressBook struct {
 	ID          int64
@@ -162,7 +266,28 @@ type AddressBook struct {
 	UpdatedAt   time.Time
 }
 
-// Contact stores raw vCard payload and metadata.
+// MaxIdentifierOctets bounds a UID or resource name. Both are keys of unique
+// btree indexes, and PostgreSQL refuses an index entry larger than about a
+// third of an 8 KB page (2704 octets) after compression; 1 KB leaves room for
+// the collection id and the derived ACL path beside it, and is far longer
+// than any identifier a client generates.
+const MaxIdentifierOctets = 1024
+
+// maxDisplayNameOctets bounds the indexed display_name column. It is derived
+// from FN for sorting and search, so a longer FN is kept whole in the card
+// and only the column is cut.
+const maxDisplayNameOctets = 1024
+
+// NoYearBirthdayYear is the year a birthday written without one (--MM-DD) is
+// stored under. It is a leap year, so February 29 survives the round trip.
+const NoYearBirthdayYear = 4
+
+// legacyNoYearBirthdayYear marks a year-less birthday in rows the v1.2.0
+// migration has not rewritten; scanContact reads it as NoYearBirthdayYear.
+const legacyNoYearBirthdayYear = 1
+
+// Contact stores raw vCard payload and metadata. A Birthday in
+// NoYearBirthdayYear has no year of its own.
 type Contact struct {
 	ID            int64
 	AddressBookID int64
@@ -194,14 +319,16 @@ func (f ContactFilter) IsZero() bool {
 
 // AppPassword is a per-client credential for DAV access.
 type AppPassword struct {
-	ID         int64
-	UserID     int64
-	Label      string
-	TokenHash  string
-	CreatedAt  time.Time
-	ExpiresAt  *time.Time
-	RevokedAt  *time.Time
-	LastUsedAt *time.Time
+	ID              int64
+	UserID          int64
+	Label           string
+	TokenHash       string
+	DigestMD5HA1    *string
+	DigestSHA256HA1 *string
+	CreatedAt       time.Time
+	ExpiresAt       *time.Time
+	RevokedAt       *time.Time
+	LastUsedAt      *time.Time
 }
 
 // DeletedResource tracks tombstones for sync reporting.
@@ -238,6 +365,21 @@ type Lock struct {
 	TimeoutSeconds int
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
+
+	// These transient fields bind lock creation to the state authorized by the
+	// DAV layer. They are not persisted in the locks table.
+	ExpectedTargetExists  *bool
+	ExpectedCollection    string
+	ExpectedCollectionID  int64
+	ExpectedResourceState *DAVResourceState
+}
+
+// LockPrecondition captures one write target whose active locks must be
+// satisfied inside the same transaction that performs the write.
+type LockPrecondition struct {
+	ResourcePath string
+	LookupPaths  []string
+	Tokens       []string
 }
 
 // ACLEntry represents a single access control entry (RFC 3744).
@@ -247,7 +389,28 @@ type ACLEntry struct {
 	PrincipalHref string
 	IsGrant       bool
 	Privilege     string
+	Position      int
 	CreatedAt     time.Time
+}
+
+// DeadProperty is a persistent, non-live WebDAV property bound to a canonical
+// DAV resource path.
+type DeadProperty struct {
+	ResourcePath string
+	NamespaceURI string
+	LocalName    string
+	InnerXML     string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// DeadPropertyMutation sets or removes one dead property. Remove takes
+// precedence over InnerXML; an empty InnerXML is a valid empty property value.
+type DeadPropertyMutation struct {
+	NamespaceURI string
+	LocalName    string
+	InnerXML     string
+	Remove       bool
 }
 
 // PaginatedResult wraps a paginated query result.

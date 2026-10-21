@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS application (
 );
 
 INSERT INTO application (key, value)
-VALUES ('version', 'v1.0.13')
+VALUES ('version', 'v1.2.0')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- Initial schema for CalCard
@@ -14,6 +14,8 @@ CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     oauth_subject TEXT NOT NULL UNIQUE,
     primary_email TEXT NOT NULL,
+    full_name TEXT NOT NULL DEFAULT '',
+    first_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     onboarding_completed_at TIMESTAMPTZ NULL
@@ -63,12 +65,31 @@ CREATE TABLE app_passwords (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NULL,
     revoked_at TIMESTAMPTZ NULL,
-    last_used_at TIMESTAMPTZ NULL
+    last_used_at TIMESTAMPTZ NULL,
+    -- Encrypted HTTP Digest HA1s (AES-256-GCM under a key derived from
+    -- APP_SESSION_SECRET). An HA1 is password-equivalent for the DAV realm, so
+    -- it is never stored as the bare hash Digest computes.
+    digest_md5_ha1 TEXT NULL,
+    digest_sha256_ha1 TEXT NULL
 );
 
-CREATE INDEX idx_events_calendar_id ON events(calendar_id);
-CREATE INDEX idx_contacts_address_book_id ON contacts(address_book_id);
 CREATE INDEX idx_app_passwords_user_id ON app_passwords(user_id);
+
+-- Consumed Digest nonce counts. RFC 7616 section 3.4 makes the (nonce, nc) pair
+-- single-use, and the nonce this server issues verifies at every instance
+-- holding the configured session secret and across a restart, so the record of
+-- which counts have been spent has to be shared the same way. The primary key
+-- is the uniqueness constraint: the insert that changes no row is the replay.
+CREATE TABLE IF NOT EXISTS digest_nonce_counts (
+    token_id    BIGINT NOT NULL REFERENCES app_passwords(id) ON DELETE CASCADE,
+    nonce       TEXT NOT NULL,
+    nonce_count BIGINT NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (token_id, nonce, nonce_count)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_nonce_counts_expiry
+    ON digest_nonce_counts (expires_at);
 
 -- Automatically keep last_modified columns fresh for updates.
 CREATE OR REPLACE FUNCTION touch_last_modified()
@@ -151,13 +172,16 @@ ALTER TABLE events ADD COLUMN dtend TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN all_day BOOLEAN NOT NULL DEFAULT false;
 
 CREATE INDEX idx_events_dtstart ON events(calendar_id, dtstart);
-CREATE INDEX idx_events_last_modified ON events(calendar_id, last_modified DESC);
+-- sync-collection reads a collection's changes in stream order, a cursor of
+-- (stamp, id) at a time; internal/store/sync_changes.go carries why the id is
+-- part of the position.
+CREATE INDEX idx_events_change_stream ON events(calendar_id, last_modified, id);
 
 ALTER TABLE contacts ADD COLUMN display_name TEXT;
 ALTER TABLE contacts ADD COLUMN primary_email TEXT;
 
 CREATE INDEX idx_contacts_display_name ON contacts(address_book_id, display_name);
-CREATE INDEX idx_contacts_last_modified ON contacts(address_book_id, last_modified DESC);
+CREATE INDEX idx_contacts_change_stream ON contacts(address_book_id, last_modified, id);
 
 UPDATE contacts SET resource_name = uid WHERE resource_name = '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_resource_name ON contacts(address_book_id, resource_name);
@@ -170,7 +194,7 @@ CREATE TABLE deleted_resources (
     deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_deleted_resources_lookup ON deleted_resources(resource_type, collection_id, deleted_at);
+CREATE INDEX idx_deleted_resources_change_stream ON deleted_resources(resource_type, collection_id, deleted_at, id);
 
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
@@ -229,6 +253,16 @@ ALTER TABLE contacts ADD COLUMN birthday DATE;
 CREATE INDEX idx_contacts_birthday ON contacts(address_book_id, birthday) WHERE birthday IS NOT NULL;
 CREATE INDEX idx_contacts_birthday_user ON contacts(birthday) WHERE birthday IS NOT NULL;
 
+-- Keyset indexes for the DAV report reads, which page a single collection by
+-- (collection, id). The reads spell the cursor as a row comparison, which the
+-- primary key cannot answer as an index bound, so these are what serves them
+-- whatever fraction of the table one collection holds. The trailing columns are
+-- the predicates the paged reads narrow on: carried here they are evaluated on
+-- the index tuple, so a page does not visit the heap for a row it discards.
+-- idx_events_calendar_keyset is created below, with the recurrence columns its
+-- trailing expressions read.
+CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);
+
 -- Lock storage for WebDAV Class 2/3 compliance
 CREATE TABLE IF NOT EXISTS locks (
     id BIGSERIAL PRIMARY KEY,
@@ -245,6 +279,12 @@ CREATE TABLE IF NOT EXISTS locks (
 );
 CREATE INDEX IF NOT EXISTS idx_locks_resource ON locks(resource_path);
 CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks(expires_at);
+-- Serves the scans for every lock beneath a collection, a LIKE on the path
+-- prefix, whatever the database's collation: text_pattern_ops compares
+-- byte-wise, which a prefix LIKE needs and the default btree does not give
+-- under a linguistic collation.
+CREATE INDEX IF NOT EXISTS idx_locks_resource_path_pattern
+    ON locks (resource_path text_pattern_ops);
 
 -- ACL entries for WebDAV access control (RFC 3744)
 CREATE TABLE IF NOT EXISTS acl_entries (
@@ -253,12 +293,13 @@ CREATE TABLE IF NOT EXISTS acl_entries (
     principal_href TEXT NOT NULL,
     is_grant BOOLEAN NOT NULL DEFAULT TRUE,
     privilege TEXT NOT NULL,
+    ace_order INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_acl_resource ON acl_entries(resource_path);
 CREATE INDEX IF NOT EXISTS idx_acl_principal ON acl_entries(principal_href);
 DROP INDEX IF EXISTS idx_acl_unique;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_acl_unique ON acl_entries(resource_path, principal_href, privilege, is_grant);
+CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id);
 
 -- Add slug column for MKCALENDAR path mapping
 ALTER TABLE calendars ADD COLUMN slug TEXT;
@@ -331,3 +372,210 @@ DROP TRIGGER IF EXISTS trg_contacts_increment_ctag ON contacts;
 CREATE TRIGGER trg_contacts_increment_ctag
 AFTER INSERT OR UPDATE OR DELETE ON contacts
 FOR EACH ROW EXECUTE FUNCTION increment_address_book_ctag();
+
+-- The path an object's ACL entries, locks and dead properties are stored at:
+-- its collection's canonical path and its stored name, exactly, or its UID
+-- where it has no name (store.MemberStatePath). The object-level ACL decisions
+-- join acl_entries.resource_path to it by plain equality. A STORED generated
+-- column is always correct on write and can be indexed.
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/calendars/' || calendar_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_acl_principal_grant_path
+    ON acl_entries (principal_href, is_grant, resource_path);
+
+CREATE INDEX IF NOT EXISTS idx_events_object_acl_path
+    ON events (object_acl_path);
+
+-- recurrence_start/recurrence_until make calendar-query time-range bounds
+-- indexable for recurring events. They hold a recurring event's earliest
+-- instance start and last instance end (sentinels when not precisely bounded)
+-- and are NULL for non-recurring events, so COALESCE falls back to the
+-- single-instance dtstart/dtend window. The application recomputes them on every
+-- write.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_start TIMESTAMPTZ;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ;
+
+-- These expressions have to match the ListForCalendarFiltered predicates
+-- verbatim or the indexes stop applying; internal/store/postgres.go carries why
+-- each COALESCE reads the columns it does.
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_start
+    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+
+CREATE INDEX IF NOT EXISTS idx_events_recurrence_until
+    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz));
+
+-- The events keyset index, created here rather than beside the other two
+-- because its trailing expressions read the recurrence columns added just above.
+CREATE INDEX idx_events_calendar_keyset ON events(
+    calendar_id, id,
+    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),
+    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));
+
+-- Persistent WebDAV dead properties and batched ACL lookup support.
+CREATE TABLE IF NOT EXISTS dav_dead_properties (
+    resource_path TEXT NOT NULL,
+    namespace_uri TEXT NOT NULL,
+    local_name TEXT NOT NULL,
+    inner_xml TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (resource_path, namespace_uri, local_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dav_dead_properties_resource
+    ON dav_dead_properties (resource_path);
+
+CREATE INDEX IF NOT EXISTS idx_acl_resource_principal
+    ON acl_entries (resource_path, principal_href);
+
+-- Serves a range over every path beneath a collection whatever the database's
+-- collation: text_pattern_ops compares byte-wise, which a range on a path
+-- prefix needs and the default btree on resource_path does not give under a
+-- linguistic collation.
+CREATE INDEX IF NOT EXISTS idx_acl_resource_path_pattern
+    ON acl_entries (resource_path text_pattern_ops);
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS object_acl_path TEXT
+    GENERATED ALWAYS AS ('/dav/addressbooks/' || address_book_id::text || '/' || COALESCE(NULLIF(resource_name, ''), uid)) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_contacts_object_acl_path
+    ON contacts (object_acl_path);
+
+-- description_lang holds the xml:lang attribute RFC 4918 section 4.3 requires a
+-- server to return with the property value it was set with; NULL means the
+-- calendar description carries no language tag. supported_components holds the
+-- component names a calendar collection accepts, as set by MKCALENDAR; NULL
+-- means the collection imposes no restriction of its own and the server default
+-- applies.
+ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT;
+ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[];
+
+-- Commit-ordered sync stamps.
+--
+-- A sync token is its collection's updated_at, and sync-collection reports a
+-- member whose last_modified, or a tombstone whose deleted_at, is later than the
+-- token. That only holds while the stamps order the way the writes commit.
+-- NOW() is the time the transaction started, so a writer that started before
+-- another but committed after it stamped its change behind a token the other's
+-- commit had already let a client take, and the change was never reported.
+--
+-- Every member write locks its collection's row before it writes, so a stamp
+-- read from clock_timestamp() inside the write, and kept above the collection's
+-- current updated_at, is later than every token handed out before the write
+-- can commit. The collection's own updated_at only moves forward, by at least a
+-- microsecond per change, so two changes never share a token.
+CREATE OR REPLACE FUNCTION touch_last_modified()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'events' THEN
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM calendars WHERE id = NEW.calendar_id) + interval '1 microsecond');
+    ELSE
+        NEW.last_modified = GREATEST(clock_timestamp(),
+            (SELECT updated_at FROM address_books WHERE id = NEW.address_book_id) + interval '1 microsecond');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_events_touch_last_modified ON events;
+CREATE TRIGGER trg_events_touch_last_modified
+BEFORE INSERT OR UPDATE ON events
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+DROP TRIGGER IF EXISTS trg_contacts_touch_last_modified ON contacts;
+CREATE TRIGGER trg_contacts_touch_last_modified
+BEFORE INSERT OR UPDATE ON contacts
+FOR EACH ROW EXECUTE FUNCTION touch_last_modified();
+
+-- Any change to a collection row moves its sync token, whatever updated_at the
+-- statement itself wrote.
+CREATE OR REPLACE FUNCTION stamp_collection_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = GREATEST(clock_timestamp(), OLD.updated_at + interval '1 microsecond');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_calendars_stamp_updated_at ON calendars;
+CREATE TRIGGER trg_calendars_stamp_updated_at
+BEFORE UPDATE ON calendars
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+DROP TRIGGER IF EXISTS trg_address_books_stamp_updated_at ON address_books;
+CREATE TRIGGER trg_address_books_stamp_updated_at
+BEFORE UPDATE ON address_books
+FOR EACH ROW EXECUTE FUNCTION stamp_collection_updated_at();
+
+-- An event write moves its calendar's CTag, except while its transaction has
+-- set calcard.defer_calendar_ctag to that calendar's id. A transaction does
+-- that around writes of many members of one calendar and then moves the CTag
+-- once itself: each update of one row within a transaction leaves a version
+-- that later reads of the row step over, so a move per member would make the
+-- write quadratic in its member count. Any other value defers nothing, and
+-- set_config(..., true) ends the setting with the transaction.
+CREATE OR REPLACE FUNCTION increment_calendar_ctag()
+RETURNS TRIGGER AS $$
+DECLARE
+    deferred TEXT := current_setting('calcard.defer_calendar_ctag', true);
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF deferred IS DISTINCT FROM OLD.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = OLD.calendar_id;
+        END IF;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('event', OLD.calendar_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        IF deferred IS DISTINCT FROM NEW.calendar_id::text THEN
+            UPDATE calendars SET ctag = ctag + 1 WHERE id = NEW.calendar_id;
+        END IF;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION increment_address_book_ctag()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = OLD.address_book_id;
+        INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name)
+        VALUES ('contact', OLD.address_book_id, OLD.uid, OLD.resource_name);
+        RETURN OLD;
+    ELSE
+        UPDATE address_books SET ctag = ctag + 1 WHERE id = NEW.address_book_id;
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A tombstone moves its collection's sync token and takes the new token as its
+-- own stamp: a client holding an older token is told of the removal, and one
+-- holding the new token already has a state without the resource. The
+-- collection may already be gone when its members are removed with it.
+CREATE OR REPLACE FUNCTION stamp_deleted_resource()
+RETURNS TRIGGER AS $$
+DECLARE
+    stamped TIMESTAMPTZ;
+BEGIN
+    IF NEW.resource_type = 'event' THEN
+        UPDATE calendars SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    ELSIF NEW.resource_type = 'contact' THEN
+        UPDATE address_books SET updated_at = clock_timestamp() WHERE id = NEW.collection_id
+        RETURNING updated_at INTO stamped;
+    END IF;
+    NEW.deleted_at = COALESCE(stamped, clock_timestamp());
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_deleted_resources_stamp ON deleted_resources;
+CREATE TRIGGER trg_deleted_resources_stamp
+BEFORE INSERT ON deleted_resources
+FOR EACH ROW EXECUTE FUNCTION stamp_deleted_resource();

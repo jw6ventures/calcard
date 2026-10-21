@@ -21,7 +21,7 @@ func (f extensionFunc) RegisterDAV(r *Registry) {
 }
 
 func TestServerRegistersDefaultDAVModules(t *testing.T) {
-	s := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+	s := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 
 	for _, prefix := range []string{"/dav", "/dav/principals", "/dav/calendars", "/dav/addressbooks"} {
 		if !s.davRegistry().HasCollection(prefix) {
@@ -32,7 +32,7 @@ func TestServerRegistersDefaultDAVModules(t *testing.T) {
 
 func TestExtensionHandlesAdditiveReportOnDefaultPath(t *testing.T) {
 	reportBody := `<C:schedule-query xmlns:C="urn:ietf:params:xml:ns:caldav"/>`
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -72,8 +72,8 @@ func TestExtensionHandlesAdditiveReportOnDefaultPath(t *testing.T) {
 }
 
 func TestExtensionReportDoesNotOverrideCoreReportByDefault(t *testing.T) {
-	reportBody := `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav"/>`
-	s := NewServer(Options{
+	reportBody := `<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav"><C:filter><C:comp-filter name="VCALENDAR"/></C:filter></C:calendar-query>`
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -85,6 +85,7 @@ func TestExtensionReportDoesNotOverrideCoreReportByDefault(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(reportBody))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 1}))
 	rec := httptest.NewRecorder()
 
@@ -96,7 +97,7 @@ func TestExtensionReportDoesNotOverrideCoreReportByDefault(t *testing.T) {
 }
 
 func TestExtensionAddsPropfindCollection(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -134,7 +135,7 @@ func TestExtensionAddsPropfindCollection(t *testing.T) {
 }
 
 func TestExtensionPropfindCustomXMLPropertyCanBeRequestedExplicitly(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -165,8 +166,66 @@ func TestExtensionPropfindCustomXMLPropertyCanBeRequestedExplicitly(t *testing.T
 	}
 }
 
+func TestExtensionPropfindDecoratorReceivesRequestAndContributesPropname(t *testing.T) {
+	var decoratorRequest *http.Request
+	s := NewDavServer(Options{
+		Config: &config.Config{},
+		Store:  &store.Store{},
+		Extensions: []Extension{extensionFunc(func(r *Registry) {
+			r.RegisterCollection("/dav/pro")
+			r.RegisterPropfindDecorator("/dav/pro", func(ctx RequestContext, props *PropfindProperties) error {
+				decoratorRequest = ctx.Request
+				props.SetXMLProperty(XMLProperty{Name: xml.Name{Space: "urn:calcard:pro", Local: "enabled"}, Value: true})
+				return nil
+			})
+		})},
+	})
+
+	body := `<d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/pro/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 1}))
+	rec := httptest.NewRecorder()
+
+	s.Propfind(rec, req)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND status = %d, want %d: %s", rec.Code, http.StatusMultiStatus, rec.Body.String())
+	}
+	if decoratorRequest == nil || decoratorRequest.Method != "PROPFIND" || decoratorRequest.URL.Path != "/dav/pro/" {
+		t.Fatalf("decorator request = %#v, want non-nil PROPFIND /dav/pro/ request", decoratorRequest)
+	}
+	if !strings.Contains(rec.Body.String(), `enabled xmlns="urn:calcard:pro"`) {
+		t.Fatalf("PROPFIND propname omitted extension property: %s", rec.Body.String())
+	}
+}
+
+func TestReportPropertyDecorationDoesNotInvokePropfindDecorator(t *testing.T) {
+	decoratorCalls := 0
+	s := NewDavServer(Options{
+		Store: &store.Store{},
+		Extensions: []Extension{extensionFunc(func(r *Registry) {
+			r.RegisterPropfindDecorator("/dav/calendars", func(ctx RequestContext, props *PropfindProperties) error {
+				decoratorCalls++
+				if ctx.Request == nil {
+					t.Fatal("REPORT invoked PROPFIND decorator with nil request")
+				}
+				return nil
+			})
+		})},
+	})
+	responses := []response{resourceResponse("/dav/calendars/1/event.ics", etagProp("etag", "", true))}
+
+	if _, err := s.finishReportResponses(context.Background(), &store.User{ID: 1}, responses, propertySelector{Prop: &reportProp{propertySelection: propertySelection{GetETag: &struct{}{}}}}, false, nil); err != nil {
+		t.Fatalf("finishReportResponses() error = %v", err)
+	}
+	if decoratorCalls != 0 {
+		t.Fatalf("PROPFIND decorator calls during REPORT = %d, want 0", decoratorCalls)
+	}
+}
+
 func TestExtensionRegisteredCollectionHandlesPropfind(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -201,7 +260,7 @@ func TestExtensionRegisteredCollectionHandlesPropfind(t *testing.T) {
 }
 
 func TestCollectionContributorAddsDynamicCollection(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -227,7 +286,7 @@ func TestCollectionContributorAddsDynamicCollection(t *testing.T) {
 }
 
 func TestCollectionContributorOnlyAppliesToExactParent(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store: &store.Store{
 			Calendars: &fakeCalendarRepo{},
@@ -258,7 +317,7 @@ func TestCollectionContributorOnlyAppliesToExactParent(t *testing.T) {
 }
 
 func TestMethodHandlerDoesNotOverrideDefaultDAVPath(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -279,7 +338,7 @@ func TestMethodHandlerDoesNotOverrideDefaultDAVPath(t *testing.T) {
 }
 
 func TestMethodHandlerCanExtendDefaultDAVPathWithAdditiveMethod(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -301,7 +360,7 @@ func TestMethodHandlerCanExtendDefaultDAVPathWithAdditiveMethod(t *testing.T) {
 }
 
 func TestMethodHandlerRequiresAuthenticatedRequest(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -323,7 +382,7 @@ func TestMethodHandlerRequiresAuthenticatedRequest(t *testing.T) {
 }
 
 func TestMethodHandlerHandlesAuthenticatedExtensionPath(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -346,7 +405,7 @@ func TestMethodHandlerHandlesAuthenticatedExtensionPath(t *testing.T) {
 }
 
 func TestHeadFallsBackToExtensionGetHandler(t *testing.T) {
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -370,7 +429,7 @@ func TestHeadFallsBackToExtensionGetHandler(t *testing.T) {
 
 func TestExtensionOptionsAuthPolicyIsExplicit(t *testing.T) {
 	t.Run("required", func(t *testing.T) {
-		s := NewServer(Options{
+		s := NewDavServer(Options{
 			Config: &config.Config{},
 			Store:  &store.Store{},
 			Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -392,7 +451,7 @@ func TestExtensionOptionsAuthPolicyIsExplicit(t *testing.T) {
 	})
 
 	t.Run("none", func(t *testing.T) {
-		s := NewServer(Options{
+		s := NewDavServer(Options{
 			Config: &config.Config{},
 			Store:  &store.Store{},
 			Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -428,7 +487,7 @@ func TestExtensionPutValidatorRejectsCalendarObject(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: validCalendarObject("event"), ETag: "old"},
 		},
 	}
-	s := NewServer(Options{
+	s := NewDavServer(Options{
 		Config: &config.Config{},
 		Store:  &store.Store{Calendars: calRepo, Events: eventRepo},
 		Extensions: []Extension{extensionFunc(func(r *Registry) {
@@ -459,5 +518,6 @@ func TestExtensionPutValidatorRejectsCalendarObject(t *testing.T) {
 }
 
 func validCalendarObject(uid string) string {
-	return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	return buildCalendarObject(buildVEvent(uid,
+		"DTSTART:20260101T120000Z", "DTEND:20260101T130000Z", "SUMMARY:Test"))
 }

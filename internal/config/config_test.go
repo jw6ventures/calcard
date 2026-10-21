@@ -1,9 +1,11 @@
 package config
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
@@ -29,6 +31,382 @@ func TestLoadUsesExplicitDSNAndParsesFlags(t *testing.T) {
 	want := []string{"10.0.0.0/8", "127.0.0.1/32", "2001:db8::1/128"}
 	if !reflect.DeepEqual(cfg.TrustedProxies, want) {
 		t.Fatalf("TrustedProxies = %#v, want %#v", cfg.TrustedProxies, want)
+	}
+	if cfg.DB.MaxOpenConns != 25 {
+		t.Fatalf("DB.MaxOpenConns = %d, want 25", cfg.DB.MaxOpenConns)
+	}
+	if cfg.DB.MaxIdleConns != 10 {
+		t.Fatalf("DB.MaxIdleConns = %d, want 10", cfg.DB.MaxIdleConns)
+	}
+	if cfg.DB.ConnMaxLifetime != 30*time.Minute {
+		t.Fatalf("DB.ConnMaxLifetime = %s, want 30m", cfg.DB.ConnMaxLifetime)
+	}
+	if cfg.HTTP.ReadTimeout != 15*time.Second {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 15s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 15*time.Second {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 15s", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 60*time.Second {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 60s", cfg.HTTP.IdleTimeout)
+	}
+	if !cfg.DAV.PropfindInfinityEnabled {
+		t.Fatal("expected DAV.PropfindInfinityEnabled to default to true")
+	}
+	if cfg.DAV.DigestEnabled {
+		t.Fatal("expected DAV.DigestEnabled to default to false")
+	}
+	if cfg.DAV.InsecureBasicEnabled {
+		t.Fatal("expected DAV.InsecureBasicEnabled to default to false")
+	}
+	if cfg.DAV.MaxMultistatusResponses != 10000 {
+		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 10000", cfg.DAV.MaxMultistatusResponses)
+	}
+	if cfg.DAV.MaxMultistatusBytes != 67108864 {
+		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 67108864", cfg.DAV.MaxMultistatusBytes)
+	}
+	if cfg.DAV.MaxFilterElements != 100 {
+		t.Fatalf("DAV.MaxFilterElements = %d, want 100", cfg.DAV.MaxFilterElements)
+	}
+	if cfg.DAV.MaxCardDAVQueryBytes != 65536 || cfg.DAV.MaxAddressDataProperties != 100 {
+		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
+	}
+	if cfg.DAV.MaxRequestedProperties != 1000 {
+		t.Fatalf("DAV.MaxRequestedProperties = %d, want 1000", cfg.DAV.MaxRequestedProperties)
+	}
+	if cfg.DAV.MaxReportElementDepth != 20 {
+		t.Fatalf("DAV.MaxReportElementDepth = %d, want 20", cfg.DAV.MaxReportElementDepth)
+	}
+	if cfg.DAV.MaxMultigetHrefs != 5000 {
+		t.Fatalf("DAV.MaxMultigetHrefs = %d, want 5000", cfg.DAV.MaxMultigetHrefs)
+	}
+	if cfg.DAV.MaxReportCandidateRows != 50000 {
+		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 50000", cfg.DAV.MaxReportCandidateRows)
+	}
+	if cfg.DAV.SyncHistoryRetention != 90*24*time.Hour {
+		t.Fatalf("DAV.SyncHistoryRetention = %s, want 90 days", cfg.DAV.SyncHistoryRetention)
+	}
+	if cfg.DAV.ReportTimeout != 10*time.Second {
+		t.Fatalf("DAV.ReportTimeout = %s, want 10s", cfg.DAV.ReportTimeout)
+	}
+	if cfg.DAV.ReportTimeout >= cfg.HTTP.WriteTimeout {
+		t.Fatalf("DAV.ReportTimeout = %s, want less than the %s write timeout so the answer can be written", cfg.DAV.ReportTimeout, cfg.HTTP.WriteTimeout)
+	}
+	if cfg.TrafficCaptureFile != "" {
+		t.Fatalf("TrafficCaptureFile = %q, want disabled by default", cfg.TrafficCaptureFile)
+	}
+}
+
+func TestLoadEnablesTrafficCaptureWhenFileIsConfigured(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_TRAFFIC_CAPTURE_FILE", "/tmp/calcard-traffic.jsonl")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TrafficCaptureFile != "/tmp/calcard-traffic.jsonl" {
+		t.Fatalf("TrafficCaptureFile = %q", cfg.TrafficCaptureFile)
+	}
+}
+
+func TestLoadParsesDAVMultistatusLimits(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_MAX_MULTISTATUS_RESPONSES", "321")
+	t.Setenv("APP_DAV_MAX_MULTISTATUS_BYTES", "654321")
+	t.Setenv("APP_DAV_MAX_FILTER_ELEMENTS", "17")
+	t.Setenv("APP_DAV_MAX_CARDDAV_QUERY_BYTES", "4096")
+	t.Setenv("APP_DAV_MAX_ADDRESS_DATA_PROPERTIES", "12")
+	t.Setenv("APP_DAV_MAX_REQUESTED_PROPERTIES", "64")
+	t.Setenv("APP_DAV_MAX_REPORT_ELEMENT_DEPTH", "7")
+	t.Setenv("APP_DAV_MAX_MULTIGET_HREFS", "42")
+	t.Setenv("APP_DAV_MAX_REPORT_CANDIDATE_ROWS", "9876")
+	t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", "36h")
+	t.Setenv("APP_DAV_REPORT_TIMEOUT", "2500ms")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DAV.MaxMultistatusResponses != 321 {
+		t.Fatalf("DAV.MaxMultistatusResponses = %d, want 321", cfg.DAV.MaxMultistatusResponses)
+	}
+	if cfg.DAV.MaxMultistatusBytes != 654321 {
+		t.Fatalf("DAV.MaxMultistatusBytes = %d, want 654321", cfg.DAV.MaxMultistatusBytes)
+	}
+	if cfg.DAV.MaxFilterElements != 17 {
+		t.Fatalf("DAV.MaxFilterElements = %d, want 17", cfg.DAV.MaxFilterElements)
+	}
+	if cfg.DAV.MaxCardDAVQueryBytes != 4096 || cfg.DAV.MaxAddressDataProperties != 12 {
+		t.Fatalf("CardDAV query limits = %d bytes, %d selectors", cfg.DAV.MaxCardDAVQueryBytes, cfg.DAV.MaxAddressDataProperties)
+	}
+	if cfg.DAV.MaxRequestedProperties != 64 {
+		t.Fatalf("DAV.MaxRequestedProperties = %d, want 64", cfg.DAV.MaxRequestedProperties)
+	}
+	if cfg.DAV.MaxReportElementDepth != 7 {
+		t.Fatalf("DAV.MaxReportElementDepth = %d, want 7", cfg.DAV.MaxReportElementDepth)
+	}
+	if cfg.DAV.MaxMultigetHrefs != 42 {
+		t.Fatalf("DAV.MaxMultigetHrefs = %d, want 42", cfg.DAV.MaxMultigetHrefs)
+	}
+	if cfg.DAV.MaxReportCandidateRows != 9876 {
+		t.Fatalf("DAV.MaxReportCandidateRows = %d, want 9876", cfg.DAV.MaxReportCandidateRows)
+	}
+	if cfg.DAV.SyncHistoryRetention != 36*time.Hour {
+		t.Fatalf("DAV.SyncHistoryRetention = %s, want 36h", cfg.DAV.SyncHistoryRetention)
+	}
+	if cfg.DAV.ReportTimeout != 2500*time.Millisecond {
+		t.Fatalf("DAV.ReportTimeout = %s, want 2.5s", cfg.DAV.ReportTimeout)
+	}
+}
+
+// davLimitKeys is every DAV resource limit, which share one loader and one
+// meaning for 0.
+var davLimitKeys = []string{
+	"APP_DAV_MAX_MULTISTATUS_RESPONSES",
+	"APP_DAV_MAX_MULTISTATUS_BYTES",
+	"APP_DAV_MAX_FILTER_ELEMENTS",
+	"APP_DAV_MAX_CARDDAV_QUERY_BYTES",
+	"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES",
+	"APP_DAV_MAX_REQUESTED_PROPERTIES",
+	"APP_DAV_MAX_REPORT_ELEMENT_DEPTH",
+	"APP_DAV_MAX_MULTIGET_HREFS",
+	"APP_DAV_MAX_REPORT_CANDIDATE_ROWS",
+}
+
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+}
+
+func TestLoadRejectsNegativeAndNonNumericDAVLimits(t *testing.T) {
+	for _, key := range davLimitKeys {
+		for _, value := range []string{"-1", "invalid"} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				setRequiredEnv(t)
+				t.Setenv(key, value)
+
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), key+" must be a non-negative integer") {
+					t.Fatalf("Load() error = %v, want non-negative validation for %s=%q", err, key, value)
+				}
+			})
+		}
+	}
+}
+
+// A limit set to 0 turns that limit off. It is loaded as math.MaxInt so the
+// comparisons downstream need no separate "is it set" test, and so an operator
+// who disables one knob does not silently get the default back.
+func TestLoadTreatsZeroDAVLimitAsUnlimited(t *testing.T) {
+	read := map[string]func(*Config) int{
+		"APP_DAV_MAX_MULTISTATUS_RESPONSES":   func(c *Config) int { return c.DAV.MaxMultistatusResponses },
+		"APP_DAV_MAX_MULTISTATUS_BYTES":       func(c *Config) int { return c.DAV.MaxMultistatusBytes },
+		"APP_DAV_MAX_FILTER_ELEMENTS":         func(c *Config) int { return c.DAV.MaxFilterElements },
+		"APP_DAV_MAX_CARDDAV_QUERY_BYTES":     func(c *Config) int { return c.DAV.MaxCardDAVQueryBytes },
+		"APP_DAV_MAX_ADDRESS_DATA_PROPERTIES": func(c *Config) int { return c.DAV.MaxAddressDataProperties },
+		"APP_DAV_MAX_REQUESTED_PROPERTIES":    func(c *Config) int { return c.DAV.MaxRequestedProperties },
+		"APP_DAV_MAX_REPORT_ELEMENT_DEPTH":    func(c *Config) int { return c.DAV.MaxReportElementDepth },
+		"APP_DAV_MAX_MULTIGET_HREFS":          func(c *Config) int { return c.DAV.MaxMultigetHrefs },
+		"APP_DAV_MAX_REPORT_CANDIDATE_ROWS":   func(c *Config) int { return c.DAV.MaxReportCandidateRows },
+	}
+	for _, key := range davLimitKeys {
+		t.Run(key, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(key, "0")
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want 0 accepted as unlimited", err)
+			}
+			if got := read[key](cfg); got != math.MaxInt {
+				t.Fatalf("%s = %d, want math.MaxInt", key, got)
+			}
+		})
+	}
+}
+
+// The sync-history retention window turns off at 0, on the same terms every
+// DAV resource limit does: an operator who does not want tombstones pruned must
+// not silently get the default window, because pruning is what makes a sync
+// token past the window unanswerable.
+func TestLoadTreatsZeroSyncHistoryRetentionAsOff(t *testing.T) {
+	for _, value := range []string{"0", "0s"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", value)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want 0 accepted as retention off", err)
+			}
+			if cfg.DAV.SyncHistoryRetention != 0 {
+				t.Fatalf("DAV.SyncHistoryRetention = %s, want 0", cfg.DAV.SyncHistoryRetention)
+			}
+		})
+	}
+}
+
+// A negative window would prune tombstones the server still owes a client, and a
+// value the duration parser cannot read must not fall back to the default.
+func TestLoadRejectsNegativeAndNonDurationSyncHistoryRetention(t *testing.T) {
+	for _, value := range []string{"-1h", "invalid", "90"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_SYNC_HISTORY_RETENTION", value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "APP_DAV_SYNC_HISTORY_RETENTION must be a non-negative duration") {
+				t.Fatalf("Load() error = %v, want non-negative validation for %q", err, value)
+			}
+		})
+	}
+}
+
+// The REPORT deadline turns off at 0, as every other DAV limit does, and a
+// negative or unreadable value is refused rather than replaced by the default.
+func TestLoadReportTimeoutZeroTurnsItOffAndBadValuesAreRefused(t *testing.T) {
+	for _, value := range []string{"0", "0s"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_REPORT_TIMEOUT", value)
+			cfg, err := Load()
+			if err != nil || cfg.DAV.ReportTimeout != 0 {
+				t.Fatalf("Load() = %v, %v; want the deadline off", cfg, err)
+			}
+		})
+	}
+	for _, value := range []string{"-1s", "invalid", "10"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("APP_DAV_REPORT_TIMEOUT", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "APP_DAV_REPORT_TIMEOUT must be a non-negative duration") {
+				t.Fatalf("Load() error = %v, want validation for %q", err, value)
+			}
+		})
+	}
+}
+
+func TestLoadDisablesPropfindInfinity(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_PROPFIND_INFINITY_ENABLED", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DAV.PropfindInfinityEnabled {
+		t.Fatal("expected APP_DAV_PROPFIND_INFINITY_ENABLED=false to disable Depth: infinity PROPFIND")
+	}
+}
+
+// App passwords issued before Digest existed carry no HA1, so advertising
+// Digest to a client that would then select it is what an upgrade must not do
+// on its own. The scheme is therefore opt-in rather than defaulted on.
+func TestLoadEnablesDAVDigestOnlyWhenOptedIn(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DAV_DIGEST_ENABLED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.DAV.DigestEnabled {
+		t.Fatal("expected APP_DAV_DIGEST_ENABLED=true to enable DAV Digest")
+	}
+}
+
+// RFC 4791 Section 11 forbids Basic without TLS, so accepting it over plain
+// HTTP is an operator's explicit choice and never a default.
+func TestLoadEnablesInsecureBasicOnlyWhenOptedIn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "unset", want: false},
+		{name: "true", value: "true", set: true, want: true},
+		{name: "1", value: "1", set: true, want: true},
+		{name: "false", value: "false", set: true, want: false},
+		{name: "unrecognised value", value: "maybe", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("APP_DB_DSN", "postgres://dsn")
+			t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+			t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+			t.Setenv("APP_OAUTH_DISCOVERY_URL", "https://issuer.example/.well-known/openid-configuration")
+			t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+			if tc.set {
+				t.Setenv("APP_DAV_INSECURE_BASIC_ENABLED", tc.value)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.DAV.InsecureBasicEnabled != tc.want {
+				t.Fatalf("DAV.InsecureBasicEnabled = %v, want %v", cfg.DAV.InsecureBasicEnabled, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadParsesPoolAndHTTPTimeoutConfig(t *testing.T) {
+	t.Setenv("APP_DB_DSN", "postgres://dsn")
+	t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+	t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+	t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("APP_DB_MAX_OPEN_CONNS", "50")
+	t.Setenv("APP_DB_MAX_IDLE_CONNS", "20")
+	t.Setenv("APP_DB_CONN_MAX_LIFETIME", "45m")
+	t.Setenv("APP_HTTP_READ_TIMEOUT", "30s")
+	t.Setenv("APP_HTTP_WRITE_TIMEOUT", "60s")
+	t.Setenv("APP_HTTP_IDLE_TIMEOUT", "2m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.DB.MaxOpenConns != 50 {
+		t.Fatalf("DB.MaxOpenConns = %d, want 50", cfg.DB.MaxOpenConns)
+	}
+	if cfg.DB.MaxIdleConns != 20 {
+		t.Fatalf("DB.MaxIdleConns = %d, want 20", cfg.DB.MaxIdleConns)
+	}
+	if cfg.DB.ConnMaxLifetime != 45*time.Minute {
+		t.Fatalf("DB.ConnMaxLifetime = %s, want 45m", cfg.DB.ConnMaxLifetime)
+	}
+	if cfg.HTTP.ReadTimeout != 30*time.Second {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 30s", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 60*time.Second {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 60s", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 2*time.Minute {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 2m", cfg.HTTP.IdleTimeout)
 	}
 }
 
@@ -142,6 +520,8 @@ func TestLoadReturnsUsefulValidationErrors(t *testing.T) {
 				"APP_OAUTH_CLIENT_ID", "APP_OAUTH_CLIENT_SECRET", "APP_OAUTH_ISSUER_URL",
 				"APP_OAUTH_DISCOVERY_URL", "APP_OAUTH_REDIRECT_PATH", "APP_SESSION_SECRET",
 				"APP_PROMETHEUS_ENDPOINT_ENABLED", "APP_TRUSTED_PROXIES",
+				"APP_DB_MAX_OPEN_CONNS", "APP_DB_MAX_IDLE_CONNS", "APP_DB_CONN_MAX_LIFETIME",
+				"APP_HTTP_READ_TIMEOUT", "APP_HTTP_WRITE_TIMEOUT", "APP_HTTP_IDLE_TIMEOUT",
 			} {
 				t.Setenv(key, "")
 			}
@@ -177,5 +557,60 @@ func TestGetenvHelpers(t *testing.T) {
 	}
 	if got := getenvList("MISSING_LIST"); got != nil {
 		t.Fatalf("getenvList() = %#v, want nil", got)
+	}
+}
+
+// The auth service sends the identity provider to APP_BASE_URL plus this path
+// and the router serves the callback there, so the value has to be a plain
+// absolute path that no route the application already serves claims.
+func TestLoadValidatesOAuthRedirectPath(t *testing.T) {
+	setRequired := func(t *testing.T, redirectPath string) {
+		t.Helper()
+		t.Setenv("APP_DB_DSN", "postgres://dsn")
+		t.Setenv("APP_OAUTH_CLIENT_ID", "client")
+		t.Setenv("APP_OAUTH_CLIENT_SECRET", "secret")
+		t.Setenv("APP_OAUTH_ISSUER_URL", "https://issuer.example")
+		t.Setenv("APP_SESSION_SECRET", strings.Repeat("s", 32))
+		t.Setenv("APP_TRUSTED_PROXIES", "")
+		t.Setenv("APP_OAUTH_REDIRECT_PATH", redirectPath)
+	}
+
+	for _, tc := range []struct{ value, want string }{
+		{"", "/auth/callback"},
+		{"/auth/callback", "/auth/callback"},
+		{"/oidc/return", "/oidc/return"},
+		{"/sso-callback", "/sso-callback"},
+		{"/calendars-sso", "/calendars-sso"},
+	} {
+		t.Run("accepts "+tc.value, func(t *testing.T) {
+			setRequired(t, tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.OAuth.RedirectPath != tc.want {
+				t.Fatalf("OAuth.RedirectPath = %q, want %q", cfg.OAuth.RedirectPath, tc.want)
+			}
+		})
+	}
+
+	for _, value := range []string{
+		// Not a plain absolute path.
+		"auth/callback", "https://idp.example/cb", "//idp.example/cb",
+		"/cb?x=1", "/cb#frag", "/cb/{id}", "/cb/*", "/cb/../auth/login", "/cb/./x", "/cb//x", "/cb with space",
+		// Collides with a route the application serves.
+		"/", "/auth", "/auth/login", "/auth/logout", "/auth/oidc",
+		"/dav", "/dav/cb", "/api/cb", "/healthz", "/readyz", "/metrics",
+		"/.well-known/caldav", "/.well-known/openid", "/principals/cb", "/calendar/cb",
+		"/calendars", "/calendars/cb", "/addressbooks", "/app-passwords", "/sessions",
+		"/birthdays", "/help", "/onboarding/cb",
+	} {
+		t.Run("refuses "+value, func(t *testing.T) {
+			setRequired(t, value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "APP_OAUTH_REDIRECT_PATH") {
+				t.Fatalf("Load() error = %v, want an APP_OAUTH_REDIRECT_PATH error", err)
+			}
+		})
 	}
 }

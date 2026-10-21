@@ -1,10 +1,15 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +17,48 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/lib/pq"
 )
+
+// expectDAVPathLocks asserts the single batched advisory-lock statement a DAV
+// transaction issues. want is the complete lock set spelled out by the test:
+// every path the statement must lock, mapped to whether it must be exclusive.
+// The statement has to take them in ascending lock-key order.
+func expectDAVPathLocks(mock sqlmock.Sqlmock, want map[string]bool) {
+	type lock struct {
+		key       int64
+		exclusive bool
+	}
+	locks := make([]lock, 0, len(want))
+	for lockPath, exclusive := range want {
+		locks = append(locks, lock{key: davPathLockKey(lockPath), exclusive: exclusive})
+	}
+	slices.SortFunc(locks, func(a, b lock) int { return cmp.Compare(a.key, b.key) })
+	keys := make([]int64, len(locks))
+	modes := make([]bool, len(locks))
+	for i, l := range locks {
+		keys[i] = l.key
+		modes[i] = l.exclusive
+	}
+	mock.ExpectExec(regexp.QuoteMeta(davPathLockQuery)).
+		WithArgs(pq.Array(keys), pq.Array(modes)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectSourceEventRow expects the locked read of the event the transaction
+// is to write, as it was stored.
+func expectSourceEventRow(mock sqlmock.Sqlmock, calendarID int64, uid, resourceName, raw, etag string) {
+	columns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+	mock.ExpectQuery(`SELECT .* FROM events WHERE calendar_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(calendarID, resourceName).
+		WillReturnRows(sqlmock.NewRows(columns).AddRow(int64(10), calendarID, uid, resourceName, raw, etag, nil, nil, nil, nil, nil, false, time.Now()))
+}
+
+// expectCollectionRowLock asserts the row lock a member write takes on its
+// collection before writing any member.
+func expectCollectionRowLock(mock sqlmock.Sqlmock, table string, id int64) {
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT 1 FROM ` + table + ` WHERE id=$1 FOR NO KEY UPDATE`)).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"present"}).AddRow(1))
+}
 
 func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -26,10 +73,10 @@ func TestCalendarRepoCreateAndOwnerScopedMutations(t *testing.T) {
 	timezone := "America/Chicago"
 	color := "#00aa00"
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO calendars (user_id, name, slug, description, timezone, color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at`)).
-		WithArgs(int64(4), "Primary", nil, &description, &timezone, &color).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at"}).
-			AddRow(int64(10), int64(4), "Primary", nil, description, timezone, color, int64(3), now, now))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO calendars (user_id, name, slug, description, description_lang, timezone, color, supported_components) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, user_id, name, slug, description, description_lang, timezone, color, supported_components, ctag, created_at, updated_at`)).
+		WithArgs(int64(4), "Primary", nil, &description, nil, &timezone, &color, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at"}).
+			AddRow(int64(10), int64(4), "Primary", nil, description, nil, timezone, color, nil, int64(3), now, now))
 
 	created, err := repo.Create(context.Background(), Calendar{
 		UserID:      4,
@@ -98,7 +145,7 @@ func TestCalendarRepoAccessQueriesReturnNilWhenMissing(t *testing.T) {
 
 	repo := &calendarRepo{pool: db}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, name, slug, description, timezone, color, ctag, created_at, updated_at FROM calendars WHERE id=$1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, name, slug, description, description_lang, timezone, color, supported_components, ctag, created_at, updated_at FROM calendars WHERE id=$1`)).
 		WithArgs(int64(404)).
 		WillReturnError(sql.ErrNoRows)
 	got, err := repo.GetByID(context.Background(), 404)
@@ -110,7 +157,7 @@ func TestCalendarRepoAccessQueriesReturnNilWhenMissing(t *testing.T) {
 	}
 
 	mock.ExpectQuery(`(?s)`+
-		regexp.QuoteMeta(`SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,`)+
+		regexp.QuoteMeta(`SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,`)+
 		`.*acl_entries.*`+
 		regexp.QuoteMeta(`FROM calendars c`)+
 		`.*`+
@@ -140,11 +187,11 @@ func TestCalendarAccessibleReposUseACLs(t *testing.T) {
 	calendarRepo := &calendarRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*acl_entries.*ORDER BY shared, name`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*acl_entries.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(1), int64(4), "Owned", nil, nil, nil, nil, int64(1), now, now, "owner@example.com", false, true, true, true, true, true, true, true).
-			AddRow(int64(2), int64(9), "Shared", "shared", "Desc", "UTC", "#123456", int64(3), now, now, "other@example.com", true, true, false, false, false, false, true, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(1), int64(4), "Owned", nil, nil, nil, nil, nil, nil, int64(1), now, now, "owner@example.com", false, true, true, true, true, true, true, true).
+			AddRow(int64(2), int64(9), "Shared", "shared", "Desc", nil, "UTC", "#123456", nil, int64(3), now, now, "other@example.com", true, true, false, false, false, false, true, false))
 
 	accessible, err := calendarRepo.ListAccessible(context.Background(), 4)
 	if err != nil {
@@ -168,6 +215,22 @@ func TestCalendarAccessibleReposUseACLs(t *testing.T) {
 	}
 }
 
+func TestACLAccessSQLUsesFirstMatchingACEOrder(t *testing.T) {
+	for name, expression := range map[string]string{
+		"calendar": calendarACLBooleanExpr("$1", "read", "all"),
+		"object":   calendarEventACLAllowsExpr("$1", "read", "all"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(expression, "ORDER BY a.ace_order, a.id") || !strings.Contains(expression, "LIMIT 1") {
+				t.Fatalf("ACL SQL does not evaluate the first matching ACE in stored order: %s", expression)
+			}
+			if strings.Contains(expression, "NOT EXISTS") {
+				t.Fatalf("ACL SQL still gives unordered denies global precedence: %s", expression)
+			}
+		})
+	}
+}
+
 func TestCalendarAccessibleReposIncludeReadFreeBusyOnlyCalendars(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -178,10 +241,10 @@ func TestCalendarAccessibleReposIncludeReadFreeBusyOnlyCalendars(t *testing.T) {
 	repo := &calendarRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*read-free-busy.*ORDER BY shared, name`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*read-free-busy.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
 
 	accessible, err := repo.ListAccessible(context.Background(), 4)
 	if err != nil {
@@ -200,10 +263,10 @@ func TestCalendarAccessibleReposIncludeReadFreeBusyOnlyCalendars(t *testing.T) {
 		t.Fatalf("ListAccessible() editor = true, want false")
 	}
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*read-free-busy.*`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*read-free-busy.*`).
 		WithArgs(int64(7), int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(7), int64(9), "Busy Only", nil, nil, nil, nil, nil, nil, int64(5), now, now, "owner@example.com", true, false, true, false, false, false, false, false))
 
 	got, err := repo.GetAccessible(context.Background(), 7, 4)
 	if err != nil {
@@ -234,10 +297,10 @@ func TestCalendarAccessibleReposIncludeBindOnlyCalendars(t *testing.T) {
 	repo := &calendarRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*bind.*ORDER BY shared, name`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.user_id = \$1.*bind.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
 
 	accessible, err := repo.ListAccessible(context.Background(), 4)
 	if err != nil {
@@ -256,10 +319,10 @@ func TestCalendarAccessibleReposIncludeBindOnlyCalendars(t *testing.T) {
 		t.Fatalf("ListAccessible() editor = true, want false")
 	}
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*bind.*`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*bind.*`).
 		WithArgs(int64(8), int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(8), int64(9), "Inbox", nil, nil, nil, nil, nil, nil, int64(6), now, now, "owner@example.com", true, false, false, false, false, false, true, false))
 
 	got, err := repo.GetAccessible(context.Background(), 8, 4)
 	if err != nil {
@@ -290,10 +353,10 @@ func TestCalendarAccessibleReposIncludeObjectGrantedCalendars(t *testing.T) {
 	repo := &calendarRepo{pool: db}
 	now := time.Now().UTC()
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*events e.*resource_path IN.*ORDER BY shared, name`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*JOIN events e.*e.object_acl_path = g0.resource_path\b.*ORDER BY shared, name`).
 		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
 
 	accessible, err := repo.ListAccessible(context.Background(), 4)
 	if err != nil {
@@ -306,10 +369,10 @@ func TestCalendarAccessibleReposIncludeObjectGrantedCalendars(t *testing.T) {
 		t.Fatalf("ListAccessible() privileges = %#v, want no collection privileges for object-only grant", accessible[0].Privileges)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.timezone, c.color, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*events e.*resource_path IN`).
+	mock.ExpectQuery(`(?s)SELECT c.id, c.user_id, c.name, c.slug, c.description, c.description_lang, c.timezone, c.color, c.supported_components, c.ctag, c.created_at, c.updated_at,.*FROM calendars c.*WHERE c.id = \$1.*JOIN events e.*e.object_acl_path = g0.resource_path\b`).
 		WithArgs(int64(12), int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "timezone", "color", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
-			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at", "owner_email", "shared", "can_read", "can_read_free_busy", "can_write", "can_write_content", "can_write_properties", "can_bind", "can_unbind"}).
+			AddRow(int64(12), int64(9), "Object Shared", nil, nil, nil, nil, nil, nil, int64(7), now, now, "owner@example.com", true, false, false, false, false, false, false, false))
 
 	got, err := repo.GetAccessible(context.Background(), 12, 4)
 	if err != nil {
@@ -340,9 +403,17 @@ func TestEventRepoUpsertParsesFieldsAndPagination(t *testing.T) {
 	dtend := time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC)
 
 	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test-uid\r\nSUMMARY:Planning Day\r\nDTSTART;VALUE=DATE:20260412\r\nDTEND;VALUE=DATE:20260413\r\nEND:VEVENT\r\nEND:VCALENDAR"
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 7)
+	expectCreatedEventStateCleared(mock, 7, "test-uid", "test-uid", false)
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 ON CONFLICT (calendar_id, uid) DO UPDATE SET
         resource_name = EXCLUDED.resource_name,
         raw_ical = EXCLUDED.raw_ical,
@@ -353,12 +424,15 @@ ON CONFLICT (calendar_id, uid) DO UPDATE SET
         dtstart = EXCLUDED.dtstart,
         dtend = EXCLUDED.dtend,
         all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
         last_modified = NOW()
 RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
 `)).
-		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true).
+		WithArgs(int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(1), int64(7), "test-uid", "test-uid", rawICAL, "etag-1", "Planning Day", nil, nil, dtstart, dtend, true, now))
+	mock.ExpectCommit()
 
 	created, err := repo.Upsert(context.Background(), Event{
 		CalendarID: 7,
@@ -423,6 +497,12 @@ func TestEventRepoMoveToCalendarRenameWithinSameCalendarCreatesTombstone(t *test
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -456,6 +536,12 @@ func TestEventRepoMoveToCalendarOverwriteWithinSameCalendarDeletesDestination(t 
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -489,6 +575,14 @@ func TestEventRepoMoveToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *te
 	repo := &eventRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/5": true,
+		"/dav/calendars/9": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 5)
+	expectCollectionRowLock(mock, "calendars", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "event-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("source-name"))
@@ -500,36 +594,6 @@ func TestEventRepoMoveToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *te
 	err = repo.MoveToCalendar(context.Background(), 5, 9, "event-1", "new-dest-name")
 	if err != ErrConflict {
 		t.Fatalf("MoveToCalendar() error = %v, want ErrConflict", err)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
-func TestEventRepoCopyToCalendarRejectsDestinationUIDRebindAcrossCalendars(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New() error = %v", err)
-	}
-	defer db.Close()
-
-	repo := &eventRepo{pool: db}
-	now := time.Now().UTC()
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND uid=$2`)).
-		WithArgs(int64(5), "event-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(1), int64(5), "event-1", "source-name", "BEGIN:VCALENDAR", "etag-src", nil, nil, nil, nil, nil, false, now))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
-		WithArgs(int64(9), "event-1").
-		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-dest-name"))
-	mock.ExpectRollback()
-
-	_, err = repo.CopyToCalendar(context.Background(), 5, 9, "event-1", "new-dest-name", "etag-new")
-	if err != ErrConflict {
-		t.Fatalf("CopyToCalendar() error = %v, want ErrConflict", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -611,17 +675,48 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("GetByResourceName() = %#v, want nil", resource)
 	}
 
-	since := now.Add(-time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
-		WithArgs(int64(7), since).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
-			AddRow(int64(2), int64(7), "uid-2", "uid-2.ics", "BEGIN:VCALENDAR", "etag-2", "Recent", nil, nil, nil, nil, true, now))
-	modified, err := eventRepo.ListModifiedSince(context.Background(), 7, since)
+	// The unfiltered calendar page is the read idx_events_calendar_keyset
+	// exists for, and it is the one statement assembled through a builder
+	// rather than written as a literal -- so the assembled text is what has to
+	// be pinned. A leading column or an ORDER BY that stopped matching the
+	// index would drop the read back onto the primary key while staying
+	// correct, which no result assertion can see.
+	eventColumnNames := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) ORDER BY calendar_id ASC, id ASC LIMIT $3`)).
+		WithArgs(int64(7), int64(4), 256).
+		WillReturnRows(sqlmock.NewRows(eventColumnNames).
+			AddRow(int64(5), int64(7), "uid-5", "uid-5.ics", "BEGIN:VCALENDAR", "etag-5", "Paged", nil, nil, nil, nil, true, now))
+	page, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 256, EventFilter{})
 	if err != nil {
-		t.Fatalf("ListModifiedSince() error = %v", err)
+		t.Fatalf("ListForCalendarPageAfter() error = %v", err)
 	}
-	if len(modified) != 1 || !modified[0].AllDay {
-		t.Fatalf("ListModifiedSince() = %#v", modified)
+	if len(page) != 1 || page[0].ID != 5 {
+		t.Fatalf("ListForCalendarPageAfter() = %#v", page)
+	}
+
+	// A time-range narrows the same page. The filter is appended between the
+	// keyset predicate and the ORDER BY, so this pins that the range does not
+	// displace either of them.
+	rangeStart := now.Add(-24 * time.Hour)
+	rangeEnd := now.Add(24 * time.Hour)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified FROM events WHERE calendar_id=$1 AND (calendar_id, id) > ($1, $2) AND COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= $3 AND COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= $4 ORDER BY calendar_id ASC, id ASC LIMIT $5`)).
+		WithArgs(int64(7), int64(4), rangeStart.UTC(), rangeEnd.UTC(), 256).
+		WillReturnRows(sqlmock.NewRows(eventColumnNames).
+			AddRow(int64(6), int64(7), "uid-6", "uid-6.ics", "BEGIN:VCALENDAR", "etag-6", "In range", nil, nil, nil, nil, true, now))
+	filtered, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 256, EventFilter{Start: &rangeStart, End: &rangeEnd})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter(filtered) error = %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != 6 {
+		t.Fatalf("ListForCalendarPageAfter(filtered) = %#v", filtered)
+	}
+
+	emptyPage, err := eventRepo.ListForCalendarPageAfter(context.Background(), 7, 4, 0, EventFilter{})
+	if err != nil {
+		t.Fatalf("ListForCalendarPageAfter(limit 0) error = %v", err)
+	}
+	if len(emptyPage) != 0 {
+		t.Fatalf("ListForCalendarPageAfter(limit 0) = %#v", emptyPage)
 	}
 
 	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*FROM events e.*acl_entries.*ORDER BY e.last_modified DESC.*LIMIT \$2`).
@@ -636,7 +731,7 @@ func TestEventAndAddressBookListQueries(t *testing.T) {
 		t.Fatalf("ListRecentByUser() = %#v", recent)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*resource_path IN.*e.resource_name.*LIMIT \$2`).
+	mock.ExpectQuery(`(?s)SELECT e.id, e.calendar_id, e.uid, e.resource_name, e.raw_ical, e.etag, e.summary, e.description, e.location, e.dtstart, e.dtend, e.all_day, e.last_modified.*a.resource_path = e.object_acl_path.*LIMIT \$2`).
 		WithArgs(int64(4), 2).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}).
 			AddRow(int64(6), int64(8), "uid-object", "uid-object", "BEGIN:VCALENDAR", "etag-6", "Direct Grant", nil, nil, nil, nil, false, now))
@@ -684,6 +779,13 @@ func TestContactRepoUpsertAndMoveToAddressBook(t *testing.T) {
 	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nEMAIL:jane@example.com\r\nBDAY:1990-05-15\r\nEND:VCARD"
 
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -700,6 +802,7 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 		WithArgs(int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
 			AddRow(int64(1), int64(5), "contact-1", "contact-1", rawVCard, "etag-1", "Jane Doe", "jane@example.com", birthday, now))
+	mock.ExpectCommit()
 
 	created, err := repo.Upsert(context.Background(), Contact{
 		AddressBookID: 5,
@@ -715,9 +818,20 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("contact-1"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "contact-1").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
 		WithArgs(int64(9), "contact-1-copy", "contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -740,6 +854,14 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "missing").
 		WillReturnError(sql.ErrNoRows)
@@ -771,6 +893,12 @@ func TestContactRepoMoveToAddressBookRenameWithinSameBookCreatesTombstone(t *tes
 	repo := &contactRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
@@ -804,6 +932,12 @@ func TestContactRepoMoveToAddressBookOverwriteWithinSameBookDeletesDestination(t
 	repo := &contactRepo{pool: db}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("old-name"))
@@ -827,6 +961,61 @@ func TestContactRepoMoveToAddressBookOverwriteWithinSameBookDeletesDestination(t
 	}
 }
 
+func TestEventRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &eventRepo{pool: db}
+	rawICAL := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-1\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR"
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectCollectionRowLock(mock, "calendars", 7)
+	expectCreatedEventStateCleared(mock, 7, "ev-1", "renamed", true)
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO events (calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, recurrence_start, recurrence_until, last_modified)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+ON CONFLICT (calendar_id, uid) DO UPDATE SET
+        resource_name = EXCLUDED.resource_name,
+        raw_ical = EXCLUDED.raw_ical,
+        etag = EXCLUDED.etag,
+        summary = EXCLUDED.summary,
+        description = EXCLUDED.description,
+        location = EXCLUDED.location,
+        dtstart = EXCLUDED.dtstart,
+        dtend = EXCLUDED.dtend,
+        all_day = EXCLUDED.all_day,
+        recurrence_start = EXCLUDED.recurrence_start,
+        recurrence_until = EXCLUDED.recurrence_until,
+        last_modified = NOW()
+RETURNING id, calendar_id, uid, resource_name, raw_ical, etag, summary, description, location, dtstart, dtend, all_day, last_modified
+`)).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "events_calendar_resource_name_unique"})
+	mock.ExpectRollback()
+
+	_, err = repo.Upsert(context.Background(), Event{
+		CalendarID:   7,
+		UID:          "ev-1",
+		ResourceName: "renamed",
+		RawICAL:      rawICAL,
+		ETag:         "etag-1",
+	})
+	if err != ErrConflict {
+		t.Fatalf("Upsert() error = %v, want ErrConflict", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestContactRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -837,6 +1026,13 @@ func TestContactRepoUpsertMapsResourceNameConflictsToErrConflict(t *testing.T) {
 	repo := &contactRepo{pool: db}
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
 
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO contacts (address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -852,6 +1048,7 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 `)).
 		WithArgs(int64(5), "contact-1", "renamed", rawVCard, "etag-1", "Jane Doe", nil, nil).
 		WillReturnError(&pq.Error{Code: "23505", Constraint: "idx_contacts_resource_name"})
+	mock.ExpectRollback()
 
 	_, err = repo.Upsert(context.Background(), Contact{
 		AddressBookID: 5,
@@ -881,6 +1078,14 @@ func TestContactRepoCopyToAddressBookRenameExistingUIDCreatesDestinationTombston
 	rawVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n"
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "contact-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
@@ -922,6 +1127,191 @@ RETURNING id, address_book_id, uid, resource_name, raw_vcard, etag, display_name
 	}
 }
 
+func TestStoreCreateCalendarAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(createCalendarQuery)).
+		WithArgs(int64(4), "Work", nil, nil, nil, nil, nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at"}).
+			AddRow(int64(12), int64(4), "Work", nil, nil, nil, nil, nil, nil, int64(1), now, now))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml)`)).
+		WithArgs("/dav/calendars/12", "urn:example:custom", "note", "keep").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`)).
+		WithArgs("/dav/calendars/12").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE locks SET resource_path=$1 WHERE resource_path=$2 AND expires_at > NOW()`)).
+		WithArgs("/dav/calendars/12", "/dav/calendars/work").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	created, err := st.CreateCalendarAndState(
+		context.Background(),
+		Calendar{UserID: 4, Name: "Work"},
+		[]DeadPropertyMutation{{NamespaceURI: "urn:example:custom", LocalName: "note", InnerXML: "keep"}},
+		nil,
+		"/dav/calendars/work",
+		func(id int64) string { return "/dav/calendars/" + strconv.FormatInt(id, 10) },
+	)
+	if err != nil {
+		t.Fatalf("CreateCalendarAndState() error = %v", err)
+	}
+	if created.ID != 12 {
+		t.Fatalf("CreateCalendarAndState() id = %d, want 12", created.ID)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreCreateCalendarAndStateRechecksLocksInsideTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	pendingPath := "/dav/calendars/.pending/4/work"
+	lookupPaths := []string{pendingPath, "/dav/calendars"}
+	preconditions := []LockPrecondition{{
+		ResourcePath: pendingPath,
+		LookupPaths:  lookupPaths,
+	}}
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                           false,
+		"/dav/calendars":                 false,
+		"/dav/calendars/.pending":        false,
+		"/dav/calendars/.pending/4":      true,
+		"/dav/calendars/.pending/4/work": true,
+	})
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`)).
+		WithArgs(pq.Array(lookupPaths)).
+		WillReturnRows(sqlmock.NewRows([]string{"token", "resource_path", "depth", "expires_at"}).
+			AddRow("opaquelocktoken:concurrent", pendingPath, "0", time.Now().Add(time.Hour)))
+	mock.ExpectRollback()
+
+	_, err = st.CreateCalendarAndState(
+		context.Background(),
+		Calendar{UserID: 4, Name: "Work"},
+		nil,
+		preconditions,
+		pendingPath,
+		func(id int64) string { return "/dav/calendars/" + strconv.FormatInt(id, 10) },
+	)
+	if !errors.Is(err, ErrLockConflict) {
+		t.Fatalf("CreateCalendarAndState() error = %v, want ErrLockConflict", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockPreconditionsSatisfied(t *testing.T) {
+	now := time.Now()
+	target := "/dav/calendars/.pending/4/work"
+	parent := "/dav/calendars"
+	precondition := LockPrecondition{
+		ResourcePath: target,
+		LookupPaths:  []string{target, parent},
+		Tokens:       []string{"opaquelocktoken:allowed"},
+	}
+
+	tests := []struct {
+		name  string
+		locks []Lock
+		want  bool
+	}{
+		{name: "no locks", want: true},
+		{
+			name:  "matching target token",
+			locks: []Lock{{Token: "opaquelocktoken:allowed", ResourcePath: target, Depth: "0", ExpiresAt: now.Add(time.Hour)}},
+			want:  true,
+		},
+		{
+			name:  "missing target token",
+			locks: []Lock{{Token: "opaquelocktoken:other", ResourcePath: target, Depth: "0", ExpiresAt: now.Add(time.Hour)}},
+			want:  false,
+		},
+		{
+			name:  "depth zero ancestor does not apply",
+			locks: []Lock{{Token: "opaquelocktoken:other", ResourcePath: parent, Depth: "0", ExpiresAt: now.Add(time.Hour)}},
+			want:  true,
+		},
+		{
+			name:  "depth infinity ancestor applies",
+			locks: []Lock{{Token: "opaquelocktoken:other", ResourcePath: parent, Depth: "infinity", ExpiresAt: now.Add(time.Hour)}},
+			want:  false,
+		},
+		{
+			name:  "expired lock does not apply",
+			locks: []Lock{{Token: "opaquelocktoken:other", ResourcePath: target, Depth: "0", ExpiresAt: now.Add(-time.Hour)}},
+			want:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := LockPreconditionsSatisfied([]LockPrecondition{precondition}, test.locks); got != test.want {
+				t.Fatalf("LockPreconditionsSatisfied() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// A MKCALENDAR that fails after its dead properties are written must not leave
+// them behind: dav_dead_properties is keyed by path with no foreign key to the
+// calendar, so only the transaction can retract them.
+func TestStoreCreateCalendarAndStateRollsBackDeadPropertiesWhenLockRebindFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(createCalendarQuery)).
+		WithArgs(int64(4), "Work", nil, nil, nil, nil, nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "name", "slug", "description", "description_lang", "timezone", "color", "supported_components", "ctag", "created_at", "updated_at"}).
+			AddRow(int64(12), int64(4), "Work", nil, nil, nil, nil, nil, nil, int64(1), now, now))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO dav_dead_properties (resource_path, namespace_uri, local_name, inner_xml)`)).
+		WithArgs("/dav/calendars/12", "urn:example:custom", "note", "keep").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1 AND expires_at > NOW()`)).
+		WithArgs("/dav/calendars/12").
+		WillReturnError(errors.New("lock rebind failed"))
+	mock.ExpectRollback()
+
+	_, err = st.CreateCalendarAndState(
+		context.Background(),
+		Calendar{UserID: 4, Name: "Work"},
+		[]DeadPropertyMutation{{NamespaceURI: "urn:example:custom", LocalName: "note", InnerXML: "keep"}},
+		nil,
+		"/dav/calendars/work",
+		func(id int64) string { return "/dav/calendars/" + strconv.FormatInt(id, 10) },
+	)
+	if err == nil {
+		t.Fatal("CreateCalendarAndState() error = nil, want error")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestStoreDeleteEventAndStateRunsInSingleTransaction(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -930,11 +1320,22 @@ func TestStoreDeleteEventAndStateRunsInSingleTransaction(t *testing.T) {
 	defer db.Close()
 
 	st := New(db)
+	now := time.Now().UTC()
+	eventColumns := []string{"id", "calendar_id", "uid", "resource_name", "raw_ical", "etag", "summary", "description", "location", "dtstart", "dtend", "all_day", "last_modified"}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND uid=$2`)).
-		WithArgs(int64(7), "event-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	expectDAVObjectIdentityLocks(mock, "calendar-object", 7, "renamed", "event-1")
+	expectCollectionRowLock(mock, "calendars", 7)
+	mock.ExpectQuery(`SELECT .* FROM events WHERE calendar_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(7), "renamed").
+		WillReturnRows(sqlmock.NewRows(eventColumns).AddRow(int64(10), int64(7), "event-1", "renamed", "raw", "etag", nil, nil, nil, nil, nil, false, now))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE id=$1`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
 		WithArgs("/dav/calendars/7/renamed").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -943,11 +1344,46 @@ func TestStoreDeleteEventAndStateRunsInSingleTransaction(t *testing.T) {
 		WillReturnError(errors.New("acl delete failed"))
 	mock.ExpectRollback()
 
-	err = st.DeleteEventAndState(context.Background(), 7, "event-1", "/dav/calendars/7/renamed")
+	err = st.DeleteEventAndState(context.Background(), 7, DAVResourceState{Exists: true, UID: "event-1", ResourceName: "renamed", ETag: "etag", RawData: "raw"}, "/dav/calendars/7/renamed", nil)
 	if err == nil {
 		t.Fatal("DeleteEventAndState() error = nil, want error")
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreDeleteEventAndStateRechecksLocksInsideTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	resourcePath := "/dav/calendars/7/event"
+	lookupPaths := []string{resourcePath, "/dav/calendars/7"}
+	preconditions := []LockPrecondition{{ResourcePath: resourcePath, LookupPaths: lookupPaths}}
+
+	mock.ExpectBegin()
+	// The member's own path lock is left out: the delete holds its calendar
+	// exclusively, which every write to the member also takes.
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/7": true,
+	})
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT token, resource_path, depth, expires_at FROM locks WHERE resource_path = ANY($1) AND expires_at > NOW() ORDER BY created_at`)).
+		WithArgs(pq.Array(lookupPaths)).
+		WillReturnRows(sqlmock.NewRows([]string{"token", "resource_path", "depth", "expires_at"}).
+			AddRow("opaquelocktoken:concurrent", resourcePath, "0", time.Now().Add(time.Hour)))
+	mock.ExpectRollback()
+
+	err = st.DeleteEventAndState(context.Background(), 7, DAVResourceState{Exists: true, UID: "event", ResourceName: "event"}, resourcePath, preconditions)
+	if !errors.Is(err, ErrLockConflict) {
+		t.Fatalf("DeleteEventAndState() error = %v, want ErrLockConflict", err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
 	}
@@ -961,17 +1397,28 @@ func TestStoreDeleteContactAndStateRunsInSingleTransaction(t *testing.T) {
 	defer db.Close()
 
 	st := New(db)
+	now := time.Now().UTC()
+	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
-		WithArgs(int64(5), "contact-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectDAVObjectIdentityLocks(mock, "contact-object", 5, "contact.v1", "contact-1")
+	expectCollectionRowLock(mock, "address_books", 5)
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(5), "contact.v1").
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "contact-1", "contact.v1", "raw", "etag", nil, nil, nil, now))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE id=$1`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact.v1").
 		WillReturnError(errors.New("lock delete failed"))
 	mock.ExpectRollback()
 
-	err = st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact.v1")
+	err = st.DeleteContactAndState(context.Background(), 5, DAVResourceState{Exists: true, UID: "contact-1", ResourceName: "contact.v1", ETag: "etag", RawData: "raw"}, "/dav/addressbooks/5/contact.v1", nil)
 	if err == nil {
 		t.Fatal("DeleteContactAndState() error = nil, want error")
 	}
@@ -981,7 +1428,9 @@ func TestStoreDeleteContactAndStateRunsInSingleTransaction(t *testing.T) {
 	}
 }
 
-func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) {
+// A delete removes the state at the contact's own state path and no other:
+// contact-1.vcf is another member's.
+func TestStoreDeleteContactAndStateDeletesACLState(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -989,50 +1438,34 @@ func TestStoreDeleteContactAndStateRemovesCanonicalAndLegacyPaths(t *testing.T) 
 	defer db.Close()
 
 	st := New(db)
+	now := time.Now().UTC()
+	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
+	expectDAVObjectIdentityLocks(mock, "contact-object", 5, "contact-1", "contact-1")
+	expectCollectionRowLock(mock, "address_books", 5)
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
 		WithArgs(int64(5), "contact-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "contact-1", "contact-1", "raw", "etag", nil, nil, nil, now))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE id=$1`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
-		WithArgs("/dav/addressbooks/5/contact-1.vcf").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	if err := st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact-1"); err != nil {
-		t.Fatalf("DeleteContactAndState() error = %v", err)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
-func TestStoreDeleteContactAndStatePreservesACLState(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New() error = %v", err)
-	}
-	defer db.Close()
-
-	st := New(db)
-
-	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
-		WithArgs(int64(5), "contact-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
 		WithArgs("/dav/addressbooks/5/contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
-		WithArgs("/dav/addressbooks/5/contact-1.vcf").
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs("/dav/addressbooks/5/contact-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	if err := st.DeleteContactAndState(context.Background(), 5, "contact-1", "/dav/addressbooks/5/contact-1"); err != nil {
+	if err := st.DeleteContactAndState(context.Background(), 5, DAVResourceState{Exists: true, UID: "contact-1", ResourceName: "contact-1", ETag: "etag", RawData: "raw"}, "/dav/addressbooks/5/contact-1", nil); err != nil {
 		t.Fatalf("DeleteContactAndState() error = %v", err)
 	}
 
@@ -1052,23 +1485,19 @@ func TestLockRepoCreateSerializesAncestorAndDescendantPaths(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav/addressbooks/5").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav/addressbooks").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
 		WithArgs("/dav/addressbooks/5").
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`)).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`)).
-		WithArgs(`/dav/addressbooks/5/%`).
+	mock.ExpectQuery(regexp.QuoteMeta(lockDescendantScopeQuery)).
+		WithArgs(`/dav/addressbooks/5/`, `/dav/addressbooks/50`).
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`
 INSERT INTO locks (token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, expires_at)
@@ -1094,6 +1523,66 @@ RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner
 		t.Fatalf("Create() error = %v", err)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestLockRepoCreateCanonicalizesPendingCalendarAfterSerialization(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &lockRepo{pool: db}
+	expiresAt := time.Now().Add(time.Hour)
+	pendingPath := "/dav/calendars/.pending/4/work"
+	canonicalPath := "/dav/calendars/12"
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                           false,
+		"/dav/calendars":                 false,
+		"/dav/calendars/.pending":        false,
+		"/dav/calendars/.pending/4":      true,
+		"/dav/calendars/.pending/4/work": true,
+	})
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id FROM calendars WHERE user_id=$1 AND LOWER(slug)=LOWER($2)`)).
+		WithArgs(int64(4), "work").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(12)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
+		WithArgs(canonicalPath).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`)).
+		WithArgs(pq.Array([]string{"/dav/calendars", "/dav"})).
+		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`
+INSERT INTO locks (token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, token, resource_path, user_id, lock_scope, lock_type, depth, owner_info, timeout_seconds, created_at, expires_at
+`)).
+		WithArgs("opaquelocktoken:late", canonicalPath, int64(4), "exclusive", "write", "0", "", 3600, expiresAt).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_path", "user_id", "lock_scope", "lock_type", "depth", "owner_info", "timeout_seconds", "created_at", "expires_at"}).
+			AddRow(int64(9), "opaquelocktoken:late", canonicalPath, int64(4), "exclusive", "write", "0", "", 3600, time.Now(), expiresAt))
+	mock.ExpectCommit()
+
+	created, err := repo.Create(context.Background(), Lock{
+		Token:          "opaquelocktoken:late",
+		ResourcePath:   pendingPath,
+		UserID:         4,
+		LockScope:      "exclusive",
+		LockType:       "write",
+		Depth:          "0",
+		TimeoutSeconds: 3600,
+		ExpiresAt:      expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if created.ResourcePath != canonicalPath {
+		t.Fatalf("Create() resource path = %q, want %q", created.ResourcePath, canonicalPath)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
 	}
@@ -1136,7 +1625,6 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 	repo := &contactRepo{pool: db}
 	now := time.Now().UTC()
 	birthday := time.Date(1985, 7, 20, 0, 0, 0, 0, time.UTC)
-	since := now.Add(-2 * time.Hour)
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND uid = ANY($2)`)).
 		WithArgs(int64(5), sqlmock.AnyArg()).
@@ -1177,18 +1665,6 @@ func TestContactRepoListQueriesAndMoveRollbackOnFailure(t *testing.T) {
 		t.Fatalf("ListForBookPaginated() = %#v", page)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, address_book_id, uid, resource_name, raw_vcard, etag, display_name, primary_email, birthday, last_modified FROM contacts WHERE address_book_id=$1 AND last_modified > $2 ORDER BY last_modified DESC`)).
-		WithArgs(int64(5), since).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(4), int64(5), "uid-4", "uid-4", "BEGIN:VCARD", "etag-4", "Chris", "chris@example.com", nil, now))
-	modified, err := repo.ListModifiedSince(context.Background(), 5, since)
-	if err != nil {
-		t.Fatalf("ListModifiedSince() error = %v", err)
-	}
-	if len(modified) != 1 || modified[0].PrimaryEmail == nil || *modified[0].PrimaryEmail != "chris@example.com" {
-		t.Fatalf("ListModifiedSince() = %#v", modified)
-	}
-
 	mock.ExpectQuery(regexp.QuoteMeta(`
 SELECT c.id, c.address_book_id, c.uid, c.resource_name, c.raw_vcard, c.etag, c.display_name, c.primary_email, c.birthday, c.last_modified
 FROM contacts c
@@ -1225,22 +1701,41 @@ FROM contacts c
 JOIN address_books ab ON ab.id = c.address_book_id
 WHERE ab.user_id = $1 AND c.birthday IS NOT NULL
 ORDER BY c.display_name
+LIMIT $2
 `)).
-		WithArgs(int64(4)).
+		WithArgs(int64(4), 257).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}).
-			AddRow(int64(6), int64(5), "uid-6", "uid-6", "BEGIN:VCARD", "etag-6", "Birthday Person", nil, birthday, now))
-	withBirthdays, err := repo.ListWithBirthdaysByUser(context.Background(), 4)
+			AddRow(int64(7), int64(5), "uid-7", "uid-7", "BEGIN:VCARD", "etag-7", "Later Birthday", nil, birthday, now))
+	cappedBirthdays, err := repo.ListWithBirthdaysByUserLimit(context.Background(), 4, 257)
 	if err != nil {
-		t.Fatalf("ListWithBirthdaysByUser() error = %v", err)
+		t.Fatalf("ListWithBirthdaysByUserLimit() error = %v", err)
 	}
-	if len(withBirthdays) != 1 || withBirthdays[0].Birthday == nil {
-		t.Fatalf("ListWithBirthdaysByUser() = %#v", withBirthdays)
+	if len(cappedBirthdays) != 1 || cappedBirthdays[0].UID != "uid-7" {
+		t.Fatalf("ListWithBirthdaysByUserLimit() = %#v", cappedBirthdays)
+	}
+	emptyBirthdays, err := repo.ListWithBirthdaysByUserLimit(context.Background(), 4, 0)
+	if err != nil {
+		t.Fatalf("ListWithBirthdaysByUserLimit(limit 0) error = %v", err)
+	}
+	if len(emptyBirthdays) != 0 {
+		t.Fatalf("ListWithBirthdaysByUserLimit(limit 0) = %#v", emptyBirthdays)
 	}
 
 	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/9": true,
+	})
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 9)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
 		WithArgs(int64(5), "uid-rollback").
 		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("legacy-name"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM contacts WHERE address_book_id=$1 AND uid=$2`)).
+		WithArgs(int64(9), "uid-rollback").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM contacts WHERE address_book_id=$1 AND resource_name=$2 AND uid<>$3`)).
 		WithArgs(int64(9), "renamed-contact", "uid-rollback").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -1274,68 +1769,6 @@ ORDER BY c.display_name
 	}
 }
 
-func TestACLRepoHasPrivilegeDenyOverridesGrant(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New() error = %v", err)
-	}
-	defer db.Close()
-
-	repo := &aclRepo{pool: db}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT CASE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
-    ) THEN FALSE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
-    ) THEN TRUE
-    ELSE FALSE
-END
-`)).
-		WithArgs("/dav/addressbooks/5/alice.vcf", "/dav/principals/2/", "read").
-		WillReturnRows(sqlmock.NewRows([]string{"has_privilege"}).AddRow(false))
-
-	allowed, err := repo.HasPrivilege(context.Background(), "/dav/addressbooks/5/alice.vcf", "/dav/principals/2/", "read")
-	if err != nil {
-		t.Fatalf("HasPrivilege() error = %v", err)
-	}
-	if allowed {
-		t.Fatal("HasPrivilege() = true, want deny to override grant")
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT CASE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=false
-    ) THEN FALSE
-    WHEN EXISTS (
-        SELECT 1 FROM acl_entries
-        WHERE resource_path=$1 AND principal_href=$2 AND privilege=$3 AND is_grant=true
-    ) THEN TRUE
-    ELSE FALSE
-END
-`)).
-		WithArgs("/dav/addressbooks/5/alice.vcf", "/dav/principals/3/", "read").
-		WillReturnRows(sqlmock.NewRows([]string{"has_privilege"}).AddRow(true))
-
-	allowed, err = repo.HasPrivilege(context.Background(), "/dav/addressbooks/5/alice.vcf", "/dav/principals/3/", "read")
-	if err != nil {
-		t.Fatalf("HasPrivilege() error = %v", err)
-	}
-	if !allowed {
-		t.Fatal("HasPrivilege() = false, want true when no deny exists")
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
 func TestACLRepoSetACLPreservesCreatedAtForUnchangedEntries(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -1348,18 +1781,23 @@ func TestACLRepoSetACLPreservesCreatedAtForUnchangedEntries(t *testing.T) {
 	createdAt := time.Date(2024, time.June, 1, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`)).
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":             false,
+		"/dav/calendars":   false,
+		"/dav/calendars/1": true,
+	})
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`)).
 		WithArgs(resourcePath).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "created_at"}).
-			AddRow(int64(1), resourcePath, "/dav/principals/2/", true, "read", createdAt))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "ace_order", "created_at"}).
+			AddRow(int64(1), resourcePath, "/dav/principals/2/", true, "read", 0, createdAt))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path = $1`)).
 		WithArgs(resourcePath).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
-		WithArgs(resourcePath, "/dav/principals/2/", true, "read", createdAt).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at) VALUES ($1, $2, $3, $4, $5, $6)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", true, "read", 0, createdAt).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
-		WithArgs(resourcePath, "/dav/principals/2/", true, "write", sqlmock.AnyArg()).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at) VALUES ($1, $2, $3, $4, $5, $6)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", true, "write", 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(1)).
@@ -1393,20 +1831,26 @@ func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
 	resourcePath := "/dav/calendars/1/event-1"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, created_at FROM acl_entries WHERE resource_path=$1 ORDER BY created_at, id`)).
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                     false,
+		"/dav/calendars":           false,
+		"/dav/calendars/1":         true,
+		"/dav/calendars/1/event-1": true,
+	})
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_path, principal_href, is_grant, privilege, ace_order, created_at FROM acl_entries WHERE resource_path = $1 ORDER BY ace_order, id`)).
 		WithArgs(resourcePath).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "created_at"}))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_path", "principal_href", "is_grant", "privilege", "ace_order", "created_at"}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path = $1`)).
 		WithArgs(resourcePath).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, created_at) VALUES ($1, $2, $3, $4, $5)`)).
-		WithArgs(resourcePath, "/dav/principals/2/", false, "read", sqlmock.AnyArg()).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO acl_entries (resource_path, principal_href, is_grant, privilege, ace_order, created_at) VALUES ($1, $2, $3, $4, $5, $6)`)).
+		WithArgs(resourcePath, "/dav/principals/2/", false, "read", 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
 		WithArgs(int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
-		WithArgs(int64(1), "event-1", "event-1.ics").
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND object_acl_path = ANY($2)`)).
+		WithArgs(int64(1), pq.Array([]string{resourcePath})).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -1415,51 +1859,6 @@ func TestACLRepoSetACLTouchesOnlyAffectedCalendarObjectSyncState(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("SetACL() error = %v", err)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
-func TestACLRepoDeletePrincipalEntriesByResourcePrefixUsesSingleTransaction(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New() error = %v", err)
-	}
-	defer db.Close()
-
-	repo := &aclRepo{pool: db}
-	principalHref := "/dav/principals/2/"
-	resourcePrefix := "/dav/calendars/1"
-	likePrefix := "/dav/calendars/1/%"
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT DISTINCT resource_path FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\') ORDER BY resource_path`)).
-		WithArgs(principalHref, resourcePrefix, likePrefix).
-		WillReturnRows(sqlmock.NewRows([]string{"resource_path"}).
-			AddRow("/dav/calendars/1").
-			AddRow("/dav/calendars/1/private-event"))
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE principal_href=$1 AND (resource_path=$2 OR resource_path LIKE $3 ESCAPE '\')`)).
-		WithArgs(principalHref, resourcePrefix, likePrefix).
-		WillReturnResult(sqlmock.NewResult(0, 3))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
-		WithArgs(int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET last_modified = NOW() WHERE calendar_id = $1 AND resource_name IN ($2, $3)`)).
-		WithArgs(int64(1), "private-event", "private-event.ics").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	err = repo.DeletePrincipalEntriesByResourcePrefix(context.Background(), principalHref, resourcePrefix)
-	if err != nil {
-		t.Fatalf("DeletePrincipalEntriesByResourcePrefix() error = %v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -1478,23 +1877,19 @@ func TestLockRepoCreateRejectsDepthInfinityWhenDescendantLocked(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav/addressbooks/5").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav/addressbooks").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
-		WithArgs("/dav").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+	})
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = $1 AND expires_at > NOW()`)).
 		WithArgs("/dav/addressbooks/5").
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path = ANY($1) AND depth = 'infinity' AND expires_at > NOW()`)).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT lock_scope FROM locks WHERE resource_path LIKE $1 ESCAPE '\' AND expires_at > NOW()`)).
-		WithArgs(`/dav/addressbooks/5/%`).
+	mock.ExpectQuery(regexp.QuoteMeta(lockDescendantScopeQuery)).
+		WithArgs(`/dav/addressbooks/5/`, `/dav/addressbooks/50`).
 		WillReturnRows(sqlmock.NewRows([]string{"lock_scope"}).AddRow("exclusive"))
 	mock.ExpectRollback()
 
@@ -1546,4 +1941,797 @@ func TestLockRepoCreateRejectsInvalidDepth(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
 	}
+}
+
+func TestStoreMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                   false,
+		"/dav/calendars":         false,
+		"/dav/calendars/2":       true,
+		"/dav/calendars/3":       true,
+		"/dav/calendars/2/event": true,
+		"/dav/calendars/3/moved": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:moved", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(2), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("event"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(3), "moved", "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE calendar_id=$3 AND uid=$4`)).
+		WithArgs(int64(3), "moved", int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(2), "event", "event").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVStateMove(mock, "/dav/calendars/2/event", "/dav/calendars/3/moved")
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("event", int64(3), "moved").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = st.MoveEventAndState(context.Background(), 2, 3, "event", "moved", "/dav/calendars/2/event", "/dav/calendars/3/moved", "replaced-uid")
+	if err != nil {
+		t.Fatalf("MoveEventAndState() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreMoveEventAndStateRollsBackWhenStateRebindFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                   false,
+		"/dav/calendars":         false,
+		"/dav/calendars/2":       true,
+		"/dav/calendars/3":       true,
+		"/dav/calendars/2/event": true,
+		"/dav/calendars/3/moved": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:uid:event", "calendar-object:3:name:moved", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(2), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}).AddRow("event"))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT resource_name FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnRows(sqlmock.NewRows([]string{"resource_name"}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND resource_name=$2 AND uid<>$3`)).
+		WithArgs(int64(3), "moved", "event").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM events WHERE calendar_id=$1 AND uid=$2`)).
+		WithArgs(int64(3), "event").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET calendar_id=$1, resource_name=$2, last_modified=NOW() WHERE calendar_id=$3 AND uid=$4`)).
+		WithArgs(int64(3), "moved", int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(2), "event", "event").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs("/dav/calendars/3/moved").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`)).
+		WithArgs("/dav/calendars/3/moved", "/dav/calendars/2/event").
+		WillReturnError(errors.New("acl move failed"))
+	mock.ExpectRollback()
+
+	err = st.MoveEventAndState(context.Background(), 2, 3, "event", "moved", "/dav/calendars/2/event", "/dav/calendars/3/moved", "")
+	if err == nil {
+		t.Fatal("MoveEventAndState() error = nil, want error")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreUpdateAndMoveEventAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	start := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	end := start.Add(30 * time.Minute)
+	summary := "Updated"
+	event := Event{
+		CalendarID:   3,
+		UID:          "event",
+		ResourceName: "custom.ics",
+		RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		ETag:         "new-etag",
+		WriteMetadata: &EventWriteMetadata{
+			Summary: &summary,
+			DTStart: &start,
+			DTEnd:   &end,
+		},
+	}
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                        false,
+		"/dav/calendars":              false,
+		"/dav/calendars/2":            true,
+		"/dav/calendars/3":            true,
+		"/dav/calendars/2/custom.ics": true,
+		"/dav/calendars/3/custom.ics": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:name:custom.ics", "calendar-object:2:uid:event", "calendar-object:3:name:custom.ics", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
+	expectSourceEventRow(mock, 2, "event", "custom.ics", "old-raw", "old-etag")
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE events SET
+calendar_id=$1, resource_name=$2, raw_ical=$3, etag=$4,
+summary=$5, description=$6, location=$7, dtstart=$8, dtend=$9,
+all_day=$10, recurrence_start=$11, recurrence_until=$12, last_modified=NOW()
+WHERE calendar_id=$13 AND uid=$14`)).
+		WithArgs(int64(3), "custom.ics", event.RawICAL, "new-etag", &summary, nil, nil, &start, &end, false, nil, nil, int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('event', $1, $2, $3)`)).
+		WithArgs(int64(2), "event", "custom.ics").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE calendars SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVStateMove(mock, "/dav/calendars/2/custom.ics", "/dav/calendars/3/custom.ics")
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("event", int64(3), "custom.ics").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = st.UpdateAndMoveEventAndState(
+		context.Background(),
+		2,
+		DAVResourceState{Exists: true, UID: "event", ResourceName: "custom.ics", ETag: "old-etag", RawData: "old-raw"},
+		event,
+		"/dav/calendars/2/custom.ics",
+		"/dav/calendars/3/custom.ics",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("UpdateAndMoveEventAndState() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreUpdateAndMoveEventAndStateRollsBackOnDAVStateFailure(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	event := Event{
+		CalendarID:    3,
+		UID:           "event",
+		ResourceName:  "event",
+		RawICAL:       "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+		ETag:          "new-etag",
+		WriteMetadata: &EventWriteMetadata{},
+	}
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                   false,
+		"/dav/calendars":         false,
+		"/dav/calendars/2":       true,
+		"/dav/calendars/3":       true,
+		"/dav/calendars/2/event": true,
+		"/dav/calendars/3/event": true,
+	})
+	expectIdentityLocks(mock, "calendar-object:2:name:event", "calendar-object:2:uid:event", "calendar-object:3:name:event", "calendar-object:3:uid:event")
+	expectCollectionRowLock(mock, "calendars", 2)
+	expectCollectionRowLock(mock, "calendars", 3)
+	expectSourceEventRow(mock, 2, "event", "event", "old-raw", "old-etag")
+	mock.ExpectExec(`UPDATE events SET`).
+		WithArgs(int64(3), "event", event.RawICAL, "new-etag", nil, nil, nil, nil, nil, false, nil, nil, int64(2), "event").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO deleted_resources`).
+		WithArgs(int64(2), "event", "event").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE calendars SET ctag`).
+		WithArgs(int64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM acl_entries`).WithArgs("/dav/calendars/3/event").WillReturnError(errors.New("state failure"))
+	mock.ExpectRollback()
+
+	err = st.UpdateAndMoveEventAndState(
+		context.Background(),
+		2,
+		DAVResourceState{Exists: true, UID: "event", ResourceName: "event", ETag: "old-etag", RawData: "old-raw"},
+		event,
+		"/dav/calendars/2/event",
+		"/dav/calendars/3/event",
+		nil,
+	)
+	if err == nil {
+		t.Fatal("UpdateAndMoveEventAndState() error = nil, want rollback error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreMoveContactAndStateRunsInSingleTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
+
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/6": true,
+	})
+	for _, key := range []string{"contact-object:5:name:alice", "contact-object:5:uid:alice", "contact-object:6:name:moved", "contact-object:6:uid:alice"} {
+		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 6)
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(5), "alice").
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "alice", "alice", "", "", nil, nil, nil, now))
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(6), "moved").WillReturnRows(sqlmock.NewRows(contactColumns))
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND uid=\$2 FOR UPDATE`).
+		WithArgs(int64(6), "alice").WillReturnRows(sqlmock.NewRows(contactColumns))
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE contacts SET address_book_id=$1, resource_name=$2, last_modified=NOW() WHERE id=$3 RETURNING `)+`.*`).
+		WithArgs(int64(6), "moved", int64(10)).
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(6), "alice", "moved", "", "", nil, nil, nil, now))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deleted_resources (resource_type, collection_id, uid, resource_name) VALUES ('contact', $1, $2, $3)`)).
+		WithArgs(int64(5), "alice", "alice").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE address_books SET ctag = ctag + 1, updated_at = NOW() WHERE id = $1`)).
+		WithArgs(int64(5)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDAVStateMove(mock, "/dav/addressbooks/5/alice", "/dav/addressbooks/6/moved")
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND resource_name=$3`)).
+		WithArgs("contact", int64(6), "moved").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = st.MoveContactAndState(context.Background(), 5, 6, "alice", "moved", "/dav/addressbooks/5/alice", "/dav/addressbooks/6/moved", "", ContactTransferExpectation{Source: DAVResourceState{Exists: true, UID: "alice", ResourceName: "alice"}, Overwrite: true}, nil)
+	if err != nil {
+		t.Fatalf("MoveContactAndState() error = %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestStoreMoveContactAndStateRejectsLateDestinationUIDConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	st := New(db)
+	now := time.Now().UTC()
+	contactColumns := []string{"id", "address_book_id", "uid", "resource_name", "raw_vcard", "etag", "display_name", "primary_email", "birthday", "last_modified"}
+	mock.ExpectBegin()
+	expectDAVPathLocks(mock, map[string]bool{
+		"/dav":                false,
+		"/dav/addressbooks":   false,
+		"/dav/addressbooks/5": true,
+		"/dav/addressbooks/6": true,
+	})
+	for _, key := range []string{"contact-object:5:name:alice", "contact-object:5:uid:alice", "contact-object:6:name:moved", "contact-object:6:uid:alice"} {
+		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	expectCollectionRowLock(mock, "address_books", 5)
+	expectCollectionRowLock(mock, "address_books", 6)
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(5), "alice").
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(10), int64(5), "alice", "alice", "", "", nil, nil, nil, now))
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).
+		WithArgs(int64(6), "moved").WillReturnRows(sqlmock.NewRows(contactColumns))
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND uid=\$2 FOR UPDATE`).
+		WithArgs(int64(6), "alice").
+		WillReturnRows(sqlmock.NewRows(contactColumns).AddRow(int64(11), int64(6), "alice", "other-path", "", "", nil, nil, nil, now))
+	mock.ExpectRollback()
+
+	err = st.MoveContactAndState(context.Background(), 5, 6, "alice", "moved", "/dav/addressbooks/5/alice", "/dav/addressbooks/6/moved", "", ContactTransferExpectation{Source: DAVResourceState{Exists: true, UID: "alice", ResourceName: "alice"}, Overwrite: true}, nil)
+	if err != ErrConflict {
+		t.Fatalf("MoveContactAndState() error = %v, want ErrConflict", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// expectCollectionRowLocks matches the ascending-id collection row locks a
+// member transfer takes so its ctag updates cannot deadlock against a transfer
+// running the other way.
+func expectDAVStateMove(mock sqlmock.Sqlmock, fromPath, toPath string) {
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs(toPath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE acl_entries SET resource_path=$1 WHERE resource_path=$2`)).
+		WithArgs(toPath, fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM locks WHERE resource_path=$1`)).
+		WithArgs(fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs(toPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE dav_dead_properties SET resource_path=$1, updated_at=NOW() WHERE resource_path=$2`)).
+		WithArgs(toPath, fromPath).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectIdentityLocks asserts one advisory lock per identity key, in the
+// order given.
+func expectIdentityLocks(mock sqlmock.Sqlmock, keys ...string) {
+	for _, key := range keys {
+		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+			WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+}
+
+func expectDAVObjectIdentityLocks(mock sqlmock.Sqlmock, kind string, collectionID int64, resourceName, uid string) {
+	for _, key := range []string{
+		fmt.Sprintf("%s:%d:name:%s", kind, collectionID, resourceName),
+		fmt.Sprintf("%s:%d:uid:%s", kind, collectionID, uid),
+	} {
+		mock.ExpectExec(regexp.QuoteMeta(`SELECT pg_advisory_xact_lock(hashtext($1))`)).
+			WithArgs(key).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+}
+
+// baselineSchemaVersionRow is the version db.sql seeds, which every migration
+// test below asserts against: a fresh install and one upgraded through the
+// newest migration have to report the same schema version.
+const baselineSchemaVersionRow = "VALUES ('version', 'v1.2.0')"
+
+// TestCalendarPropertyColumnsMigration pins that the migration and the flattened
+// baseline schema both add the columns the calendar live properties are read
+// from, so a deployment upgraded by migration and one created from db.sql agree.
+func TestCalendarPropertyColumnsMigration(t *testing.T) {
+	sources := map[string][]string{
+		"../../migrations/v1.2.0.sql": {
+			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
+			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[]",
+			"UPDATE application SET value = 'v1.2.0'",
+		},
+		"../../db.sql": {
+			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS description_lang TEXT",
+			"ALTER TABLE calendars ADD COLUMN IF NOT EXISTS supported_components TEXT[]",
+			baselineSchemaVersionRow,
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+func TestACLOrderAndDigestCredentialMigrationMatchesBaselineSchema(t *testing.T) {
+	sources := map[string][]string{
+		"../../migrations/v1.2.0.sql": {
+			"ALTER TABLE acl_entries ADD COLUMN IF NOT EXISTS ace_order INTEGER NOT NULL DEFAULT 0",
+			// Denials first: an unordered ACL was read deny-first, an ordered one
+			// is read first-match, and ordering by age alone would let an older
+			// blanket grant answer ahead of the denial that suppressed it.
+			"ROW_NUMBER() OVER (PARTITION BY resource_path ORDER BY is_grant, created_at, id)",
+			// And only on the upgrade that introduces the column, so an
+			// installation already carrying ACL orderings keeps them.
+			"IF backfill_needed THEN",
+			"attrelid = 'acl_entries'::regclass",
+			"DROP INDEX IF EXISTS idx_acl_unique",
+			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
+			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_md5_ha1 TEXT",
+			"ALTER TABLE app_passwords ADD COLUMN IF NOT EXISTS digest_sha256_ha1 TEXT",
+			"CREATE TABLE IF NOT EXISTS digest_nonce_counts",
+			// The whole of the uint32 nc range validateDAVDigest accepts has to fit.
+			"nonce_count BIGINT NOT NULL",
+			"PRIMARY KEY (token_id, nonce, nonce_count)",
+			"UPDATE application SET value = 'v1.2.0'",
+		},
+		"../../db.sql": {
+			"ace_order INTEGER NOT NULL DEFAULT 0",
+			"DROP INDEX IF EXISTS idx_acl_unique",
+			"CREATE INDEX IF NOT EXISTS idx_acl_resource_order ON acl_entries(resource_path, ace_order, id)",
+			"digest_md5_ha1 TEXT NULL",
+			"digest_sha256_ha1 TEXT NULL",
+			"CREATE TABLE IF NOT EXISTS digest_nonce_counts",
+			"nonce_count BIGINT NOT NULL",
+			"PRIMARY KEY (token_id, nonce, nonce_count)",
+			baselineSchemaVersionRow,
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+// A PostgreSQL expression index only serves a predicate that spells the
+// expression verbatim, so the two COALESCE tails have to read the same in the
+// migration, the baseline schema, and ListForCalendarFiltered. Drift costs the
+// index silently: the range falls out of the index scan and back into a filter.
+func TestTimeRangeIndexMigrationMatchesBaselineSchema(t *testing.T) {
+	startIndex := "CREATE INDEX IF NOT EXISTS idx_events_recurrence_start\n    ON events (calendar_id, COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz))"
+	untilIndex := "CREATE INDEX IF NOT EXISTS idx_events_recurrence_until\n    ON events (calendar_id, COALESCE(recurrence_until, dtend, 'infinity'::timestamptz))"
+
+	sources := map[string][]string{
+		"../../migrations/v1.2.0.sql": {
+			"DROP INDEX IF EXISTS idx_events_recurrence_start",
+			"DROP INDEX IF EXISTS idx_events_recurrence_until",
+			startIndex,
+			untilIndex,
+			"UPDATE application SET value = 'v1.2.0'",
+		},
+		"../../db.sql": {
+			startIndex,
+			untilIndex,
+			baselineSchemaVersionRow,
+		},
+		"postgres.go": {
+			"COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz) <= ",
+			"COALESCE(recurrence_until, dtend, 'infinity'::timestamptz) >= ",
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+// Each keyset index exists for the statements that page a collection, so the
+// indexes and every one of those statements are pinned together. Two things have
+// to stay in step or the read silently drops back onto the primary key, which
+// stays correct while costing the whole table: the row-comparison cursor, which
+// is what the primary key cannot answer as an index bound, and the ORDER BY that
+// names the leading column so the index provides the order. The trailing filter
+// columns are pinned for the same reason -- without them the predicate moves off
+// the index tuple and back onto the heap.
+//
+// The collection equality is pinned for a different reason, and a stronger one:
+// it is not a duplicate of the row comparison but the clause that scopes the read
+// to one collection. `(collection, id) > ($1, $2)` on its own also admits every
+// row of every collection whose id is higher, which is another user's data, so
+// removing the equality as redundant would turn a paged read into a cross-
+// collection one.
+func TestKeysetIndexMigrationMatchesBaselineSchema(t *testing.T) {
+	eventsIndex := "idx_events_calendar_keyset ON events (\n    calendar_id, id,\n" +
+		"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
+		"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz))"
+	contactsIndex := "idx_contacts_book_keyset ON contacts (address_book_id, id)"
+
+	sources := map[string][]string{
+		"../../migrations/v1.2.0.sql": {
+			eventsIndex,
+			contactsIndex,
+			"DROP INDEX IF EXISTS idx_events_calendar_keyset",
+			"DROP INDEX IF EXISTS idx_contacts_book_keyset",
+			"CREATE INDEX IF NOT EXISTS idx_events_change_stream ON events (calendar_id, last_modified, id)",
+			"CREATE INDEX IF NOT EXISTS idx_contacts_change_stream ON contacts (address_book_id, last_modified, id)",
+			"CREATE INDEX IF NOT EXISTS idx_deleted_resources_change_stream\n    ON deleted_resources (resource_type, collection_id, deleted_at, id)",
+			"DROP INDEX IF EXISTS idx_events_last_modified",
+			"DROP INDEX IF EXISTS idx_contacts_last_modified",
+			"DROP INDEX IF EXISTS idx_deleted_resources_lookup",
+			"DROP INDEX IF EXISTS idx_deleted_resources_keyset",
+			"DROP INDEX IF EXISTS idx_events_calendar_id",
+			"DROP INDEX IF EXISTS idx_contacts_address_book_id",
+			"UPDATE application SET value = 'v1.2.0'",
+		},
+		"../../db.sql": {
+			"CREATE INDEX idx_events_calendar_keyset ON events(\n    calendar_id, id,\n" +
+				"    COALESCE(recurrence_until, dtend, 'infinity'::timestamptz),\n" +
+				"    COALESCE(recurrence_start, dtstart, '-infinity'::timestamptz));",
+			"CREATE INDEX idx_contacts_book_keyset ON contacts(address_book_id, id);",
+			"CREATE INDEX idx_events_change_stream ON events(calendar_id, last_modified, id);",
+			"CREATE INDEX idx_contacts_change_stream ON contacts(address_book_id, last_modified, id);",
+			"CREATE INDEX idx_deleted_resources_change_stream ON deleted_resources(resource_type, collection_id, deleted_at, id);",
+			baselineSchemaVersionRow,
+		},
+		"postgres.go": {
+			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, id) > ($1, $2) ORDER BY address_book_id ASC, id ASC LIMIT $3",
+		},
+		// The change-stream reads lead their row comparison and ORDER BY with
+		// the collection columns of the change-stream indexes, so the cursor is
+		// one index bound and the index provides the order.
+		"sync_changes.go": {
+			"FROM events WHERE calendar_id=$1 AND (calendar_id, last_modified, id) > ($1, $2, $3) ORDER BY calendar_id ASC, last_modified ASC, id ASC LIMIT $4",
+			"FROM contacts WHERE address_book_id=$1 AND (address_book_id, last_modified, id) > ($1, $2, $3) ORDER BY address_book_id ASC, last_modified ASC, id ASC LIMIT $4",
+			"FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND (resource_type, collection_id, deleted_at, id) > ($1, $2, $3, $4) ORDER BY resource_type ASC, collection_id ASC, deleted_at ASC, id ASC LIMIT $5",
+		},
+	}
+	for path, expected := range sources {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		for _, want := range expected {
+			if !strings.Contains(string(contents), want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+	}
+}
+
+// db.sql must not still create an index the newest migration drops, or a fresh
+// install carries one an upgraded deployment does not.
+func TestBaselineSchemaDropsSupersededIndexes(t *testing.T) {
+	contents, err := os.ReadFile("../../db.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(db.sql) error = %v", err)
+	}
+	for _, superseded := range []string{
+		"CREATE INDEX idx_events_calendar_id ON events(calendar_id);",
+		"CREATE INDEX idx_contacts_address_book_id ON contacts(address_book_id);",
+	} {
+		if strings.Contains(string(contents), superseded) {
+			t.Errorf("db.sql still creates %q, which the keyset migration drops", superseded)
+		}
+	}
+}
+
+func TestDeleteMissingDAVResourceState(t *testing.T) {
+	for _, kind := range []string{"event", "contact"} {
+		t.Run(kind, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			st := New(db)
+			mock.ExpectBegin()
+			table, collection := "events", "calendar_id"
+			collectionTable, lockSet := "calendars", map[string]bool{
+				"/dav":             false,
+				"/dav/calendars":   false,
+				"/dav/calendars/7": true,
+			}
+			if kind == "contact" {
+				table, collection = "contacts", "address_book_id"
+				collectionTable, lockSet = "address_books", map[string]bool{
+					"/dav":                false,
+					"/dav/addressbooks":   false,
+					"/dav/addressbooks/7": true,
+				}
+			}
+			expectDAVPathLocks(mock, lockSet)
+			expectCollectionRowLock(mock, collectionTable, 7)
+			mock.ExpectQuery("SELECT .* FROM "+table+" WHERE "+collection+`=\$1 AND resource_name=\$2 FOR UPDATE`).WithArgs(int64(7), "").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectRollback()
+			defer func() {
+				if value := recover(); value != nil {
+					t.Errorf("missing resource panicked: %v", value)
+				}
+			}()
+			if kind == "event" {
+				err = st.DeleteEventAndState(context.Background(), 7, DAVResourceState{}, "/dav/calendars/7/missing", nil)
+			} else {
+				err = st.DeleteContactAndState(context.Background(), 7, DAVResourceState{}, "/dav/addressbooks/7/missing", nil)
+			}
+			if !errors.Is(err, ErrResourceStateChanged) {
+				t.Fatalf("error = %v, want ErrResourceStateChanged", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTransferContactMissingSourceState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectQuery(`SELECT .* FROM contacts WHERE address_book_id=\$1 AND resource_name=\$2 FOR UPDATE`).WithArgs(int64(7), "").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectRollback()
+	defer func() {
+		tx.Rollback()
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer func() {
+		if value := recover(); value != nil {
+			t.Errorf("missing source panicked: %v", value)
+		}
+	}()
+	_, _, err = transferContactTx(context.Background(), tx, contactTransferMove, 7, 8, "missing", "missing", "", ContactTransferExpectation{})
+	if !errors.Is(err, ErrResourceStateChanged) {
+		t.Fatalf("error = %v, want ErrResourceStateChanged", err)
+	}
+}
+
+// Consume reports the replay, and it does so from the row count rather than a
+// read: two instances handed the same captured header race here, and only the
+// insert that changed a row may authenticate.
+func TestDigestNonceRepoConsumeReportsFirstClaimAndReplay(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &digestNonceRepo{pool: db}
+	expiresAt := time.Date(2026, time.August, 3, 12, 5, 0, 0, time.UTC)
+	const insert = `INSERT INTO digest_nonce_counts (token_id, nonce, nonce_count, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (token_id, nonce, nonce_count) DO NOTHING`
+
+	tests := []struct {
+		name     string
+		affected int64
+		want     bool
+	}{
+		{name: "first claim", affected: 1, want: true},
+		{name: "replay", affected: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock.ExpectExec(regexp.QuoteMeta(insert)).
+				WithArgs(int64(7), "nonce-value", int64(1), expiresAt).
+				WillReturnResult(sqlmock.NewResult(0, tt.affected))
+
+			claimed, err := repo.Consume(context.Background(), 7, "nonce-value", 1, expiresAt)
+			if err != nil {
+				t.Fatalf("Consume() error = %v", err)
+			}
+			if claimed != tt.want {
+				t.Fatalf("Consume() = %v, want %v", claimed, tt.want)
+			}
+		})
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestDigestNonceRepoConsumeReturnsTheStoreError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec(`INSERT INTO digest_nonce_counts`).WillReturnError(errors.New("database unreachable"))
+
+	claimed, err := (&digestNonceRepo{pool: db}).Consume(context.Background(), 7, "nonce-value", 1, time.Now())
+	if err == nil {
+		t.Fatal("Consume() error = nil, want the store error")
+	}
+	if claimed {
+		t.Fatal("Consume() claimed the count despite the store failing")
+	}
+}
+
+// A calendar collection accepts only the component types its
+// CALDAV:supported-calendar-component-set names, and a collection that set none
+// of its own falls back to the server default RFC 4791 Section 5.2.3 makes the
+// meaning of an absent property. The rule lives on the model because both the
+// DAV handlers and the UI write into these collections and have to apply the
+// same one.
+func TestCalendarAcceptsComponent(t *testing.T) {
+	tests := []struct {
+		name      string
+		supported []string
+		component string
+		want      bool
+	}{
+		{name: "no restriction accepts the default set", supported: nil, component: "VEVENT", want: true},
+		{name: "no restriction accepts VTODO", supported: nil, component: "VTODO", want: true},
+		{name: "no restriction accepts VJOURNAL", supported: nil, component: "VJOURNAL", want: true},
+		{name: "no restriction accepts VFREEBUSY", supported: nil, component: "VFREEBUSY", want: true},
+		// VTIMEZONE is outside the default set: Section 5.2.3 admits it only
+		// from a server that stores VTIMEZONE-only object resources.
+		{name: "no restriction refuses VTIMEZONE", supported: nil, component: "VTIMEZONE", want: false},
+		{name: "a restriction admits what it names", supported: []string{"VTODO"}, component: "VTODO", want: true},
+		{name: "a restriction refuses what it omits", supported: []string{"VTODO"}, component: "VEVENT", want: false},
+		{name: "component names are case-insensitive", supported: []string{"VTODO"}, component: "vtodo", want: true},
+		// An explicitly empty set is a restriction that names nothing, which is
+		// not the same as carrying no restriction at all.
+		{name: "an empty restriction accepts nothing", supported: []string{}, component: "VEVENT", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calendar := Calendar{SupportedComponents: tt.supported}
+			if got := calendar.AcceptsComponent(tt.component); got != tt.want {
+				t.Errorf("AcceptsComponent(%q) with %#v = %v, want %v", tt.component, tt.supported, got, tt.want)
+			}
+		})
+	}
+}
+
+// expectCreatedEventStateCleared expects an event repository write to look
+// for an event with uid in the calendar and, finding none, clear the ACL
+// entries and dead properties stored at the path it creates resourceName at.
+func expectCreatedEventStateCleared(mock sqlmock.Sqlmock, calendarID int64, uid, resourceName string, exists bool) {
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS (SELECT 1 FROM events WHERE calendar_id = $1 AND uid = $2)`)).
+		WithArgs(calendarID, uid).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(exists))
+	if exists {
+		return
+	}
+	statePath := fmt.Sprintf("/dav/calendars/%d/%s", calendarID, resourceName)
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM acl_entries WHERE resource_path=$1`)).
+		WithArgs(statePath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM dav_dead_properties WHERE resource_path=$1`)).
+		WithArgs(statePath).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 }

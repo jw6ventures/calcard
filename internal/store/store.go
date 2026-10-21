@@ -14,16 +14,23 @@ type txPool interface {
 type Store struct {
 	pool txPool
 
-	Users            UserRepository
-	Calendars        CalendarRepository
-	Events           EventRepository
-	AddressBooks     AddressBookRepository
-	Contacts         ContactRepository
-	AppPasswords     AppPasswordRepository
-	DeletedResources DeletedResourceRepository
-	Sessions         SessionRepository
-	Locks            LockRepository
-	ACLEntries       ACLRepository
+	Users               UserRepository
+	Calendars           CalendarRepository
+	CalendarState       CalendarStateCreator
+	CalendarObjects     CalendarObjectWriter
+	ContactObjects      ContactObjectWriter
+	CalendarTransfers   CalendarObjectTransferBackend
+	CalendarCollections CalendarCollectionTransferBackend
+	Events              EventRepository
+	AddressBooks        AddressBookRepository
+	Contacts            ContactRepository
+	AppPasswords        AppPasswordRepository
+	DigestNonces        DigestNonceRepository
+	DeletedResources    DeletedResourceRepository
+	Sessions            SessionRepository
+	Locks               LockRepository
+	ACLEntries          ACLRepository
+	DeadProperties      DeadPropertyRepository
 }
 
 // New wires concrete repository implementations with shared connection pool.
@@ -36,10 +43,12 @@ func New(pool *sql.DB) *Store {
 		AddressBooks:     &addressBookRepo{pool: pool},
 		Contacts:         &contactRepo{pool: pool},
 		AppPasswords:     &appPasswordRepo{pool: pool},
+		DigestNonces:     &digestNonceRepo{pool: pool},
 		DeletedResources: &deletedResourceRepo{pool: pool},
 		Sessions:         &sessionRepo{pool: pool},
 		Locks:            &lockRepo{pool: pool},
 		ACLEntries:       &aclRepo{pool: pool},
+		DeadProperties:   &deadPropertyRepo{pool: pool},
 	}
 }
 

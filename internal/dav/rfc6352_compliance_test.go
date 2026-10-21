@@ -8,10 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/store"
@@ -38,12 +42,19 @@ func buildVCard(version string, lines ...string) string {
 }
 
 type fakeLockRepo struct {
-	locks               map[string]*store.Lock
-	listByResourcesErr  error
-	moveResourcePathErr error
+	locks                map[string]*store.Lock
+	listByResourcesErr   error
+	listByResourcesCalls int
+	getByTokenCalls      int
+	getByTokenErr        error
+	moveResourcePathErr  error
+	refreshErr           error
+	// calls counts every call to any of the repository's methods.
+	calls int
 }
 
 func (f *fakeLockRepo) Create(ctx context.Context, lock store.Lock) (*store.Lock, error) {
+	f.calls++
 	if f.locks == nil {
 		f.locks = map[string]*store.Lock{}
 	}
@@ -70,6 +81,11 @@ func (f *fakeLockRepo) Create(ctx context.Context, lock store.Lock) (*store.Lock
 }
 
 func (f *fakeLockRepo) GetByToken(ctx context.Context, token string) (*store.Lock, error) {
+	f.calls++
+	f.getByTokenCalls++
+	if f.getByTokenErr != nil {
+		return nil, f.getByTokenErr
+	}
 	if lock, ok := f.locks[token]; ok {
 		copy := *lock
 		return &copy, nil
@@ -78,6 +94,7 @@ func (f *fakeLockRepo) GetByToken(ctx context.Context, token string) (*store.Loc
 }
 
 func (f *fakeLockRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.Lock, error) {
+	f.calls++
 	var result []store.Lock
 	for _, lock := range f.locks {
 		if lock.ResourcePath == resourcePath {
@@ -88,6 +105,8 @@ func (f *fakeLockRepo) ListByResource(ctx context.Context, resourcePath string) 
 }
 
 func (f *fakeLockRepo) ListByResources(ctx context.Context, paths []string) ([]store.Lock, error) {
+	f.calls++
+	f.listByResourcesCalls++
 	if f.listByResourcesErr != nil {
 		return nil, f.listByResourcesErr
 	}
@@ -116,6 +135,7 @@ func containsPath(path, parent string) bool {
 }
 
 func (f *fakeLockRepo) ListByResourcePrefix(ctx context.Context, prefix string) ([]store.Lock, error) {
+	f.calls++
 	var result []store.Lock
 	for _, lock := range f.locks {
 		if strings.HasPrefix(lock.ResourcePath, prefix) {
@@ -126,6 +146,7 @@ func (f *fakeLockRepo) ListByResourcePrefix(ctx context.Context, prefix string) 
 }
 
 func (f *fakeLockRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
+	f.calls++
 	if f.moveResourcePathErr != nil {
 		return f.moveResourcePathErr
 	}
@@ -143,6 +164,7 @@ func (f *fakeLockRepo) MoveResourcePath(ctx context.Context, fromPath, toPath st
 }
 
 func (f *fakeLockRepo) DeleteByResourcePath(ctx context.Context, resourcePath string) error {
+	f.calls++
 	for token, lock := range f.locks {
 		if lock.ResourcePath == resourcePath {
 			delete(f.locks, token)
@@ -152,15 +174,21 @@ func (f *fakeLockRepo) DeleteByResourcePath(ctx context.Context, resourcePath st
 }
 
 func (f *fakeLockRepo) Delete(ctx context.Context, token string) error {
+	f.calls++
 	delete(f.locks, token)
 	return nil
 }
 
 func (f *fakeLockRepo) DeleteExpired(ctx context.Context) (int64, error) {
+	f.calls++
 	return 0, nil
 }
 
 func (f *fakeLockRepo) Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*store.Lock, error) {
+	f.calls++
+	if f.refreshErr != nil {
+		return nil, f.refreshErr
+	}
 	lock, ok := f.locks[token]
 	if !ok {
 		return nil, store.ErrNotFound
@@ -177,6 +205,8 @@ type fakeACLRepo struct {
 	listByPrincipalErr   error
 	listByResourceCalls  int
 	listByPrincipalCalls int
+	listByResourcesCalls int
+	listScopedACLCalls   int
 	moveResourcePathHook func(fromPath, toPath string)
 	moveResourcePathErr  error
 }
@@ -210,6 +240,52 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 	return result, nil
 }
 
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+// RevokePrincipalGrants mirrors the repository contract: drop the
+// principal's grants of collectionPrivileges on the collection and every grant
+// on a resource beneath it, keeping denies.
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
+}
+
+func (f *fakeACLRepo) ListByPrincipals(ctx context.Context, principalHrefs []string) ([]store.ACLEntry, error) {
+	var result []store.ACLEntry
+	for _, principalHref := range principalHrefs {
+		entries, err := f.ListByPrincipal(ctx, principalHref)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, entries...)
+	}
+	return result, nil
+}
+
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
 	f.listByPrincipalCalls++
 	if f.listByPrincipalErr != nil {
@@ -224,42 +300,12 @@ func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string)
 	return result, nil
 }
 
-func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	entries, err := f.ListByResource(ctx, resourcePath)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if entry.PrincipalHref == principalHref && entry.Privilege == privilege && !entry.IsGrant {
-			return false, nil
-		}
-	}
-	for _, entry := range entries {
-		if entry.PrincipalHref == principalHref && entry.Privilege == privilege && entry.IsGrant {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {
 		if entry.ResourcePath != resourcePath {
 			filtered = append(filtered, entry)
 		}
-	}
-	f.entries = filtered
-	return nil
-}
-
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	filtered := f.entries[:0]
-	for _, entry := range f.entries {
-		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
-			continue
-		}
-		filtered = append(filtered, entry)
 	}
 	f.entries = filtered
 	return nil
@@ -289,7 +335,7 @@ func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath str
 
 func TestRFC6352_RequirementsOverview(t *testing.T) {
 	t.Run("Section3_OptionsAdvertisesCardDAV", func(t *testing.T) {
-		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+		h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 		rr := httptest.NewRecorder()
 
@@ -316,7 +362,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_WebDAVClass3AndACLAreAdvertised", func(t *testing.T) {
-		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+		h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 		rr := httptest.NewRecorder()
 
@@ -332,7 +378,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_WebDAVMethodSurfaceMatchesAdvertisedSupport", func(t *testing.T) {
-		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+		h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		t.Run("collection", func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/1/", nil)
 			rr := httptest.NewRecorder()
@@ -385,7 +431,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 				},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 		vcard := buildVCard("3.0", "UID:locked", "FN:Locked Contact")
 
 		req := newAddressBookPutRequest("/dav/addressbooks/5/locked.vcf", strings.NewReader(vcard))
@@ -408,7 +454,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 	})
 
-	t.Run("Section3_ACLDenyOverridesBroadGrant", func(t *testing.T) {
+	t.Run("Section3_EarlierACLDenyStopsLaterBroadGrant", func(t *testing.T) {
 		user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
@@ -417,11 +463,11 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 
@@ -430,7 +476,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 			t.Fatalf("checkACLPrivilege() error = %v", err)
 		}
 		if granted {
-			t.Fatal("RFC 6352 Section 3: deny ACEs must override broader grants for the same resource")
+			t.Fatal("RFC 3744 Section 6: an earlier matching deny ACE must stop evaluation before a later grant")
 		}
 	})
 
@@ -448,10 +494,10 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -476,7 +522,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -511,10 +557,10 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
-				{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -522,8 +568,8 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 
 		h.Get(rr, req)
 
-		if rr.Code != http.StatusForbidden {
-			t.Fatalf("RFC 6352 Sections 3 and 7: deny ACEs must be enforced by GET handlers, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("RFC 6352 Sections 3 and 7: deny ACEs must be enforced by GET handlers with a non-disclosing 404, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 
@@ -540,7 +586,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Example")
 
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -568,7 +614,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
@@ -608,7 +654,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 			},
 		}
 		aclRepo := &fakeACLRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
@@ -639,7 +685,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_ExtendedMKCOLShouldBeAdvertisedWhenSupported", func(t *testing.T) {
-		h := NewServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+		h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
 		req := httptest.NewRequest(http.MethodOptions, "/dav/addressbooks/", nil)
 		rr := httptest.NewRecorder()
 
@@ -651,7 +697,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_CurrentUserPrincipalDiscovery", func(t *testing.T) {
-		h := &Handler{}
+		h := &DavServer{}
 		user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -678,7 +724,7 @@ func TestRFC6352_RequirementsOverview(t *testing.T) {
 	})
 
 	t.Run("Section3_CurrentUserPrincipalURLDiscovery", func(t *testing.T) {
-		h := &Handler{}
+		h := &DavServer{}
 		user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -724,7 +770,7 @@ func TestRFC6352_DeploymentAndSecurityRequirements(t *testing.T) {
 		bookRepo := &fakeAddressBookRepo{}
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
 		aclRepo := &fakeACLRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		mkcolReq := httptest.NewRequest("MKCOL", "/dav/addressbooks/ProvisionedBook", nil)
 		mkcolReq = mkcolReq.WithContext(auth.WithUser(mkcolReq.Context(), owner))
@@ -787,7 +833,7 @@ func TestRFC6352_AddressBookSecuritySemantics(t *testing.T) {
 	}
 
 	t.Run("Section13_PrivateAddressBooksAreNotReadableByOtherAuthenticatedUsers", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), reader))
@@ -805,7 +851,7 @@ func TestRFC6352_AddressBookSecuritySemantics(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), reader))
@@ -823,7 +869,7 @@ func TestRFC6352_AddressBookSecuritySemantics(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		rr := httptest.NewRecorder()
@@ -840,7 +886,7 @@ func TestRFC6352_AddressBookSecuritySemantics(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), reader))
@@ -858,7 +904,7 @@ func TestRFC6352_AddressBookSecuritySemantics(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		rr := httptest.NewRecorder()
@@ -882,7 +928,7 @@ func TestRFC6352_AddressBookDiscoverySequence(t *testing.T) {
 			2: {ID: 2, UserID: 1, Name: "Family", Description: &desc2, UpdatedAt: now, CTag: 20},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	t.Run("Step1_DiscoverCurrentUserPrincipal", func(t *testing.T) {
@@ -995,7 +1041,7 @@ func TestRFC6352_AddressBookCollectionProperties(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts", Description: &description, UpdatedAt: now, CTag: 9},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	t.Run("Section5_2_ResourceType", func(t *testing.T) {
@@ -1069,7 +1115,6 @@ func TestRFC6352_AddressBookCollectionProperties(t *testing.T) {
 			t.Errorf("RFC 6352 Section 6.2.1: addressbook-description SHOULD NOT be protected against user updates, got %s", rr.Body.String())
 		}
 
-		// Verify the update actually persisted by doing a follow-up PROPFIND
 		propfindBody := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -1244,7 +1289,7 @@ func TestRFC6352_AddressBookCollectionProperties(t *testing.T) {
 }
 
 func TestRFC6352_PrincipalProperties(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	user := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	t.Run("Section7_1_1_AddressbookHomeSetExplicit", func(t *testing.T) {
@@ -1325,7 +1370,7 @@ func TestRFC6352_ProtectedCardDAVProperties(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	user := &store.User{ID: 1}
 
 	tests := []struct {
@@ -1407,7 +1452,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_PutCreatesNewResourceOnUnmappedURI", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0",
 			"UID:alice",
@@ -1427,7 +1472,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_IfNoneMatchStarCreatesNewResource", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0", "UID:new-uid", "FN:New Contact")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/new.vcf", strings.NewReader(vcard))
@@ -1448,7 +1493,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "old"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Updated")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -1469,7 +1514,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "correct-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Updated")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -1490,7 +1535,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Updated", "EMAIL:alice@example.com")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -1519,7 +1564,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: vcard, ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -1552,7 +1597,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: vcard, ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Accept", "application/json")
@@ -1571,10 +1616,10 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", RawVCard: vcard, ETag: "etag-v4"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice-v4.vcf", nil)
-		req.Header.Set("Accept", `text/vcard; version="3.0"`)
+		req.Header.Set("Accept", `text/vcard; version="2.1"`)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
 
@@ -1588,7 +1633,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_RejectsUnsupportedMediaType", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Example")
 		req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -1604,9 +1649,57 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 		assertCardDAVErrorBody(t, rr.Body.String(), "supported-address-data")
 	})
 
+	t.Run("Section6_3_2_1_MediaTypeMatchesTheAdvertisedAddressData", func(t *testing.T) {
+		accepted := map[string]string{
+			"the advertised type":      "text/vcard",
+			"with a charset parameter": "text/vcard; charset=utf-8",
+			"an advertised version":    "text/vcard; version=3.0",
+			"the other advertised one": "text/vcard; version=4.0",
+			"case-insensitive type":    "TEXT/VCard",
+		}
+		refused := map[string]string{
+			"an unadvertised version":          "text/vcard; version=2.1",
+			"a longer type sharing the prefix": "text/vcardjunk",
+			"the legacy directory type":        "text/directory",
+			"calendar data":                    "text/calendar",
+			"an unparseable header":            "text/vcard;;",
+		}
+		vcard := buildVCard("3.0", "UID:media-type", "FN:Media Type")
+
+		for name, contentType := range accepted {
+			t.Run("accepted/"+name, func(t *testing.T) {
+				h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
+				req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/media-type.vcf", strings.NewReader(vcard))
+				req.Header.Set("Content-Type", contentType)
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				h.Put(rr, req)
+
+				if rr.Code != http.StatusCreated {
+					t.Errorf("PUT with Content-Type %q = %d, want 201; body: %s", contentType, rr.Code, rr.Body.String())
+				}
+			})
+		}
+
+		for name, contentType := range refused {
+			t.Run("refused/"+name, func(t *testing.T) {
+				h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
+				req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/media-type.vcf", strings.NewReader(vcard))
+				req.Header.Set("Content-Type", contentType)
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				h.Put(rr, req)
+
+				assertCardDAVPreconditionStatus(t, rr, http.StatusUnsupportedMediaType, "supported-address-data")
+			})
+		}
+	})
+
 	t.Run("Section6_3_2_1_RejectsInvalidVCardData", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader("NOT A VCARD"))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -1622,7 +1715,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section5_1_RejectsVCardWithoutUID", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		card := buildVCard("3.0", "FN:Alice Example")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(card))
@@ -1639,7 +1732,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_RejectsVCardWithoutVersion", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		card := "BEGIN:VCARD\r\nUID:alice\r\nFN:Alice Example\r\nEND:VCARD\r\n"
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(card))
@@ -1656,7 +1749,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_RejectsUnsupportedVCardVersion", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		card := buildVCard("2.1", "UID:alice", "FN:Alice Example")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(card))
@@ -1673,7 +1766,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_RejectsVCardWithoutFN", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		card := buildVCard("3.0", "UID:alice")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(card))
@@ -1714,7 +1807,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
 				contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-				h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+				h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 				req := newAddressBookPutRequest(tc.path, strings.NewReader(tc.card))
 				req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -1731,7 +1824,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section5_1_AddressObjectContainsSingleVCardComponentOnly", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		doubleVCard := buildVCard("3.0", "UID:first", "FN:First") + buildVCard("3.0", "UID:second", "FN:Second")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/double.vcf", strings.NewReader(doubleVCard))
@@ -1745,7 +1838,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section3_ServerShouldSupportVCard4", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("4.0", "UID:alice-v4", "FN:Alice Example")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice-v4.vcf", strings.NewReader(vcard))
@@ -1761,7 +1854,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_2_AcceptsNonStandardXProperties", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0",
 			"UID:alice-x",
@@ -1790,7 +1883,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_2_AcceptsNonStandardParameters", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		vcard := buildVCard("3.0",
 			"UID:alice-param",
@@ -1819,7 +1912,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section5_1_Section6_3_2_1_DuplicateUIDAcrossResourcesRejected", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		first := buildVCard("3.0", "UID:shared-uid", "FN:First Contact")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/first.vcf", strings.NewReader(first))
@@ -1843,7 +1936,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_ChangingUIDOfExistingResourceRejected", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		initial := buildVCard("3.0", "UID:alice", "FN:Alice Example")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(initial))
@@ -1870,7 +1963,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section5_1_Section6_3_2_1_ResourceHrefsPreserveDestinationNames", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		first := buildVCard("3.0", "UID:shared-uid", "FN:First Contact")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/first.vcf", strings.NewReader(first))
@@ -1958,7 +2051,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:shared-uid": {AddressBookID: 5, UID: "shared-uid", ResourceName: "first", RawVCard: buildVCard("3.0", "UID:shared-uid", "FN:First Contact"), ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/first.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -1989,7 +2082,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"6:shared-uid": {AddressBookID: 6, UID: "shared-uid", ResourceName: "existing", RawVCard: buildVCard("3.0", "UID:shared-uid", "FN:Existing Contact"), ETag: "etag-2"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/first.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -2013,7 +2106,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:shared-uid": {AddressBookID: 5, UID: "shared-uid", ResourceName: "first", RawVCard: buildVCard("3.0", "UID:shared-uid", "FN:First Contact"), ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/first.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -2037,7 +2130,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 
 	t.Run("Section6_3_2_1_RejectsResourcesExceedingMaxResourceSize", func(t *testing.T) {
 		contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		oversized := buildVCard("3.0", "UID:alice", "FN:"+strings.Repeat("A", int(maxDAVBodyBytes)))
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(oversized))
@@ -2065,7 +2158,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:shared-uid": {AddressBookID: 5, UID: "shared-uid", ResourceName: "first", RawVCard: oversized, ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/first.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -2093,7 +2186,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:shared-uid": {AddressBookID: 5, UID: "shared-uid", ResourceName: "first", RawVCard: oversized, ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/first.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -2115,7 +2208,7 @@ func TestRFC6352_AddressObjectResources(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: vcard, ETag: "etag-1"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -2156,7 +2249,7 @@ func TestRFC6352_AddressBookCreation(t *testing.T) {
 
 	t.Run("Section6_3_1_MKCOLCreatesAddressBookCollection", func(t *testing.T) {
 		bookRepo := &fakeAddressBookRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 		req := httptest.NewRequest("MKCOL", "/dav/addressbooks/NewBook", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -2191,7 +2284,7 @@ func TestRFC6352_AddressBookCreation(t *testing.T) {
 
 	t.Run("Section6_3_1_ExtendedMKCOLInitializesProperties", func(t *testing.T) {
 		bookRepo := &fakeAddressBookRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:mkcol xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
@@ -2254,7 +2347,7 @@ func TestRFC6352_AddressBookCreation(t *testing.T) {
 				5: {ID: 5, UserID: 1, Name: "Contacts"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 		req := httptest.NewRequest("MKCOL", "/dav/addressbooks/5/ChildBook", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -2269,7 +2362,7 @@ func TestRFC6352_AddressBookCreation(t *testing.T) {
 }
 
 func TestRFC6352_ReportMethodSupport(t *testing.T) {
-	user := &store.User{ID: 1}
+	user := &store.User{ID: 1, FullName: "Test User", PrimaryEmail: "test@example.com"}
 	now := store.Now()
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -2281,19 +2374,15 @@ func TestRFC6352_ReportMethodSupport(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Adams"), ETag: "etag-a", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("Section8_1_ExpandPropertySupportedOnCollection", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
-<D:expand-property xmlns:D="DAV:">
-  <D:prop>
-    <D:current-user-principal>
-      <D:prop>
-        <D:displayname/>
-      </D:prop>
-    </D:current-user-principal>
-  </D:prop>
-</D:expand-property>`
+	<D:expand-property xmlns:D="DAV:">
+	  <D:property name="current-user-principal" namespace="DAV:">
+	    <D:property name="displayname" namespace="DAV:"/>
+	  </D:property>
+	</D:expand-property>`
 
 		req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(body))
 		req.Header.Set("Depth", "0")
@@ -2305,26 +2394,21 @@ func TestRFC6352_ReportMethodSupport(t *testing.T) {
 		if rr.Code != http.StatusMultiStatus {
 			t.Errorf("RFC 6352 Section 8.1: servers MUST support the expand-property REPORT on address book collections, got %d", rr.Code)
 		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "/dav/principals/1/") {
-			t.Errorf("expand-property on a collection should include the expanded principal href, got %s", respBody)
-		}
-		if !strings.Contains(respBody, user.PrimaryEmail) {
-			t.Errorf("expand-property on a collection should include the expanded principal properties, got %s", respBody)
-		}
+		principal := decodeMultistatus(t, rr).
+			responseForHref(t, "/dav/addressbooks/5/").
+			assertPropStatus(t, davQN("current-user-principal"), http.StatusOK)
+		expanded := responseFromElement(t, assertSoleChild(t, principal, davQN("response")))
+		expanded.assertHref(t, "/dav/principals/1/")
+		expanded.assertPropValue(t, davQN("displayname"), http.StatusOK, user.FullName)
 	})
 
 	t.Run("Section8_1_ExpandPropertySupportedOnAddressObjectResource", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
-<D:expand-property xmlns:D="DAV:">
-  <D:prop>
-    <D:current-user-principal>
-      <D:prop>
-        <D:displayname/>
-      </D:prop>
-    </D:current-user-principal>
-  </D:prop>
-</D:expand-property>`
+	<D:expand-property xmlns:D="DAV:">
+	  <D:property name="current-user-principal" namespace="DAV:">
+	    <D:property name="displayname" namespace="DAV:"/>
+	  </D:property>
+	</D:expand-property>`
 
 		req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
 		req.Header.Set("Depth", "0")
@@ -2376,7 +2460,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	}
 
 	t.Run("Section8_1_8_6_QuerySupportedOnAddressBookCollections", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2409,7 +2493,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_TopLevelAddressDataSelectionIsHonored", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2445,7 +2529,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_QueryRequiresDepthHeader", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -2481,7 +2565,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 				LastModified: now,
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: prodidContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: prodidContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2512,7 +2596,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_QueryReportsSupportedOnAddressObjectResources", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2540,7 +2624,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_EmptyMultistatusWhenNoMatches", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{}}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -2565,7 +2649,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_MissingRequestedWebDAVPropertyReturns404Propstat", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2592,7 +2676,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_3_FilteringByTextMatchModes", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		tests := []struct {
 			name      string
@@ -2639,7 +2723,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_3_DefaultCollationAliasUsesUnicodeCasemap", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2669,7 +2753,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section10_5_4_MissingCollationDefaultsToUnicodeCasemap", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2699,7 +2783,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section10_5_3_IsNotDefinedFilter", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2730,7 +2814,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section10_5_FilterTestAttributeAnyOfAndAllOf", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		defaultBody := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2820,7 +2904,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 			"5:home": {AddressBookID: 5, UID: "home", RawVCard: homeVCard, ETag: "etag-home", LastModified: now},
 			"5:work": {AddressBookID: 5, UID: "work", RawVCard: workVCard, ETag: "etag-work", LastModified: now},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2859,7 +2943,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 			"5:typed":   {AddressBookID: 5, UID: "typed", RawVCard: typedVCard, ETag: "etag-typed", LastModified: now},
 			"5:untyped": {AddressBookID: 5, UID: "untyped", RawVCard: untypedVCard, ETag: "etag-untyped", LastModified: now},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2892,7 +2976,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section10_5_4_NegateCondition", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2920,7 +3004,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_3_RejectsUnsupportedCollation", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2945,7 +3029,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_3_RejectsWildcardCollationIdentifiers", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2970,7 +3054,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_RejectsUnsupportedRequestedAddressDataType", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -2993,7 +3077,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_4_PartialRetrievalAllprop", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3023,7 +3107,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_4_SelectedPropertiesPartialRetrieval", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3068,7 +3152,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 		contacts := map[string]*store.Contact{
 			"5:grouped": {AddressBookID: 5, UID: "grouped", RawVCard: groupedVCard, ETag: "etag-grouped", LastModified: now},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 		ungroupedBody := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3127,7 +3211,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section10_4_2_NovalueSelection", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3160,7 +3244,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_5_NonStandardPropertySelection", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3189,7 +3273,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_5_UnsupportedInvalidPropertyFilterFails", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		// Use a property name that is neither a standard vCard property nor an X- extension
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3215,7 +3299,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_5_UnsupportedParamFilterFailsWithSupportedFilter", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3248,7 +3332,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 			"5:x-prop-user": {AddressBookID: 5, UID: "x-prop-user", ResourceName: "x-prop-user", RawVCard: xPropVCard, ETag: "etag-xp", LastModified: now},
 			"5:no-x-prop":   {AddressBookID: 5, UID: "no-x-prop", ResourceName: "no-x-prop", RawVCard: noXPropVCard, ETag: "etag-nxp", LastModified: now},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3290,7 +3374,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 			"5:grouped-b": {AddressBookID: 5, UID: "grouped-b", RawVCard: groupedB, ETag: "etag-grouped-b", LastModified: now},
 			"5:plain":     {AddressBookID: 5, UID: "plain", RawVCard: plain, ETag: "etag-plain", LastModified: now},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 		ungroupedBody := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3347,7 +3431,7 @@ func TestRFC6352_AddressbookQueryReport(t *testing.T) {
 	})
 
 	t.Run("Section8_6_1_And_8_6_2_ClientLimitHandling", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3405,7 +3489,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	}
 
 	t.Run("Section8_7_RequestMustIncludeAtLeastOneHref", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:"/>`
@@ -3423,7 +3507,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_MultigetSupportedOnAddressBookCollections", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3448,7 +3532,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_MultigetSupportedOnAddressObjectResources", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3468,7 +3552,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_MultigetRequiresDepthZero", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3488,7 +3572,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_MultigetRequiresDepthHeader", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3507,7 +3591,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_MissingHrefReturns404ForThatResponse", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3528,7 +3612,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_OutOfScopeHrefReturnsPerResourceError", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3552,7 +3636,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_SelectedPropertiesPartialRetrieval", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3581,10 +3665,10 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_PerResourceVersionConversionFailureUsesSupportedAddressDataConversion", func(t *testing.T) {
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			AddressBooks: bookRepo,
 			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
-				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: buildVCard("4.0", "UID:alice-v4", "FN:Alice Example"), ETag: "etag-v4"},
+				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: "BEGIN:VCARD\r\nUID:alice-v4\r\nFN:Alice Example\r\nEND:VCARD\r\n", ETag: "etag-v4"},
 			}},
 		}}
 
@@ -3617,10 +3701,10 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_TopLevelVersionConversionFailureUsesSupportedAddressDataConversion", func(t *testing.T) {
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			AddressBooks: bookRepo,
 			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
-				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: buildVCard("4.0", "UID:alice-v4", "FN:Alice Example"), ETag: "etag-v4"},
+				"5:alice-v4": {AddressBookID: 5, UID: "alice-v4", ResourceName: "alice-v4", RawVCard: "BEGIN:VCARD\r\nUID:alice-v4\r\nFN:Alice Example\r\nEND:VCARD\r\n", ETag: "etag-v4"},
 			}},
 		}}
 
@@ -3650,7 +3734,7 @@ func TestRFC6352_AddressbookMultigetReport(t *testing.T) {
 	})
 
 	t.Run("Section8_7_RejectsUnsupportedRequestedAddressDataType", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: baseContacts}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
@@ -3686,7 +3770,7 @@ func TestRFC6352_UnicodeCollation(t *testing.T) {
 		"5:jose":    {AddressBookID: 5, UID: "jose", ResourceName: "jose", RawVCard: joseVCard, ETag: "etag-jose", LastModified: now},
 		"5:strasse": {AddressBookID: 5, UID: "strasse", ResourceName: "strasse", RawVCard: strasseVCard, ETag: "etag-strasse", LastModified: now},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 	t.Run("UnicodeCasemapMatchesAccentedCharacters", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3740,8 +3824,8 @@ func TestRFC6352_UnicodeCollation(t *testing.T) {
 	})
 
 	t.Run("AsciiCasemapDoesNotFoldUnicode", func(t *testing.T) {
-		// i;ascii-casemap only does ASCII uppercasing; 'é' != 'É' via ToUpper for non-ASCII
-		// but more importantly, ß does NOT fold to SS under ASCII-only rules
+		// i;ascii-casemap folds only US-ASCII letters (RFC 4790), so ß does not
+		// fold to ss and "Straße" does not match "strasse".
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
   <D:prop><D:getetag/></D:prop>
@@ -3781,7 +3865,7 @@ func TestRFC6352_Depth0AddressbookQuery(t *testing.T) {
 	contacts := map[string]*store.Contact{
 		"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: aliceVCard, ETag: "etag-a", LastModified: now},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 	t.Run("Section8_6_Depth0OnCollectionReturnsNoResources", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3822,7 +3906,7 @@ func TestRFC6352_UIDConflictIncludesHref(t *testing.T) {
 	contacts := map[string]*store.Contact{
 		"5:duplicate-uid": {AddressBookID: 5, UID: "duplicate-uid", ResourceName: "existing", RawVCard: existingVCard, ETag: "etag-existing", LastModified: now},
 	}
-	h := &Handler{
+	h := &DavServer{
 		store: &store.Store{
 			AddressBooks:     bookRepo,
 			Contacts:         &fakeContactRepo{contacts: contacts},
@@ -3832,7 +3916,6 @@ func TestRFC6352_UIDConflictIncludesHref(t *testing.T) {
 	}
 
 	t.Run("Section6_3_2_1_NoUIDConflictIncludesHref", func(t *testing.T) {
-		// Try to PUT a new contact at a different path but with the same UID
 		newVCard := buildVCard("3.0", "UID:duplicate-uid", "FN:New Contact Same UID")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/different-resource.vcf", strings.NewReader(newVCard))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -3864,7 +3947,7 @@ func TestRFC6352_ExpandPropertyAtDAVRoot(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now, CTag: 1},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	t.Run("Section8_1_ExpandPropertySupportedOnDAVRoot", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -3931,13 +4014,12 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	t.Run("ExclusiveLockByUser1BlocksUser2Lock", func(t *testing.T) {
-		// User 1 takes an exclusive lock
 		lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/contact.vcf", strings.NewReader(lockBody))
 		req.Header.Set("Timeout", "Second-3600")
@@ -3949,7 +4031,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected user1 LOCK to succeed with 200, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// User 2 attempts an exclusive lock on the same resource
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/contact.vcf", strings.NewReader(lockBody))
 		req2.Header.Set("Timeout", "Second-3600")
 		req2 = req2.WithContext(auth.WithUser(req2.Context(), user2))
@@ -3963,7 +4044,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 
 	t.Run("SharedLockAllowsAnotherSharedLock", func(t *testing.T) {
 		sharedLockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-		sh := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: sharedLockRepo, ACLEntries: aclRepo}}
+		sh := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: sharedLockRepo, ACLEntries: aclRepo}}
 
 		sharedBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/shared.vcf", strings.NewReader(sharedBody))
@@ -3976,7 +4057,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected shared lock to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// User 2 takes another shared lock — should succeed
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/shared.vcf", strings.NewReader(sharedBody))
 		req2.Header.Set("Timeout", "Second-3600")
 		req2 = req2.WithContext(auth.WithUser(req2.Context(), user2))
@@ -3990,7 +4070,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 
 	t.Run("SharedLockBlocksExclusiveLock", func(t *testing.T) {
 		sharedLockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-		sh := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: sharedLockRepo, ACLEntries: aclRepo}}
+		sh := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: sharedLockRepo, ACLEntries: aclRepo}}
 
 		sharedBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/mixed.vcf", strings.NewReader(sharedBody))
@@ -4003,7 +4083,6 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 			t.Fatalf("expected shared lock to succeed, got %d", rr.Code)
 		}
 
-		// User 2 requests an exclusive lock — should be blocked
 		exclusiveBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req2 := httptest.NewRequest("LOCK", "/dav/addressbooks/5/mixed.vcf", strings.NewReader(exclusiveBody))
 		req2.Header.Set("Timeout", "Second-3600")
@@ -4020,7 +4099,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 		descendantLockRepo := &fakeLockRepo{locks: map[string]*store.Lock{
 			"opaquelocktoken:child": {
 				Token:        "opaquelocktoken:child",
-				ResourcePath: "/dav/addressbooks/5/alice.vcf",
+				ResourcePath: "/dav/addressbooks/5/alice",
 				UserID:       user1.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -4033,7 +4112,7 @@ func TestRFC6352_LockConflictBetweenUsers(t *testing.T) {
 				5: {ID: 5, UserID: user1.ID, Name: "Contacts"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: descendantLockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: descendantLockRepo}}
 
 		lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", strings.NewReader(lockBody))
@@ -4056,7 +4135,7 @@ func TestRFC4918_LockResponseUsesDAVXML(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
@@ -4096,9 +4175,8 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 			5: {ID: 5, UserID: user1.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
-	// User 1 creates a lock
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
 	req.Header.Set("Timeout", "Second-3600")
@@ -4115,7 +4193,6 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 		t.Fatal("expected Lock-Token header in response")
 	}
 
-	// User 2 attempts to UNLOCK the resource — should be forbidden
 	unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	unlockReq.Header.Set("Lock-Token", lockToken)
 	unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user2))
@@ -4126,7 +4203,6 @@ func TestRFC6352_UnlockByWrongUser(t *testing.T) {
 		t.Fatalf("RFC 4918: UNLOCK by a different user MUST be forbidden, got %d: %s", unlockRR.Code, unlockRR.Body.String())
 	}
 
-	// User 1 can successfully UNLOCK
 	unlockReq2 := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	unlockReq2.Header.Set("Lock-Token", lockToken)
 	unlockReq2 = unlockReq2.WithContext(auth.WithUser(unlockReq2.Context(), user1))
@@ -4146,9 +4222,8 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
-	// Create a lock with a short timeout
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/refresh.vcf", strings.NewReader(lockBody))
 	req.Header.Set("Timeout", "Second-600")
@@ -4161,7 +4236,6 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 	}
 
 	lockToken := rr.Header().Get("Lock-Token")
-	// Strip angle brackets
 	token := strings.TrimPrefix(strings.TrimSuffix(lockToken, ">"), "<")
 
 	t.Run("RefreshExtensdsTimeout", func(t *testing.T) {
@@ -4177,7 +4251,6 @@ func TestRFC6352_LockRefresh(t *testing.T) {
 			t.Fatalf("RFC 4918: lock refresh via If header MUST succeed, got %d: %s", refreshRR.Code, refreshRR.Body.String())
 		}
 
-		// Verify the lock still exists and timeout was updated
 		refreshed, _ := lockRepo.GetByToken(context.Background(), token)
 		if refreshed == nil {
 			t.Fatal("expected lock to still exist after refresh")
@@ -4262,7 +4335,7 @@ func TestRFC6352_Depth0CollectionLockBlocksMemberMutation(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	t.Run("PutOfNewMemberReturns423", func(t *testing.T) {
 		req := newAddressBookPutRequest("/dav/addressbooks/5/bob.vcf", strings.NewReader(buildVCard("3.0", "UID:bob", "FN:Bob")))
@@ -4295,7 +4368,7 @@ func TestRFC6352_InvalidLockDepthRejected(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
@@ -4335,7 +4408,7 @@ func TestRFC6352_CollectionLockTokensAuthorizeMemberWrites(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req.Header.Set("If", `</dav/addressbooks/5/> (<opaquelocktoken:collection>)`)
@@ -4366,7 +4439,7 @@ func TestRFC4918_NegatedIfStateDoesNotAuthorizeLockedWrite(t *testing.T) {
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:member": {
 				Token:          "opaquelocktoken:member",
-				ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+				ResourcePath:   "/dav/addressbooks/5/alice",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -4376,7 +4449,7 @@ func TestRFC4918_NegatedIfStateDoesNotAuthorizeLockedWrite(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	req.Header.Set("If", `(Not <opaquelocktoken:member>)`)
@@ -4399,7 +4472,7 @@ func TestRFC6352_LockAuthorizationAndErrorHandling(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 		lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
@@ -4426,7 +4499,7 @@ func TestRFC6352_LockAuthorizationAndErrorHandling(t *testing.T) {
 			locks:              map[string]*store.Lock{},
 			listByResourcesErr: errors.New("lock store unavailable"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4457,7 +4530,8 @@ func TestRFC6352_SyncCollectionOnAddressBook(t *testing.T) {
 		},
 	}
 	deletedRepo := &fakeDeletedResourceRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	contactRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	t.Run("Section8_2_InitialSyncReturnsAllContacts", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -4542,7 +4616,7 @@ func TestRFC6352_LockTimeoutParsing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Incremental sync-collection (RFC 6578 Section 3)
+// Incremental sync-collection (RFC 6578 Section 3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
@@ -4566,7 +4640,8 @@ func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 5, UID: "carol", ResourceName: "carol", DeletedAt: laterTime},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	contactRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	t.Run("IncrementalSyncReturnsOnlyChangedAndDeleted", func(t *testing.T) {
 		// Build a sync-token that represents a point in time before bob was modified and carol was deleted,
@@ -4619,7 +4694,7 @@ func TestRFC6352_IncrementalSyncCollection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. DELETE of address book collection (RFC 6352 Section 6.3 / RFC 4918 Section 9.6)
+// DELETE of address book collection (RFC 6352 Section 6.3 / RFC 4918 Section 9.6)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
@@ -4637,7 +4712,7 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
 
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4648,7 +4723,6 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 			t.Fatalf("RFC 4918 Section 9.6: DELETE on an address object resource MUST return 204, got %d: %s", rr.Code, rr.Body.String())
 		}
 
-		// Verify the contact was actually removed
 		c, _ := contactRepo.GetByResourceName(context.Background(), 5, "alice")
 		if c != nil {
 			t.Error("RFC 4918 Section 9.6: DELETE must actually remove the resource from the store")
@@ -4661,7 +4735,7 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 				5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
 
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/nonexistent.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4686,10 +4760,10 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 		}
 		lockRepo := &fakeLockRepo{
 			locks: map[string]*store.Lock{
-				"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice.vcf", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+				"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4703,7 +4777,7 @@ func TestRFC6352_DeleteAddressBookCollection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. addressbook-query with empty filter (RFC 6352 Section 8.6)
+// addressbook-query with empty filter (RFC 6352 Section 8.6)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_AddressbookQueryEmptyFilter(t *testing.T) {
@@ -4718,7 +4792,7 @@ func TestRFC6352_AddressbookQueryEmptyFilter(t *testing.T) {
 		"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
 		"5:bob":   {AddressBookID: 5, UID: "bob", ResourceName: "bob", RawVCard: buildVCard("3.0", "UID:bob", "FN:Bob"), ETag: "etag-b", LastModified: now},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 	t.Run("EmptyFilterMatchesAllResources", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -4769,7 +4843,7 @@ func TestRFC6352_AddressbookQueryEmptyFilter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. PROPPATCH on address object resources (RFC 6352 Section 6.3.2.3)
+// PROPPATCH on address object resources (RFC 6352 Section 6.3.2.3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
@@ -4782,7 +4856,7 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 				5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -4805,7 +4879,6 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 			t.Errorf("RFC 4918 Section 9.2: successful PROPPATCH should include 200 propstat, got: %s", rr.Body.String())
 		}
 
-		// Verify the update took effect
 		book := bookRepo.books[5]
 		if book.Name != "Renamed Book" {
 			t.Errorf("PROPPATCH should update the display name, got %q", book.Name)
@@ -4818,7 +4891,7 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 				5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -4855,7 +4928,7 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:">
@@ -4871,17 +4944,17 @@ func TestRFC6352_ProppatchOnAddressBook(t *testing.T) {
 		rr := httptest.NewRecorder()
 		h.Proppatch(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "403") {
-			t.Errorf("RFC 4918/RFC 3744: PROPPATCH by non-owner MUST return 403 propstat, got: %s", rr.Body.String())
+		if !strings.Contains(rr.Body.String(), "<D:need-privileges>") || !strings.Contains(rr.Body.String(), "<D:write-properties/>") {
+			t.Errorf("RFC 3744: PROPPATCH privilege failure must identify DAV:write-properties, got: %s", rr.Body.String())
 		}
 	})
 }
 
 // ---------------------------------------------------------------------------
-// 5. Depth:infinity for addressbook-query (RFC 6352 Section 8.6.1)
+// Depth:infinity for addressbook-query (RFC 6352 Section 8.6.1)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_DepthInfinityAddressbookQuery(t *testing.T) {
@@ -4895,7 +4968,7 @@ func TestRFC6352_DepthInfinityAddressbookQuery(t *testing.T) {
 	contacts := map[string]*store.Contact{
 		"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a", LastModified: now},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 	t.Run("DepthInfinityReturnsContactResources", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -4924,7 +4997,7 @@ func TestRFC6352_DepthInfinityAddressbookQuery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. COPY/MOVE cross-collection integration (RFC 4918 Sections 9.8/9.9)
+// COPY/MOVE cross-collection integration (RFC 4918 Sections 9.8/9.9)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_CopyMoveIntegration(t *testing.T) {
@@ -4945,7 +5018,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "/dav/addressbooks/6/alice.vcf")
@@ -4981,7 +5054,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/bob.vcf", nil)
 		req.Header.Set("Destination", "/dav/addressbooks/6/bob.vcf")
@@ -5018,7 +5091,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "/dav/addressbooks/6/alice.vcf")
@@ -5046,10 +5119,10 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 		}
 		lockRepo := &fakeLockRepo{
 			locks: map[string]*store.Lock{
-				"tok-src": {Token: "tok-src", ResourcePath: "/dav/addressbooks/5/carol.vcf", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+				"tok-src": {Token: "tok-src", ResourcePath: "/dav/addressbooks/5/carol", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/carol.vcf", nil)
 		req.Header.Set("Destination", "/dav/addressbooks/6/carol.vcf")
@@ -5064,7 +5137,7 @@ func TestRFC6352_CopyMoveIntegration(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. ACL enforcement on writes (RFC 3744)
+// ACL enforcement on writes (RFC 3744)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
@@ -5084,7 +5157,7 @@ func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -5114,7 +5187,7 @@ func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo}}
 
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -5143,7 +5216,7 @@ func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo, Locks: lockRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 		vcard := buildVCard("3.0", "UID:alice", "FN:Alice Updated")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(vcard))
@@ -5158,7 +5231,7 @@ func TestRFC6352_ACLDenyBlocksPutDelete(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Multiple shared locks (RFC 4918 Section 6.2)
+// Multiple shared locks (RFC 4918 Section 6.2)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
@@ -5179,7 +5252,7 @@ func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	// Both users take shared locks
 	sharedBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
@@ -5208,7 +5281,6 @@ func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
 	t.Run("SharedLockHolderCanWriteWithToken", func(t *testing.T) {
 		vcard := buildVCard("3.0", "UID:shared-contact", "FN:Shared Contact")
 		req := newAddressBookPutRequest("/dav/addressbooks/5/shared-contact.vcf", strings.NewReader(vcard))
-		// Strip angle brackets from lock token for If header
 		cleanToken := strings.TrimPrefix(strings.TrimSuffix(token1, ">"), "<")
 		req.Header.Set("If", "(<"+cleanToken+">)")
 		req = req.WithContext(auth.WithUser(req.Context(), user1))
@@ -5249,7 +5321,7 @@ func TestRFC6352_SharedLocksAllowWrites(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Lock timeout capping integration test
+// Lock timeout capping integration test
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_LockTimeoutCappingIntegration(t *testing.T) {
@@ -5260,7 +5332,7 @@ func TestRFC6352_LockTimeoutCappingIntegration(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	t.Run("OversizedTimeoutIsCapped", func(t *testing.T) {
 		lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
@@ -5303,7 +5375,7 @@ func TestRFC6352_LockTimeoutCappingIntegration(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. content-type/version in address-data responses (RFC 6352 Section 10.3)
+// content-type/version in address-data responses (RFC 6352 Section 10.3)
 // ---------------------------------------------------------------------------
 
 func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
@@ -5318,7 +5390,7 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 	contacts := map[string]*store.Contact{
 		"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: aliceVCard, ETag: "etag-a", LastModified: now},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{contacts: contacts}}}
 
 	t.Run("MultigetIncludesAddressDataInResponse", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -5378,11 +5450,9 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 		}
 		respBody := rr.Body.String()
 
-		// Verify the response contains the vCard data
 		if !strings.Contains(respBody, "BEGIN:VCARD") {
 			t.Errorf("RFC 6352 Section 10.3: addressbook-query response MUST include vCard data when address-data is requested, got: %s", respBody)
 		}
-		// Verify the content type is indicated in the response
 		if !strings.Contains(respBody, "text/vcard") {
 			t.Logf("Note: address-data element may not include explicit content-type attribute — acceptable if vCard is returned correctly")
 		}
@@ -5405,4 +5475,28 @@ func TestRFC6352_AddressDataResponseFormat(t *testing.T) {
 			t.Errorf("RFC 6352 Section 10.3: address data MUST include VERSION property, got: %s", rr.Body.String())
 		}
 	})
+}
+
+// propstatHasStatus and extractPropInt probe response XML with regular
+// expressions and match element names without their namespaces; the
+// namespace-aware helpers in dav_xml_assert_test.go do not.
+func propstatHasStatus(body, prop string, statusCode int) bool {
+	pattern := fmt.Sprintf(`(?s)<[^>]*propstat[^>]*>.*?<[^>]*%s[^>]*>.*?<[^>]*status[^>]*>HTTP/1.1 %d`,
+		regexp.QuoteMeta(prop), statusCode)
+	re := regexp.MustCompile(pattern)
+	return re.MatchString(body)
+}
+
+func extractPropInt(body, prop string) (int, bool) {
+	pattern := fmt.Sprintf(`(?s)<[^>]*%s[^>]*>\s*([0-9]+)\s*<`, regexp.QuoteMeta(prop))
+	re := regexp.MustCompile(pattern)
+	match := re.FindStringSubmatch(body)
+	if len(match) < 2 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }

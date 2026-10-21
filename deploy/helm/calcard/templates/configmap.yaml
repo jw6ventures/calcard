@@ -12,8 +12,88 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 data:
   APP_BASE_URL: {{ required "app.baseUrl is required" .Values.app.baseUrl | quote }}
+  {{- /* helm upgrade --reuse-values replaces this chart's defaults with the
+         previous release's, so a key that release's chart did not define is
+         absent rather than defaulted. An absent key is left out, and the server
+         applies its own default, which is the one values.yaml documents. */}}
+  {{- with .Values.app.db }}
+  {{- if hasKey . "maxOpenConns" }}
+  APP_DB_MAX_OPEN_CONNS: {{ include "calcard.integer" (list "app.db.maxOpenConns" .maxOpenConns 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxIdleConns" }}
+  APP_DB_MAX_IDLE_CONNS: {{ include "calcard.integer" (list "app.db.maxIdleConns" .maxIdleConns 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "connMaxLifetime" }}
+  APP_DB_CONN_MAX_LIFETIME: {{ .connMaxLifetime | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.app.http }}
+  {{- if hasKey . "readTimeout" }}
+  APP_HTTP_READ_TIMEOUT: {{ .readTimeout | quote }}
+  {{- end }}
+  {{- if hasKey . "writeTimeout" }}
+  APP_HTTP_WRITE_TIMEOUT: {{ .writeTimeout | quote }}
+  {{- end }}
+  {{- if hasKey . "idleTimeout" }}
+  APP_HTTP_IDLE_TIMEOUT: {{ .idleTimeout | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if hasKey .Values.app "trafficCaptureFile" }}
+  APP_TRAFFIC_CAPTURE_FILE: {{ .Values.app.trafficCaptureFile | quote }}
+  {{- end }}
   APP_OAUTH_CLIENT_ID: {{ .Values.app.oauth.clientId | quote }}
   APP_OAUTH_ISSUER_URL: {{ .Values.app.oauth.issuerUrl | quote }}
   APP_OAUTH_DISCOVERY_URL: {{ .Values.app.oauth.discoveryUrl | quote }}
   APP_TRUSTED_PROXIES: {{ .Values.app.trustedProxies | quote }}
+  {{- if hasKey .Values.app "logLevel" }}
   LOG_LEVEL: {{ .Values.app.logLevel | quote }}
+  {{- end }}
+  {{- with .Values.app.dav }}
+  {{- /* hasKey rather than with, so an explicit 0 -- which turns a limit off --
+         reaches the server instead of being dropped as an empty value. */}}
+  {{- if hasKey . "propfindInfinityEnabled" }}
+  APP_DAV_PROPFIND_INFINITY_ENABLED: {{ .propfindInfinityEnabled | quote }}
+  {{- end }}
+  {{- if hasKey . "digestEnabled" }}
+  APP_DAV_DIGEST_ENABLED: {{ .digestEnabled | quote }}
+  {{- end }}
+  {{- if hasKey . "insecureBasicEnabled" }}
+  APP_DAV_INSECURE_BASIC_ENABLED: {{ .insecureBasicEnabled | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultistatusResponses" }}
+  APP_DAV_MAX_MULTISTATUS_RESPONSES: {{ include "calcard.integer" (list "app.dav.maxMultistatusResponses" .maxMultistatusResponses 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultistatusBytes" }}
+  APP_DAV_MAX_MULTISTATUS_BYTES: {{ include "calcard.integer" (list "app.dav.maxMultistatusBytes" .maxMultistatusBytes 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxFilterElements" }}
+  APP_DAV_MAX_FILTER_ELEMENTS: {{ include "calcard.integer" (list "app.dav.maxFilterElements" .maxFilterElements 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxReportElementDepth" }}
+  APP_DAV_MAX_REPORT_ELEMENT_DEPTH: {{ include "calcard.integer" (list "app.dav.maxReportElementDepth" .maxReportElementDepth 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxCardDAVQueryBytes" }}
+  APP_DAV_MAX_CARDDAV_QUERY_BYTES: {{ include "calcard.integer" (list "app.dav.maxCardDAVQueryBytes" .maxCardDAVQueryBytes 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxAddressDataProperties" }}
+  APP_DAV_MAX_ADDRESS_DATA_PROPERTIES: {{ include "calcard.integer" (list "app.dav.maxAddressDataProperties" .maxAddressDataProperties 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxRequestedProperties" }}
+  APP_DAV_MAX_REQUESTED_PROPERTIES: {{ include "calcard.integer" (list "app.dav.maxRequestedProperties" .maxRequestedProperties 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxMultigetHrefs" }}
+  APP_DAV_MAX_MULTIGET_HREFS: {{ include "calcard.integer" (list "app.dav.maxMultigetHrefs" .maxMultigetHrefs 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "maxReportCandidateRows" }}
+  APP_DAV_MAX_REPORT_CANDIDATE_ROWS: {{ include "calcard.integer" (list "app.dav.maxReportCandidateRows" .maxReportCandidateRows 0) | quote }}
+  {{- end }}
+  {{- if hasKey . "syncHistoryRetention" }}
+  APP_DAV_SYNC_HISTORY_RETENTION: {{ .syncHistoryRetention | quote }}
+  {{- end }}
+  {{- if hasKey . "reportTimeout" }}
+  {{- if not (regexMatch "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" (toString .reportTimeout)) }}
+  {{- fail (printf "app.dav.reportTimeout must be a Go duration such as 10s, or 0, got %v" .reportTimeout) }}
+  {{- end }}
+  APP_DAV_REPORT_TIMEOUT: {{ .reportTimeout | quote }}
+  {{- end }}
+  {{- end }}

@@ -22,21 +22,25 @@ func TestAppPasswordRepoCRUDAndQueries(t *testing.T) {
 	now := time.Now().UTC()
 	expires := now.Add(24 * time.Hour)
 	lastUsed := now.Add(time.Hour)
+	md5HA1 := "md5-ha1"
+	sha256HA1 := "sha256-ha1"
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-INSERT INTO app_passwords (user_id, label, token_hash, expires_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+INSERT INTO app_passwords (user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 `)).
-		WithArgs(int64(7), "Laptop", "hash", &expires).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "created_at", "expires_at", "revoked_at", "last_used_at"}).
-			AddRow(int64(1), int64(7), "Laptop", "hash", now, expires, nil, nil))
+		WithArgs(int64(7), "Laptop", "hash", &md5HA1, &sha256HA1, &expires).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "digest_md5_ha1", "digest_sha256_ha1", "created_at", "expires_at", "revoked_at", "last_used_at"}).
+			AddRow(int64(1), int64(7), "Laptop", "hash", md5HA1, sha256HA1, now, expires, nil, nil))
 
 	created, err := repo.Create(context.Background(), AppPassword{
-		UserID:    7,
-		Label:     "Laptop",
-		TokenHash: "hash",
-		ExpiresAt: &expires,
+		UserID:          7,
+		Label:           "Laptop",
+		TokenHash:       "hash",
+		DigestMD5HA1:    &md5HA1,
+		DigestSHA256HA1: &sha256HA1,
+		ExpiresAt:       &expires,
 	})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -46,14 +50,14 @@ RETURNING id, user_id, label, token_hash, created_at, expires_at, revoked_at, la
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta(`
-SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at
+SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at
 FROM app_passwords
 WHERE user_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
 ORDER BY created_at DESC
 `)).
 		WithArgs(int64(7)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "created_at", "expires_at", "revoked_at", "last_used_at"}).
-			AddRow(int64(1), int64(7), "Laptop", "hash", now, expires, nil, lastUsed))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "label", "token_hash", "digest_md5_ha1", "digest_sha256_ha1", "created_at", "expires_at", "revoked_at", "last_used_at"}).
+			AddRow(int64(1), int64(7), "Laptop", "hash", md5HA1, sha256HA1, now, expires, nil, lastUsed))
 
 	found, err := repo.FindValidByUser(context.Background(), 7)
 	if err != nil {
@@ -63,7 +67,7 @@ ORDER BY created_at DESC
 		t.Fatalf("FindValidByUser() = %#v", found)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, label, token_hash, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, user_id, label, token_hash, digest_md5_ha1, digest_sha256_ha1, created_at, expires_at, revoked_at, last_used_at FROM app_passwords WHERE id=$1`)).
 		WithArgs(int64(9)).
 		WillReturnError(sql.ErrNoRows)
 
@@ -101,7 +105,134 @@ ORDER BY created_at DESC
 	}
 }
 
-func TestDeletedResourceRepoListAndCleanup(t *testing.T) {
+// Purging may never cost a credential its Basic access, which the token hash
+// alone decides, and it has to be safe to repeat.
+func TestAppPasswordRepoPurgesDigestCredentialsWithoutBreakingBasic(t *testing.T) {
+	st := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := st.Users.UpsertOAuthUser(ctx, "subject-purge", "purge@example.test", "Test User", "Test")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
+	}
+
+	md5HA1, sha256HA1 := "sealed-md5", "sealed-sha256"
+	sealed, err := st.AppPasswords.Create(ctx, AppPassword{
+		UserID:          user.ID,
+		Label:           "sealed",
+		TokenHash:       "bcrypt-hash",
+		DigestMD5HA1:    &md5HA1,
+		DigestSHA256HA1: &sha256HA1,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	partial, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: "partial", TokenHash: "bcrypt-hash", DigestSHA256HA1: &sha256HA1})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	bare, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: "bare", TokenHash: "bcrypt-hash"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	purged, err := st.AppPasswords.PurgeDigestCredentials(ctx)
+	if err != nil {
+		t.Fatalf("PurgeDigestCredentials() error = %v", err)
+	}
+	if purged != 2 {
+		t.Fatalf("PurgeDigestCredentials() = %d, want 2 (the rows holding any HA1)", purged)
+	}
+	for _, id := range []int64{sealed.ID, partial.ID, bare.ID} {
+		requireAppPasswordDigestState(t, st, id, nil, nil)
+	}
+
+	again, err := st.AppPasswords.PurgeDigestCredentials(ctx)
+	if err != nil {
+		t.Fatalf("repeated PurgeDigestCredentials() error = %v", err)
+	}
+	if again != 0 {
+		t.Fatalf("repeated PurgeDigestCredentials() = %d, want 0", again)
+	}
+}
+
+// Replacing an HA1 is one compare-and-swap, so two requests acting on
+// different reads of the same row cannot interleave into a state neither
+// intended: the one whose read is stale changes nothing and is told so.
+func TestAppPasswordRepoReplaceDigestCredentialsIsACompareAndSwap(t *testing.T) {
+	st := newPostgresStore(t)
+	ctx := context.Background()
+	user, err := st.Users.UpsertOAuthUser(ctx, "subject-replace", "replace@example.test", "Test User", "Test")
+	if err != nil {
+		t.Fatalf("UpsertOAuthUser() error = %v", err)
+	}
+	ptr := func(value string) *string { return &value }
+
+	for _, tc := range []struct {
+		name                 string
+		storedMD5, storedSHA *string
+		oldMD5, oldSHA       *string
+		newMD5, newSHA       *string
+		wantSwapped          bool
+	}{
+		{name: "fills an empty row", newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "replaces what the caller read", storedMD5: ptr("old-md5"), storedSHA: ptr("old-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "replaces a partial row", storedSHA: ptr("old-sha"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha"), wantSwapped: true},
+		{name: "clears what the caller read", storedMD5: ptr("old-md5"), storedSHA: ptr("old-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), wantSwapped: true},
+		{name: "loses to a concurrent fill", storedMD5: ptr("b-md5"), storedSHA: ptr("b-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "loses to a concurrent replacement", storedMD5: ptr("b-md5"), storedSHA: ptr("b-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "loses to a concurrent clear", oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha"), newMD5: ptr("a-md5"), newSHA: ptr("a-sha")},
+		{name: "matches both columns, not one", storedMD5: ptr("old-md5"), storedSHA: ptr("b-sha"), oldMD5: ptr("old-md5"), oldSHA: ptr("old-sha")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			created, err := st.AppPasswords.Create(ctx, AppPassword{UserID: user.ID, Label: tc.name, TokenHash: "bcrypt-hash", DigestMD5HA1: tc.storedMD5, DigestSHA256HA1: tc.storedSHA})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			swapped, err := st.AppPasswords.ReplaceDigestCredentials(ctx, created.ID, tc.newMD5, tc.newSHA, tc.oldMD5, tc.oldSHA)
+			if err != nil {
+				t.Fatalf("ReplaceDigestCredentials() error = %v", err)
+			}
+			if swapped != tc.wantSwapped {
+				t.Fatalf("ReplaceDigestCredentials() = %v, want %v", swapped, tc.wantSwapped)
+			}
+			wantMD5, wantSHA := tc.storedMD5, tc.storedSHA
+			if tc.wantSwapped {
+				wantMD5, wantSHA = tc.newMD5, tc.newSHA
+			}
+			requireAppPasswordDigestState(t, st, created.ID, wantMD5, wantSHA)
+		})
+	}
+
+	swapped, err := st.AppPasswords.ReplaceDigestCredentials(ctx, 1<<40, ptr("a-md5"), ptr("a-sha"), nil, nil)
+	if err != nil || swapped {
+		t.Fatalf("ReplaceDigestCredentials() on a missing row = %v, %v; want false, nil", swapped, err)
+	}
+}
+
+func requireAppPasswordDigestState(t *testing.T, st *Store, id int64, wantMD5, wantSHA *string) {
+	t.Helper()
+	got, err := st.AppPasswords.GetByID(context.Background(), id)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID(%d) = %#v, %v", id, got, err)
+	}
+	for column, pair := range map[string][2]*string{"digest_md5_ha1": {got.DigestMD5HA1, wantMD5}, "digest_sha256_ha1": {got.DigestSHA256HA1, wantSHA}} {
+		if (pair[0] == nil) != (pair[1] == nil) || pair[0] != nil && *pair[0] != *pair[1] {
+			t.Fatalf("app password %d %s = %v, want %v", id, column, derefForLog(pair[0]), derefForLog(pair[1]))
+		}
+	}
+	if got.TokenHash != "bcrypt-hash" {
+		t.Fatalf("app password %d token hash = %q, want it untouched", id, got.TokenHash)
+	}
+}
+
+func derefForLog(value *string) string {
+	if value == nil {
+		return "<NULL>"
+	}
+	return *value
+}
+
+func TestDeletedResourceRepoCleanup(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New() error = %v", err)
@@ -109,21 +240,6 @@ func TestDeletedResourceRepoListAndCleanup(t *testing.T) {
 	defer db.Close()
 
 	repo := &deletedResourceRepo{pool: db}
-	since := time.Now().Add(-time.Hour).UTC()
-	deletedAt := since.Add(10 * time.Minute)
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, resource_type, collection_id, uid, resource_name, deleted_at FROM deleted_resources WHERE resource_type=$1 AND collection_id=$2 AND deleted_at > $3 ORDER BY deleted_at DESC`)).
-		WithArgs("event", int64(4), since).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "resource_type", "collection_id", "uid", "resource_name", "deleted_at"}).
-			AddRow(int64(8), "event", int64(4), "uid-1", "uid-1.ics", deletedAt))
-
-	items, err := repo.ListDeletedSince(context.Background(), "event", 4, since)
-	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
-	}
-	if len(items) != 1 || items[0].UID != "uid-1" {
-		t.Fatalf("ListDeletedSince() = %#v", items)
-	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deleted_resources WHERE deleted_at < $1`)).
 		WithArgs(sqlmock.AnyArg()).
@@ -248,13 +364,15 @@ func TestScanHelpersHandleNullableFields(t *testing.T) {
 		*(dest[1].(*int64)) = 2
 		*(dest[2].(*string)) = "Laptop"
 		*(dest[3].(*string)) = "hash"
-		*(dest[4].(*time.Time)) = now
-		*(dest[5].(*sql.NullTime)) = sql.NullTime{}
-		*(dest[6].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[4].(*sql.NullString)) = sql.NullString{String: "md5-ha1", Valid: true}
+		*(dest[5].(*sql.NullString)) = sql.NullString{}
+		*(dest[6].(*time.Time)) = now
 		*(dest[7].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[8].(*sql.NullTime)) = sql.NullTime{}
+		*(dest[9].(*sql.NullTime)) = sql.NullTime{}
 		return nil
 	})
-	if err != nil || app.ExpiresAt != nil || app.RevokedAt != nil || app.LastUsedAt != nil {
+	if err != nil || app.DigestMD5HA1 == nil || *app.DigestMD5HA1 != "md5-ha1" || app.DigestSHA256HA1 != nil || app.ExpiresAt != nil || app.RevokedAt != nil || app.LastUsedAt != nil {
 		t.Fatalf("scanAppPassword() = %#v, %v", app, err)
 	}
 

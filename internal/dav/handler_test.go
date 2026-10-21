@@ -8,13 +8,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -65,7 +67,7 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{
+	h := &DavServer{
 		store: &store.Store{Contacts: contactRepo},
 	}
 
@@ -78,7 +80,8 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}
 
-	// Check that UIDs are properly formatted
+	// Each birthday event has a birthday- UID, a yearly recurrence and
+	// transparent time.
 	for _, ev := range events {
 		if !strings.HasPrefix(ev.UID, "birthday-") {
 			t.Errorf("expected birthday event UID to start with 'birthday-', got %q", ev.UID)
@@ -94,35 +97,112 @@ func TestBirthdayCalendarGeneration(t *testing.T) {
 
 func TestBirthdayCalendarReadOnly(t *testing.T) {
 	cfg := &config.Config{}
-	h := NewServer(Options{Config: cfg, Store: &store.Store{}})
-
+	h := NewDavServer(Options{Config: cfg, Store: &store.Store{}})
 	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
 
-	// Test PUT is blocked
-	putBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	putReq := newCalendarPutRequest("/dav/calendars/-1/test.ics", strings.NewReader(putBody))
-	putReq = putReq.WithContext(auth.WithUser(context.Background(), user))
-	putRec := httptest.NewRecorder()
-	h.Put(putRec, putReq)
-
-	if putRec.Code != http.StatusForbidden {
-		t.Errorf("expected PUT to birthday calendar to return 403, got %d", putRec.Code)
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPut, path: "/dav/calendars/-1/test.ics"},
+		{method: http.MethodDelete, path: "/dav/calendars/-1/test.ics"},
+		{method: "MKCOL", path: "/dav/calendars/-1/"},
+		{method: "MKCALENDAR", path: "/dav/calendars/-1/"},
+		{method: "LOCK", path: "/dav/calendars/-1/test.ics"},
+		{method: "UNLOCK", path: "/dav/calendars/-1/test.ics"},
+		{method: "ACL", path: "/dav/calendars/-1/"},
+		{method: "COPY", path: "/dav/calendars/-1/test.ics"},
+		{method: "MOVE", path: "/dav/calendars/-1/test.ics"},
 	}
-	if !strings.Contains(putRec.Body.String(), "read-only") {
-		t.Errorf("expected error message to mention read-only, got %q", putRec.Body.String())
-	}
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			if tc.method == "COPY" || tc.method == "MOVE" {
+				req.Header.Set("Destination", "/dav/calendars/2/test.ics")
+			}
+			rr := httptest.NewRecorder()
 
-	// Test DELETE is blocked
-	delReq := httptest.NewRequest("DELETE", "/dav/calendars/-1/test.ics", nil)
-	delReq = delReq.WithContext(auth.WithUser(context.Background(), user))
-	delRec := httptest.NewRecorder()
-	h.Delete(delRec, delReq)
+			h.ServeHTTP(rr, req)
 
-	if delRec.Code != http.StatusForbidden {
-		t.Errorf("expected DELETE from birthday calendar to return 403, got %d", delRec.Code)
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("expected %s on birthday calendar to return 403, got %d: %s", tc.method, rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "read-only") {
+				t.Fatalf("expected error message to mention read-only, got %q", rr.Body.String())
+			}
+		})
 	}
-	if !strings.Contains(delRec.Body.String(), "read-only") {
-		t.Errorf("expected error message to mention read-only, got %q", delRec.Body.String())
+}
+
+func TestBirthdayCalendarMutationRequiresAuthentication(t *testing.T) {
+	h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+	req := httptest.NewRequest(http.MethodPut, "/dav/calendars/-1/test.ics", nil)
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated birthday mutation = %d, want 401: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBirthdayCalendarNumericAliasesAreReadOnly(t *testing.T) {
+	h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
+
+	for _, path := range []string{
+		"/dav/calendars/-01/event.ics",
+		"/dav/calendars/-0001/",
+	} {
+		req := httptest.NewRequest(http.MethodPut, path, nil)
+		req = req.WithContext(auth.WithUser(req.Context(), user))
+		rr := httptest.NewRecorder()
+
+		h.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("PUT %s = %d, want 403: %s", path, rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "read-only") {
+			t.Fatalf("PUT %s did not report the birthday calendar as read-only: %q", path, rr.Body.String())
+		}
+	}
+}
+
+func TestBirthdayCalendarProppatchReturnsForbiddenMultistatus(t *testing.T) {
+	h := NewDavServer(Options{Config: &config.Config{}, Store: &store.Store{}})
+	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
+	body := `<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Renamed birthdays</D:displayname>
+      <C:calendar-description>Changed description</C:calendar-description>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+	for _, path := range []string{"/dav/calendars/-1/", "/dav/calendars/-01/"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("PROPPATCH", path, strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			h.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("PROPPATCH %s = %d, want 207: %s", path, rr.Code, rr.Body.String())
+			}
+			if contentType := rr.Header().Get("Content-Type"); !strings.Contains(contentType, "application/xml") {
+				t.Fatalf("PROPPATCH %s content type = %q, want application/xml", path, contentType)
+			}
+			responseBody := rr.Body.String()
+			for _, want := range []string{"403 Forbidden", "<d:displayname", "<cal:calendar-description"} {
+				if !strings.Contains(responseBody, want) {
+					t.Fatalf("PROPPATCH %s response missing %q: %s", path, want, responseBody)
+				}
+			}
+		})
 	}
 }
 
@@ -150,11 +230,17 @@ func TestCalendarMultiGetHandlesAbsoluteHref(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"https://cal.example.com/dav/calendars/2/test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
+	request := httptest.NewRequest("REPORT", "https://cal.example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -177,11 +263,17 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	hrefs := []string{"test-event.ics"}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
-	responses, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, hrefs, "/dav/calendars/2/", "/dav/calendars/2/", nil)
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
 	if err != nil {
 		t.Fatalf("calendarMultiGet returned error: %v", err)
 	}
@@ -190,6 +282,43 @@ func TestCalendarMultiGetHandlesRelativeHref(t *testing.T) {
 	}
 	if responses[0].Href != "/dav/calendars/2/test-event.ics" {
 		t.Fatalf("unexpected href %q", responses[0].Href)
+	}
+}
+
+func TestCalendarMultiGetPreservesEncodedPathSeparators(t *testing.T) {
+	repo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:team/standup": {
+				CalendarID:   2,
+				UID:          "team-standup",
+				ResourceName: "team/standup",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:team-standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "abc123",
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+
+	hrefs := []string{"/dav/calendars/2/team%2Fstandup.ics"}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1}}
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/2/", nil)
+	responses, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+		request:        request,
+	}, hrefs)
+	if err != nil {
+		t.Fatalf("calendarMultiGet returned error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(responses))
+	}
+	if responses[0].Status != httpStatusOK {
+		t.Fatalf("encoded resource href returned %q, want 200 OK", responses[0].Status)
+	}
+	if responses[0].Href != "/dav/calendars/2/team%2Fstandup.ics" {
+		t.Fatalf("response href = %q, want encoded path separator", responses[0].Href)
 	}
 }
 
@@ -208,6 +337,44 @@ func TestParseResourcePathRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestCollectionSegmentResolutionIsMemoizedAcrossPathConsumers(t *testing.T) {
+	repo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: repo}}
+	user := &store.User{ID: 1}
+	ctx := withDAVRequestState(context.Background())
+
+	for i := 0; i < 3; i++ {
+		id, resource, matched, err := h.parseCalendarResourcePath(ctx, user, "/dav/calendars/Work/event.ics")
+		if err != nil || !matched || id != 2 || resource != "event" {
+			t.Fatalf("resolution %d = (%d, %q, %v, %v)", i, id, resource, matched, err)
+		}
+	}
+	if repo.listAccessibleCalls != 1 {
+		t.Fatalf("collection alias was resolved %d times, want 1", repo.listAccessibleCalls)
+	}
+}
+
+func TestMissingCollectionSegmentResolutionIsMemoizedAcrossPathConsumers(t *testing.T) {
+	repo := &fakeCalendarRepo{}
+	h := &DavServer{store: &store.Store{Calendars: repo}}
+	user := &store.User{ID: 1}
+	ctx := withDAVRequestState(context.Background())
+
+	for i := 0; i < 3; i++ {
+		_, resource, matched, err := h.parseCalendarResourcePath(ctx, user, "/dav/calendars/missing/event.ics")
+		if !errors.Is(err, store.ErrNotFound) || !matched || resource != "event" {
+			t.Fatalf("resolution %d = (%q, %v, %v)", i, resource, matched, err)
+		}
+	}
+	if repo.listAccessibleCalls != 1 {
+		t.Fatalf("missing collection alias was resolved %d times, want 1", repo.listAccessibleCalls)
+	}
+}
+
 func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 	now := store.Now()
 	repo := &fakeEventRepo{
@@ -221,11 +388,12 @@ func TestCalendarReportSyncCollectionReturnsToken(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 
 	report := reportRequest{XMLName: xml.Name{Local: "sync-collection"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 1, UpdatedAt: now}, Editor: true}
-	responses, token, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses, token := answer.responses, answer.syncToken
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -250,14 +418,16 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 			{ID: 1, ResourceType: "event", CollectionID: 2, UID: "deleted-uid", ResourceName: "deleted-resource", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: deletedRepo}}
+	repo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: deletedRepo}}
 
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("cal", 2, now.Add(-time.Hour)),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses := answer.responses
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -265,7 +435,6 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
 	}
-	// Check that deleted event has 404 status
 	found := false
 	for _, r := range responses {
 		if strings.Contains(r.Href, "deleted-resource") {
@@ -283,30 +452,15 @@ func TestCalendarSyncCollectionIncludesDeletedResources(t *testing.T) {
 func TestCalendarSyncCollectionRejectsInvalidToken(t *testing.T) {
 	now := store.Now()
 	repo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 2, now), // wrong kind for calendar
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	_, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	_, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
 	if !errors.Is(err, errInvalidSyncToken) {
 		t.Fatalf("expected errInvalidSyncToken, got %v", err)
-	}
-}
-
-func TestResolveDAVHrefHandlesRelativeAbsoluteAndURL(t *testing.T) {
-	base := "/dav/calendars/2/"
-	cases := map[string]string{
-		"event.ics":                                    "/dav/calendars/2/event.ics",
-		"/dav/calendars/2/absolute.ics":                "/dav/calendars/2/absolute.ics",
-		"https://example.com/dav/calendars/2/full.ics": "/dav/calendars/2/full.ics",
-		"http://example.com/dav/calendars/2/full.ics":  "/dav/calendars/2/full.ics",
-	}
-	for raw, want := range cases {
-		if got := resolveDAVHref(base, raw); got != want {
-			t.Fatalf("resolveDAVHref(%q) = %q, want %q", raw, got, want)
-		}
 	}
 }
 
@@ -322,10 +476,10 @@ func TestAddressBookMultiGetReportHandlesRelativeHrefAgainstResourceBase(t *test
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Contacts"}
 
-	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil)
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, []string{"alice.vcf"}, "/dav/addressbooks/5/alice.vcf", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/5/alice.vcf", nil))
 	if err != nil {
 		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
@@ -362,7 +516,7 @@ func TestParseSyncTokenRejectsGarbage(t *testing.T) {
 }
 
 func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodOptions, "/dav", nil)
 
@@ -378,13 +532,13 @@ func TestOptionsAdvertisesDAVCapabilities(t *testing.T) {
 	if dav := res.Header.Get("DAV"); dav != "1, 2, 3, access-control, calendar-access, addressbook" {
 		t.Fatalf("DAV header = %q", dav)
 	}
-	if patch := res.Header.Get("Accept-Patch"); patch != "application/xml" {
-		t.Fatalf("Accept-Patch header = %q", patch)
+	if patch := res.Header.Get("Accept-Patch"); patch != "" {
+		t.Fatalf("Accept-Patch must not be advertised while PATCH is unimplemented, got %q", patch)
 	}
 }
 
-func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
-	h := &Handler{}
+func TestOptionsAdvertisesCopyMoveForSupportedResources(t *testing.T) {
+	h := &DavServer{}
 
 	tests := []struct {
 		path          string
@@ -393,7 +547,7 @@ func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
 	}{
 		{path: "/dav/addressbooks/5/", wantCopyMove: false, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
 		{path: "/dav/addressbooks/5/alice.vcf", wantCopyMove: true, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
-		{path: "/dav/calendars/2/", wantCopyMove: false, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
+		{path: "/dav/calendars/2/", wantCopyMove: true, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
 		{path: "/dav/calendars/2/event.ics", wantCopyMove: true, wantDAVHeader: "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"},
 	}
 
@@ -417,35 +571,19 @@ func TestOptionsAdvertisesCopyMoveOnlyForObjectResources(t *testing.T) {
 	}
 }
 
-func TestGetAdvertisesCurrentDAVCapabilities(t *testing.T) {
-	h := &Handler{}
+func TestGetRootReturnsNotFound(t *testing.T) {
+	// GET has no defined body for collections; capability discovery belongs
+	// to OPTIONS. A 200 with an empty body confuses client probes.
+	h := &DavServer{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dav", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 
-	t.Run("positive root request advertises current capabilities", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
-		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	h.Get(rr, req)
 
-		h.Get(rr, req)
-
-		if rr.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rr.Code)
-		}
-		if got := rr.Header().Get("DAV"); got != "1, 2, 3, access-control, calendar-access, addressbook" {
-			t.Fatalf("GET DAV header = %q", got)
-		}
-	})
-
-	t.Run("negative root request does not advertise collection-only extensions", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/dav", nil)
-		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
-
-		h.Get(rr, req)
-
-		if got := rr.Header().Get("DAV"); strings.Contains(got, "extended-mkcol") {
-			t.Fatalf("GET DAV header should not include extended-mkcol, got %q", got)
-		}
-	})
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rr.Code)
+	}
 }
 
 func TestSupportsCopyMove(t *testing.T) {
@@ -458,7 +596,7 @@ func TestSupportsCopyMove(t *testing.T) {
 		{path: "/dav", want: false},
 		{path: "/dav/addressbooks/5/", want: false},
 		{path: "/dav/addressbooks/5/alice.vcf", want: true},
-		{path: "/dav/calendars/2/", want: false},
+		{path: "/dav/calendars/2/", want: true},
 		{path: "/dav/calendars/2/event.ics", want: true},
 	}
 
@@ -508,7 +646,7 @@ func TestCanLockCalendarPath(t *testing.T) {
 			"11:event": {CalendarID: 11, UID: "event", ResourceName: "event"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	tests := []struct {
 		name string
@@ -519,9 +657,9 @@ func TestCanLockCalendarPath(t *testing.T) {
 		{name: "owner collection", user: user, path: "/dav/calendars/5/", want: true},
 		{name: "shared editor resource", user: sharedUser, path: "/dav/calendars/7/event.ics", want: true},
 		{name: "shared readonly collection", user: sharedUser, path: "/dav/calendars/6/", want: false},
-		{name: "shared bind-only collection", user: sharedUser, path: "/dav/calendars/8/", want: true},
+		{name: "shared bind-only collection", user: sharedUser, path: "/dav/calendars/8/", want: false},
 		{name: "shared write-content-only collection", user: sharedUser, path: "/dav/calendars/9/", want: true},
-		{name: "shared unbind-only collection", user: sharedUser, path: "/dav/calendars/10/", want: true},
+		{name: "shared unbind-only collection", user: sharedUser, path: "/dav/calendars/10/", want: false},
 		{name: "direct object write-content grant without collection access", user: sharedUser, path: "/dav/calendars/11/event.ics", want: true},
 		{name: "birthday calendar", user: user, path: fmt.Sprintf("/dav/calendars/%d/", birthdayCalendarID), want: false},
 		{name: "unsupported path", user: user, path: "/dav/unknown", want: false},
@@ -529,14 +667,15 @@ func TestCanLockCalendarPath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var (
-				got bool
-				err error
-			)
+			exists, err := h.lockTargetExists(context.Background(), tc.user, tc.path)
+			if err != nil {
+				t.Fatalf("lockTargetExists error = %v", err)
+			}
+			var got bool
 			if strings.HasPrefix(tc.path, "/dav/calendars/") {
-				got, err = h.canLockCalendarPath(context.Background(), tc.user, tc.path)
+				got, err = h.canLockCalendarPath(context.Background(), tc.user, tc.path, exists)
 			} else {
-				got, err = h.canLockPath(context.Background(), tc.user, tc.path)
+				got, err = h.canLockPath(context.Background(), tc.user, tc.path, exists)
 			}
 			if err != nil {
 				t.Fatalf("canLock path error = %v", err)
@@ -565,7 +704,7 @@ func TestDefaultSupportedLock(t *testing.T) {
 }
 
 func TestPropfindRootIncludesPrincipalAndHomes(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav", nil)
@@ -575,20 +714,12 @@ func TestPropfindRootIncludesPrincipalAndHomes(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
-	}
-	body := rr.Body.Bytes()
-	if responses := strings.Count(string(body), "<d:response>"); responses != 4 {
-		t.Fatalf("expected 4 responses (root, calendars, addressbooks, principal), got %d", responses)
-	}
-	if !strings.Contains(string(body), "<d:href>/dav/principals/1/</d:href>") {
-		t.Fatal("principal response not found")
-	}
-	if !strings.Contains(string(body), "<cal:calendar-home-set>") || !strings.Contains(string(body), "<card:addressbook-home-set>") {
-		t.Fatal("principal response missing home sets")
-	}
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/", "/dav/calendars/", "/dav/addressbooks/", "/dav/principals/1/")
+
+	principal := ms.responseForHref(t, "/dav/principals/1/")
+	principal.assertPropAbsent(t, calQN("calendar-home-set"))
+	principal.assertPropAbsent(t, qn(nsCardDAV, "addressbook-home-set"))
 }
 
 func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
@@ -603,7 +734,7 @@ func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -613,23 +744,27 @@ func TestPropfindCalendarCollectionIncludesReportsAndSync(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/calendars/2/", "/dav/calendars/2/event.ics")
+
+	collection := ms.responseForHref(t, "/dav/calendars/2/")
+	if token := collection.assertPropStatus(t, davQN("sync-token"), http.StatusOK).Value(); token == "" {
+		t.Error("DAV:sync-token is empty")
 	}
-	body := rr.Body.Bytes()
-	if strings.Count(string(body), "<d:response>") != 2 {
-		t.Fatalf("expected collection + 1 event, got body: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:sync-token>") || !strings.Contains(string(body), "<cs:getctag>5</cs:getctag>") {
-		t.Fatalf("missing sync metadata: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:supported-report-set>") {
-		t.Fatalf("supported-report-set missing: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:getcontenttype>text/calendar; charset=utf-8</d:getcontenttype>") {
-		t.Fatalf("unexpected content type: %s", string(body))
-	}
+	collection.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "5")
+	collection.assertSupportedReports(t,
+		calQN("calendar-multiget"),
+		calQN("calendar-query"),
+		calQN("free-busy-query"),
+		davQN("sync-collection"),
+		davQN("expand-property"),
+		davQN("acl-principal-prop-set"),
+		davQN("principal-match"),
+		davQN("principal-property-search"),
+	)
+
+	event := ms.responseForHref(t, "/dav/calendars/2/event.ics")
+	event.assertPropValue(t, davQN("getcontenttype"), http.StatusOK, "text/calendar; charset=utf-8")
 }
 
 func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
@@ -644,7 +779,7 @@ func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "e1", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks/3/", nil)
@@ -654,23 +789,26 @@ func TestPropfindAddressBookCollectionIncludesReportsAndSync(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	res := rr.Result()
-	if res.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", res.StatusCode)
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/addressbooks/3/", "/dav/addressbooks/3/alice.vcf")
+
+	collection := ms.responseForHref(t, "/dav/addressbooks/3/")
+	if token := collection.assertPropStatus(t, davQN("sync-token"), http.StatusOK).Value(); token == "" {
+		t.Error("DAV:sync-token is empty")
 	}
-	body := rr.Body.Bytes()
-	if strings.Count(string(body), "<d:response>") != 2 {
-		t.Fatalf("expected collection + 1 contact, got body: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:sync-token>") || !strings.Contains(string(body), "<cs:getctag>9</cs:getctag>") {
-		t.Fatalf("missing sync metadata: %s", string(body))
-	}
-	if !strings.Contains(string(body), "<d:supported-report-set>") {
-		t.Fatal("supported-report-set missing")
-	}
-	if !strings.Contains(string(body), "<d:getcontenttype>text/vcard; charset=utf-8</d:getcontenttype>") {
-		t.Fatalf("unexpected content type: %s", string(body))
-	}
+	collection.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "9")
+	collection.assertSupportedReports(t,
+		qn(nsCardDAV, "addressbook-multiget"),
+		qn(nsCardDAV, "addressbook-query"),
+		davQN("sync-collection"),
+		davQN("expand-property"),
+		davQN("acl-principal-prop-set"),
+		davQN("principal-match"),
+		davQN("principal-property-search"),
+	)
+
+	contact := ms.responseForHref(t, "/dav/addressbooks/3/alice.vcf")
+	contact.assertPropValue(t, davQN("getcontenttype"), http.StatusOK, "text/vcard; charset=utf-8")
 }
 
 func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
@@ -685,7 +823,7 @@ func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
@@ -695,16 +833,7 @@ func TestPropfindCalendarDepth0DoesNotListEvents(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 1 {
-		t.Fatalf("expected only collection response at depth 0, got %s", body)
-	}
-	if strings.Contains(body, ".ics") {
-		t.Fatalf("expected no event resources at depth 0, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/2/")
 }
 
 func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
@@ -724,8 +853,12 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	user := &store.User{ID: 1}
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		Users:     &aclReportUserRepo{users: map[int64]store.User{user.ID: *user}},
+	}}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/event.ics", nil)
 	req.Header.Set("Depth", "0")
@@ -734,20 +867,17 @@ func TestPropfindCalendarResourceReturnsProps(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	resp := rr.Body.String()
-	if !strings.Contains(resp, "getetag") {
-		t.Fatalf("expected getetag in response, got %s", resp)
-	}
-	if !strings.Contains(resp, "BEGIN:VEVENT") {
-		t.Fatalf("expected calendar data in response, got %s", resp)
+	ms := decodeMultistatus(t, rr)
+	resp := ms.responseForHref(t, "/dav/calendars/1/event.ics")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag1"`)
+	resp.assertPropAbsent(t, calQN("calendar-data"))
+	if body := rr.Body.String(); strings.Contains(body, "BEGIN:VEVENT") {
+		t.Fatalf("PROPFIND must not expose calendar data, got %s", body)
 	}
 }
 
 func TestPropfindPrincipalsDepth0OmitsUserPrincipal(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1, PrimaryEmail: "user@example.com"}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/principals", nil)
@@ -757,16 +887,7 @@ func TestPropfindPrincipalsDepth0OmitsUserPrincipal(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 1 {
-		t.Fatalf("expected only collection response, got %s", body)
-	}
-	if strings.Contains(body, "<d:href>/dav/principals/1/</d:href></d:response>") {
-		t.Fatalf("depth 0 should not include principal resource response: %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/principals/")
 }
 
 func TestPropfindCalendarsRootListsCollections(t *testing.T) {
@@ -776,7 +897,7 @@ func TestPropfindCalendarsRootListsCollections(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Two"}},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars", nil)
 	req.Header.Set("Depth", "1")
@@ -785,13 +906,12 @@ func TestPropfindCalendarsRootListsCollections(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 4 { // collection + birthday calendar + two calendars
-		t.Fatalf("expected calendar collection listings, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+		"/dav/calendars/1/",
+		"/dav/calendars/2/",
+	)
 }
 
 func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
@@ -801,7 +921,7 @@ func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
 			2: {ID: 2, UserID: 1, Name: "Shared"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("PROPFIND", "/dav/addressbooks", nil)
 	req.Header.Set("Depth", "1")
@@ -810,57 +930,51 @@ func TestPropfindAddressBooksRootListsCollections(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if strings.Count(body, "<d:response>") != 3 { // collection + two books
-		t.Fatalf("expected address book listings, got %s", body)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/addressbooks/",
+		"/dav/addressbooks/1/",
+		"/dav/addressbooks/2/",
+	)
 }
 
-func TestCalendarReportFallsBackToQueryForUnknownType(t *testing.T) {
+func TestCalendarReportUnknownTypeIsRefused(t *testing.T) {
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
 			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Events: eventRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}}
 
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "/dav/calendars/1/", report)
-	if err != nil {
-		t.Fatalf("calendarReportResponses returned error: %v", err)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/1/", "", report, nil)
+	responses := answer.responses
+	if !errors.Is(err, errUnsupportedReport) {
+		t.Fatalf("calendarReportResponses error = %v, want errUnsupportedReport", err)
 	}
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
-	}
-	if responses[0].Propstat[0].Prop.GetContentType != "text/calendar; charset=utf-8" {
-		t.Fatalf("unexpected content type %q", responses[0].Propstat[0].Prop.GetContentType)
+	if len(responses) != 0 {
+		t.Fatalf("unknown report must not return data, got %d responses", len(responses))
 	}
 }
 
-func TestAddressBookReportFallsBackToQueryForUnknownType(t *testing.T) {
+func TestAddressBookReportUnknownTypeIsRefused(t *testing.T) {
 	contactRepo := &fakeContactRepo{
 		contacts: map[string]*store.Contact{
 			"4:alice": {AddressBookID: 4, UID: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
 	report := reportRequest{XMLName: xml.Name{Local: "unknown"}}
 	book := &store.AddressBook{ID: 4, UserID: 1, Name: "Contacts"}
 	user := &store.User{ID: 1}
 
-	responses, _, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, nil)
-	if err != nil {
-		t.Fatalf("addressBookReportResponses returned error: %v", err)
+	answer, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/4/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/4/", nil))
+	responses := answer.responses
+	if !errors.Is(err, errUnsupportedReport) {
+		t.Fatalf("addressBookReportResponses error = %v, want errUnsupportedReport", err)
 	}
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
-	}
-	if responses[0].Propstat[0].Prop.GetContentType != "text/vcard; charset=utf-8" {
-		t.Fatalf("unexpected content type %q", responses[0].Propstat[0].Prop.GetContentType)
+	if len(responses) != 0 {
+		t.Fatalf("unknown report must not return data, got %d responses", len(responses))
 	}
 }
 
@@ -875,7 +989,7 @@ func TestGetServesCalendarEvent(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICALDATA", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/event.ics", nil)
@@ -909,7 +1023,7 @@ func TestGetServesContact(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "VCARD", ETag: "etag2"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
@@ -949,11 +1063,11 @@ func TestGetRejectsWildcardAcceptRangeWithZeroQuality(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
-	req.Header.Set("Accept", `text/vcard; version="4.0", */*;q=0`)
+	req.Header.Set("Accept", `text/vcard; version="2.1", */*;q=0`)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -985,7 +1099,7 @@ func TestGetAddressBookResourceReturnsInternalServerErrorWhenACLLookupFails(t *t
 		},
 	}
 	aclRepo := &fakeACLRepo{listByResourceErr: errors.New("acl lookup failed")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "reader@example.com"}))
@@ -999,7 +1113,7 @@ func TestGetAddressBookResourceReturnsInternalServerErrorWhenACLLookupFails(t *t
 }
 
 func TestGetRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/1/e.ics", nil)
 	rr := httptest.NewRecorder()
 
@@ -1026,7 +1140,7 @@ func TestGetRequiresUserEvenForDAVAllAddressBookRead(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	rr := httptest.NewRecorder()
 
@@ -1051,7 +1165,7 @@ func TestDeleteRemovesContactFromAddressBook(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1081,7 +1195,7 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -1104,7 +1218,7 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 			getByResourceNameErr:    errors.New("lookup failed"),
 			getByResourceNameErrKey: "5:alice",
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -1125,8 +1239,9 @@ func TestDeleteAddressBookContactPropagatesLookupErrors(t *testing.T) {
 }
 
 func TestReportRequiresAuthentication(t *testing.T) {
-	h := &Handler{}
-	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`))
+	h := &DavServer{}
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`))
+	req.Header.Set("Depth", "1")
 	rr := httptest.NewRecorder()
 
 	h.Report(rr, req)
@@ -1142,8 +1257,9 @@ func TestReportRejectsTooLargeBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", nil)
+	req.Header.Set("Depth", "1")
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1163,12 +1279,13 @@ func TestReportCalendarQueryReturnsEvents(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:event": {CalendarID: 1, UID: "event", RawICAL: "ICAL", ETag: "etag"},
+			"1:event": {CalendarID: 1, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -1182,6 +1299,243 @@ func TestReportCalendarQueryReturnsEvents(t *testing.T) {
 	}
 }
 
+func TestCalendarReportsReturnOnlyRequestedObjectProperties(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: store.Now()}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {
+				CalendarID:   1,
+				UID:          "event",
+				ResourceName: "event",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "etag-event",
+				LastModified: store.Now(),
+			},
+		},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{
+		"opaquelocktoken:report-lock": {
+			Token:          "opaquelocktoken:report-lock",
+			ResourcePath:   "/dav/calendars/1/event",
+			UserID:         1,
+			LockScope:      "exclusive",
+			LockType:       "write",
+			Depth:          "0",
+			TimeoutSeconds: 3600,
+			ExpiresAt:      time.Now().Add(time.Hour),
+		},
+	}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo}}
+	user := &store.User{ID: 1}
+
+	tests := []struct {
+		name       string
+		body       string
+		want       string
+		unwanted   []string
+		responseID string
+	}{
+		{
+			name: "calendar query getetag only",
+			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><D:getetag/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
+</cal:calendar-query>`,
+			want:       "<d:getetag>",
+			unwanted:   []string{"<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar multiget calendar-data only",
+			body: `<cal:calendar-multiget xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><cal:calendar-data/></D:prop>
+  <D:href>/dav/calendars/1/event.ics</D:href>
+</cal:calendar-multiget>`,
+			want:       "<cal:calendar-data>",
+			unwanted:   []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar sync getetag only",
+			body: `<D:sync-collection xmlns:D="DAV:">
+  <D:sync-token/>
+  <D:prop><D:getetag/></D:prop>
+</D:sync-collection>`,
+			want:       "<d:getetag>",
+			unwanted:   []string{"<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar query supported report set",
+			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><D:supported-report-set/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
+</cal:calendar-query>`,
+			want:       "<d:supported-report-set>",
+			unwanted:   []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar query resource type",
+			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><D:resourcetype/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
+</cal:calendar-query>`,
+			want:       "<d:resourcetype",
+			unwanted:   []string{"<d:getetag>", "<d:getcontenttype>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar query lock discovery",
+			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+  <D:prop><D:lockdiscovery/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
+</cal:calendar-query>`,
+			want:       "opaquelocktoken:report-lock",
+			unwanted:   []string{"404 Not Found", "<d:getetag>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+		{
+			name: "calendar query unknown property",
+			body: `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:" xmlns:x="urn:example:unknown">
+  <D:prop><x:mystery/></D:prop>
+  <cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter>
+</cal:calendar-query>`,
+			want:       "urn:example:unknown",
+			unwanted:   []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>", "<cal:calendar-data>"},
+			responseID: "/dav/calendars/1/event.ics",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(tc.body))
+			req.Header.Set("Depth", "1")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			h.Report(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+			}
+			objectResponse := davResponseForHref(t, rr.Body.String(), tc.responseID)
+			if !strings.Contains(objectResponse, tc.want) {
+				t.Fatalf("expected requested property %q in %s", tc.want, objectResponse)
+			}
+			if tc.name == "calendar query unknown property" && !strings.Contains(objectResponse, httpStatusNotFound) {
+				t.Fatalf("expected unknown property in a 404 propstat: %s", objectResponse)
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(objectResponse, unwanted) {
+					t.Fatalf("unrequested property %q leaked into %s", unwanted, objectResponse)
+				}
+			}
+		})
+	}
+}
+
+func TestAddressBookSyncReturnsOnlyRequestedObjectProperties(t *testing.T) {
+	now := store.Now()
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		5: {ID: 5, UserID: 1, Name: "Contacts", UpdatedAt: now},
+	}}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice", LastModified: now},
+	}}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{
+		"opaquelocktoken:address-report-lock": {
+			Token:          "opaquelocktoken:address-report-lock",
+			ResourcePath:   "/dav/addressbooks/5/alice",
+			UserID:         1,
+			LockScope:      "exclusive",
+			LockType:       "write",
+			Depth:          "0",
+			TimeoutSeconds: 3600,
+			ExpiresAt:      time.Now().Add(time.Hour),
+		},
+	}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	tests := []struct {
+		name     string
+		property string
+		want     []string
+		unwanted []string
+	}{
+		{
+			name:     "getetag only",
+			property: "<D:getetag/>",
+			want:     []string{"<d:getetag>"},
+			unwanted: []string{"<d:resourcetype", "<d:getcontenttype>", "<card:address-data>"},
+		},
+		{
+			name:     "supported report set",
+			property: "<D:supported-report-set/>",
+			want:     []string{"<d:supported-report-set>", "addressbook-query", "addressbook-multiget"},
+			unwanted: []string{"<d:getetag>", "<d:resourcetype", "<d:getcontenttype>", "<card:address-data>"},
+		},
+		{
+			name:     "resource type",
+			property: "<D:resourcetype/>",
+			want:     []string{"<d:resourcetype"},
+			unwanted: []string{"<d:getetag>", "<d:getcontenttype>", "<card:address-data>"},
+		},
+		{
+			name:     "lock discovery",
+			property: "<D:lockdiscovery/>",
+			want:     []string{"<d:lockdiscovery>", "opaquelocktoken:address-report-lock"},
+			unwanted: []string{"404 Not Found", "<d:getetag>", "<card:address-data>"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `<D:sync-collection xmlns:D="DAV:">
+  <D:sync-token/>
+  <D:prop>` + tc.property + `</D:prop>
+</D:sync-collection>`
+			req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Report(rr, req)
+
+			if rr.Code != http.StatusMultiStatus {
+				t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
+			}
+			objectResponse := davResponseForHref(t, rr.Body.String(), "/dav/addressbooks/5/alice.vcf")
+			for _, want := range tc.want {
+				if !strings.Contains(objectResponse, want) {
+					t.Fatalf("expected requested property content %q in %s", want, objectResponse)
+				}
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(objectResponse, unwanted) {
+					t.Fatalf("unrequested property %q leaked into %s", unwanted, objectResponse)
+				}
+			}
+		})
+	}
+}
+
+func davResponseForHref(t *testing.T, body, href string) string {
+	t.Helper()
+	hrefIndex := strings.Index(body, ">"+href+"</d:href>")
+	if hrefIndex < 0 {
+		t.Fatalf("response for href %q not found in %s", href, body)
+	}
+	start := strings.LastIndex(body[:hrefIndex], "<d:response>")
+	endOffset := strings.Index(body[hrefIndex:], "</d:response>")
+	if start < 0 || endOffset < 0 {
+		t.Fatalf("malformed response for href %q in %s", href, body)
+	}
+	return body[start : hrefIndex+endOffset+len("</d:response>")]
+}
+
 func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -1193,7 +1547,7 @@ func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "1")
@@ -1211,7 +1565,7 @@ func TestReportAddressBookQueryReturnsContacts(t *testing.T) {
 }
 
 func TestReportInvalidCalendarIDReturnsBadRequest(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/notanint/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1230,7 +1584,7 @@ func TestReportAddressBookRejectsInvalidSyncToken(t *testing.T) {
 			3: {ID: 3, UserID: 1, Name: "Contacts", CTag: 1, UpdatedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"><D:sync-token>urn:calcard-sync:cal:3:0</D:sync-token></D:sync-collection>`))
 	req.Header.Set("Content-Type", "application/xml")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1238,9 +1592,10 @@ func TestReportAddressBookRejectsInvalidSyncToken(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for invalid sync token kind, got %d", rr.Code)
-	}
+	// RFC 6578 §3.2 names this failure DAV:valid-sync-token, and RFC 4918 §16
+	// returns a named condition as the child of a top-level DAV:error rather
+	// than as a bare status.
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("valid-sync-token"))
 }
 
 func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
@@ -1251,10 +1606,10 @@ func TestPutCreatesCalendarEventWhenEditor(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	u := &store.User{ID: 1}
 
-	validIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	validIcal := buildCalendarObject(buildVEvent("new"))
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(validIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -1281,10 +1636,10 @@ func TestPutRejectsCalendarWriteWithoutEditor(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
-	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"))
+	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(buildCalendarObject(buildVEvent("new"))))
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -1303,7 +1658,7 @@ func TestPutCreatesContact(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	u := &store.User{ID: 1}
 
 	validVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
@@ -1338,7 +1693,7 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 			"2:old": {CalendarID: 2, UID: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/old.ics", nil)
@@ -1351,7 +1706,6 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 		t.Fatalf("expected 403 without editor, got %d", rr.Code)
 	}
 
-	// Grant editor and delete
 	calRepo.accessible[0].Editor = true
 	aclRepo.entries = append(aclRepo.entries, store.ACLEntry{
 		ResourcePath:  "/dav/calendars/2",
@@ -1371,7 +1725,7 @@ func TestDeleteCalendarEventHonorsEditor(t *testing.T) {
 
 func TestMkcolCreatesAddressBook(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/NewBook", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1389,7 +1743,7 @@ func TestMkcolCreatesAddressBook(t *testing.T) {
 
 func TestMkcalendarCreatesCalendar(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
@@ -1407,7 +1761,7 @@ func TestMkcalendarCreatesCalendar(t *testing.T) {
 
 func TestMkcalendarParsesChunkedRequestBody(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -1440,7 +1794,7 @@ func TestMkcalendarRejectsSlugNameCollisions(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work", Slug: &slug}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
@@ -1475,7 +1829,9 @@ func TestMkcalendarRequiresParentCollectionLockToken(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/NewCal", nil)
@@ -1513,11 +1869,12 @@ func TestAddressBookMultiGetFiltersByBook(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
 		2: {ID: 2, UserID: 1, Name: "Book"},
 	}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/keep.vcf", "/dav/addressbooks/3/skip.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
+	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/2/", nil))
 	if err != nil {
-		t.Fatalf("addressBookMultiGet returned error: %v", err)
+		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
@@ -1542,11 +1899,12 @@ func TestAddressBookMultiGetMissingReturns404(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
 		2: {ID: 2, UserID: 1, Name: "Book"},
 	}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	hrefs := []string{"/dav/addressbooks/2/present.vcf", "/dav/addressbooks/2/missing.vcf"}
-	responses, err := h.addressBookMultiGet(context.Background(), &store.User{ID: 1}, 2, hrefs, "/dav/addressbooks/2/")
+	book := &store.AddressBook{ID: 2, UserID: 1, Name: "Book"}
+	responses, err := h.addressBookMultiGetReport(context.Background(), &store.User{ID: 1}, book, hrefs, "/dav/addressbooks/2/", nil, nil, httptest.NewRequest("REPORT", "/dav/addressbooks/2/", nil))
 	if err != nil {
-		t.Fatalf("addressBookMultiGet returned error: %v", err)
+		t.Fatalf("addressBookMultiGetReport returned error: %v", err)
 	}
 	if len(responses) != 2 {
 		t.Fatalf("expected 2 responses, got %d", len(responses))
@@ -1568,14 +1926,16 @@ func TestAddressBookSyncCollectionIncludesDeleted(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 5, UID: "gone", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Contacts: contacts, DeletedResources: deleted}}
+	contacts.tombstones = deleted
+	h := &DavServer{store: &store.Store{Contacts: contacts, DeletedResources: deleted}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("card", 5, now.Add(-time.Hour)),
 	}
 	book := &store.AddressBook{ID: 5, UserID: 1, Name: "Book", CTag: 1, UpdatedAt: now}
 	user := &store.User{ID: 1}
-	responses, token, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, nil)
+	answer, err := h.addressBookReportResponses(context.Background(), user, book, "/dav/principals/1/", "/dav/addressbooks/5/", report, httptest.NewRequest("REPORT", "/dav/addressbooks/5/", nil))
+	responses, token := answer.responses, answer.syncToken
 	if err != nil {
 		t.Fatalf("addressBookReportResponses returned error: %v", err)
 	}
@@ -1608,13 +1968,14 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 			"2:new": {CalendarID: 2, UID: "new", RawICAL: "NEW", ETag: "2", LastModified: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: repo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	report := reportRequest{
 		XMLName:   xml.Name{Local: "sync-collection"},
 		SyncToken: buildSyncToken("cal", 2, then),
 	}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Test", CTag: 2, UpdatedAt: now}, Editor: true}
-	responses, _, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "/dav/calendars/2/", report)
+	answer, err := h.calendarReportResponses(context.Background(), &store.User{ID: 1}, cal, "/dav/principals/1/", "/dav/calendars/2/", "", report, nil)
+	responses := answer.responses
 	if err != nil {
 		t.Fatalf("calendarReportResponses returned error: %v", err)
 	}
@@ -1630,7 +1991,7 @@ func TestCalendarSyncCollectionFiltersByModifiedSince(t *testing.T) {
 func TestNewServerInitializesFields(t *testing.T) {
 	cfg := &config.Config{}
 	s := &store.Store{}
-	h := NewServer(Options{Config: cfg, Store: s})
+	h := NewDavServer(Options{Config: cfg, Store: s})
 	if h.cfg != cfg || h.store != s {
 		t.Fatal("server fields not initialized")
 	}
@@ -1647,7 +2008,7 @@ func TestHeadDelegatesToGet(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICALDATA", ETag: "etag1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	req := httptest.NewRequest(http.MethodHead, "/dav/calendars/2/event.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1663,7 +2024,7 @@ func TestHeadDelegatesToGet(t *testing.T) {
 }
 
 func TestProppatchRequiresAuth(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/1", nil)
 	rr := httptest.NewRecorder()
 	h.Proppatch(rr, req)
@@ -1681,7 +2042,7 @@ func TestProppatchCalendarUpdatesProperties(t *testing.T) {
 			2: {ID: 2, UserID: 1, Name: "Old Name"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -1710,7 +2071,7 @@ func TestProppatchCalendarUpdatesProperties(t *testing.T) {
 }
 
 func TestProppatchCalendarRejectsSlugPath(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{}}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPPATCH", "/dav/calendars/work", nil)
@@ -1736,10 +2097,11 @@ func TestPropfindRejectsAmbiguousCalendarSlug(t *testing.T) {
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/work/", nil)
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
@@ -1756,7 +2118,7 @@ func TestGetNotFoundReturns404(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/calendars/2/missing.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1769,7 +2131,7 @@ func TestGetNotFoundReturns404(t *testing.T) {
 }
 
 func TestGetRejectsUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodGet, "/unknown", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1782,7 +2144,7 @@ func TestGetRejectsUnsupportedPath(t *testing.T) {
 }
 
 func TestDeleteUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/unknown", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1795,7 +2157,7 @@ func TestDeleteUnsupportedPath(t *testing.T) {
 }
 
 func TestDeleteRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/e.ics", nil)
 	rr := httptest.NewRecorder()
 
@@ -1807,7 +2169,7 @@ func TestDeleteRequiresUser(t *testing.T) {
 }
 
 func TestReportInvalidXMLReturnsBadRequest(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader("<bad"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1819,8 +2181,31 @@ func TestReportInvalidXMLReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestReportRejectsMutatedXMLDeclarationPayloads(t *testing.T) {
+	h := &DavServer{}
+	body := `<?xml version="1.0' OR '1'='1"?>
+<D:sync-collection xmlns:D="DAV:"/>`
+
+	for _, path := range []string{"/dav/", "/dav/principals/"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest("REPORT", path, strings.NewReader(body))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Report(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for mutated XML declaration, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "invalid REPORT body") {
+				t.Fatalf("expected stable invalid REPORT body error, got %s", rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestReportUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("REPORT", "/dav/unknown", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1838,7 +2223,7 @@ func TestReportCalendarInvalidSyncToken(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, DeletedResources: &fakeDeletedResourceRepo{}}}
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(`<D:sync-collection xmlns:D="DAV:"><D:sync-token>urn:calcard-sync:card:1:0</D:sync-token></D:sync-collection>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1861,8 +2246,8 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
-	newIcal := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	newIcal := buildCalendarObject(buildVEvent("event", "SUMMARY:Updated"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(newIcal))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1875,7 +2260,7 @@ func TestPutUpdatesExistingEventReturnsNoContent(t *testing.T) {
 }
 
 func TestPutUnsupportedPath(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest(http.MethodPut, "/dav/unknown", strings.NewReader("data"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -1888,7 +2273,10 @@ func TestPutUnsupportedPath(t *testing.T) {
 }
 
 func TestPutTooLarge(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{store: &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 1, Name: "Home"}}},
+		Events:    &fakeEventRepo{},
+	}}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", nil)
 	req.ContentLength = maxDAVBodyBytes + 1
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -1896,15 +2284,12 @@ func TestPutTooLarge(t *testing.T) {
 
 	h.Put(rr, req)
 
-	if rr.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected 413, got %d", rr.Code)
-	}
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-resource-size"))
 }
 
 func TestMkcolValidatesPathAndName(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	u := &store.User{ID: 1}
-	// unsupported path
 	req := httptest.NewRequest("MKCOL", "/dav/calendars/bad", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
@@ -1913,7 +2298,6 @@ func TestMkcolValidatesPathAndName(t *testing.T) {
 		t.Fatalf("expected 400 for unsupported mkcol path, got %d", rr.Code)
 	}
 
-	// missing name
 	req = httptest.NewRequest("MKCOL", "/dav/addressbooks/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr = httptest.NewRecorder()
@@ -1923,39 +2307,25 @@ func TestMkcolValidatesPathAndName(t *testing.T) {
 	}
 }
 
-func TestMkcalendarValidatesPathAndName(t *testing.T) {
-	h := &Handler{}
+// A Request-URI that cannot host a calendar collection fails the RFC 4791
+// §5.3.1.1 location precondition; TestRFC4791_MkcalendarInvalidPath covers the
+// error body and status split, so this case pins the slug rule CalCard adds on
+// top of it.
+func TestMkcalendarRejectsSlugUnsafeName(t *testing.T) {
+	h := &DavServer{}
 	u := &store.User{ID: 1}
-	// unsupported path
-	req := httptest.NewRequest("MKCALENDAR", "/dav/addressbooks/bad", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr := httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unsupported mkcalendar path, got %d", rr.Code)
-	}
 
-	// missing name
-	req = httptest.NewRequest("MKCALENDAR", "/dav/calendars/", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr = httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for missing calendar name, got %d", rr.Code)
-	}
-
-	// numeric name
-	req = httptest.NewRequest("MKCALENDAR", "/dav/calendars/123", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), u))
-	rr = httptest.NewRecorder()
-	h.Mkcalendar(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for numeric calendar name, got %d", rr.Code)
+	for _, path := range []string{"/dav/calendars/-leading-hyphen", "/dav/calendars/spaced%20name"} {
+		req := httptest.NewRequest("MKCALENDAR", path, nil)
+		req = req.WithContext(auth.WithUser(req.Context(), u))
+		rr := httptest.NewRecorder()
+		h.Mkcalendar(rr, req)
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("calendar-collection-location-ok"))
 	}
 }
 
 func TestLoadCalendarNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}}}
 	if _, err := h.loadCalendar(context.Background(), &store.User{ID: 1}, 10); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -1967,15 +2337,15 @@ func TestLoadAddressBookWrongUser(t *testing.T) {
 			1: {ID: 1, UserID: 2, Name: "Other"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	if _, err := h.loadAddressBook(context.Background(), &store.User{ID: 1}, 1); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
 func TestPrincipalResponsesRejectsOtherPrincipal(t *testing.T) {
-	h := &Handler{}
-	_, err := h.principalResponses("/dav/principals/999", "0", &store.User{ID: 1}, func(s string) string { return s })
+	h := &DavServer{}
+	_, err := h.principalResponses("/dav/principals/999", "0", &store.User{ID: 1})
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -1994,7 +2364,7 @@ func TestCdataStringEmptySkipsEncoding(t *testing.T) {
 }
 
 func TestPropfindRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPFIND", "/dav", nil)
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, req)
@@ -2004,13 +2374,37 @@ func TestPropfindRequiresUser(t *testing.T) {
 }
 
 func TestPropfindUnsupportedPathReturnsNotFound(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("PROPFIND", "/invalid", nil)
+	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Propfind(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestPropfindCardNamespaceMutationDoesNotMatchCardDAVProperty(t *testing.T) {
+	h := &DavServer{}
+	user := &store.User{ID: 1, PrimaryEmail: "test@example.com"}
+	body := `<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav' OR '1'='1">
+  <d:prop>
+    <card:addressbook-home-set/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/principals/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("expected 207 for namespace mutation handled as DAV property mismatch, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "<card:addressbook-home-set>") {
+		t.Fatalf("mutated CardDAV namespace must not satisfy addressbook-home-set, got %s", rr.Body.String())
 	}
 }
 
@@ -2020,7 +2414,7 @@ func TestGetAddressBookNotFoundForWrongUser(t *testing.T) {
 			5: {ID: 5, UserID: 2, Name: "Other"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2031,7 +2425,7 @@ func TestGetAddressBookNotFoundForWrongUser(t *testing.T) {
 }
 
 func TestPutRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", strings.NewReader("data"))
 	rr := httptest.NewRecorder()
 	h.Put(rr, req)
@@ -2042,7 +2436,7 @@ func TestPutRequiresUser(t *testing.T) {
 
 func TestPutAddressBookNotFound(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/9/alice.vcf", strings.NewReader("VCARD"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2053,7 +2447,7 @@ func TestPutAddressBookNotFound(t *testing.T) {
 }
 
 func TestDeleteCalendarNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{}}, Events: &fakeEventRepo{}}}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/e.ics", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2080,18 +2474,24 @@ func TestReportCalendarSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "event", CollectionID: 2, UID: "gone", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+	eventRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("cal", 2, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
+
+	// Decoding is the assertion: RFC 6578 §6.4 sequences DAV:multistatus as
+	// (response*, responsedescription?, sync-token?), so a sync token serialized
+	// ahead of the responses fails the content model rather than the href set.
+	ms := decodeMultistatus(t, rr)
+	ms.assertHrefs(t, "/dav/calendars/2/", "/dav/calendars/2/event.ics", "/dav/calendars/2/gone.ics")
+	if ms.SyncToken == "" {
+		t.Errorf("sync-collection response carries no DAV:sync-token; body: %s", rr.Body.String())
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "event.ics") || !strings.Contains(respBody, "gone.ics") {
-		t.Fatalf("expected sync responses for event and deleted resource, got %s", respBody)
+	if got := ms.responseForHref(t, "/dav/calendars/2/gone.ics").Status; statusCodeFromLine(t, got) != http.StatusNotFound {
+		t.Errorf("tombstone status = %q, want 404", got)
 	}
 }
 
@@ -2114,7 +2514,7 @@ func TestReportCalendarSyncCollectionReturnsTombstoneForACLHiddenEvent(t *testin
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars:        calRepo,
 		Events:           eventRepo,
 		DeletedResources: &fakeDeletedResourceRepo{},
@@ -2162,7 +2562,7 @@ func TestReportCalendarSyncCollectionDoesNotRepeatACLHiddenTombstoneAfterTokenAd
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars:        calRepo,
 		Events:           eventRepo,
 		DeletedResources: &fakeDeletedResourceRepo{},
@@ -2204,7 +2604,7 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 			{ResourcePath: "/dav/calendars/2/hidden", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Events: &fakeEventRepo{events: map[string]*store.Event{
 			"2:visible": {CalendarID: 2, UID: "visible", ResourceName: "visible", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:visible\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-visible"},
 			"2:hidden":  {CalendarID: 2, UID: "hidden", ResourceName: "hidden", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:hidden\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-hidden"},
@@ -2219,7 +2619,11 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 		Privileges:         store.CalendarPrivileges{Read: true},
 	}
 
-	responses, err := h.calendarQuery(context.Background(), &store.User{ID: 1}, cal, "/dav/calendars/2/", nil, nil)
+	responses, err := h.calendarQuery(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/2/",
+	}, nil)
 	if err != nil {
 		t.Fatalf("calendarQuery() error = %v", err)
 	}
@@ -2229,8 +2633,8 @@ func TestCalendarQueryBatchesACLLookupsForEventFiltering(t *testing.T) {
 	if aclRepo.listByResourceCalls != 0 {
 		t.Fatalf("expected batched ACL lookup without per-resource calls, got %d ListByResource calls", aclRepo.listByResourceCalls)
 	}
-	if aclRepo.listByPrincipalCalls == 0 || aclRepo.listByPrincipalCalls > 3 {
-		t.Fatalf("expected batched ListByPrincipal calls, got %d", aclRepo.listByPrincipalCalls)
+	if aclRepo.listByResourcesCalls != 1 {
+		t.Fatalf("expected one batched ACL lookup, got %d", aclRepo.listByResourcesCalls)
 	}
 }
 
@@ -2251,7 +2655,8 @@ func TestReportAddressBookSyncCollectionViaHandler(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "bob", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	contactRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2283,7 +2688,8 @@ func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
 			{ResourceType: "contact", CollectionID: 3, UID: "gone-uid", ResourceName: "former", DeletedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	contactRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2301,7 +2707,7 @@ func TestReportAddressBookSyncCollectionUsesStoredResourceNames(t *testing.T) {
 	}
 }
 
-func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *testing.T) {
+func TestReportAddressBookSyncCollectionUsesCollectionACLAfterObjectDelete(t *testing.T) {
 	now := store.Now()
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -2324,6 +2730,7 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 			{ResourcePath: "/dav/addressbooks/3/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
+	contactRepo.tombstones = deletedRepo
 	st := &store.Store{
 		AddressBooks:     bookRepo,
 		Contacts:         contactRepo,
@@ -2331,7 +2738,11 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 		ACLEntries:       aclRepo,
 		Locks:            &fakeLockRepo{},
 	}
-	if err := st.DeleteContactAndState(context.Background(), 3, "secret", "/dav/addressbooks/3/secret"); err != nil {
+	contact, err := contactRepo.GetByResourceName(context.Background(), 3, "secret")
+	if err != nil || contact == nil {
+		t.Fatalf("GetByResourceName() = %#v, %v", contact, err)
+	}
+	if err := st.DeleteContactAndState(context.Background(), 3, store.ContactDAVResourceState(contact), "/dav/addressbooks/3/secret", nil); err != nil {
 		t.Fatalf("DeleteContactAndState() error = %v", err)
 	}
 	deletedRepo.deleted = append(deletedRepo.deleted, store.DeletedResource{
@@ -2342,7 +2753,7 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 		DeletedAt:    now,
 	})
 
-	h := &Handler{store: st}
+	h := &DavServer{store: st}
 	body := `<D:sync-collection xmlns:D="DAV:"><D:sync-token>` + buildSyncToken("card", 3, now.Add(-time.Hour)) + `</D:sync-token></D:sync-collection>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}))
@@ -2355,13 +2766,13 @@ func TestReportAddressBookSyncCollectionPreservesDeletedObjectACLVisibility(t *t
 	if !strings.Contains(respBody, "public.vcf") {
 		t.Fatalf("expected collection-level read grant to expose unrelated deleted tombstones, got %s", respBody)
 	}
-	if strings.Contains(respBody, "secret.vcf") {
-		t.Fatalf("expected object-level deny ACL to keep deleted tombstone hidden after delete, got %s", respBody)
+	if !strings.Contains(respBody, "secret.vcf") {
+		t.Fatalf("expected deleted object ACL cleanup to leave tombstone visibility governed by the collection, got %s", respBody)
 	}
 }
 
 func TestMkcolRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/Book", nil)
 	rr := httptest.NewRecorder()
 	h.Mkcol(rr, req)
@@ -2371,7 +2782,7 @@ func TestMkcolRequiresUser(t *testing.T) {
 }
 
 func TestMkcalendarRequiresUser(t *testing.T) {
-	h := &Handler{}
+	h := &DavServer{}
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/Cal", nil)
 	rr := httptest.NewRecorder()
 	h.Mkcalendar(rr, req)
@@ -2382,7 +2793,7 @@ func TestMkcalendarRequiresUser(t *testing.T) {
 
 func TestPutCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := newCalendarPutRequest("/dav/calendars/9/e.ics", strings.NewReader("ICAL"))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2402,7 +2813,7 @@ func TestPutReadErrorReturnsBadRequest(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	req := newCalendarPutRequest("/dav/calendars/1/e.ics", io.NopCloser(errReader{}))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2423,7 +2834,7 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	newVCard := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice Updated\r\nEMAIL:alice@example.com\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2435,7 +2846,7 @@ func TestPutUpdatesExistingContactReturnsNoContent(t *testing.T) {
 }
 
 func TestDeleteAddressBookNotFound(t *testing.T) {
-	h := &Handler{store: &store.Store{AddressBooks: &fakeAddressBookRepo{}, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: &fakeAddressBookRepo{}, Contacts: &fakeContactRepo{}}}
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/9/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -2447,9 +2858,10 @@ func TestDeleteAddressBookNotFound(t *testing.T) {
 
 func TestReportCalendarNotFound(t *testing.T) {
 	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/9/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 	h.Report(rr, req)
@@ -2460,7 +2872,7 @@ func TestReportCalendarNotFound(t *testing.T) {
 
 func TestReportAddressBookNotFound(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
 	req.Header.Set("Depth", "1")
@@ -2483,7 +2895,7 @@ func TestReportAddressBookAliasResolutionDistinguishesMissingAndPresentAliases(t
 			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("positive alias resolves to address book", func(t *testing.T) {
 		body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
@@ -2523,7 +2935,7 @@ func TestReportAddressBookQueryDepthZeroRequiresAccess(t *testing.T) {
 			9: {ID: 9, UserID: 1, Name: "Private"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 	body := `<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"><card:filter/></card:addressbook-query>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/9/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2532,8 +2944,8 @@ func TestReportAddressBookQueryDepthZeroRequiresAccess(t *testing.T) {
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for inaccessible depth-0 addressbook-query, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for inaccessible depth-0 addressbook-query, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -2548,7 +2960,7 @@ func TestReportCalendarMultiGetPath(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 	body := `<cal:calendar-multiget xmlns:cal="urn:ietf:params:xml:ns:caldav"><D:href xmlns:D="DAV:">/dav/calendars/2/event.ics</D:href></cal:calendar-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/2/", strings.NewReader(body))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -2573,7 +2985,7 @@ func TestReportAddressBookMultiGetPath(t *testing.T) {
 			"3:alice": {AddressBookID: 3, UID: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/3/alice.vcf</D:href></card:addressbook-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2599,7 +3011,7 @@ func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testi
 			"3:alice": {AddressBookID: 3, UID: "alice", ResourceName: "alice", RawVCard: "VCARD", ETag: "e"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 	body := `<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav"><D:href xmlns:D="DAV:">/dav/addressbooks/Contacts/alice.vcf</D:href></card:addressbook-multiget>`
 	req := httptest.NewRequest("REPORT", "/dav/addressbooks/3/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
@@ -2620,9 +3032,15 @@ func TestReportAddressBookMultiGetResolvesAliasHrefWithinNumericRequest(t *testi
 
 func TestCalendarMultiGetReturnsErrorWhenRepoFails(t *testing.T) {
 	brokenRepo := &errorEventRepo{}
-	h := &Handler{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
+	h := &DavServer{store: &store.Store{Events: brokenRepo, DeletedResources: &fakeDeletedResourceRepo{}}}
 	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 1}}
-	_, err := h.calendarMultiGet(context.Background(), &store.User{ID: 1}, cal, []string{"/dav/calendars/1/e.ics"}, "/dav/calendars/1/", "/dav/calendars/1/", nil)
+	request := httptest.NewRequest("REPORT", "http://example.com/dav/calendars/1/", nil)
+	_, err := h.calendarMultiGet(context.Background(), calendarReportRequest{
+		user:           &store.User{ID: 1},
+		cal:            cal,
+		collectionPath: "/dav/calendars/1/",
+		request:        request,
+	}, []string{"/dav/calendars/1/e.ics"})
 	if err == nil {
 		t.Fatal("expected error from repo")
 	}
@@ -2643,7 +3061,7 @@ func TestCalendarCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 					"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-event"},
 				},
 			}
-			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 			req := httptest.NewRequest(method, "/dav/calendars/2/event.ics", nil)
 			req.Header.Set("Destination", "https://example.com/dav/calendars/2/event.ics")
@@ -2667,6 +3085,49 @@ func TestCalendarCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 	}
 }
 
+func TestCopyMoveRejectBirthdayCalendarEndpointsExplicitly(t *testing.T) {
+	user := &store.User{ID: 1}
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: validCalendarObject("event"), ETag: "etag-event"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		for _, tc := range []struct {
+			name        string
+			source      string
+			destination string
+		}{
+			{name: "source", source: "/dav/calendars/-1/birthday-contact@calcard.ics", destination: "/dav/calendars/2/birthday.ics"},
+			{name: "destination", source: "/dav/calendars/2/event.ics", destination: "/dav/calendars/-1/event.ics"},
+		} {
+			t.Run(method+"/birthday_"+tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(method, tc.source, nil)
+				req.Header.Set("Destination", "https://example.com"+tc.destination)
+				req = req.WithContext(auth.WithUser(req.Context(), user))
+				rr := httptest.NewRecorder()
+
+				if method == "COPY" {
+					h.Copy(rr, req)
+				} else {
+					h.Move(rr, req)
+				}
+
+				if rr.Code != http.StatusForbidden {
+					t.Fatalf("expected explicit 403 for birthday %s, got %d: %s", tc.name, rr.Code, rr.Body.String())
+				}
+			})
+		}
+	}
+}
+
 func TestContactCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 	user := &store.User{ID: 1}
 	bookRepo := &fakeAddressBookRepo{
@@ -2682,7 +3143,7 @@ func TestContactCopyAndMoveToSameDestinationAreNoOps(t *testing.T) {
 					"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-alice"},
 				},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/alice.vcf")
@@ -2724,12 +3185,12 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 	t.Run("calendar copy", func(t *testing.T) {
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
-				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: buildCalendarObject(buildVEvent("event", "SUMMARY:Old")), ETag: "etag-dest"},
 			},
 			copyErr: errors.New("copy failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -2751,12 +3212,12 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 	t.Run("calendar move", func(t *testing.T) {
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
-				"3:event": {CalendarID: 3, UID: "event", ResourceName: "moved", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "moved", RawICAL: buildCalendarObject(buildVEvent("event", "SUMMARY:Old")), ETag: "etag-dest"},
 			},
 			moveErr: errors.New("move failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2783,7 +3244,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			copyErr: errors.New("copy failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -2810,7 +3271,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 			},
 			moveErr: errors.New("move failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -2830,7 +3291,7 @@ func TestCopyAndMoveOverwriteFailurePreservesExistingDestination(t *testing.T) {
 	})
 }
 
-func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
+func TestCalendarMoveUsesExplicitAtomicBackend(t *testing.T) {
 	user := &store.User{ID: 1}
 
 	t.Run("calendar move rebinding succeeds", func(t *testing.T) {
@@ -2842,7 +3303,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		}
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag-source"},
 			},
 		}
 		aclRepo := &fakeACLRepo{
@@ -2850,7 +3311,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2867,15 +3328,9 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src != nil {
 			t.Fatalf("expected source event to be removed after move, got %#v", src)
 		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/3/moved"); len(entries) != 1 {
-			t.Fatalf("expected ACL entry to move to destination, got %#v", entries)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/2/event"); len(entries) != 0 {
-			t.Fatalf("expected source ACL entry to be cleared, got %#v", entries)
-		}
 	})
 
-	t.Run("calendar move rolls back when ACL rebind fails", func(t *testing.T) {
+	t.Run("calendar move surfaces atomic backend failure", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			accessible: []store.CalendarAccess{
 				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
@@ -2884,23 +3339,17 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		}
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event", "SUMMARY:Source")), ETag: "etag-source"},
 			},
+			moveErr: errors.New("atomic transfer failed"),
 		}
-		deletedRepo := &fakeDeletedResourceRepo{}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/calendars/2/event", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
-			moveResourcePathHook: func(fromPath, toPath string) {
-				deletedRepo.deleted = []store.DeletedResource{
-					{ResourceType: "event", CollectionID: 2, UID: "event", ResourceName: "event", DeletedAt: time.Now()},
-					{ResourceType: "event", CollectionID: 3, UID: "event", ResourceName: "moved", DeletedAt: time.Now()},
-				}
-			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -2911,23 +3360,8 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		if rr.Code != http.StatusInternalServerError {
 			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if src, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); src == nil || src.ETag != "etag-source" {
-			t.Fatalf("expected source event to be restored, got %#v", src)
-		}
-		if dest, _ := eventRepo.GetByResourceName(req.Context(), 3, "moved"); dest != nil {
-			t.Fatalf("expected destination event creation to be rolled back, got %#v", dest)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/2/event"); len(entries) != 1 {
-			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/calendars/3/moved"); len(entries) != 0 {
-			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected source event tombstones to be removed during rollback, got %#v", tombstones)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "event", 3, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected destination event tombstones to be removed during rollback, got %#v", tombstones)
+		if source, _ := eventRepo.GetByResourceName(req.Context(), 2, "event"); source == nil {
+			t.Fatal("atomic backend failure mutated the source")
 		}
 	})
 
@@ -2948,7 +3382,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -2973,7 +3407,7 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("contact move rolls back when ACL rebind fails", func(t *testing.T) {
+	t.Run("contact move surfaces ACL rebind failure", func(t *testing.T) {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Contacts"},
@@ -2985,20 +3419,13 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
 			},
 		}
-		deletedRepo := &fakeDeletedResourceRepo{}
 		aclRepo := &fakeACLRepo{
 			entries: []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 			},
-			moveResourcePathHook: func(fromPath, toPath string) {
-				deletedRepo.deleted = []store.DeletedResource{
-					{ResourceType: "contact", CollectionID: 5, UID: "alice", ResourceName: "alice", DeletedAt: time.Now()},
-					{ResourceType: "contact", CollectionID: 6, UID: "alice", ResourceName: "moved", DeletedAt: time.Now()},
-				}
-			},
 			moveResourcePathErr: errors.New("acl move failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/moved.vcf")
@@ -3009,28 +3436,13 @@ func TestMoveRebindsACLStateAndRollsBackOnACLRebindFailure(t *testing.T) {
 		if rr.Code != http.StatusInternalServerError {
 			t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 		}
-		if src, _ := contactRepo.GetByResourceName(req.Context(), 5, "alice"); src == nil || src.ETag != "etag-source" {
-			t.Fatalf("expected source contact to be restored, got %#v", src)
-		}
-		if dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "moved"); dest != nil {
-			t.Fatalf("expected destination contact creation to be rolled back, got %#v", dest)
-		}
-		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/5/alice"); len(entries) != 1 {
-			t.Fatalf("expected source ACL entry to remain, got %#v", entries)
-		}
 		if entries, _ := aclRepo.ListByResource(req.Context(), "/dav/addressbooks/6/moved"); len(entries) != 0 {
-			t.Fatalf("expected destination ACL entry creation to be rolled back, got %#v", entries)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 5, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected source contact tombstones to be removed during rollback, got %#v", tombstones)
-		}
-		if tombstones, _ := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{}); len(tombstones) != 0 {
-			t.Fatalf("expected destination contact tombstones to be removed during rollback, got %#v", tombstones)
+			t.Fatalf("expected no destination ACL entry after failed rebind, got %#v", entries)
 		}
 	})
 }
 
-func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) {
+func TestMoveCalendarEventDoesNotRequireSourceReadPrivilege(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	calRepo := &fakeCalendarRepo{
@@ -3045,7 +3457,7 @@ func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) 
 				CalendarID:   9,
 				UID:          "secret",
 				ResourceName: "secret",
-				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				RawICAL:      buildCalendarObject(buildVEvent("secret")),
 				ETag:         "etag-secret",
 			},
 		},
@@ -3057,7 +3469,7 @@ func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) 
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo, ACLEntries: aclRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -3066,11 +3478,14 @@ func TestMoveCalendarEventRequiresSourceReadPrivilegeBeforeLookup(t *testing.T) 
 
 	h.Move(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected source read denial to return 403, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("MOVE status = %d, want 201 without source read privilege: %s", rr.Code, rr.Body.String())
 	}
-	if eventRepo.resourceLookupCount != 0 {
-		t.Fatalf("expected MOVE to reject denied source before loading the event, got %d lookups", eventRepo.resourceLookupCount)
+	if source, _ := eventRepo.GetByResourceName(req.Context(), 9, "secret"); source != nil {
+		t.Fatalf("MOVE retained source: %#v", source)
+	}
+	if destination, _ := eventRepo.GetByResourceName(req.Context(), 2, "copied"); destination == nil || destination.UID != "secret" {
+		t.Fatalf("MOVE destination = %#v", destination)
 	}
 }
 
@@ -3093,7 +3508,7 @@ func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t 
 			5: {ID: 5, UserID: owner.ID, Name: "Shared", UpdatedAt: now},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("PROPFIND", "/dav/calendars/5/", nil)
 	req.Header.Set("Depth", "0")
@@ -3102,29 +3517,12 @@ func TestPropfindCalendarCollectionDoesNotOverAdvertisePartialWritePrivileges(t 
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	body := rr.Body.String()
-	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
-	if privilegeSet == "" {
-		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
-	}
-	if !strings.Contains(privilegeSet, "bind") {
-		t.Fatalf("expected bind privilege in response, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "write-content") {
-		t.Fatalf("did not expect write-content privilege for bind-only access, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "write-properties") {
-		t.Fatalf("did not expect write-properties privilege for bind-only access, got %s", privilegeSet)
-	}
-	if strings.Contains(privilegeSet, "unbind") {
-		t.Fatalf("did not expect unbind privilege for bind-only access, got %s", privilegeSet)
-	}
+	ms := decodeMultistatus(t, rr)
+	resp := ms.responseForHref(t, "/dav/calendars/5/")
+	resp.assertPrivileges(t, davQN("read"), calQN("read-free-busy"), davQN("bind"))
 }
 
-func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T) {
+func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusyAndTheReadContainingIt(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	calRepo := &fakeCalendarRepo{
@@ -3133,30 +3531,27 @@ func TestCurrentUserPrivilegeSetForCalendarOmitsDeniedReadFreeBusy(t *testing.T)
 		},
 	}
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
-		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
+		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privilegeSet := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privilegeSet, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privilegeSet == nil {
 		t.Fatal("expected privilege set for readable calendar")
 	}
-	if len(privilegeSet.Privileges) != 1 {
-		t.Fatalf("expected only DAV:read privilege, got %#v", privilegeSet.Privileges)
-	}
-	if privilegeSet.Privileges[0].Read == nil {
-		t.Fatalf("expected DAV:read privilege, got %#v", privilegeSet.Privileges[0])
-	}
-	if privilegeSet.Privileges[0].Read.ReadFreeBusy != nil {
-		t.Fatalf("did not expect read-free-busy nested under DAV:read when explicitly denied, got %#v", privilegeSet.Privileges[0])
-	}
-	if privilegeSet.Privileges[0].ReadFreeBusy != nil {
-		t.Fatalf("did not expect standalone read-free-busy privilege when explicitly denied, got %#v", privilegeSet.Privileges[0])
+	// CalCard's DAV:read contains read-free-busy, and RFC 3744 section 3.12
+	// makes an aggregate equivalent to what it contains, so the refused
+	// read-free-busy leaves DAV:read unreported as well.
+	if len(privilegeSet.Privileges) != 0 {
+		t.Fatalf("expected neither DAV:read nor the denied read-free-busy, got %#v", privilegeSet.Privileges)
 	}
 }
 
-func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
+func TestPropfindHidesBindOnlyCalendarCollections(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	now := store.Now()
@@ -3177,7 +3572,7 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/8", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3186,12 +3581,7 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/8/") {
-		t.Fatalf("expected bind-only calendar to be discoverable, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref())
 
 	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/8/", nil)
 	calReq.Header.Set("Depth", "0")
@@ -3200,19 +3590,12 @@ func TestPropfindListsAndLoadsBindOnlyCalendarCollections(t *testing.T) {
 
 	h.Propfind(calRR, calReq)
 
-	if calRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected bind-only calendar PROPFIND to succeed, got %d: %s", calRR.Code, calRR.Body.String())
-	}
-	body := calRR.Body.String()
-	if !strings.Contains(body, "/dav/calendars/8/") {
-		t.Fatalf("expected bind-only calendar href in response, got %s", body)
-	}
-	if !strings.Contains(body, "bind") {
-		t.Fatalf("expected bind privilege in response, got %s", body)
+	if calRR.Code != http.StatusNotFound {
+		t.Fatalf("bind-only direct PROPFIND status = %d, want 404: %s", calRR.Code, calRR.Body.String())
 	}
 }
 
-func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
+func TestPropfindHidesCalendarCollectionsWithoutRead(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	now := store.Now()
@@ -3234,7 +3617,7 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 				{
 					Calendar:   store.Calendar{ID: 11, UserID: owner.ID, Name: "Review", Slug: &reviewSlug, UpdatedAt: now},
 					Shared:     true,
-					Privileges: store.CalendarPrivileges{WriteContent: true},
+					Privileges: store.CalendarPrivileges{ReadFreeBusy: true},
 				},
 			},
 		},
@@ -3247,9 +3630,9 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/9", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		{ResourcePath: "/dav/calendars/10", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "unbind"},
-		{ResourcePath: "/dav/calendars/11", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/11", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3258,25 +3641,18 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	rootBody := rootRR.Body.String()
-	for _, href := range []string{"/dav/calendars/9/", "/dav/calendars/10/", "/dav/calendars/11/"} {
-		if !strings.Contains(rootBody, href) {
-			t.Fatalf("expected partial-access calendar %s to be discoverable, got %s", href, rootBody)
-		}
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+	)
 
 	tests := []struct {
-		name      string
-		path      string
-		wantHref  string
-		privilege string
+		name string
+		path string
 	}{
-		{name: "write-content by id", path: "/dav/calendars/9/", wantHref: "/dav/calendars/9/", privilege: "write-content"},
-		{name: "unbind by id", path: "/dav/calendars/10/", wantHref: "/dav/calendars/10/", privilege: "unbind"},
-		{name: "write-content by slug", path: "/dav/calendars/review/", wantHref: "/dav/calendars/11/", privilege: "write-content"},
+		{name: "write-content by id", path: "/dav/calendars/9/"},
+		{name: "unbind by id", path: "/dav/calendars/10/"},
+		{name: "read-free-busy by slug", path: "/dav/calendars/review/"},
 	}
 
 	for _, tc := range tests {
@@ -3288,21 +3664,14 @@ func TestPropfindListsAndLoadsPartialAccessCalendarCollections(t *testing.T) {
 
 			h.Propfind(rr, req)
 
-			if rr.Code != http.StatusMultiStatus {
-				t.Fatalf("expected partial-access calendar PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-			}
-			body := rr.Body.String()
-			if !strings.Contains(body, tc.wantHref) {
-				t.Fatalf("expected calendar href %s in response, got %s", tc.wantHref, body)
-			}
-			if !strings.Contains(body, tc.privilege) {
-				t.Fatalf("expected privilege %q in response, got %s", tc.privilege, body)
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("PROPFIND status = %d, want 404: %s", rr.Code, rr.Body.String())
 			}
 		})
 	}
 }
 
-func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
+func TestPropfindObjectGrantDoesNotExposeParentCalendar(t *testing.T) {
 	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2}
 	now := store.Now()
@@ -3310,6 +3679,9 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now}, Editor: true},
+			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 12, UserID: owner.ID, Name: "Object Shared", UpdatedAt: now}, Shared: true, PrivilegesResolved: true},
 			},
 		},
 		calendars: map[int64]*store.Calendar{
@@ -3330,7 +3702,7 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/12/special", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3339,12 +3711,7 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if !strings.Contains(rootRR.Body.String(), "/dav/calendars/12/") {
-		t.Fatalf("expected object-granted calendar to be discoverable, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref())
 
 	calReq := httptest.NewRequest("PROPFIND", "/dav/calendars/12/", nil)
 	calReq.Header.Set("Depth", "0")
@@ -3353,22 +3720,16 @@ func TestPropfindDiscoveryIncludesObjectGrantedCalendars(t *testing.T) {
 
 	h.Propfind(calRR, calReq)
 
-	if calRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected direct calendar PROPFIND to succeed for object grant, got %d: %s", calRR.Code, calRR.Body.String())
+	if calRR.Code != http.StatusNotFound {
+		t.Fatalf("collection PROPFIND status = %d, want 404: %s", calRR.Code, calRR.Body.String())
 	}
-	body := calRR.Body.String()
-	if !strings.Contains(body, "/dav/calendars/12/") {
-		t.Fatalf("expected object-granted calendar href in response, got %s", body)
-	}
-	privilegeSet := regexp.MustCompile(`(?s)<d:current-user-privilege-set>.*?</d:current-user-privilege-set>`).FindString(body)
-	if privilegeSet == "" {
-		t.Fatalf("expected current-user-privilege-set in response, got %s", body)
-	}
-	for _, privilege := range []string{"<d:read", "read-free-busy", "write-content", "write-properties", "<d:bind", "<d:unbind", "<d:write"} {
-		if strings.Contains(privilegeSet, privilege) {
-			t.Fatalf("did not expect collection privilege %q for object-only calendar discovery, got %s", privilege, privilegeSet)
-		}
-	}
+
+	objectReq := httptest.NewRequest("PROPFIND", "/dav/calendars/12/special.ics", nil)
+	objectReq.Header.Set("Depth", "0")
+	objectReq = objectReq.WithContext(auth.WithUser(objectReq.Context(), delegate))
+	objectRR := httptest.NewRecorder()
+	h.Propfind(objectRR, objectReq)
+	decodeMultistatus(t, objectRR).assertHrefs(t, "/dav/calendars/12/special.ics")
 }
 
 func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing.T) {
@@ -3399,7 +3760,7 @@ func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/13/secret", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	rootReq := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
 	rootReq.Header.Set("Depth", "1")
@@ -3408,12 +3769,7 @@ func TestPropfindDiscoveryExcludesCalendarsWithOnlyObjectLevelDenyACE(t *testing
 
 	h.Propfind(rootRR, rootReq)
 
-	if rootRR.Code != http.StatusMultiStatus {
-		t.Fatalf("expected calendar home PROPFIND to succeed, got %d: %s", rootRR.Code, rootRR.Body.String())
-	}
-	if strings.Contains(rootRR.Body.String(), "/dav/calendars/13/") {
-		t.Fatalf("did not expect deny-only object ACE to surface calendar discovery, got %s", rootRR.Body.String())
-	}
+	decodeMultistatus(t, rootRR).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref())
 }
 
 func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
@@ -3434,11 +3790,11 @@ func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
 	t.Run("calendar", func(t *testing.T) {
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
-				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag-source"},
+				"3:event": {CalendarID: 3, UID: "event", ResourceName: "copied", RawICAL: buildCalendarObject(buildVEvent("event", "SUMMARY:Old")), ETag: "etag-dest"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo}}
 
 		req1 := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req1.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3472,7 +3828,7 @@ func TestCopyGeneratesFreshETagsOnRepeatedOverwrite(t *testing.T) {
 				"6:alice": {AddressBookID: 6, UID: "alice", ResourceName: "copied", RawVCard: buildVCard("3.0", "UID:alice", "FN:Old Alice"), ETag: "etag-dest"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req1 := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 		req1.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -3512,10 +3868,10 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 	t.Run("positive copy succeeds when destination lookups succeed", func(t *testing.T) {
 		eventRepo := &fakeEventRepo{
 			events: map[string]*store.Event{
-				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: buildCalendarObject(buildVEvent("event")), ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3540,7 +3896,7 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 			getByResourceNameErr: errors.New("resource lookup failed"),
 			getByResourceNameKey: "3:copied",
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/copied.ics")
@@ -3569,7 +3925,7 @@ func TestCalendarCopyAndMoveFailClosedOnDestinationLookupErrors(t *testing.T) {
 			getByUIDErr:    errors.New("uid lookup failed"),
 			getByUIDErrKey: "3:event",
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("MOVE", "/dav/calendars/2/event.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/3/moved.ics")
@@ -3604,7 +3960,7 @@ func TestCopyWithinSameCollectionRejectsRebindingSameUID(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+		h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/calendars/2/original.ics", nil)
 		req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3640,7 +3996,7 @@ func TestCopyWithinSameCollectionRejectsRebindingSameUID(t *testing.T) {
 				"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "original", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice Example"), ETag: "etag-source"},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 		req := httptest.NewRequest("COPY", "/dav/addressbooks/5/original.vcf", nil)
 		req.Header.Set("Destination", "https://example.com/dav/addressbooks/5/renamed.vcf")
@@ -3686,7 +4042,7 @@ func TestCalendarCopyAndMoveRejectDestinationUIDConflict(t *testing.T) {
 					"3:event": {CalendarID: 3, UID: "event", ResourceName: "existing", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
 				},
 			}
-			h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+			h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 			req := httptest.NewRequest(method, "/dav/calendars/2/original.ics", nil)
 			req.Header.Set("Destination", "https://example.com/dav/calendars/3/renamed.ics")
@@ -3731,11 +4087,11 @@ func TestMoveCalendarEventOverwriteWithinSameCalendarReplacesDestination(t *test
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:source\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
-			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:destination\r\nSUMMARY:Destination\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: buildCalendarObject(buildVEvent("source", "SUMMARY:Source")), ETag: "etag-source"},
+			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: buildCalendarObject(buildVEvent("destination", "SUMMARY:Destination")), ETag: "etag-dest"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3774,12 +4130,12 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:source\r\nSUMMARY:Source\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-source"},
-			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:destination\r\nSUMMARY:Destination\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-dest"},
+			"2:source":      {CalendarID: 2, UID: "source", ResourceName: "original", RawICAL: buildCalendarObject(buildVEvent("source", "SUMMARY:Source")), ETag: "etag-source"},
+			"2:destination": {CalendarID: 2, UID: "destination", ResourceName: "renamed", RawICAL: buildCalendarObject(buildVEvent("destination", "SUMMARY:Destination")), ETag: "etag-dest"},
 		},
 		overwriteMoveDeletedRepo: deletedRepo,
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, DeletedResources: deletedRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, CalendarTransfers: eventRepo, DeletedResources: deletedRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/2/original.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/renamed.ics")
@@ -3790,10 +4146,7 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE within same calendar to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "event", 2, time.Time{})
-	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
-	}
+	tombstones := deletedRepo.collectionTombstones("event", 2)
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
 			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
@@ -3803,7 +4156,7 @@ func TestMoveCalendarEventOverwriteClearsDestinationTombstone(t *testing.T) {
 
 func TestCanonicalDAVPathUsesExtensionlessResourceIdentity(t *testing.T) {
 	slug := "work"
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: &fakeCalendarRepo{
 			accessible: []store.CalendarAccess{
 				{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Slug: &slug}, Editor: true},
@@ -3841,24 +4194,6 @@ func TestCanonicalDAVPathUsesExtensionlessResourceIdentity(t *testing.T) {
 	}
 }
 
-func TestNormalizeDAVResourceIdentityPreservesDottedCanonicalNames(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{path: "/dav/calendars/2/event.v2", want: "/dav/calendars/2/event.v2"},
-		{path: "/dav/addressbooks/5/alice.v1", want: "/dav/addressbooks/5/alice.v1"},
-		{path: "/dav/calendars/2/event.ics", want: "/dav/calendars/2/event"},
-		{path: "/dav/addressbooks/5/alice.vcf", want: "/dav/addressbooks/5/alice"},
-	}
-
-	for _, tc := range tests {
-		if got := normalizeDAVResourceIdentity(tc.path); got != tc.want {
-			t.Fatalf("normalizeDAVResourceIdentity(%q) = %q, want %q", tc.path, got, tc.want)
-		}
-	}
-}
-
 func TestDeleteRejectsCanonicalResourceLockAcrossExtensions(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -3875,7 +4210,7 @@ func TestDeleteRejectsCanonicalResourceLockAcrossExtensions(t *testing.T) {
 			"tok-1": {Token: "tok-1", ResourcePath: "/dav/addressbooks/5/alice", UserID: 2, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 	user := &store.User{ID: 1}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.txt", nil)
@@ -3905,7 +4240,7 @@ func TestGetRejectsCanonicalResourceACLAcrossExtensions(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 	user := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.txt", nil)
@@ -3914,8 +4249,8 @@ func TestGetRejectsCanonicalResourceACLAcrossExtensions(t *testing.T) {
 
 	h.Get(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected canonical ACL check to reject GET with 403, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected canonical ACL check to reject GET with non-disclosing 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -3928,7 +4263,7 @@ func TestLockAndACLRejectOversizedBodies(t *testing.T) {
 	}
 
 	t.Run("lock", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: &fakeLockRepo{locks: map[string]*store.Lock{}}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: &fakeLockRepo{locks: map[string]*store.Lock{}}}}
 		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
 		req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(body))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -3942,7 +4277,7 @@ func TestLockAndACLRejectOversizedBodies(t *testing.T) {
 	})
 
 	t.Run("acl", func(t *testing.T) {
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: &fakeACLRepo{}}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: &fakeACLRepo{}}}
 		body := strings.Repeat("A", int(maxDAVBodyBytes)+1)
 		req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(body))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -3984,7 +4319,7 @@ func TestCalendarCopyRequiresReadAccessToSource(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest("COPY", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -4028,7 +4363,7 @@ func TestCalendarMoveRejectsUnauthorizedSourceBeforeEventLookup(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/calendars/9/secret.ics", nil)
 	req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
@@ -4041,6 +4376,59 @@ func TestCalendarMoveRejectsUnauthorizedSourceBeforeEventLookup(t *testing.T) {
 	}
 	if eventRepo.resourceLookupCount != 0 {
 		t.Fatalf("expected MOVE to reject unauthorized source before loading the event, got %d lookups", eventRepo.resourceLookupCount)
+	}
+}
+
+func TestInaccessibleCalendarObjectMutationsConcealLockState(t *testing.T) {
+	owner := &store.User{ID: 1}
+	attacker := &store.User{ID: 2}
+	for _, method := range []string{"MOVE", http.MethodDelete} {
+		for _, locked := range []bool{false, true} {
+			name := method + "/unlocked"
+			locks := map[string]*store.Lock{}
+			if locked {
+				name = method + "/locked"
+				locks["opaquelocktoken:private"] = &store.Lock{
+					Token:        "opaquelocktoken:private",
+					ResourcePath: "/dav/calendars/9/secret",
+					UserID:       owner.ID,
+					LockScope:    "exclusive",
+					LockType:     "write",
+					Depth:        "0",
+					ExpiresAt:    time.Now().Add(time.Hour),
+				}
+			}
+			t.Run(name, func(t *testing.T) {
+				calRepo := &fakeCalendarRepo{
+					accessibleByUser: map[int64][]store.CalendarAccess{
+						owner.ID:    {{Calendar: store.Calendar{ID: 9, UserID: owner.ID, Name: "Private"}, Editor: true}},
+						attacker.ID: {{Calendar: store.Calendar{ID: 2, UserID: attacker.ID, Name: "Mine"}, Editor: true}},
+					},
+					calendars: map[int64]*store.Calendar{
+						2: {ID: 2, UserID: attacker.ID, Name: "Mine"},
+						9: {ID: 9, UserID: owner.ID, Name: "Private"},
+					},
+				}
+				eventRepo := &fakeEventRepo{events: map[string]*store.Event{
+					"9:secret": {CalendarID: 9, UID: "secret", ResourceName: "secret", RawICAL: buildCalendarObject(buildVEvent("secret")), ETag: "etag-secret"},
+				}}
+				h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: &fakeLockRepo{locks: locks}}}
+				req := httptest.NewRequest(method, "/dav/calendars/9/secret.ics", nil)
+				if method == "MOVE" {
+					req.Header.Set("Destination", "https://example.com/dav/calendars/2/copied.ics")
+				}
+				req = req.WithContext(auth.WithUser(req.Context(), attacker))
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, req)
+
+				if rr.Code != http.StatusNotFound {
+					t.Fatalf("%s status = %d, want 404 regardless of lock state: %s", method, rr.Code, rr.Body.String())
+				}
+				if eventRepo.resourceLookupCount != 0 {
+					t.Fatalf("%s loaded inaccessible source %d times", method, eventRepo.resourceLookupCount)
+				}
+			})
+		}
 	}
 }
 
@@ -4067,7 +4455,7 @@ func TestContactCopyAndMoveRejectUnauthorizedSourceBeforeContactLookup(t *testin
 					},
 				},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/9/secret.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/2/copied.vcf")
@@ -4098,7 +4486,7 @@ func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", strings.NewReader(lockBody))
@@ -4117,15 +4505,17 @@ func TestUnlockRejectsMismatchedRequestURI(t *testing.T) {
 	unlockRR := httptest.NewRecorder()
 	h.Unlock(unlockRR, unlockReq)
 
-	if unlockRR.Code != http.StatusPreconditionFailed {
-		t.Fatalf("expected mismatched UNLOCK to return 412, got %d: %s", unlockRR.Code, unlockRR.Body.String())
-	}
+	// RFC 4918 §9.11.1 and §16 both give UNLOCK 409 with the named
+	// DAV:lock-token-matches-request-uri precondition when the Request-URI is
+	// outside the scope of the token's lock. The 412 of §9.10.6 is the LOCK
+	// refresh case, not this one.
+	assertErrorConditions(t, unlockRR, http.StatusConflict, davQN("lock-token-matches-request-uri"))
 	if lock, _ := lockRepo.GetByToken(context.Background(), strings.Trim(token, "<>")); lock == nil {
 		t.Fatal("expected mismatched UNLOCK to preserve the original lock")
 	}
 }
 
-func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
+func TestCollectionLockRefreshesAndUnlocksWithinItsScope(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -4133,7 +4523,7 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", strings.NewReader(lockBody))
@@ -4152,7 +4542,7 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		t.Fatal("expected collection lock to be stored")
 	}
 
-	t.Run("refresh uses lock root", func(t *testing.T) {
+	t.Run("refresh within the lock's scope keeps its root", func(t *testing.T) {
 		refreshReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/", nil)
 		refreshReq.Header.Set("If", "(<"+token+">)")
 		refreshReq.Header.Set("Timeout", "Second-7200")
@@ -4164,6 +4554,9 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 			t.Fatalf("expected lock-root refresh to succeed, got %d: %s", refreshRR.Code, refreshRR.Body.String())
 		}
 
+		// RFC 4918 §9.10.2 refreshes a lock from any resource within its
+		// scope, which a depth-infinity lock extends to the collection's
+		// members; the lock keeps its root.
 		descendantReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
 		descendantReq.Header.Set("If", "(<"+token+">)")
 		descendantReq.Header.Set("Timeout", "Second-3600")
@@ -4171,58 +4564,28 @@ func TestCollectionLockRefreshAndUnlockRequireLockRoot(t *testing.T) {
 		descendantRR := httptest.NewRecorder()
 		h.Lock(descendantRR, descendantReq)
 
-		if descendantRR.Code != http.StatusPreconditionFailed {
-			t.Fatalf("expected descendant refresh to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
+		if descendantRR.Code != http.StatusOK || !strings.Contains(descendantRR.Body.String(), "<d:lockroot><d:href>/dav/addressbooks/5</d:href></d:lockroot>") {
+			t.Fatalf("expected a refresh from within the lock's scope to keep its root, got %d: %s", descendantRR.Code, descendantRR.Body.String())
 		}
 	})
 
-	t.Run("unlock uses lock root", func(t *testing.T) {
+	// RFC 4918 §9.11: the Request-URI of an UNLOCK identifies a resource
+	// within the scope of the lock, which a depth-infinity lock extends to
+	// the collection's members.
+	t.Run("unlock within the lock's scope", func(t *testing.T) {
 		descendantReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/alice.vcf", nil)
 		descendantReq.Header.Set("Lock-Token", "<"+token+">")
 		descendantReq = descendantReq.WithContext(auth.WithUser(descendantReq.Context(), user))
 		descendantRR := httptest.NewRecorder()
 		h.Unlock(descendantRR, descendantReq)
 
-		if descendantRR.Code != http.StatusPreconditionFailed {
-			t.Fatalf("expected descendant UNLOCK to return 412, got %d: %s", descendantRR.Code, descendantRR.Body.String())
+		if descendantRR.Code != http.StatusNoContent {
+			t.Fatalf("expected UNLOCK from within the lock's scope to succeed, got %d: %s", descendantRR.Code, descendantRR.Body.String())
 		}
-		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock == nil {
-			t.Fatal("expected descendant UNLOCK to preserve the collection lock")
-		}
-
-		unlockReq := httptest.NewRequest("UNLOCK", "/dav/addressbooks/5/", nil)
-		unlockReq.Header.Set("Lock-Token", "<"+token+">")
-		unlockReq = unlockReq.WithContext(auth.WithUser(unlockReq.Context(), user))
-		unlockRR := httptest.NewRecorder()
-		h.Unlock(unlockRR, unlockReq)
-
-		if unlockRR.Code != http.StatusNoContent {
-			t.Fatalf("expected lock-root UNLOCK to succeed, got %d: %s", unlockRR.Code, unlockRR.Body.String())
+		if lock, _ := lockRepo.GetByToken(context.Background(), token); lock != nil {
+			t.Fatal("expected UNLOCK from within the lock's scope to remove the collection lock")
 		}
 	})
-}
-
-func TestLockCoversPath(t *testing.T) {
-	tests := []struct {
-		name        string
-		lockPath    string
-		depth       string
-		requestPath string
-		want        bool
-	}{
-		{name: "exact match", lockPath: "/dav/addressbooks/5/alice", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
-		{name: "descendant covered by infinity", lockPath: "/dav/addressbooks/5", depth: "infinity", requestPath: "/dav/addressbooks/5/alice.vcf", want: true},
-		{name: "descendant not covered by depth zero", lockPath: "/dav/addressbooks/5", depth: "0", requestPath: "/dav/addressbooks/5/alice.vcf", want: false},
-		{name: "sibling not covered", lockPath: "/dav/addressbooks/5/alice", depth: "infinity", requestPath: "/dav/addressbooks/5/bob.vcf", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := lockCoversPath(tc.lockPath, tc.depth, tc.requestPath); got != tc.want {
-				t.Fatalf("lockCoversPath(%q, %q, %q) = %t, want %t", tc.lockPath, tc.depth, tc.requestPath, got, tc.want)
-			}
-		})
-	}
 }
 
 func TestACLNormalizesPrincipalHrefWithoutTrailingSlash(t *testing.T) {
@@ -4234,7 +4597,7 @@ func TestACLNormalizesPrincipalHrefWithoutTrailingSlash(t *testing.T) {
 		},
 	}
 	aclRepo := &fakeACLRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
@@ -4272,36 +4635,40 @@ func TestACLRejectsInvalidPrivileges(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		body string
+		name       string
+		body       string
+		wantStatus int
 	}{
 		{
-			name: "unsupported privilege element",
+			name:       "unsupported privilege element",
+			wantStatus: http.StatusForbidden,
 			body: `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
   <D:ace>
     <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
     <D:grant>
-      <D:privilege><D:unlock/></D:privilege>
+				<D:privilege><D:unknown-privilege/></D:privilege>
     </D:grant>
   </D:ace>
 </D:acl>`,
 		},
 		{
-			name: "mixed valid and unsupported privileges",
+			name:       "mixed valid and unsupported privileges",
+			wantStatus: http.StatusForbidden,
 			body: `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
   <D:ace>
     <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
     <D:grant>
       <D:privilege><D:read/></D:privilege>
-      <D:privilege><D:unlock/></D:privilege>
+				<D:privilege><D:unknown-privilege/></D:privilege>
     </D:grant>
   </D:ace>
 </D:acl>`,
 		},
 		{
-			name: "known privilege contains nested element",
+			name:       "known privilege contains nested element",
+			wantStatus: http.StatusBadRequest,
 			body: `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
   <D:ace>
@@ -4328,15 +4695,15 @@ func TestACLRejectsInvalidPrivileges(t *testing.T) {
 					Privilege:     "read",
 				}},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
 			req = req.WithContext(auth.WithUser(req.Context(), owner))
 			rr := httptest.NewRecorder()
 			h.Acl(rr, req)
 
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("expected ACL to reject invalid privilege with 400, got %d: %s", rr.Code, rr.Body.String())
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("expected ACL to reject invalid privilege with %d, got %d: %s", tc.wantStatus, rr.Code, rr.Body.String())
 			}
 
 			entries, err := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/5")
@@ -4364,7 +4731,7 @@ func TestLockAndACLCanonicalizeAddressBookAliases(t *testing.T) {
 			},
 		}
 		lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 		lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4416,7 +4783,7 @@ func TestLockAndACLCanonicalizeAddressBookAliases(t *testing.T) {
 			},
 		}
 		aclRepo := &fakeACLRepo{}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
@@ -4461,7 +4828,7 @@ func TestLockResponseUsesServedResourceHref(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4496,7 +4863,7 @@ func TestLockCreateRequiresRequestBody(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := httptest.NewRequest("LOCK", "/dav/addressbooks/5/alice.vcf", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4520,7 +4887,7 @@ func TestLockRejectsInvalidRequestBodies(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	tests := []struct {
 		name string
@@ -4568,7 +4935,7 @@ func TestLockOnUnmappedCollectionReturnsCreated(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4588,6 +4955,56 @@ func TestLockOnUnmappedCollectionReturnsCreated(t *testing.T) {
 	if rr.Header().Get("Lock-Token") == "" {
 		t.Fatal("expected LOCK on an unmapped collection to return a lock token")
 	}
+
+	parentReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/", nil)
+	parentReq.Header.Set("Depth", "1")
+	parentReq = parentReq.WithContext(auth.WithUser(parentReq.Context(), user))
+	parentRR := httptest.NewRecorder()
+	h.Propfind(parentRR, parentReq)
+	decodeMultistatus(t, parentRR).assertHrefs(t, "/dav/addressbooks/", "/dav/addressbooks/NewBook")
+
+	directReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/NewBook", nil)
+	directReq.Header.Set("Depth", "0")
+	directReq = directReq.WithContext(auth.WithUser(directReq.Context(), user))
+	directRR := httptest.NewRecorder()
+	h.Propfind(directRR, directReq)
+	decodeMultistatus(t, directRR).responseForHref(t, "/dav/addressbooks/NewBook")
+	if !strings.Contains(directRR.Body.String(), "<d:lockdiscovery>") {
+		t.Fatalf("lock-null PROPFIND omitted lockdiscovery: %s", directRR.Body.String())
+	}
+}
+
+func TestLockNullObjectAppearsInParentPropfind(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	book := store.AddressBook{ID: 5, UserID: user.ID, Name: "Contacts"}
+	bookRepo := &fakeAddressBookRepo{
+		books:            map[int64]*store.AddressBook{5: &book},
+		accessibleByUser: map[int64][]store.AddressBook{user.ID: {book}},
+	}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	lockBody := `<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	lockReq := httptest.NewRequest("LOCK", "/dav/addressbooks/5/draft.vcf", strings.NewReader(lockBody))
+	lockReq = lockReq.WithContext(auth.WithUser(lockReq.Context(), user))
+	lockRR := httptest.NewRecorder()
+	h.Lock(lockRR, lockReq)
+	if lockRR.Code != http.StatusCreated {
+		t.Fatalf("LOCK status = %d, want 201: %s", lockRR.Code, lockRR.Body.String())
+	}
+
+	parentReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/", nil)
+	parentReq.Header.Set("Depth", "1")
+	parentReq = parentReq.WithContext(auth.WithUser(parentReq.Context(), user))
+	parentRR := httptest.NewRecorder()
+	h.Propfind(parentRR, parentReq)
+	decodeMultistatus(t, parentRR).assertHrefs(t, "/dav/addressbooks/5/", "/dav/addressbooks/5/draft.vcf")
+
+	directReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/draft.vcf", nil)
+	directReq.Header.Set("Depth", "0")
+	directReq = directReq.WithContext(auth.WithUser(directReq.Context(), user))
+	directRR := httptest.NewRecorder()
+	h.Propfind(directRR, directReq)
+	decodeMultistatus(t, directRR).assertHrefs(t, "/dav/addressbooks/5/draft.vcf")
 }
 
 func TestLockDoesNotPersistWhenTargetResolutionFails(t *testing.T) {
@@ -4602,7 +5019,7 @@ func TestLockDoesNotPersistWhenTargetResolutionFails(t *testing.T) {
 		getByResourceNameErrKey: "5:alice",
 	}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4628,7 +5045,7 @@ func TestMkcolRebindsPendingCollectionLocks(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4700,7 +5117,7 @@ func TestMkcolRebindsPendingCollectionLocks(t *testing.T) {
 
 func TestMkcolAppliesExtendedBodyProperties(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -4737,7 +5154,7 @@ func TestMkcolAppliesExtendedBodyProperties(t *testing.T) {
 
 func TestMkcolRejectsOversizedRequestBody(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4760,7 +5177,7 @@ func TestMkcolReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
 		locks:               map[string]*store.Lock{},
 		moveResourcePathErr: errors.New("rebind failed"),
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4795,7 +5212,9 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	calRepo := &fakeCalendarRepo{}
 	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4865,9 +5284,46 @@ func TestMkcalendarRebindsPendingCollectionLocks(t *testing.T) {
 	}
 }
 
+func TestMkcalendarRechecksLocksInsideAtomicCreation(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	calRepo := &fakeCalendarRepo{}
+	lockRepo := &fakeLockRepo{locks: map[string]*store.Lock{}}
+	stateCreator := &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	stateCreator.beforeCreate = func() {
+		lockRepo.locks["opaquelocktoken:concurrent"] = &store.Lock{
+			Token:        "opaquelocktoken:concurrent",
+			ResourcePath: pendingCollectionPath("/dav/calendars", user.ID, "work"),
+			UserID:       user.ID,
+			LockScope:    "exclusive",
+			LockType:     "write",
+			Depth:        "0",
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+	}
+	st := &store.Store{Calendars: calRepo, Locks: lockRepo, CalendarState: stateCreator}
+	h := &DavServer{store: st}
+
+	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Mkcalendar(rr, req)
+
+	if rr.Code != http.StatusLocked {
+		t.Fatalf("MKCALENDAR racing with LOCK = %d, want 423; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(calRepo.calendars) != 0 {
+		t.Fatalf("MKCALENDAR racing with LOCK created calendars: %#v", calRepo.calendars)
+	}
+	lock := lockRepo.locks["opaquelocktoken:concurrent"]
+	if lock == nil || lock.ResourcePath != pendingCollectionPath("/dav/calendars", user.ID, "work") {
+		t.Fatalf("concurrent lock was moved or lost: %#v", lock)
+	}
+}
+
 func TestMkcalendarRejectsInvalidBodyAndDoesNotCreate(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(`<d:mkcalendar xmlns:d="DAV:"><d:set>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4885,7 +5341,7 @@ func TestMkcalendarRejectsInvalidBodyAndDoesNotCreate(t *testing.T) {
 
 func TestMkcalendarRejectsOversizedRequestBody(t *testing.T) {
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Calendars: calRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo}}
 
 	req := httptest.NewRequest("MKCALENDAR", "/dav/calendars/work", strings.NewReader(strings.Repeat("x", int(maxDAVBodyBytes)+1)))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -4908,7 +5364,7 @@ func TestMkcalendarReturnsInternalServerErrorWhenLockRebindFails(t *testing.T) {
 		locks:               map[string]*store.Lock{},
 		moveResourcePathErr: errors.New("rebind failed"),
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Locks: lockRepo}}
 
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
@@ -4947,7 +5403,7 @@ func TestPutAddressBookMapsUpsertConflictsToCardDAVConflict(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{upsertErr: store.ErrConflict}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
 
 	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4971,7 +5427,7 @@ func TestPutAddressBookPreservesInternalErrorsFromUpsert(t *testing.T) {
 		},
 	}
 	contactRepo := &fakeContactRepo{upsertErr: errors.New("db unavailable")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}}}
 
 	req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -4987,7 +5443,7 @@ func TestPutAddressBookPreservesInternalErrorsFromUpsert(t *testing.T) {
 	}
 }
 
-func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
+func TestCopyDoesNotRequireSourceLockTokenAndPreservesDestinationLock(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -5004,7 +5460,7 @@ func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:src": {
 				Token:        "opaquelocktoken:src",
-				ResourcePath: "/dav/addressbooks/5/alice.vcf",
+				ResourcePath: "/dav/addressbooks/5/alice",
 				UserID:       user.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -5013,7 +5469,7 @@ func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
 			},
 			"opaquelocktoken:dest": {
 				Token:        "opaquelocktoken:dest",
-				ResourcePath: "/dav/addressbooks/6/copied.vcf",
+				ResourcePath: "/dav/addressbooks/6/copied",
 				UserID:       user.ID,
 				LockScope:    "exclusive",
 				LockType:     "write",
@@ -5022,11 +5478,11 @@ func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	req := httptest.NewRequest("COPY", "/dav/addressbooks/5/alice.vcf", nil)
 	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
-	req.Header.Set("If", `</dav/addressbooks/5/alice.vcf> (<opaquelocktoken:src>) </dav/addressbooks/6/copied.vcf> (<opaquelocktoken:dest>)`)
+	req.Header.Set("If", `</dav/addressbooks/6/copied.vcf> (<opaquelocktoken:dest>)`)
 	req = req.WithContext(auth.WithUser(req.Context(), user))
 	rr := httptest.NewRecorder()
 
@@ -5037,6 +5493,11 @@ func TestCopyUsesTaggedIfTokensForLockedSourceAndDestination(t *testing.T) {
 	}
 	if copied, _ := contactRepo.GetByResourceName(req.Context(), 6, "copied"); copied == nil {
 		t.Fatal("expected destination contact to be created")
+	}
+	for _, token := range []string{"opaquelocktoken:src", "opaquelocktoken:dest"} {
+		if lock, _ := lockRepo.GetByToken(req.Context(), token); lock == nil {
+			t.Fatalf("COPY removed lock %q", token)
+		}
 	}
 }
 
@@ -5066,7 +5527,7 @@ func TestPropfindAddressBookCollectionIncludesLockAndACLProperties(t *testing.T)
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5096,6 +5557,60 @@ func TestPropfindAddressBookCollectionIncludesLockAndACLProperties(t *testing.T)
 	}
 }
 
+func TestDecoratePropfindResponsesBatchesLockDiscovery(t *testing.T) {
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"opaquelocktoken:cal10": {
+				Token:        "opaquelocktoken:cal10",
+				ResourcePath: "/dav/calendars/10",
+				UserID:       user.ID,
+				LockScope:    "exclusive",
+				LockType:     "write",
+				Depth:        "0",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+
+	responses := []response{
+		{Href: "/dav/calendars/9/", Propstat: []propstat{{Status: httpStatusOK}}},
+		{Href: "/dav/calendars/10/", Propstat: []propstat{{Status: httpStatusOK}}},
+	}
+
+	ctx := auth.WithUser(context.Background(), user)
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	mask := propDecorationMask{lockDiscovery: true}
+	if err := h.decoratePropfindResponses(ctx, req, user, responses, mask); err != nil {
+		t.Fatalf("decoratePropfindResponses: %v", err)
+	}
+
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("expected a single batched lock query for the whole Depth:1 set, got %d", lockRepo.listByResourcesCalls)
+	}
+
+	lockCount := func(href string) int {
+		for i := range responses {
+			if responses[i].Href != href {
+				continue
+			}
+			ld := responses[i].Propstat[0].Prop.LockDiscovery
+			if ld == nil {
+				return -1
+			}
+			return len(ld.ActiveLocks)
+		}
+		return -1
+	}
+	if got := lockCount("/dav/calendars/10/"); got != 1 {
+		t.Fatalf("expected the locked collection to report its lock, got %d", got)
+	}
+	if got := lockCount("/dav/calendars/9/"); got != 0 {
+		t.Fatalf("expected the unlocked collection to report no locks, got %d", got)
+	}
+}
+
 func TestACLRejectsInvalidACEs(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	bookRepo := &fakeAddressBookRepo{
@@ -5108,6 +5623,57 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 		name string
 		body string
 	}{
+		{
+			name: "acl has character data",
+			body: `<d:acl xmlns:d="DAV:">junk<d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "wrong ACL local name",
+			body: `<d:not-acl xmlns:d="DAV:"><d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:not-acl>`,
+		},
+		{
+			name: "wrong ACL namespace",
+			body: `<x:acl xmlns:x="urn:not-dav" xmlns:d="DAV:"><d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></x:acl>`,
+		},
+		{
+			name: "principal has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal>junk<d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "principal href has nested content",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:href>/dav/<d:all/>principals/2/</d:href></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "grant has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:all/></d:principal><d:grant>junk<d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "privilege has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege>junk<d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "principal property has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:property>junk<d:owner/></d:property></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "invert has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:invert>junk<d:principal><d:all/></d:principal></d:invert><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "invert nested inside principal",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:invert><d:principal><d:all/></d:principal></d:invert></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>`,
+		},
+		{
+			name: "inherited has character data",
+			body: `<d:acl xmlns:d="DAV:"><d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant><d:inherited>junk<d:href>/dav/calendars/</d:href></d:inherited></d:ace></d:acl>`,
+		},
+		{
+			name: "unknown acl child",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:" xmlns:X="urn:example:unknown">
+  <X:foo/>
+</D:acl>`,
+		},
 		{
 			name: "ace missing grant and deny",
 			body: `<?xml version="1.0" encoding="utf-8"?>
@@ -5133,12 +5699,59 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 </D:acl>`,
 		},
 		{
+			name: "grant precedes principal",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:">
+  <D:ace>
+    <D:grant><D:privilege><D:read/></D:privilege></D:grant>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+  </D:ace>
+</D:acl>`,
+		},
+		{
 			name: "ace grant has no privileges",
 			body: `<?xml version="1.0" encoding="utf-8"?>
 <D:acl xmlns:D="DAV:">
   <D:ace>
     <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
     <D:grant/>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "grant has unknown child",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:" xmlns:X="urn:example:unknown">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant>
+      <D:privilege><D:read/></D:privilege>
+      <X:foo/>
+    </D:grant>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "deny has unknown child",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:" xmlns:X="urn:example:unknown">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:deny>
+      <D:privilege><D:write/></D:privilege>
+      <X:foo/>
+    </D:deny>
+  </D:ace>
+</D:acl>`,
+		},
+		{
+			name: "inherited has unknown child",
+			body: `<?xml version="1.0" encoding="utf-8"?>
+<D:acl xmlns:D="DAV:" xmlns:X="urn:example:unknown">
+  <D:ace>
+    <D:principal><D:href>/dav/principals/2/</D:href></D:principal>
+    <D:grant><D:privilege><D:read/></D:privilege></D:grant>
+    <D:inherited><D:href>/dav/calendars/</D:href><X:foo/></D:inherited>
   </D:ace>
 </D:acl>`,
 		},
@@ -5154,7 +5767,7 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 					Privilege:     "read",
 				}},
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 			req := httptest.NewRequest("ACL", "/dav/addressbooks/5/", strings.NewReader(tc.body))
 			req = req.WithContext(auth.WithUser(req.Context(), owner))
@@ -5177,7 +5790,7 @@ func TestACLRejectsInvalidACEs(t *testing.T) {
 }
 
 func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	bookRepo := &fakeAddressBookRepo{
 		books: map[int64]*store.AddressBook{
@@ -5191,8 +5804,12 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
-	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/"); privs == nil || len(privs.Privileges) == 0 {
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/addressbooks/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
 
@@ -5215,12 +5832,15 @@ func TestPropfindAddressBookCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 }
 
 func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{ReadFreeBusy: true}},
 			},
 		},
 		calendars: map[int64]*store.Calendar{
@@ -5234,8 +5854,12 @@ func TestPropfindCalendarCurrentUserPrivilegeSetForDelegate(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
-	if privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/"); privs == nil || len(privs.Privileges) == 0 {
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privs == nil || len(privs.Privileges) == 0 {
 		t.Fatalf("expected computed privilege set for delegate, got %#v", privs)
 	}
 
@@ -5269,9 +5893,12 @@ func TestCalendarCurrentUserPrivilegeSetForReadFreeBusyDelegate(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privs == nil {
 		t.Fatal("expected computed privilege set for read-free-busy delegate")
 	}
@@ -5292,13 +5919,16 @@ func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenie
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
-	privs := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	privs, err := h.currentUserPrivilegeSetForPath(context.Background(), delegate, "/dav/calendars/5/")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if privs == nil {
 		t.Fatal("expected computed privilege set")
 	}
@@ -5309,13 +5939,16 @@ func TestCalendarCurrentUserPrivilegeSetOmitsAggregateWriteWhenSubPrivilegeDenie
 	}
 }
 
-func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+func TestPropfindCalendarDiscoveryExcludesReadFreeBusyOnlyCalendars(t *testing.T) {
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
+			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
 			},
 		},
 		calendars: map[int64]*store.Calendar{
@@ -5327,7 +5960,7 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	t.Run("calendar home discovery", func(t *testing.T) {
 		req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
@@ -5337,12 +5970,7 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		if !strings.Contains(rr.Body.String(), "<d:href>/dav/calendars/5/</d:href>") {
-			t.Fatalf("expected read-free-busy calendar in discovery response, got %s", rr.Body.String())
-		}
+		decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref())
 	})
 
 	t.Run("direct collection propfind", func(t *testing.T) {
@@ -5353,29 +5981,29 @@ func TestPropfindCalendarDiscoveryIncludesReadFreeBusyOnlyCalendars(t *testing.T
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected direct PROPFIND to succeed with read-free-busy, got %d: %s", rr.Code, rr.Body.String())
-		}
-		if !strings.Contains(rr.Body.String(), "read-free-busy") {
-			t.Fatalf("expected direct PROPFIND to advertise read-free-busy, got %s", rr.Body.String())
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404: %s", rr.Code, rr.Body.String())
 		}
 	})
 }
 
 func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
 			owner.ID: {
 				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Editor: true},
 			},
+			delegate.ID: {
+				{Calendar: store.Calendar{ID: 5, UserID: owner.ID, Name: "Work"}, Shared: true, PrivilegesResolved: true, Privileges: store.CalendarPrivileges{Read: true}},
+			},
 		},
 		calendars: map[int64]*store.Calendar{
 			5: {ID: 5, UserID: owner.ID, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
@@ -5389,13 +6017,7 @@ func TestPropfindCalendarDiscoveryIncludesACLGrantedCalendars(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:href>/dav/calendars/5/</d:href>") {
-		t.Fatalf("expected ACL-granted calendar in discovery response, got %s", respBody)
-	}
+	decodeMultistatus(t, rr).assertHrefs(t, "/dav/calendars/", birthdayCalendarHref(), "/dav/calendars/5/")
 }
 
 func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
@@ -5421,7 +6043,7 @@ func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5436,17 +6058,19 @@ func TestPropfindAddressBookObjectACLUsesCanonicalStoredPath(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/alice.vcf")
+	aces := resp.aces(t)
+	if len(aces) != 2 {
+		t.Fatalf("DAV:acl carries %d ACEs, want the protected owner ACE and the stored ACE", len(aces))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:acl>") || !strings.Contains(respBody, "/dav/principals/2/") || !strings.Contains(respBody, "<d:read") {
-		t.Fatalf("expected PROPFIND to include the stored ACE for the canonical resource path, got %s", respBody)
+	assertSoleHref(t, aces[1].child(t, davQN("principal")), "/dav/principals/2/")
+	if got := qnList(acePrivileges(t, aces[1], davQN("grant"))); got != qnString(davQN("read")) {
+		t.Errorf("ACE grants %s, want %s", got, qnString(davQN("read")))
 	}
 }
 
 func TestPropfindGenericCollectionReportsUnsupportedRequestedPropertiesAs404(t *testing.T) {
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -5461,16 +6085,9 @@ func TestPropfindGenericCollectionReportsUnsupportedRequestedPropertiesAs404(t *
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !propstatHasStatus(respBody, "calendar-home-set", http.StatusNotFound) {
-		t.Fatalf("expected unsupported calendar-home-set to be reported with 404, got %s", respBody)
-	}
-	if propstatHasStatus(respBody, "displayname", http.StatusOK) {
-		t.Fatalf("expected PROPFIND prop response to avoid leaking unrelated default properties, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/")
+	resp.assertPropstatNames(t, http.StatusNotFound, calQN("calendar-home-set"))
+	resp.assertNoPropstatWithStatus(t, http.StatusOK)
 }
 
 func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T) {
@@ -5498,7 +6115,7 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:event": {
 				Token:          "opaquelocktoken:event",
-				ResourcePath:   "/dav/calendars/5/event.ics",
+				ResourcePath:   "/dav/calendars/5/event",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -5510,10 +6127,10 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/calendars/5/event.ics", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5528,18 +6145,10 @@ func TestPropfindCalendarPropRequestReturnsOnlyRequestedProperties(t *testing.T)
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected getetag in response, got %s", respBody)
-	}
-	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "calendar-data", "getcontenttype"} {
-		if strings.Contains(respBody, forbidden) {
-			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5/event.ics")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag-event"`)
+	resp.assertPropstatNames(t, http.StatusOK, davQN("getetag"))
+	resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 }
 
 func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
@@ -5566,7 +6175,7 @@ func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
 			{ResourcePath: "/dav/calendars/5/event", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5581,15 +6190,10 @@ func TestPropfindCalendarObjectHidesDeniedEvent(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected denied object PROPFIND to hide getetag, got %s", respBody)
-	}
-	if !strings.Contains(respBody, "404 Not Found") {
-		t.Fatalf("expected denied object PROPFIND to look like not found, got %s", respBody)
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5/event.ics")
+	resp.assertPropAbsent(t, davQN("getetag"))
+	if code := statusCodeFromLine(t, resp.Status); code != http.StatusNotFound {
+		t.Errorf("denied object response status = %d, want 404 Not Found", code)
 	}
 }
 
@@ -5615,7 +6219,7 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 		locks: map[string]*store.Lock{
 			"opaquelocktoken:alice": {
 				Token:          "opaquelocktoken:alice",
-				ResourcePath:   "/dav/addressbooks/5/alice.vcf",
+				ResourcePath:   "/dav/addressbooks/5/alice",
 				UserID:         user.ID,
 				LockScope:      "exclusive",
 				LockType:       "write",
@@ -5627,10 +6231,10 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
-			{ResourcePath: "/dav/addressbooks/5/alice.vcf", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -5645,25 +6249,17 @@ func TestPropfindAddressBookPropRequestReturnsOnlyRequestedProperties(t *testing
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:getetag>") {
-		t.Fatalf("expected getetag in response, got %s", respBody)
-	}
-	for _, forbidden := range []string{"supportedlock", "lockdiscovery", "<d:acl>", "supported-privilege-set", "principal-collection-set", "address-data", "getcontenttype"} {
-		if strings.Contains(respBody, forbidden) {
-			t.Fatalf("did not expect %q in prop-only response, got %s", forbidden, respBody)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/alice.vcf")
+	resp.assertPropValue(t, davQN("getetag"), http.StatusOK, `"etag-alice"`)
+	resp.assertPropstatNames(t, http.StatusOK, davQN("getetag"))
+	resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 }
 
 func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
 	now := store.Now()
 	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 
-	newHandler := func(denySecret bool) *Handler {
+	newHandler := func(denySecret bool) *DavServer {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now},
@@ -5686,7 +6282,7 @@ func TestPropfindAddressBookDepthOneFiltersDeniedContacts(t *testing.T) {
 				Privilege:     "read",
 			})
 		}
-		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+		return &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
 	}
 
 	t.Run("positive_includes_visible_members", func(t *testing.T) {
@@ -5733,7 +6329,7 @@ func TestAddressBookReportsFilterDeniedContacts(t *testing.T) {
 	now := store.Now()
 	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
 
-	newHandler := func(denySecret bool) *Handler {
+	newHandler := func(denySecret bool) *DavServer {
 		bookRepo := &fakeAddressBookRepo{
 			books: map[int64]*store.AddressBook{
 				5: {ID: 5, UserID: 1, Name: "Shared Contacts", UpdatedAt: now, CTag: 2},
@@ -5756,7 +6352,7 @@ func TestAddressBookReportsFilterDeniedContacts(t *testing.T) {
 				Privilege:     "read",
 			})
 		}
-		return &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
+		return &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: &fakeACLRepo{entries: entries}}}
 	}
 
 	tests := []struct {
@@ -5861,9 +6457,9 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
-	t.Run("positive_empty_address_data_returns_full_card", func(t *testing.T) {
+	t.Run("empty_address_data_is_report_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -5881,14 +6477,15 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 		respBody := rr.Body.String()
-		for _, want := range []string{"FN:Alice Example", "EMAIL:alice@example.com"} {
-			if !strings.Contains(respBody, want) {
-				t.Fatalf("expected full address-data response to include %q, got %s", want, respBody)
-			}
+		if !strings.Contains(respBody, httpStatusNotFound) {
+			t.Fatalf("expected address-data to be reported as unavailable through PROPFIND, got %s", respBody)
+		}
+		if strings.Contains(respBody, "FN:Alice Example") || strings.Contains(respBody, "EMAIL:alice@example.com") {
+			t.Fatalf("PROPFIND must not expose address data, got %s", respBody)
 		}
 	})
 
-	t.Run("negative_selected_properties_exclude_unrequested_fields", func(t *testing.T) {
+	t.Run("selected_address_data_is_report_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
   <d:prop>
@@ -5908,11 +6505,11 @@ func TestPropfindAddressDataRequestsRespectSelection(t *testing.T) {
 			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
 		}
 		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "FN:Alice Example") {
-			t.Fatalf("expected filtered address-data to include FN, got %s", respBody)
+		if !strings.Contains(respBody, httpStatusNotFound) {
+			t.Fatalf("expected selected address-data to be unavailable through PROPFIND, got %s", respBody)
 		}
-		if strings.Contains(respBody, "EMAIL:alice@example.com") {
-			t.Fatalf("expected filtered address-data to omit EMAIL, got %s", respBody)
+		if strings.Contains(respBody, "FN:Alice Example") || strings.Contains(respBody, "EMAIL:alice@example.com") {
+			t.Fatalf("PROPFIND must not expose selected address data, got %s", respBody)
 		}
 	})
 }
@@ -5924,7 +6521,7 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 			5: {ID: 5, UserID: user.ID, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	t.Run("positive_supported_addressbook_property_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -5940,18 +6537,10 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
-			t.Fatalf("expected displayname in response, got %s", respBody)
-		}
-		for _, forbidden := range []string{"addressbook-description", "supported-address-data", "supportedlock"} {
-			if strings.Contains(respBody, forbidden) {
-				t.Fatalf("did not expect %q in supported prop-only response, got %s", forbidden, respBody)
-			}
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+		resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Contacts")
+		resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"))
+		resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 	})
 
 	t.Run("negative_unsupported_addressbook_property_returns_404", func(t *testing.T) {
@@ -5968,22 +6557,15 @@ func TestPropfindCollectionPropRequestsReportUnsupportedProperties(t *testing.T)
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !propstatHasStatus(respBody, "principal-URL", http.StatusNotFound) {
-			t.Fatalf("expected unsupported principal-URL to be reported with 404, got %s", respBody)
-		}
-		if strings.Contains(respBody, "<d:displayname>Contacts</d:displayname>") {
-			t.Fatalf("expected unsupported prop request to avoid leaking default collection properties, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+		resp.assertPropstatNames(t, http.StatusNotFound, davQN("principal-URL"))
+		resp.assertNoPropstatWithStatus(t, http.StatusOK)
 	})
 }
 
 func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	t.Run("positive_supported_principal_property_only", func(t *testing.T) {
 		body := `<?xml version="1.0" encoding="utf-8"?>
@@ -5999,16 +6581,10 @@ func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !strings.Contains(respBody, "<d:principal-URL>") {
-			t.Fatalf("expected principal-URL in response, got %s", respBody)
-		}
-		if strings.Contains(respBody, "calendar-home-set") {
-			t.Fatalf("did not expect unrelated principal properties in prop-only response, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/principals/1/")
+		resp.assertPropHrefs(t, davQN("principal-URL"), "/dav/principals/1/")
+		resp.assertPropstatNames(t, http.StatusOK, davQN("principal-URL"))
+		resp.assertNoPropstatWithStatus(t, http.StatusNotFound)
 	})
 
 	t.Run("negative_unsupported_principal_property_returns_404", func(t *testing.T) {
@@ -6025,22 +6601,15 @@ func TestPropfindPrincipalUnsupportedPropertyReturns404(t *testing.T) {
 
 		h.Propfind(rr, req)
 
-		if rr.Code != http.StatusMultiStatus {
-			t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
-		}
-		respBody := rr.Body.String()
-		if !propstatHasStatus(respBody, "calendar-description", http.StatusNotFound) {
-			t.Fatalf("expected unsupported principal property to be reported with 404, got %s", respBody)
-		}
-		if strings.Contains(respBody, "<d:principal-URL>") {
-			t.Fatalf("expected unsupported prop request to avoid leaking principal defaults, got %s", respBody)
-		}
+		resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/principals/1/")
+		resp.assertPropstatNames(t, http.StatusNotFound, calQN("calendar-description"))
+		resp.assertNoPropstatWithStatus(t, http.StatusOK)
 	})
 }
 
 func TestIsResourceOwnerParsesPrincipalIDPositionally(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
-	h := &Handler{store: &store.Store{}}
+	h := &DavServer{store: &store.Store{}}
 
 	if !h.isResourceOwner(context.Background(), user, "/dav/principals/1/") {
 		t.Fatal("expected authenticated principal path to be owned by the matching user")
@@ -6077,7 +6646,7 @@ func TestPutAddressBookUIDConflictEscapesHref(t *testing.T) {
 				},
 			},
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/"+resourceName+".vcf", strings.NewReader(buildVCard("3.0", "UID:new", "FN:New")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -6109,7 +6678,7 @@ func TestPutAddressBookUIDConflictEscapesHref(t *testing.T) {
 
 func TestMkcolRejectsNumericDisplayNameFromBody(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -6135,7 +6704,7 @@ func TestMkcolRejectsNumericDisplayNameFromBody(t *testing.T) {
 
 func TestMkcolRejectsInvalidExtendedBodyAndDoesNotCreate(t *testing.T) {
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/tmp", strings.NewReader(`<d:mkcol xmlns:d="DAV:"><d:set>`))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -6157,7 +6726,7 @@ func TestMkcolRejectsDuplicateAddressBookName(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 
 	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/contacts", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -6182,7 +6751,7 @@ func TestAddressBookHandlersRejectExtraResourcePathSegments(t *testing.T) {
 			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-a"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 
 	t.Run("get", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/5/alice.vcf/extra", nil)
@@ -6229,7 +6798,7 @@ func TestAddressBookCopyAndMoveOverwriteReplaceDifferentUIDDestination(t *testin
 				},
 			}
 			lockRepo := &fakeLockRepo{}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6280,7 +6849,8 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 		},
 		overwriteMoveDeletedRepo: deletedRepo,
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
+	contactRepo.tombstones = deletedRepo
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, DeletedResources: deletedRepo}}
 
 	req := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6291,10 +6861,7 @@ func TestMoveContactOverwriteClearsDestinationTombstone(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite MOVE to return 204, got %d: %s", rr.Code, rr.Body.String())
 	}
-	tombstones, err := deletedRepo.ListDeletedSince(req.Context(), "contact", 6, time.Time{})
-	if err != nil {
-		t.Fatalf("ListDeletedSince() error = %v", err)
-	}
+	tombstones := deletedRepo.collectionTombstones("contact", 6)
 	for _, tombstone := range tombstones {
 		if tombstone.ResourceName == "renamed" {
 			t.Fatalf("expected overwrite MOVE to clear destination tombstone, got %#v", tombstones)
@@ -6321,7 +6888,11 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 			}
 			aclEntries := []store.ACLEntry{
 				{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
-				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
+				{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+				{ResourcePath: "/dav/addressbooks/6", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"},
 			}
 			if method == "MOVE" {
 				aclEntries = append(aclEntries, store.ACLEntry{
@@ -6331,7 +6902,7 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 					Privilege:     "unbind",
 				})
 			}
-			h := &Handler{store: &store.Store{
+			h := &DavServer{store: &store.Store{
 				AddressBooks: bookRepo,
 				Contacts:     contactRepo,
 				Locks:        &fakeLockRepo{},
@@ -6350,8 +6921,17 @@ func TestAddressBookCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebinding
 				h.Move(rr, req)
 			}
 
-			if rr.Code != http.StatusNotFound {
+			if rr.Code != http.StatusForbidden {
 				t.Fatalf("expected overwrite %s without rebinding privileges to be rejected, got %d: %s", method, rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "need-privileges") {
+				t.Fatalf("expected overwrite %s rejection to identify missing privileges, got %s", method, rr.Body.String())
+			}
+			wantHref, wantPrivilege := "/dav/addressbooks/6", "unbind"
+			for _, want := range []string{"<D:href>" + wantHref + "</D:href>", "<D:" + wantPrivilege + "/>"} {
+				if !strings.Contains(rr.Body.String(), want) {
+					t.Errorf("overwrite %s rejection missing %q: %s", method, want, rr.Body.String())
+				}
 			}
 			dest, _ := contactRepo.GetByResourceName(req.Context(), 6, "renamed")
 			if dest == nil || dest.UID != "bob" {
@@ -6382,7 +6962,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 						CalendarID:   5,
 						UID:          "alice",
 						ResourceName: "alice",
-						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:alice\r\nSUMMARY:Alice\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						RawICAL:      buildCalendarObject(buildVEvent("alice", "SUMMARY:Alice")),
 						ETag:         "etag-a",
 						LastModified: now,
 					},
@@ -6390,7 +6970,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 						CalendarID:   6,
 						UID:          "bob",
 						ResourceName: "renamed",
-						RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bob\r\nSUMMARY:Bob\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+						RawICAL:      buildCalendarObject(buildVEvent("bob", "SUMMARY:Bob")),
 						ETag:         "etag-b",
 						LastModified: now,
 					},
@@ -6398,7 +6978,11 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 			}
 			aclEntries := []store.ACLEntry{
 				{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
-				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-content"},
+				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
+				{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "bind"},
+				{ResourcePath: "/dav/calendars/6", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "unbind"},
 			}
 			if method == "MOVE" {
 				aclEntries = append(aclEntries, store.ACLEntry{
@@ -6408,7 +6992,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 					Privilege:     "unbind",
 				})
 			}
-			h := &Handler{store: &store.Store{
+			h := &DavServer{store: &store.Store{
 				Calendars:  calRepo,
 				Events:     eventRepo,
 				Locks:      &fakeLockRepo{},
@@ -6430,6 +7014,12 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 			if rr.Code != http.StatusForbidden {
 				t.Fatalf("expected overwrite %s without rebinding privileges to be rejected, got %d: %s", method, rr.Code, rr.Body.String())
 			}
+			wantHref, wantPrivilege := "/dav/calendars/6", "unbind"
+			for _, want := range []string{"<D:need-privileges>", "<D:href>" + wantHref + "</D:href>", "<D:" + wantPrivilege + "/>"} {
+				if !strings.Contains(rr.Body.String(), want) {
+					t.Errorf("overwrite %s rejection missing %q: %s", method, want, rr.Body.String())
+				}
+			}
 			dest, _ := eventRepo.GetByResourceName(req.Context(), 6, "renamed")
 			if dest == nil || dest.UID != "bob" {
 				t.Fatalf("expected %s to preserve the existing destination event, got %#v", method, dest)
@@ -6442,7 +7032,7 @@ func TestCalendarCopyAndMoveOverwriteDifferentUIDDestinationRequiresRebindingPri
 	}
 }
 
-func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
+func TestMoveContactRemovesDirectSourceLock(t *testing.T) {
 	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	now := store.Now()
 	bookRepo := &fakeAddressBookRepo{
@@ -6470,7 +7060,7 @@ func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -6488,18 +7078,11 @@ func TestMoveContactRebindsDirectLockToDestination(t *testing.T) {
 	putDestRR := httptest.NewRecorder()
 	h.Put(putDestRR, putDestReq)
 
-	if putDestRR.Code != http.StatusLocked {
-		t.Fatalf("expected moved lock to protect destination resource, got %d: %s", putDestRR.Code, putDestRR.Body.String())
-	}
-
-	putDestReq = newAddressBookPutRequest("/dav/addressbooks/6/copied.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated")))
-	putDestReq.Header.Set("If", "(<"+lockToken+">)")
-	putDestReq = putDestReq.WithContext(auth.WithUser(putDestReq.Context(), user))
-	putDestRR = httptest.NewRecorder()
-	h.Put(putDestRR, putDestReq)
-
 	if putDestRR.Code != http.StatusNoContent {
-		t.Fatalf("expected destination write with moved lock token to succeed, got %d: %s", putDestRR.Code, putDestRR.Body.String())
+		t.Fatalf("expected MOVE source lock to be removed, got destination write status %d: %s", putDestRR.Code, putDestRR.Body.String())
+	}
+	if lock, _ := lockRepo.GetByToken(context.Background(), lockToken); lock != nil {
+		t.Fatalf("MOVE retained source lock: %#v", lock)
 	}
 
 	putOldReq := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:new-alice", "FN:Replacement Alice")))
@@ -6557,7 +7140,7 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo, ACLEntries: aclRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/renamed.vcf")
@@ -6577,8 +7160,8 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	putRR := httptest.NewRecorder()
 	h.Put(putRR, putReq)
 
-	if putRR.Code != http.StatusNoContent {
-		t.Fatalf("expected source lock token to be rebound onto overwritten destination, got %d: %s", putRR.Code, putRR.Body.String())
+	if putRR.Code != http.StatusLocked {
+		t.Fatalf("expected source lock to be removed while the destination lock remains, got %d: %s", putRR.Code, putRR.Body.String())
 	}
 
 	putReq = newAddressBookPutRequest("/dav/addressbooks/6/renamed.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Updated Again")))
@@ -6587,8 +7170,8 @@ func TestMoveContactOverwritePreservesDestinationDAVState(t *testing.T) {
 	putRR = httptest.NewRecorder()
 	h.Put(putRR, putReq)
 
-	if putRR.Code != http.StatusLocked {
-		t.Fatalf("expected overwritten destination lock token to be cleared, got %d: %s", putRR.Code, putRR.Body.String())
+	if putRR.Code != http.StatusNoContent {
+		t.Fatalf("expected overwritten destination lock token to remain valid, got %d: %s", putRR.Code, putRR.Body.String())
 	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/dav/addressbooks/6/renamed.vcf", nil)
@@ -6627,7 +7210,7 @@ func TestDeleteContactRemovesDirectLockState(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: lockRepo}}
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	deleteReq.Header.Set("If", "(<"+lockToken+">)")
@@ -6669,7 +7252,7 @@ func TestMoveContactRebindsACLToDestination(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, Locks: &fakeLockRepo{}, ACLEntries: aclRepo}}
 
 	moveReq := httptest.NewRequest("MOVE", "/dav/addressbooks/5/alice.vcf", nil)
 	moveReq.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
@@ -6727,7 +7310,7 @@ func TestDeleteContactRemovesResourceACLState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5/alice", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
 	deleteReq = deleteReq.WithContext(auth.WithUser(deleteReq.Context(), owner))
@@ -6792,7 +7375,7 @@ func TestCopyContactOverwriteClearsDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     contactRepo,
 		Locks:        lockRepo,
@@ -6810,8 +7393,8 @@ func TestCopyContactOverwriteClearsDestinationDAVState(t *testing.T) {
 	if copyRR.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite COPY to succeed, got %d: %s", copyRR.Code, copyRR.Body.String())
 	}
-	if _, ok := lockRepo.locks[destToken]; ok {
-		t.Fatalf("expected overwrite COPY to clear destination lock state, got %#v", lockRepo.locks)
+	if _, ok := lockRepo.locks[destToken]; !ok {
+		t.Fatalf("expected overwrite COPY to preserve destination lock state, got %#v", lockRepo.locks)
 	}
 	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/addressbooks/6/renamed"); len(entries) != 0 {
 		t.Fatalf("expected overwrite COPY to clear destination ACL state, got %#v", entries)
@@ -6829,7 +7412,6 @@ func TestCopyContactOverwriteClearsDestinationDAVState(t *testing.T) {
 
 func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
-	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
@@ -6843,8 +7425,8 @@ func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"5:alice": {CalendarID: 5, UID: "alice", ResourceName: "alice", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:alice\r\nSUMMARY:Alice\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-a", LastModified: now},
-			"6:bob":   {CalendarID: 6, UID: "bob", ResourceName: "renamed", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bob\r\nSUMMARY:Bob\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "etag-b", LastModified: now},
+			"5:alice": {CalendarID: 5, UID: "alice", ResourceName: "alice", RawICAL: buildCalendarObject(buildVEvent("alice", "SUMMARY:Alice")), ETag: "etag-a", LastModified: now},
+			"6:bob":   {CalendarID: 6, UID: "bob", ResourceName: "renamed", RawICAL: buildCalendarObject(buildVEvent("bob", "SUMMARY:Bob")), ETag: "etag-b", LastModified: now},
 		},
 	}
 	destToken := "opaquelocktoken:dest-calendar-lock"
@@ -6866,11 +7448,12 @@ func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
 			{ResourcePath: "/dav/calendars/6/renamed", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{
-		Calendars:  calRepo,
-		Events:     eventRepo,
-		Locks:      lockRepo,
-		ACLEntries: aclRepo,
+	h := &DavServer{store: &store.Store{
+		Calendars:         calRepo,
+		Events:            eventRepo,
+		CalendarTransfers: eventRepo,
+		Locks:             lockRepo,
+		ACLEntries:        aclRepo,
 	}}
 
 	copyReq := httptest.NewRequest("COPY", "/dav/calendars/5/alice.ics", nil)
@@ -6884,20 +7467,8 @@ func TestCopyCalendarOverwriteClearsDestinationDAVState(t *testing.T) {
 	if copyRR.Code != http.StatusNoContent {
 		t.Fatalf("expected overwrite COPY to succeed, got %d: %s", copyRR.Code, copyRR.Body.String())
 	}
-	if _, ok := lockRepo.locks[destToken]; ok {
-		t.Fatalf("expected overwrite COPY to clear destination lock state, got %#v", lockRepo.locks)
-	}
-	if entries, _ := aclRepo.ListByResource(context.Background(), "/dav/calendars/6/renamed"); len(entries) != 0 {
-		t.Fatalf("expected overwrite COPY to clear destination ACL state, got %#v", entries)
-	}
-
-	getReq := httptest.NewRequest(http.MethodGet, "/dav/calendars/6/renamed.ics", nil)
-	getReq = getReq.WithContext(auth.WithUser(getReq.Context(), delegate))
-	getRR := httptest.NewRecorder()
-	h.Get(getRR, getReq)
-
-	if getRR.Code != http.StatusNotFound {
-		t.Fatalf("expected overwrite COPY to clear destination ACL access, got %d: %s", getRR.Code, getRR.Body.String())
+	if _, ok := lockRepo.locks[destToken]; !ok {
+		t.Fatalf("expected overwrite COPY to preserve destination lock state, got %#v", lockRepo.locks)
 	}
 }
 
@@ -6914,7 +7485,7 @@ func TestPropfindACLUsesSpecialPrincipalElements(t *testing.T) {
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "DAV:all", IsGrant: false, Privilege: "write"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -6929,19 +7500,29 @@ func TestPropfindACLUsesSpecialPrincipalElements(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/addressbooks/5/")
+	aces := resp.aces(t)
+	if len(aces) != 3 {
+		t.Fatalf("DAV:acl carries %d ACEs, want the protected owner ACE and one per stored entry", len(aces))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "<d:authenticated") {
-		t.Fatalf("expected DAV:authenticated principal element, got %s", respBody)
+	aces = aces[1:]
+
+	// RFC 3744 §5.5.1: DAV:all and DAV:authenticated are principal elements in
+	// their own right, so neither may be serialized as a DAV:href.
+	want := []struct {
+		principal xml.Name
+		container xml.Name
+		privilege xml.Name
+	}{
+		{principal: davQN("authenticated"), container: davQN("grant"), privilege: davQN("read")},
+		{principal: davQN("all"), container: davQN("deny"), privilege: davQN("write")},
 	}
-	if !strings.Contains(respBody, "<d:all") {
-		t.Fatalf("expected DAV:all principal element, got %s", respBody)
-	}
-	for _, invalid := range []string{"<d:href>DAV:authenticated</d:href>", "<d:href>DAV:all</d:href>"} {
-		if strings.Contains(respBody, invalid) {
-			t.Fatalf("did not expect ACL principal to be serialized as href %q, got %s", invalid, respBody)
+	for i, tc := range want {
+		if got := qnList(acePrincipals(t, aces[i])); got != qnString(tc.principal) {
+			t.Errorf("ACE %d principal = %s, want %s", i, got, qnString(tc.principal))
+		}
+		if got := qnList(acePrivileges(t, aces[i], tc.container)); got != qnString(tc.privilege) {
+			t.Errorf("ACE %d %s = %s, want %s", i, qnString(tc.container), got, qnString(tc.privilege))
 		}
 	}
 }
@@ -6977,7 +7558,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 			contacts:             map[string]*store.Contact{},
 			getByResourceNameErr: errors.New("resource lookup failed"),
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -6998,7 +7579,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 			getByUIDErr:    errors.New("uid lookup failed"),
 			getByUIDErrKey: "5:alice",
 		}
-		h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+		h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 		req := newAddressBookPutRequest("/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 		req = req.WithContext(auth.WithUser(req.Context(), user))
 		rr := httptest.NewRecorder()
@@ -7028,7 +7609,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByResourceNameErr:    errors.New("destination lookup failed"),
 				getByResourceNameErrKey: "6:copied",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7065,7 +7646,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByResourceNameErr:    errors.New("source lookup failed"),
 				getByResourceNameErrKey: "5:alice",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7099,7 +7680,7 @@ func TestContactWritesFailClosedOnLookupErrors(t *testing.T) {
 				getByUIDErr:    errors.New("destination uid lookup failed"),
 				getByUIDErrKey: "6:alice",
 			}
-			h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+			h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
 			req := httptest.NewRequest(method, "/dav/addressbooks/5/alice.vcf", nil)
 			req.Header.Set("Destination", "https://example.com/dav/addressbooks/6/copied.vcf")
 			req = req.WithContext(auth.WithUser(req.Context(), user))
@@ -7131,7 +7712,7 @@ func TestCanLockAddressBookCollectionRequiresMoreThanBind(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     &fakeContactRepo{},
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -7139,7 +7720,7 @@ func TestCanLockAddressBookCollectionRequiresMoreThanBind(t *testing.T) {
 		}},
 	}}
 
-	got, err := h.canLockAddressBookPath(context.Background(), user, "/dav/addressbooks/5/")
+	got, err := h.canLockAddressBookPath(context.Background(), user, "/dav/addressbooks/5/", true)
 	if err != nil {
 		t.Fatalf("canLockAddressBookPath() error = %v", err)
 	}
@@ -7160,7 +7741,7 @@ func TestLockScopesDirectChildCollectionCreationPathsPerUser(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			lockRepo := &fakeLockRepo{}
-			h := &Handler{store: &store.Store{Locks: lockRepo}}
+			h := &DavServer{store: &store.Store{Locks: lockRepo}}
 			lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7200,7 +7781,7 @@ func TestLockScopesDirectChildCollectionCreationPathsPerUser(t *testing.T) {
 func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
 	lockRepo := &fakeLockRepo{}
 	bookRepo := &fakeAddressBookRepo{}
-	h := &Handler{store: &store.Store{Locks: lockRepo, AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{Locks: lockRepo, AddressBooks: bookRepo}}
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7235,7 +7816,9 @@ func TestMkcolIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) 
 func TestMkcalendarIgnoresAnotherUsersPendingLockForSameCollectionName(t *testing.T) {
 	lockRepo := &fakeLockRepo{}
 	calRepo := &fakeCalendarRepo{}
-	h := &Handler{store: &store.Store{Locks: lockRepo, Calendars: calRepo}}
+	st := &store.Store{Locks: lockRepo, Calendars: calRepo}
+	st.CalendarState = &fakeCalendarStateCreator{calendars: calRepo, locks: lockRepo}
+	h := &DavServer{store: st}
 	lockBody := `<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -7274,7 +7857,7 @@ func TestPutReturnsInternalServerErrorWhenLockLookupFails(t *testing.T) {
 		},
 	}
 	lockRepo := &fakeLockRepo{listByResourcesErr: errors.New("lock lookup failed")}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(buildVCard("3.0", "UID:alice", "FN:Alice Example")))
 	req.Header.Set("Content-Type", "text/vcard")
@@ -7308,7 +7891,7 @@ func TestProppatchIgnoresParentCollectionLock(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, Locks: lockRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -7340,13 +7923,19 @@ func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
 			2: {ID: 2, UserID: user.ID, Name: "Owned"},
 			5: {ID: 5, UserID: 1, Name: "Shared"},
 		},
+		accessibleByUser: map[int64][]store.AddressBook{
+			user.ID: {
+				{ID: 2, UserID: user.ID, Name: "Owned"},
+				{ID: 5, UserID: 1, Name: "Shared"},
+			},
+		},
 	}
 	aclRepo := &fakeACLRepo{
 		entries: []store.ACLEntry{
 			{ResourcePath: "/dav/addressbooks/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
@@ -7362,28 +7951,75 @@ func TestPropfindAddressBookHomeSetIncludesACLSharedBooks(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected PROPFIND to succeed, got %d: %s", rr.Code, rr.Body.String())
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/addressbooks/",
+		"/dav/addressbooks/2/",
+		"/dav/addressbooks/5/",
+	)
+}
+
+func TestPropfindObjectGrantDoesNotExposeParentAddressBook(t *testing.T) {
+	user := &store.User{ID: 2, PrimaryEmail: "reader@example.com"}
+	book := store.AddressBook{ID: 5, UserID: 1, Name: "Private"}
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{5: &book},
+		accessibleByUser: map[int64][]store.AddressBook{
+			user.ID: {book},
+		},
 	}
-	respBody := rr.Body.String()
-	for _, href := range []string{"/dav/addressbooks/2/", "/dav/addressbooks/5/"} {
-		if !strings.Contains(respBody, href) {
-			t.Fatalf("expected addressbook-home-set listing to include %s, got %s", href, respBody)
-		}
-	}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"5:shared": {AddressBookID: 5, UID: "shared", ResourceName: "shared", RawVCard: buildVCard("3.0", "UID:shared", "FN:Shared"), ETag: "etag"},
+	}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{{
+		ResourcePath: "/dav/addressbooks/5/shared", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read",
+	}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo, ACLEntries: aclRepo}}
+
+	homeReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/", nil)
+	homeReq.Header.Set("Depth", "1")
+	homeReq = homeReq.WithContext(auth.WithUser(homeReq.Context(), user))
+	homeRR := httptest.NewRecorder()
+	h.Propfind(homeRR, homeReq)
+	decodeMultistatus(t, homeRR).assertHrefs(t, "/dav/addressbooks/")
+
+	objectReq := httptest.NewRequest("PROPFIND", "/dav/addressbooks/5/shared.vcf", nil)
+	objectReq.Header.Set("Depth", "0")
+	objectReq = objectReq.WithContext(auth.WithUser(objectReq.Context(), user))
+	objectRR := httptest.NewRecorder()
+	h.Propfind(objectRR, objectReq)
+	decodeMultistatus(t, objectRR).assertHrefs(t, "/dav/addressbooks/5/shared.vcf")
 }
 
 type fakeEventRepo struct {
+	// ignoreFilter drops the time-range narrowing the PostgreSQL predicates
+	// apply, so a test can compare the pushdown path against a full scan.
+	ignoreFilter             bool
 	events                   map[string]*store.Event
 	deleted                  []string
 	copyErr                  error
 	moveErr                  error
+	upsertErr                error
 	getByUIDErr              error
 	getByUIDErrKey           string
 	getByResourceNameErr     error
 	getByResourceNameKey     string
+	resourceLookupSequence   []*store.Event
+	uidLookupSequence        []*store.Event
 	resourceLookupCount      int
+	upsertCalls              int
+	batchResourceLookupCount int
+	listForCalendarCalls     int
+	pageLookupCount          int
+	// listPageErr fails every ListForCalendarPageAfter call when set.
+	listPageErr error
+	// listByResourceNamesErr fails every ListByResourceNames call when set.
+	listByResourceNamesErr   error
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
+	// tombstones holds the removals ListChangesAfter merges into the change
+	// stream, as the store reads deleted_resources beside the member rows.
+	tombstones *fakeDeletedResourceRepo
+	// listChangesErr fails every ListChangesAfter call when set.
+	listChangesErr error
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -7391,6 +8027,10 @@ func (f *fakeEventRepo) key(calendarID int64, uid string) string {
 }
 
 func (f *fakeEventRepo) Upsert(ctx context.Context, event store.Event) (*store.Event, error) {
+	f.upsertCalls++
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
 	if f.events == nil {
 		f.events = map[string]*store.Event{}
 	}
@@ -7409,6 +8049,15 @@ func (f *fakeEventRepo) DeleteByUID(ctx context.Context, calendarID int64, uid s
 }
 
 func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*store.Event, error) {
+	if len(f.uidLookupSequence) > 0 {
+		event := f.uidLookupSequence[0]
+		f.uidLookupSequence = f.uidLookupSequence[1:]
+		if event == nil {
+			return nil, nil
+		}
+		copy := *event
+		return &copy, nil
+	}
 	if f.getByUIDErr != nil && (f.getByUIDErrKey == "" || f.getByUIDErrKey == f.key(calendarID, uid)) {
 		return nil, f.getByUIDErr
 	}
@@ -7421,6 +8070,15 @@ func (f *fakeEventRepo) GetByUID(ctx context.Context, calendarID int64, uid stri
 
 func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*store.Event, error) {
 	f.resourceLookupCount++
+	if len(f.resourceLookupSequence) > 0 {
+		event := f.resourceLookupSequence[0]
+		f.resourceLookupSequence = f.resourceLookupSequence[1:]
+		if event == nil {
+			return nil, nil
+		}
+		copy := *event
+		return &copy, nil
+	}
 	if f.getByResourceNameErr != nil && (f.getByResourceNameKey == "" || f.getByResourceNameKey == f.key(calendarID, resourceName)) {
 		return nil, f.getByResourceNameErr
 	}
@@ -7440,7 +8098,33 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 	return nil, nil
 }
 
+func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	f.batchResourceLookupCount++
+	if f.listByResourceNamesErr != nil {
+		return nil, f.listByResourceNamesErr
+	}
+	wanted := make(map[string]struct{}, len(resourceNames))
+	for _, name := range resourceNames {
+		wanted[name] = struct{}{}
+	}
+	var result []store.Event
+	for _, ev := range f.events {
+		if ev.CalendarID != calendarID {
+			continue
+		}
+		name := ev.ResourceName
+		if name == "" {
+			name = ev.UID
+		}
+		if _, ok := wanted[name]; ok {
+			result = append(result, *ev)
+		}
+	}
+	return result, nil
+}
+
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
+	f.listForCalendarCalls++
 	var result []store.Event
 	for _, ev := range f.events {
 		if ev.CalendarID != calendarID {
@@ -7452,8 +8136,110 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 	return result, nil
 }
 
-func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
-	return f.ListForCalendar(ctx, calendarID)
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
+	f.pageLookupCount++
+	if f.listPageErr != nil {
+		return nil, f.listPageErr
+	}
+	var result []store.Event
+	for _, event := range f.events {
+		if event.CalendarID == calendarID && (event.ID > afterID || afterID == 0 && event.ID == 0) && f.keeps(*event, filter) {
+			result = append(result, *event)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return truncateToLimit(result, limit), nil
+}
+
+func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, filter store.EventFilter) ([]store.Event, error) {
+	f.listForCalendarCalls++
+	var result []store.Event
+	for _, event := range f.events {
+		if event.CalendarID == calendarID && f.keeps(*event, filter) {
+			result = append(result, *event)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeEventRepo) keeps(event store.Event, filter store.EventFilter) bool {
+	return f.ignoreFilter || eventFilterKeeps(event, filter)
+}
+
+// eventFilterKeeps mirrors the time-range narrowing the PostgreSQL predicates
+// apply, so a report exercised against this fake sees the same candidate set a
+// real query plan would hand it. The infinity fallbacks are the COALESCE tails:
+// a row with no derived bound at all stays a candidate for every range and the
+// in-memory RFC 4791 §9.9 test decides it.
+//
+// Every column the predicates read is derived from the payload here rather than
+// taken off store.Event, because that is where they come from in production: a
+// fixture whose fields disagree with its own iCalendar would otherwise be
+// narrowed on bounds no stored row could ever have.
+func eventFilterKeeps(event store.Event, filter store.EventFilter) bool {
+	dtstart, dtend := fakeEventColumns(event.RawICAL)
+	recurrenceStart, recurrenceUntil := fakeRecurrenceBounds(event.RawICAL)
+	if filter.Start != nil {
+		latest := firstNonNilTime(recurrenceUntil, dtend)
+		if latest != nil && latest.Before(*filter.Start) {
+			return false
+		}
+	}
+	if filter.End != nil {
+		earliest := firstNonNilTime(recurrenceStart, dtstart)
+		if earliest != nil && earliest.After(*filter.End) {
+			return false
+		}
+	}
+	return true
+}
+
+// fakeEventColumns derives the dtstart and dtend columns the way
+// store.parseICalFields does: from the primary VEVENT alone, and dtend only from
+// a literal DTEND property. No other component type populates either.
+func fakeEventColumns(raw string) (*time.Time, *time.Time) {
+	component := ical.PrimaryVEventComponent(raw)
+	if component == nil {
+		return nil, nil
+	}
+	read := func(name string) *time.Time {
+		property, ok := ical.ComponentProperty(component, name)
+		if !ok {
+			return nil
+		}
+		parsed, ok := ical.ParsePropertyDateTimeLocal(property.KeyPart, property.Value)
+		if !ok {
+			return nil
+		}
+		return &parsed
+	}
+	return read("DTSTART"), read("DTEND")
+}
+
+func fakeRecurrenceBounds(raw string) (*time.Time, *time.Time) {
+	bounds := ical.ConservativeRecurrenceBounds(raw)
+	if !bounds.Recurring {
+		return nil, nil
+	}
+	start, until := bounds.Start, bounds.Until
+	if bounds.StartUnknown {
+		sentinel := ical.RecurrenceStartSentinel
+		start = &sentinel
+	}
+	if bounds.UntilUnknown {
+		sentinel := ical.RecurrenceUntilSentinel
+		until = &sentinel
+	}
+	return start, until
+}
+
+func firstNonNilTime(candidates ...*time.Time) *time.Time {
+	for _, candidate := range candidates {
+		if candidate != nil {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
@@ -7470,18 +8256,21 @@ func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids [
 	return nil, nil
 }
 
-func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
-	var result []store.Event
+func (f *fakeEventRepo) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	if f.listChangesErr != nil {
+		return store.SyncChanges[store.Event]{}, f.listChangesErr
+	}
+	var members []store.Event
 	for _, ev := range f.events {
-		if ev.CalendarID != calendarID {
-			continue
-		}
-		if ev.LastModified.After(since) {
-			copy := *ev
-			result = append(result, copy)
+		if ev.CalendarID == calendarID {
+			members = append(members, *ev)
 		}
 	}
-	return result, nil
+	var tombstones []store.DeletedResource
+	if removals {
+		tombstones = f.tombstones.collectionTombstones("event", calendarID)
+	}
+	return fakeChangesAfter(members, func(ev store.Event) time.Time { return ev.LastModified }, func(ev store.Event) int64 { return ev.ID }, eventResourceName, tombstones, after, limit), nil
 }
 
 func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -7540,22 +8329,61 @@ func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCa
 	return nil
 }
 
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	if f.copyErr != nil {
+func (f *fakeEventRepo) TransferCalendarObject(ctx context.Context, transfer store.CalendarObjectTransfer) (*store.CalendarObjectTransferResult, error) {
+	if transfer.Operation == store.CalendarObjectCopy && f.copyErr != nil {
 		return nil, f.copyErr
 	}
-	src, ok := f.events[f.key(fromCalendarID, uid)]
-	if !ok {
-		return nil, nil
+	if transfer.Operation == store.CalendarObjectMove && f.moveErr != nil {
+		return nil, f.moveErr
 	}
-	copy := *src
-	copy.CalendarID = toCalendarID
-	if destResourceName != "" {
-		copy.ResourceName = destResourceName
+	source, err := f.GetByResourceName(ctx, transfer.SourceCalendarID, transfer.SourceResourceName)
+	if err != nil {
+		return nil, err
 	}
-	copy.ETag = newETag
-	f.events[f.key(toCalendarID, copy.UID)] = &copy
-	return &copy, nil
+	if source == nil {
+		return nil, store.ErrNotFound
+	}
+	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
+		return nil, store.ErrResourceStateChanged
+	}
+	destination, err := f.GetByResourceName(ctx, transfer.DestinationCalendarID, transfer.DestinationResourceName)
+	if err != nil {
+		return nil, err
+	}
+	if transfer.ExpectedDestination.Exists != (destination != nil) || destination != nil && (destination.UID != transfer.ExpectedDestination.UID || destination.ETag != transfer.ExpectedDestination.ETag) {
+		return nil, store.ErrResourceStateChanged
+	}
+	if destination != nil && !transfer.Overwrite {
+		return nil, store.ErrPreconditionFailed
+	}
+	byUID, err := f.GetByUID(ctx, transfer.DestinationCalendarID, source.UID)
+	if err != nil {
+		return nil, err
+	}
+	if byUID != nil && !(byUID.CalendarID == source.CalendarID && eventResourceName(*byUID) == eventResourceName(*source)) && eventResourceName(*byUID) != transfer.DestinationResourceName {
+		return &store.CalendarObjectTransferResult{Conflict: byUID}, store.ErrUIDConflict
+	}
+	if transfer.Operation == store.CalendarObjectCopy && transfer.SourceCalendarID == transfer.DestinationCalendarID {
+		return &store.CalendarObjectTransferResult{Conflict: source}, store.ErrUIDConflict
+	}
+	created := destination == nil
+	if destination != nil {
+		delete(f.events, f.key(destination.CalendarID, destination.UID))
+	}
+	copy := *source
+	copy.CalendarID = transfer.DestinationCalendarID
+	copy.ResourceName = transfer.DestinationResourceName
+	if transfer.Operation == store.CalendarObjectCopy {
+		copy.ETag = transfer.ETag
+	}
+	if transfer.Operation == store.CalendarObjectMove {
+		delete(f.events, f.key(source.CalendarID, source.UID))
+	}
+	if f.events == nil {
+		f.events = make(map[string]*store.Event)
+	}
+	f.events[f.key(copy.CalendarID, copy.UID)] = &copy
+	return &store.CalendarObjectTransferResult{Event: &copy, Created: created}, nil
 }
 
 type errorEventRepo struct{}
@@ -7576,7 +8404,14 @@ func (e *errorEventRepo) GetByResourceName(ctx context.Context, calendarID int64
 	return nil, errors.New("fail")
 }
 
+func (e *errorEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	return nil, errors.New("fail")
+}
+
 func (e *errorEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
+	return nil, errors.New("fail")
+}
+func (e *errorEventRepo) ListForCalendarPageAfter(context.Context, int64, int64, int, store.EventFilter) ([]store.Event, error) {
 	return nil, errors.New("fail")
 }
 
@@ -7592,8 +8427,8 @@ func (e *errorEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids 
 	return nil, errors.New("fail")
 }
 
-func (e *errorEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
-	return nil, errors.New("fail")
+func (e *errorEventRepo) ListChangesAfter(ctx context.Context, calendarID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	return store.SyncChanges[store.Event]{}, errors.New("fail")
 }
 
 func (e *errorEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -7608,12 +8443,17 @@ func (e *errorEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toC
 	return errors.New("fail")
 }
 
-func (e *errorEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, errors.New("fail")
-}
-
 type fakeContactRepo struct {
-	contacts                 map[string]*store.Contact
+	contacts map[string]*store.Contact
+	// tombstones holds the removals ListChangesAfter merges into the change
+	// stream, as the store reads deleted_resources beside the member rows.
+	tombstones *fakeDeletedResourceRepo
+	// listChangesErr fails every ListChangesAfter call when set.
+	listChangesErr error
+	// listPageErr fails every ListForBookPageAfter call when set.
+	listPageErr error
+	// listByResourceNamesErr fails every ListByResourceNames call when set.
+	listByResourceNamesErr   error
 	deleted                  []string
 	copyErr                  error
 	moveErr                  error
@@ -7623,6 +8463,11 @@ type fakeContactRepo struct {
 	getByResourceNameErr     error
 	getByResourceNameErrKey  string
 	resourceLookupCount      int
+	batchResourceLookupCount int
+	pageLookupCount          int
+	birthdayLookupCount      int
+	birthdayLimit            int
+	birthdayErr              error
 	overwriteMoveDeletedRepo *fakeDeletedResourceRepo
 }
 
@@ -7705,18 +8550,21 @@ func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, u
 	return result, nil
 }
 
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]store.Contact, error) {
-	var result []store.Contact
+func (f *fakeContactRepo) ListChangesAfter(ctx context.Context, addressBookID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	if f.listChangesErr != nil {
+		return store.SyncChanges[store.Contact]{}, f.listChangesErr
+	}
+	var members []store.Contact
 	for _, c := range f.contacts {
-		if c.AddressBookID != addressBookID {
-			continue
-		}
-		if c.LastModified.After(since) {
-			copy := *c
-			result = append(result, copy)
+		if c.AddressBookID == addressBookID {
+			members = append(members, *c)
 		}
 	}
-	return result, nil
+	var tombstones []store.DeletedResource
+	if removals {
+		tombstones = f.tombstones.collectionTombstones("contact", addressBookID)
+	}
+	return fakeChangesAfter(members, func(c store.Contact) time.Time { return c.LastModified }, func(c store.Contact) int64 { return c.ID }, contactResourceName, tombstones, after, limit), nil
 }
 
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
@@ -7736,17 +8584,35 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 	return max, nil
 }
 
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	if f.contacts == nil {
-		return nil, nil
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
+	f.birthdayLookupCount++
+	f.birthdayLimit = limit
+	if f.birthdayErr != nil {
+		return nil, f.birthdayErr
 	}
-	var result []store.Contact
+	var all []store.Contact
 	for _, c := range f.contacts {
 		if c.Birthday != nil {
-			result = append(result, *c)
+			all = append(all, *c)
 		}
 	}
-	return result, nil
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	return truncateToLimit(all, limit), nil
+}
+
+// truncateToLimit mirrors what every paged repository in internal/store does
+// with limit: a non-positive one reads nothing, which is the guard each
+// PostgreSQL implementation opens with. A fake reading it as "no limit" instead
+// would answer in full where storage answers with nothing, and hide a caller
+// that computed the limit wrongly.
+func truncateToLimit[T any](rows []T, limit int) []T {
+	if limit <= 0 {
+		return nil
+	}
+	if len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
 }
 
 func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
@@ -7768,6 +8634,31 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 		}
 	}
 	return nil, nil
+}
+
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]store.Contact, error) {
+	f.batchResourceLookupCount++
+	if f.listByResourceNamesErr != nil {
+		return nil, f.listByResourceNamesErr
+	}
+	wanted := make(map[string]struct{}, len(resourceNames))
+	for _, name := range resourceNames {
+		wanted[name] = struct{}{}
+	}
+	var result []store.Contact
+	for _, c := range f.contacts {
+		if c.AddressBookID != addressBookID {
+			continue
+		}
+		name := c.ResourceName
+		if name == "" {
+			name = c.UID
+		}
+		if _, ok := wanted[name]; ok {
+			result = append(result, *c)
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
@@ -7807,11 +8698,9 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 	oldKey := f.key(fromAddressBookID, uid)
 	contact, ok := f.contacts[oldKey]
 	if !ok {
-		return nil // Contact not found
+		return nil
 	}
-	// Remove from old location
 	delete(f.contacts, oldKey)
-	// Update address book ID
 	contact.AddressBookID = toAddressBookID
 	if destResourceName != "" {
 		contact.ResourceName = destResourceName
@@ -7837,19 +8726,108 @@ func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, fromAddressBook
 			delete(f.contacts, key)
 		}
 	}
-	// Add to new location
 	newKey := f.key(toAddressBookID, uid)
 	f.contacts[newKey] = contact
 	return nil
 }
 
 type fakeCalendarRepo struct {
-	accessible       []store.CalendarAccess
-	accessibleByUser map[int64][]store.CalendarAccess
-	calendars        map[int64]*store.Calendar
+	accessible          []store.CalendarAccess
+	accessibleByUser    map[int64][]store.CalendarAccess
+	calendars           map[int64]*store.Calendar
+	listAccessibleCalls int
+	getByIDCalls        int
+	deleteErr           error
+	// accessErr fails every GetAccessible and ListAccessible call when set.
+	accessErr error
+}
+
+type fakeCalendarStateCreator struct {
+	calendars    *fakeCalendarRepo
+	dead         *fakeDeadPropertyRepo
+	locks        *fakeLockRepo
+	beforeCreate func()
+}
+
+func (f *fakeCalendarStateCreator) CreateCalendarAndState(ctx context.Context, cal store.Calendar, dead []store.DeadPropertyMutation, lockPreconditions []store.LockPrecondition, lockPath string, resourcePath func(calendarID int64) string) (*store.Calendar, error) {
+	if f.beforeCreate != nil {
+		f.beforeCreate()
+	}
+	calendarSnapshot := make(map[int64]*store.Calendar, len(f.calendars.calendars))
+	for id, existing := range f.calendars.calendars {
+		copy := *existing
+		calendarSnapshot[id] = &copy
+	}
+	accessibleSnapshot := append([]store.CalendarAccess(nil), f.calendars.accessible...)
+
+	var deadSnapshot map[string]map[string]store.DeadProperty
+	if f.dead != nil {
+		deadSnapshot = make(map[string]map[string]store.DeadProperty, len(f.dead.properties))
+		for resourcePath, properties := range f.dead.properties {
+			deadSnapshot[resourcePath] = make(map[string]store.DeadProperty, len(properties))
+			for name, property := range properties {
+				deadSnapshot[resourcePath][name] = property
+			}
+		}
+	}
+
+	var lockSnapshot map[string]*store.Lock
+	if f.locks != nil {
+		lockSnapshot = make(map[string]*store.Lock, len(f.locks.locks))
+		for token, lock := range f.locks.locks {
+			copy := *lock
+			lockSnapshot[token] = &copy
+		}
+	}
+
+	restore := func() {
+		f.calendars.calendars = calendarSnapshot
+		f.calendars.accessible = accessibleSnapshot
+		if f.dead != nil {
+			f.dead.properties = deadSnapshot
+		}
+		if f.locks != nil {
+			f.locks.locks = lockSnapshot
+		}
+	}
+
+	if f.locks != nil {
+		locks := make([]store.Lock, 0, len(f.locks.locks))
+		for _, lock := range f.locks.locks {
+			locks = append(locks, *lock)
+		}
+		if !store.LockPreconditionsSatisfied(lockPreconditions, locks) {
+			return nil, store.ErrLockConflict
+		}
+	}
+
+	created, err := f.calendars.Create(ctx, cal)
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	statePath := resourcePath(created.ID)
+	if len(dead) != 0 {
+		if f.dead == nil {
+			restore()
+			return nil, store.ErrNotFound
+		}
+		if err := f.dead.Apply(ctx, statePath, dead); err != nil {
+			restore()
+			return nil, err
+		}
+	}
+	if f.locks != nil {
+		if err := f.locks.MoveResourcePath(ctx, lockPath, statePath); err != nil {
+			restore()
+			return nil, err
+		}
+	}
+	return created, nil
 }
 
 func (f *fakeCalendarRepo) GetByID(ctx context.Context, id int64) (*store.Calendar, error) {
+	f.getByIDCalls++
 	if f.calendars == nil {
 		return nil, nil
 	}
@@ -7870,6 +8848,10 @@ func (f *fakeCalendarRepo) ListByUser(ctx context.Context, userID int64) ([]stor
 }
 
 func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]store.CalendarAccess, error) {
+	f.listAccessibleCalls++
+	if f.accessErr != nil {
+		return nil, f.accessErr
+	}
 	if f.accessibleByUser != nil {
 		return f.accessibleByUser[userID], nil
 	}
@@ -7877,6 +8859,9 @@ func (f *fakeCalendarRepo) ListAccessible(ctx context.Context, userID int64) ([]
 }
 
 func (f *fakeCalendarRepo) GetAccessible(ctx context.Context, calendarID, userID int64) (*store.CalendarAccess, error) {
+	if f.accessErr != nil {
+		return nil, f.accessErr
+	}
 	if f.accessibleByUser != nil {
 		for _, c := range f.accessibleByUser[userID] {
 			if c.ID == calendarID {
@@ -7926,15 +8911,31 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, props store.CalendarProperties) error {
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
 	}
-	cal.Name = name
-	cal.Description = description
-	cal.Timezone = timezone
-	cal.Color = color
+	cal.Name = props.Name
+	cal.Description = props.Description
+	cal.DescriptionLang = props.DescriptionLang
+	cal.Timezone = props.Timezone
+	cal.Color = props.Color
+	// The accessible view holds copies, so it is updated alongside the record a
+	// PROPFIND after a PROPPATCH would otherwise read stale.
+	for i := range f.accessible {
+		if f.accessible[i].ID == id {
+			f.accessible[i].Calendar = *cal
+		}
+	}
+	for userID := range f.accessibleByUser {
+		entries := f.accessibleByUser[userID]
+		for i := range entries {
+			if entries[i].ID == id {
+				entries[i].Calendar = *cal
+			}
+		}
+	}
 	return nil
 }
 
@@ -7943,6 +8944,9 @@ func (f *fakeCalendarRepo) Rename(ctx context.Context, userID, id int64, name st
 }
 
 func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
@@ -7951,11 +8955,21 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 		return store.ErrNotFound
 	}
 	delete(f.calendars, id)
+	// Create publishes the calendar into the accessible view, so Delete has to
+	// retract it there too or a later read still sees the removed collection.
+	f.accessible = slices.DeleteFunc(f.accessible, func(access store.CalendarAccess) bool {
+		return access.ID == id
+	})
 	return nil
 }
 
 type fakeAddressBookRepo struct {
-	books map[int64]*store.AddressBook
+	books               map[int64]*store.AddressBook
+	accessibleByUser    map[int64][]store.AddressBook
+	listAccessibleCalls int
+	getByIDCalls        int
+	// readErr fails every GetByID and ListByUser call when set.
+	readErr error
 }
 
 func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name string) bool {
@@ -7971,6 +8985,10 @@ func (f *fakeAddressBookRepo) hasDuplicateName(userID, excludeID int64, name str
 }
 
 func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.AddressBook, error) {
+	f.getByIDCalls++
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	if f.books == nil {
 		return nil, nil
 	}
@@ -7978,6 +8996,9 @@ func (f *fakeAddressBookRepo) GetByID(ctx context.Context, id int64) (*store.Add
 }
 
 func (f *fakeAddressBookRepo) ListByUser(ctx context.Context, userID int64) ([]store.AddressBook, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	var res []store.AddressBook
 	for _, b := range f.books {
 		if b.UserID == userID {
@@ -8028,9 +9049,7 @@ func (f *fakeAddressBookRepo) UpdateProperties(ctx context.Context, id int64, na
 		return store.ErrConflict
 	}
 	book.Name = name
-	if description != nil {
-		book.Description = description
-	}
+	book.Description = description
 	return nil
 }
 
@@ -8065,14 +9084,81 @@ type fakeDeletedResourceRepo struct {
 	deleted []store.DeletedResource
 }
 
-func (f *fakeDeletedResourceRepo) ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]store.DeletedResource, error) {
+// collectionTombstones is every tombstone of one collection. A nil repository
+// holds none.
+func (f *fakeDeletedResourceRepo) collectionTombstones(resourceType string, collectionID int64) []store.DeletedResource {
+	if f == nil {
+		return nil
+	}
 	var result []store.DeletedResource
 	for _, d := range f.deleted {
-		if d.ResourceType == resourceType && d.CollectionID == collectionID && d.DeletedAt.After(since) {
+		if d.ResourceType == resourceType && d.CollectionID == collectionID {
 			result = append(result, d)
 		}
 	}
-	return result, nil
+	return result
+}
+
+// fakeChangesAfter pages members and tombstones the way the store's change
+// stream does: members by (stamp, id), tombstones by (deleted_at, id), a
+// member before a tombstone of the same instant, and a tombstone whose name a
+// member holds left out of Removals while still counting toward the page.
+func fakeChangesAfter[T any](members []T, stamp func(T) time.Time, id func(T) int64, name func(T) string, tombstones []store.DeletedResource, after store.SyncCursor, limit int) store.SyncChanges[T] {
+	page := store.SyncChanges[T]{Last: after}
+	if limit <= 0 {
+		return page
+	}
+	type change struct {
+		at        store.SyncCursor
+		member    *T
+		tombstone *store.DeletedResource
+	}
+	// The store's zero cursor precedes every row, whose ids and stamps are
+	// never zero; fixtures here may leave either unset, so the zero cursor
+	// admits every row outright.
+	first := after == store.SyncCursor{}
+	held := make(map[string]struct{}, len(members))
+	var changes []change
+	for i := range members {
+		held[name(members[i])] = struct{}{}
+		at := store.SyncCursor{Stamp: stamp(members[i]), ID: id(members[i])}
+		if first || syncCursorBefore(after, at) {
+			changes = append(changes, change{at: at, member: &members[i]})
+		}
+	}
+	for i := range tombstones {
+		at := store.SyncCursor{Stamp: tombstones[i].DeletedAt, Removal: true, ID: tombstones[i].ID}
+		if first || syncCursorBefore(after, at) {
+			changes = append(changes, change{at: at, tombstone: &tombstones[i]})
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool { return syncCursorBefore(changes[i].at, changes[j].at) })
+	if len(changes) > limit {
+		changes, page.More = changes[:limit], true
+	}
+	for _, c := range changes {
+		page.Last = c.at
+		if c.member != nil {
+			page.Members = append(page.Members, *c.member)
+			continue
+		}
+		if _, ok := held[deletedResourceName(*c.tombstone)]; !ok {
+			page.Removals = append(page.Removals, *c.tombstone)
+		}
+	}
+	return page
+}
+
+// syncCursorBefore reports whether position a of a change stream precedes b:
+// by stamp, then members before removals at one stamp, then by id.
+func syncCursorBefore(a, b store.SyncCursor) bool {
+	if !a.Stamp.Equal(b.Stamp) {
+		return a.Stamp.Before(b.Stamp)
+	}
+	if a.Removal != b.Removal {
+		return !a.Removal
+	}
+	return a.ID < b.ID
 }
 
 func (f *fakeDeletedResourceRepo) DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error {
@@ -8105,11 +9191,11 @@ func TestCalendarDataUseCDATA(t *testing.T) {
 		t.Fatalf("failed to marshal: %v", err)
 	}
 	xmlStr := string(out)
-	// Check that calendar data is wrapped in CDATA and contains raw CRLF
+	// calendar-data is written as a CDATA section, so its CRLF line endings are
+	// not escaped.
 	if !strings.Contains(xmlStr, "<![CDATA[BEGIN:VCALENDAR") {
 		t.Errorf("expected CDATA wrapper, got: %s", xmlStr)
 	}
-	// Check that CRLF is not escaped
 	if strings.Contains(xmlStr, "&#xD;") || strings.Contains(xmlStr, "&#xA;") {
 		t.Errorf("CRLF should not be escaped, got: %s", xmlStr)
 	}
@@ -8184,16 +9270,21 @@ func TestCalendarQueryWithCompFilter(t *testing.T) {
 			"1:todo1":  {CalendarID: 1, UID: "todo1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:todo1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n", ETag: "t1"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	// Filter for VEVENT only
+	// Filter for VEVENT only. RFC 4791 §9.7.1 scopes the outermost comp-filter
+	// to the calendar object resource, so the component being selected is
+	// always one level in from VCALENDAR.
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
-			<cal:comp-filter name="VEVENT"/>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT"/>
+			</cal:comp-filter>
 		</cal:filter>
 	</cal:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -8222,22 +9313,24 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
-			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	// Query for events in June 2024 - filter should apply to VEVENT component
 	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
 		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT">
+					<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+				</cal:comp-filter>
 			</cal:comp-filter>
 		</cal:filter>
 	</cal:calendar-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -8255,6 +9348,46 @@ func TestCalendarQueryWithTimeRangeFilter(t *testing.T) {
 	}
 }
 
+func TestCalendarQueryRejectsSQLLookingTimeRangeStart(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:in-range":  {CalendarID: 1, UID: "in-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:out-range": {CalendarID: 1, UID: "out-range", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2", DTStart: ptrTime(time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)), DTEnd: ptrTime(time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC))},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:filter>
+			<cal:comp-filter name="VCALENDAR">
+				<cal:comp-filter name="VEVENT">
+					<cal:time-range start="20240601T000000Z' OR '1'='1" end="20240630T235959Z"/>
+				</cal:comp-filter>
+			</cal:comp-filter>
+		</cal:filter>
+	</cal:calendar-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-filter"))
+	if strings.Contains(rr.Body.String(), "in-range.ics") || strings.Contains(rr.Body.String(), "out-range.ics") {
+		t.Fatalf("invalid time-range must not broaden query results, got %s", rr.Body.String())
+	}
+}
+
 func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
 	now := store.Now()
 	calRepo := &fakeCalendarRepo{
@@ -8262,32 +9395,24 @@ func TestPropfindIncludesSupportedCalendarComponentSet(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	// RFC 4791 §5.2.3 keeps the property out of DAV:allprop, so it is requested
+	// by name here.
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop><cal:supported-calendar-component-set/></d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(body))
 	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-	if !strings.Contains(body, "<cal:supported-calendar-component-set>") {
-		t.Errorf("missing supported-calendar-component-set: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VEVENT"`) {
-		t.Errorf("missing VEVENT component: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VTODO"`) {
-		t.Errorf("missing VTODO component: %s", body)
-	}
-	if !strings.Contains(body, `<cal:comp name="VFREEBUSY"`) {
-		t.Errorf("missing VFREEBUSY component: %s", body)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertSupportedComponents(t, "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY")
 }
 
 func TestPutWithIfMatchSuccess(t *testing.T) {
@@ -8301,9 +9426,9 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -8317,7 +9442,7 @@ func TestPutWithIfMatchSuccess(t *testing.T) {
 }
 
 func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8340,7 +9465,7 @@ func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8363,7 +9488,7 @@ func TestGetCalendarObjectUsesCollectionACLFallback(t *testing.T) {
 }
 
 func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8386,7 +9511,7 @@ func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8410,7 +9535,7 @@ func TestGetCalendarObjectUsesCollectionACLFallbackDespiteUnrelatedObjectACL(t *
 }
 
 func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8433,7 +9558,7 @@ func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testin
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8453,7 +9578,7 @@ func TestGetCalendarObjectAllowsObjectReadGrantWithoutCollectionAccess(t *testin
 }
 
 func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8481,7 +9606,7 @@ func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8505,7 +9630,7 @@ func TestGetCalendarObjectHonorsExplicitObjectReadDeny(t *testing.T) {
 }
 
 func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8522,7 +9647,7 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "event1", ResourceName: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8530,8 +9655,9 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 		}},
 	}}
 
-	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"/>`
+	body := `<cal:calendar-query xmlns:cal="urn:ietf:params:xml:ns:caldav"><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>`
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), delegate))
 	rr := httptest.NewRecorder()
 
@@ -8546,7 +9672,7 @@ func TestReportCalendarQueryUsesCollectionACLFallback(t *testing.T) {
 }
 
 func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t *testing.T) {
-	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	owner := &store.User{ID: 1}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	calRepo := &fakeCalendarRepo{
 		accessibleByUser: map[int64][]store.CalendarAccess{
@@ -8569,7 +9695,7 @@ func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t
 			},
 		},
 	}
-	h := &Handler{store: &store.Store{
+	h := &DavServer{store: &store.Store{
 		Calendars: calRepo,
 		Events:    eventRepo,
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8579,7 +9705,7 @@ func TestPutCalendarObjectUsesCollectionWriteFallbackDespiteUnrelatedObjectACL(t
 		}},
 	}}
 
-	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Updated\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	body := buildCalendarObject(buildVEvent("event", "SUMMARY:Updated", "DTSTART:20240601T100000Z"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
 	req.Header.Set("If-Match", `"old-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), delegate))
@@ -8607,9 +9733,9 @@ func TestPutWithIfMatchFailure(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-Match", `"wrong-etag"`)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -8629,9 +9755,9 @@ func TestPutWithIfNoneMatchStar(t *testing.T) {
 		},
 	}
 	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("new"))
 	req := newCalendarPutRequest("/dav/calendars/2/new.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -8655,9 +9781,9 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event"))
 	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
 	req.Header.Set("If-None-Match", "*")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
@@ -8673,7 +9799,7 @@ func TestPutWithIfNoneMatchStarFailsIfExists(t *testing.T) {
 func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
-	icalData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	icalData := buildCalendarObject(buildVEvent("event", "DTSTART:20240601T100000Z"))
 
 	t.Run("read-only grant cannot create event", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
@@ -8687,7 +9813,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 			},
 		}
 		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8718,7 +9844,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 			},
 		}
 		eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8754,7 +9880,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8791,7 +9917,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8832,7 +9958,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "OLD", ETag: "old-etag"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8870,7 +9996,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8891,7 +10017,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 		}
 	})
 
-	t.Run("object-level unbind grant can delete existing event without collection access", func(t *testing.T) {
+	t.Run("object-level unbind grant cannot replace parent collection privilege", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			accessibleByUser: map[int64][]store.CalendarAccess{
 				owner.ID: {
@@ -8907,7 +10033,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8922,12 +10048,12 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 
 		h.Delete(rr, req)
 
-		if rr.Code != http.StatusNoContent {
-			t.Fatalf("expected object-level unbind grant to allow calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "<D:unbind/>") || !strings.Contains(rr.Body.String(), "/dav/calendars/2") {
+			t.Fatalf("expected DELETE to require unbind on the parent collection, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 
-	t.Run("object-level unbind deny blocks existing event delete despite collection grant", func(t *testing.T) {
+	t.Run("object-level unbind deny does not override parent collection grant", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			accessibleByUser: map[int64][]store.CalendarAccess{
 				delegate.ID: {
@@ -8948,7 +10074,7 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
 			},
 		}
-		h := &Handler{store: &store.Store{
+		h := &DavServer{store: &store.Store{
 			Calendars: calRepo,
 			Events:    eventRepo,
 			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
@@ -8965,8 +10091,8 @@ func TestCalendarCollectionACLControlsWriteOperations(t *testing.T) {
 
 		h.Delete(rr, req)
 
-		if rr.Code != http.StatusForbidden {
-			t.Fatalf("expected object-level deny to block calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("expected parent collection unbind grant to allow calendar DELETE, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 }
@@ -8982,7 +10108,7 @@ func TestDeleteWithIfMatchSuccess(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
 	req.Header.Set("If-Match", `"current"`)
@@ -9007,7 +10133,7 @@ func TestDeleteWithIfMatchFailure(t *testing.T) {
 			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
 	req.Header.Set("If-Match", `"wrong"`)
@@ -9021,13 +10147,78 @@ func TestDeleteWithIfMatchFailure(t *testing.T) {
 	}
 }
 
+// A lock the request holds no token for is answered with 423 ahead of a failed
+// If-Match, as it is for a contact and for a MOVE. With the lock's token
+// submitted the lock no longer refuses, and the stale If-Match gets 412.
+func TestDeleteEventAnswersAHeldLockBeforeAFailedIfMatch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		locks map[string]*store.Lock
+		ifHdr string
+		want  int
+	}{
+		{"lock and no token", map[string]*store.Lock{"opaquelocktoken:tok-1": {Token: "opaquelocktoken:tok-1", ResourcePath: "/dav/calendars/2/event", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}}, "", http.StatusLocked},
+		{"lock and its token", map[string]*store.Lock{"opaquelocktoken:tok-1": {Token: "opaquelocktoken:tok-1", ResourcePath: "/dav/calendars/2/event", UserID: 1, LockScope: "exclusive", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)}}, "(<opaquelocktoken:tok-1>)", http.StatusPreconditionFailed},
+		{"no lock", nil, "", http.StatusPreconditionFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eventRepo := &fakeEventRepo{events: map[string]*store.Event{
+				"2:event": {CalendarID: 2, UID: "event", ResourceName: "event", RawICAL: "ICAL", ETag: "current"},
+			}}
+			h := &DavServer{store: &store.Store{
+				Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true}}},
+				Events:    eventRepo,
+				Locks:     &fakeLockRepo{locks: tc.locks},
+			}}
+			req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+			req.Header.Set("If-Match", `"wrong"`)
+			if tc.ifHdr != "" {
+				req.Header.Set("If", tc.ifHdr)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Delete(rr, req)
+
+			if rr.Code != tc.want {
+				t.Fatalf("DELETE answered %d, want %d: %s", rr.Code, tc.want, rr.Body.String())
+			}
+			if _, ok := eventRepo.events["2:event"]; !ok {
+				t.Fatal("a refused DELETE removed the event")
+			}
+		})
+	}
+}
+
+// RFC 9110 section 13.2.1: a member that is not there is 404 whatever the lock
+// and the conditional header say.
+func TestDeleteOfAMissingEventIsNotFoundUnderALockAndAnIfMatch(t *testing.T) {
+	h := &DavServer{store: &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: []store.CalendarAccess{{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true}}},
+		Events:    &fakeEventRepo{events: map[string]*store.Event{}},
+		Locks: &fakeLockRepo{locks: map[string]*store.Lock{
+			"tok-1": {Token: "tok-1", ResourcePath: "/dav/calendars/2", UserID: 2, LockScope: "exclusive", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		}},
+	}}
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/absent.ics", nil)
+	req.Header.Set("If-Match", `"wrong"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("DELETE answered %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestPutRejectsInvalidICalendar(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: []store.CalendarAccess{
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
 	tests := []struct {
 		name string
@@ -9047,12 +10238,7 @@ func TestPutRejectsInvalidICalendar(t *testing.T) {
 
 			h.Put(rr, req)
 
-			if rr.Code != http.StatusBadRequest {
-				t.Errorf("expected 400 for invalid iCalendar, got %d", rr.Code)
-			}
-			if !strings.Contains(rr.Body.String(), "valid-calendar-data") {
-				t.Errorf("expected CalDAV error body for invalid calendar data, got %s", rr.Body.String())
-			}
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
 		})
 	}
 }
@@ -9063,9 +10249,9 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
-	validData := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20240601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	validData := buildCalendarObject(buildVEvent("test", "DTSTART:20240601T100000Z"))
 	req := newCalendarPutRequest("/dav/calendars/2/test.ics", strings.NewReader(validData))
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
@@ -9077,10 +10263,9 @@ func TestPutAcceptsValidICalendar(t *testing.T) {
 	}
 }
 
-func TestValidateICalendarDetectsVEVENT(t *testing.T) {
-	h := &Handler{}
+func TestAnalyzeICalendarAcceptsVEVENT(t *testing.T) {
 	data := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-	if err := h.validateICalendar(data); err != nil {
+	if _, err := analyzeICalendar(data); err != nil {
 		t.Fatalf("expected valid iCalendar, got error: %v", err)
 	}
 }
@@ -9091,7 +10276,7 @@ func TestPutRejectsInvalidVCard(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	invalidData := "NOT A VCARD"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(invalidData))
@@ -9114,7 +10299,7 @@ func TestPutAcceptsValidVCard(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	validData := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"
 	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(validData))
@@ -9144,7 +10329,7 @@ func TestParseICalDateTime(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result, err := parseICalDateTime(tt.input)
+			result, err := ical.ParseDateTime(tt.input)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error for %q", tt.input)
@@ -9165,8 +10350,6 @@ func ptrTime(t time.Time) *time.Time {
 	return &t
 }
 
-// Tests for new medium priority features
-
 func TestFreeBusyQueryReport(t *testing.T) {
 	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
@@ -9178,20 +10361,17 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	}
 	eventRepo := &fakeEventRepo{
 		events: map[string]*store.Event{
-			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1", DTStart: &start, DTEnd: &end},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -9203,13 +10383,9 @@ func TestFreeBusyQueryReport(t *testing.T) {
 	if rr.Header().Get("Content-Type") != "text/calendar" {
 		t.Fatalf("expected text/calendar, got %s", rr.Header().Get("Content-Type"))
 	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "VFREEBUSY") {
-		t.Errorf("expected VFREEBUSY in response, got %s", respBody)
-	}
-	if !strings.Contains(respBody, "FREEBUSY:") {
-		t.Errorf("expected FREEBUSY property in response, got %s", respBody)
-	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, rr.Body.String()), []string{
+		"FREEBUSY:20240601T100000Z/20240601T120000Z",
+	})
 }
 
 func TestPropfindParsesRequestBody(t *testing.T) {
@@ -9218,7 +10394,7 @@ func TestPropfindParsesRequestBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9236,14 +10412,9 @@ func TestPropfindParsesRequestBody(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	// Response should contain displayname and resourcetype
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "displayname") {
-		t.Errorf("expected displayname in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Work")
+	resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"), davQN("resourcetype"))
 }
 
 func TestPropfindParsesChunkedRequestBody(t *testing.T) {
@@ -9252,7 +10423,7 @@ func TestPropfindParsesChunkedRequestBody(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9271,13 +10442,9 @@ func TestPropfindParsesChunkedRequestBody(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "displayname") {
-		t.Errorf("expected displayname in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "Work")
+	resp.assertPropstatNames(t, http.StatusOK, davQN("displayname"), davQN("resourcetype"))
 }
 
 func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
@@ -9286,7 +10453,7 @@ func TestProppatchAddressBookUpdatesProperties(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Old Name"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9320,7 +10487,7 @@ func TestProppatchAddressBookRejectsDuplicateDisplayName(t *testing.T) {
 			6: {ID: 6, UserID: 1, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9352,7 +10519,7 @@ func TestProppatchAddressBookProtectedPropertyIsAtomic(t *testing.T) {
 			5: {ID: 5, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9394,35 +10561,36 @@ func TestCalendarPropertiesIncludeLimits(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
-	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", nil)
+	// RFC 4791 §5.2.5 through §5.2.9 keep the limit properties out of
+	// DAV:allprop, so they are requested by name.
+	request := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <cal:max-resource-size/>
+    <cal:min-date-time/>
+    <cal:max-date-time/>
+    <cal:max-instances/>
+    <cal:max-attendees-per-instance/>
+  </d:prop>
+</d:propfind>`
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/2/", strings.NewReader(request))
 	req.Header.Set("Depth", "0")
 	req = req.WithContext(auth.WithUser(req.Context(), u))
 	rr := httptest.NewRecorder()
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
-	}
-	body := rr.Body.String()
-
-	// Check for required calendar properties
-	expectedProps := []string{
-		"<cal:max-resource-size>",
-		"<cal:min-date-time>",
-		"<cal:max-date-time>",
-		"<cal:max-instances>",
-		"<cal:max-attendees-per-instance>",
-	}
-
-	for _, prop := range expectedProps {
-		if !strings.Contains(body, prop) {
-			t.Errorf("missing required property %s in response: %s", prop, body)
-		}
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropstatNames(t, http.StatusOK,
+		calQN("max-resource-size"),
+		calQN("min-date-time"),
+		calQN("max-date-time"),
+		calQN("max-instances"),
+		calQN("max-attendees-per-instance"),
+	)
 }
 
 func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
@@ -9433,7 +10601,7 @@ func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", Color: &color, CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9448,16 +10616,9 @@ func TestCalendarPropfindIncludesRequestedCalendarColor(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, `<ical:calendar-color>#336699FF</ical:calendar-color>`) {
-		t.Fatalf("expected calendar color in response, got %s", respBody)
-	}
-	if !strings.Contains(respBody, `xmlns:ical="http://apple.com/ns/ical/"`) {
-		t.Fatalf("expected Apple calendar namespace in response, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "#336699FF")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
@@ -9467,7 +10628,7 @@ func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
 			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 	u := &store.User{ID: 1}
 
 	body := `<D:propfind xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9482,19 +10643,10 @@ func TestCalendarPropfindReturnsNotFoundForUnsetCalendarColor(t *testing.T) {
 
 	h.Propfind(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d: %s", rr.Code, rr.Body.String())
-	}
-	respBody := rr.Body.String()
-	if !strings.Contains(respBody, `HTTP/1.1 404 Not Found`) {
-		t.Fatalf("expected calendar color 404 propstat, got %s", respBody)
-	}
-	if strings.Contains(respBody, `HTTP/1.1 200 OK`) {
-		t.Fatalf("did not expect empty 200 propstat for missing color, got %s", respBody)
-	}
-	if !strings.Contains(respBody, `<ical:calendar-color>calendar-color</ical:calendar-color>`) {
-		t.Fatalf("expected calendar-color in 404 propstat, got %s", respBody)
-	}
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/2/")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusNotFound, "")
+	resp.assertPropstatNames(t, http.StatusNotFound, qn(nsAppleICal, "calendar-color"))
+	resp.assertNoPropstatWithStatus(t, http.StatusOK)
 }
 
 func TestProppatchRejectsForbidden(t *testing.T) {
@@ -9509,7 +10661,7 @@ func TestProppatchRejectsForbidden(t *testing.T) {
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/1/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 	u := &store.User{ID: 1}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
@@ -9527,12 +10679,12 @@ func TestProppatchRejectsForbidden(t *testing.T) {
 
 	h.Proppatch(rr, req)
 
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("expected 207, got %d", rr.Code)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rr.Code)
 	}
 	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "403 Forbidden") {
-		t.Errorf("expected 403 Forbidden for non-editor, got %s", respBody)
+	if !strings.Contains(respBody, "<D:need-privileges>") || !strings.Contains(respBody, "<D:write-properties/>") {
+		t.Errorf("expected DAV:need-privileges for non-editor, got %s", respBody)
 	}
 }
 
@@ -9548,7 +10700,7 @@ func TestProppatchSharedCalendarWritePropertiesGrantPersistsChange(t *testing.T)
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 		{ResourcePath: "/dav/calendars/5", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "write-properties"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: aclRepo}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -9591,7 +10743,7 @@ func TestProppatchCalendarColorPersistsChange(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Work"},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9618,9 +10770,10 @@ func TestProppatchCalendarColorPersistsChange(t *testing.T) {
 	if updated == nil || updated.Color == nil || *updated.Color != "#22CC88FF" {
 		t.Fatalf("expected PROPPATCH to persist color, got %#v", updated)
 	}
-	if !strings.Contains(rr.Body.String(), `<ical:calendar-color>#22CC88FF</ical:calendar-color>`) {
-		t.Fatalf("expected color in PROPPATCH response, got %s", rr.Body.String())
-	}
+	// PROPPATCH echoes the Request-URI, which carried no trailing slash.
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
@@ -9631,7 +10784,7 @@ func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
 			5: {ID: 5, UserID: user.ID, Name: "Work", Color: &color},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, ACLEntries: &fakeACLRepo{}}}
 
 	body := `<?xml version="1.0" encoding="utf-8" ?>
 <D:propertyupdate xmlns:D="DAV:" xmlns:ical="http://apple.com/ns/ical/">
@@ -9658,9 +10811,10 @@ func TestProppatchCalendarColorRemoveClearsChange(t *testing.T) {
 	if updated == nil || updated.Color != nil {
 		t.Fatalf("expected PROPPATCH remove to clear color, got %#v", updated)
 	}
-	if !strings.Contains(rr.Body.String(), `<ical:calendar-color></ical:calendar-color>`) {
-		t.Fatalf("expected color remove in PROPPATCH response, got %s", rr.Body.String())
-	}
+	// PROPPATCH echoes the Request-URI, which carried no trailing slash.
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/5")
+	resp.assertPropValue(t, qn(nsAppleICal, "calendar-color"), http.StatusOK, "")
+	resp.assertPropstatNames(t, http.StatusOK, qn(nsAppleICal, "calendar-color"))
 }
 
 func TestFreeBusyIncludesDateRange(t *testing.T) {
@@ -9677,17 +10831,14 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "ICAL", ETag: "e1", DTStart: &start, DTEnd: &end},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 	rr := httptest.NewRecorder()
 
@@ -9700,6 +10851,67 @@ func TestFreeBusyIncludesDateRange(t *testing.T) {
 	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
 		t.Errorf("expected DTEND in freebusy, got %s", respBody)
 	}
+}
+
+func TestFreeBusyQueryUsesTopLevelTimeRange(t *testing.T) {
+	inRangeStart := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	inRangeEnd := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	outOfRangeStart := time.Date(2024, 7, 1, 10, 0, 0, 0, time.UTC)
+	outOfRangeEnd := time.Date(2024, 7, 1, 11, 0, 0, 0, time.UTC)
+
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:in-range": {
+				CalendarID:   1,
+				UID:          "in-range",
+				ResourceName: "in-range",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in-range\r\nDTSTART:20240601T100000Z\r\nDTEND:20240601T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "e1",
+				DTStart:      &inRangeStart,
+				DTEnd:        &inRangeEnd,
+			},
+			"1:out-of-range": {
+				CalendarID:   1,
+				UID:          "out-of-range",
+				ResourceName: "out-of-range",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out-of-range\r\nDTSTART:20240701T100000Z\r\nDTEND:20240701T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:         "e2",
+				DTStart:      &outOfRangeStart,
+				DTEnd:        &outOfRangeEnd,
+			},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+	</cal:free-busy-query>`
+
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "DTSTART:20240601T000000Z") {
+		t.Fatalf("expected top-level DTSTART in freebusy, got %s", respBody)
+	}
+	if !strings.Contains(respBody, "DTEND:20240630T235959Z") {
+		t.Fatalf("expected top-level DTEND in freebusy, got %s", respBody)
+	}
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, respBody), []string{
+		"FREEBUSY:20240601T100000Z/20240601T120000Z",
+	})
 }
 
 func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
@@ -9723,17 +10935,14 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read-free-busy"},
 		{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 2}))
 	rr := httptest.NewRecorder()
 
@@ -9743,15 +10952,19 @@ func TestFreeBusyQuerySkipsDeniedCalendarObjects(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	respBody := rr.Body.String()
-	if !strings.Contains(respBody, "FREEBUSY:20240601T100000Z/20240601T110000Z") {
-		t.Fatalf("expected visible busy slot, got %s", respBody)
+	assertPublishedFreeBusy(t, parsedFreeBusyLines(t, respBody), []string{
+		"FREEBUSY:20240601T100000Z/20240601T110000Z",
+	})
+	root, err := parseICalendarObject(respBody)
+	if err != nil {
+		t.Fatalf("free-busy response is not parseable iCalendar: %v", err)
 	}
-	if strings.Contains(respBody, "FREEBUSY:20240602T120000Z/20240602T130000Z") {
-		t.Fatalf("expected denied busy slot to be omitted, got %s", respBody)
+	if len(root.children) != 1 || root.children[0].name != "VFREEBUSY" {
+		t.Fatalf("free-busy response exposes resource components: %v", componentNames(t, respBody))
 	}
 }
 
-func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(t *testing.T) {
+func TestFreeBusyQueryConcealsCalendarWhenReadFreeBusyIsExplicitlyDenied(t *testing.T) {
 	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
 	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
@@ -9785,17 +10998,13 @@ func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(
 		},
 	}
 	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
-		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: false, Privilege: "read-free-busy"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
 	}}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
 
 	body := `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
-		<cal:filter>
-			<cal:comp-filter name="VEVENT">
-				<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
-			</cal:comp-filter>
-		</cal:filter>
+		<cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
 	</cal:free-busy-query>`
 
 	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
@@ -9804,8 +11013,11 @@ func TestFreeBusyQueryRejectsReadOnlyCalendarWhenReadFreeBusyIsExplicitlyDenied(
 
 	h.Report(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected explicit read-free-busy deny to block REPORT, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected explicit read-free-busy deny to conceal the calendar, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "need-privileges") || strings.Contains(rr.Body.String(), "read-free-busy") {
+		t.Fatalf("concealed free-busy denial exposed privilege details: %s", rr.Body.String())
 	}
 }
 
@@ -9815,43 +11027,55 @@ func TestReportRejectsCalendarResourcePath(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
 		},
 	}
-	h := &Handler{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
 
+	// RFC 4791 §7 makes calendar-query and calendar-multiget available on a
+	// calendar object resource, so only the collection-scoped reports are
+	// refused there. A refused report answers DAV:supported-report (RFC 3253
+	// §3.6) unless the report has a rule of its own, as free-busy-query does.
 	testCases := []struct {
 		name         string
 		path         string
 		reportType   string
+		body         string
+		condition    xml.Name
 		errorMessage string
 	}{
 		{
-			name:         "calendar-query on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "calendar-query",
-			errorMessage: "calendar reports not allowed on calendar object resources",
+			name:       "sync-collection on resource path",
+			path:       "/dav/calendars/1/event.ics",
+			reportType: "sync-collection",
+			condition:  davQN("supported-report"),
 		},
 		{
-			name:         "sync-collection on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "sync-collection",
-			errorMessage: "REPORT not allowed on calendar object resources",
-		},
-		{
-			name:         "free-busy-query on resource path",
-			path:         "/dav/calendars/1/event.ics",
-			reportType:   "free-busy-query",
+			name:       "free-busy-query on resource path",
+			path:       "/dav/calendars/1/event.ics",
+			reportType: "free-busy-query",
+			// A free-busy-query needs its RFC 4791 §7.10 time-range to reach the
+			// resource-path check; a bare body is rejected as 400 first.
+			body: `<cal:free-busy-query xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <cal:time-range start="20240601T000000Z" end="20240630T235959Z"/>
+</cal:free-busy-query>`,
 			errorMessage: "free-busy-query not allowed on calendar object resources",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`<cal:%s xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"/>`, tc.reportType)
+			body := tc.body
+			if body == "" {
+				body = fmt.Sprintf(`<cal:%s xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"/>`, tc.reportType)
+			}
 			req := httptest.NewRequest("REPORT", tc.path, strings.NewReader(body))
 			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
 			rr := httptest.NewRecorder()
 
 			h.Report(rr, req)
 
+			if tc.condition.Local != "" {
+				assertErrorConditions(t, rr, http.StatusForbidden, tc.condition)
+				return
+			}
 			if rr.Code != http.StatusForbidden {
 				t.Errorf("expected 403 Forbidden, got %d: %s", rr.Code, rr.Body.String())
 			}
@@ -9868,12 +11092,18 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 			3: {ID: 3, UserID: 1, Name: "Contacts"},
 		},
 	}
-	h := &Handler{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: &fakeContactRepo{}}}
 
 	testCases := []struct {
 		name       string
 		path       string
 		reportType string
+		// supportedReport marks the reports an address book object resource
+		// does not support at all, which RFC 3253 §3.6 declines with the named
+		// DAV:supported-report condition rather than a bare status. The others
+		// are supported reports refused for a missing Depth header, which names
+		// no condition of its own.
+		supportedReport bool
 	}{
 		{
 			name:       "addressbook-query on resource path",
@@ -9881,9 +11111,10 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 			reportType: "addressbook-query",
 		},
 		{
-			name:       "sync-collection on resource path",
-			path:       "/dav/addressbooks/3/contact.vcf",
-			reportType: "sync-collection",
+			name:            "sync-collection on resource path",
+			path:            "/dav/addressbooks/3/contact.vcf",
+			reportType:      "sync-collection",
+			supportedReport: true,
 		},
 	}
 
@@ -9899,11 +11130,942 @@ func TestReportRejectsAddressBookResourcePath(t *testing.T) {
 
 			h.Report(rr, req)
 
+			if tc.supportedReport {
+				assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+				return
+			}
 			if rr.Code != http.StatusForbidden {
 				t.Errorf("expected 403 Forbidden, got %d: %s", rr.Code, rr.Body.String())
 			}
 			if !strings.Contains(rr.Body.String(), "REPORT not allowed on address book object resources") {
 				t.Errorf("expected error message about resource path, got %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestCheckConditionalETagHandling(t *testing.T) {
+	tests := []struct {
+		name        string
+		ifMatch     string
+		ifNoneMatch string
+		etag        string
+		exists      bool
+		want        bool
+	}{
+		{name: "if-match star with existing resource", ifMatch: "*", etag: "abc", exists: true, want: true},
+		{name: "if-match star without resource", ifMatch: "*", exists: false, want: false},
+		{name: "if-match list with match", ifMatch: `"other", "abc"`, etag: "abc", exists: true, want: true},
+		{name: "if-match list without match", ifMatch: `"other", "third"`, etag: "abc", exists: true, want: false},
+		{name: "if-match weak validator", ifMatch: `W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-match list with only weak match", ifMatch: `"other", W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-match list with weak and strong match", ifMatch: `W/"abc", "abc"`, etag: "abc", exists: true, want: true},
+		{name: "if-none-match star with existing resource", ifNoneMatch: "*", etag: "abc", exists: true, want: false},
+		{name: "if-none-match star without resource", ifNoneMatch: "*", exists: false, want: true},
+		{name: "if-none-match list with match", ifNoneMatch: `"x", "abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-none-match weak validator with match", ifNoneMatch: `W/"abc"`, etag: "abc", exists: true, want: false},
+		{name: "if-none-match list without match", ifNoneMatch: `"x"`, etag: "abc", exists: true, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/dav/calendars/1/x.ics", nil)
+			if tc.ifMatch != "" {
+				req.Header.Set("If-Match", tc.ifMatch)
+			}
+			if tc.ifNoneMatch != "" {
+				req.Header.Set("If-None-Match", tc.ifNoneMatch)
+			}
+			if got := checkConditional(req, tc.etag, tc.exists); got != tc.want {
+				t.Fatalf("checkConditional(If-Match=%q, If-None-Match=%q, etag=%q, exists=%t) = %t, want %t",
+					tc.ifMatch, tc.ifNoneMatch, tc.etag, tc.exists, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPutWithIfMatchStarUpdatesExistingEvent(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		Users:     &aclReportUserRepo{users: map[int64]store.User{user.ID: *user}},
+	}}
+
+	icalData := buildCalendarObject(buildVEvent("existing"))
+	req := newCalendarPutRequest("/dav/calendars/1/existing.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", "*")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("PUT with If-Match: * against existing resource = %d, want 204: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutEventWeakIfMatchPreconditionFails(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "OLD", ETag: "old-etag"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	icalData := buildCalendarObject(buildVEvent("event"))
+	req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(icalData))
+	req.Header.Set("If-Match", `W/"old-etag"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("PUT event with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteEventWeakIfMatchPreconditionFails(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "current"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/2/event.ics", nil)
+	req.Header.Set("If-Match", `W/"current"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE event with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPutContactWeakIfMatchPreconditionFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	newVCard := buildVCard("3.0", "UID:alice", "FN:Alice Updated")
+	req := httptest.NewRequest(http.MethodPut, "/dav/addressbooks/5/alice.vcf", strings.NewReader(newVCard))
+	req.Header.Set("If-Match", `W/"etag-alice"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("PUT contact with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteContactWeakIfMatchPreconditionFails(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", ResourceName: "alice", RawVCard: buildVCard("3.0", "UID:alice", "FN:Alice"), ETag: "etag-alice"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/addressbooks/5/alice.vcf", nil)
+	req.Header.Set("If-Match", `W/"etag-alice"`)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE contact with weak If-Match = %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestReportUnknownCalendarReportReturns403(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:secret": {CalendarID: 1, UID: "secret", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:secret\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e"},
+		},
+	}
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		Users:     &aclReportUserRepo{users: map[int64]store.User{user.ID: *user}},
+	}}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+	if strings.Contains(rr.Body.String(), "secret") {
+		t.Fatalf("unknown calendar REPORT leaked event data: %s", rr.Body.String())
+	}
+}
+
+func TestReportUnknownAddressBookReportReturns403(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		2: {ID: 2, UserID: 1, Name: "Book"},
+	}}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"2:secret": {AddressBookID: 2, UID: "secret", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:secret\r\nFN:Secret\r\nEND:VCARD\r\n", ETag: "e"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/2/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+	if strings.Contains(rr.Body.String(), "secret") {
+		t.Fatalf("unknown address-book REPORT leaked contact data: %s", rr.Body.String())
+	}
+}
+
+func TestReportUnknownBirthdayReportReturns403(t *testing.T) {
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0"?><x:bogus-report xmlns:x="urn:example:bogus"/>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/-1/", strings.NewReader(body))
+	req.Header.Set("Depth", "1")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, davQN("supported-report"))
+}
+
+func TestPropfindMalformedXMLReturns400(t *testing.T) {
+	h := &DavServer{}
+	req := httptest.NewRequest("PROPFIND", "/dav/", strings.NewReader("<not-xml"))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("PROPFIND with malformed XML = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPropfindDepthHandling(t *testing.T) {
+	disabledCfg := &config.Config{}
+	enabledCfg := &config.Config{}
+	enabledCfg.DAV.PropfindInfinityEnabled = true
+
+	tests := []struct {
+		name     string
+		cfg      *config.Config
+		depth    string
+		setDepth bool
+		want     int
+	}{
+		{name: "explicit infinity served by default", depth: "infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "missing depth means infinity", setDepth: false, want: http.StatusMultiStatus},
+		{name: "explicit infinity served when enabled", cfg: enabledCfg, depth: "infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "explicit infinity refused when disabled", cfg: disabledCfg, depth: "infinity", setDepth: true, want: http.StatusForbidden},
+		{name: "missing depth refused when disabled", cfg: disabledCfg, setDepth: false, want: http.StatusForbidden},
+		{name: "capitalised infinity served by default", depth: "Infinity", setDepth: true, want: http.StatusMultiStatus},
+		{name: "upper-case infinity refused when disabled", cfg: disabledCfg, depth: "INFINITY", setDepth: true, want: http.StatusForbidden},
+		{name: "invalid depth", depth: "2", setDepth: true, want: http.StatusBadRequest},
+		{name: "misspelt infinity", depth: "infinite", setDepth: true, want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &DavServer{cfg: tc.cfg}
+			req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+			if tc.setDepth {
+				req.Header.Set("Depth", tc.depth)
+			}
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+			rr := httptest.NewRecorder()
+
+			h.Propfind(rr, req)
+
+			if rr.Code != tc.want {
+				t.Fatalf("PROPFIND depth=%q = %d, want %d: %s", tc.depth, rr.Code, tc.want, rr.Body.String())
+			}
+			if tc.want == http.StatusForbidden && !strings.Contains(rr.Body.String(), "propfind-finite-depth") {
+				t.Fatalf("PROPFIND infinity refusal missing propfind-finite-depth precondition: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestCalendarMultiGetBatchesEventLookups(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event1": {CalendarID: 1, UID: "event1", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e1"},
+			"1:event2": {CalendarID: 1, UID: "event2", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", ETag: "e2"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
+  <D:href>/dav/calendars/1/event1.ics</D:href>
+  <D:href>/dav/calendars/1/event2.ics</D:href>
+  <D:href>/dav/calendars/1/missing.ics</D:href>
+</C:calendar-multiget>`
+	req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("calendar-multiget = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, want := range []string{"event1.ics", "event2.ics", "missing.ics", "404"} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("calendar-multiget response missing %q: %s", want, respBody)
+		}
+	}
+	if eventRepo.resourceLookupCount != 0 {
+		t.Fatalf("calendar-multiget issued %d per-href event lookups, want 0 (batched)", eventRepo.resourceLookupCount)
+	}
+	if eventRepo.batchResourceLookupCount != 1 {
+		t.Fatalf("calendar-multiget issued %d batch event lookups, want 1", eventRepo.batchResourceLookupCount)
+	}
+}
+
+func TestAddressBookMultiGetBatchesContactLookups(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{
+		books: map[int64]*store.AddressBook{
+			5: {ID: 5, UserID: 1, Name: "Contacts"},
+		},
+	}
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"5:alice": {AddressBookID: 5, UID: "alice", RawVCard: "BEGIN:VCARD\r\nUID:alice\r\nEND:VCARD\r\n", ETag: "e1"},
+			"5:bob":   {AddressBookID: 5, UID: "bob", RawVCard: "BEGIN:VCARD\r\nUID:bob\r\nEND:VCARD\r\n", ETag: "e2"},
+		},
+	}
+	h := &DavServer{store: &store.Store{AddressBooks: bookRepo, Contacts: contactRepo}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<card:addressbook-multiget xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:D="DAV:">
+  <D:prop><D:getetag/></D:prop>
+  <D:href>/dav/addressbooks/5/alice.vcf</D:href>
+  <D:href>/dav/addressbooks/5/bob.vcf</D:href>
+  <D:href>/dav/addressbooks/5/missing.vcf</D:href>
+</card:addressbook-multiget>`
+	req := httptest.NewRequest("REPORT", "/dav/addressbooks/5/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Report(rr, req)
+
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("addressbook-multiget = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	respBody := rr.Body.String()
+	for _, want := range []string{"alice.vcf", "bob.vcf", "missing.vcf", "404"} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("addressbook-multiget response missing %q: %s", want, respBody)
+		}
+	}
+	if contactRepo.resourceLookupCount != 0 {
+		t.Fatalf("addressbook-multiget issued %d per-href contact lookups, want 0 (batched)", contactRepo.resourceLookupCount)
+	}
+	if contactRepo.batchResourceLookupCount != 1 {
+		t.Fatalf("addressbook-multiget issued %d batch contact lookups, want 1", contactRepo.batchResourceLookupCount)
+	}
+}
+
+func TestCheckLocksBatchesLockQueries(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/addressbooks/5", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MKCOL", "/dav/addressbooks/5/new", nil)
+
+	allowed, err := h.checkLocks(req, "/dav/addressbooks/5/new.vcf", "/dav/addressbooks/5")
+	if err != nil {
+		t.Fatalf("checkLocks returned error: %v", err)
+	}
+	if allowed {
+		t.Fatal("checkLocks must block writes covered by an active depth-infinity lock")
+	}
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("checkLocks issued %d lock queries for 2 paths, want 1 (batched)", lockRepo.listByResourcesCalls)
+	}
+}
+
+func TestCopyMoveLockPrefetchServesLockChecks(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/calendars/2", Depth: "infinity", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MOVE", "/dav/calendars/1/event.ics", nil)
+
+	req = h.prefetchCopyMoveLocks(req, "/dav/calendars/1/event.ics", "/dav/calendars/2/event.ics")
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("prefetch issued %d lock queries, want 1", lockRepo.listByResourcesCalls)
+	}
+
+	allowed, err := h.checkLock(req, "/dav/calendars/1/event.ics")
+	if err != nil {
+		t.Fatalf("checkLock returned error: %v", err)
+	}
+	if !allowed {
+		t.Fatal("unlocked source must be writable")
+	}
+	allowed, err = h.checkLock(req, "/dav/calendars/2/event.ics")
+	if err != nil {
+		t.Fatalf("checkLock returned error: %v", err)
+	}
+	if allowed {
+		t.Fatal("destination under an active depth-infinity lock must be blocked")
+	}
+	if lockRepo.listByResourcesCalls != 1 {
+		t.Fatalf("lock checks after prefetch issued %d extra queries, want 0", lockRepo.listByResourcesCalls-1)
+	}
+}
+
+// A lock index prefetched for some paths answers only for those: a lock check
+// on any other path reads the store, and the paths it read are served from the
+// index after that.
+func TestLockIndexReadsTheStoreForPathsItHasNotFetched(t *testing.T) {
+	lockRepo := &fakeLockRepo{
+		locks: map[string]*store.Lock{
+			"tok": {Token: "tok", ResourcePath: "/dav/calendars/9/event", Depth: "0", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	h := &DavServer{store: &store.Store{Locks: lockRepo}}
+	req := httptest.NewRequest("MOVE", "/dav/calendars/1/event.ics", nil)
+	req = h.prefetchCopyMoveLocks(req, "/dav/calendars/1/event.ics", "/dav/calendars/2/event.ics")
+
+	for range 2 {
+		allowed, err := h.checkLock(req, "/dav/calendars/9/event")
+		if err != nil {
+			t.Fatalf("checkLock returned error: %v", err)
+		}
+		if allowed {
+			t.Fatal("a lock on a path the prefetch did not cover was not found")
+		}
+	}
+	if lockRepo.listByResourcesCalls != 2 {
+		t.Fatalf("lock queries = %d, want the prefetch and one read of the uncovered path", lockRepo.listByResourcesCalls)
+	}
+}
+
+func TestPropfindDepthInfinityListsCollectionsAndResources(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Work", CTag: 5, UpdatedAt: now}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"2:event": {CalendarID: 2, UID: "event", RawICAL: "ICAL", ETag: "etag", LastModified: now},
+		},
+	}
+	contactRepo := &fakeContactRepo{}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, Contacts: contactRepo}}
+	u := &store.User{ID: 1}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/", nil)
+	req.Header.Set("Depth", "infinity")
+	req = req.WithContext(auth.WithUser(req.Context(), u))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	decodeMultistatus(t, rr).assertHrefs(t,
+		"/dav/calendars/",
+		birthdayCalendarHref(),
+		"/dav/calendars/2/",
+		"/dav/calendars/2/event.ics",
+	)
+}
+
+func TestBirthdayEventsUseStableDTStampAndSummary(t *testing.T) {
+	lastMod := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	name := "John Doe"
+	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	contactRepo := &fakeContactRepo{
+		contacts: map[string]*store.Contact{
+			"1:c1": {AddressBookID: 1, UID: "c1", DisplayName: &name, Birthday: &birthday, LastModified: lastMod},
+		},
+	}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents returned error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if !strings.Contains(events[0].RawICAL, "DTSTAMP:20260102T030405Z") {
+		t.Errorf("DTSTAMP must derive from the contact's LastModified, got: %s", events[0].RawICAL)
+	}
+	if strings.Contains(events[0].RawICAL, "turning") {
+		t.Errorf("summary must not bake an age into a yearly recurring event, got: %s", events[0].RawICAL)
+	}
+
+	again, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents returned error: %v", err)
+	}
+	if again[0].ETag != events[0].ETag {
+		t.Errorf("birthday event ETag must be stable across requests: %q != %q", again[0].ETag, events[0].ETag)
+	}
+}
+
+func TestPutEventUnidentifiedStoreConflictDoesNotReturnMalformedNoUIDConflict(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{upsertErr: store.ErrConflict}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := buildCalendarObject(buildVEvent("new-event"))
+	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT with unidentified store conflict = %d, want 500: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "no-uid-conflict") {
+		t.Fatalf("PUT emitted no-uid-conflict without its required DAV:href: %s", rr.Body.String())
+	}
+}
+
+func TestCalendarPutReauthorizesWhenResourceExistenceChanges(t *testing.T) {
+	owner := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	delegate := &store.User{ID: 2, PrimaryEmail: "delegate@example.com"}
+	existing := &store.Event{
+		ID: 10, CalendarID: 2, UID: "event", ResourceName: "event",
+		RawICAL: "OLD", ETag: "old-etag",
+	}
+	newServer := func(eventRepo *fakeEventRepo, privilege string) *DavServer {
+		return &DavServer{store: &store.Store{
+			Calendars: &fakeCalendarRepo{
+				accessibleByUser: map[int64][]store.CalendarAccess{
+					owner.ID: {{Calendar: store.Calendar{ID: 2, UserID: owner.ID, Name: "Work"}, Editor: true}},
+				},
+				calendars: map[int64]*store.Calendar{
+					2: {ID: 2, UserID: owner.ID, Name: "Work"},
+				},
+			},
+			Events: eventRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/calendars/2", PrincipalHref: "/dav/principals/2/", IsGrant: true, Privilege: privilege},
+			}},
+		}}
+	}
+	body := buildCalendarObject(buildVEvent("event", "DTSTART:20240601T100000Z", "SUMMARY:New"))
+
+	t.Run("create authorization cannot become update authorization", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events:                 map[string]*store.Event{"2:event": existing},
+			resourceLookupSequence: []*store.Event{nil, existing, existing},
+		}
+		h := newServer(eventRepo, "bind")
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("PUT after target appeared = %d, want 403: %s", rr.Code, rr.Body.String())
+		}
+		if eventRepo.upsertCalls != 0 {
+			t.Fatalf("PUT updated the appeared resource %d times without write-content", eventRepo.upsertCalls)
+		}
+	})
+
+	t.Run("update authorization cannot become create authorization", func(t *testing.T) {
+		eventRepo := &fakeEventRepo{
+			events:                 map[string]*store.Event{"2:event": existing},
+			resourceLookupSequence: []*store.Event{existing, nil, nil},
+			uidLookupSequence:      []*store.Event{nil},
+		}
+		h := newServer(eventRepo, "write-content")
+		req := newCalendarPutRequest("/dav/calendars/2/event.ics", strings.NewReader(body))
+		req = req.WithContext(auth.WithUser(req.Context(), delegate))
+		rr := httptest.NewRecorder()
+
+		h.Put(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("PUT after target disappeared = %d, want 403: %s", rr.Code, rr.Body.String())
+		}
+		if eventRepo.upsertCalls != 0 {
+			t.Fatalf("PUT recreated the disappeared resource %d times without bind", eventRepo.upsertCalls)
+		}
+	})
+}
+
+func TestCopyMoveAmbiguousSourceCalendarReturns409(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Dup"}, Editor: true},
+			{Calendar: store.Calendar{ID: 2, UserID: 1, Name: "Dup"}, Editor: true},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/dav/calendars/Dup/event.ics", nil)
+			req.Header.Set("Destination", "/dav/calendars/1/copy.ics")
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+
+			if method == "COPY" {
+				h.Copy(rr, req)
+			} else {
+				h.Move(rr, req)
+			}
+
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("%s with ambiguous source calendar = %d, want 409: %s", method, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestDeleteEventWithoutUnbindReturns403WithConsistentBody(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 2, Name: "Shared"}, Shared: true, Editor: false},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:existing": {CalendarID: 1, UID: "existing", RawICAL: "DATA", ETag: "e"},
+		},
+	}
+	aclRepo := &fakeACLRepo{
+		entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/1/", IsGrant: false, Privilege: "unbind"},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodDelete, "/dav/calendars/1/existing.ics", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Delete(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("DELETE without unbind = %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(strings.ToLower(rr.Body.String()), "not found") {
+		t.Fatalf("403 response must not carry a not-found body: %s", rr.Body.String())
+	}
+	for _, want := range []string{"<D:need-privileges>", "<D:href>/dav/calendars/1</D:href>", "<D:unbind/>"} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Errorf("DELETE privilege response missing %q: %s", want, rr.Body.String())
+		}
+	}
+}
+
+func TestGetUnknownDavPathReturns404(t *testing.T) {
+	h := &DavServer{store: &store.Store{}}
+	user := &store.User{ID: 1}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/unknown-collection", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Get(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("GET on unknown /dav path = %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// A PUT reads the target resource twice and no more: once in the handler, to
+// choose between the DAV:bind and DAV:write-content privilege, and once inside
+// the store's write decision. The second read is not a redundant lookup — on
+// PostgreSQL it happens inside the write transaction, under the advisory locks
+// that make the UID and identity checks hold through to the write.
+func TestPutEventFetchesResourceTwice(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	user := &store.User{ID: 1}
+
+	icalData := buildCalendarObject(buildVEvent("new-event"))
+	req := newCalendarPutRequest("/dav/calendars/1/new-event.ics", strings.NewReader(icalData))
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Put(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201: %s", rr.Code, rr.Body.String())
+	}
+	if eventRepo.resourceLookupCount != 2 {
+		t.Fatalf("PUT performed %d GetByResourceName lookups, want 2", eventRepo.resourceLookupCount)
+	}
+}
+
+// A single PROPFIND mixing the DAV, CalDAV and calendarserver namespaces, as
+// the clients CalCard targets send it. Every requested property must be served
+// at 200 and none may land in a 404 propstat.
+//
+// This is a client-interoperability test, not an RFC 4791 one: CS:getctag is a
+// calendarserver.org extension and DAV:sync-token is RFC 6578 §3, neither of
+// which RFC 4791 defines. The CalDAV properties it names have their own
+// coverage in rfc4791_compliance_test.go; what this pins is that the whole
+// mixed set is answered in one propstat.
+func TestCalendarCollectionServesClientDiscoveryProperties(t *testing.T) {
+	now := store.Now()
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{
+				ID:          1,
+				UserID:      1,
+				Name:        "My Calendar",
+				Description: stringPtr("Test calendar"),
+				UpdatedAt:   now,
+				CTag:        42,
+			}, Editor: true},
+		},
+	}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: &fakeEventRepo{}}}
+	user := &store.User{ID: 1}
+
+	body := `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <cs:getctag/>
+    <d:sync-token/>
+    <cal:calendar-description/>
+    <cal:supported-calendar-component-set/>
+    <d:supported-report-set/>
+  </d:prop>
+</d:propfind>`
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", strings.NewReader(body))
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+
+	h.Propfind(rr, req)
+
+	resp := decodeMultistatus(t, rr).responseForHref(t, "/dav/calendars/1/")
+
+	resp.assertPropstatNames(t, http.StatusOK,
+		davQN("displayname"),
+		davQN("resourcetype"),
+		qn(nsCalendarServer, "getctag"),
+		davQN("sync-token"),
+		calQN("calendar-description"),
+		calQN("supported-calendar-component-set"),
+		davQN("supported-report-set"),
+	)
+	resp.assertPropValue(t, davQN("displayname"), http.StatusOK, "My Calendar")
+	resp.assertPropValue(t, calQN("calendar-description"), http.StatusOK, "Test calendar")
+	resp.assertPropValue(t, qn(nsCalendarServer, "getctag"), http.StatusOK, "42")
+	resp.assertPropChildNames(t, davQN("resourcetype"), davQN("collection"), calQN("calendar"))
+	resp.assertSupportedComponents(t, "VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY")
+}
+
+// RFC 3253 §3.1.5 makes DAV:supported-report-set the set of reports a resource
+// supports, so every report named there must answer one. The advertised set on
+// a calendar collection spans three specifications — the CalDAV reports, RFC
+// 6578 §3.2 sync-collection and RFC 3253 §3.8 expand-property — which is why
+// this test lives here rather than in the RFC 4791 suite: exercising it means
+// executing reports RFC 4791 does not define.
+func TestSupportedReportSetAdvertisedReportsActuallyWork(t *testing.T) {
+	start := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	calRepo := &fakeCalendarRepo{
+		accessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test", UpdatedAt: store.Now()}, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepo{
+		events: map[string]*store.Event{
+			"1:event": {
+				CalendarID: 1,
+				UID:        "event",
+				RawICAL:    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				ETag:       "e",
+				DTStart:    &start,
+				DTEnd:      &end,
+			},
+		},
+	}
+	user := &store.User{ID: 1, PrimaryEmail: "owner@example.com"}
+	h := &DavServer{store: &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+		Users:     &aclReportUserRepo{users: map[int64]store.User{user.ID: *user}},
+	}}
+
+	// Each advertised report is paired with a minimal well-formed body and the
+	// status a working implementation returns. A report that gains an
+	// advertisement without gaining an entry here fails the exactness check
+	// below rather than going silently unexercised.
+	type reportCase struct {
+		body       string
+		wantStatus int
+	}
+	cases := map[xml.Name]reportCase{
+		calQN("calendar-query"): {
+			body: `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR">` +
+				`<C:comp-filter name="VEVENT"/></C:comp-filter></C:filter></C:calendar-query>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		calQN("calendar-multiget"): {
+			body: `<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<D:prop><D:getetag/></D:prop><D:href>/dav/calendars/1/event.ics</D:href></C:calendar-multiget>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		calQN("free-busy-query"): {
+			body: `<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+				`<C:time-range start="20240601T000000Z" end="20240630T235959Z"/></C:free-busy-query>`,
+			wantStatus: http.StatusOK,
+		},
+		davQN("sync-collection"): {
+			body: `<D:sync-collection xmlns:D="DAV:"><D:sync-token/>` +
+				`<D:sync-level>1</D:sync-level><D:prop><D:getetag/></D:prop></D:sync-collection>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		davQN("expand-property"): {
+			body:       `<D:expand-property xmlns:D="DAV:"><D:property name="owner"/></D:expand-property>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		davQN("acl-principal-prop-set"): {
+			body:       `<D:acl-principal-prop-set xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:acl-principal-prop-set>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		davQN("principal-match"): {
+			body:       `<D:principal-match xmlns:D="DAV:"><D:self/><D:prop><D:displayname/></D:prop></D:principal-match>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+		davQN("principal-property-search"): {
+			body: `<D:principal-property-search xmlns:D="DAV:"><D:property-search>` +
+				`<D:prop><D:displayname/></D:prop><D:match>owner</D:match></D:property-search>` +
+				`<D:apply-to-principal-collection-set/></D:principal-property-search>`,
+			wantStatus: http.StatusMultiStatus,
+		},
+	}
+
+	req := httptest.NewRequest("PROPFIND", "/dav/calendars/1/", nil)
+	req.Header.Set("Depth", "0")
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rr := httptest.NewRecorder()
+	h.Propfind(rr, req)
+
+	ms := decodeMultistatus(t, rr)
+	advertised := ms.responseForHref(t, "/dav/calendars/1/").supportedReports(t)
+
+	known := make([]xml.Name, 0, len(cases))
+	for name := range cases {
+		known = append(known, name)
+	}
+	if qnList(advertised) != qnList(known) {
+		t.Fatalf("supported-report-set advertises %s, but this test can exercise %s", qnList(advertised), qnList(known))
+	}
+
+	for _, name := range advertised {
+		t.Run(name.Local, func(t *testing.T) {
+			tc := cases[name]
+			req := httptest.NewRequest("REPORT", "/dav/calendars/1/", strings.NewReader(tc.body))
+			req = req.WithContext(auth.WithUser(req.Context(), user))
+			rr := httptest.NewRecorder()
+			h.Report(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Errorf("%s is advertised in supported-report-set but returned %d, want %d; body: %s",
+					qnString(name), rr.Code, tc.wantStatus, rr.Body.String())
 			}
 		})
 	}

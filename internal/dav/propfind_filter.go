@@ -1,0 +1,682 @@
+package dav
+
+import (
+	"cmp"
+	"encoding/xml"
+	"slices"
+	"strings"
+)
+
+// propfindResourceKind classifies a PROPFIND response so the property table
+// can decide, per property, whether the resource defines it (200) or lacks it
+// (404).
+type propfindResourceKind uint8
+
+const (
+	kindGenericCollection propfindResourceKind = 1 << iota
+	kindPrincipal
+	kindCalendarCollection
+	kindAddressBookCollection
+	kindCalendarObject
+	kindAddressObject
+)
+
+const (
+	kindCollections = kindGenericCollection | kindPrincipal | kindCalendarCollection | kindAddressBookCollection
+	kindObjects     = kindCalendarObject | kindAddressObject
+	kindAll         = kindCollections | kindObjects
+)
+
+// propfindPropertySpec is one row of the property table: how to recognize the
+// property in a request, which resource kinds define it, and how to copy its
+// value into a response prop.
+type propfindPropertySpec struct {
+	// emptyName is the prefixed wire name used when rendering the property
+	// as an empty element (404 propstats and propname responses).
+	emptyName xml.Name
+	requested func(q *propfindPropQuery) bool
+	// ok lists the kinds that define the property; every other kind answers
+	// 404 per RFC 4918 §9.1.
+	ok propfindResourceKind
+	// present, when set, gates ok kinds: a requested property that is absent
+	// from the source moves to the 404 propstat. Presence is an explicit
+	// property of the source, independent of the property's value.
+	present func(src *prop) bool
+	// alwaysDefined marks a property the server computes for every kind in ok,
+	// so a propname response lists its name even though propname skips the
+	// value decoration that present depends on (see decorationMaskFor).
+	alwaysDefined bool
+	// emptyValue, when set, reports that a present property carries an empty
+	// value. Such a property is rendered as an empty element in the 200
+	// propstat (RFC 4918 §9.1) rather than copied through copyValue, so the
+	// three states — absent, present-empty, present-nonempty — are decided
+	// explicitly and never by Go's zero values or xml omitempty.
+	emptyValue func(src *prop) bool
+	// forbidden distinguishes a defined property whose value the current
+	// principal may not read from an absent property. RFC 3744 assigns those
+	// cases a property-level 403, not a 404.
+	forbidden func(src *prop) bool
+	// hrefs lists direct DAV:href values. expandValue supplies a compound value
+	// whose nested hrefs need the recursive XML expander instead.
+	hrefs       func(src *prop) []string
+	expandValue func(src *prop) any
+	copyValue   func(dst, src *prop, q *propfindPropQuery)
+}
+
+func davName(local string) xml.Name { return xml.Name{Local: local} }
+
+// propfindPrefixNamespaces resolves the wire prefixes emptyName carries back to
+// the namespaces a request names them by. The table stores the prefixed form
+// because that is what the multistatus declares.
+var propfindPrefixNamespaces = map[string]string{
+	"d":    namespaceDAV,
+	"cal":  namespaceCalDAV,
+	"card": namespaceCardDAV,
+	"cs":   "http://calendarserver.org/ns/",
+	"ical": "http://apple.com/ns/ical/",
+}
+
+func (s *propfindPropertySpec) qname() xml.Name {
+	prefix, local, found := strings.Cut(s.emptyName.Local, ":")
+	if !found {
+		return xml.Name{Local: s.emptyName.Local}
+	}
+	return xml.Name{Space: propfindPrefixNamespaces[prefix], Local: local}
+}
+
+func singleHref(p *hrefProp) []string {
+	if p == nil || p.Href == "" {
+		return nil
+	}
+	return []string{p.Href}
+}
+
+func listHrefs(p *hrefListProp) []string {
+	if p == nil {
+		return nil
+	}
+	return p.Href
+}
+
+var propfindPropertyTable = []propfindPropertySpec{
+	{
+		emptyName:  davName("d:displayname"),
+		requested:  func(q *propfindPropQuery) bool { return q.DisplayName != nil },
+		ok:         kindCollections,
+		present:    func(src *prop) bool { return src.DisplayName != nil },
+		emptyValue: func(src *prop) bool { return src.DisplayName != nil && *src.DisplayName == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.DisplayName = src.DisplayName },
+	},
+	{
+		// RFC 4918 §15.9: resourcetype is defined on every resource; object
+		// resources answer with an empty value rather than a 404.
+		emptyName: davName("d:resourcetype"),
+		requested: func(q *propfindPropQuery) bool { return q.ResourceType != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.ResourceType = src.ResourceType
+			if dst.ResourceType == nil {
+				dst.ResourceType = &resourceType{}
+			}
+		},
+	},
+	{
+		emptyName: davName("d:getetag"),
+		requested: func(q *propfindPropQuery) bool { return q.GetETag != nil },
+		ok:        kindObjects,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.GetETag = src.GetETag },
+	},
+	{
+		emptyName: davName("d:getcontenttype"),
+		requested: func(q *propfindPropQuery) bool { return q.GetContentType != nil },
+		ok:        kindObjects,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.GetContentType = src.GetContentType },
+	},
+	{
+		emptyName: davName("cal:calendar-data"),
+		requested: func(q *propfindPropQuery) bool { return q.CalendarData != nil },
+		ok:        kindCalendarObject,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarData = src.CalendarData },
+	},
+	{
+		emptyName: davName("card:address-data"),
+		requested: func(q *propfindPropQuery) bool { return q.AddressData != nil },
+		ok:        kindAddressObject,
+		copyValue: func(dst, src *prop, q *propfindPropQuery) {
+			dst.AddressData = cdataString(filterVCardData(string(src.AddressData), q.AddressData))
+		},
+	},
+	{
+		emptyName: davName("cal:calendar-description"),
+		requested: func(q *propfindPropQuery) bool { return q.CalendarDescription != nil },
+		ok:        kindCalendarCollection,
+		present:   func(src *prop) bool { return src.CalendarDescription != nil },
+		// A present-empty value still has to carry its xml:lang, so an empty
+		// description with a language tag goes through copyValue rather than
+		// being rendered as a bare empty element.
+		emptyValue: func(src *prop) bool {
+			return src.CalendarDescription != nil && src.CalendarDescription.Value == "" && src.CalendarDescription.Lang == ""
+		},
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarDescription = src.CalendarDescription },
+	},
+	{
+		emptyName:  davName("cal:calendar-timezone"),
+		requested:  func(q *propfindPropQuery) bool { return q.CalendarTimezone != nil },
+		ok:         kindCalendarCollection,
+		present:    func(src *prop) bool { return src.CalendarTimezone != nil },
+		emptyValue: func(src *prop) bool { return src.CalendarTimezone != nil && *src.CalendarTimezone == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarTimezone = src.CalendarTimezone },
+	},
+	{
+		emptyName:  davName("ical:calendar-color"),
+		requested:  func(q *propfindPropQuery) bool { return q.CalendarColor != nil },
+		ok:         kindCalendarCollection,
+		present:    func(src *prop) bool { return src.CalendarColor != nil },
+		emptyValue: func(src *prop) bool { return src.CalendarColor != nil && *src.CalendarColor == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarColor = src.CalendarColor },
+	},
+	{
+		emptyName:  davName("card:addressbook-description"),
+		requested:  func(q *propfindPropQuery) bool { return q.AddressBookDesc != nil },
+		ok:         kindAddressBookCollection,
+		present:    func(src *prop) bool { return src.AddressBookDesc != nil },
+		emptyValue: func(src *prop) bool { return src.AddressBookDesc != nil && *src.AddressBookDesc == "" },
+		copyValue:  func(dst, src *prop, _ *propfindPropQuery) { dst.AddressBookDesc = src.AddressBookDesc },
+	},
+	{
+		emptyName: davName("card:supported-address-data"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedAddressData != nil },
+		ok:        kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedAddressData = src.SupportedAddressData },
+	},
+	{
+		emptyName: davName("card:max-resource-size"),
+		requested: func(q *propfindPropQuery) bool { return q.AddressBookMaxResourceSize != nil },
+		ok:        kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.AddressBookMaxResourceSize = src.AddressBookMaxResourceSize
+		},
+	},
+	{
+		emptyName: davName("card:supported-collation-set"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedCollationSet != nil },
+		ok:        kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedCollationSet = src.SupportedCollationSet },
+	},
+	{
+		// RFC 4791 §7.5.1: defined on every resource that supports a report doing
+		// text matching. calendar-query is the only text-matching CalDAV report,
+		// and §7 makes it available on calendar object resources as well as on
+		// the collections that hold them, so both advertise the collations it
+		// honours.
+		emptyName: davName("cal:supported-collation-set"),
+		requested: func(q *propfindPropQuery) bool { return q.CalDAVSupportedCollationSet != nil },
+		ok:        kindCalendarCollection | kindCalendarObject,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.CalDAVSupportedCollationSet = src.CalDAVSupportedCollationSet
+		},
+	},
+	{
+		emptyName: davName("d:sync-token"),
+		requested: func(q *propfindPropQuery) bool { return q.SyncToken != nil },
+		ok:        kindCalendarCollection | kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SyncToken = src.SyncToken },
+	},
+	{
+		emptyName: davName("cs:getctag"),
+		requested: func(q *propfindPropQuery) bool { return q.CTag != nil },
+		ok:        kindCalendarCollection | kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CTag = src.CTag },
+	},
+	{
+		emptyName: davName("d:current-user-principal"),
+		hrefs:     func(src *prop) []string { return singleHref(src.CurrentUserPrincipal) },
+		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrincipal != nil },
+		ok:        kindCollections,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CurrentUserPrincipal = src.CurrentUserPrincipal },
+	},
+	{
+		emptyName: davName("d:current-user-principal-URL"),
+		hrefs:     func(src *prop) []string { return singleHref(src.CurrentUserPrincipalURL) },
+		requested: func(q *propfindPropQuery) bool { return q.CurrentUserPrincipalURL != nil },
+		ok:        kindCollections,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.CurrentUserPrincipalURL = src.CurrentUserPrincipalURL
+		},
+	},
+	{
+		emptyName: davName("d:principal-URL"),
+		hrefs:     func(src *prop) []string { return singleHref(src.PrincipalURL) },
+		requested: func(q *propfindPropQuery) bool { return q.PrincipalURL != nil },
+		ok:        kindPrincipal,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalURL = src.PrincipalURL },
+	},
+	{
+		emptyName:     davName("d:alternate-URI-set"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.AlternateURISet) },
+		requested:     func(q *propfindPropQuery) bool { return q.AlternateURISet != nil },
+		ok:            kindPrincipal,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.AlternateURISet = src.AlternateURISet },
+	},
+	{
+		emptyName:     davName("d:group-membership"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.GroupMembership) },
+		requested:     func(q *propfindPropQuery) bool { return q.GroupMembership != nil },
+		ok:            kindPrincipal,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.GroupMembership = src.GroupMembership },
+	},
+	{
+		emptyName: davName("cal:calendar-home-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.CalendarHomeSet) },
+		requested: func(q *propfindPropQuery) bool { return q.CalendarHomeSet != nil },
+		ok:        kindPrincipal,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarHomeSet = src.CalendarHomeSet },
+	},
+	{
+		emptyName: davName("card:addressbook-home-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.AddressbookHomeSet) },
+		requested: func(q *propfindPropQuery) bool { return q.AddressbookHomeSet != nil },
+		ok:        kindPrincipal | kindAddressBookCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.AddressbookHomeSet = src.AddressbookHomeSet },
+	},
+	{
+		emptyName: davName("card:principal-address"),
+		hrefs:     func(src *prop) []string { return singleHref(src.PrincipalAddress) },
+		requested: func(q *propfindPropQuery) bool { return q.PrincipalAddress != nil },
+	},
+	{
+		emptyName: davName("d:supported-report-set"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedReportSet != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedReportSet = src.SupportedReportSet },
+	},
+	{
+		emptyName: davName("cal:supported-calendar-component-set"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedCalendarComponentSet != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.SupportedCalendarComponentSet = src.SupportedCalendarComponentSet
+		},
+	},
+	{
+		emptyName: davName("cal:max-resource-size"),
+		requested: func(q *propfindPropQuery) bool { return q.MaxResourceSize != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxResourceSize = src.MaxResourceSize },
+	},
+	{
+		emptyName: davName("cal:min-date-time"),
+		requested: func(q *propfindPropQuery) bool { return q.MinDateTime != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MinDateTime = src.MinDateTime },
+	},
+	{
+		emptyName: davName("cal:max-date-time"),
+		requested: func(q *propfindPropQuery) bool { return q.MaxDateTime != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxDateTime = src.MaxDateTime },
+	},
+	{
+		emptyName: davName("cal:max-instances"),
+		requested: func(q *propfindPropQuery) bool { return q.MaxInstances != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.MaxInstances = src.MaxInstances },
+	},
+	{
+		emptyName: davName("cal:max-attendees-per-instance"),
+		requested: func(q *propfindPropQuery) bool { return q.MaxAttendeesPerInstance != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.MaxAttendeesPerInstance = src.MaxAttendeesPerInstance
+		},
+	},
+	{
+		emptyName: davName("cal:schedule-calendar-transp"),
+		requested: func(q *propfindPropQuery) bool { return q.ScheduleCalendarTransp != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.ScheduleCalendarTransp = src.ScheduleCalendarTransp },
+	},
+	{
+		emptyName: davName("cal:supported-calendar-data"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedCalendarData != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedCalendarData = src.SupportedCalendarData },
+	},
+	{
+		emptyName: davName("cs:read-only"),
+		requested: func(q *propfindPropQuery) bool { return q.CalendarServerReadOnly != nil },
+		ok:        kindCalendarCollection,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.CalendarServerReadOnly = src.CalendarServerReadOnly },
+	},
+	{
+		// Presence follows the same explicit contract as the other properties:
+		// a nil source is absent (404); a non-nil set is present, rendered as a
+		// present-empty element when it has zero privilege children (privilege*
+		// content model) or as its value otherwise. Producers of applicable
+		// resources (see currentUserPrivilegeSetForPath) must supply a non-nil
+		// set so the property is never wrongly reported absent.
+		//
+		// RFC 3744 §5.4: clients discover the privileges they hold from this
+		// property, so it is defined on every DAV resource — matching d:acl —
+		// not just on calendar collections and principals.
+		emptyName:     davName("d:current-user-privilege-set"),
+		requested:     func(q *propfindPropQuery) bool { return q.CurrentUserPrivilegeSet != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		forbidden:     func(src *prop) bool { return src.currentUserPrivilegesForbidden },
+		present:       func(src *prop) bool { return src.CurrentUserPrivilegeSet != nil },
+		emptyValue: func(src *prop) bool {
+			return src.CurrentUserPrivilegeSet != nil && len(src.CurrentUserPrivilegeSet.Privileges) == 0
+		},
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) {
+			dst.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
+		},
+	},
+	{
+		emptyName:   davName("d:lockdiscovery"),
+		requested:   func(q *propfindPropQuery) bool { return q.LockDiscovery != nil },
+		ok:          kindAll,
+		expandValue: func(src *prop) any { return src.LockDiscovery },
+		copyValue:   func(dst, src *prop, _ *propfindPropQuery) { dst.LockDiscovery = src.LockDiscovery },
+	},
+	{
+		emptyName: davName("d:supportedlock"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedLock != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedLock = src.SupportedLock },
+	},
+	{
+		emptyName: davName("d:owner"),
+		hrefs:     func(src *prop) []string { return singleHref(src.Owner) },
+		requested: func(q *propfindPropQuery) bool { return q.Owner != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.Owner = src.Owner },
+	},
+	{
+		emptyName:     davName("d:group"),
+		hrefs:         func(src *prop) []string { return singleHref(src.Group) },
+		requested:     func(q *propfindPropQuery) bool { return q.Group != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.Group = src.Group },
+	},
+	{
+		emptyName:   davName("d:acl"),
+		requested:   func(q *propfindPropQuery) bool { return q.ACLProp != nil },
+		ok:          kindAll,
+		forbidden:   func(src *prop) bool { return src.aclForbidden },
+		expandValue: func(src *prop) any { return src.ACL },
+		copyValue:   func(dst, src *prop, _ *propfindPropQuery) { dst.ACL = src.ACL },
+	},
+	{
+		emptyName: davName("d:supported-privilege-set"),
+		requested: func(q *propfindPropQuery) bool { return q.SupportedPrivilegeSet != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.SupportedPrivilegeSet = src.SupportedPrivilegeSet },
+	},
+	{
+		emptyName:     davName("d:acl-restrictions"),
+		requested:     func(q *propfindPropQuery) bool { return q.ACLRestrictions != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.ACLRestrictions = src.ACLRestrictions },
+	},
+	{
+		emptyName:     davName("d:inherited-acl-set"),
+		hrefs:         func(src *prop) []string { return listHrefs(src.InheritedACLSet) },
+		requested:     func(q *propfindPropQuery) bool { return q.InheritedACLSet != nil },
+		ok:            kindAll,
+		alwaysDefined: true,
+		copyValue:     func(dst, src *prop, _ *propfindPropQuery) { dst.InheritedACLSet = src.InheritedACLSet },
+	},
+	{
+		emptyName: davName("d:principal-collection-set"),
+		hrefs:     func(src *prop) []string { return listHrefs(src.PrincipalCollectionSet) },
+		requested: func(q *propfindPropQuery) bool { return q.PrincipalCollectionSet != nil },
+		ok:        kindAll,
+		copyValue: func(dst, src *prop, _ *propfindPropQuery) { dst.PrincipalCollectionSet = src.PrincipalCollectionSet },
+	},
+}
+
+// propfindKindOf classifies a built response by its resourcetype, falling back
+// to the href extension for object resources.
+func propfindKindOf(resp response) propfindResourceKind {
+	src := resp.Propstat[0].Prop
+	rtype := src.ResourceType
+	if rtype == nil {
+		rtype = &resourceType{}
+	}
+	switch {
+	case rtype.Principal != nil:
+		return kindPrincipal
+	case rtype.Calendar != nil:
+		return kindCalendarCollection
+	case rtype.AddressBook != nil:
+		return kindAddressBookCollection
+	case strings.HasSuffix(normalizeDAVHref(resp.Href), ".ics"):
+		return kindCalendarObject
+	case strings.HasSuffix(normalizeDAVHref(resp.Href), ".vcf"):
+		return kindAddressObject
+	default:
+		return kindGenericCollection
+	}
+}
+
+// propfindSelection is the part of the property filter that depends on the
+// request alone. A PROPFIND or REPORT asks the same question of every resource
+// it reaches, so this is derived once per request and shared by every
+// response, rather than rebuilt per response at a cost that would scale with
+// responses times requested names.
+type propfindSelection struct {
+	// specs are the requested rows of propfindPropertyTable, in table order.
+	specs []*propfindPropertySpec
+	// custom lists each requested name outside the table once, in the order
+	// the request first names it. RFC 4918 §9.1 answers a property in one
+	// propstat, so a name the request repeats is still answered once.
+	custom      []xml.Name
+	customIndex map[xml.Name]int
+	// noneAnswered is the 404 tail of every response that carries none of
+	// the custom names, shared by all of them.
+	noneAnswered requestedNames
+}
+
+func newPropfindSelection(q *propfindPropQuery) *propfindSelection {
+	selection := &propfindSelection{}
+	for i := range propfindPropertyTable {
+		if spec := &propfindPropertyTable[i]; spec.requested(q) {
+			selection.specs = append(selection.specs, spec)
+		}
+	}
+	for _, name := range q.CustomXML {
+		if name.Local == "" {
+			continue
+		}
+		if _, seen := selection.customIndex[name]; seen {
+			continue
+		}
+		if selection.customIndex == nil {
+			selection.customIndex = make(map[xml.Name]int)
+		}
+		selection.customIndex[name] = len(selection.custom)
+		selection.custom = append(selection.custom, name)
+	}
+	selection.noneAnswered = requestedNames{all: selection.custom}
+	return selection
+}
+
+// selected returns the request's propfindSelection, deriving it on first use.
+func (r *propfindRequest) selected() *propfindSelection {
+	if r.selection == nil {
+		r.selection = newPropfindSelection(r.Prop)
+	}
+	return r.selection
+}
+
+// customAnswer pairs a requested custom name, by its index in
+// propfindSelection.custom, with the source property that answers it.
+type customAnswer struct {
+	requested int
+	source    int
+}
+
+// customAnswers finds the requested custom names the source carries, in
+// request order. It walks the source's properties rather than the request's
+// names, so its cost follows what the resource holds and not the length of
+// the request. Where the source repeats a name its first property answers.
+func (s *propfindSelection) customAnswers(src *prop) []customAnswer {
+	if len(s.custom) == 0 || len(src.CustomXML) == 0 {
+		return nil
+	}
+	var answers []customAnswer
+	for i := range src.CustomXML {
+		if requested, ok := s.customIndex[src.CustomXML[i].Name]; ok {
+			answers = append(answers, customAnswer{requested: requested, source: i})
+		}
+	}
+	slices.SortFunc(answers, func(a, b customAnswer) int {
+		return cmp.Or(cmp.Compare(a.requested, b.requested), cmp.Compare(a.source, b.source))
+	})
+	return slices.CompactFunc(answers, func(a, b customAnswer) bool { return a.requested == b.requested })
+}
+
+// filterPropfindResponseForKind rebuilds the response's propstats from the
+// property table: requested properties the kind defines land in the 200
+// propstat, requested properties it lacks land in a 404 propstat rendered as
+// empty elements per RFC 4918 §9.1.
+func filterPropfindResponseForKind(resp response, req *propfindRequest, kind propfindResourceKind) response {
+	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
+		return resp
+	}
+	selection := req.selected()
+	src := resp.Propstat[0].Prop
+	var okProp prop
+	var okSet bool
+	var notFoundNames []xml.Name
+	var forbiddenNames []xml.Name
+	for _, spec := range selection.specs {
+		if spec.forbidden != nil && spec.forbidden(&src) {
+			forbiddenNames = append(forbiddenNames, spec.emptyName)
+			continue
+		}
+		dataSuppressed := req.suppressData && (spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data")
+		if dataSuppressed || spec.ok&kind == 0 || (spec.present != nil && !spec.present(&src)) {
+			// Absent: the resource kind does not define the property, or the
+			// source carries no value for it.
+			notFoundNames = append(notFoundNames, spec.emptyName)
+			continue
+		}
+		okSet = true
+		if expanded, ok := req.expandProperty(spec, &src); ok {
+			// RFC 3253 §3.8: the hrefs are replaced by a DAV:response for each
+			// resource they reference, under the property's own name.
+			okProp.setCustomXMLProperty(expanded)
+			continue
+		}
+		if spec.emptyValue != nil && spec.emptyValue(&src) {
+			// Present-empty: render an explicit empty element in the 200
+			// propstat instead of copying a value that omitempty would drop.
+			okProp.setCustomXMLProperty(XMLProperty{Name: spec.emptyName})
+			continue
+		}
+		spec.copyValue(&okProp, &src, req.Prop)
+	}
+	answers := selection.customAnswers(&src)
+	unanswered := &selection.noneAnswered
+	if len(answers) > 0 {
+		unanswered = &requestedNames{all: selection.custom, skip: make([]int, len(answers))}
+	}
+	for i, answer := range answers {
+		property := src.CustomXML[answer.source]
+		if expanded, ok := req.expandCustomXMLProperty(property); ok {
+			property = expanded
+		}
+		okProp.setCustomXMLProperty(property)
+		okSet = true
+		unanswered.skip[i] = answer.requested
+	}
+	resp.Propstat = nil
+	if okSet {
+		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
+	}
+	if len(notFoundNames) > 0 || unanswered.len() > 0 {
+		resp.Propstat = append(resp.Propstat, propstat{PropNames: notFoundNames, requested: unanswered, Status: httpStatusNotFound})
+	}
+	if len(forbiddenNames) > 0 {
+		resp.Propstat = append(resp.Propstat, propstat{PropNames: forbiddenNames, Status: httpStatusForbidden})
+	}
+	if len(resp.Propstat) == 0 {
+		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}
+	}
+	return resp
+}
+
+// filterPropfindResponse routes a response to the property table with the
+// right resource kind.
+func filterPropfindResponse(resp response, req *propfindRequest) response {
+	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
+		return resp
+	}
+	kind := propfindKindOf(resp)
+	if kind == kindAddressObject {
+		return filterAddressObjectPropfindResponse(resp, req)
+	}
+	return filterPropfindResponseForKind(resp, req, kind)
+}
+
+// filterAddressObjectPropfindResponse applies the address-data conversion
+// precondition (RFC 6352 §8.7) before the generic property filtering.
+func filterAddressObjectPropfindResponse(resp response, req *propfindRequest) response {
+	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
+		return resp
+	}
+	if !req.suppressData && req.Prop.AddressData != nil {
+		converted, ok := addressDataForQuery(string(resp.Propstat[0].Prop.AddressData), req.Prop.AddressData)
+		if !ok {
+			resp.Propstat = nil
+			resp.Status = httpStatusNotAcceptable
+			resp.Error = &responseError{SupportedAddressDataConversion: &struct{}{}}
+			return resp
+		}
+		// The converted data belongs to this response alone, so the propstat is
+		// copied rather than rewritten where the caller built it.
+		propstats := make([]propstat, len(resp.Propstat))
+		copy(propstats, resp.Propstat)
+		propstats[0].Prop.AddressData = cdataString(converted)
+		resp.Propstat = propstats
+	}
+	resp.Status = ""
+	resp.Error = nil
+	return filterPropfindResponseForKind(resp, req, kindAddressObject)
+}
+
+// propnamePropfindResponse converts a fully built response into an RFC 4918
+// §9.1 propname response: the names of the properties defined on the
+// resource, without values.
+func propnamePropfindResponse(resp response) response {
+	if len(resp.Propstat) == 0 {
+		return resp
+	}
+	kind := propfindKindOf(resp)
+	src := resp.Propstat[0].Prop
+	var names []xml.Name
+	for i := range propfindPropertyTable {
+		spec := &propfindPropertyTable[i]
+		if spec.emptyName.Local == "cal:calendar-data" || spec.emptyName.Local == "card:address-data" {
+			continue
+		}
+		if spec.ok&kind == 0 {
+			continue
+		}
+		if spec.present != nil && !spec.alwaysDefined && !spec.present(&src) {
+			continue
+		}
+		names = append(names, spec.emptyName)
+	}
+	for _, custom := range src.CustomXML {
+		names = append(names, custom.Name)
+	}
+	resp.Propstat = []propstat{{PropNames: names, Status: httpStatusOK}}
+	return resp
+}

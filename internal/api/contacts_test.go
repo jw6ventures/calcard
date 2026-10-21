@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -97,6 +98,19 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, bookID int64, r
 	}
 	return nil, nil
 }
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, bookID int64, resourceNames []string) ([]store.Contact, error) {
+	var out []store.Contact
+	for _, name := range resourceNames {
+		c, err := f.GetByResourceName(ctx, bookID, name)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
 func (f *fakeContactRepo) ListForBook(ctx context.Context, bookID int64) ([]store.Contact, error) {
 	var out []store.Contact
 	for _, c := range f.contacts {
@@ -148,8 +162,8 @@ func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, bookID int64
 func (f *fakeContactRepo) ListByUIDs(ctx context.Context, bookID int64, uids []string) ([]store.Contact, error) {
 	return nil, nil
 }
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, bookID int64, since time.Time) ([]store.Contact, error) {
-	return nil, nil
+func (f *fakeContactRepo) ListChangesAfter(ctx context.Context, collectionID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	return store.SyncChanges[store.Contact]{Last: after}, nil
 }
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
@@ -157,7 +171,7 @@ func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, li
 func (f *fakeContactRepo) MaxLastModified(ctx context.Context, bookID int64) (time.Time, error) {
 	return time.Time{}, nil
 }
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 func (f *fakeContactRepo) MoveToAddressBook(ctx context.Context, from, to int64, uid, destResourceName string) error {
@@ -184,7 +198,8 @@ func newContactsHandler(books map[int64]*store.AddressBook, contacts map[string]
 	return NewHandler(&config.Config{}, &store.Store{
 		AddressBooks: &fakeAddressBookRepo{books: books},
 		Contacts:     &fakeContactRepo{contacts: contacts},
-	})
+	}, dav.ValidateCalendarObject)
+
 }
 
 func strptr(s string) *string { return &s }

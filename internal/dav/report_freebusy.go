@@ -1,0 +1,706 @@
+package dav
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/ical"
+	"github.com/jw6ventures/calcard/internal/store"
+)
+
+// maxFreeBusyExpandedPeriods bounds the occurrences the recurrence sets of a
+// whole free-busy response may be expanded into.
+//
+// It is deliberately not CALDAV:max-instances. That property bounds what one
+// resource may store, and RFC 4791 §5.2.9 measures it over the recurrence set
+// rather than over a requested range; an unbounded rule is admitted on the
+// instances it generates in a year. A range covering more than a thousand of
+// them is an ordinary question about an ordinary "repeats daily, no end date"
+// event, and answering it with a failure loses the whole collection's busy time.
+//
+// What the bound exists for is the range that genuinely holds more occurrences
+// than a response can carry: a secondly rule fills a year with thirty million.
+// 75 000 is past the 73 414 days from CALDAV:min-date-time to
+// CALDAV:max-date-time, so a daily rule answers over any range this server
+// stores within.
+//
+// It is spent across the report rather than per resource because the periods of
+// every candidate are held at once to be merged, so the resident cost is their
+// sum and a per-resource bound would multiply by the candidate row budget.
+const maxFreeBusyExpandedPeriods = 75_000
+
+// maxFreeBusyStoredPeriods bounds the periods the stored VFREEBUSY components
+// of a whole free-busy response may contribute. One resource's are bounded by
+// the request body limit, but those are held for the merge alongside every
+// other candidate's, so without a report-wide bound the candidate row budget
+// would multiply them. It is kept apart from the expansion budget so a large
+// published VFREEBUSY cannot starve an ordinary recurring event beside it.
+const maxFreeBusyStoredPeriods = 75_000
+
+// errFreeBusyStoredPeriodLimit refuses a report whose stored VFREEBUSY periods
+// together exceed maxFreeBusyStoredPeriods.
+var errFreeBusyStoredPeriodLimit = errors.New("free-busy stored period limit exceeded")
+
+// freeBusyBudget is what remains of a report's period budgets.
+type freeBusyBudget struct {
+	expandedPeriods int
+	storedPeriods   int
+}
+
+func newFreeBusyBudget() *freeBusyBudget {
+	return &freeBusyBudget{expandedPeriods: maxFreeBusyExpandedPeriods, storedPeriods: maxFreeBusyStoredPeriods}
+}
+
+// freeBusyQuery returns the free-busy iCalendar text for the calendar objects
+// visible to user and intersecting the report's required time range.
+func (h *DavServer) freeBusyQuery(ctx context.Context, user *store.User, cal *store.CalendarAccess, tr *timeRange) (string, error) {
+	// §7.3 gives free-busy only the collection's timezone: the report carries
+	// no CALDAV:timezone element of its own.
+	zone := reportFloatingZone("", cal.Timezone)
+	events, err := h.listCalendarEventsForTimeRange(ctx, cal.ID, tr)
+	if err != nil {
+		// §7.10 gives this report the §7.8 postcondition, so a row budget the
+		// generic reports answer with a capacity status is named here.
+		if errors.Is(err, errTooManyCandidateRows) {
+			return "", errNumberOfMatchesExceeded
+		}
+		return "", fmt.Errorf("failed to list events: %w", err)
+	}
+
+	candidates, err := filterFreeBusyCandidatesByTimeRange(ctx, freeBusyCandidates(events, zone, davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget)), tr)
+	if err != nil {
+		return "", freeBusyReportError(err)
+	}
+	candidates, err = h.filterFreeBusyCandidatesByPrivilege(ctx, user, cal, candidates)
+	if err != nil {
+		return "", err
+	}
+
+	body, err := h.generateFreeBusy(ctx, candidates, tr)
+	if err != nil {
+		return "", freeBusyReportError(err)
+	}
+	if davRequestStateFromContext(ctx).requestWork(ctx, reportWorkBudget).Exhausted() {
+		// A period read through a zone the request's work could not follow is
+		// a guess, and this report must not publish a guessed hour as free.
+		return "", errNumberOfMatchesExceeded
+	}
+	return body, nil
+}
+
+// freeBusyReportError answers a range this report will not compute in full
+// with the DAV:number-of-matches-within-limits postcondition, the one failure
+// RFC 4791 §7.10 gives the report (by reference to §7.8), rather than letting an
+// internal budget surface as a server fault. The cause stays wrapped so the log
+// records which limit was reached.
+//
+// Three limits reach here, and they mean different things:
+//   - the expansion output budget and the stored-period cap are spent on the
+//     busy time the request's range holds; a narrower range can succeed, which
+//     is the statement about the request §7.8 describes.
+//   - ErrRecurrenceScanLimit says one stored rule needs more generation work
+//     over the range than the server undertakes, a property of the resource.
+//     It is still this postcondition: the server cannot return the complete
+//     result within its limits, and nothing else §7.10 offers is truthful.
+//     Leaving the resource out would publish its busy time as free, and padding
+//     the range with invented busy time would hide the failure as an answer.
+func freeBusyReportError(err error) error {
+	if errors.Is(err, ical.ErrRecurrenceExpansionLimit) || errors.Is(err, errFreeBusyStoredPeriodLimit) {
+		return fmt.Errorf("%w: %w", errNumberOfMatchesExceeded, err)
+	}
+	return err
+}
+
+// freeBusyCandidate is one calendar object under consideration, parsed once so
+// its time-range test and period derivation read the same component tree.
+type freeBusyCandidate struct {
+	event   store.Event
+	matcher calendarTimeRangeMatcher
+}
+
+// freeBusyCandidates parses each stored object once. An object holding no
+// VCALENDAR carries no component to read a period, a TRANSP or a STATUS off, so
+// it is left out here rather than carried forward as a candidate every later
+// stage would have to keep excluding.
+func freeBusyCandidates(events []store.Event, zone floatingZone, pool *ical.RequestWork) []freeBusyCandidate {
+	candidates := make([]freeBusyCandidate, 0, len(events))
+	for _, event := range events {
+		matcher, parsed := newEventTimeRangeMatcher(event, zone, pool)
+		if !parsed {
+			continue
+		}
+		candidates = append(candidates, freeBusyCandidate{event: event, matcher: matcher})
+	}
+	return candidates
+}
+
+// filterFreeBusyCandidatesByTimeRange keeps the candidates intersecting tr,
+// checking the request before each one for the reason applyCalendarFilter does.
+func filterFreeBusyCandidatesByTimeRange(ctx context.Context, candidates []freeBusyCandidate, tr *timeRange) ([]freeBusyCandidate, error) {
+	if tr == nil {
+		return candidates, nil
+	}
+	kept := make([]freeBusyCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if matcherInTimeRange(candidate.matcher, tr) {
+			kept = append(kept, candidate)
+		}
+		if *candidate.matcher.expansionError != nil {
+			return nil, *candidate.matcher.expansionError
+		}
+	}
+	return kept, nil
+}
+
+// filterFreeBusyCandidatesByPrivilege applies the CALDAV:read-free-busy check
+// the stored-event path already implements, keeping the parse each surviving
+// candidate carries. It runs after the content filters so the ACL prefetch
+// covers only the objects the report would otherwise publish.
+func (h *DavServer) filterFreeBusyCandidatesByPrivilege(ctx context.Context, user *store.User, cal *store.CalendarAccess, candidates []freeBusyCandidate) ([]freeBusyCandidate, error) {
+	events := make([]store.Event, 0, len(candidates))
+	for _, candidate := range candidates {
+		events = append(events, candidate.event)
+	}
+	visible, err := h.filterCalendarEventsByPrivilege(ctx, user, cal, events, "read-free-busy")
+	if err != nil {
+		return nil, err
+	}
+	// A resource name is unique within a collection, so it identifies which
+	// candidates survived without re-deriving the privilege decision.
+	allowed := make(map[string]struct{}, len(visible))
+	for _, event := range visible {
+		allowed[eventResourceName(event)] = struct{}{}
+	}
+	kept := make([]freeBusyCandidate, 0, len(visible))
+	for _, candidate := range candidates {
+		if _, ok := allowed[eventResourceName(candidate.event)]; ok {
+			kept = append(kept, candidate)
+		}
+	}
+	return kept, nil
+}
+
+// listCalendarEventsForTimeRange narrows the database read using the given
+// time-range when one is present. The returned rows are a superset; callers
+// must still apply exact filtering.
+func (h *DavServer) listCalendarEventsForTimeRange(ctx context.Context, calendarID int64, tr *timeRange) ([]store.Event, error) {
+	databaseFilter, _ := eventFilterFromTimeRange(tr)
+	return h.listBoundedCalendarEvents(ctx, calendarID, databaseFilter)
+}
+
+// matcherInTimeRange reports whether any component of the parsed resource
+// intersects tr under the RFC 4791 §9.9 tables. It is the resource-level test
+// free-busy selects with, so it applies the tables to every component §9.9
+// defines one for; the calendar-query filter walk scopes the same tables to the
+// single component the comp-filter names instead. An object holding no
+// VCALENDAR carries no component to judge and intersects nothing.
+func matcherInTimeRange(matcher calendarTimeRangeMatcher, tr *timeRange) bool {
+	start, end, ok := calendarTimeRangeBounds(tr)
+	if !ok || matcher.root == nil {
+		return false
+	}
+	for _, component := range matcher.root.children {
+		if !calendarTimeRangeComponents.contains(component.name) {
+			continue
+		}
+		if matcher.componentSetInTimeRange(component, matcher.root, start, end) {
+			return true
+		}
+	}
+	return false
+}
+
+// freeBusyHasTimeRange reports whether the range the §9.11 grammar required
+// carries usable bounds. Without them the report degenerates into a
+// full-collection read and an unbounded text/calendar response.
+//
+// The end has to be one the request spelled, which is more than §9.9 asks of a
+// time-range in general. §7.10 answers with the periods the range covers rather
+// than with which resources reach it, and an open end covers endlessly many: the
+// report has no answer to give, so it is refused instead of attempted. An open
+// start is left alone, since no period precedes the earliest DTSTART stored.
+func freeBusyHasTimeRange(tr *timeRange) bool {
+	_, end, ok := calendarTimeRangeBounds(tr)
+	return ok && !openTimeRangeEnd(end)
+}
+
+// generateFreeBusy builds the §7.10 response body. Each candidate resolves its
+// periods through the zone it was parsed with, which RFC 4791 §7.3 makes the
+// collection's CALDAV:calendar-timezone for this report. Expanding a recurring
+// candidate can take milliseconds, so the request is checked before each one
+// for the reason applyCalendarFilter does.
+func (h *DavServer) generateFreeBusy(ctx context.Context, candidates []freeBusyCandidate, tr *timeRange) (string, error) {
+	var sb strings.Builder
+	sb.WriteString("BEGIN:VCALENDAR\r\n")
+	sb.WriteString("VERSION:2.0\r\n")
+	sb.WriteString("PRODID:" + calDAVServerProdID + "\r\n")
+	sb.WriteString("BEGIN:VFREEBUSY\r\n")
+	now := time.Now().UTC()
+	// RFC 5545 §3.6.4 makes UID as REQUIRED in a VFREEBUSY as DTSTAMP is, so a
+	// response omitting it is not a valid iCalendar object. The report builds a
+	// fresh component per request rather than identifying a stored resource, so
+	// the value only has to be unique.
+	sb.WriteString(fmt.Sprintf("UID:%s-%s@calcard\r\n", now.Format("20060102T150405Z"), freeBusyUIDSuffix()))
+	sb.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", now.Format("20060102T150405Z")))
+
+	rangeStart, rangeEnd, _ := calendarTimeRangeBounds(tr)
+	if tr != nil {
+		if tr.Start != "" {
+			sb.WriteString(fmt.Sprintf("DTSTART:%s\r\n", tr.Start))
+		}
+		if tr.End != "" {
+			sb.WriteString(fmt.Sprintf("DTEND:%s\r\n", tr.End))
+		}
+	}
+
+	// §9.11 requires exactly one CALDAV:time-range, and a report whose bounds
+	// are unusable is refused before dispatch, so every period below is selected
+	// against a real range.
+	var intervals []freeBusyInterval
+	budget := newFreeBusyBudget()
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		published, err := freeBusyIntervals(candidate, rangeStart, rangeEnd, budget)
+		if err != nil {
+			return "", err
+		}
+		intervals = append(intervals, published...)
+	}
+	// §7.10 asks for duplicates to be dropped and consecutive or overlapping
+	// periods of the same type to be coalesced. Both are collection-wide
+	// questions, so the merge runs once over every candidate rather than per
+	// resource: two calendar objects can perfectly well cover the same hour.
+	for _, interval := range mergeFreeBusyPeriods(intervals) {
+		sb.WriteString(fmt.Sprintf("FREEBUSY%s:%s/%s\r\n",
+			freeBusyTypeParameter(interval.fbType),
+			interval.start.UTC().Format("20060102T150405Z"),
+			interval.end.UTC().Format("20060102T150405Z")))
+	}
+
+	sb.WriteString("END:VFREEBUSY\r\n")
+	sb.WriteString("END:VCALENDAR\r\n")
+
+	return sb.String(), nil
+}
+
+var freeBusyUIDFallbackSequence atomic.Uint64
+
+func freeBusyUIDSuffix() string {
+	return freeBusyUIDSuffixFrom(rand.Reader, time.Now().UTC())
+}
+
+func freeBusyUIDSuffixFrom(reader io.Reader, now time.Time) string {
+	b := make([]byte, 8)
+	if _, err := io.ReadFull(reader, b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("fallback-%x-%x", now.UnixNano(), freeBusyUIDFallbackSequence.Add(1))
+}
+
+// freeBusyInterval is one published busy period and the FBTYPE it is published
+// under. RFC 4791 §7.10 lets periods of different types overlap, so the type is
+// carried through the merge rather than resolved at the end.
+type freeBusyInterval struct {
+	start  time.Time
+	end    time.Time
+	fbType string
+}
+
+// freeBusyBusy is the FBTYPE RFC 5545 §3.2.9 defaults to, which is why the
+// parameter is written out only for the other types.
+const freeBusyBusy = "BUSY"
+
+func freeBusyTypeParameter(fbType string) string {
+	if fbType == "" || fbType == freeBusyBusy {
+		return ""
+	}
+	return ";FBTYPE=" + fbType
+}
+
+// freeBusyIntervals is every busy period one calendar object publishes.
+// RFC 4791 §7.10 considers a VEVENT that is absent TRANSP or names OPAQUE, plus
+// every VFREEBUSY, so an object can contribute through both routes.
+//
+// budget is what remains of the report's budgets, and what this resource
+// spends is taken from it: each occurrence its recurrence set expands into, and
+// each stored VFREEBUSY period reaching the range.
+func freeBusyIntervals(candidate freeBusyCandidate, rangeStart, rangeEnd time.Time, budget *freeBusyBudget) ([]freeBusyInterval, error) {
+	var intervals []freeBusyInterval
+	// A recurrence set belongs to the resource rather than to any one of its
+	// components, so it is expanded once from the master and each period is then
+	// typed by whichever component actually describes the instance it came from.
+	//
+	// That route requires a master defining a set. Without one -- a resource of
+	// overridden instances alone, which §4.1 permits, or a master carrying no
+	// recurrence property beside a RECURRENCE-ID sibling -- every VEVENT stands
+	// for itself and is typed by itself, which is also what the §9.6.5 expansion
+	// returns for the same octets.
+	master := freeBusyMasterComponent(candidate.matcher.root)
+	if master != nil && ical.EventHasRecurrence(candidate.event.RawICAL) {
+		if freeBusyRecurrenceSetPublishes(candidate.matcher.root, master) {
+			published, expanded, err := freeBusyEventIntervals(candidate, master, rangeStart, rangeEnd, budget.expandedPeriods)
+			if err != nil {
+				return nil, err
+			}
+			budget.expandedPeriods -= expanded
+			intervals = append(intervals, published...)
+		}
+	} else {
+		for _, child := range candidate.matcher.root.children {
+			if child.name != "VEVENT" {
+				continue
+			}
+			if interval, ok := freeBusyStandaloneEventInterval(candidate, child, rangeStart, rangeEnd); ok {
+				intervals = append(intervals, interval)
+			}
+		}
+	}
+	for _, child := range candidate.matcher.root.children {
+		if child.name != "VFREEBUSY" {
+			continue
+		}
+		stored := freeBusyStoredPeriods(candidate.matcher, child, rangeStart, rangeEnd)
+		budget.storedPeriods -= len(stored)
+		if budget.storedPeriods < 0 {
+			return nil, errFreeBusyStoredPeriodLimit
+		}
+		intervals = append(intervals, stored...)
+	}
+	return intervals, nil
+}
+
+// freeBusyRecurrenceSetPublishes reports whether any component describing an
+// instance of master's recurrence set publishes busy time. When none does --
+// the master and every override TRANSP:TRANSPARENT or STATUS:CANCELLED, as
+// every generated birthday is -- no instance can publish a period whatever the
+// expansion yields, so the set is not expanded and costs the report nothing.
+func freeBusyRecurrenceSetPublishes(root, master *icalNode) bool {
+	if _, publishes := freeBusyEventType(master); publishes {
+		return true
+	}
+	for _, child := range root.children {
+		if child.name != master.name || child.count("RECURRENCE-ID") == 0 {
+			continue
+		}
+		if _, publishes := freeBusyEventType(child); publishes {
+			return true
+		}
+	}
+	return false
+}
+
+// freeBusyEventType maps a VEVENT's TRANSP and STATUS to the FBTYPE its periods
+// carry, per the RFC 4791 §7.10 table. ok is false for a component publishing no
+// busy time at all: TRANSP:TRANSPARENT under any status, and STATUS:CANCELLED
+// under OPAQUE. Both map to FREE, and this report returns only busy time.
+func freeBusyEventType(node *icalNode) (string, bool) {
+	if strings.EqualFold(strings.TrimSpace(node.value("TRANSP")), "TRANSPARENT") {
+		return "", false
+	}
+	switch strings.ToUpper(strings.TrimSpace(node.value("STATUS"))) {
+	case "CANCELLED":
+		return "", false
+	case "TENTATIVE":
+		return "BUSY-TENTATIVE", true
+	default:
+		// CONFIRMED, absent, and the x-name row, which §7.10 lets a server
+		// answer as BUSY.
+		return freeBusyBusy, true
+	}
+}
+
+// freeBusyEventIntervals derives the periods a resource's VEVENT recurrence set
+// occupies, each tagged with the FBTYPE of the component that describes its
+// instance. master is the component defining that set, which the caller has
+// established does define one.
+//
+// expanded is the size of the recurrence set that was generated, which is what
+// the report's budget is spent on. It is not len(intervals): the components
+// describing these instances decide which of them publish busy time, and one
+// that publishes none cost the same to expand as one that publishes all.
+func freeBusyEventIntervals(candidate freeBusyCandidate, master *icalNode, rangeStart, rangeEnd time.Time, expansionBudget int) (intervals []freeBusyInterval, expanded int, err error) {
+	extent, ok := candidate.extent(master)
+	if !ok {
+		return nil, 0, nil
+	}
+	// The expansion reads its EXDATEs and RDATEs through the same resolver that
+	// placed the start, so an exception still names an occurrence the zone moved.
+	periods, err := ical.RecurringBusyPeriods(candidate.event.RawICAL, extent.start, extent.length,
+		rangeStart, rangeEnd, expansionBudget, extent.resolve, candidate.matcher.pool)
+	if err != nil {
+		// Publishing the periods collected so far would report the hours they
+		// cover and leave the rest of the range looking free, which is the one
+		// answer this report must never give. The refusal is carried up instead.
+		return nil, 0, err
+	}
+	overrides := candidate.matcher.overrideIndex(candidate.matcher.root, master)
+	intervals = make([]freeBusyInterval, 0, len(periods))
+	for _, period := range periods {
+		recurrenceID := period.RecurrenceID
+		if recurrenceID.IsZero() {
+			recurrenceID = period.Start
+		}
+		describing := overrides.describing(master, recurrenceID, period.RecurrenceDate)
+		fbType, publishes := freeBusyEventType(describing)
+		if !publishes {
+			continue
+		}
+		intervals = append(intervals, freeBusyInterval{start: period.Start, end: period.End, fbType: fbType})
+	}
+	return intervals, len(periods), nil
+}
+
+func freeBusyStandaloneEventInterval(candidate freeBusyCandidate, node *icalNode, rangeStart, rangeEnd time.Time) (freeBusyInterval, bool) {
+	dtstart, ok := candidate.matcher.dateValue(node, "DTSTART", noShift)
+	if !ok {
+		return freeBusyInterval{}, false
+	}
+	end := withStoredDTEndFallback(candidate.matcher, node, candidate.event, dtstart,
+		candidate.matcher.eventOccurrenceEnd(node, dtstart, noShift))
+	if !periodInTimeRange(dtstart.instant, end, rangeStart, rangeEnd) {
+		return freeBusyInterval{}, false
+	}
+	fbType, publishes := freeBusyEventType(node)
+	if !publishes {
+		return freeBusyInterval{}, false
+	}
+	return freeBusyInterval{start: dtstart.instant, end: end, fbType: fbType}, true
+}
+
+// freeBusyStoredPeriods reads the FREEBUSY properties of a stored VFREEBUSY,
+// each under the FBTYPE its own parameter names. RFC 5545 §3.2.9 defaults that
+// to BUSY, and FREE names free time, which this report does not publish.
+func freeBusyStoredPeriods(matcher calendarTimeRangeMatcher, node *icalNode, rangeStart, rangeEnd time.Time) []freeBusyInterval {
+	var intervals []freeBusyInterval
+	for _, property := range node.properties {
+		if property.name != "FREEBUSY" {
+			continue
+		}
+		fbType := strings.ToUpper(strings.TrimSpace(property.parameters["FBTYPE"]))
+		if fbType == "" {
+			fbType = freeBusyBusy
+		}
+		if fbType == "FREE" {
+			continue
+		}
+		for _, value := range strings.Split(property.value, ",") {
+			start, end, ok := matcher.freeBusyPeriod(property, strings.TrimSpace(value))
+			if !ok {
+				continue
+			}
+			if !periodInTimeRange(start, end, rangeStart, rangeEnd) {
+				continue
+			}
+			intervals = append(intervals, freeBusyInterval{start: start, end: end, fbType: fbType})
+		}
+	}
+	return intervals
+}
+
+// mergeFreeBusyPeriods removes values that cannot form an RFC 5545 PERIOD,
+// then de-duplicates and coalesces the remaining periods per FBTYPE. The result
+// is in the ascending start order RFC 5545 §3.8.2.6 asks it to publish in.
+//
+// The argument is reordered in place: grouping by type is what lets the single
+// pass below coalesce, so the caller passes ownership of the slice.
+func mergeFreeBusyPeriods(intervals []freeBusyInterval) []freeBusyInterval {
+	valid := intervals[:0]
+	for _, interval := range intervals {
+		if interval.end.After(interval.start) {
+			valid = append(valid, interval)
+		}
+	}
+	intervals = valid
+	if len(intervals) < 2 {
+		return intervals
+	}
+	// Only periods of the same FBTYPE may merge, and §7.10 lets two types cover
+	// one interval, so the grouping is internal to the merge rather than the
+	// order the result is published in.
+	slices.SortFunc(intervals, func(a, b freeBusyInterval) int {
+		if order := strings.Compare(a.fbType, b.fbType); order != 0 {
+			return order
+		}
+		return compareFreeBusyPlacement(a, b)
+	})
+
+	merged := make([]freeBusyInterval, 0, len(intervals))
+	for _, interval := range intervals {
+		if len(merged) == 0 {
+			merged = append(merged, interval)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if last.fbType != interval.fbType || interval.start.After(last.end) {
+			merged = append(merged, interval)
+			continue
+		}
+		if interval.end.After(last.end) {
+			last.end = interval.end
+		}
+	}
+
+	slices.SortFunc(merged, func(a, b freeBusyInterval) int {
+		if order := compareFreeBusyPlacement(a, b); order != 0 {
+			return order
+		}
+		// Two types covering one interval need a tie-break, or the order two
+		// equally-placed periods come out in depends on candidate order.
+		return strings.Compare(a.fbType, b.fbType)
+	})
+	return merged
+}
+
+// compareFreeBusyPlacement orders two periods by where they fall, which is the
+// start-then-end order RFC 5545 §3.8.2.6 publishes in.
+func compareFreeBusyPlacement(a, b freeBusyInterval) int {
+	if order := a.start.Compare(b.start); order != 0 {
+		return order
+	}
+	return a.end.Compare(b.end)
+}
+
+// freeBusyExtent is where a calendar object starts, how long one occurrence of
+// it lasts, and the resolver that placed both -- so the recurrence expansion
+// resolves the rest of the set the same way, and the recurring and
+// non-recurring paths cannot disagree about the same event.
+type freeBusyExtent struct {
+	start   time.Time
+	length  time.Duration
+	resolve ical.RecurrenceTimeResolver
+}
+
+// extent resolves the interval one occurrence of master occupies.
+//
+// Values resolve through the zone the candidate was parsed with, which RFC 4791
+// §7.3 makes the collection's CALDAV:calendar-timezone for this report. A
+// floating DTSTART names a wall clock rather than an instant, so reading it as
+// UTC publishes a period hours away from the one the client asked about. The
+// denormalized store columns are the fallback for a master whose own DTSTART
+// does not resolve, which is the only case where they say more than the
+// component does.
+//
+// master is the component freeBusyIntervals expanded the recurrence set from,
+// so the extent and the periods derived from it cannot come to describe two
+// different components of one resource.
+func (c freeBusyCandidate) extent(master *icalNode) (freeBusyExtent, bool) {
+	if dtstart, ok := c.matcher.dateValue(master, "DTSTART", noShift); ok {
+		length := c.matcher.occurrenceWindow(master, dtstart)
+		end := withStoredDTEndFallback(c.matcher, master, c.event, dtstart, dtstart.instant.Add(length))
+		return freeBusyExtent{
+			start:   dtstart.instant,
+			length:  end.Sub(dtstart.instant),
+			resolve: c.matcher,
+		}, true
+	}
+	if c.event.DTStart == nil {
+		return freeBusyExtent{}, false
+	}
+	return freeBusyExtent{
+		start:   *c.event.DTStart,
+		length:  freeBusyColumnLength(c.event, *c.event.DTStart),
+		resolve: c.matcher,
+	}, true
+}
+
+// freeBusyMasterComponent returns the VEVENT defining the recurrence set.
+// A resource containing only overridden instances has no master.
+func freeBusyMasterComponent(root *icalNode) *icalNode {
+	for _, child := range root.children {
+		if child.name != "VEVENT" {
+			continue
+		}
+		if child.count("RECURRENCE-ID") == 0 {
+			return child
+		}
+	}
+	return nil
+}
+
+// withStoredDTEndFallback is end, as the caller already placed it with
+// eventOccurrenceEnd or occurrenceWindow, except when node carries a DTEND
+// that does not read and no usable DURATION, and dtstart is a DATE-TIME
+// rather than a DATE: both readers then place end at dtstart itself, RFC 5545
+// §3.6.1's rule for an event that states no end at all, but a DTEND present
+// and unreadable is not that absence. The length the event's stored dtstart
+// and dtend columns keep for such a row -- what ical.StoredEventEnd and the
+// v1.2.0 repair carry forward from a 1.1.x release's own reading of it --
+// answers instead, so the row's busy time is not lost to a column read as
+// empty only because this reader is stricter than the one that stored it.
+//
+// The columns describe the one component the store derives them from, the
+// primary VEVENT (primaryEventNode), so only that node takes their length;
+// any other component of the resource, an override with its own unreadable
+// DTEND among them, is left at the end its own octets place. The length is
+// placed from dtstart, the instant this reader resolves for the node, which
+// differs from the column's for a floating start, read in the collection's
+// zone here and as UTC wall time there.
+func withStoredDTEndFallback(matcher calendarTimeRangeMatcher, node *icalNode, event store.Event, dtstart icalTimeValue, end time.Time) time.Time {
+	if dtstart.isDate || !end.Equal(dtstart.instant) || node.count("DTEND") == 0 {
+		return end
+	}
+	if event.DTStart == nil || event.DTEnd == nil || node != primaryEventNode(matcher.root) {
+		return end
+	}
+	if _, ok := matcher.dateValue(node, "DTEND", noShift); ok {
+		return end
+	}
+	if _, ok := componentDuration(node, "DURATION"); ok {
+		return end
+	}
+	if length := event.DTEnd.Sub(*event.DTStart); length > 0 {
+		return dtstart.instant.Add(length)
+	}
+	return end
+}
+
+// primaryEventNode is the VEVENT the store derives an object's denormalized
+// columns from, chosen as primaryEventMetadata and ical.PrimaryVEventComponent
+// choose it: the first carrying no RECURRENCE-ID, else the first.
+func primaryEventNode(root *icalNode) *icalNode {
+	if root == nil {
+		return nil
+	}
+	var first *icalNode
+	for _, child := range root.children {
+		if child.name != "VEVENT" {
+			continue
+		}
+		if child.count("RECURRENCE-ID") == 0 {
+			return child
+		}
+		if first == nil {
+			first = child
+		}
+	}
+	return first
+}
+
+// freeBusyColumnLength reads the length off the denormalized columns, for an
+// event whose own octets bound nothing. RFC 5545 §3.6.1 ends an event carrying
+// a DATE-TIME DTSTART and no DTEND at that same instant, so nothing left to read
+// means zero rather than a guessed length.
+func freeBusyColumnLength(event store.Event, start time.Time) time.Duration {
+	if event.DTEnd != nil {
+		if length := event.DTEnd.Sub(start); length > 0 {
+			return length
+		}
+	}
+	if event.AllDay {
+		return 24 * time.Hour
+	}
+	return 0
+}

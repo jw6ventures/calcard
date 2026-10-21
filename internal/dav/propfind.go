@@ -1,7 +1,7 @@
 package dav
 
 import (
-	"encoding/xml"
+	"bytes"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,13 +10,18 @@ import (
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
-	if h.handleRegisteredMethod(w, r) {
-		return
-	}
-	depth := strings.TrimSpace(r.Header.Get("Depth"))
+// propfindInfinityEnabled reports whether Depth: infinity PROPFIND is served.
+// Enabled by default (including when no config is wired, as in tests); the
+// APP_DAV_PROPFIND_INFINITY_ENABLED env var can turn it off.
+func (h *DavServer) propfindInfinityEnabled() bool {
+	return h == nil || h.cfg == nil || h.cfg.DAV.PropfindInfinityEnabled
+}
+
+func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
+	depth := strings.ToLower(strings.TrimSpace(r.Header.Get("Depth")))
 	if depth == "" {
-		depth = "1"
+		// RFC 4918 §9.1: a missing Depth header means Depth: infinity.
+		depth = "infinity"
 	}
 	h.logger().Trace("Propfind", "PROPFIND %s depth=%s", r.URL.Path, depth)
 
@@ -26,9 +31,24 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var propfindReq propfindRequest
-	if r.Body != http.NoBody {
-		body, err := readDAVBody(w, r, maxDAVBodyBytes)
+	switch depth {
+	case "0", "1":
+	case "infinity":
+		// RFC 4918 §9.1.1: servers may refuse infinite-depth PROPFIND, but
+		// must say so instead of silently degrading the depth.
+		if !h.propfindInfinityEnabled() {
+			writeDAVError(w, http.StatusForbidden, "propfind-finite-depth")
+			return
+		}
+	default:
+		http.Error(w, "invalid Depth header", http.StatusBadRequest)
+		return
+	}
+
+	var body []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		body, err = readDAVBody(w, r, maxDAVBodyBytes)
 		if err != nil {
 			if errors.Is(err, errRequestTooLarge) {
 				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
@@ -37,39 +57,67 @@ func (h *Handler) Propfind(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+	}
+	var propfindReq propfindRequest
+	// RFC 4918 §9.1: an empty body is an allprop request. A chunked request
+	// carries no length to announce that, so emptiness is judged by what was
+	// read, and XML whitespace alone is no document either.
+	if len(bytes.Trim(body, xmlWhitespace)) != 0 {
+		if h.propfindBodyExceedsPropertyLimit(body) {
+			h.logger().Trace("Propfind", "rejected %s: requests more than %d distinct properties", r.URL.Path, h.requestedPropertyLimit())
+			http.Error(w, "PROPFIND requests too many properties", http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err := safeUnmarshalXML(body, &propfindReq); err != nil {
-			propfindReq.AllProp = &struct{}{}
+			// RFC 4918 §9.1: a request body that is not valid XML is a 400,
+			// not an implicit allprop.
+			http.Error(w, "invalid PROPFIND body", http.StatusBadRequest)
+			return
 		}
 	} else {
 		propfindReq.AllProp = &struct{}{}
 	}
+	// calendar-data and address-data are REPORT selectors, not WebDAV
+	// properties, so PROPFIND must never return their values.
+	propfindReq.suppressData = true
 
 	responses, err := h.buildPropfindResponses(r.Context(), r, r.URL.Path, depth, user, &propfindReq)
 	if err != nil {
+		if errors.Is(err, errForbidden) {
+			writeNeedPrivileges(w, r.URL.Path, "read")
+			return
+		}
+		// The generated birthday collection is read under the report row
+		// budget, and a PROPFIND deep enough to reach it inherits that refusal.
+		if errors.Is(err, errTooManyCandidateRows) {
+			writeInsufficientStorage(w)
+			return
+		}
 		status := http.StatusBadRequest
 		if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
 			status = http.StatusConflict
-		}
-		if errors.Is(err, errForbidden) {
-			status = http.StatusForbidden
 		}
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, http.ErrNotSupported) {
 			status = http.StatusNotFound
 		}
 		h.logger().Error("Propfind", "failed to build responses for %s (status %d): %v", r.URL.Path, status, err)
-		http.Error(w, err.Error(), status)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))
-
-	payload := multistatus{
-		XMLName:   xml.Name{Space: "DAV:", Local: "multistatus"},
-		XmlnsD:    "DAV:",
-		XmlnsC:    "urn:ietf:params:xml:ns:caldav",
-		XmlnsA:    "urn:ietf:params:xml:ns:carddav",
-		XmlnsCS:   "http://calendarserver.org/ns/",
-		XmlnsICAL: "http://apple.com/ns/ical/",
-		Response:  responses,
+	responses, limitExceeded := h.capMultistatusResponses(responses)
+	if limitExceeded {
+		h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
+		return
 	}
-	writeMultiStatus(w, payload)
+
+	// RFC 4918 §9.1: <propname/> asks for the names of the resource's
+	// properties, not their values.
+	if propfindReq.PropName != nil {
+		for i := range responses {
+			responses[i] = propnamePropfindResponse(responses[i])
+		}
+	}
+
+	h.writeBoundedMultiStatus(w, newMultistatus(responses, ""))
 }

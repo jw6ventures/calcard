@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,13 +16,45 @@ import (
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/dav"
+	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/http/csrf"
 	"github.com/jw6ventures/calcard/internal/http/ratelimit"
+	"github.com/jw6ventures/calcard/internal/http/trafficcapture"
 	"github.com/jw6ventures/calcard/internal/logging"
 	"github.com/jw6ventures/calcard/internal/metrics"
 	"github.com/jw6ventures/calcard/internal/store"
 	"github.com/jw6ventures/calcard/internal/ui"
 )
+
+// trustedRealIP resolves r.RemoteAddr to the client clientip.ClientIP
+// attributes the request to, so traffic capture records the same client the
+// rate limiter and the session record do; a request whose client is the peer
+// keeps the peer's address, port included. It does so only when the immediate
+// peer is a proxy APP_TRUSTED_PROXIES names: rewriting on any other peer's say-so
+// lets a client claim to be a trusted proxy, and a spoofed X-Forwarded-Proto:
+// https would then unlock HTTP Basic over cleartext -- the transport requirement
+// RFC 4791 §11 makes of it.
+//
+// The peer address is recorded first, through clientip.WithPeerAddr. Trust is
+// decided on the connection, and once RemoteAddr carries the client, testing it
+// against the proxy CIDRs asks whether the client is a proxy. After this,
+// RemoteAddr answers "who is the client" and clientip.PeerAddr answers "who
+// connected".
+//
+// A deployment configuring no trusted proxies trusts every peer's forwarded
+// headers, which the configuration loader already warns about at startup.
+func trustedRealIP(trustedProxies []string) func(http.Handler) http.Handler {
+	trusted := clientip.NewTrustedProxies(trustedProxies)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if trusted.AllowsPeer(r.RemoteAddr) {
+				r = r.WithContext(clientip.WithPeerAddr(r.Context(), r.RemoteAddr))
+				r.RemoteAddr = trusted.RemoteAddr(r)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
 
 var registeredDAVMethods = struct {
 	sync.Mutex
@@ -68,11 +101,23 @@ type RouterOptions struct {
 	// Logger is the leveled log sink handed to the DAV server. A nil sink
 	// disables DAV logging.
 	Logger logging.Sink
+	// TrafficCaptureWriter receives replay-compatible JSONL request records.
+	// A nil writer disables traffic capture.
+	TrafficCaptureWriter io.Writer
 }
 
 // NewRouter wires all HTTP routes for UI and DAV endpoints.
 func NewRouter(cfg *config.Config, store *store.Store, authService *auth.Service) http.Handler {
 	return NewRouterWithOptions(cfg, store, authService, RouterOptions{})
+}
+
+// oauthCallbackPath returns the path the OAuth callback is served at.
+// config.Load has already validated a configured value.
+func oauthCallbackPath(cfg *config.Config) string {
+	if cfg.OAuth.RedirectPath == "" {
+		return config.DefaultOAuthRedirectPath
+	}
+	return cfg.OAuth.RedirectPath
 }
 
 // NewRouterWithOptions wires all HTTP routes and optional integrations.
@@ -81,11 +126,21 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 
 	// Auth endpoints: 5 requests per second, burst of 10
 	authRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(5), 10, 5*time.Minute, cfg.TrustedProxies)
-	// DAV endpoints: 20 requests per second, burst of 50 (more permissive for sync clients)
-	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 50, 5*time.Minute, cfg.TrustedProxies)
+	// DAV endpoints: 20 requests per second, burst of 100 (more permissive for
+	// sync clients, which fan out many small PROPFIND/REPORT requests at once)
+	davRateLimiter := ratelimit.NewIPRateLimiter(rate.Limit(20), 100, 5*time.Minute, cfg.TrustedProxies)
 
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(trustedRealIP(cfg.TrustedProxies))
+	if opts.TrafficCaptureWriter != nil {
+		captureLogger := logging.New(opts.Logger, "HTTP")
+		r.Use(trafficcapture.Middleware(trafficcapture.Options{
+			Writer: opts.TrafficCaptureWriter,
+			OnError: func(err error) {
+				captureLogger.Error("TrafficCapture", "%v", err)
+			},
+		}))
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(overrideMethod)
 	r.Use(metrics.Middleware())
@@ -119,9 +174,11 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		http.Redirect(w, r, "/dav/", http.StatusMovedPermanently)
 	}
 	r.Get("/.well-known/caldav", wellKnownHandler)
+	r.MethodFunc("OPTIONS", "/.well-known/caldav", wellKnownHandler)
 	r.MethodFunc("PROPFIND", "/.well-known/caldav", wellKnownHandler)
 
 	r.Get("/.well-known/carddav", wellKnownHandler)
+	r.MethodFunc("OPTIONS", "/.well-known/carddav", wellKnownHandler)
 	r.MethodFunc("PROPFIND", "/.well-known/carddav", wellKnownHandler)
 
 	// Redirect root PROPFIND to /dav/ for discovery
@@ -136,13 +193,16 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 	// Redirect Apple-specific legacy path to /dav/
 	r.MethodFunc("PROPFIND", "/calendar/*", wellKnownHandler)
 
-	uiHandler := ui.NewHandler(cfg, store, authService)
-	apiHandler := api.NewHandler(cfg, store)
+	uiHandler := ui.NewHandler(cfg, store, authService, dav.ValidateCalendarObject, dav.EventInstances)
+	uiHandler.ShareTimezoneOnsets(dav.SharedTimezoneOnsets())
+	apiHandler := api.NewHandler(cfg, store, dav.ValidateCalendarObject)
 	r.Route("/auth", func(r chi.Router) {
 		r.Use(authRateLimiter.Middleware())
 		r.Get("/login", authService.BeginOAuth)
-		r.Get("/callback", authService.HandleOAuthCallback)
 	})
+	// Registered on the root rather than under /auth because the auth service
+	// sends the identity provider to BaseURL+RedirectPath, wherever that is.
+	r.With(authRateLimiter.Middleware()).Get(oauthCallbackPath(cfg), authService.HandleOAuthCallback)
 
 	r.With(authService.RequireSession, csrf.Middleware(cfg)).Post("/auth/logout", uiHandler.Logout)
 
@@ -230,7 +290,7 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Delete("/addressbooks/{id}/contacts/{uid}", apiHandler.DeleteContact)
 	})
 
-	davHandler := dav.NewServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions, Logger: opts.Logger})
+	davHandler := dav.NewDavServer(dav.Options{Config: cfg, Store: store, Extensions: opts.DAVExtensions, Logger: opts.Logger})
 	registerDAVMethods(davHandler.RegisteredMethods())
 	davAuth := opts.DAVAuthMiddleware
 	if davAuth == nil && authService != nil {
@@ -248,25 +308,25 @@ func NewRouterWithOptions(cfg *config.Config, store *store.Store, authService *a
 		r.Use(davRateLimiter.Middleware())
 
 		// OPTIONS and root PROPFIND must be accessible without authentication for CalDAV client discovery
-		r.MethodFunc("OPTIONS", "/*", davHandler.Options)
+		r.Method("OPTIONS", "/*", davHandler)
 
 		// All other methods require authentication
 		r.Group(func(r chi.Router) {
 			r.Use(davAuth)
-			r.MethodFunc("HEAD", "/*", davHandler.Head)
-			r.MethodFunc("GET", "/*", davHandler.Get)
-			r.MethodFunc("PROPFIND", "/*", davHandler.Propfind)
-			r.MethodFunc("PROPPATCH", "/*", davHandler.Proppatch)
-			r.MethodFunc("MKCOL", "/*", davHandler.Mkcol)
-			r.MethodFunc("MKCALENDAR", "/*", davHandler.Mkcalendar)
-			r.MethodFunc("PUT", "/*", davHandler.Put)
-			r.MethodFunc("DELETE", "/*", davHandler.Delete)
-			r.MethodFunc("REPORT", "/*", davHandler.Report)
-			r.MethodFunc("COPY", "/*", davHandler.Copy)
-			r.MethodFunc("MOVE", "/*", davHandler.Move)
-			r.MethodFunc("LOCK", "/*", davHandler.Lock)
-			r.MethodFunc("UNLOCK", "/*", davHandler.Unlock)
-			r.MethodFunc("ACL", "/*", davHandler.Acl)
+			r.Method("HEAD", "/*", davHandler)
+			r.Method("GET", "/*", davHandler)
+			r.Method("PROPFIND", "/*", davHandler)
+			r.Method("PROPPATCH", "/*", davHandler)
+			r.Method("MKCOL", "/*", davHandler)
+			r.Method("MKCALENDAR", "/*", davHandler)
+			r.Method("PUT", "/*", davHandler)
+			r.Method("DELETE", "/*", davHandler)
+			r.Method("REPORT", "/*", davHandler)
+			r.Method("COPY", "/*", davHandler)
+			r.Method("MOVE", "/*", davHandler)
+			r.Method("LOCK", "/*", davHandler)
+			r.Method("UNLOCK", "/*", davHandler)
+			r.Method("ACL", "/*", davHandler)
 		})
 
 		// Extension-registered methods carry their own per-route auth policy.
@@ -303,7 +363,7 @@ func registerDAVMethods(methods []string) {
 
 // extensionMethodHandler serves an extension-registered DAV method, applying
 // davAuth only when the matched route declares that it requires authentication.
-func extensionMethodHandler(davHandler *dav.Server, davAuth func(http.Handler) http.Handler) http.Handler {
+func extensionMethodHandler(davHandler *dav.DavServer, davAuth func(http.Handler) http.Handler) http.Handler {
 	authed := davAuth(http.HandlerFunc(davHandler.ServeHTTP))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if davHandler.RouteRequiresAuth(r.Method, r.URL.Path) {

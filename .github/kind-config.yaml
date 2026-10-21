@@ -1,0 +1,24 @@
+# Kind cluster for the deployment gate.
+#
+# The ingress-nginx "kind" provider binds the controller to hostPort 80 and 443
+# on a node labelled ingress-ready, so the label is set here and the two ports
+# are published from the node container to the runner. Without the mappings the
+# workflow could reach the Service but not the ingress, which is the only path
+# the TLS assertions are about.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP

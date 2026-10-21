@@ -1,0 +1,1078 @@
+package dav
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/ical"
+	"github.com/jw6ventures/calcard/internal/store"
+)
+
+// writableCalendarServer builds a server holding one writable calendar, together
+// with the event repository the caller inspects to prove a rejected object was
+// not stored and an accepted one was stored verbatim.
+func writableCalendarServer() (*DavServer, *fakeEventRepo) {
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{
+		{Calendar: store.Calendar{ID: 1, UserID: 1, Name: "Test"}, Editor: true},
+	}}
+	return &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}, eventRepo
+}
+
+// buildVTimezone returns a minimal VTIMEZONE, one zero-offset observance, so a
+// case exercising a TZID parameter rule is not also exercising the §4.1 rule
+// that every referenced TZID is defined.
+func buildVTimezone(tzid string) string {
+	return buildComponent("VTIMEZONE",
+		"TZID:"+tzid,
+		buildComponent("STANDARD",
+			"DTSTART:19700101T000000",
+			"TZOFFSETFROM:+0000",
+			"TZOFFSETTO:+0000",
+			"TZNAME:GMT"))
+}
+
+func putCalendarObject(t *testing.T, h *DavServer, name, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := newCalendarPutRequest("/dav/calendars/1/"+name, strings.NewReader(body))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 1}))
+	rr := httptest.NewRecorder()
+	h.Put(rr, req)
+	return rr
+}
+
+// Section 5.3.2.1 (CALDAV:valid-calendar-data): submitted data must be valid for
+// its media type, which for iCalendar means the RFC 5545 content model and value
+// grammar rather than balanced BEGIN and END lines alone. Each case below is
+// well-formed as a nesting of components and invalid as iCalendar.
+func TestRFC4791_ValidCalendarData_EnforcesICalendarGrammar(t *testing.T) {
+	tests := map[string]string{
+		"VCALENDAR at another version": "BEGIN:VCALENDAR\r\nVERSION:1.0\r\nPRODID:" + testProdID + "\r\n" +
+			buildVEvent("old-version") + "END:VCALENDAR\r\n",
+		"non-Gregorian CALSCALE": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + testProdID +
+			"\r\nCALSCALE:JULIAN\r\n" + buildVEvent("calscale") + "END:VCALENDAR\r\n",
+		"VEVENT without DTSTART in a METHOD-less object": buildCalendarObject(buildComponent("VEVENT",
+			"UID:no-dtstart", "DTSTAMP:"+testDTStamp)),
+		"DTEND alongside DURATION": buildCalendarObject(buildVEvent("both",
+			"DTEND:20240601T110000Z", "DURATION:PT1H")),
+		"VEVENT date types do not match": buildCalendarObject(buildVEvent("event-types",
+			"DTSTART;VALUE=DATE:20240601", "DTEND:20240601T110000Z")),
+		"VEVENT DTEND is earlier than DTSTART": buildCalendarObject(buildVEvent("event-order",
+			"DTSTART:20240601T110000Z", "DTEND:20240601T100000Z")),
+		"malformed DURATION": buildCalendarObject(buildVEvent("bad-duration",
+			"DURATION:not-a-duration")),
+		"repeated RRULE": buildCalendarObject(buildVEvent("two-rules",
+			"RRULE:FREQ=DAILY;COUNT=2", "RRULE:FREQ=WEEKLY;COUNT=2")),
+		"malformed RRULE": buildCalendarObject(buildVEvent("bad-rule",
+			"RRULE:FREQ")),
+		"RRULE carrying COUNT and UNTIL": buildCalendarObject(buildVEvent("two-ends",
+			"RRULE:FREQ=DAILY;COUNT=2;UNTIL=20240603T100000Z")),
+		"RRULE with a frequency-forbidden BY part": buildCalendarObject(buildVEvent("bad-by-part",
+			"RRULE:FREQ=WEEKLY;BYMONTHDAY=1")),
+		"RRULE with an unknown rule part": buildCalendarObject(buildVEvent("unknown-rule-part",
+			"RRULE:FREQ=DAILY;X-CALCARD=1")),
+		"VTODO DURATION without DTSTART": buildCalendarObject(buildVTodo("orphan-duration",
+			"DURATION:PT1H")),
+		"VTODO date types do not match": buildCalendarObject(buildVTodo("todo-types",
+			"DTSTART;VALUE=DATE:20240601", "DUE:20240601T110000Z")),
+		"VTODO DUE is earlier than DTSTART": buildCalendarObject(buildVTodo("todo-order",
+			"DTSTART:20240601T110000Z", "DUE:20240601T100000Z")),
+		"VALARM without ACTION": buildCalendarObject(buildVEvent("alarm",
+			buildComponent("VALARM", "TRIGGER:-PT15M"))),
+		"VALARM REPEAT without DURATION": buildCalendarObject(buildVEvent("repeat-alarm",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm",
+				"TRIGGER:-PT15M", "REPEAT:2"))),
+		"AUDIO VALARM carrying DISPLAY-only DESCRIPTION": buildCalendarObject(buildVEvent("audio-description",
+			buildComponent("VALARM", "ACTION:AUDIO", "TRIGGER:-PT15M", "DESCRIPTION:Alarm"))),
+		"DISPLAY VALARM carrying AUDIO-only ATTACH": buildCalendarObject(buildVEvent("display-attach",
+			buildComponent("VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M", "DESCRIPTION:Alarm",
+				"ATTACH:https://example.test/alarm.wav"))),
+		"VFREEBUSY carrying an RRULE": buildCalendarObject(buildVFreeBusy("recurring-freebusy",
+			"RRULE:FREQ=DAILY;COUNT=2")),
+		"VFREEBUSY DTSTART is not UTC": buildCalendarObject(buildVFreeBusy("freebusy-start",
+			"DTSTART:20240601T100000")),
+		"VFREEBUSY DTEND is not UTC": buildCalendarObject(buildVFreeBusy("freebusy-end",
+			"DTEND:20240601T120000")),
+		"VFREEBUSY DTEND is not later than DTSTART": buildCalendarObject(buildVFreeBusy("freebusy-order",
+			"DTSTART:20240601T120000Z", "DTEND:20240601T110000Z")),
+		"VALARM carrying two UIDs": buildCalendarObject(buildVEvent("alarm-uids",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M",
+				"UID:alarm-one", "UID:alarm-two"))),
+		"VALARM acknowledged twice": buildCalendarObject(buildVEvent("alarm-acknowledged",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M",
+				"ACKNOWLEDGED:20240601T094500Z", "ACKNOWLEDGED:20240601T095000Z"))),
+		"VALARM with two proximity triggers": buildCalendarObject(buildVEvent("alarm-proximity",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER;VALUE=DATE-TIME:19760401T005545Z",
+				"PROXIMITY:ARRIVE", "PROXIMITY:DEPART"))),
+		"VALARM nested in a VJOURNAL": buildCalendarObject(buildVJournal("journal-alarm",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", "TRIGGER:-PT15M"))),
+		"content line with no value delimiter": buildCalendarObject(buildComponent("VEVENT",
+			"UID:no-colon", "DTSTAMP:"+testDTStamp, "DTSTART:"+testDTStart, "SUMMARY")),
+		"VTIMEZONE without an observance": buildCalendarObject(
+			buildComponent("VTIMEZONE", "TZID:Example/Zone"),
+			buildVEvent("no-observance")),
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "grammar.ics", body)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+func TestRFC4791_NonStandardComponentAcceptedWhenCollectionAdvertisesIt(t *testing.T) {
+	eventRepo := &fakeEventRepo{events: map[string]*store.Event{}}
+	calRepo := &fakeCalendarRepo{accessible: []store.CalendarAccess{{
+		Calendar: store.Calendar{
+			ID:                  1,
+			UserID:              1,
+			Name:                "Extensions",
+			SupportedComponents: []string{"X-CALCARD-THING"},
+		},
+		Editor: true,
+	}}}
+	h := &DavServer{store: &store.Store{Calendars: calRepo, Events: eventRepo}}
+	body := buildCalendarObject(buildComponent("X-CALCARD-THING",
+		"UID:extension-object", "X-CALCARD-VALUE:preserve me"))
+
+	rr := putCalendarObject(t, h, "extension.ics", body)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT X-component = %d, want 201: %s", rr.Code, rr.Body.String())
+	}
+	stored := eventRepo.events["1:extension-object"]
+	if stored == nil || stored.RawICAL != body {
+		t.Fatalf("stored X-component = %#v, want submitted object preserved", stored)
+	}
+}
+
+func TestRFC4791_MkcalendarAcceptsNonStandardSupportedComponent(t *testing.T) {
+	components, ok := parseSupportedComponentSet(
+		`<cal:comp xmlns:cal="urn:ietf:params:xml:ns:caldav" name="X-CALCARD-THING"/>`,
+	)
+	if !ok || len(components) != 1 || components[0] != "X-CALCARD-THING" {
+		t.Fatalf("parseSupportedComponentSet(X-CALCARD-THING) = %v, %t", components, ok)
+	}
+}
+
+func TestRFC4791_DateLimitsUseSubmittedVTimezoneDefinition(t *testing.T) {
+	minDate, _ := ical.DateLimits()
+	for _, tzid := range []string{"Custom/Plus14", "America/New_York"} {
+		t.Run(tzid, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+			body := buildCalendarObject(
+				buildComponent("VTIMEZONE",
+					"TZID:"+tzid,
+					buildComponent("STANDARD",
+						"DTSTART:19700101T000000",
+						"TZOFFSETFROM:+1400",
+						"TZOFFSETTO:+1400")),
+				buildVEvent("before-min-in-submitted-zone",
+					"DTSTART;TZID="+tzid+":"+minDate.Format("20060102T150405")))
+
+			rr := putCalendarObject(t, h, "submitted-zone.ics", body)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("min-date-time"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("object before min-date-time was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+func TestSubmittedVTimezoneResolverAppliesRecurringObservances(t *testing.T) {
+	body := buildCalendarObject(
+		buildComponent("VTIMEZONE",
+			"TZID:Example/Eastern",
+			buildComponent("STANDARD",
+				"DTSTART:19701101T020000",
+				"TZOFFSETFROM:-0400",
+				"TZOFFSETTO:-0500",
+				"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU"),
+			buildComponent("DAYLIGHT",
+				"DTSTART:19700308T020000",
+				"TZOFFSETFROM:-0500",
+				"TZOFFSETTO:-0400",
+				"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU")),
+		buildVEvent("timezone-observances", "DTSTART;TZID=Example/Eastern:20240115T100000"))
+	root, err := parseICalendarObject(body)
+	if err != nil {
+		t.Fatalf("parse calendar: %v", err)
+	}
+	if fault := validateCalendarObject(root); fault != nil {
+		t.Fatalf("valid calendar rejected: %#v", fault)
+	}
+
+	tests := []struct {
+		wall time.Time
+		want time.Duration
+	}{
+		{wall: time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC), want: -5 * time.Hour},
+		{wall: time.Date(2024, 7, 15, 10, 0, 0, 0, time.UTC), want: -4 * time.Hour},
+	}
+	for _, tt := range tests {
+		got, ok := submittedOffset(root, "Example/Eastern", tt.wall)
+		if !ok || got != tt.want {
+			t.Errorf("submittedOffset(%s) = %s, %t; want %s", tt.wall, got, ok, tt.want)
+		}
+	}
+}
+
+func submittedOffset(root *icalNode, tzid string, wall time.Time) (time.Duration, bool) {
+	observances, ok := submittedTimezoneObservances(root, tzid)
+	if !ok {
+		return 0, false
+	}
+	return observanceOffsetAtWall(observances, wall)
+}
+
+// An observance rule describing more candidate starts than the server will
+// generate leaves the resolver unable to say which observance is in force. The
+// offset reachable from a half-generated period is the wrong one and reads
+// exactly like the right one, so for a zone the host does not define either the
+// object is refused rather than stored against it.
+func TestSubmittedVTimezoneObservanceTooLargeToResolveIsRefused(t *testing.T) {
+	enumerate := func(n int) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = strconv.Itoa(i)
+		}
+		return strings.Join(parts, ",")
+	}
+	monthDays := make([]string, 0, 31)
+	for day := 1; day <= 31; day++ {
+		monthDays = append(monthDays, strconv.Itoa(day))
+	}
+	dense := "RRULE:FREQ=YEARLY;BYMONTH=1,2,3,4,5,6" +
+		";BYMONTHDAY=" + strings.Join(monthDays, ",") +
+		";BYHOUR=" + enumerate(24) +
+		";BYMINUTE=" + enumerate(60) +
+		";BYSECOND=" + enumerate(60)
+
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(
+		buildComponent("VTIMEZONE",
+			"TZID:Example/Dense",
+			buildComponent("STANDARD",
+				"DTSTART:20200101T000000",
+				"TZOFFSETFROM:-0400",
+				"TZOFFSETTO:-0500",
+				dense)),
+		buildVEvent("dense-observance", "DTSTART;TZID=Example/Dense:20260115T100000"))
+
+	root, err := parseICalendarObject(body)
+	if err != nil {
+		t.Fatalf("parse calendar: %v", err)
+	}
+	if _, ok := submittedOffset(root, "Example/Dense", time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)); ok {
+		t.Fatal("an observance the server cannot resolve still produced an offset")
+	}
+	if fault := validateCalendarObject(root); fault == nil {
+		t.Fatal("an object whose VTIMEZONE cannot be resolved was accepted")
+	}
+
+	rr := putCalendarObject(t, h, "dense-observance.ics", body)
+	if rr.Code < 400 {
+		t.Fatalf("status = %d, want a refusal", rr.Code)
+	}
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("object with an unresolvable VTIMEZONE was stored: %#v", eventRepo.events)
+	}
+}
+
+// Sections 3.3.4 and 3.3.5 of RFC 5545 define three spellings of a DATE or
+// DATE-TIME and no more: a bare date, a floating date-time, and a date-time in
+// UTC. A numeric UTC offset belongs to no iCalendar value type, so it is not
+// calendar data whatever a lenient parser makes of it.
+func TestRFC4791_ValidCalendarData_RejectsIllFormedDateValues(t *testing.T) {
+	tests := map[string]string{
+		"numeric offset on DTSTART":         "DTSTART:20240601T100000-0700",
+		"colon offset on DTSTART":           "DTSTART:20240601T100000-07:00",
+		"extended format on DTSTART":        "DTSTART:2024-06-01T10:00:00Z",
+		"VALUE=DATE with a time":            "DTSTART;VALUE=DATE:20240601T100000Z",
+		"unknown VALUE on DTSTART":          "DTSTART;VALUE=BOGUS:20240601T100000Z",
+		"VALUE=DATE on UTC-only DTSTAMP":    "DTSTAMP;VALUE=DATE:20240601T000000Z",
+		"TZID on a UTC value":               "DTSTART;TZID=Example/Zone:20240601T100000Z",
+		"TZID on a DATE value":              "DTSTART;VALUE=DATE;TZID=Example/Zone:20240601",
+		"impossible month":                  "DTSTART:20241301T100000Z",
+		"floating DTSTAMP":                  "DTSTAMP:20240601T100000",
+		"numeric offset in an RDATE":        "RDATE:20240602T100000+0200",
+		"unparseable VALARM TRIGGER":        "TRIGGER:not-a-duration",
+		"floating FREEBUSY period":          "FREEBUSY:20240601T100000/20240601T110000",
+		"FREEBUSY period with no slash":     "FREEBUSY:20240601T100000Z",
+		"numeric offset in typed extension": "X-CALCARD-DATE;VALUE=DATE-TIME:20240601T100000-0700",
+	}
+
+	for name, line := range tests {
+		t.Run(name, func(t *testing.T) {
+			var body string
+			switch {
+			case strings.HasPrefix(line, "FREEBUSY"):
+				body = buildCalendarObject(buildVFreeBusy("dates", line))
+			case strings.HasPrefix(line, "TRIGGER"):
+				body = buildCalendarObject(buildVEvent("dates",
+					buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Alarm", line)))
+			case strings.Contains(line, "TZID="):
+				body = buildCalendarObject(buildVTimezone("Example/Zone"), buildVEvent("dates", line))
+			default:
+				body = buildCalendarObject(buildVEvent("dates", line))
+			}
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "dates.ics", body)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+func TestRFC4791_DateLimitsIncludeExplicitlyTypedExtensionProperties(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(buildVEvent("extension-before-min",
+		"X-CALCARD-DATE;VALUE=DATE-TIME:18991231T235959Z"))
+
+	rr := putCalendarObject(t, h, "extension-before-min.ics", body)
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("min-date-time"))
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("extension date before min-date-time was stored: %#v", eventRepo.events)
+	}
+}
+
+func fixedOffsetVTimezone(tzid, offset string) string {
+	return buildComponent("VTIMEZONE", "TZID:"+tzid,
+		buildComponent("STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:"+offset, "TZOFFSETTO:"+offset))
+}
+
+// RFC 5545 §3.3.10 makes UNTIL inclusive, and a DATE UNTIL on a timed series
+// names the day the series runs through in DTSTART's zone. The date limits
+// admit that day when any instant of it lies within them, as they admit a DATE
+// value on its date: neither a zone west of UTC pushing its last second past
+// CALDAV:max-date-time, nor one east of UTC pulling its first before
+// CALDAV:min-date-time, refuses a date inside the limits. A DATE series and a
+// timed UNTIL are read as written.
+func TestRecurrenceUntilDateOnATimedSeriesIsBoundedAsItsDay(t *testing.T) {
+	requireHostZones(t, "America/New_York", "Asia/Tokyo")
+	tests := []struct {
+		name      string
+		timezones string
+		dtstart   string
+		until     string
+		refusal   string
+	}{
+		{"last day, west of UTC", "", "DTSTART;TZID=America/New_York:20250101T100000", "21001231", ""},
+		{"day after the last, west of UTC", "", "DTSTART;TZID=America/New_York:20250101T100000", "21010101", "max-date-time"},
+		{"last day, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:20250101T100000", "21001231", ""},
+		{"last day, UTC series", "", "DTSTART:20250101T100000Z", "21001231", ""},
+		{"last day, floating series", "", "DTSTART:20250101T100000", "21001231", ""},
+		{"first day, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:19000101T100000", "19000101", ""},
+		{"day before the first, east of UTC", "", "DTSTART;TZID=Asia/Tokyo:19000101T100000", "18991231", "min-date-time"},
+		{"last day, DATE series", "", "DTSTART;VALUE=DATE:20250101", "21001231", ""},
+		{"day after the last, DATE series", "", "DTSTART;VALUE=DATE:20250101", "21010101", "max-date-time"},
+		{"timed UNTIL at the limit", fixedOffsetVTimezone("Custom/Minus5", "-0500"),
+			"DTSTART;TZID=Custom/Minus5:20250101T090000", "21001231T235959Z", ""},
+		{"timed UNTIL past the limit", fixedOffsetVTimezone("Custom/Minus5", "-0500"),
+			"DTSTART;TZID=Custom/Minus5:20250101T090000", "21010101T000000Z", "max-date-time"},
+	}
+	// A daily series through the last day is refused for its instances, which
+	// outnumber CALDAV:max-instances, not for its UNTIL.
+	daily := buildCalendarObject(buildComponent("VEVENT", "UID:e",
+		"DTSTART;TZID=America/New_York:20250101T100000", "RRULE:FREQ=DAILY;UNTIL=21001231"))
+	if _, fault := validateCalendarObjectForStorage(daily, nil); fault == nil || !reflect.DeepEqual(fault.conditions, []string{"max-instances"}) {
+		t.Errorf("daily series through 2100 refused with %+v, want max-instances", fault)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := buildCalendarObject(tt.timezones,
+				buildComponent("VEVENT", "UID:e", tt.dtstart, "RRULE:FREQ=YEARLY;UNTIL="+tt.until))
+			_, fault := validateCalendarObjectForStorage(raw, nil)
+			switch {
+			case tt.refusal == "" && fault != nil:
+				t.Fatalf("refused: %+v", fault)
+			case tt.refusal != "" && (fault == nil || !reflect.DeepEqual(fault.conditions, []string{tt.refusal})):
+				t.Fatalf("fault = %+v, want %s", fault, tt.refusal)
+			}
+		})
+	}
+}
+
+// A series that starts at min-date-time and runs through the day it starts on
+// ends inside the limits, however far west of UTC that day falls.
+func TestRFC4791_DateLimitsReadADateUntilThroughItsWholeDay(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(fixedOffsetVTimezone("Custom/Minus12", "-1200"),
+		buildVEvent("until-min-day",
+			"DTSTART;TZID=Custom/Minus12:18991231T120000",
+			"RRULE:FREQ=HOURLY;UNTIL=18991231"))
+
+	rr := putCalendarObject(t, h, "until-min-day.ics", body)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(eventRepo.events) != 1 {
+		t.Fatalf("stored %d objects, want 1", len(eventRepo.events))
+	}
+}
+
+func TestRFC4791_ValidCalendarData_RejectsInvalidPeriods(t *testing.T) {
+	tests := map[string]string{
+		"FREEBUSY end before start": buildCalendarObject(buildVFreeBusy("period",
+			"FREEBUSY:20240601T110000Z/20240601T100000Z")),
+		"FREEBUSY end equal to start": buildCalendarObject(buildVFreeBusy("period",
+			"FREEBUSY:20240601T100000Z/20240601T100000Z")),
+		"FREEBUSY zero duration": buildCalendarObject(buildVFreeBusy("period",
+			"FREEBUSY:20240601T100000Z/PT0S")),
+		"FREEBUSY negative duration": buildCalendarObject(buildVFreeBusy("period",
+			"FREEBUSY:20240601T100000Z/-PT1H")),
+		"RDATE end before start": buildCalendarObject(buildVEvent("period",
+			"RDATE;VALUE=PERIOD:20240601T110000Z/20240601T100000Z")),
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "period.ics", body)
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+func TestRFC4791_ValidCalendarData_AcceptsRDatePeriods(t *testing.T) {
+	tests := map[string]string{
+		"explicit end": "RDATE;VALUE=PERIOD:20240602T100000Z/20240602T120000Z",
+		"duration end": "RDATE;VALUE=PERIOD:20240602T100000Z/PT2H",
+	}
+
+	for name, rdate := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+			body := buildCalendarObject(buildVEvent("period", rdate))
+
+			rr := putCalendarObject(t, h, "period.ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT with a valid RDATE PERIOD = %d, want 201: %s", rr.Code, rr.Body.String())
+			}
+			stored := eventRepo.events[eventRepo.key(1, "period")]
+			if stored == nil || stored.RawICAL != body {
+				t.Fatalf("stored RDATE PERIOD = %#v, want submitted object preserved", stored)
+			}
+		})
+	}
+}
+
+func TestRFC4791_ValidCalendarData_AcceptsPositiveLeapSecond(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(buildVEvent("leap-second",
+		"DTSTAMP:19970630T235960Z",
+		"DTSTART:19970630T235960Z"))
+
+	rr := putCalendarObject(t, h, "leap-second.ics", body)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT with a positive leap second = %d, want 201: %s", rr.Code, rr.Body.String())
+	}
+	stored := eventRepo.events[eventRepo.key(1, "leap-second")]
+	if stored == nil || stored.RawICAL != body {
+		t.Fatalf("stored leap-second event = %#v, want submitted object preserved", stored)
+	}
+}
+
+// Section 4.1: a VTIMEZONE is specified for each unique TZID parameter value the
+// object uses. A reference with no definition leaves the stored resource
+// unreadable to the client that fetches it, which is the restriction
+// CALDAV:valid-calendar-object-resource carries.
+func TestRFC4791_ValidCalendarObject_RequiresVTimezoneForEachTZID(t *testing.T) {
+	t.Run("reference without a definition is rejected", func(t *testing.T) {
+		h, eventRepo := writableCalendarServer()
+		body := buildCalendarObject(buildVEvent("undefined-tzid",
+			"DTSTART;TZID=Example/Zone:20240601T100000"))
+
+		rr := putCalendarObject(t, h, "tz.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+		}
+	})
+
+	t.Run("one definition per referenced TZID is accepted", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVTimezone("Example/Zone"),
+			buildVTimezone("Example/Other"),
+			buildVEvent("defined-tzids",
+				"DTSTART;TZID=Example/Zone:20240601T100000",
+				"DTEND;TZID=Example/Other:20240601T110000"))
+
+		rr := putCalendarObject(t, h, "tz.ics", body)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("PUT with a VTIMEZONE per TZID = %d, want 201; body: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("a second definition of one TZID is rejected", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVTimezone("Example/Zone"),
+			buildVTimezone("Example/Zone"),
+			buildVEvent("duplicate-tzid", "DTSTART;TZID=Example/Zone:20240601T100000"))
+
+		rr := putCalendarObject(t, h, "tz.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+	})
+}
+
+// Section 4.1 describes a recurrence set as the master component plus its
+// overridden instances, and admits a resource carrying only overrides: the
+// components sharing one UID are the ones that go in one resource, however many
+// of them the client is sending.
+func TestRFC4791_ValidCalendarObject_RecurrenceSetShapes(t *testing.T) {
+	t.Run("overrides with no master are accepted", func(t *testing.T) {
+		h, eventRepo := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVEvent("override-only",
+				"RECURRENCE-ID:20240601T100000Z", "DTSTART:20240601T110000Z"),
+			buildVEvent("override-only",
+				"RECURRENCE-ID:20240602T100000Z", "DTSTART:20240602T113000Z"))
+
+		rr := putCalendarObject(t, h, "overrides.ics", body)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("PUT of an override-only recurrence set = %d, want 201; body: %s", rr.Code, rr.Body.String())
+		}
+		if len(eventRepo.events) != 1 {
+			t.Fatalf("stored events = %d, want the one resource the overrides share", len(eventRepo.events))
+		}
+	})
+
+	t.Run("two masters sharing a UID are rejected", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVEvent("two-masters", "DTSTART:20240601T100000Z"),
+			buildVEvent("two-masters", "DTSTART:20240602T100000Z"))
+
+		rr := putCalendarObject(t, h, "masters.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+	})
+
+	t.Run("two overrides of one instance are rejected", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVEvent("clashing", "DTSTART:20240601T100000Z"),
+			buildVEvent("clashing", "RECURRENCE-ID:20240602T100000Z", "DTSTART:20240602T110000Z"),
+			buildVEvent("clashing", "RECURRENCE-ID:20240602T100000Z", "DTSTART:20240602T120000Z"))
+
+		rr := putCalendarObject(t, h, "clash.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+	})
+
+	t.Run("override value type must match the master DTSTART", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVEvent("type-mismatch", "DTSTART;VALUE=DATE:20240601"),
+			buildVEvent("type-mismatch", "RECURRENCE-ID:20240602T100000Z", "DTSTART:20240602T110000Z"))
+
+		rr := putCalendarObject(t, h, "type-mismatch.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+	})
+
+	t.Run("override TZID must match the master DTSTART", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVTimezone("Example/Zone"),
+			buildVEvent("tzid-mismatch", "DTSTART;TZID=Example/Zone:20240601T100000"),
+			buildVEvent("tzid-mismatch", "RECURRENCE-ID:20240602T100000", "DTSTART;TZID=Example/Zone:20240602T110000"))
+
+		rr := putCalendarObject(t, h, "tzid-mismatch.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+	})
+
+	// RFC 5545 §3.3.5 reads 11:30, which the 11:00 transition skips, with the
+	// offset before the gap, so it names 11:30Z, as 12:30 after the gap does.
+	t.Run("equivalent recurrence instants are duplicate overrides", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildComponent("VTIMEZONE",
+				"TZID:Example/Forward",
+				buildComponent("DAYLIGHT",
+					"DTSTART:20240601T110000", "TZOFFSETFROM:+0000", "TZOFFSETTO:+0100")),
+			buildVEvent("normalized-clash",
+				"RECURRENCE-ID;TZID=Example/Forward:20240601T113000", "DTSTART:20240601T120000Z"),
+			buildVEvent("normalized-clash",
+				"RECURRENCE-ID;TZID=Example/Forward:20240601T123000", "DTSTART:20240601T130000Z"))
+
+		rr := putCalendarObject(t, h, "normalized-clash.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+	})
+
+	// The one-component-type rule of §4.1 holds across a recurrence set too: a
+	// VTODO override of a VEVENT master shares its UID and is still two types
+	// of calendar component in one resource.
+	t.Run("an override of another component type is rejected", func(t *testing.T) {
+		h, _ := writableCalendarServer()
+		body := buildCalendarObject(
+			buildVEvent("mixed-recurrence", "DTSTART:20240601T100000Z"),
+			buildVTodo("mixed-recurrence", "RECURRENCE-ID:20240602T100000Z"))
+
+		rr := putCalendarObject(t, h, "mixed.ics", body)
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-object-resource"))
+	})
+}
+
+// Section 5.3.3: non-standard components, properties and parameters submitted
+// through PUT are supported and preserved. The stored octets are compared
+// against the submitted ones, because §5.3.4's strong ETag says they are equal.
+func TestRFC4791_PutPreservesNonStandardCalendarData(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	body := buildCalendarObject(buildVEvent("extensions",
+		"X-CALCARD-TEST-FLAG;X-CALCARD-TEST-PARAM=kept:value",
+		"X-CALCARD-DATE;VALUE=DATE-TIME:20240601T100000Z",
+		"SUMMARY;X-CALCARD-TEST-PARAM=kept:Extended",
+		buildComponent("X-CALCARD-TEST-COMPONENT", "X-CALCARD-TEST-INNER:nested")))
+
+	rr := putCalendarObject(t, h, "extensions.ics", body)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT carrying non-standard content = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	stored := eventRepo.events[eventRepo.key(1, "extensions")]
+	if stored == nil {
+		t.Fatal("object was not stored")
+	}
+	if stored.RawICAL != body {
+		t.Fatalf("stored octets = %q, want the submitted %q", stored.RawICAL, body)
+	}
+}
+
+// appleAlarmEvent is a VEVENT as Apple Calendar writes it: every VALARM carries
+// the RFC 9074 §4 UID beside Apple's X-WR-ALARMUID, an acknowledged alarm
+// carries ACKNOWLEDGED (§6), and a snoozed alarm is a second VALARM pointing back
+// at the first through RELATED-TO (§5, §7).
+const appleAlarmEvent = "BEGIN:VCALENDAR\r\n" +
+	"VERSION:2.0\r\n" +
+	"PRODID:-//Apple Inc.//macOS 14.6.1//EN\r\n" +
+	"CALSCALE:GREGORIAN\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:America/New_York\r\n" +
+	"BEGIN:DAYLIGHT\r\n" +
+	"TZOFFSETFROM:-0500\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\n" +
+	"DTSTART:20070311T020000\r\n" +
+	"TZNAME:EDT\r\n" +
+	"TZOFFSETTO:-0400\r\n" +
+	"END:DAYLIGHT\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"TZOFFSETFROM:-0400\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n" +
+	"DTSTART:20071104T020000\r\n" +
+	"TZNAME:EST\r\n" +
+	"TZOFFSETTO:-0500\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"CREATED:20240601T140512Z\r\n" +
+	"DTEND;TZID=America/New_York:20240603T100000\r\n" +
+	"DTSTAMP:20240601T140539Z\r\n" +
+	"DTSTART;TZID=America/New_York:20240603T090000\r\n" +
+	"LAST-MODIFIED:20240601T140538Z\r\n" +
+	"SEQUENCE:0\r\n" +
+	"SUMMARY:Team sync\r\n" +
+	"TRANSP:OPAQUE\r\n" +
+	"UID:6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10\r\n" +
+	"X-APPLE-CREATOR-IDENTITY:com.apple.calendar\r\n" +
+	"X-APPLE-CREATOR-TEAM-IDENTITY:0000000000\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACKNOWLEDGED:20240603T124500Z\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:This is an event reminder\r\n" +
+	"TRIGGER:-PT15M\r\n" +
+	"UID:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"X-WR-ALARMUID:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"END:VALARM\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:This is an event reminder\r\n" +
+	"RELATED-TO;RELTYPE=SNOOZE:D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E\r\n" +
+	"TRIGGER;VALUE=DATE-TIME:20240603T125000Z\r\n" +
+	"UID:0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\r\n" +
+	"X-WR-ALARMUID:0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D\r\n" +
+	"END:VALARM\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:AUDIO\r\n" +
+	"ATTACH;VALUE=URI:Chord\r\n" +
+	"TRIGGER:-PT5M\r\n" +
+	"UID:7F6E5D4C-3B2A-4190-8F7E-6D5C4B3A2910\r\n" +
+	"X-APPLE-DEFAULT-ALARM:TRUE\r\n" +
+	"X-WR-ALARMUID:7F6E5D4C-3B2A-4190-8F7E-6D5C4B3A2910\r\n" +
+	"END:VALARM\r\n" +
+	"END:VEVENT\r\n" +
+	"END:VCALENDAR\r\n"
+
+// RFC 9074 extends every VALARM, whatever its ACTION, with UID, RELATED-TO,
+// ACKNOWLEDGED and PROXIMITY. Apple Calendar writes a UID on every alarm it
+// saves, so refusing these refuses any event with a reminder.
+func TestRFC9074_PutAcceptsAlarmExtensions(t *testing.T) {
+	tests := map[string]string{
+		"Apple Calendar alarms": appleAlarmEvent,
+		"EMAIL alarm with UID and RELATED-TO": buildCalendarObject(buildVEvent("email-alarm",
+			buildComponent("VALARM", "ACTION:EMAIL", "TRIGGER:-PT1H", "DESCRIPTION:Body", "SUMMARY:Subject",
+				"ATTENDEE:mailto:someone@example.test", "UID:email-alarm-uid",
+				"RELATED-TO:first-alarm", "RELATED-TO;RELTYPE=SNOOZE:second-alarm"))),
+		"proximity alarm": buildCalendarObject(buildVEvent("proximity-alarm",
+			buildComponent("VALARM", "UID:77D80D14-906B-4257-963F-85B1E734DBB6", "ACTION:DISPLAY",
+				"TRIGGER;VALUE=DATE-TIME:19760401T005545Z", "DESCRIPTION:Remember to buy milk",
+				"PROXIMITY:DEPART"))),
+		"VTODO alarm with UID": buildCalendarObject(buildVTodo("todo-alarm",
+			buildComponent("VALARM", "ACTION:DISPLAY", "DESCRIPTION:Due soon", "TRIGGER:-PT15M",
+				"UID:todo-alarm-uid"))),
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "alarm.ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+			}
+			if len(eventRepo.events) != 1 {
+				t.Fatalf("stored %d objects, want 1", len(eventRepo.events))
+			}
+			for _, stored := range eventRepo.events {
+				if stored.RawICAL != body {
+					t.Fatalf("stored octets = %q, want the submitted %q", stored.RawICAL, body)
+				}
+			}
+		})
+	}
+}
+
+// Section 8.5.1: inline attachments are supported. The size limit a server puts
+// on them is expressed through CALDAV:max-resource-size and nothing else, so an
+// attachment inside that limit is stored and one past it fails that precondition
+// rather than a separate attachment rule.
+func TestRFC4791_PutSupportsInlineAttachmentsBoundedByMaxResourceSize(t *testing.T) {
+	inline := func(payloadBytes int) string {
+		return buildCalendarObject(buildVEvent("attached",
+			"ATTACH;FMTTYPE=text/plain;ENCODING=BASE64;VALUE=BINARY:"+strings.Repeat("QQ==", payloadBytes/4)))
+	}
+
+	t.Run("an inline attachment inside the limit is stored", func(t *testing.T) {
+		h, eventRepo := writableCalendarServer()
+		body := inline(4096)
+
+		rr := putCalendarObject(t, h, "attach.ics", body)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("PUT with an inline attachment = %d, want 201; body: %s", rr.Code, rr.Body.String())
+		}
+		stored := eventRepo.events[eventRepo.key(1, "attached")]
+		if stored == nil || stored.RawICAL != body {
+			t.Fatalf("inline attachment was not preserved: %#v", stored)
+		}
+	})
+
+	t.Run("an inline attachment past the limit fails max-resource-size", func(t *testing.T) {
+		h, eventRepo := writableCalendarServer()
+
+		rr := putCalendarObject(t, h, "attach.ics", inline(int(maxDAVBodyBytes)+4))
+
+		assertErrorConditions(t, rr, http.StatusForbidden, calQN("max-resource-size"))
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+		}
+	})
+}
+
+// Section 5.3.3 (RFC 2445 §4.2): a non-standard property the server itself puts
+// into calendar data carries a vendor id, so it cannot collide with another
+// implementation's property of the same name. The generated birthday collection
+// is the server-authored calendar data this checks.
+func TestRFC4791_ServerAuthoredNonStandardPropertiesCarryVendorID(t *testing.T) {
+	birthday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	name := "Jane Doe"
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact": {AddressBookID: 1, UID: "contact", DisplayName: &name, Birthday: &birthday},
+	}}
+	h := &DavServer{store: &store.Store{Contacts: contactRepo}}
+
+	events, err := h.generateBirthdayEvents(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("generateBirthdayEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("generated events = %d, want 1", len(events))
+	}
+
+	root, err := parseICalendarObject(events[0].RawICAL)
+	if err != nil {
+		t.Fatalf("parse generated birthday event: %v", err)
+	}
+	walkICalNodes(root, func(node *icalNode) {
+		for _, property := range node.properties {
+			if !strings.HasPrefix(property.name, "X-") {
+				continue
+			}
+			// RFC 2445 §4.2 spells the shape as "X-" vendor id "-" name, so a
+			// vendor id means at least two hyphen-separated parts after "X-".
+			if len(strings.SplitN(strings.TrimPrefix(property.name, "X-"), "-", 2)) < 2 {
+				t.Errorf("non-standard property %q carries no vendor id", property.name)
+			}
+		}
+	})
+}
+
+// A parsed tree is read by whichever goroutine judges it: the definitions its
+// VTIMEZONEs give are read once, and safely, however many read it at once.
+func TestParsedTreeIsSafeForConcurrentReaders(t *testing.T) {
+	root, err := parseICalendarObject(outlookEasternEvent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wall := time.Date(2024, 3, 4, 9, 0, 0, 0, time.UTC)
+	var wg sync.WaitGroup
+	offsets := make([]time.Duration, 8)
+	for worker := range offsets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				observances, ok := submittedTimezoneObservances(root, "Eastern Standard Time")
+				if !ok {
+					t.Error("the object's definition was not read")
+					return
+				}
+				offsets[worker], _ = observanceOffsetAtWall(observances, wall)
+			}
+		}()
+	}
+	wg.Wait()
+	for worker, offset := range offsets {
+		if offset != -5*time.Hour {
+			t.Errorf("reader %d read offset %v, want -5h", worker, offset)
+		}
+	}
+}
+
+// calendarWithProperties is an object whose VCALENDAR carries properties
+// beside its VERSION and PRODID, holding one VEVENT whose UID is uid.
+func calendarWithProperties(uid string, properties ...string) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + testProdID + "\r\n")
+	for _, property := range properties {
+		b.WriteString(property + "\r\n")
+	}
+	b.WriteString(buildVEvent(uid))
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+// RFC 7986 §5 defines properties of a calendar as a whole, which an exported
+// or shared calendar carries on its VCALENDAR, each of NAME, DESCRIPTION,
+// CATEGORIES and IMAGE as often as it likes. Each is accepted there, and the
+// object is stored as written under the UID of its VEVENT: RFC 4791 §4.1 binds
+// the UID of a resource's components, which a calendar UID is not.
+func TestRFC7986_CalendarPropertiesAreAcceptedOnTheVCalendar(t *testing.T) {
+	tests := map[string][]string{
+		"NAME":             {"NAME:Team", "NAME;LANGUAGE=de:Mannschaft"},
+		"DESCRIPTION":      {"DESCRIPTION:Shared team calendar", "DESCRIPTION;LANGUAGE=de:Gemeinsamer Kalender"},
+		"UID":              {"UID:5FC53010-1267-4F8E-BC28-1D7AE55A7C99"},
+		"URL":              {"URL:https://example.com/calendars/team.ics"},
+		"LAST-MODIFIED":    {"LAST-MODIFIED:20240601T000000Z"},
+		"CATEGORIES":       {"CATEGORIES:WORK,TEAM", "CATEGORIES:SHARED"},
+		"REFRESH-INTERVAL": {"REFRESH-INTERVAL;VALUE=DURATION:P1W"},
+		"SOURCE":           {"SOURCE;VALUE=URI:https://example.com/calendars/team.ics"},
+		"COLOR":            {"COLOR:turquoise"},
+		"IMAGE": {"IMAGE;VALUE=URI;DISPLAY=BADGE;FMTTYPE=image/png:https://example.com/badge.png",
+			"IMAGE;VALUE=URI;DISPLAY=THUMBNAIL;FMTTYPE=image/png:https://example.com/thumbnail.png"},
+	}
+	for name, properties := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+			uid := "calendar-" + strings.ToLower(name)
+			body := calendarWithProperties(uid, properties...)
+
+			rr := putCalendarObject(t, h, uid+".ics", body)
+
+			if rr.Code != http.StatusCreated {
+				t.Fatalf("PUT with a VCALENDAR %s = %d, want 201; body: %s", name, rr.Code, rr.Body.String())
+			}
+			stored := eventRepo.events[eventRepo.key(1, uid)]
+			if stored == nil {
+				t.Fatalf("object was not stored under its VEVENT's UID %q: %#v", uid, eventRepo.events)
+			}
+			if stored.UID != uid || stored.RawICAL != body {
+				t.Fatalf("stored UID %q and octets %q, want %q and the submitted %q", stored.UID, stored.RawICAL, uid, body)
+			}
+			object, err := ValidateCalendarObject(body, nil)
+			if err != nil {
+				t.Fatalf("ValidateCalendarObject() = %v", err)
+			}
+			if object.UID != uid {
+				t.Errorf("ValidateCalendarObject() UID = %q, want the VEVENT's %q", object.UID, uid)
+			}
+		})
+	}
+}
+
+// RFC 7986 §4 lets a VCALENDAR carry at most one each of UID, URL and
+// LAST-MODIFIED, which RFC 5545 defines for components and this server reads
+// the same way wherever they appear.
+func TestRFC7986_CalendarPropertiesThatMayNotRepeatAreRefusedTwice(t *testing.T) {
+	tests := map[string][]string{
+		"UID":           {"UID:calendar-one", "UID:calendar-two"},
+		"URL":           {"URL:https://example.com/one.ics", "URL:https://example.com/two.ics"},
+		"LAST-MODIFIED": {"LAST-MODIFIED:20240601T000000Z", "LAST-MODIFIED:20240602T000000Z"},
+	}
+	for name, properties := range tests {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "repeated.ics", calendarWithProperties("repeated", properties...))
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+// A VCALENDAR's UID (RFC 7986 §5.3) names the calendar the object came from,
+// which an empty one names no more than a component's does.
+func TestRFC7986_EmptyCalendarUIDIsRefused(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+
+	rr := putCalendarObject(t, h, "empty-uid.ics", calendarWithProperties("empty-uid", "UID:"))
+
+	assertErrorConditions(t, rr, http.StatusForbidden, calQN("valid-calendar-data"))
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+	}
+}
+
+// NAME, COLOR, SOURCE, REFRESH-INTERVAL and IMAGE are names RFC 5545 does not
+// define, so a VCALENDAR carries them as written: repeated, and with whatever
+// value and parameters a client gave them. Holding them to RFC 7986 would
+// strand the stored objects that carry them, which every later write -- a PUT
+// of them back, a COPY or MOVE, an edit -- would refuse.
+func TestRFC7986_CalendarPropertiesOutsideRFC5545AreKeptAsWritten(t *testing.T) {
+	properties := []string{
+		"NAME:Team", "NAME:Team again",
+		"COLOR:red", "COLOR:blue",
+		"SOURCE:not a uri", "SOURCE;VALUE=URI:https://example.com/two.ics",
+		"REFRESH-INTERVAL:PT1H", "REFRESH-INTERVAL;VALUE=DURATION:-P1W",
+		"IMAGE:https://example.com/badge.png", "IMAGE;VALUE=BINARY:@@@",
+	}
+	raw := calendarWithProperties("kept", properties...)
+	h, eventRepo := writableCalendarServer()
+	if rr := putCalendarObject(t, h, "kept.ics", raw); rr.Code != http.StatusCreated {
+		t.Fatalf("PUT = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	if stored := eventRepo.events[eventRepo.key(1, "kept")]; stored == nil || stored.RawICAL != raw {
+		t.Fatalf("stored %#v, want the submitted octets", stored)
+	}
+	if _, fault := validateTransferredCalendarObject(raw, nil, nil); fault != nil {
+		t.Errorf("transfer refused the object: %+v", fault)
+	}
+}
+
+// A submitted VCALENDAR's LAST-MODIFIED is held to what RFC 5545 §3.8.7.3
+// makes it on a component: a UTC DATE-TIME within the dates the server
+// accepts.
+func TestRFC7986_CalendarLastModifiedIsChecked(t *testing.T) {
+	refused := map[string]struct {
+		property  string
+		condition string
+	}{
+		"no date":                  {"LAST-MODIFIED:not-a-date", "valid-calendar-data"},
+		"a DATE":                   {"LAST-MODIFIED;VALUE=DATE:20240101", "valid-calendar-data"},
+		"floating time":            {"LAST-MODIFIED:20240101T000000", "valid-calendar-data"},
+		"before the earliest date": {"LAST-MODIFIED:18000101T000000Z", "min-date-time"},
+	}
+	for name, tt := range refused {
+		t.Run(name, func(t *testing.T) {
+			h, eventRepo := writableCalendarServer()
+
+			rr := putCalendarObject(t, h, "checked.ics", calendarWithProperties("checked", tt.property))
+
+			assertErrorConditions(t, rr, http.StatusForbidden, calQN(tt.condition))
+			if len(eventRepo.events) != 0 {
+				t.Fatalf("rejected object was stored: %#v", eventRepo.events)
+			}
+		})
+	}
+}
+
+// An object the store holds may carry a VCALENDAR property PUT refuses, a
+// LAST-MODIFIED that is no date or an empty UID, and COPY or MOVE writes it
+// as it is.
+func TestRFC7986_StoredCalendarPropertiesAreTransferredAsTheyAre(t *testing.T) {
+	for _, property := range []string{"LAST-MODIFIED:not-a-date", "UID:"} {
+		t.Run(property, func(t *testing.T) {
+			raw := calendarWithProperties("stored", property)
+			if _, fault := validateCalendarObjectForStorage(raw, nil); fault == nil {
+				t.Fatal("PUT accepts the fixture, so it does not exercise a stored object")
+			}
+			validated, fault := validateTransferredCalendarObject(raw, nil, nil)
+			if fault != nil {
+				t.Fatalf("transfer refused the stored object: %+v", fault)
+			}
+			if validated.Body != raw {
+				t.Errorf("transferred body = %q, want the stored %q", validated.Body, raw)
+			}
+		})
+	}
+}
+
+// A calendar UID names the calendar an object was exported from, so every
+// object of one export carries the same one. It is no resource's UID, and two
+// resources carrying it are no UID conflict.
+func TestRFC7986_SharedCalendarUIDIsNoUIDConflict(t *testing.T) {
+	h, eventRepo := writableCalendarServer()
+	for _, uid := range []string{"first-event", "second-event"} {
+		rr := putCalendarObject(t, h, uid+".ics", calendarWithProperties(uid, "UID:exported-calendar"))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("PUT %s = %d, want 201; body: %s", uid, rr.Code, rr.Body.String())
+		}
+	}
+	for _, uid := range []string{"first-event", "second-event"} {
+		if stored := eventRepo.events[eventRepo.key(1, uid)]; stored == nil || stored.UID != uid {
+			t.Errorf("stored %s = %#v, want it under its VEVENT's UID", uid, stored)
+		}
+	}
+}

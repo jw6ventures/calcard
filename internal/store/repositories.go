@@ -7,7 +7,7 @@ import (
 
 // UserRepository defines persistence operations for users.
 type UserRepository interface {
-	UpsertOAuthUser(ctx context.Context, subject, email string) (*User, error)
+	UpsertOAuthUser(ctx context.Context, subject, email, fullName, firstName string) (*User, error)
 	GetByID(ctx context.Context, id int64) (*User, error)
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	ListActive(ctx context.Context) ([]User, error)
@@ -22,9 +22,16 @@ type CalendarRepository interface {
 	GetAccessible(ctx context.Context, calendarID, userID int64) (*CalendarAccess, error)
 	Create(ctx context.Context, cal Calendar) (*Calendar, error)
 	Update(ctx context.Context, userID, id int64, name string, description, timezone, color *string) error
-	UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error
+	UpdateProperties(ctx context.Context, id int64, props CalendarProperties) error
 	Rename(ctx context.Context, userID, id int64, name string) error
 	Delete(ctx context.Context, userID, id int64) error
+}
+
+// CalendarStateCreator is an atomic collection-creation backend for stores
+// that do not use Store's PostgreSQL transaction. Implementations recheck the
+// supplied lock conditions immediately before creating the collection.
+type CalendarStateCreator interface {
+	CreateCalendarAndState(ctx context.Context, cal Calendar, dead []DeadPropertyMutation, lockPreconditions []LockPrecondition, lockPath string, resourcePath func(calendarID int64) string) (*Calendar, error)
 }
 
 // EventRepository handles event storage.
@@ -33,21 +40,26 @@ type EventRepository interface {
 	DeleteByUID(ctx context.Context, calendarID int64, uid string) error
 	GetByUID(ctx context.Context, calendarID int64, uid string) (*Event, error)
 	GetByResourceName(ctx context.Context, calendarID int64, resourceName string) (*Event, error)
+	ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]Event, error)
 	ListForCalendar(ctx context.Context, calendarID int64) ([]Event, error)
+	ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, f EventFilter) ([]Event, error)
 	ListForCalendarFiltered(ctx context.Context, calendarID int64, f EventFilter) ([]Event, error)
 	ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*PaginatedResult[Event], error)
 	ListByUIDs(ctx context.Context, calendarID int64, uids []string) ([]Event, error)
-	ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]Event, error)
+	// ListChangesAfter reads up to limit changes of the calendar's change
+	// stream following after, from one snapshot; tombstones are read only when
+	// removals is set.
+	ListChangesAfter(ctx context.Context, calendarID int64, after SyncCursor, removals bool, limit int) (SyncChanges[Event], error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Event, error)
 	MaxLastModified(ctx context.Context, calendarID int64) (time.Time, error)
 	MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error
-	CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*Event, error)
 }
 
 // AddressBookRepository manages address books.
 type AddressBookRepository interface {
 	GetByID(ctx context.Context, id int64) (*AddressBook, error)
 	ListByUser(ctx context.Context, userID int64) ([]AddressBook, error)
+	ListAccessible(ctx context.Context, userID int64) ([]AddressBook, error)
 	Create(ctx context.Context, book AddressBook) (*AddressBook, error)
 	Update(ctx context.Context, userID, id int64, name string, description *string) error
 	UpdateProperties(ctx context.Context, id int64, name string, description *string) error
@@ -61,15 +73,20 @@ type ContactRepository interface {
 	DeleteByUID(ctx context.Context, addressBookID int64, uid string) error
 	GetByUID(ctx context.Context, addressBookID int64, uid string) (*Contact, error)
 	ListForBook(ctx context.Context, addressBookID int64) ([]Contact, error)
+	ListForBookPageAfter(ctx context.Context, addressBookID, afterID int64, limit int) ([]Contact, error)
 	ListForBookFiltered(ctx context.Context, addressBookID int64, f ContactFilter) ([]Contact, error)
 	ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*PaginatedResult[Contact], error)
 	ListByUIDs(ctx context.Context, addressBookID int64, uids []string) ([]Contact, error)
-	ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]Contact, error)
+	// ListChangesAfter reads up to limit changes of the address book's change
+	// stream following after, from one snapshot; tombstones are read only when
+	// removals is set.
+	ListChangesAfter(ctx context.Context, addressBookID int64, after SyncCursor, removals bool, limit int) (SyncChanges[Contact], error)
 	ListRecentByUser(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MaxLastModified(ctx context.Context, addressBookID int64) (time.Time, error)
-	ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]Contact, error)
+	ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]Contact, error)
 	MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error
 	GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*Contact, error)
+	ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]Contact, error)
 	CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*Contact, error)
 }
 
@@ -82,11 +99,19 @@ type AppPasswordRepository interface {
 	Revoke(ctx context.Context, id int64) error
 	DeleteRevoked(ctx context.Context, id int64) error
 	TouchLastUsed(ctx context.Context, id int64) error
+	// ReplaceDigestCredentials swaps one app password's sealed HA1 columns in
+	// a single compare-and-swap: it writes newMD5/newSHA256 (nil clears) only
+	// while the row still holds oldMD5/oldSHA256, and reports whether it did.
+	// A caller acting on a stale read therefore loses instead of overwriting.
+	ReplaceDigestCredentials(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error)
+	// PurgeDigestCredentials returns every app password's HA1 columns to NULL
+	// and reports how many rows it changed. It never touches the token hash,
+	// so no credential loses Basic access.
+	PurgeDigestCredentials(ctx context.Context) (int64, error)
 }
 
 // DeletedResourceRepository handles tombstone tracking for sync.
 type DeletedResourceRepository interface {
-	ListDeletedSince(ctx context.Context, resourceType string, collectionID int64, since time.Time) ([]DeletedResource, error)
 	DeleteByIdentity(ctx context.Context, resourceType string, collectionID int64, uid, resourceName string) error
 	Cleanup(ctx context.Context, olderThan time.Duration) (int64, error)
 }
@@ -116,13 +141,51 @@ type LockRepository interface {
 	Refresh(ctx context.Context, token string, newTimeout int, newExpiry time.Time) (*Lock, error)
 }
 
+// DigestNonceRepository records the HTTP Digest nonce counts that have already
+// been spent. The state is shared rather than per-process because a nonce this
+// server issues verifies at every instance holding the configured session
+// secret, and across a restart.
+type DigestNonceRepository interface {
+	// Consume claims one (nonce, count) pair for a token, reporting whether the
+	// claim was the first. A false result is a replay.
+	Consume(ctx context.Context, tokenID int64, nonce string, nonceCount uint32, expiresAt time.Time) (bool, error)
+	DeleteExpired(ctx context.Context) (int64, error)
+}
+
 // ACLRepository handles WebDAV access control entries.
 type ACLRepository interface {
 	SetACL(ctx context.Context, resourcePath string, entries []ACLEntry) error
+	// UpdateACL replaces the resource's ACL with mutate's result. The ACL is
+	// locked before it is read, so a caller that derives the new ACL from the old
+	// one cannot lose a concurrent writer's entries. mutate runs inside the
+	// transaction and must not block or touch the store.
+	UpdateACL(ctx context.Context, resourcePath string, mutate func([]ACLEntry) ([]ACLEntry, error)) error
+	// RevokePrincipalGrants removes, in one transaction, the principal's grants of
+	// collectionPrivileges on collectionPath plus every grant the principal holds
+	// on resources beneath it. The collection's other grants are the owner's to
+	// manage through the ACL method on that collection. A member grant records
+	// no origin, so one a share left behind cannot be told from one the owner
+	// set through the ACL method on that resource, and both are taken: a revoked
+	// principal keeps no access anywhere in the collection, even where the owner
+	// had granted it separately. Deny entries are never removed: revoking access
+	// must not widen it. When the principal is left without access to the
+	// collection, the locks they hold on it and beneath it are deleted in the same
+	// transaction, since they could only keep the owner from writing; the
+	// collection's owner, and a principal another entry still admits, keep theirs.
+	// No lock refuses the revocation.
+	RevokePrincipalGrants(ctx context.Context, collectionPath, principalHref string, collectionPrivileges []string) error
 	ListByResource(ctx context.Context, resourcePath string) ([]ACLEntry, error)
+	ListByResources(ctx context.Context, resourcePaths []string) ([]ACLEntry, error)
+	ListByResourcesAndPrincipals(ctx context.Context, resourcePaths, principalHrefs []string) ([]ACLEntry, error)
 	ListByPrincipal(ctx context.Context, principalHref string) ([]ACLEntry, error)
-	HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error)
-	DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error
+	ListByPrincipals(ctx context.Context, principalHrefs []string) ([]ACLEntry, error)
 	MoveResourcePath(ctx context.Context, fromPath, toPath string) error
 	Delete(ctx context.Context, resourcePath string) error
+}
+
+// DeadPropertyRepository persists WebDAV properties that are not computed by
+// the server.
+type DeadPropertyRepository interface {
+	ListByResources(ctx context.Context, resourcePaths []string) ([]DeadProperty, error)
+	Apply(ctx context.Context, resourcePath string, mutations []DeadPropertyMutation) error
 }

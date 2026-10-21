@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -371,11 +370,7 @@ func parseBookIDAndUID(w http.ResponseWriter, r *http.Request) (int64, string, b
 	if !ok {
 		return 0, "", false
 	}
-	rawUID := chi.URLParam(r, "uid")
-	uid, err := url.PathUnescape(rawUID)
-	if err != nil || uid == "" {
-		uid = rawUID
-	}
+	uid := routeUID(r)
 	if uid == "" {
 		http.Error(w, "invalid contact uid", http.StatusBadRequest)
 		return 0, "", false

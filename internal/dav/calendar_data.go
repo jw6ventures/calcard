@@ -1,6 +1,74 @@
 package dav
 
-import "strings"
+import (
+	"errors"
+	"strings"
+
+	"github.com/jw6ventures/calcard/internal/ical"
+)
+
+// supportedCalendarDataRequest reports whether a CALDAV:calendar-data in a
+// calendaring REPORT names a media type the server can return. RFC 4791 §7.8
+// and §7.9 make an unsupported content-type or version a
+// CALDAV:supported-calendar-data failure, and §9.6 defaults both attributes to
+// the single pair CALDAV:supported-calendar-data advertises. Distinct from the
+// §5.3.2.1 precondition of the same name, which governs stored data.
+func supportedCalendarDataRequest(calData *calendarDataEl) bool {
+	if calData == nil {
+		return true
+	}
+	if calData.ContentType != nil && !strings.EqualFold(*calData.ContentType, "text/calendar") {
+		return false
+	}
+	if calData.Version == nil {
+		return true
+	}
+	for _, supported := range calendarDataVersions {
+		if *calData.Version == supported {
+			return true
+		}
+	}
+	return false
+}
+
+// calendarDataProjection is what a REPORT response needs to render
+// CALDAV:calendar-data: the §9.6 selection, and the zone RFC 4791 §7.3 makes
+// its recurrence arithmetic resolve floating values against. PROPFIND has
+// neither and passes the zero value, which projects nothing.
+type calendarDataProjection struct {
+	selection *calendarDataEl
+	zone      floatingZone
+	// index is the selection resolved by name. One report applies one selection
+	// to every resource it matches, so building it per resource would multiply
+	// the request body against the collection.
+	index *calendarCompIndex
+	// pool, when set, is the request-wide budget the projection's reparse of
+	// each resource draws on besides its own per-evaluation cap.
+	pool *ical.RequestWork
+}
+
+// newCalendarDataProjection resolves the §9.6 selection by name once, for the
+// whole report.
+func newCalendarDataProjection(selection *calendarDataEl, zone floatingZone) calendarDataProjection {
+	projection := calendarDataProjection{selection: selection, zone: zone}
+	if selection != nil && selection.Comp != nil {
+		projection.index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
+	}
+	return projection
+}
+
+// withPool returns the projection sharing every other field, with pool as the
+// request-wide budget its reparse of each resource draws on.
+func (p calendarDataProjection) withPool(pool *ical.RequestWork) calendarDataProjection {
+	p.pool = pool
+	return p
+}
+
+// requested reports whether the response carries CALDAV:calendar-data at all,
+// which is a different question from whether the selection narrows it.
+func (p calendarDataProjection) requested() bool {
+	return p.selection != nil
+}
 
 func reportCalendarData(report reportRequest) *calendarDataEl {
 	if report.Prop != nil && report.Prop.CalendarData != nil {
@@ -12,184 +80,205 @@ func reportCalendarData(report reportRequest) *calendarDataEl {
 	return nil
 }
 
-func filterICalendarData(raw string, calData *calendarDataEl) string {
-	if calData == nil {
-		return raw
+// filterICalendarData applies the RFC 4791 §9.6 selection to one stored
+// calendar object resource.
+//
+// A selection that narrows nothing returns the stored octets untouched: §9.6
+// returns the resource in its entirety when the request names no CALDAV:comp,
+// and a report that only names CALDAV:calendar-data owes the client exactly
+// what was PUT. The object is read as parseStoredICalendarObject reads it, the
+// same reading calendar-query matched it by, and one holding no VCALENDAR is
+// likewise returned as it stands, since a projection cannot be derived from a
+// tree that was never built.
+//
+// A recurrence transform the request's work cannot afford is an error rather
+// than a projection read through zones the work could not follow: the resource
+// is answered with a 500 of its own inside the multistatus.
+func filterICalendarData(raw string, projection calendarDataProjection) (string, error) {
+	selection := projection.selection
+	if selection == nil || selection.empty() {
+		return raw, nil
 	}
-	if len(calData.Comp) == 0 && len(calData.Prop) == 0 {
-		return raw
+	transforms := selection.Expand != nil || selection.LimitRecurrenceSet != nil
+	if transforms && projection.pool.Exhausted() {
+		return "", errRecurrenceWorkSpent
 	}
-	allowAllComponents := len(calData.Comp) == 0 && len(calData.Prop) > 0
-	globalProps := calData.Prop
-	calData = normalizeCalendarData(calData)
+	root, err := parseStoredICalendarObject(raw)
+	if err != nil {
+		return raw, nil
+	}
+	index := projection.index
+	if index == nil && selection.Comp != nil {
+		// A projection built without newCalendarDataProjection still projects
+		// correctly, at the per-resource cost the index exists to avoid.
+		index = newCalendarCompIndex(calendarDataRootSelection(selection.Comp))
+	}
+	projected, err := projectCalendarData(root, raw, selection, index, projection.zone, projection.pool)
+	if err != nil {
+		return "", err
+	}
+	if transforms && projection.pool.Exhausted() {
+		return "", errRecurrenceWorkSpent
+	}
+	return writeICalendarObject(projected), nil
+}
 
-	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
-	normalized = strings.ReplaceAll(normalized, "\r", "\n")
-	lines := strings.Split(normalized, "\n")
+// errRecurrenceWorkSpent is why a resource's recurrence transform was refused:
+// the request's recurrence and observance work ran out.
+var errRecurrenceWorkSpent = errors.New("the request's recurrence work is spent")
 
-	var out []string
-	var compStack []string
-	var allowStack []*calendarComp
-	var keepStack []bool
-	var lastIncluded bool
+// projectCalendarData applies the recurrence transform, then the free-busy
+// trim, then the component and property selection. That is not the order the
+// §9.6 content model lists the elements in: the first two rewrite the
+// recurrence set and the third decides what of it is returned, so selection has
+// to run last or it would judge components the transforms have not produced yet.
+//
+// Every transform reads dates through one matcher, built over the resource as
+// it was stored. A transform hands the next one the tree it produced, which is
+// not the document any more -- expansion removes the VTIMEZONE a later value
+// may still name -- so the zone lookups have to keep answering from the parse.
+func projectCalendarData(root *icalNode, raw string, selection *calendarDataEl, index *calendarCompIndex, zone floatingZone, pool *ical.RequestWork) (*icalNode, error) {
+	m := newCalendarTimeRangeMatcher(raw, root, zone).withPool(pool)
+	source := root
+	switch {
+	case selection.Expand != nil:
+		source = expandCalendarData(m, source, *selection.Expand)
+	case selection.LimitRecurrenceSet != nil:
+		source = limitCalendarRecurrenceSet(m, source, *selection.LimitRecurrenceSet)
+	}
+	if selection.LimitFreeBusySet != nil {
+		source = limitCalendarFreeBusySet(m, source, *selection.LimitFreeBusySet)
+	}
+	if *m.expansionError != nil {
+		return nil, *m.expansionError
+	}
+	if selection.Comp == nil {
+		return source, nil
+	}
+	// §9.6.5 requires an expanded instance to carry the RECURRENCE-ID naming it,
+	// unconditionally. §9.6's permission to return data that is invalid per its
+	// media type covers properties the *media type* requires and the request did
+	// not select, which is a different set: the identifier only exists because
+	// the server expanded, so a client cannot be said to have declined it.
+	var mandatory icalNameSet
+	if selection.Expand != nil {
+		mandatory = recurrenceIDName
+	}
+	projected := selectComponent(source, index, mandatory)
+	if projected == nil {
+		return nil, nil
+	}
+	return projected, nil
+}
 
-	for _, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		upper := strings.ToUpper(line)
-		if strings.HasPrefix(upper, "BEGIN:") {
-			name := strings.ToUpper(strings.TrimSpace(line[len("BEGIN:"):]))
-			parentKeep := len(keepStack) == 0 || keepStack[len(keepStack)-1]
-			var match *calendarComp
-			if parentKeep {
-				if len(allowStack) == 0 || allowStack[len(allowStack)-1] == nil {
-					if allowAllComponents {
-						match = &calendarComp{Name: name, Prop: globalProps}
-					} else {
-						for i := range calData.Comp {
-							if strings.EqualFold(calData.Comp[i].Name, name) {
-								match = &calData.Comp[i]
-								break
-							}
-						}
-					}
-				} else {
-					parent := allowStack[len(allowStack)-1]
-					if len(parent.Comp) == 0 {
-						if allowAllComponents {
-							match = &calendarComp{Name: name, Prop: globalProps}
-						} else {
-							match = &calendarComp{Name: name}
-						}
-					} else {
-						for i := range parent.Comp {
-							if strings.EqualFold(parent.Comp[i].Name, name) {
-								match = &parent.Comp[i]
-								break
-							}
-						}
-					}
-				}
+// calendarDataRootSelection scopes the request's CALDAV:comp to the VCALENDAR
+// root. §9.6.1 nests the selection under a comp naming VCALENDAR, but a client
+// naming an inner component alone is asking for that component out of a
+// resource that is still one iCalendar object, so the selection is read as
+// nested under an implicit VCALENDAR rather than as a root that matches nothing.
+func calendarDataRootSelection(comp *calendarComp) *calendarComp {
+	if strings.EqualFold(comp.Name, "VCALENDAR") {
+		return comp
+	}
+	return &calendarComp{Name: "VCALENDAR", Comp: []calendarComp{*comp}}
+}
+
+// calendarCompIndex is one CALDAV:comp of the §9.6.1 selection with its
+// children resolved by name. The selection is matched against every property of
+// every component of every resource a report returns, so scanning it costs the
+// request body multiplied by the collection -- the CPU exhaustion RFC 4791 §11
+// asks a server to guard against. iCalendar names are case-insensitive, so the
+// keys are upper-cased.
+type calendarCompIndex struct {
+	name    string
+	allProp bool
+	allComp bool
+	// props and comps are nil under allProp and allComp respectively, where the
+	// selection names no child to resolve.
+	props map[string]calendarProp
+	comps map[string]*calendarCompIndex
+}
+
+// newCalendarCompIndex resolves sel and everything below it. A name repeated
+// among siblings keeps its first occurrence, which is the element a scan in
+// document order would have stopped at.
+func newCalendarCompIndex(sel *calendarComp) *calendarCompIndex {
+	index := &calendarCompIndex{
+		name:    sel.Name,
+		allProp: sel.AllProp,
+		allComp: sel.AllComp,
+	}
+	if !sel.AllProp && len(sel.Prop) > 0 {
+		index.props = make(map[string]calendarProp, len(sel.Prop))
+		for _, prop := range sel.Prop {
+			key := strings.ToUpper(prop.Name)
+			if _, seen := index.props[key]; !seen {
+				index.props[key] = prop
 			}
-			keep := parentKeep && match != nil
-			compStack = append(compStack, name)
-			allowStack = append(allowStack, match)
-			keepStack = append(keepStack, keep)
-			if keep {
-				out = append(out, line)
-			}
-			lastIncluded = false
-			continue
 		}
+	}
+	if !sel.AllComp && len(sel.Comp) > 0 {
+		index.comps = make(map[string]*calendarCompIndex, len(sel.Comp))
+		for i := range sel.Comp {
+			key := strings.ToUpper(sel.Comp[i].Name)
+			if _, seen := index.comps[key]; !seen {
+				index.comps[key] = newCalendarCompIndex(&sel.Comp[i])
+			}
+		}
+	}
+	return index
+}
 
-		if strings.HasPrefix(upper, "END:") {
-			if len(compStack) == 0 {
+// selectComponent returns the copy of node that sel admits: the properties
+// under (allprop | prop*) and the sub-components under (allcomp | comp*), per
+// RFC 4791 §9.6.1. A bare CALDAV:comp names neither, and matching zero of each
+// is what its content model says, so it returns the component alone. Properties
+// named in mandatory survive whatever the selection said. nil means sel names
+// no component matching node.
+func selectComponent(node *icalNode, sel *calendarCompIndex, mandatory icalNameSet) *icalNode {
+	if !strings.EqualFold(sel.name, node.name) {
+		return nil
+	}
+	projected := &icalNode{name: node.name}
+	if sel.allProp {
+		projected.properties = append(projected.properties, node.properties...)
+	} else {
+		for _, property := range node.properties {
+			if mandatory.contains(property.name) {
+				projected.properties = append(projected.properties, property)
 				continue
 			}
-			if keepStack[len(keepStack)-1] {
-				out = append(out, line)
+			if selected, ok := selectProperty(property, sel.props); ok {
+				projected.properties = append(projected.properties, selected)
 			}
-			compStack = compStack[:len(compStack)-1]
-			allowStack = allowStack[:len(allowStack)-1]
-			keepStack = keepStack[:len(keepStack)-1]
-			lastIncluded = false
-			continue
-		}
-
-		if len(compStack) == 0 {
-			lastIncluded = false
-			continue
-		}
-
-		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
-			if keepStack[len(keepStack)-1] && lastIncluded {
-				out = append(out, line)
-			}
-			continue
-		}
-
-		if !keepStack[len(keepStack)-1] {
-			lastIncluded = false
-			continue
-		}
-
-		allowed := true
-		current := allowStack[len(allowStack)-1]
-		if current != nil && len(current.Prop) > 0 {
-			allowed = false
-			propName := strings.ToUpper(line)
-			if idx := strings.IndexAny(propName, ":;"); idx != -1 {
-				propName = propName[:idx]
-			}
-			for i := range current.Prop {
-				if strings.EqualFold(current.Prop[i].Name, propName) {
-					allowed = true
-					break
-				}
-			}
-		}
-
-		if allowed {
-			out = append(out, line)
-			lastIncluded = true
-		} else {
-			lastIncluded = false
 		}
 	}
-
-	if len(out) == 0 {
-		return ""
+	if sel.allComp {
+		projected.children = append(projected.children, node.children...)
+		return projected
 	}
-	filtered := strings.Join(out, "\r\n") + "\r\n"
-	if strings.Contains(strings.ToUpper(filtered), "BEGIN:VCALENDAR") {
-		return filtered
+	for _, child := range node.children {
+		selectedChild, ok := sel.comps[strings.ToUpper(child.name)]
+		if !ok {
+			continue
+		}
+		if projectedChild := selectComponent(child, selectedChild, mandatory); projectedChild != nil {
+			projected.children = append(projected.children, projectedChild)
+		}
 	}
-	header := extractVCalendarHeader(lines)
-	trimmed := strings.TrimSuffix(filtered, "\r\n")
-	filterLines := strings.Split(trimmed, "\r\n")
-	var wrapped []string
-	wrapped = append(wrapped, "BEGIN:VCALENDAR")
-	wrapped = append(wrapped, header...)
-	wrapped = append(wrapped, filterLines...)
-	wrapped = append(wrapped, "END:VCALENDAR")
-	return strings.Join(wrapped, "\r\n") + "\r\n"
+	return projected
 }
 
-func normalizeCalendarData(calData *calendarDataEl) *calendarDataEl {
-	hasVCalendar := false
-	for i := range calData.Comp {
-		if strings.EqualFold(calData.Comp[i].Name, "VCALENDAR") {
-			hasVCalendar = true
-			break
-		}
+// selectProperty matches one content line against the CALDAV:prop selection,
+// keeping every occurrence of a named property rather than the first: two
+// ATTENDEEs are two content lines and §9.6.4 names neither of them individually.
+func selectProperty(property icalProperty, selected map[string]calendarProp) (icalProperty, bool) {
+	want, ok := selected[strings.ToUpper(property.name)]
+	if !ok {
+		return icalProperty{}, false
 	}
-	if hasVCalendar {
-		return calData
+	if want.NoValue {
+		property.value = ""
 	}
-	wrapped := calendarComp{Name: "VCALENDAR", Comp: calData.Comp, Prop: calData.Prop}
-	return &calendarDataEl{Comp: []calendarComp{wrapped}}
-}
-
-func extractVCalendarHeader(lines []string) []string {
-	var header []string
-	inCalendar := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !inCalendar {
-			if strings.EqualFold(trimmed, "BEGIN:VCALENDAR") {
-				inCalendar = true
-			}
-			continue
-		}
-		if strings.HasPrefix(strings.ToUpper(trimmed), "END:VCALENDAR") {
-			break
-		}
-		if strings.HasPrefix(strings.ToUpper(trimmed), "BEGIN:") {
-			break
-		}
-		if trimmed == "" {
-			continue
-		}
-		header = append(header, line)
-	}
-	return header
+	return property, true
 }

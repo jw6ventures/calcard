@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 	"golang.org/x/text/cases"
 )
@@ -63,43 +64,6 @@ type vcardProperty struct {
 	Raw    string
 }
 
-func parseAddressBookReportPath(cleanPath string) (bookID int64, resourceUID string, isResource bool, err error) {
-	trimmed := strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks"), "/")
-	if trimmed == "" {
-		return 0, "", false, errInvalidPath
-	}
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return 0, "", false, errInvalidPath
-	}
-	bookID, err = parseCollectionID(parts[0])
-	if err != nil {
-		return 0, "", false, err
-	}
-	if len(parts) == 1 {
-		return bookID, "", false, nil
-	}
-	if len(parts) == 2 && parts[1] != "" {
-		return bookID, strings.TrimSuffix(parts[1], pathExt(parts[1])), true, nil
-	}
-	return 0, "", false, errInvalidPath
-}
-
-func parseCollectionID(raw string) (int64, error) {
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%w: invalid address book id", errInvalidPath)
-	}
-	return id, nil
-}
-
-func pathExt(raw string) string {
-	if idx := strings.LastIndexByte(raw, '.'); idx >= 0 {
-		return raw[idx:]
-	}
-	return ""
-}
-
 func validateAddressDataRequest(query *addressDataQuery) error {
 	if query == nil {
 		return nil
@@ -116,7 +80,7 @@ func validateAddressDataRequest(query *addressDataQuery) error {
 }
 
 func extractVCardVersion(raw string) (string, error) {
-	lines := unfoldICalLines(raw)
+	lines := ical.UnfoldLines(raw)
 	version := ""
 	versionCount := 0
 	for _, line := range lines {
@@ -144,38 +108,36 @@ func extractVCardVersion(raw string) (string, error) {
 	}
 }
 
-func canServeRequestedAddressData(raw string, query *addressDataQuery) bool {
-	if query == nil || strings.TrimSpace(query.Version) == "" {
-		return true
+// addressDataForQuery returns the vCard data a CARDDAV:address-data request
+// should receive, converting the stored copy when the client asked for the
+// other advertised version. It reports false for the
+// CARDDAV:supported-address-data-conversion precondition.
+func addressDataForQuery(raw string, query *addressDataQuery) (string, bool) {
+	if query == nil {
+		return raw, true
 	}
-	version, err := extractVCardVersion(raw)
-	if err != nil {
-		return false
-	}
-	return version == strings.TrimSpace(query.Version)
+	return addressDataForVersion(raw, query.Version)
 }
 
-func acceptsVCardData(rawVCard, acceptHeader string) bool {
+// vcardDataForAccept negotiates the vCard version named by an Accept header,
+// converting the stored copy when the client asked for the other advertised
+// version. It reports false when nothing the client accepts can be produced.
+func vcardDataForAccept(rawVCard, acceptHeader string) (string, bool) {
 	acceptHeader = strings.TrimSpace(acceptHeader)
 	if acceptHeader == "" {
-		return true
+		return rawVCard, true
 	}
 
-	rawVersion, err := extractVCardVersion(rawVCard)
-	if err != nil {
-		return false
-	}
-
+	var requestedVersions []string
 	for _, rawRange := range strings.Split(acceptHeader, ",") {
 		parts := strings.Split(rawRange, ";")
-		mediaType := strings.ToLower(strings.TrimSpace(parts[0]))
-		quality := 1.0
-		switch mediaType {
+		switch strings.ToLower(strings.TrimSpace(parts[0])) {
 		case "*/*", "text/*", "text/vcard":
 		default:
 			continue
 		}
 
+		quality := 1.0
 		requestedVersion := ""
 		for _, part := range parts[1:] {
 			param := strings.SplitN(strings.TrimSpace(part), "=", 2)
@@ -198,12 +160,25 @@ func acceptsVCardData(rawVCard, acceptHeader string) bool {
 		if quality <= 0 {
 			continue
 		}
-		if requestedVersion == "" || requestedVersion == rawVersion {
-			return true
+		if requestedVersion == "" {
+			return rawVCard, true
 		}
+		requestedVersions = append(requestedVersions, requestedVersion)
 	}
 
-	return false
+	if storedVersion, err := extractVCardVersion(rawVCard); err == nil {
+		for _, version := range requestedVersions {
+			if version == storedVersion {
+				return rawVCard, true
+			}
+		}
+	}
+	for _, version := range requestedVersions {
+		if converted, ok := convertVCardVersion(rawVCard, version); ok {
+			return converted, true
+		}
+	}
+	return "", false
 }
 
 func validateCardFilter(filter *cardFilter) error {
@@ -253,89 +228,8 @@ var supportedCardDAVFilterParams = map[string]struct{}{
 	"TZ":        {},
 }
 
-func parseExpandPropertyRequest(body []byte) (*expandPropertyRequest, error) {
-	if len(body) == 0 {
-		return nil, nil
-	}
-	var req expandPropertyRequest
-	if err := safeUnmarshalXML(body, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
-}
-
-type expandPropertySelection struct {
-	CurrentUserPrincipal *propfindRequest
-	PrincipalURL         *propfindRequest
-}
-
-func expandPropertySelections(req *expandPropertyRequest) expandPropertySelection {
-	var selection expandPropertySelection
-	if req == nil {
-		return selection
-	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		selection.CurrentUserPrincipal = &propfindRequest{Prop: req.Prop.CurrentUserPrincipal.Prop}
-	}
-	if req.Prop.PrincipalURL != nil {
-		selection.PrincipalURL = &propfindRequest{Prop: req.Prop.PrincipalURL.Prop}
-	}
-	for _, property := range req.Property {
-		propReq := &propfindRequest{Prop: propfindQueryFromExpandProperties(property.Property)}
-		switch {
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal":
-			selection.CurrentUserPrincipal = propReq
-		case property.Namespace == "DAV:" && property.Name == "principal-URL":
-			selection.PrincipalURL = propReq
-		}
-	}
-	return selection
-}
-
-func propfindQueryFromExpandProperties(properties []expandPropertyElement) *propfindPropQuery {
-	if len(properties) == 0 {
-		return nil
-	}
-	query := &propfindPropQuery{}
-	for _, property := range properties {
-		switch {
-		case property.Namespace == "DAV:" && property.Name == "displayname":
-			query.DisplayName = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "resourcetype":
-			query.ResourceType = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal":
-			query.CurrentUserPrincipal = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-principal-URL":
-			query.CurrentUserPrincipalURL = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "principal-URL":
-			query.PrincipalURL = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supported-report-set":
-			query.SupportedReportSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "lockdiscovery":
-			query.LockDiscovery = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supportedlock":
-			query.SupportedLock = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "acl":
-			query.ACLProp = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "supported-privilege-set":
-			query.SupportedPrivilegeSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "principal-collection-set":
-			query.PrincipalCollectionSet = &struct{}{}
-		case property.Namespace == "DAV:" && property.Name == "current-user-privilege-set":
-			query.CurrentUserPrivilegeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:caldav" && property.Name == "calendar-home-set":
-			query.CalendarHomeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:carddav" && property.Name == "addressbook-home-set":
-			query.AddressbookHomeSet = &struct{}{}
-		case property.Namespace == "urn:ietf:params:xml:ns:carddav" && property.Name == "principal-address":
-			query.PrincipalAddress = &struct{}{}
-		}
-	}
-	return query
-}
-
 func parseVCardProperties(raw string) []vcardProperty {
-	lines := unfoldICalLines(raw)
+	lines := ical.UnfoldLines(raw)
 	props := make([]vcardProperty, 0, len(lines))
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -399,11 +293,9 @@ func vcardNameMatches(fullName, requested string) bool {
 	if fullName == requested {
 		return true
 	}
-	// If the requested name is grouped (contains a dot), only exact match.
 	if strings.ContainsRune(requested, '.') {
 		return false
 	}
-	// Ungrouped request: also match if the base name (after dot) equals it.
 	return vcardPropertyBaseName(fullName) == requested
 }
 
@@ -424,7 +316,7 @@ func filterVCardData(raw string, query *addressDataQuery) string {
 		})
 	}
 
-	lines := unfoldICalLines(raw)
+	lines := ical.UnfoldLines(raw)
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -475,9 +367,29 @@ func filterVCardData(raw string, query *addressDataQuery) string {
 func collationFold(s, collation string) string {
 	switch strings.ToLower(strings.TrimSpace(collation)) {
 	case "i;ascii-casemap":
-		return strings.ToUpper(s)
+		return asciiCasemapFold(s)
 	default:
 		return cases.Fold().String(s)
+	}
+}
+
+// prepareCardFilter folds search text once for the request, including parameter
+// matches. The decoded filter belongs exclusively to this request.
+func prepareCardFilter(filter *cardFilter) {
+	if filter == nil {
+		return
+	}
+	prepare := func(match *textMatch) {
+		if match != nil {
+			folded := collationFold(strings.TrimSpace(match.Text), match.Collation)
+			match.foldedText = &folded
+		}
+	}
+	for _, prop := range filter.PropFilter {
+		prepare(prop.TextMatch)
+		for _, param := range prop.ParamFilter {
+			prepare(param.TextMatch)
+		}
 	}
 }
 
@@ -490,7 +402,12 @@ func matchTextValue(value string, textMatch *textMatch) bool {
 		collation = textMatch.Collation
 	}
 	candidate := collationFold(value, collation)
-	needle := collationFold(strings.TrimSpace(textMatch.Text), collation)
+	var needle string
+	if textMatch.foldedText != nil {
+		needle = *textMatch.foldedText
+	} else {
+		needle = collationFold(strings.TrimSpace(textMatch.Text), collation)
+	}
 	matchType := strings.ToLower(strings.TrimSpace(textMatch.MatchType))
 	matches := false
 	switch matchType {
@@ -612,10 +529,6 @@ func reportAddressData(report reportRequest) *addressDataQuery {
 	return report.AddressData
 }
 
-func hasAddressObjectRequestedProps(req *reportProp, topLevelAddressData *addressDataQuery) bool {
-	return topLevelAddressData != nil || (req != nil && (req.GetETag != nil || req.GetContentType != nil || req.AddressData != nil || req.DisplayName != nil || req.SupportedReport != nil))
-}
-
 func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDataQuery) *addressDataQuery {
 	if req != nil && req.AddressData != nil {
 		return req.AddressData
@@ -623,510 +536,36 @@ func effectiveAddressDataRequest(req *reportProp, topLevelAddressData *addressDa
 	return topLevelAddressData
 }
 
-func buildAddressObjectReportResponse(href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) response {
+func (h *DavServer) buildAddressObjectReportResponse(href string, contact store.Contact, req *reportProp, topLevelAddressData *addressDataQuery) (response, error) {
 	addressDataReq := effectiveAddressDataRequest(req, topLevelAddressData)
-	if addressDataReq != nil && !canServeRequestedAddressData(contact.RawVCard, addressDataReq) {
+	rawData, ok := addressDataForQuery(contact.RawVCard, addressDataReq)
+	if !ok {
 		return response{
 			Href:   href,
 			Status: httpStatusNotAcceptable,
 			Error:  &responseError{SupportedAddressDataConversion: &struct{}{}},
-		}
-	}
-
-	if !hasAddressObjectRequestedProps(req, topLevelAddressData) {
-		return resourceResponse(href, etagProp(contact.ETag, contact.RawVCard, false))
-	}
-	if req == nil {
-		return resourceResponse(href, etagProp(contact.ETag, filterVCardData(contact.RawVCard, addressDataReq), false))
-	}
-
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-
-	if req.GetETag != nil {
-		okProp.GetETag = `"` + contact.ETag + `"`
-		okSet = true
-	}
-	if req.GetContentType != nil {
-		okProp.GetContentType = "text/vcard; charset=utf-8"
-		okSet = true
+		}, nil
 	}
 	if addressDataReq != nil {
-		okProp.AddressData = cdataString(filterVCardData(contact.RawVCard, addressDataReq))
-		okSet = true
+		rawData = filterVCardData(rawData, addressDataReq)
 	}
-	if req.SupportedReport != nil {
-		okProp.SupportedReportSet = addressbookSupportedReports()
-		okSet = true
+	propertyStatus := etagProp(contact.ETag, rawData, false)
+	if req != nil && req.SupportedReportSet != nil {
+		propertyStatus.Prop.SupportedReportSet = addressbookSupportedReports()
 	}
-	if req.DisplayName != nil {
-		notFoundProp.DisplayName = "displayname"
-		notFoundSet = true
-	}
-
-	resp := response{Href: href}
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	return resp
-}
-
-func buildAddressObjectExpandPropertyResponse(href string, contact store.Contact, req *expandPropertyRequest) response {
-	resp := resourceResponse(href, addressBookResourcePropstat(contact.ETag, contact.RawVCard, true))
-	if req == nil {
-		return resp
-	}
-
-	var notFoundProp prop
-	var notFoundSet bool
-	if req.Prop.CurrentUserPrincipal != nil {
-		notFoundProp.CurrentUserPrincipal = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		notFoundProp.PrincipalURL = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	return resp
-}
-
-func propstatForAddressObjectPropfind(req *propfindPropQuery, src prop) []propstat {
-	if req == nil {
-		return []propstat{{Prop: src, Status: httpStatusOK}}
-	}
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-
-	if req.GetETag != nil {
-		okProp.GetETag = src.GetETag
-		okSet = true
-	}
-	if req.GetContentType != nil {
-		okProp.GetContentType = src.GetContentType
-		okSet = true
-	}
-	if req.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
-	}
-	if req.AddressData != nil {
-		okProp.AddressData = cdataString(filterVCardData(string(src.AddressData), req.AddressData))
-		okSet = true
-	}
-	if req.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
-	}
-	if req.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
-	if req.DisplayName != nil {
-		notFoundProp.DisplayName = "displayname"
-		notFoundSet = true
-	}
-
-	var stats []propstat
-	if okSet {
-		stats = append(stats, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		stats = append(stats, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	if len(stats) == 0 {
-		stats = append(stats, propstat{Prop: prop{}, Status: httpStatusOK})
-	}
-	return stats
-}
-
-func filterAddressObjectPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
-		return resp
-	}
-	src := resp.Propstat[0].Prop
-	if req.Prop.AddressData != nil && !canServeRequestedAddressData(string(src.AddressData), req.Prop.AddressData) {
-		resp.Propstat = nil
-		resp.Status = httpStatusNotAcceptable
-		resp.Error = &responseError{SupportedAddressDataConversion: &struct{}{}}
-		return resp
-	}
-	resp.Status = ""
-	resp.Error = nil
-	resp.Propstat = propstatForAddressObjectPropfind(req.Prop, src)
-	return resp
-}
-
-func filterPrincipalPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil {
-		return resp
-	}
-	src := resp.Propstat[0].Prop
-	var okProp prop
-	var okSet bool
-	var notFound prop
-	var notFoundSet bool
-
-	if req.Prop.DisplayName != nil {
-		okProp.DisplayName = src.DisplayName
-		okSet = true
-	}
-	if req.Prop.ResourceType != nil {
-		okProp.ResourceType = src.ResourceType
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		okProp.CurrentUserPrincipal = src.CurrentUserPrincipal
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipalURL != nil {
-		okProp.CurrentUserPrincipalURL = src.CurrentUserPrincipalURL
-		okSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		okProp.PrincipalURL = src.PrincipalURL
-		okSet = true
-	}
-	if req.Prop.CalendarHomeSet != nil {
-		okProp.CalendarHomeSet = src.CalendarHomeSet
-		okSet = true
-	}
-	if req.Prop.AddressbookHomeSet != nil {
-		okProp.AddressbookHomeSet = src.AddressbookHomeSet
-		okSet = true
-	}
-	if req.Prop.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
-	}
-	if req.Prop.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
-	}
-	if req.Prop.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.Prop.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.Prop.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.Prop.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrivilegeSet != nil {
-		okProp.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFound, &notFoundSet)
-	if req.Prop.GetETag != nil {
-		notFound.GetETag = "getetag"
-		notFoundSet = true
-	}
-	if req.Prop.GetContentType != nil {
-		notFound.GetContentType = "getcontenttype"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarData != nil {
-		notFound.CalendarData = cdataString("calendar-data")
-		notFoundSet = true
-	}
-	if req.Prop.AddressData != nil {
-		notFound.AddressData = cdataString("address-data")
-		notFoundSet = true
-	}
-	if req.Prop.CalendarDescription != nil {
-		notFound.CalendarDescription = "calendar-description"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarTimezone != nil {
-		notFound.CalendarTimezone = stringPtr("calendar-timezone")
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookDesc != nil {
-		notFound.AddressBookDesc = "addressbook-description"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedAddressData != nil {
-		notFound.SupportedAddressData = &supportedAddressData{}
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookMaxResourceSize != nil {
-		notFound.AddressBookMaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCollationSet != nil {
-		notFound.SupportedCollationSet = &supportedCollationSet{}
-		notFoundSet = true
-	}
-	if req.Prop.SyncToken != nil {
-		notFound.SyncToken = "sync-token"
-		notFoundSet = true
-	}
-	if req.Prop.CTag != nil {
-		notFound.CTag = "getctag"
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalAddress != nil {
-		notFound.PrincipalAddress = &hrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarComponentSet != nil {
-		notFound.SupportedCalendarComponentSet = &supportedCalendarComponentSet{}
-		notFoundSet = true
-	}
-	if req.Prop.MaxResourceSize != nil {
-		notFound.MaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.MinDateTime != nil {
-		notFound.MinDateTime = "min-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxDateTime != nil {
-		notFound.MaxDateTime = "max-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxInstances != nil {
-		notFound.MaxInstances = "max-instances"
-		notFoundSet = true
-	}
-	if req.Prop.MaxAttendeesPerInstance != nil {
-		notFound.MaxAttendeesPerInstance = "max-attendees-per-instance"
-		notFoundSet = true
-	}
-	if req.Prop.ScheduleCalendarTransp != nil {
-		notFound.ScheduleCalendarTransp = &scheduleCalendarTransp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarData != nil {
-		notFound.SupportedCalendarData = &supportedCalendarData{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarServerReadOnly != nil {
-		notFound.CalendarServerReadOnly = &struct{}{}
-		notFoundSet = true
-	}
-	if req.Prop.Owner != nil {
-		notFound.Owner = &hrefProp{}
-		notFoundSet = true
-	}
-
-	resp.Propstat = nil
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFound, Status: httpStatusNotFound})
-	}
-	if len(resp.Propstat) == 0 {
-		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}
-	}
-	return resp
-}
-
-func filterAddressBookCollectionPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil {
-		return resp
-	}
-	src := resp.Propstat[0].Prop
-	var okProp prop
-	var okSet bool
-	var notFound prop
-	var notFoundSet bool
-	if req.Prop.DisplayName != nil {
-		okProp.DisplayName = src.DisplayName
-		okSet = true
-	}
-	if req.Prop.ResourceType != nil {
-		okProp.ResourceType = src.ResourceType
-		okSet = true
-	}
-	if req.Prop.AddressBookDesc != nil {
-		okProp.AddressBookDesc = src.AddressBookDesc
-		okSet = true
-	}
-	if req.Prop.SupportedAddressData != nil {
-		okProp.SupportedAddressData = src.SupportedAddressData
-		okSet = true
-	}
-	if req.Prop.AddressBookMaxResourceSize != nil {
-		okProp.AddressBookMaxResourceSize = src.AddressBookMaxResourceSize
-		okSet = true
-	}
-	if req.Prop.SupportedCollationSet != nil {
-		okProp.SupportedCollationSet = src.SupportedCollationSet
-		okSet = true
-	}
-	if req.Prop.SyncToken != nil {
-		okProp.SyncToken = src.SyncToken
-		okSet = true
-	}
-	if req.Prop.CTag != nil {
-		okProp.CTag = src.CTag
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		okProp.CurrentUserPrincipal = src.CurrentUserPrincipal
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipalURL != nil {
-		okProp.CurrentUserPrincipalURL = src.CurrentUserPrincipalURL
-		okSet = true
-	}
-	if req.Prop.AddressbookHomeSet != nil {
-		okProp.AddressbookHomeSet = src.AddressbookHomeSet
-		okSet = true
-	}
-	if req.Prop.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
-	}
-	if req.Prop.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
-	}
-	if req.Prop.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.Prop.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.Prop.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.Prop.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFound, &notFoundSet)
-	if req.Prop.GetETag != nil {
-		notFound.GetETag = "getetag"
-		notFoundSet = true
-	}
-	if req.Prop.GetContentType != nil {
-		notFound.GetContentType = "getcontenttype"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarData != nil {
-		notFound.CalendarData = cdataString("calendar-data")
-		notFoundSet = true
-	}
-	if req.Prop.AddressData != nil {
-		notFound.AddressData = cdataString("address-data")
-		notFoundSet = true
-	}
-	if req.Prop.CalendarDescription != nil {
-		notFound.CalendarDescription = "calendar-description"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarTimezone != nil {
-		notFound.CalendarTimezone = stringPtr("calendar-timezone")
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		notFound.PrincipalURL = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarHomeSet != nil {
-		notFound.CalendarHomeSet = &hrefListProp{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalAddress != nil {
-		notFound.PrincipalAddress = &hrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarComponentSet != nil {
-		notFound.SupportedCalendarComponentSet = &supportedCalendarComponentSet{}
-		notFoundSet = true
-	}
-	if req.Prop.MaxResourceSize != nil {
-		notFound.MaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.MinDateTime != nil {
-		notFound.MinDateTime = "min-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxDateTime != nil {
-		notFound.MaxDateTime = "max-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxInstances != nil {
-		notFound.MaxInstances = "max-instances"
-		notFoundSet = true
-	}
-	if req.Prop.MaxAttendeesPerInstance != nil {
-		notFound.MaxAttendeesPerInstance = "max-attendees-per-instance"
-		notFoundSet = true
-	}
-	if req.Prop.ScheduleCalendarTransp != nil {
-		notFound.ScheduleCalendarTransp = &scheduleCalendarTransp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarData != nil {
-		notFound.SupportedCalendarData = &supportedCalendarData{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarServerReadOnly != nil {
-		notFound.CalendarServerReadOnly = &struct{}{}
-		notFoundSet = true
-	}
-	if req.Prop.Owner != nil {
-		notFound.Owner = &hrefProp{}
-		notFoundSet = true
-	}
-	resp.Propstat = nil
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFound, Status: httpStatusNotFound})
-	}
-	if len(resp.Propstat) == 0 {
-		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}
-	}
-	return resp
+	resp := resourceResponse(href, propertyStatus)
+	return resp, nil
 }
 
 func stripAddressBookAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
-			if prop.ResourceType.AddressBook == nil {
+			prop.AddressData = ""
+			if prop.ResourceType == nil || prop.ResourceType.AddressBook == nil {
 				continue
 			}
-			prop.AddressBookDesc = ""
+			prop.AddressBookDesc = nil
 			prop.SupportedAddressData = nil
 			prop.AddressBookMaxResourceSize = ""
 			prop.SupportedCollationSet = nil
@@ -1138,7 +577,7 @@ func stripPrincipalAllprop(responses []response) {
 	for i := range responses {
 		for j := range responses[i].Propstat {
 			prop := &responses[i].Propstat[j].Prop
-			if prop.ResourceType.Principal == nil {
+			if prop.ResourceType == nil || prop.ResourceType.Principal == nil {
 				continue
 			}
 			prop.CalendarHomeSet = nil
@@ -1148,9 +587,7 @@ func stripPrincipalAllprop(responses []response) {
 }
 
 func writeCardDAVPrecondition(w http.ResponseWriter, status int, condition string) {
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><C:%s/></D:error>`, condition)
+	writeConditionError(w, status, namespaceCardDAV, condition)
 }
 
 // writeCardDAVUIDConflict writes a no-uid-conflict error response including the

@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/contacts"
 	"github.com/jw6ventures/calcard/internal/events"
@@ -26,11 +27,13 @@ type Handler struct {
 	contacts *contacts.Service
 }
 
-func NewHandler(cfg *config.Config, st *store.Store) *Handler {
+// NewHandler returns the REST API handler. validate is the validator every
+// calendar object written through the API must pass; it is required.
+func NewHandler(cfg *config.Config, st *store.Store, validate calobject.Validator) *Handler {
 	return &Handler{
 		cfg:      cfg,
 		store:    st,
-		events:   events.NewService(st),
+		events:   events.NewService(st, validate),
 		contacts: contacts.NewService(st),
 	}
 }
@@ -188,17 +191,13 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		writeEventError(w, err)
 		return
 	}
-	ev, created, err := h.events.CreateEvent(r.Context(), user, calendarID, input)
+	ev, err := h.events.CreateEvent(r.Context(), user, calendarID, input)
 	if err != nil {
 		writeEventError(w, err)
 		return
 	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
 	w.Header().Set("ETag", `"`+ev.ETag+`"`)
-	writeJSON(w, status, toEventResponse(*ev))
+	writeJSON(w, http.StatusCreated, toEventResponse(*ev))
 }
 
 func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +244,6 @@ func (h *Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 
 func decodeUpsertInput(r *http.Request) (events.UpsertInput, error) {
 	input := events.UpsertInput{
-		ContentType: r.Header.Get("Content-Type"),
 		IfMatch:     r.Header.Get("If-Match"),
 		IfNoneMatch: r.Header.Get("If-None-Match"),
 	}
@@ -309,16 +307,35 @@ func parseCalendarIDAndUID(w http.ResponseWriter, r *http.Request) (int64, strin
 	if !ok {
 		return 0, "", false
 	}
-	rawUID := chi.URLParam(r, "uid")
-	uid, err := url.PathUnescape(rawUID)
-	if err != nil || uid == "" {
-		uid = rawUID
-	}
+	uid := routeUID(r)
 	if uid == "" {
 		http.Error(w, "invalid event uid", http.StatusBadRequest)
 		return 0, "", false
 	}
 	return calendarID, uid, true
+}
+
+// routeUID returns the {uid} route parameter with percent-encoding resolved
+// exactly once.
+//
+// Which of the two path forms chi matched on decides whether there is anything
+// to resolve. chi routes on r.URL.RawPath when net/url set it -- which happens
+// only when the request spelled a segment differently from how the decoded path
+// re-encodes, as "a%40b.com" does for "@" -- and on the already-decoded
+// r.URL.Path otherwise. Unescaping in the second case decodes the value a
+// second time, so a UID carrying a literal percent ("literal%41", requested as
+// "literal%2541") would come back as "literalA": a different resource, and one
+// the caller never named.
+func routeUID(r *http.Request) string {
+	raw := chi.URLParam(r, "uid")
+	if r.URL.RawPath == "" {
+		return raw
+	}
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || decoded == "" {
+		return raw
+	}
+	return decoded
 }
 
 const maxEventSearchLen = 256
@@ -327,7 +344,7 @@ const maxEventLimit = 1000
 
 // parseEventFilter builds a store.EventFilter from the request query string.
 // Supported params: start, end (RFC3339 or YYYY-MM-DD), title, description,
-// location, q (matches any text field), limWere it, offset.
+// location, q (matches any text field), limit, offset.
 func parseEventFilter(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	var f store.EventFilter

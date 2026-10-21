@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "description": "Must be 0 or 1: every pod runs the startup schema migration and the runner takes no lock.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "app": {
+      "type": "object",
+      "properties": {
+        "db": {
+          "type": "object",
+          "properties": {
+            "port": {
+              "anyOf": [
+                { "type": "integer", "minimum": 1, "maximum": 65535 },
+                { "type": "string", "pattern": "^[0-9]+$" }
+              ]
+            },
+            "maxOpenConns": { "type": "integer", "minimum": 0 },
+            "maxIdleConns": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "dav": {
+          "type": "object",
+          "properties": {
+            "insecureBasicEnabled": { "type": "boolean" },
+            "maxMultistatusResponses": { "type": "integer", "minimum": 0 },
+            "maxMultistatusBytes": { "type": "integer", "minimum": 0 },
+            "maxFilterElements": { "type": "integer", "minimum": 0 },
+            "maxReportElementDepth": { "type": "integer", "minimum": 0 },
+            "maxCardDAVQueryBytes": { "type": "integer", "minimum": 0 },
+            "maxAddressDataProperties": { "type": "integer", "minimum": 0 },
+            "maxRequestedProperties": { "type": "integer", "minimum": 0 },
+            "maxMultigetHrefs": { "type": "integer", "minimum": 0 },
+            "maxReportCandidateRows": { "type": "integer", "minimum": 0 },
+            "reportTimeout": {
+              "oneOf": [
+                { "type": "string", "pattern": "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|ms|s|m|h))+)$" },
+                { "type": "integer", "const": 0 }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1, "maximum": 65535 },
+            { "type": "string", "pattern": "^[0-9]+$" }
+          ]
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "host": { "type": "string" },
+        "annotations": { "type": "object" },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" }
+          }
+        }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "startupProbe": {
+      "type": "object",
+      "properties": {
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "resources": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "priorityClassName": { "type": "string" }
+  }
+}

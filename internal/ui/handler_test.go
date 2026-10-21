@@ -2,21 +2,31 @@ package ui
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
+	"github.com/jw6ventures/calcard/internal/contacts"
+	"github.com/jw6ventures/calcard/internal/dav"
 	"github.com/jw6ventures/calcard/internal/store"
+	"github.com/jw6ventures/calcard/internal/ui/utils"
 )
 
 func TestViewCalendarHandler(t *testing.T) {
@@ -99,7 +109,7 @@ func TestViewCalendarHandler(t *testing.T) {
 				Events:    eventRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodGet, "/calendars/"+tc.calendarID, nil)
 			rctx := chi.NewRouteContext()
@@ -140,7 +150,7 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 					},
 				},
 			},
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
 		rctx := chi.NewRouteContext()
@@ -175,7 +185,7 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 					},
 				},
 			},
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
 		rctx := chi.NewRouteContext()
@@ -197,6 +207,35 @@ func TestViewCalendarUsesExplicitCapabilitiesForActions(t *testing.T) {
 			t.Fatalf("did not expect import action for read-only access, got %s", body)
 		}
 	})
+}
+
+func TestViewCalendarRendersDayAndWeekViews(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Work"},
+			},
+		},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewCalendar(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewCalendar() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`data-view="day"`, `data-view="week"`, `id="time-grid-view"`, `id="prev-time-range"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected calendar view to contain %q, got %s", want, body)
+		}
+	}
 }
 
 func TestViewAddressBookHandler(t *testing.T) {
@@ -279,7 +318,7 @@ func TestViewAddressBookHandler(t *testing.T) {
 				Contacts:     contactRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			req := httptest.NewRequest(http.MethodGet, "/addressbooks/"+tc.bookID, nil)
 			rctx := chi.NewRouteContext()
@@ -336,7 +375,7 @@ func TestCreateEventHandler(t *testing.T) {
 		Events:    eventRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -428,6 +467,70 @@ func TestCreateEventHandler(t *testing.T) {
 	}
 }
 
+func TestCreateEventReturnsToAllCalendars(t *testing.T) {
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Work"},
+		}},
+		Events: eventRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"summary":   {"Planning"},
+		"dtstart":   {"2026-07-24T10:00"},
+		"dtend":     {"2026-07-24T10:30"},
+		"return_to": {"/calendars/all?view=week&date=2026-07-24"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.CreateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("CreateEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, "/calendars/all?") ||
+		!strings.Contains(location, "view=week") ||
+		!strings.Contains(location, "date=2026-07-24") ||
+		!strings.Contains(location, "status=event_created") {
+		t.Fatalf("CreateEvent() redirect = %q, want all-calendars state and status", location)
+	}
+}
+
+func TestEventReturnPathRejectsExternalTargets(t *testing.T) {
+	form := url.Values{"return_to": {"https://example.com/calendars/all?view=week"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1" {
+		t.Fatalf("eventReturnPath() = %q, want local calendar fallback", got)
+	}
+}
+
+func TestEventReturnPathPreservesOwnCalendarView(t *testing.T) {
+	form := url.Values{"return_to": {"/calendars/1?view=week&date=2026-07-24"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1?date=2026-07-24&view=week" {
+		t.Fatalf("eventReturnPath() = %q, want own calendar view/date preserved", got)
+	}
+}
+
+func TestEventReturnPathRejectsOtherCalendarTargets(t *testing.T) {
+	form := url.Values{"return_to": {"/calendars/2?view=week&date=2026-07-24"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if got := eventReturnPath(req, 1); got != "/calendars/1" {
+		t.Fatalf("eventReturnPath() = %q, want fallback for a different calendar target", got)
+	}
+}
+
 func TestDeleteEventHandler(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		calendars: map[int64]*store.Calendar{
@@ -437,19 +540,23 @@ func TestDeleteEventHandler(t *testing.T) {
 	eventRepo := &fakeEventRepoWithDelete{
 		fakeEventRepo: fakeEventRepo{
 			events: map[string]*store.Event{
-				"1:event-1": {ID: 1, CalendarID: 1, UID: "event-1"},
+				"1:event-1": {ID: 1, CalendarID: 1, UID: "event-1", ETag: "tag"},
 			},
 		},
 	}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		"/dav/calendars/1/event-1": {{ResourcePath: "/dav/calendars/1/event-1", NamespaceURI: "urn:test", LocalName: "note"}},
+	}}
 
 	s := &store.Store{
-		Calendars: calRepo,
-		Events:    eventRepo,
+		Calendars:      calRepo,
+		Events:         eventRepo,
+		DeadProperties: deadProperties,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
-	req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1?etag=tag", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "1")
 	rctx.URLParams.Add("uid", "event-1")
@@ -463,6 +570,86 @@ func TestDeleteEventHandler(t *testing.T) {
 
 	if w.Code != http.StatusFound {
 		t.Errorf("DeleteEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	if len(deadProperties.properties["/dav/calendars/1/event-1"]) != 0 {
+		t.Fatalf("DeleteEvent() retained dead properties: %#v", deadProperties.properties)
+	}
+}
+
+func TestDeleteContactHandlerRemovesDAVState(t *testing.T) {
+	bookRepo := &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+		1: {ID: 1, UserID: 100, Name: "Contacts"},
+	}}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "alice"},
+	}}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		"/dav/addressbooks/1/alice": {{ResourcePath: "/dav/addressbooks/1/alice", NamespaceURI: "urn:test", LocalName: "note"}},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks:   bookRepo,
+		Contacts:       contactRepo,
+		DeadProperties: deadProperties,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/contact-1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "contact-1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	response := httptest.NewRecorder()
+
+	handler.DeleteContact(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("DeleteContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	if len(deadProperties.properties["/dav/addressbooks/1/alice"]) != 0 {
+		t.Fatalf("DeleteContact() retained dead properties: %#v", deadProperties.properties)
+	}
+}
+
+// memberRefusingACLRepo answers a lookup of any member of calendar 1 with a
+// refusal of bind, whatever path it is asked for, so a decision reading a
+// member's ACL for a privilege of the calendar shows.
+type memberRefusingACLRepo struct {
+	*fakeACLRepo
+}
+
+func (r memberRefusingACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	if strings.HasPrefix(resourcePath, "/dav/calendars/1/") {
+		return []store.ACLEntry{{ResourcePath: resourcePath, PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "bind"}}, nil
+	}
+	return r.fakeACLRepo.ListByResource(ctx, resourcePath)
+}
+
+// DAV:bind is a privilege of the calendar a new event joins (RFC 3744 section
+// 3.9), so creating one is decided by the calendar's ACL alone, whatever is
+// stored at the path the new event takes.
+func TestCreateEventDecidesBindOnTheCalendar(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		accessible: map[string]*store.CalendarAccess{
+			"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
+		},
+	}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+	aclRepo := memberRefusingACLRepo{&fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "bind"},
+	}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{"summary": {"Test Event"}, "dtstart": {"2024-01-01T10:00"}, "dtend": {"2024-01-01T11:00"}}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.CreateEvent(w, req)
+
+	if w.Code != http.StatusFound || len(eventRepo.events) != 1 {
+		t.Fatalf("CreateEvent() status = %d location %q with %d events stored, want the event created", w.Code, w.Header().Get("Location"), len(eventRepo.events))
 	}
 }
 
@@ -484,7 +671,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary": {"Test Event"},
@@ -535,7 +722,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary":    {"Updated Summary"},
@@ -562,7 +749,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 		}
 	})
 
-	t.Run("update_respects_canonical_object_deny_for_ics_resource", func(t *testing.T) {
+	t.Run("update_respects_the_object_deny_of_an_event_named_with_ics", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			accessible: map[string]*store.CalendarAccess{
 				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true, Editor: true},
@@ -585,13 +772,13 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 		aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
-			{ResourcePath: "/dav/calendars/1/event-1", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "write-content"},
+			{ResourcePath: "/dav/calendars/1/event-1.ics", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "write-content"},
 		}}
 		handler := NewHandler(&config.Config{}, &store.Store{
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"summary":    {"Updated Summary"},
@@ -639,7 +826,7 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := httptest.NewRequest(http.MethodDelete, "/calendars/1/events/event-1", nil)
 		rctx := chi.NewRouteContext()
@@ -687,12 +874,13 @@ func TestCalendarEventHandlersRequireSpecificACLPrivileges(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		form := url.Values{
 			"edit_scope":         {"occurrence"},
 			"recurrence_id":      {"2024-01-02T10:00"},
 			"recurrence_all_day": {"false"},
+			"etag":               {"etag-1"},
 		}
 		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event-1/delete", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -730,7 +918,7 @@ func TestCreateContactHandler(t *testing.T) {
 		Contacts:     contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -796,6 +984,401 @@ func TestCreateContactHandler(t *testing.T) {
 	}
 }
 
+// A contact created in the UI is addressed over DAV by its resource name, so
+// the create path has to store that identity itself rather than leave the
+// column for a repository default to fill in: the resource name is what the
+// sync reports build an href from.
+func TestCreateContactStoresDAVResourceName(t *testing.T) {
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"display_name": {"Johnny Appleseed"},
+		"first_name":   {"Johnny"},
+		"last_name":    {"Appleseed"},
+		"email":        {"johnny@apple.seed"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "test@example.com"}))
+
+	response := httptest.NewRecorder()
+	handler.CreateContact(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("CreateContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("CreateContact() stored %d contacts, want 1", len(contactRepo.contacts))
+	}
+	for _, stored := range contactRepo.contacts {
+		if stored.UID == "" || stored.ResourceName != stored.UID {
+			t.Fatalf("stored resource name = %q, want it to equal the contact UID %q", stored.ResourceName, stored.UID)
+		}
+		if !strings.Contains(stored.RawVCard, "FN:Johnny Appleseed") {
+			t.Fatalf("stored vCard = %q, want it to carry the display name", stored.RawVCard)
+		}
+		if stored.ETag == "" {
+			t.Fatal("CreateContact() stored no ETag")
+		}
+	}
+}
+
+// contactFormRouter serves the contact routes with a signed-in user, so a case
+// exercises the handlers through the same chi routing the server mounts.
+func contactFormRouter(h *Handler, userID int64) http.Handler {
+	router := chi.NewRouter()
+	router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := &store.User{ID: userID, PrimaryEmail: "test@example.com"}
+			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+		})
+	})
+	router.Post("/addressbooks/{id}/contacts", h.CreateContact)
+	router.Put("/addressbooks/{id}/contacts/{uid}", h.UpdateContact)
+	router.Post("/addressbooks/{id}/import", h.ImportAddressBook)
+	return router
+}
+
+// chi routes on r.URL.RawPath when it is set and on the already-decoded
+// r.URL.Path when it is not, so a route parameter reaches the handler encoded
+// only in the first case. Unescaping unconditionally decodes the second case
+// twice, which turns "literal%2541" into "literalA" instead of "literal%41" --
+// a different contact, and one a mutation must not reach.
+func TestResourceUIDParamDecodesExactlyOnceThroughChiRouting(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment string
+		want    string
+	}{
+		// The escape has to survive: "%25" is a percent sign, and decoding it a
+		// second time reads the two characters after it as an escape of their
+		// own. chi leaves RawPath empty here, because re-escaping the decoded
+		// path reproduces the request exactly.
+		{name: "escaped percent", segment: "literal%2541", want: "literal%41"},
+		// The identity the double decode collides with, asked for directly.
+		{name: "decoded twin", segment: "literalA", want: "literalA"},
+		// The encoding resourceUIDParam exists for: chi sets RawPath, because
+		// "@" needs no escape in a path segment, so the parameter is encoded.
+		{name: "escaped at sign", segment: "a%40b.com", want: "a@b.com"},
+		{name: "literal at sign", segment: "a@b.com", want: "a@b.com"},
+		{name: "escaped space", segment: "sp%20ace", want: "sp ace"},
+		{name: "plain", segment: "plain-uid", want: "plain-uid"},
+	}
+
+	// Every route that reads a {uid}, spelled as the server mounts them.
+	patterns := []string{
+		"/calendars/{id}/events/{uid}",
+		"/calendars/{id}/events/{uid}/delete",
+		"/addressbooks/{id}/contacts/{uid}",
+		"/addressbooks/{id}/contacts/{uid}/delete",
+		"/addressbooks/{id}/contacts/{uid}/move",
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, pattern := range patterns {
+				var got string
+				router := chi.NewRouter()
+				router.Get(pattern, func(_ http.ResponseWriter, r *http.Request) {
+					got = resourceUIDParam(r)
+				})
+
+				target := strings.Replace(pattern, "{id}", "1", 1)
+				target = strings.Replace(target, "{uid}", tt.segment, 1)
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, target, nil))
+
+				if got != tt.want {
+					t.Errorf("%s with %q resolved to %q, want %q", pattern, tt.segment, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// The consequence of decoding twice, at the route that mutates: two contacts
+// whose identities differ only by an escape, and the request names the escaped
+// one. Reaching the other would edit a contact the client never asked for.
+func TestUpdateContactTargetsTheRequestedIdentityNotItsDecodedTwin(t *testing.T) {
+	const (
+		requested = `literal%41`
+		twin      = "literalA"
+	)
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:" + requested: {ID: 1, AddressBookID: 1, UID: requested, ResourceName: requested, ETag: "etag-requested"},
+			"1:" + twin:      {ID: 2, AddressBookID: 1, UID: twin, ResourceName: twin, ETag: "etag-twin"},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{"display_name": {"Renamed By The Request"}}
+	// url.PathEscape(`literal%41`) is "literal%2541": the percent is escaped, so
+	// the request names the first contact and not the second.
+	req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(requested), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("UpdateContact() status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+	}
+	if stored := contactRepo.contacts["1:"+requested]; stored == nil || !strings.Contains(stored.RawVCard, "Renamed By The Request") {
+		t.Fatalf("the requested contact was not updated: %#v", stored)
+	}
+	if stored := contactRepo.contacts["1:"+twin]; stored == nil || stored.ETag != "etag-twin" {
+		t.Fatalf("the mutation reached the wrong contact: %#v", stored)
+	}
+}
+
+// A contact stored by a CardDAV PUT carries the resource name that PUT chose,
+// and that name is the last segment of every href the sync reports publish for
+// it. Editing the contact in the UI changes the contact, not its identity, so
+// the resource name has to survive the write: rewriting it to the UID retracts
+// one href and publishes another for the same contact.
+func TestUpdateContactPreservesDAVResourceName(t *testing.T) {
+	const (
+		uid          = "alice@calcard"
+		resourceName = "alice-from-the-phone"
+	)
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: resourceName, ETag: "etag-old"},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{"display_name": {"Alice Renamed"}}
+	req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("UpdateContact() status = %d, want %d", response.Code, http.StatusFound)
+	}
+	stored := contactRepo.contacts["1:"+uid]
+	if stored == nil {
+		t.Fatal("UpdateContact() stored no contact")
+	}
+	if stored.ResourceName != resourceName {
+		t.Fatalf("stored resource name = %q, want the name the CardDAV PUT chose, %q", stored.ResourceName, resourceName)
+	}
+	if !strings.Contains(stored.RawVCard, "FN:Alice Renamed") {
+		t.Fatalf("stored vCard = %q, want it to carry the new display name", stored.RawVCard)
+	}
+}
+
+// A file mixing a vCard 2.1 card (with a quoted-printable soft line break), a
+// card the server refuses and a good 3.0 card stores the two it can and says
+// which one it skipped and why -- in the server's own words only, since the
+// flash travels in the redirect URL and a skip reason may quote the file.
+func TestImportAddressBookReportsSkippedCards(t *testing.T) {
+	vcf := strings.Join([]string{
+		"BEGIN:VCARD",
+		"VERSION:2.1",
+		"UID:legacy@calcard",
+		"N:Lovelace;Ada",
+		"FN;ENCODING=QUOTED-PRINTABLE:Ada =",
+		"Lovelace",
+		"END:VCARD",
+		"BEGIN:VCARD",
+		"VERSION:3.0",
+		"UID:nameless@calcard",
+		"NOTE:no name here <script>",
+		"END:VCARD",
+		"BEGIN:VCARD",
+		"VERSION:3.0",
+		"UID:modern@calcard",
+		"FN:Grace Hopper",
+		"END:VCARD",
+		"",
+	}, "\r\n")
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "contacts.vcf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte(vcf)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/import", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+	}
+	legacy := contactRepo.contacts["1:legacy@calcard"]
+	if legacy == nil || !strings.Contains(legacy.RawVCard, "FN:Ada Lovelace") {
+		t.Fatalf("the 2.1 card was not stored whole: %#v", legacy)
+	}
+	if contactRepo.contacts["1:modern@calcard"] == nil {
+		t.Fatal("the 3.0 card was not stored")
+	}
+	if contactRepo.contacts["1:nameless@calcard"] != nil {
+		t.Fatal("the card without FN was stored")
+	}
+
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := location.Query().Get("status"); got != "Imported 2 contacts." {
+		t.Errorf("status = %q, want the imported count", got)
+	}
+	if got := location.Query().Get("error"); got != "1 card skipped: card 2 (it has no name)." {
+		t.Errorf("error = %q, want the skipped card and its reason", got)
+	}
+	for _, leaked := range []string{"nameless", "script", "no name here"} {
+		if strings.Contains(location.RawQuery, leaked) || strings.Contains(location.Query().Get("error"), leaked) {
+			t.Errorf("the redirect carries text from the file (%q): %s", leaked, location)
+		}
+	}
+}
+
+// Only reasons the server words itself are repeated in the flash; one that
+// quotes the file, or that nobody listed, is summarized, and the list is
+// bounded however many cards were skipped.
+func TestImportSkipFlash(t *testing.T) {
+	skips := []contacts.ImportSkip{
+		{Card: 1, UID: "a", Code: contacts.ImportSkipMissingFN, Reason: "VCARD must contain FN"},
+		{Card: 4, UID: "evil<script>", Code: contacts.ImportSkipMalformed, Reason: `vCard 2.1: malformed content line "<img src=x onerror=alert(1)>"`},
+		{Card: 5, Code: contacts.ImportSkipUnsupportedCharset, Reason: "vCard 2.1: FN: unsupported character set SHIFT_JIS"},
+		{Card: 9, Code: contacts.ImportSkipDuplicateUID, Reason: "another contact already uses this UID or resource name"},
+		{Card: 12, Code: contacts.ImportSkipMissingFN, Reason: "VCARD must contain FN"},
+	}
+	got := importSkipFlash(skips)
+	want := "5 cards skipped: card 1 (it has no name), card 4 (it is not a well-formed vCard), card 5 (it uses a character set this server cannot read), and 2 more."
+	if got != want {
+		t.Fatalf("importSkipFlash() = %q\nwant %q", got, want)
+	}
+	for code, message := range map[contacts.ImportSkipCode]string{
+		contacts.ImportSkipDuplicateUID: "another contact already uses this UID",
+		contacts.ImportSkipForbidden:    "you may not change this contact",
+		contacts.ImportSkipChanged:      "the contact changed while it was being imported",
+		contacts.ImportSkipInvalid:      "not a vCard this server can read",
+		"":                              "not a vCard this server can read",
+	} {
+		if got := importSkipFlash([]contacts.ImportSkip{{Card: 2, Code: code, Reason: "VCARD must contain FN"}}); got != "1 card skipped: card 2 ("+message+")." {
+			t.Errorf("code %q: flash = %q", code, got)
+		}
+	}
+}
+
+// An imported vCard is a contact like any other: it needs the DAV resource
+// name the sync reports build an href from, and re-importing a file replaces
+// the contacts it already carries rather than failing on their UIDs.
+func TestImportAddressBookStoresContactsThroughTheService(t *testing.T) {
+	const uid = "imported@calcard"
+	contactRepo := &fakeContactRepoWithUpsert{
+		fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	importVCF := func(t *testing.T, displayName string) {
+		t.Helper()
+		vcf := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + displayName + "\r\nEND:VCARD\r\n"
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", "contacts.vcf")
+		if err != nil {
+			t.Fatalf("CreateFormFile() error = %v", err)
+		}
+		if _, err := part.Write([]byte(vcf)); err != nil {
+			t.Fatalf("write vCard: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close multipart writer: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/import", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		response := httptest.NewRecorder()
+
+		contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("ImportAddressBook() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if location := response.Header().Get("Location"); strings.Contains(location, "error") {
+			t.Fatalf("ImportAddressBook() redirected with an error: %s", location)
+		}
+	}
+
+	importVCF(t, "Imported Person")
+
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("ImportAddressBook() stored %d contacts, want 1", len(contactRepo.contacts))
+	}
+	stored := contactRepo.contacts["1:"+uid]
+	if stored == nil {
+		t.Fatalf("ImportAddressBook() stored no contact under %q", uid)
+	}
+	if stored.ResourceName != uid {
+		t.Fatalf("stored resource name = %q, want the contact UID %q", stored.ResourceName, uid)
+	}
+	if stored.ETag == "" {
+		t.Fatal("ImportAddressBook() stored no ETag")
+	}
+
+	// Re-importing the same UID replaces the contact instead of being refused.
+	importVCF(t, "Imported Person Revised")
+
+	if len(contactRepo.contacts) != 1 {
+		t.Fatalf("re-import stored %d contacts, want the original replaced", len(contactRepo.contacts))
+	}
+	stored = contactRepo.contacts["1:"+uid]
+	if stored == nil || !strings.Contains(stored.RawVCard, "FN:Imported Person Revised") {
+		t.Fatalf("re-import stored vCard = %#v, want the revised display name", stored)
+	}
+	if stored.ResourceName != uid {
+		t.Fatalf("re-import resource name = %q, want %q", stored.ResourceName, uid)
+	}
+}
+
 func TestViewBirthdaysHandler(t *testing.T) {
 	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
 	displayName := "John Doe"
@@ -810,7 +1393,7 @@ func TestViewBirthdaysHandler(t *testing.T) {
 		Contacts: contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
 	user := &store.User{ID: 100, PrimaryEmail: "test@example.com"}
@@ -829,6 +1412,88 @@ func TestViewBirthdaysHandler(t *testing.T) {
 	}
 }
 
+// The page is handed month and day, never a date built in the current year:
+// 29 February rebuilt in a year without one is 1 March. The year decides only
+// the age, and a year the store uses as a stand-in for "no year" gives none.
+func TestViewBirthdaysKeepsLeapDayAndKnownYears(t *testing.T) {
+	leapDay := time.Date(2000, time.February, 29, 0, 0, 0, 0, time.UTC)
+	born1900 := time.Date(1900, time.May, 15, 0, 0, 0, 0, time.UTC)
+	noYear := time.Date(store.NoYearBirthdayYear, time.February, 29, 0, 0, 0, 0, time.UTC)
+	legacyNoYear := time.Date(1, time.July, 4, 0, 0, 0, 0, time.UTC)
+	future := time.Date(time.Now().Year()+5, time.March, 3, 0, 0, 0, 0, time.UTC)
+	names := []string{"Leap", "Old", "Yearless", "Future", "Legacy"}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays: []store.Contact{
+			{ID: 1, UID: "leap", DisplayName: &names[0], Birthday: &leapDay},
+			{ID: 2, UID: "old", DisplayName: &names[1], Birthday: &born1900},
+			{ID: 3, UID: "yearless", DisplayName: &names[2], Birthday: &noYear},
+			{ID: 5, UID: "legacy-yearless", DisplayName: &names[4], Birthday: &legacyNoYear},
+			{ID: 4, UID: "future", DisplayName: &names[3], Birthday: &future},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	body := w.Body.String()
+	_, rest, ok := strings.Cut(body, "var birthdays = (")
+	if !ok {
+		t.Fatalf("no birthday payload in the page: %s", body)
+	}
+	payload, _, ok := strings.Cut(rest, " || [])")
+	if !ok {
+		t.Fatalf("unterminated birthday payload: %s", rest)
+	}
+	var events []map[string]any
+	if err := json.Unmarshal([]byte(payload), &events); err != nil {
+		t.Fatalf("birthday payload %s: %v", payload, err)
+	}
+	byUID := make(map[string]map[string]any, len(events))
+	for _, event := range events {
+		if _, ok := event["Date"]; ok {
+			t.Errorf("%v carries a date rebuilt in the current year", event["ContactUID"])
+		}
+		byUID[event["ContactUID"].(string)] = event
+	}
+
+	// The page works the age out for the year it shows, so it is sent the
+	// birth year rather than an age fixed to the server's year.
+	tests := []struct {
+		uid        string
+		month, day float64
+		birthYear  any
+	}{
+		{uid: "leap", month: 2, day: 29, birthYear: float64(2000)},
+		{uid: "old", month: 5, day: 15, birthYear: float64(1900)},
+		{uid: "yearless", month: 2, day: 29, birthYear: nil},
+		{uid: "legacy-yearless", month: 7, day: 4, birthYear: nil},
+		{uid: "future", month: 3, day: 3, birthYear: nil},
+	}
+	for _, tt := range tests {
+		event, ok := byUID[tt.uid]
+		if !ok {
+			t.Errorf("%s is missing from the page", tt.uid)
+			continue
+		}
+		if event["Month"] != tt.month || event["Day"] != tt.day {
+			t.Errorf("%s = month %v day %v, want %v/%v", tt.uid, event["Month"], event["Day"], tt.month, tt.day)
+		}
+		if event["BirthYear"] != tt.birthYear {
+			t.Errorf("%s birth year = %v, want %v", tt.uid, event["BirthYear"], tt.birthYear)
+		}
+		if _, ok := event["Age"]; ok {
+			t.Errorf("%s carries an age fixed to the server's year", tt.uid)
+		}
+	}
+}
+
 func TestImportCalendarHandler(t *testing.T) {
 	t.Run("imports grouped ICS resources and injects missing uid", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
@@ -840,9 +1505,9 @@ func TestImportCalendarHandler(t *testing.T) {
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
 		s := &store.Store{Calendars: calRepo, Events: eventRepo}
-		handler := NewHandler(&config.Config{}, s, nil)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
-		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nSUMMARY:Series\r\nDTSTART;TZID=America/Chicago:20250115T140000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nRECURRENCE-ID;TZID=America/Chicago:20250122T140000\r\nSUMMARY:Override\r\nDTSTART;TZID=America/Chicago:20250122T150000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:No UID\r\nDTSTART:20250116T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nBEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0600\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nSUMMARY:Series\r\nDTSTART;TZID=America/Chicago:20250115T140000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series@example.com\r\nRECURRENCE-ID;TZID=America/Chicago:20250122T140000\r\nSUMMARY:Override\r\nDTSTART;TZID=America/Chicago:20250122T150000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:No UID\r\nDTSTART:20250116T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
 		req = withRouteID(req, "1")
 		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "editor@example.com"}))
@@ -871,7 +1536,7 @@ func TestImportCalendarHandler(t *testing.T) {
 		if !strings.Contains(series.RawICAL, "BEGIN:VTIMEZONE") {
 			t.Fatalf("expected VTIMEZONE to be preserved, got: %s", series.RawICAL)
 		}
-		if series.ResourceName != "series_example.com.ics" {
+		if series.ResourceName != "series_example.com" {
 			t.Fatalf("unexpected resource name: %s", series.ResourceName)
 		}
 
@@ -890,6 +1555,114 @@ func TestImportCalendarHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("stores Apple events under the event UID not the alarm UIDs", func(t *testing.T) {
+		const eventUID = "6C4E3B5F-2A7D-4E3C-9F1B-8D2A6E7C4B10"
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		alarm := func(uid string) string {
+			return "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT15M\r\nUID:" + uid + "\r\nX-WR-ALARMUID:" + uid + "\r\nEND:VALARM\r\n"
+		}
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//macOS 15.0//EN\r\n" +
+			"BEGIN:VEVENT\r\n" + alarm("D1B2C3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E") +
+			"UID:" + eventUID + "\r\nSUMMARY:Standup\r\nDTSTART:20260320T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=10\r\nEND:VEVENT\r\n" +
+			"BEGIN:VEVENT\r\n" + alarm("B2B2B2B2-0000-4000-8000-000000000002") +
+			"UID:" + eventUID + "\r\nRECURRENCE-ID:20260327T100000Z\r\nSUMMARY:Standup (moved)\r\nDTSTART:20260327T110000Z\r\nEND:VEVENT\r\n" +
+			"END:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "apple.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+") {
+			t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+		}
+		if len(eventRepo.events) != 1 {
+			t.Fatalf("expected 1 stored resource, got %d", len(eventRepo.events))
+		}
+		stored := eventRepo.events["1:"+eventUID]
+		if stored == nil {
+			t.Fatalf("expected the series stored under %q", eventUID)
+		}
+		if stored.ResourceName != utils.ResourceNameForUID(eventUID) {
+			t.Fatalf("ResourceName = %q, want %q", stored.ResourceName, utils.ResourceNameForUID(eventUID))
+		}
+		if strings.Count(stored.RawICAL, "BEGIN:VEVENT") != 2 {
+			t.Fatalf("expected master and override in one resource, got: %s", stored.RawICAL)
+		}
+	})
+
+	// The resource name an import gives a new event is no longer than its
+	// UID, so an event whose UID is at the bound the server keeps a UID to is
+	// stored under a name a CalDAV PUT may still write.
+	t.Run("names an event with a UID at the bound within the bound", func(t *testing.T) {
+		uid := strings.Repeat("u", store.MaxIdentifierOctets)
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nSUMMARY:Long\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "long.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		stored := eventRepo.events["1:"+uid]
+		if stored == nil {
+			t.Fatalf("the event was not imported: status %d location %s", w.Code, w.Header().Get("Location"))
+		}
+		if stored.ResourceName != uid || len(stored.ResourceName) > store.MaxIdentifierOctets {
+			t.Fatalf("ResourceName is %d octets, want the %d-octet UID itself", len(stored.ResourceName), len(uid))
+		}
+	})
+
+	t.Run("stores an event under its parameterized UID", func(t *testing.T) {
+		calRepo := &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+			},
+		}
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID;X-SOURCE=import:param@example.com\r\nSUMMARY:Param\r\nDTSTART:20260320T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		req := newICSImportRequest(t, "/calendars/1/import", "param.ics", ics)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+
+		w := httptest.NewRecorder()
+		handler.ImportCalendar(w, req)
+
+		if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+") {
+			t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+		}
+		stored := eventRepo.events["1:param@example.com"]
+		if stored == nil || len(eventRepo.events) != 1 {
+			t.Fatalf("expected one event stored under param@example.com, got %v", eventRepo.events)
+		}
+		if n := strings.Count(strings.ToUpper(stored.RawICAL), "\r\nUID"); n != 1 {
+			t.Fatalf("expected the original UID line alone, found %d UID lines in: %s", n, stored.RawICAL)
+		}
+	})
+
 	t.Run("rejects malformed ICS", func(t *testing.T) {
 		calRepo := &fakeCalendarRepo{
 			calendars: map[int64]*store.Calendar{
@@ -900,7 +1673,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)},
 		}
 		s := &store.Store{Calendars: calRepo, Events: eventRepo}
-		handler := NewHandler(&config.Config{}, s, nil)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		req := newICSImportRequest(t, "/calendars/1/import", "bad.ics", "BEGIN:VEVENT\r\nEND:VEVENT\r\n")
 		req = withRouteID(req, "1")
@@ -912,8 +1685,9 @@ func TestImportCalendarHandler(t *testing.T) {
 		if w.Code != http.StatusFound {
 			t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusFound)
 		}
-		if location := w.Header().Get("Location"); !strings.Contains(location, "error=invalid+ICS+file") {
-			t.Fatalf("expected invalid ICS redirect, got %s", location)
+		// The parser's own reason goes to the log, not to the page.
+		if got, want := flashedError(t, w), "The file is not a valid iCalendar file with at least one event."; got != want {
+			t.Fatalf("flashed error = %q, want %q", got, want)
 		}
 		if len(eventRepo.events) != 0 {
 			t.Fatalf("expected no stored events, got %d", len(eventRepo.events))
@@ -927,9 +1701,9 @@ func TestImportCalendarHandler(t *testing.T) {
 			},
 		}
 		s := &store.Store{Calendars: calRepo, Events: &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
-		handler := NewHandler(&config.Config{}, s, nil)
+		handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
-		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
 		req = withRouteID(req, "1")
 		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "viewer@example.com"}))
 
@@ -968,7 +1742,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
@@ -1013,7 +1787,7 @@ func TestImportCalendarHandler(t *testing.T) {
 			Calendars:  calRepo,
 			Events:     eventRepo,
 			ACLEntries: aclRepo,
-		}, nil)
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:new@example.com\r\nSUMMARY:New Event\r\nDTSTART:20250110T120000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:existing@example.com\r\nSUMMARY:Updated Existing\r\nDTSTART:20250115T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 		req := newICSImportRequest(t, "/calendars/1/import", "calendar.ics", ics)
@@ -1055,7 +1829,7 @@ func TestDashboardHidesDeniedRecentEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -1098,10 +1872,15 @@ func newDashboardTestStore() *store.Store {
 }
 
 func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
-	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil)
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "new@example.com"}))
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{
+		ID:           100,
+		PrimaryEmail: "new@example.com",
+		FullName:     "Dana Lee",
+		FirstName:    "Dana",
+	}))
 	w := httptest.NewRecorder()
 
 	handler.Dashboard(w, req)
@@ -1112,10 +1891,13 @@ func TestDashboardShowsWelcomeTourOnFirstLogin(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "Welcome to CalCard") {
 		t.Fatalf("expected welcome tour for first-login user, got %s", w.Body.String())
 	}
+	if !strings.Contains(w.Body.String(), "Welcome, Dana") || !strings.Contains(w.Body.String(), "Hi Dana") {
+		t.Fatalf("expected dashboard to use OAuth first name, got %s", w.Body.String())
+	}
 }
 
 func TestDashboardHidesWelcomeTourAfterOnboarding(t *testing.T) {
-	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil)
+	handler := NewHandler(&config.Config{}, newDashboardTestStore(), nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	completed := time.Now()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1134,7 +1916,7 @@ func TestDashboardHidesWelcomeTourAfterOnboarding(t *testing.T) {
 
 func TestCompleteOnboardingMarksUser(t *testing.T) {
 	userRepo := &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}}
-	handler := NewHandler(&config.Config{}, &store.Store{Users: userRepo}, nil)
+	handler := NewHandler(&config.Config{}, &store.Store{Users: userRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/onboarding/complete", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -1152,7 +1934,7 @@ func TestCompleteOnboardingMarksUser(t *testing.T) {
 
 func TestCreateCalendarPersistsSelectedColor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{}
 	form.Set("name", "Work")
@@ -1178,7 +1960,7 @@ func TestRenameCalendarPersistsSelectedColor(t *testing.T) {
 	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
 		1: {ID: 1, UserID: 100, Name: "Work"},
 	}}
-	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil)
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{}
 	form.Set("name", "Personal")
@@ -1210,7 +1992,7 @@ func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
 		Calendars:  calRepo,
 		Users:      &fakeUserRepo{users: map[int64]*store.User{100: {ID: 100, PrimaryEmail: "user@example.com"}}},
 		ACLEntries: &fakeACLRepo{},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -1245,7 +2027,7 @@ func TestCalendarsPageRendersEditModalWithCurrentValues(t *testing.T) {
 func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
 	handler := NewHandler(&config.Config{BaseURL: "https://calcard.example/"}, &store.Store{
 		AppPasswords: &fakeAppPasswordRepo{},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
@@ -1262,6 +2044,137 @@ func TestAppPasswordsUsesConfiguredDAVEndpoint(t *testing.T) {
 	}
 	if strings.Contains(body, "example.app.calcard.app") {
 		t.Fatalf("expected app password guidance not to contain hard-coded example host, got %s", body)
+	}
+}
+
+// Sealed under digestReadinessSecret by the auth package's own sealing, because
+// nothing else produces a value this server can open and the badge turns on
+// exactly when it can. A change to the sealing scheme is meant to fail here.
+const (
+	digestReadinessSecret    = "test-session-secret-at-least-32-bytes-long"
+	sealedDigestReadinessMD5 = "v1:U9tCARRuQGmw48l6B2QaVwDFCp7hhDhe87DKpfj_jA4sLXAXXvBhq9nJQQxb4LxwcsN0e_LSJrohQK__"
+	sealedDigestReadinessSHA = "v1:6kpQrKv6Lywq9D0iLN8XgbFrv9Neebg9yj05fziCeuLt6T5vjUvsJ8SVYUx2m2gcNrG7MAucdNBej96shoWXw94fzKrnLlITkKi4_X98qSEjZDqn1GLJ4LRaZig"
+)
+
+// An app password gains its HA1 the first time it authenticates over Basic
+// after Digest is turned on, so the page has to say which have caught up. The
+// badge answers about what the credential can do now: it stays off entirely
+// while the scheme is disabled, it does not claim readiness for a value this
+// server cannot open (every stored value after APP_SESSION_SECRET is rotated),
+// and it is not shown for a credential that can no longer authenticate at all.
+func TestAppPasswordsPageReportsDigestReadiness(t *testing.T) {
+	md5HA1, sha256HA1 := sealedDigestReadinessMD5, sealedDigestReadinessSHA
+	unreadable := "v1:" + strings.Repeat("A", 64)
+	past := time.Now().Add(-time.Hour)
+	digestCfg := func(enabled bool) *config.Config {
+		cfg := &config.Config{BaseURL: "https://calcard.example/"}
+		cfg.Session.Secret = digestReadinessSecret
+		cfg.DAV.DigestEnabled = enabled
+		return cfg
+	}
+	const (
+		noBadge     = ""
+		digestReady = "Digest ready"
+		basicOnly   = "Basic only"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		cfg        *config.Config
+		wantBadges map[string]string
+	}{
+		{name: "enabled", cfg: digestCfg(true), wantBadges: map[string]string{
+			"ready-token":   digestReady,
+			"legacy-token":  basicOnly,
+			"rotated-token": basicOnly,
+			"expired-token": noBadge,
+			"revoked-token": noBadge,
+		}},
+		{name: "disabled", cfg: digestCfg(false), wantBadges: map[string]string{
+			"ready-token":   noBadge,
+			"legacy-token":  noBadge,
+			"rotated-token": noBadge,
+			"expired-token": noBadge,
+			"revoked-token": noBadge,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewHandler(tc.cfg, &store.Store{
+				AppPasswords: &fakeAppPasswordRepo{list: []store.AppPassword{
+					{ID: 1, Label: "ready-token", DigestMD5HA1: &md5HA1, DigestSHA256HA1: &sha256HA1},
+					{ID: 2, Label: "legacy-token"},
+					{ID: 3, Label: "rotated-token", DigestMD5HA1: &unreadable, DigestSHA256HA1: &unreadable},
+					{ID: 4, Label: "expired-token", ExpiresAt: &past},
+					{ID: 5, Label: "revoked-token", RevokedAt: &past},
+				}},
+			}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			req := httptest.NewRequest(http.MethodGet, "/app-passwords", nil)
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+			w := httptest.NewRecorder()
+
+			handler.AppPasswords(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("AppPasswords() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+			}
+			rows := appPasswordRowsByLabel(t, w.Body.String())
+			for label, want := range tc.wantBadges {
+				row, ok := rows[label]
+				if !ok {
+					t.Fatalf("no row for %s in %s", label, w.Body.String())
+				}
+				for _, badge := range []string{digestReady, basicOnly} {
+					if got := strings.Contains(row, badge); got != (badge == want) {
+						t.Errorf("%s shows %q = %v, want badge %q: %s", label, badge, got, want, row)
+					}
+				}
+			}
+		})
+	}
+}
+
+// appPasswordRowsByLabel splits the app passwords table into its rows, keyed by
+// the label each row leads with.
+func appPasswordRowsByLabel(t *testing.T, body string) map[string]string {
+	t.Helper()
+	rows := make(map[string]string)
+	for _, row := range strings.Split(body, "<tr>")[1:] {
+		row, _, _ = strings.Cut(row, "</tr>")
+		_, label, ok := strings.Cut(row, "<strong>")
+		if !ok {
+			continue
+		}
+		label, _, _ = strings.Cut(label, "</strong>")
+		rows[label] = row
+	}
+	return rows
+}
+
+// Revoking an app password has to reach the auth cache: a cache hit answers
+// without reading the database, so an entry left behind keeps the revoked
+// credential working for the rest of its lifetime. What the cache then does
+// with the call is auth.Service's own business and is covered there; this pins
+// the handler's half -- that the revocation happens and that the notification
+// is made even when no auth service is wired in, as the UI tests construct it.
+func TestRevokeAppPasswordRevokesAndNotifiesTheAuthService(t *testing.T) {
+	repo := &fakeAppPasswordRepo{list: []store.AppPassword{{ID: 7, UserID: 100, Label: "phone"}}}
+	handler := NewHandler(&config.Config{}, &store.Store{AppPasswords: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodPost, "/app-passwords/7", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "user@example.com"}))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "7")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+
+	handler.RevokeAppPassword(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("RevokeAppPassword() status = %d, want %d: %s", w.Code, http.StatusFound, w.Body.String())
+	}
+	if repo.revoked != 7 {
+		t.Fatalf("Revoke() was called for app password %d, want 7", repo.revoked)
 	}
 }
 
@@ -1300,7 +2213,7 @@ func TestDashboardBackfillsVisibleRecentEventsAfterFiltering(t *testing.T) {
 		Events:       &fakeEventRepo{recent: recent},
 		Contacts:     &fakeContactRepo{contacts: map[string]*store.Contact{}},
 		ACLEntries:   buildHiddenRecentEventACLs(25),
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -1342,7 +2255,7 @@ func TestDashboardShowsRecentEventsWithDirectObjectReadGrant(t *testing.T) {
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1/direct", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -1379,7 +2292,7 @@ func TestCalendarEventJSONHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -1408,7 +2321,7 @@ func TestCalendarEventJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 			},
 		},
 		Events: &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -1422,6 +2335,115 @@ func TestCalendarEventJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 	}
 	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
 		t.Fatalf("expected empty JSON array, got %s", body)
+	}
+}
+
+func TestCalendarEventJSONSupportsExplicitDateRange(t *testing.T) {
+	inRange := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC)
+
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:in":  {CalendarID: 1, UID: "in", ResourceName: "in", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:in\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &inRange},
+			"1:out": {CalendarID: 1, UID: "out", ResourceName: "out", RawICAL: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:out\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", DTStart: &outOfRange},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-03-01&end=2026-04-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"uid":"in"`) {
+		t.Fatalf("expected in-range event in JSON response, got %s", body)
+	}
+	if strings.Contains(body, `"uid":"out"`) {
+		t.Fatalf("expected out-of-range event to be omitted, got %s", body)
+	}
+}
+
+// RFC 5545 section 3.1 lets a quoted parameter value hold a colon, and Exchange
+// writes zone names such as "(UTC-05:00) Eastern" as TZIDs. The value of such a
+// line starts at the first colon outside the quotes; split at the first colon
+// of all, the property loses its value and its parameter.
+func TestCalendarEventJSONReadsQuotedParameterColons(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:exchange\r\n" +
+		"DTSTART;TZID=\"(UTC-05:00) Eastern\":20240108T090000\r\n" +
+		"DTEND;TZID=\"(UTC-05:00) Eastern\":20240108T100000\r\n" +
+		"ATTENDEE;CN=\"Doe: Jane\":mailto:jane@example.com\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:exchange": {CalendarID: 1, UID: "exchange", ResourceName: "exchange", RawICAL: raw},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2024-01-01&end=2024-02-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var events []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &events); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want the January event: %s", len(events), w.Body.String())
+	}
+	event := events[0]
+	if event["timezone"] != "(UTC-05:00) Eastern" {
+		t.Errorf("timezone = %v, want the quoted TZID", event["timezone"])
+	}
+	for _, key := range []string{"dtstart", "dtend"} {
+		if value, _ := event[key].(string); !strings.HasPrefix(value, "2024-01-08T") {
+			t.Errorf("%s = %v, want 8 January 2024", key, event[key])
+		}
+	}
+	attendees, _ := event["attendees"].([]any)
+	if len(attendees) != 1 || attendees[0] != "Doe: Jane <jane@example.com>" {
+		t.Errorf("attendees = %v, want the quoted CN and the address", event["attendees"])
+	}
+}
+
+func TestCalendarEventJSONRejectsInvalidDateRange(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			accessible: map[string]*store.CalendarAccess{
+				"1:100": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}, Editor: true},
+			},
+		},
+		Events: &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?start=2026-04-01&end=2026-03-01", nil)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GetCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 
@@ -1447,7 +2469,7 @@ func TestExportCalendarDownloadsReadableEventsAsICS(t *testing.T) {
 				RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-2\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
 	req = withRouteID(req, "1")
@@ -1499,7 +2521,7 @@ func TestExportCalendarHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/export", nil)
 	req = withRouteID(req, "1")
@@ -1539,7 +2561,7 @@ func TestCalendarEventJSONIncludesImportedTimezoneEventForSourceMonth(t *testing
 				DTStart: &storedStart,
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -1592,7 +2614,7 @@ func TestCalendarEventJSONIncludesAppleImportedCurrentMonthEvents(t *testing.T) 
 					"BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -1636,7 +2658,7 @@ func TestCalendarEventJSONIgnoresTimezoneRRuleWhenFilteringMonth(t *testing.T) {
 					"DTSTART;TZID=America/Chicago:20260415T174500\r\nDTEND;TZID=America/Chicago:20260415T184500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -1653,11 +2675,47 @@ func TestCalendarEventJSONIgnoresTimezoneRRuleWhenFilteringMonth(t *testing.T) {
 	}
 }
 
+// A series is left out of a window only once no occurrence can fall in it. A
+// DATE UNTIL is inclusive of its day, and a UTC UNTIL is an instant whose date
+// the viewer may see up to fourteen hours later: a 09:00 Auckland occurrence
+// on 1 March is 20:00 UTC on 28 February.
+func TestFilterEventsForMonthKeepsSeriesUntilTheirLastDay(t *testing.T) {
+	series := func(dtstart, rrule string) store.Event {
+		return store.Event{RawICAL: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\n" + dtstart + "\r\nRRULE:" + rrule + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"}
+	}
+	monthStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Nanosecond)
+	tests := []struct {
+		name  string
+		event store.Event
+		want  bool
+	}{
+		{"timed series with a DATE UNTIL on the first day", series("DTSTART:20260105T090000Z", "FREQ=DAILY;UNTIL=20260301"), true},
+		// The UNTIL's day lasts through 23:59:59Z, which a viewer east of UTC
+		// sees on this date.
+		{"UTC series with a DATE UNTIL the day before", series("DTSTART:20260105T090000Z", "FREQ=DAILY;UNTIL=20260228"), true},
+		{"UTC series with a DATE UNTIL two days before", series("DTSTART:20260105T090000Z", "FREQ=DAILY;UNTIL=20260227"), false},
+		{"UTC UNTIL on the previous UTC date but this date east of UTC", series("DTSTART;TZID=Pacific/Auckland:20260201T090000", "FREQ=DAILY;UNTIL=20260228T200000Z"), true},
+		{"UTC UNTIL the UI writes for the last day", series("DTSTART;TZID=Europe/Berlin:20260105T090000", "FREQ=WEEKLY;UNTIL=20260301T225959Z;BYDAY=SU"), true},
+		{"UTC UNTIL no zone sees in the window", series("DTSTART:20260105T090000Z", "FREQ=DAILY;UNTIL=20260227T090000Z"), false},
+		{"floating UNTIL on the first day", series("DTSTART:20260105T090000", "FREQ=DAILY;UNTIL=20260301T090000"), true},
+		{"floating UNTIL the day before", series("DTSTART:20260105T090000", "FREQ=DAILY;UNTIL=20260228T090000"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := len(filterEventsForMonth([]store.Event{tt.event}, monthStart, monthEnd)) == 1
+			if got != tt.want {
+				t.Errorf("filterEventsForMonth() kept = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCalendarEventJSONPrefersRawTimezoneDateOverStoredDate(t *testing.T) {
 	storedStart := time.Date(2026, 4, 14, 19, 15, 0, 0, time.UTC)
 	storedEnd := time.Date(2026, 4, 14, 19, 55, 0, 0, time.UTC)
 
-	payload := calendarEventJSON(store.Event{
+	event := store.Event{
 		CalendarID:   1,
 		UID:          "apple-timezone",
 		ResourceName: "apple-timezone.ics",
@@ -1665,7 +2723,8 @@ func TestCalendarEventJSONPrefersRawTimezoneDateOverStoredDate(t *testing.T) {
 			"DTSTART;TZID=America/Chicago:20260414T191500\r\nDTEND;TZID=America/Chicago:20260414T195500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 		DTStart: &storedStart,
 		DTEnd:   &storedEnd,
-	})
+	}
+	payload := unfoldedEventJSON(unfoldedEvent{event: event, lines: utils.UnfoldLines(event.RawICAL)}, time.Time{}, time.Time{}, nil, nil)
 
 	if got := payload["dtstart"]; got != "2026-04-15T00:15:00Z" {
 		t.Fatalf("dtstart = %v, want raw timezone-adjusted time", got)
@@ -1696,7 +2755,7 @@ func TestCalendarEventJSONIncludesCrossMonthEventForEndMonth(t *testing.T) {
 				DTEnd:   &end,
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=4", nil)
 	req = withRouteID(req, "1")
@@ -1736,7 +2795,7 @@ func TestCalendarEventJSONIncludesServerDateFields(t *testing.T) {
 				AllDay:       false,
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -1785,7 +2844,7 @@ func TestCalendarEventJSONIncludesParsedICalMetadata(t *testing.T) {
 				DTEnd:   &end,
 			},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/1/events.json?year=2026&month=3", nil)
 	req = withRouteID(req, "1")
@@ -1839,7 +2898,7 @@ func TestAllCalendarEventsJSONHidesDeniedEvents(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
 			{ResourcePath: "/dav/calendars/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
@@ -1865,7 +2924,7 @@ func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Empty"}, Shared: false, Editor: true},
 		}},
 		Events: &fakeEventRepo{events: map[string]*store.Event{}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=4", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
@@ -1878,6 +2937,437 @@ func TestAllCalendarEventsJSONReturnsEmptyArrayWhenNoEventsMatch(t *testing.T) {
 	}
 	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
 		t.Fatalf("expected empty JSON array, got %s", body)
+	}
+}
+
+func TestAllCalendarEventsJSONSupportsDateRangeAndCapabilities(t *testing.T) {
+	inRange := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	// 09:00Z on 4 August is 3 August in the far west and 4 August further
+	// east, so no viewer sees it in a range ending with 2 August.
+	outOfRange := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Work"}},
+		}},
+		Events: &fakeEventRepo{events: map[string]*store.Event{
+			"1:included": {
+				CalendarID:   1,
+				UID:          "included",
+				ResourceName: "included",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:included\r\nSUMMARY:Included\r\nDTSTART:20260801T090000Z\r\nDTEND:20260801T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart:      &inRange,
+			},
+			"1:excluded": {
+				CalendarID:   1,
+				UID:          "excluded",
+				ResourceName: "excluded",
+				RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:excluded\r\nSUMMARY:Excluded\r\nDTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+				DTStart:      &outOfRange,
+			},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-07-27&end=2026-08-03", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload) != 1 || payload[0]["uid"] != "included" {
+		t.Fatalf("GetAllCalendarEventsJSON() payload = %#v, want only included event", payload)
+	}
+	for _, key := range []string{"canEdit", "canDelete", "canMove"} {
+		if value, ok := payload[0][key].(bool); !ok || !value {
+			t.Fatalf("event capability %q = %#v, want true", key, payload[0][key])
+		}
+	}
+}
+
+func TestAllCalendarEventsJSONRejectsInvalidDateRange(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{},
+		Events:    &fakeEventRepo{events: map[string]*store.Event{}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?start=2026-08-01&end=2026-07-31", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// runAllCalendarEventsForCount drives GetAllCalendarEventsJSON against a single
+// shared calendar populated with eventCount in-window events and returns the fake
+// ACL repository (for call-count inspection) and the number of events in the
+// response body.
+func runAllCalendarEventsForCount(t *testing.T, eventCount int) (*fakeACLRepo, int) {
+	t.Helper()
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	events := make(map[string]*store.Event, eventCount)
+	for i := 0; i < eventCount; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return aclRepo, len(payload)
+}
+
+func TestAllCalendarEventsJSONBatchesSharedCalendarACLLookups(t *testing.T) {
+	small, retSmall := runAllCalendarEventsForCount(t, 10)
+	large, retLarge := runAllCalendarEventsForCount(t, 100)
+
+	for _, tc := range []struct {
+		name string
+		repo *fakeACLRepo
+	}{{"small", small}, {"large", large}} {
+		if tc.repo.listByResourceCalls != 0 {
+			t.Errorf("%s: expected no per-candidate ListByResource calls, got %d", tc.name, tc.repo.listByResourceCalls)
+		}
+		if tc.repo.listByPrincipalCalls != 0 {
+			t.Errorf("%s: expected no whole-principal ListByPrincipal sweeps, got %d", tc.name, tc.repo.listByPrincipalCalls)
+		}
+	}
+	if small.listByResourcesAndPrincipalsCalls != large.listByResourcesAndPrincipalsCalls {
+		t.Fatalf("scoped ACL batch calls scaled with event count: small=%d large=%d",
+			small.listByResourcesAndPrincipalsCalls, large.listByResourcesAndPrincipalsCalls)
+	}
+	if small.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch per shared calendar, got %d", small.listByResourcesAndPrincipalsCalls)
+	}
+	if retSmall != 10 || retLarge != 100 {
+		t.Fatalf("returned events small=%d large=%d, want 10 and 100", retSmall, retLarge)
+	}
+}
+
+func TestAllCalendarEventsJSONOwnedCalendarSkipsACLLookups(t *testing.T) {
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	events := make(map[string]*store.Event, 20)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	aclRepo := &fakeACLRepo{}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Owned"}},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 || aclRepo.listByResourcesAndPrincipalsCalls != 0 {
+		t.Fatalf("owned calendar made ACL repository calls: resource=%d principal=%d batched=%d",
+			aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls, aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+}
+
+func TestAllCalendarEventsJSONWindowFilteringKeepsACLCallsConstant(t *testing.T) {
+	inRange := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC)
+	events := map[string]*store.Event{}
+	for i := 0; i < 30; i++ {
+		when := inRange
+		if i%2 == 0 {
+			when = outOfRange
+		}
+		name := fmt.Sprintf("ev-%d", i)
+		events[fmt.Sprintf("1:%s", name)] = &store.Event{
+			CalendarID:   1,
+			UID:          name,
+			ResourceName: name,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + name + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &when,
+		}
+	}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload) != 15 {
+		t.Fatalf("returned %d events, want 15 in-window events", len(payload))
+	}
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 {
+		t.Fatalf("expected no unscoped ACL reads, got resource=%d principal=%d", aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls)
+	}
+	if aclRepo.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch, got %d", aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+
+	// The ACL prefetch must be scoped to the requested window: out-of-window
+	// events must not contribute resource paths to the batch query.
+	prefetched := make(map[string]bool, len(aclRepo.batchedResourcePaths))
+	for _, path := range aclRepo.batchedResourcePaths {
+		prefetched[path] = true
+	}
+	for i := 0; i < 30; i++ {
+		name := fmt.Sprintf("ev-%d", i)
+		path := "/dav/calendars/1/" + name
+		if i%2 == 0 { // out-of-window events
+			if prefetched[path] {
+				t.Errorf("out-of-window event %q was included in the ACL prefetch", name)
+			}
+		} else if !prefetched[path] {
+			t.Errorf("in-window event %q was missing from the ACL prefetch", name)
+		}
+	}
+}
+
+func TestAllCalendarEventsJSONPerResourceCapabilities(t *testing.T) {
+	start := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	mkEvent := func(uid, resourceName string) *store.Event {
+		return &store.Event{
+			CalendarID:   1,
+			UID:          uid,
+			ResourceName: resourceName,
+			RawICAL:      "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:" + uid + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			DTStart:      &start,
+		}
+	}
+	events := map[string]*store.Event{
+		"1:full":        mkEvent("full", "full"),
+		"1:read-denied": mkEvent("read-denied", "read-denied"),
+		"1:edit-denied": mkEvent("edit-denied", "edit-denied"),
+		"1:del-denied":  mkEvent("del-denied", "del-denied"),
+		"1:both-denied": mkEvent("both-denied", "both-denied"),
+		"1:meeting":     mkEvent("meeting", "meeting.ics"),
+	}
+	const principal = "/dav/principals/100/"
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		// The collection grants read, write, bind, and unbind, so an event is editable and
+		// deletable unless a resource-level deny overrides that grant. This is
+		// what makes the deny assertions below meaningful: a regression that
+		// ignored resource denies would fall back to these grants and pass a
+		// missing-grant test, but not this one.
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "write"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "bind"},
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: principal, IsGrant: true, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/1/read-denied", PrincipalHref: principal, IsGrant: false, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1/edit-denied", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/1/del-denied", PrincipalHref: principal, IsGrant: false, Privilege: "unbind"},
+		{ResourcePath: "/dav/calendars/1/both-denied", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/1/both-denied", PrincipalHref: principal, IsGrant: false, Privilege: "unbind"},
+		// A deny at the state path of the event named "meeting.ics", and one at
+		// the path of a "full.ics" no event has, which "full" does not read.
+		{ResourcePath: "/dav/calendars/1/meeting.ics", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+		{ResourcePath: "/dav/calendars/1/full.ics", PrincipalHref: principal, IsGrant: false, Privilege: "write-content"},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true},
+		}},
+		Events:     &fakeEventRepo{events: events},
+		ACLEntries: aclRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all/events.json?year=2026&month=3", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "delegate@example.com"}))
+	w := httptest.NewRecorder()
+	handler.GetAllCalendarEventsJSON(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetAllCalendarEventsJSON() status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	byUID := make(map[string]map[string]any, len(payload))
+	for _, item := range payload {
+		uid, _ := item["uid"].(string)
+		byUID[uid] = item
+	}
+
+	if _, ok := byUID["read-denied"]; ok {
+		t.Fatalf("resource-level read deny did not hide event: %#v", byUID["read-denied"])
+	}
+
+	want := map[string]struct{ canEdit, canDelete, canMove bool }{
+		"full":        {true, true, true},   // collection write grant
+		"edit-denied": {false, true, false}, // explicit write-content deny over collection write
+		"del-denied":  {true, false, false}, // explicit unbind deny over collection write
+		"both-denied": {false, false, false},
+		"meeting":     {false, true, false}, // write-content deny at its own path, "meeting.ics"
+	}
+	for uid, expected := range want {
+		item, ok := byUID[uid]
+		if !ok {
+			t.Fatalf("event %q missing from response", uid)
+		}
+		if got := item["canEdit"].(bool); got != expected.canEdit {
+			t.Errorf("event %q canEdit = %v, want %v", uid, got, expected.canEdit)
+		}
+		if got := item["canDelete"].(bool); got != expected.canDelete {
+			t.Errorf("event %q canDelete = %v, want %v", uid, got, expected.canDelete)
+		}
+		if got := item["canMove"].(bool); got != expected.canMove {
+			t.Errorf("event %q canMove = %v, want %v", uid, got, expected.canMove)
+		}
+	}
+
+	if aclRepo.listByResourceCalls != 0 || aclRepo.listByPrincipalCalls != 0 {
+		t.Fatalf("expected no unscoped ACL reads, got resource=%d principal=%d", aclRepo.listByResourceCalls, aclRepo.listByPrincipalCalls)
+	}
+	if aclRepo.listByResourcesAndPrincipalsCalls != 1 {
+		t.Fatalf("expected exactly one scoped ACL batch, got %d", aclRepo.listByResourcesAndPrincipalsCalls)
+	}
+}
+
+// canCreate gates both the new-event button and the move destinations the
+// editor offers, so a calendar that does not accept VEVENT has to be excluded
+// there as well as refused at the handler. Offering a destination the server
+// will then reject is a dead end the user has no way to see coming.
+func TestViewAllCalendarsExcludesCalendarsThatDoNotAcceptEvents(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Events"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			{
+
+				Calendar:           store.Calendar{ID: 2, UserID: 100, Name: "Tasks", SupportedComponents: []string{"VTODO"}},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewAllCalendars(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewAllCalendars() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"name":"Events","color":"`) || !strings.Contains(body, `"canCreate":true`) {
+		t.Fatalf("the event calendar was not offered: %s", body)
+	}
+	tasks := strings.Index(body, `"name":"Tasks"`)
+	if tasks < 0 {
+		t.Fatalf("the task list is missing from the calendar metadata: %s", body)
+	}
+	if !strings.Contains(body[tasks:], `"canCreate":false`) {
+		t.Fatalf("a calendar that does not accept events was offered as a destination: %s", body[tasks:])
+	}
+}
+
+func TestViewAllCalendarsIncludesWritableCalendarMetadata(t *testing.T) {
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{listAccessible: []store.CalendarAccess{
+			{
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Owned"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			{
+				Calendar:           store.Calendar{ID: 2, UserID: 200, Name: "Read only"},
+				Shared:             true,
+				Privileges:         store.CalendarPrivileges{Read: true},
+				PrivilegesResolved: true,
+			},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/calendars/all", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.ViewAllCalendars(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewAllCalendars() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"canCreate":true`) || !strings.Contains(body, `"canCreate":false`) {
+		t.Fatalf("ViewAllCalendars() missing writable metadata: %s", body)
+	}
+	for _, marker := range []string{
+		`data-view="day"`,
+		`data-view="week"`,
+		`id="time-grid-view"`,
+		`id="event-editor-modal"`,
+		`name="destination_calendar_id"`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("ViewAllCalendars() missing interactive UI marker %q", marker)
+		}
 	}
 }
 
@@ -1898,7 +3388,7 @@ func TestShareCalendarStoresACLEntries(t *testing.T) {
 		Users:      userRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"user_id": {"200"}}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
@@ -1953,7 +3443,7 @@ func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -1981,7 +3471,7 @@ func TestUnshareCalendarRemovesACLEntries(t *testing.T) {
 	}
 }
 
-func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
+func TestUnshareCalendarLeaveRevokesOwnGrantsAndKeepsOtherACLs(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		accessible: map[string]*store.CalendarAccess{
 			"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true, Editor: true},
@@ -2001,7 +3491,7 @@ func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
 	}
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -2025,12 +3515,34 @@ func TestUnshareCalendarAllowsSharedUserToLeave(t *testing.T) {
 		t.Fatalf("unexpected ACL entries after leave: %#v", entries)
 	}
 
+	assertDescendantGrantRevoked(t, aclRepo)
+}
+
+// assertDescendantGrantRevoked checks that leaving a calendar takes the
+// departing principal's grant on a member resource with it — otherwise the
+// event stays readable to them indefinitely — while their deny and every other
+// principal's entries survive.
+func assertDescendantGrantRevoked(t *testing.T, aclRepo *fakeACLRepo) {
+	t.Helper()
 	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
 	if err != nil {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
-	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
-		t.Fatalf("expected descendant ACLs for leaving user to be deleted, got %#v", descendantEntries)
+	want := map[string]struct{}{
+		"/dav/principals/200/:false:write-content": {},
+		"/dav/principals/300/:true:read":           {},
+	}
+	got := map[string]struct{}{}
+	for _, entry := range descendantEntries {
+		got[fmt.Sprintf("%s:%t:%s", entry.PrincipalHref, entry.IsGrant, entry.Privilege)] = struct{}{}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("descendant ACLs after unshare = %#v, want only the deny and the other principal's grant", descendantEntries)
+	}
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("descendant ACL %q was removed: %#v", key, descendantEntries)
+		}
 	}
 }
 
@@ -2056,7 +3568,7 @@ func TestShareCalendarPreservesCustomPrincipalACLs(t *testing.T) {
 		Calendars:  calRepo,
 		Users:      userRepo,
 		ACLEntries: aclRepo,
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := url.Values{"user_id": {"200"}}
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares", strings.NewReader(form.Encode()))
@@ -2095,7 +3607,7 @@ func TestShareCalendarPreservesCustomPrincipalACLs(t *testing.T) {
 	}
 }
 
-func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
+func TestUnshareCalendarRemovesOnlyManagedCollectionGrants(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		calendars: map[int64]*store.Calendar{
 			1: {ID: 1, UserID: 100, Name: "Work"},
@@ -2117,7 +3629,7 @@ func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -2138,19 +3650,24 @@ func TestUnshareCalendarRemovesAllPrincipalACLs(t *testing.T) {
 		t.Fatalf("ListByResource() error = %v", err)
 	}
 
+	got := map[string]struct{}{}
 	for _, entry := range entries {
 		if entry.PrincipalHref == "/dav/principals/200/" {
-			t.Fatalf("expected all ACLs for removed principal to be deleted, got %#v", entries)
+			got[fmt.Sprintf("%t:%s", entry.IsGrant, entry.Privilege)] = struct{}{}
+		}
+	}
+	for _, want := range []string{"true:read-acl", "false:write-content"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("expected custom ACL %q to remain, got %#v", want, entries)
+		}
+	}
+	for _, removed := range []string{"true:read", "true:read-free-busy", "true:write"} {
+		if _, ok := got[removed]; ok {
+			t.Fatalf("expected managed ACL %q to be removed, got %#v", removed, entries)
 		}
 	}
 
-	descendantEntries, err := aclRepo.ListByResource(context.Background(), "/dav/calendars/1/private-event")
-	if err != nil {
-		t.Fatalf("ListByResource() error = %v", err)
-	}
-	if len(descendantEntries) != 1 || descendantEntries[0].PrincipalHref != "/dav/principals/300/" {
-		t.Fatalf("expected descendant ACLs for removed principal to be deleted, got %#v", descendantEntries)
-	}
+	assertDescendantGrantRevoked(t, aclRepo)
 }
 
 func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
@@ -2165,12 +3682,12 @@ func TestUnshareCalendarPreservesACLsWhenRepositoryRemovalFails(t *testing.T) {
 			{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "write-content"},
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
 		},
-		deletePrincipalEntriesByResourcePrefixErr: errors.New("boom"),
+		setACLErr: errors.New("boom"),
 	}
 	handler := NewHandler(&config.Config{}, &store.Store{
 		Calendars:  calRepo,
 		ACLEntries: aclRepo,
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
 	rctx := chi.NewRouteContext()
@@ -2211,7 +3728,7 @@ func TestCalendarShareViewsIncludePrincipalsWithCustomAccess(t *testing.T) {
 		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
 			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind"},
 		}},
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
 	if err != nil {
@@ -2222,6 +3739,181 @@ func TestCalendarShareViewsIncludePrincipalsWithCustomAccess(t *testing.T) {
 	}
 	if !shares[0].Editor {
 		t.Fatalf("expected bind grant to be treated as editable access, got %#v", shares)
+	}
+}
+
+// A grant naming the user by its principal href without the trailing slash
+// is the user's, as every decider reads it, so the share list shows it.
+func TestCalendarShareViewsIncludeAGrantToTheSlashlessPrincipalHref(t *testing.T) {
+	userMap := map[int64]store.User{
+		200: {ID: 200, PrimaryEmail: "delegate@example.com"},
+	}
+	h := NewHandler(&config.Config{}, &store.Store{
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200", IsGrant: true, Privilege: "read"},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
+	if err != nil {
+		t.Fatalf("calendarShareViews() error = %v", err)
+	}
+	if len(shares) != 1 || shares[0].User.ID != 200 || shares[0].Editor {
+		t.Fatalf("calendarShareViews() = %#v, want a read-only share with user 200", shares)
+	}
+}
+
+// An import decides whether a user holding grants only on events may import
+// from one read of the user's entries, whichever href spelling names them.
+func TestCalendarImportAccessReadsTheUsersEntriesOnce(t *testing.T) {
+	user := &store.User{ID: 200}
+	repo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1/event", PrincipalHref: "/dav/principals/200", IsGrant: true, Privilege: "write-content"},
+	}}
+	h := NewHandler(&config.Config{}, &store.Store{ACLEntries: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 100}, PrivilegesResolved: true}
+
+	access, err := h.calendarImportAccess(context.Background(), user, cal)
+	if err != nil {
+		t.Fatalf("calendarImportAccess() error = %v", err)
+	}
+	if access != importPerEvent {
+		t.Fatalf("calendarImportAccess() = %v, want per-event access from the slashless grant", access)
+	}
+	if repo.listByPrincipalsCalls != 1 || repo.listByPrincipalCalls != 0 {
+		t.Fatalf("calendarImportAccess read the user's entries in %d ListByPrincipals and %d ListByPrincipal calls, want one query", repo.listByPrincipalsCalls, repo.listByPrincipalCalls)
+	}
+}
+
+func TestCalendarShareViewsHonorsOrderedDeny(t *testing.T) {
+	userMap := map[int64]store.User{
+		200: {ID: 200, PrimaryEmail: "delegate@example.com"},
+	}
+	h := NewHandler(&config.Config{}, &store.Store{
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ID: 2, ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "bind", Position: 2},
+			{ID: 1, ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "all", Position: 1},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	shares, err := h.calendarShareViews(context.Background(), 1, userMap)
+	if err != nil {
+		t.Fatalf("calendarShareViews() error = %v", err)
+	}
+	if len(shares) != 0 {
+		t.Fatalf("expected effective deny to hide principal from share list, got %#v", shares)
+	}
+}
+
+// An event's decision reads the entries at its own state path only: the
+// event named event.ics is decided by the entries at /event.ics, and those at
+// /event belong to the event named event, whatever their positions.
+func TestDecideCalendarPrivilegeReadsOnlyTheEventsOwnPath(t *testing.T) {
+	user := &store.User{ID: 200}
+	cal := &store.CalendarAccess{Calendar: store.Calendar{ID: 1, UserID: 100}}
+
+	tests := []struct {
+		name    string
+		entries map[string][]store.ACLEntry
+		want    bool
+	}{
+		{
+			name: "own grant beside a sibling's earlier deny",
+			entries: map[string][]store.ACLEntry{
+				"/dav/calendars/1/event.ics": {{ID: 2, PrincipalHref: "DAV:authenticated", IsGrant: true, Privilege: "read", Position: 2}},
+				"/dav/calendars/1/event":     {{ID: 1, PrincipalHref: "/dav/principals/200/", IsGrant: false, Privilege: "read", Position: 1}},
+			},
+			want: true,
+		},
+		{
+			name: "own deny beside a sibling's earlier grant",
+			entries: map[string][]store.ACLEntry{
+				"/dav/calendars/1/event.ics": {{ID: 2, PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 2}},
+				"/dav/calendars/1/event":     {{ID: 1, PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1}},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decideCalendarPrivilege(user, cal, "/dav/calendars/1/event.ics", "read", func(candidate string) ([]store.ACLEntry, error) {
+				return tt.entries[candidate], nil
+			})
+			if err != nil {
+				t.Fatalf("decideCalendarPrivilege() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("decideCalendarPrivilege() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+// Leaving only ever takes the leaver's own grants, which cannot widen anyone's
+// access, so it has no precondition to check. A sharee whose collection grant
+// is already gone -- or never took effect -- still holds whatever per-event
+// grants the share left, and leaving is the one way they have to shed them.
+func TestUnshareCalendarLeaveSucceedsWithoutAnEffectiveCollectionShare(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []store.ACLEntry
+	}{
+		{
+			name: "only per-event grants left",
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read", Position: 2},
+			},
+		},
+		{
+			name: "collection grant shadowed by an earlier deny",
+			entries: []store.ACLEntry{
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "DAV:authenticated", IsGrant: false, Privilege: "read", Position: 1},
+				{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 2},
+				{ResourcePath: "/dav/calendars/1/private-event", PrincipalHref: "/dav/principals/200/", IsGrant: true, Privilege: "read", Position: 1},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{
+				accessible: map[string]*store.CalendarAccess{
+					"1:200": {Calendar: store.Calendar{ID: 1, UserID: 100, Name: "Shared"}, Shared: true},
+				},
+			}
+			aclRepo := &fakeACLRepo{entries: append([]store.ACLEntry(nil), tt.entries...)}
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, ACLEntries: aclRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/shares/200/delete", nil)
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			rctx.URLParams.Add("userId", "200")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 200}))
+			w := httptest.NewRecorder()
+			handler.UnshareCalendar(w, req)
+
+			if w.Code != http.StatusFound {
+				t.Fatalf("UnshareCalendar() status = %d, want %d", w.Code, http.StatusFound)
+			}
+			if location := w.Header().Get("Location"); location != "/calendars?status=calendar_updated" {
+				t.Fatalf("leave redirected to %q, want a successful leave", location)
+			}
+			for _, entry := range aclRepo.entries {
+				if entry.IsGrant && entry.PrincipalHref == "/dav/principals/200/" {
+					t.Fatalf("leave kept the leaver's grant %#v", entry)
+				}
+			}
+			for _, want := range tt.entries {
+				if want.PrincipalHref == "/dav/principals/200/" {
+					continue
+				}
+				if !slices.Contains(aclRepo.entries, want) {
+					t.Fatalf("leave removed %#v, which is not the leaver's", want)
+				}
+			}
+		})
 	}
 }
 
@@ -2356,15 +4048,16 @@ func (f *fakeCalendarRepo) Update(ctx context.Context, userID, id int64, name st
 	return nil
 }
 
-func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, name string, description, timezone, color *string) error {
+func (f *fakeCalendarRepo) UpdateProperties(ctx context.Context, id int64, props store.CalendarProperties) error {
 	cal, ok := f.calendars[id]
 	if !ok {
 		return store.ErrNotFound
 	}
-	cal.Name = name
-	cal.Description = description
-	cal.Timezone = timezone
-	cal.Color = color
+	cal.Name = props.Name
+	cal.Description = props.Description
+	cal.DescriptionLang = props.DescriptionLang
+	cal.Timezone = props.Timezone
+	cal.Color = props.Color
 	return nil
 }
 
@@ -2379,6 +4072,7 @@ func (f *fakeCalendarRepo) Delete(ctx context.Context, userID, id int64) error {
 type fakeEventRepo struct {
 	events map[string]*store.Event
 	recent []store.Event
+	moves  []string
 }
 
 func (f *fakeEventRepo) key(calendarID int64, uid string) string {
@@ -2418,6 +4112,20 @@ func (f *fakeEventRepo) GetByResourceName(ctx context.Context, calendarID int64,
 	return nil, nil
 }
 
+func (f *fakeEventRepo) ListByResourceNames(ctx context.Context, calendarID int64, resourceNames []string) ([]store.Event, error) {
+	var out []store.Event
+	for _, name := range resourceNames {
+		ev, err := f.GetByResourceName(ctx, calendarID, name)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			out = append(out, *ev)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
 	var result []store.Event
 	for _, ev := range f.events {
@@ -2430,6 +4138,34 @@ func (f *fakeEventRepo) ListForCalendar(ctx context.Context, calendarID int64) (
 
 func (f *fakeEventRepo) ListForCalendarFiltered(ctx context.Context, calendarID int64, _ store.EventFilter) ([]store.Event, error) {
 	return f.ListForCalendar(ctx, calendarID)
+}
+
+func (f *fakeEventRepo) ListForCalendarPageAfter(ctx context.Context, calendarID, afterID int64, limit int, filter store.EventFilter) ([]store.Event, error) {
+	events, err := f.ListForCalendarFiltered(ctx, calendarID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var result []store.Event
+	for _, event := range events {
+		if event.ID > afterID {
+			result = append(result, event)
+		}
+	}
+	return truncateToLimit(result, limit), nil
+}
+
+// truncateToLimit mirrors what every paged repository in internal/store does
+// with limit: a non-positive one reads nothing, which is the guard each
+// PostgreSQL implementation opens with. A fake reading it as "no limit" instead
+// would answer in full where storage answers with nothing.
+func truncateToLimit[T any](rows []T, limit int) []T {
+	if limit <= 0 {
+		return nil
+	}
+	if len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
 }
 
 func (f *fakeEventRepo) ListForCalendarPaginated(ctx context.Context, calendarID int64, limit, offset int) (*store.PaginatedResult[store.Event], error) {
@@ -2446,8 +4182,8 @@ func (f *fakeEventRepo) ListByUIDs(ctx context.Context, calendarID int64, uids [
 	return nil, nil
 }
 
-func (f *fakeEventRepo) ListModifiedSince(ctx context.Context, calendarID int64, since time.Time) ([]store.Event, error) {
-	return nil, nil
+func (f *fakeEventRepo) ListChangesAfter(ctx context.Context, collectionID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Event], error) {
+	return store.SyncChanges[store.Event]{Last: after}, nil
 }
 
 func (f *fakeEventRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Event, error) {
@@ -2466,10 +4202,18 @@ func (f *fakeEventRepo) MaxLastModified(ctx context.Context, calendarID int64) (
 	return time.Time{}, nil
 }
 func (f *fakeEventRepo) MoveToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName string) error {
+	key := f.key(fromCalendarID, uid)
+	event := f.events[key]
+	if event == nil {
+		return store.ErrNotFound
+	}
+	delete(f.events, key)
+	copy := *event
+	copy.CalendarID = toCalendarID
+	copy.ResourceName = destResourceName
+	f.events[f.key(toCalendarID, uid)] = &copy
+	f.moves = append(f.moves, fmt.Sprintf("%d:%d:%s", fromCalendarID, toCalendarID, uid))
 	return nil
-}
-func (f *fakeEventRepo) CopyToCalendar(ctx context.Context, fromCalendarID, toCalendarID int64, uid, destResourceName, newETag string) (*store.Event, error) {
-	return nil, nil
 }
 
 type fakeAddressBookRepo struct {
@@ -2518,6 +4262,41 @@ type fakeContactRepo struct {
 	contacts map[string]*store.Contact
 }
 
+type fakeDeadPropertyRepo struct {
+	properties map[string][]store.DeadProperty
+}
+
+func (f *fakeDeadPropertyRepo) ListByResources(_ context.Context, resourcePaths []string) ([]store.DeadProperty, error) {
+	var result []store.DeadProperty
+	for _, resourcePath := range resourcePaths {
+		result = append(result, f.properties[resourcePath]...)
+	}
+	return result, nil
+}
+
+func (f *fakeDeadPropertyRepo) Apply(_ context.Context, resourcePath string, mutations []store.DeadPropertyMutation) error {
+	properties := f.properties[resourcePath]
+	for _, mutation := range mutations {
+		filtered := properties[:0]
+		for _, property := range properties {
+			if property.NamespaceURI != mutation.NamespaceURI || property.LocalName != mutation.LocalName {
+				filtered = append(filtered, property)
+			}
+		}
+		properties = filtered
+		if !mutation.Remove {
+			properties = append(properties, store.DeadProperty{
+				ResourcePath: resourcePath,
+				NamespaceURI: mutation.NamespaceURI,
+				LocalName:    mutation.LocalName,
+				InnerXML:     mutation.InnerXML,
+			})
+		}
+	}
+	f.properties[resourcePath] = properties
+	return nil
+}
+
 func (f *fakeContactRepo) key(bookID int64, uid string) string {
 	return fmt.Sprintf("%d:%s", bookID, uid)
 }
@@ -2527,6 +4306,7 @@ func (f *fakeContactRepo) Upsert(ctx context.Context, contact store.Contact) (*s
 }
 
 func (f *fakeContactRepo) DeleteByUID(ctx context.Context, addressBookID int64, uid string) error {
+	delete(f.contacts, f.key(addressBookID, uid))
 	return nil
 }
 
@@ -2538,6 +4318,8 @@ func (f *fakeContactRepo) GetByUID(ctx context.Context, addressBookID int64, uid
 	return nil, nil
 }
 
+// ListForBook returns the book's contacts in the order the store lists them:
+// by display name, case-insensitively, then by ID.
 func (f *fakeContactRepo) ListForBook(ctx context.Context, addressBookID int64) ([]store.Contact, error) {
 	var result []store.Contact
 	for _, c := range f.contacts {
@@ -2545,6 +4327,15 @@ func (f *fakeContactRepo) ListForBook(ctx context.Context, addressBookID int64) 
 			result = append(result, *c)
 		}
 	}
+	displayName := func(c store.Contact) string {
+		if c.DisplayName == nil {
+			return ""
+		}
+		return strings.ToLower(*c.DisplayName)
+	}
+	slices.SortFunc(result, func(a, b store.Contact) int {
+		return cmp.Or(strings.Compare(displayName(a), displayName(b)), cmp.Compare(a.ID, b.ID))
+	})
 	return result, nil
 }
 
@@ -2554,8 +4345,12 @@ func (f *fakeContactRepo) ListForBookFiltered(ctx context.Context, addressBookID
 
 func (f *fakeContactRepo) ListForBookPaginated(ctx context.Context, addressBookID int64, limit, offset int) (*store.PaginatedResult[store.Contact], error) {
 	contacts, _ := f.ListForBook(ctx, addressBookID)
+	page := contacts[min(offset, len(contacts)):]
+	if limit > 0 && limit < len(page) {
+		page = page[:limit]
+	}
 	return &store.PaginatedResult[store.Contact]{
-		Items:      contacts,
+		Items:      page,
 		TotalCount: len(contacts),
 		Limit:      limit,
 		Offset:     offset,
@@ -2566,8 +4361,8 @@ func (f *fakeContactRepo) ListByUIDs(ctx context.Context, addressBookID int64, u
 	return nil, nil
 }
 
-func (f *fakeContactRepo) ListModifiedSince(ctx context.Context, addressBookID int64, since time.Time) ([]store.Contact, error) {
-	return nil, nil
+func (f *fakeContactRepo) ListChangesAfter(ctx context.Context, collectionID int64, after store.SyncCursor, removals bool, limit int) (store.SyncChanges[store.Contact], error) {
+	return store.SyncChanges[store.Contact]{Last: after}, nil
 }
 
 func (f *fakeContactRepo) ListRecentByUser(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
@@ -2578,7 +4373,7 @@ func (f *fakeContactRepo) MaxLastModified(ctx context.Context, addressBookID int
 	return time.Time{}, nil
 }
 
-func (f *fakeContactRepo) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
+func (f *fakeContactRepo) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
 	return nil, nil
 }
 
@@ -2601,6 +4396,19 @@ func (f *fakeContactRepo) GetByResourceName(ctx context.Context, addressBookID i
 	}
 	return nil, nil
 }
+func (f *fakeContactRepo) ListByResourceNames(ctx context.Context, addressBookID int64, resourceNames []string) ([]store.Contact, error) {
+	var out []store.Contact
+	for _, name := range resourceNames {
+		c, err := f.GetByResourceName(ctx, addressBookID, name)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
 func (f *fakeContactRepo) CopyToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName, newETag string) (*store.Contact, error) {
 	return nil, nil
 }
@@ -2609,7 +4417,10 @@ type fakeUserRepo struct {
 	users map[int64]*store.User
 }
 
-type fakeAppPasswordRepo struct{}
+type fakeAppPasswordRepo struct {
+	list    []store.AppPassword
+	revoked int64
+}
 
 func (f *fakeAppPasswordRepo) Create(ctx context.Context, token store.AppPassword) (*store.AppPassword, error) {
 	return nil, nil
@@ -2620,15 +4431,30 @@ func (f *fakeAppPasswordRepo) FindValidByUser(ctx context.Context, userID int64)
 }
 
 func (f *fakeAppPasswordRepo) ListByUser(ctx context.Context, userID int64) ([]store.AppPassword, error) {
-	return nil, nil
+	return f.list, nil
 }
 
 func (f *fakeAppPasswordRepo) GetByID(ctx context.Context, id int64) (*store.AppPassword, error) {
+	for i := range f.list {
+		if f.list[i].ID == id {
+			found := f.list[i]
+			return &found, nil
+		}
+	}
 	return nil, nil
 }
 
 func (f *fakeAppPasswordRepo) Revoke(ctx context.Context, id int64) error {
+	f.revoked = id
 	return nil
+}
+
+func (f *fakeAppPasswordRepo) ReplaceDigestCredentials(ctx context.Context, id int64, newMD5, newSHA256, oldMD5, oldSHA256 *string) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeAppPasswordRepo) PurgeDigestCredentials(ctx context.Context) (int64, error) {
+	return 0, nil
 }
 
 func (f *fakeAppPasswordRepo) DeleteRevoked(ctx context.Context, id int64) error {
@@ -2639,7 +4465,7 @@ func (f *fakeAppPasswordRepo) TouchLastUsed(ctx context.Context, id int64) error
 	return nil
 }
 
-func (f *fakeUserRepo) UpsertOAuthUser(ctx context.Context, subject, email string) (*store.User, error) {
+func (f *fakeUserRepo) UpsertOAuthUser(ctx context.Context, subject, email, fullName, firstName string) (*store.User, error) {
 	return nil, nil
 }
 
@@ -2678,11 +4504,19 @@ func (f *fakeUserRepo) MarkOnboardingComplete(ctx context.Context, userID int64)
 }
 
 type fakeACLRepo struct {
-	entries                                   []store.ACLEntry
-	deletePrincipalEntriesByResourcePrefixErr error
+	entries                           []store.ACLEntry
+	setACLErr                         error
+	listByResourceCalls               int
+	listByPrincipalCalls              int
+	listByPrincipalsCalls             int
+	listByResourcesAndPrincipalsCalls int
+	batchedResourcePaths              []string
 }
 
 func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries []store.ACLEntry) error {
+	if f.setACLErr != nil {
+		return f.setACLErr
+	}
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {
 		if entry.ResourcePath == resourcePath {
@@ -2695,6 +4529,7 @@ func (f *fakeACLRepo) SetACL(ctx context.Context, resourcePath string, entries [
 }
 
 func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) ([]store.ACLEntry, error) {
+	f.listByResourceCalls++
 	var result []store.ACLEntry
 	for _, entry := range f.entries {
 		if entry.ResourcePath != resourcePath {
@@ -2705,7 +4540,45 @@ func (f *fakeACLRepo) ListByResource(ctx context.Context, resourcePath string) (
 	return result, nil
 }
 
+func (f *fakeACLRepo) UpdateACL(ctx context.Context, resourcePath string, mutate func([]store.ACLEntry) ([]store.ACLEntry, error)) error {
+	current, err := f.ListByResource(ctx, resourcePath)
+	if err != nil {
+		return err
+	}
+	next, err := mutate(current)
+	if err != nil {
+		return err
+	}
+	return f.SetACL(ctx, resourcePath, next)
+}
+
+// RevokePrincipalGrants mirrors the repository contract: drop the
+// principal's grants on the collection and every resource beneath it, keeping
+// denies.
+func (f *fakeACLRepo) RevokePrincipalGrants(_ context.Context, collectionPath, principalHref string, collectionPrivileges []string) error {
+	if f.setACLErr != nil {
+		return f.setACLErr
+	}
+	kept := f.entries[:0:0]
+	for _, entry := range f.entries {
+		if !entry.IsGrant || acl.NormalizePrincipalHref(entry.PrincipalHref) != acl.NormalizePrincipalHref(principalHref) {
+			kept = append(kept, entry)
+			continue
+		}
+		if entry.ResourcePath == collectionPath && slices.Contains(collectionPrivileges, entry.Privilege) {
+			continue
+		}
+		if strings.HasPrefix(entry.ResourcePath, collectionPath+"/") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	f.entries = kept
+	return nil
+}
+
 func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string) ([]store.ACLEntry, error) {
+	f.listByPrincipalCalls++
 	var result []store.ACLEntry
 	for _, entry := range f.entries {
 		if entry.PrincipalHref != principalHref {
@@ -2714,20 +4587,6 @@ func (f *fakeACLRepo) ListByPrincipal(ctx context.Context, principalHref string)
 		result = append(result, entry)
 	}
 	return result, nil
-}
-
-func (f *fakeACLRepo) HasPrivilege(ctx context.Context, resourcePath, principalHref, privilege string) (bool, error) {
-	for _, entry := range f.entries {
-		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && !entry.IsGrant {
-			return false, nil
-		}
-	}
-	for _, entry := range f.entries {
-		if entry.ResourcePath == resourcePath && entry.PrincipalHref == principalHref && entry.Privilege == privilege && entry.IsGrant {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (f *fakeACLRepo) MoveResourcePath(ctx context.Context, fromPath, toPath string) error {
@@ -2743,21 +4602,6 @@ func (f *fakeACLRepo) Delete(ctx context.Context, resourcePath string) error {
 	filtered := f.entries[:0]
 	for _, entry := range f.entries {
 		if entry.ResourcePath == resourcePath {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	f.entries = filtered
-	return nil
-}
-
-func (f *fakeACLRepo) DeletePrincipalEntriesByResourcePrefix(ctx context.Context, principalHref, resourcePathPrefix string) error {
-	if f.deletePrincipalEntriesByResourcePrefixErr != nil {
-		return f.deletePrincipalEntriesByResourcePrefixErr
-	}
-	filtered := f.entries[:0]
-	for _, entry := range f.entries {
-		if entry.PrincipalHref == principalHref && (entry.ResourcePath == resourcePathPrefix || strings.HasPrefix(entry.ResourcePath, resourcePathPrefix+"/")) {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -2808,11 +4652,13 @@ func (f *fakeContactRepoWithUpsert) MoveToAddressBook(ctx context.Context, fromA
 
 type fakeContactRepoWithBirthdays struct {
 	fakeContactRepo
-	birthdays []store.Contact
+	birthdays     []store.Contact
+	birthdayLimit int
 }
 
-func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUser(ctx context.Context, userID int64) ([]store.Contact, error) {
-	return f.birthdays, nil
+func (f *fakeContactRepoWithBirthdays) ListWithBirthdaysByUserLimit(ctx context.Context, userID int64, limit int) ([]store.Contact, error) {
+	f.birthdayLimit = limit
+	return truncateToLimit(f.birthdays, limit), nil
 }
 
 func (f *fakeContactRepoWithBirthdays) MoveToAddressBook(ctx context.Context, fromAddressBookID, toAddressBookID int64, uid, destResourceName string) error {
@@ -2840,7 +4686,7 @@ func TestMoveContactHandler(t *testing.T) {
 		Contacts:     contactRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	testCases := []struct {
 		name           string
@@ -2993,7 +4839,7 @@ func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
 	handler := NewHandler(&config.Config{}, &store.Store{
 		AddressBooks: bookRepo,
 		Contacts:     contactRepo,
-	}, nil)
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	form := make(url.Values)
 	form.Set("target_address_book_id", "2")
@@ -3028,6 +4874,501 @@ func TestMoveContactRejectsDestinationConflicts(t *testing.T) {
 	if !strings.Contains(location, "/addressbooks/1") {
 		t.Fatalf("expected redirect back to source book, got %q", location)
 	}
+}
+
+func contactRequest(method, target, bookID, uid string, form url.Values, user *store.User) *http.Request {
+	req := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", bookID)
+	rctx.URLParams.Add("uid", uid)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	return req.WithContext(auth.WithUser(req.Context(), user))
+}
+
+// Deleting or moving a contact is decided as a CardDAV DELETE or MOVE of it
+// is: DAV:unbind on the book, and some privilege on the contact itself. A
+// sharee with write on the book whose every privilege on one contact that
+// contact's own ACL denies cannot remove that contact, and is answered as for
+// a contact that is not there, so as not to learn it exists; the book's other
+// contacts are still deleted and moved.
+func TestContactDeleteAndMoveHonourTheContactsOwnACL(t *testing.T) {
+	const shareeHref = "/dav/principals/100/"
+	sharee := &store.User{ID: 100, PrimaryEmail: "sharee@example.com"}
+	card := func(uid string) string {
+		return "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + uid + "\r\nEND:VCARD\r\n"
+	}
+	newHandler := func() (*Handler, *fakeContactRepoWithMove) {
+		contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:guarded": {ID: 1, AddressBookID: 1, UID: "guarded", ResourceName: "guarded", ETag: "g", RawVCard: card("guarded")},
+			"1:open":    {ID: 2, AddressBookID: 1, UID: "open", ResourceName: "open", ETag: "o", RawVCard: card("open")},
+		}}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 200, Name: "Owner's book"},
+				2: {ID: 2, UserID: 100, Name: "Sharee's book"},
+			}},
+			Contacts: contactRepo,
+			ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: "read"},
+				{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: "write"},
+				{ResourcePath: "/dav/addressbooks/1/guarded", PrincipalHref: shareeHref, IsGrant: false, Privilege: "all"},
+			}},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, contactRepo
+	}
+	moveForm := url.Values{"target_address_book_id": {"2"}}
+
+	t.Run("delete of the denied contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/guarded", "1", "guarded", nil, sharee))
+		if rr.Code != http.StatusFound || !strings.Contains(rr.Header().Get("Location"), "status=contact_deleted") {
+			t.Fatalf("DeleteContact() status = %d, location %q, want the redirect a missing contact gets", rr.Code, rr.Header().Get("Location"))
+		}
+		if contactRepo.contacts["1:guarded"] == nil {
+			t.Fatal("DeleteContact() deleted a contact its ACL denies the sharee")
+		}
+	})
+	t.Run("move of the denied contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/guarded/move", "1", "guarded", moveForm, sharee))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("MoveContact() status = %d, want %d as for a missing contact", rr.Code, http.StatusNotFound)
+		}
+		if contactRepo.moved || contactRepo.contacts["1:guarded"] == nil {
+			t.Fatal("MoveContact() moved a contact its ACL denies the sharee")
+		}
+	})
+	t.Run("delete of another contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/open", "1", "open", nil, sharee))
+		if rr.Code != http.StatusFound {
+			t.Fatalf("DeleteContact() status = %d, want %d", rr.Code, http.StatusFound)
+		}
+		if contactRepo.contacts["1:open"] != nil {
+			t.Fatal("DeleteContact() kept a contact the book's share lets the sharee delete")
+		}
+	})
+	t.Run("move of another contact", func(t *testing.T) {
+		handler, contactRepo := newHandler()
+		rr := httptest.NewRecorder()
+		handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/open/move", "1", "open", moveForm, sharee))
+		if rr.Code != http.StatusFound || !strings.Contains(rr.Header().Get("Location"), "/addressbooks/2") {
+			t.Fatalf("MoveContact() status = %d, location %q, want a redirect to the target book", rr.Code, rr.Header().Get("Location"))
+		}
+		if contactRepo.contacts["2:open"] == nil {
+			t.Fatal("MoveContact() did not move a contact the book's share lets the sharee move")
+		}
+	})
+}
+
+// A contact's dead properties and its own ACL belong to it rather than to the
+// path it left, so a move takes them to its new path (RFC 3744 section 7.3).
+func TestMoveContactCarriesItsDAVStateToTheNewPath(t *testing.T) {
+	const (
+		oldPath = "/dav/addressbooks/1/alice"
+		newPath = "/dav/addressbooks/2/alice"
+	)
+	contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "alice", ETag: "e", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Alice\r\nEND:VCARD\r\n"},
+	}}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: oldPath, PrincipalHref: "/dav/principals/300/", IsGrant: true, Privilege: "read"},
+	}}
+	deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+		oldPath: {{ResourcePath: oldPath, NamespaceURI: "urn:test", LocalName: "note", InnerXML: "kept"}},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+		}},
+		Contacts:       contactRepo,
+		ACLEntries:     aclRepo,
+		DeadProperties: deadProperties,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	rr := httptest.NewRecorder()
+	handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+		url.Values{"target_address_book_id": {"2"}}, &store.User{ID: 100}))
+
+	if rr.Code != http.StatusFound || !contactRepo.moved {
+		t.Fatalf("MoveContact() status = %d, moved = %v, want the contact moved", rr.Code, contactRepo.moved)
+	}
+	if len(aclRepo.entries) != 1 || aclRepo.entries[0].ResourcePath != newPath {
+		t.Fatalf("ACL entries after the move = %#v, want the contact's one entry at %q", aclRepo.entries, newPath)
+	}
+	if len(deadProperties.properties[oldPath]) != 0 {
+		t.Fatalf("dead properties left at the old path: %#v", deadProperties.properties[oldPath])
+	}
+	if moved := deadProperties.properties[newPath]; len(moved) != 1 || moved[0].InnerXML != "kept" {
+		t.Fatalf("dead properties at the new path = %#v, want the contact's note", moved)
+	}
+}
+
+// racingDestinationContactRepo commits another client's contact into the
+// destination book right after the first lookup there by resource name, which
+// is the move's check that the destination is free.
+type racingDestinationContactRepo struct {
+	*fakeContactRepoWithMove
+	destinationBookID int64
+	race              func()
+}
+
+func (r *racingDestinationContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	contact, err := r.fakeContactRepoWithMove.GetByResourceName(ctx, addressBookID, resourceName)
+	if addressBookID == r.destinationBookID && r.race != nil {
+		race := r.race
+		r.race = nil
+		race()
+	}
+	return contact, err
+}
+
+func TestMoveContactKeepsADestinationContactCreatedWhileItRuns(t *testing.T) {
+	const theirs = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Theirs\r\nEND:VCARD\r\n"
+	base := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "contact-1", ETag: "mine", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Mine\r\nEND:VCARD\r\n"},
+	}}}
+	contactRepo := &racingDestinationContactRepo{fakeContactRepoWithMove: base, destinationBookID: 2, race: func() {
+		base.contacts["2:contact-1"] = &store.Contact{ID: 2, AddressBookID: 2, UID: "contact-1", ResourceName: "contact-1", ETag: "theirs", RawVCard: theirs}
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+		}},
+		Contacts: contactRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	rr := httptest.NewRecorder()
+	handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+		url.Values{"target_address_book_id": {"2"}}, &store.User{ID: 100}))
+
+	if dest := base.contacts["2:contact-1"]; dest == nil || dest.RawVCard != theirs {
+		t.Fatalf("the destination contact created during the move was replaced: %#v", dest)
+	}
+	if base.contacts["1:contact-1"] == nil {
+		t.Fatal("the source contact was removed although the move could not complete")
+	}
+	location := rr.Header().Get("Location")
+	if rr.Code != http.StatusFound || !strings.Contains(location, "/addressbooks/1") || !strings.Contains(location, "already+exists") {
+		t.Fatalf("MoveContact() status = %d, location %q, want a redirect back reporting the conflict", rr.Code, location)
+	}
+}
+
+// Deleting and moving are decided on DAV:unbind and DAV:bind, not on the
+// write-content an edit needs, and a refusal of either comes back to the book
+// page with a message rather than as a bare error page.
+func TestContactRemovalRefusalsReturnToTheBookWithAMessage(t *testing.T) {
+	const shareeHref = "/dav/principals/100/"
+	sharee := &store.User{ID: 100}
+	newHandler := func(book []store.ACLEntry) (*Handler, *fakeContactRepoWithMove) {
+		contactRepo := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:alice": {ID: 1, AddressBookID: 1, UID: "alice", ResourceName: "alice", ETag: "a", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:alice\r\nFN:Alice\r\nEND:VCARD\r\n"},
+		}}}
+		entries := append([]store.ACLEntry{}, book...)
+		entries = append(entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/3", PrincipalHref: shareeHref, IsGrant: true, Privilege: "read"})
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 200, Name: "Owner's book"},
+				2: {ID: 2, UserID: 100, Name: "Sharee's book"},
+				3: {ID: 3, UserID: 200, Name: "Read-only book"},
+			}},
+			Contacts:   contactRepo,
+			ACLEntries: &fakeACLRepo{entries: entries},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, contactRepo
+	}
+	grant := func(privileges ...string) []store.ACLEntry {
+		var entries []store.ACLEntry
+		for _, privilege := range privileges {
+			entries = append(entries, store.ACLEntry{ResourcePath: "/dav/addressbooks/1", PrincipalHref: shareeHref, IsGrant: true, Privilege: privilege})
+		}
+		return entries
+	}
+	for _, tc := range []struct {
+		name   string
+		book   []store.ACLEntry
+		target string
+		run    string
+		flash  string
+	}{
+		{"delete with write-content but not unbind", grant("read", "write-content"), "", "delete", "You may not delete contacts from this address book."},
+		{"delete with read alone", grant("read"), "", "delete", "You may not delete contacts from this address book."},
+		{"move with write-content but not unbind", grant("read", "write-content"), "2", "move", "You may not move contacts out of this address book."},
+		{"move into a book shared read-only", grant("read", "write"), "3", "move", "cannot write to target address book"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, contactRepo := newHandler(tc.book)
+			rr := httptest.NewRecorder()
+			if tc.run == "delete" {
+				handler.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/alice", "1", "alice", nil, sharee))
+			} else {
+				handler.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/alice/move", "1", "alice",
+					url.Values{"target_address_book_id": {tc.target}}, sharee))
+			}
+			location, err := url.QueryUnescape(rr.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != http.StatusFound || !strings.HasPrefix(location, "/addressbooks/1") || !strings.Contains(location, tc.flash) {
+				t.Fatalf("status = %d, location %q, want a redirect to the book saying %q", rr.Code, location, tc.flash)
+			}
+			if contactRepo.contacts["1:alice"] == nil || contactRepo.moved {
+				t.Fatal("the contact was removed from the book")
+			}
+		})
+	}
+}
+
+// changingContactRepo shows the store's re-check of a write a different card
+// from the one the write was decided on, every time, as if another client
+// kept editing the contact.
+type changingContactRepo struct {
+	*fakeContactRepoWithMove
+}
+
+func (r *changingContactRepo) GetByResourceName(ctx context.Context, addressBookID int64, resourceName string) (*store.Contact, error) {
+	contact, err := r.fakeContactRepoWithMove.GetByResourceName(ctx, addressBookID, resourceName)
+	if contact != nil {
+		contact.RawVCard += "NOTE:changed\r\n"
+	}
+	return contact, err
+}
+
+// A delete or move given up because the contact kept changing under it says
+// so, rather than reporting a destination conflict or a bare failure.
+func TestContactRemovalReportsAContactThatKeepsChanging(t *testing.T) {
+	newHandler := func() (*Handler, *fakeContactRepoWithMove) {
+		base := &fakeContactRepoWithMove{fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+			"1:contact-1": {ID: 1, AddressBookID: 1, UID: "contact-1", ResourceName: "contact-1", ETag: "e", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:contact-1\r\nFN:Alice\r\nEND:VCARD\r\n"},
+		}}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+				2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+			}},
+			Contacts: &changingContactRepo{base},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+		return handler, base
+	}
+	owner := &store.User{ID: 100}
+	for _, tc := range []struct {
+		name string
+		run  func(*Handler, *httptest.ResponseRecorder)
+		want string
+	}{
+		{"delete", func(h *Handler, rr *httptest.ResponseRecorder) {
+			h.DeleteContact(rr, contactRequest(http.MethodDelete, "/addressbooks/1/contacts/contact-1", "1", "contact-1", nil, owner))
+		}, "could not be deleted"},
+		{"move", func(h *Handler, rr *httptest.ResponseRecorder) {
+			h.MoveContact(rr, contactRequest(http.MethodPost, "/addressbooks/1/contacts/contact-1/move", "1", "contact-1",
+				url.Values{"target_address_book_id": {"2"}}, owner))
+		}, "could not be moved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, base := newHandler()
+			rr := httptest.NewRecorder()
+			tc.run(handler, rr)
+			flash, err := url.QueryUnescape(rr.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != http.StatusFound || !strings.Contains(flash, "kept changing elsewhere and "+tc.want) {
+				t.Fatalf("status = %d, location %q, want a redirect saying the contact kept changing", rr.Code, flash)
+			}
+			if base.contacts["1:contact-1"] == nil {
+				t.Fatal("the contact was removed")
+			}
+		})
+	}
+}
+
+// The address book page shows a sharee only the contacts they may read: a
+// contact whose own ACL denies them read is left out of the page, its count
+// and its page numbers, as a CardDAV listing of the book leaves it out. The
+// owner still sees every contact.
+func TestAddressBookPageShowsOnlyTheContactsTheViewerMayRead(t *testing.T) {
+	name := func(s string) *string { return &s }
+	card := func(uid, fn, email string) string {
+		return "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:" + fn + "\r\nEMAIL:" + email + "\r\nEND:VCARD\r\n"
+	}
+	contactRepo := &fakeContactRepo{contacts: map[string]*store.Contact{
+		"1:alpha":  {ID: 1, AddressBookID: 1, UID: "alpha", ResourceName: "alpha", DisplayName: name("Alpha"), RawVCard: card("alpha", "Alpha", "alpha@example.com")},
+		"1:hidden": {ID: 2, AddressBookID: 1, UID: "hidden", ResourceName: "hidden", DisplayName: name("Secret Person"), PrimaryEmail: name("secret@example.com"), RawVCard: card("hidden", "Secret Person", "secret@example.com")},
+		"1:zulu":   {ID: 3, AddressBookID: 1, UID: "zulu", ResourceName: "zulu", DisplayName: name("Zulu"), RawVCard: card("zulu", "Zulu", "zulu@example.com")},
+	}}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+			1: {ID: 1, UserID: 200, Name: "Owner's book"},
+		}},
+		Contacts: contactRepo,
+		ACLEntries: &fakeACLRepo{entries: []store.ACLEntry{
+			{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/1/hidden", PrincipalHref: "/dav/principals/100/", IsGrant: false, Privilege: "read"},
+			{ResourcePath: "/dav/addressbooks/1", PrincipalHref: "/dav/principals/101/", IsGrant: true, Privilege: "read"},
+		}},
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+	page := func(t *testing.T, userID int64, number int) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/addressbooks/1?page=%d&limit=1", number), nil)
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: userID}))
+		rr := httptest.NewRecorder()
+		handler.ViewAddressBook(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("ViewAddressBook() page %d status = %d, want %d", number, rr.Code, http.StatusOK)
+		}
+		return rr.Body.String()
+	}
+	hidden := []string{"Secret Person", "secret@example.com", `"UID":"hidden"`}
+
+	t.Run("sharee denied one contact", func(t *testing.T) {
+		want := map[int][]string{
+			1: {"Alpha", "Page 1 of 2 (2 contacts)", "?page=2&limit=1"},
+			2: {"Zulu", "Page 2 of 2 (2 contacts)"},
+			3: {"Page 3 of 2 (2 contacts)"},
+		}
+		for number := 1; number <= 3; number++ {
+			body := page(t, 100, number)
+			for _, leaked := range hidden {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("page %d shows %s, which the contact's ACL denies the sharee", number, leaked)
+				}
+			}
+			for _, text := range want[number] {
+				if !strings.Contains(body, text) {
+					t.Errorf("page %d lacks %q", number, text)
+				}
+			}
+			if strings.Contains(body, fmt.Sprintf("?page=%d&limit=1", number+1)) && number >= 2 {
+				t.Errorf("page %d links to a page past the readable contacts", number)
+			}
+		}
+	})
+	t.Run("sharee with read on the book", func(t *testing.T) {
+		if body := page(t, 101, 2); !strings.Contains(body, "Secret Person") || !strings.Contains(body, "Page 2 of 3 (3 contacts)") {
+			t.Fatal("a sharee the contact's ACL does not name does not see it")
+		}
+	})
+	t.Run("owner", func(t *testing.T) {
+		if body := page(t, 200, 2); !strings.Contains(body, "Secret Person") || !strings.Contains(body, "Page 2 of 3 (3 contacts)") {
+			t.Fatal("the owner does not see every contact")
+		}
+	})
+}
+
+// Contact UIDs routinely contain characters that must be percent-encoded in a
+// path segment, and chi routes on the raw path, so handlers receive the encoded
+// form and have to decode it before hitting the repositories.
+func TestContactHandlersDecodePercentEncodedUID(t *testing.T) {
+	const (
+		decodedUID = "1789347992637824340-ynnkm8nj@calcard"
+		encodedUID = "1789347992637824340-ynnkm8nj%40calcard"
+	)
+
+	newRouter := func(h *Handler) http.Handler {
+		router := chi.NewRouter()
+		router.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				user := &store.User{ID: 100, PrimaryEmail: "test@example.com"}
+				next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+			})
+		})
+		router.Put("/addressbooks/{id}/contacts/{uid}", h.UpdateContact)
+		router.Delete("/addressbooks/{id}/contacts/{uid}", h.DeleteContact)
+		router.Post("/addressbooks/{id}/contacts/{uid}/move", h.MoveContact)
+		return router
+	}
+
+	t.Run("move", func(t *testing.T) {
+		contactRepo := &fakeContactRepoWithMove{
+			fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+		}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+				2: {ID: 2, UserID: 100, Name: "Personal Contacts"},
+			}},
+			Contacts: contactRepo,
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{"target_address_book_id": {"2"}}
+		req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts/"+encodedUID+"/move", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("MoveContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if !contactRepo.moved {
+			t.Fatal("MoveContact() did not move the contact")
+		}
+		if contactRepo.tombstoneUID != decodedUID {
+			t.Fatalf("MoveContact() tombstone UID = %q, want %q", contactRepo.tombstoneUID, decodedUID)
+		}
+		if location := response.Header().Get("Location"); !strings.Contains(location, "/addressbooks/2") {
+			t.Fatalf("MoveContact() redirect location = %q, want it to contain /addressbooks/2", location)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		resourcePath := "/dav/addressbooks/1/" + decodedUID
+		deadProperties := &fakeDeadPropertyRepo{properties: map[string][]store.DeadProperty{
+			resourcePath: {{ResourcePath: resourcePath, NamespaceURI: "urn:test", LocalName: "note"}},
+		}}
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			}},
+			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+			DeadProperties: deadProperties,
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		req := httptest.NewRequest(http.MethodDelete, "/addressbooks/1/contacts/"+encodedUID, nil)
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("DeleteContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+		if len(deadProperties.properties[resourcePath]) != 0 {
+			t.Fatalf("DeleteContact() retained dead properties: %#v", deadProperties.properties)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+				1: {ID: 1, UserID: 100, Name: "Work Contacts"},
+			}},
+			Contacts: &fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + decodedUID: {ID: 1, AddressBookID: 1, UID: decodedUID, ResourceName: decodedUID},
+			}},
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{"display_name": {"Renamed Contact"}}
+		req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+encodedUID, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+
+		newRouter(handler).ServeHTTP(response, req)
+
+		if response.Code != http.StatusFound {
+			t.Fatalf("UpdateContact() status = %d, want %d", response.Code, http.StatusFound)
+		}
+	})
 }
 
 type fakeContactRepoWithMove struct {
@@ -3117,13 +5458,14 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 				Events:    eventRepo,
 			}
 
-			handler := NewHandler(&config.Config{}, s, nil)
+			handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 			formData := url.Values{
 				"summary":    {"Updated Summary"},
 				"dtstart":    {"2024-01-02T10:00"},
 				"dtend":      {"2024-01-02T11:00"},
 				"edit_scope": {"series"},
+				"etag":       {"original-etag"},
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
@@ -3156,6 +5498,363 @@ func TestUpdateEventPreservesResourceName(t *testing.T) {
 	}
 }
 
+func TestUpdateEventMovesSeriesToSelectedCalendar(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {
+				CalendarID:   1,
+				UID:          "event-1",
+				ResourceName: "custom-name.ics",
+				RawICAL:      raw,
+				ETag:         "old",
+			},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{
+			calendars: map[int64]*store.Calendar{
+				1: {ID: 1, UserID: 100, Name: "Source"},
+				2: {ID: 2, UserID: 100, Name: "Destination"},
+			},
+		},
+		Events: eventRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"recurrence":              {"WEEKLY"},
+		"recurrence_interval":     {"1"},
+		"recurrence_end_type":     {"never"},
+		"destination_calendar_id": {"2"},
+		"return_to":               {"/calendars/all?view=week&date=2026-07-24"},
+		"etag":                    {"old"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	rctx := chi.RouteContext(req.Context())
+	rctx.URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UpdateEvent() status = %d, want %d: %s", w.Code, http.StatusFound, w.Body.String())
+	}
+	if eventRepo.events["1:event-1"] != nil {
+		t.Fatalf("source calendar still contains moved event: %#v", eventRepo.events["1:event-1"])
+	}
+	moved := eventRepo.events["2:event-1"]
+	if moved == nil {
+		t.Fatalf("destination calendar missing moved event: %#v", eventRepo.events)
+	}
+	if moved.ResourceName != "custom-name.ics" {
+		t.Fatalf("moved ResourceName = %q, want custom-name.ics", moved.ResourceName)
+	}
+	if !strings.Contains(moved.RawICAL, "SUMMARY:Updated") || !strings.Contains(moved.RawICAL, "RRULE:FREQ=WEEKLY") {
+		t.Fatalf("moved event did not preserve updated recurring series: %s", moved.RawICAL)
+	}
+	location := w.Header().Get("Location")
+	if !strings.Contains(location, "/calendars/all?") || !strings.Contains(location, "status=event_updated") {
+		t.Fatalf("UpdateEvent() redirect = %q, want all-calendars success", location)
+	}
+}
+
+func TestUpdateEventMoveRequiresDestinationBind(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+			"1:100": {
+				Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Source"},
+				Privileges:         store.FullCalendarPrivileges(),
+				PrivilegesResolved: true,
+			},
+			"2:100": {
+				Calendar:           store.Calendar{ID: 2, UserID: 200, Name: "Read only"},
+				Shared:             true,
+				Privileges:         store.CalendarPrivileges{Read: true},
+				PrivilegesResolved: true,
+			},
+		}},
+		Events: eventRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"destination_calendar_id": {"2"},
+		"etag":                    {"tag"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if eventRepo.events["1:event-1"] == nil || eventRepo.events["2:event-1"] != nil {
+		t.Fatalf("denied move mutated events: %#v", eventRepo.events)
+	}
+}
+
+// A calendar collection advertises the component types it accepts in
+// CALDAV:supported-calendar-component-set, and RFC 4791 Section 5.2.3 makes
+// that a restriction on what may be stored in it -- which the PUT path enforces
+// and DAV clients read. The UI writes into the same collections, so a write it
+// admits that PUT would refuse leaves the collection holding content it says it
+// does not.
+func TestUICalendarWritesRespectSupportedComponents(t *testing.T) {
+	const raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	// Source accepts events; the destination is a task list that does not.
+	newStore := func(eventRepo store.EventRepository) *store.Store {
+		return &store.Store{
+			Calendars: &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+				"1:100": {
+					Calendar:           store.Calendar{ID: 1, UserID: 100, Name: "Source"},
+					Privileges:         store.FullCalendarPrivileges(),
+					PrivilegesResolved: true,
+				},
+				"2:100": {
+					Calendar:           store.Calendar{ID: 2, UserID: 100, Name: "Tasks", SupportedComponents: []string{"VTODO"}},
+					Privileges:         store.FullCalendarPrivileges(),
+					PrivilegesResolved: true,
+				},
+			}},
+			Events: eventRepo,
+		}
+	}
+
+	t.Run("a move into a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{
+			fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+				"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
+			}},
+		}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{
+			"summary":                 {"Updated"},
+			"dtstart":                 {"2026-07-24T10:00"},
+			"dtend":                   {"2026-07-24T10:30"},
+			"destination_calendar_id": {"2"},
+			"etag":                    {"tag"},
+		}
+		req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "1")
+		chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.UpdateEvent(w, req)
+
+		// Neither calendar may change: the refusal has to come before the move,
+		// not leave the event half-moved.
+		if eventRepo.events["1:event-1"] == nil || eventRepo.events["2:event-1"] != nil {
+			t.Fatalf("a refused move mutated events: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("UpdateEvent() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
+
+	t.Run("creating an event in a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{
+			"summary": {"New"},
+			"dtstart": {"2026-07-24T10:00"},
+			"dtend":   {"2026-07-24T10:30"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/2/events", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "2")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.CreateEvent(w, req)
+
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("an event was created in a calendar that does not accept one: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("CreateEvent() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
+
+	t.Run("a calendar with no restriction still accepts an event", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{
+			"summary": {"New"},
+			"dtstart": {"2026-07-24T10:00"},
+			"dtend":   {"2026-07-24T10:30"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = withRouteID(req, "1")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.CreateEvent(w, req)
+
+		if len(eventRepo.events) != 1 {
+			t.Fatalf("a calendar carrying no component restriction refused an event: %#v", eventRepo.events)
+		}
+	})
+
+	t.Run("importing events into a VTODO-only calendar is refused", func(t *testing.T) {
+		eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{}}}
+		handler := NewHandler(&config.Config{}, newStore(eventRepo), nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		var body bytes.Buffer
+		form := multipart.NewWriter(&body)
+		part, err := form.CreateFormFile("ics_file", "import.ics")
+		if err != nil {
+			t.Fatalf("CreateFormFile() error = %v", err)
+		}
+		if _, err := part.Write([]byte(raw)); err != nil {
+			t.Fatalf("write ICS: %v", err)
+		}
+		if err := form.Close(); err != nil {
+			t.Fatalf("close form: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/calendars/2/import", &body)
+		req.Header.Set("Content-Type", form.FormDataContentType())
+		req = withRouteID(req, "2")
+		req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+		w := httptest.NewRecorder()
+
+		handler.ImportCalendar(w, req)
+
+		if len(eventRepo.events) != 0 {
+			t.Fatalf("events were imported into a calendar that does not accept them: %#v", eventRepo.events)
+		}
+		if !strings.Contains(w.Header().Get("Location"), "error=") {
+			t.Fatalf("ImportCalendar() redirect = %q, want an error", w.Header().Get("Location"))
+		}
+	})
+}
+
+func TestUpdateEventMoveRejectsDestinationConflict(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Old\r\nDTSTART:20260724T100000Z\r\nDTEND:20260724T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+			"1:event-1": {CalendarID: 1, UID: "event-1", ResourceName: "event-1", RawICAL: raw, ETag: "tag"},
+			"2:event-1": {CalendarID: 2, UID: "event-1", ResourceName: "event-1", RawICAL: raw},
+		}},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Source"},
+			2: {ID: 2, UserID: 100, Name: "Destination"},
+		}},
+		Events: eventRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"summary":                 {"Updated"},
+		"dtstart":                 {"2026-07-24T10:00"},
+		"dtend":                   {"2026-07-24T10:30"},
+		"destination_calendar_id": {"2"},
+		"return_to":               {"/calendars/all?view=month&date=2026-07-24"},
+		"etag":                    {"tag"},
+	}
+	req := httptest.NewRequest(http.MethodPut, "/calendars/1/events/event-1", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = withRouteID(req, "1")
+	chi.RouteContext(req.Context()).URLParams.Add("uid", "event-1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+
+	handler.UpdateEvent(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("UpdateEvent() status = %d, want %d", w.Code, http.StatusFound)
+	}
+	if !strings.Contains(w.Header().Get("Location"), "error=destination+calendar+already+contains+this+event") {
+		t.Fatalf("UpdateEvent() redirect = %q, want destination conflict", w.Header().Get("Location"))
+	}
+	if len(eventRepo.moves) != 0 {
+		t.Fatalf("conflicting move executed: %#v", eventRepo.moves)
+	}
+}
+
+func TestUpdateAllDayEventAllowsSameStartAndEndDate(t *testing.T) {
+	calRepo := &fakeCalendarRepo{
+		calendars: map[int64]*store.Calendar{
+			1: {ID: 1, UserID: 100, Name: "Test Calendar"},
+		},
+	}
+	eventRepo := &fakeEventRepoWithUpsert{
+		fakeEventRepo: fakeEventRepo{
+			events: map[string]*store.Event{
+				"1:test-event-uid": {
+					ID:           1,
+					CalendarID:   1,
+					UID:          "test-event-uid",
+					ResourceName: "test-event-uid.ics",
+					RawICAL:      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-event-uid\r\nSUMMARY:Original Summary\r\nDTSTART;VALUE=DATE:20260724\r\nDTEND;VALUE=DATE:20260725\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+					ETag:         "original-etag",
+				},
+			},
+		},
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{
+		Calendars: calRepo,
+		Events:    eventRepo,
+	}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	formData := url.Values{
+		"summary":    {"Updated Summary"},
+		"dtstart":    {"2026-07-25"},
+		"dtend":      {"2026-07-25"},
+		"all_day":    {"on"},
+		"edit_scope": {"series"},
+		"etag":       {"original-etag"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = req.WithContext(auth.WithUser(context.Background(), &store.User{ID: 100}))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "test-event-uid")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	rec := httptest.NewRecorder()
+	handler.UpdateEvent(rec, req)
+
+	if location := rec.Header().Get("Location"); !strings.Contains(location, "status=event_updated") {
+		t.Fatalf("UpdateEvent() redirect = %q, want successful update", location)
+	}
+	updated := eventRepo.events["1:test-event-uid"]
+	if !strings.Contains(updated.RawICAL, "DTSTART;VALUE=DATE:20260725\r\n") {
+		t.Errorf("updated event missing expected start date:\n%s", updated.RawICAL)
+	}
+	if !strings.Contains(updated.RawICAL, "DTEND;VALUE=DATE:20260726\r\n") {
+		t.Errorf("updated event missing exclusive end date:\n%s", updated.RawICAL)
+	}
+}
+
 func TestUpdateEventRequiresDates(t *testing.T) {
 	calRepo := &fakeCalendarRepo{
 		calendars: map[int64]*store.Calendar{
@@ -3183,12 +5882,13 @@ func TestUpdateEventRequiresDates(t *testing.T) {
 		Events:    eventRepo,
 	}
 
-	handler := NewHandler(&config.Config{}, s, nil)
+	handler := NewHandler(&config.Config{}, s, nil, dav.ValidateCalendarObject, dav.EventInstances)
 
 	formData := url.Values{
 		"summary":    {"Updated Summary"},
 		"dtstart":    {"2024-01-02T10:00"},
 		"edit_scope": {"series"},
+		"etag":       {"original-etag"},
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/test-event-uid", strings.NewReader(formData.Encode()))
@@ -3213,5 +5913,1019 @@ func TestUpdateEventRequiresDates(t *testing.T) {
 	}
 	if !strings.Contains(updatedEvent.RawICAL, "Original Summary") {
 		t.Error("event summary should remain unchanged when dates are missing")
+	}
+}
+
+// The rendered birthdays page serializes the whole set into the page, so an
+// unbounded read is an unbounded response. It shares MaxReportCandidateRows with
+// the DAV birthday collection, which is generated from the same rows.
+func TestViewBirthdaysBoundsTheContactRead(t *testing.T) {
+	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "John Doe"
+	birthdays := make([]store.Contact, 0, 40)
+	for id := int64(1); id <= 40; id++ {
+		birthdays = append(birthdays, store.Contact{
+			ID: id, UID: fmt.Sprintf("contact-%d", id), DisplayName: &displayName, Birthday: &bday,
+		})
+	}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays:       birthdays,
+	}
+	cfg := &config.Config{}
+	cfg.DAV.MaxReportCandidateRows = 10
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if contactRepo.birthdayLimit != 11 {
+		t.Fatalf("read limit = %d, want the budget plus the row that proves it was exceeded", contactRepo.birthdayLimit)
+	}
+	body := w.Body.String()
+	if strings.Count(body, `"ContactUID"`) != 10 {
+		t.Fatalf("rendered %d contacts, want the 10 the budget allows; body: %s", strings.Count(body, `"ContactUID"`), body)
+	}
+	// A page showing part of the set has to say so, or it reads as the whole.
+	if !strings.Contains(body, "Not all of your birthdays are shown") {
+		t.Fatalf("a truncated page carries no notice; body: %s", body)
+	}
+}
+
+// Inside the budget the page is complete and carries no notice.
+func TestViewBirthdaysInsideTheBudgetIsComplete(t *testing.T) {
+	bday := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	displayName := "John Doe"
+	birthdays := []store.Contact{
+		{ID: 1, UID: "contact-1", DisplayName: &displayName, Birthday: &bday},
+	}
+	contactRepo := &fakeContactRepoWithBirthdays{
+		fakeContactRepo: fakeContactRepo{contacts: make(map[string]*store.Contact)},
+		birthdays:       birthdays,
+	}
+	cfg := &config.Config{}
+	cfg.DAV.MaxReportCandidateRows = 10
+	handler := NewHandler(cfg, &store.Store{Contacts: contactRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/birthdays", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100}))
+	w := httptest.NewRecorder()
+	handler.ViewBirthdays(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("ViewBirthdays() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if strings.Contains(w.Body.String(), "Not all of your birthdays are shown") {
+		t.Fatal("a complete page carries a truncation notice")
+	}
+}
+
+func TestOccurrenceEditKeepsRecurrenceTimezone(t *testing.T) {
+	for _, method := range []string{"edit", "delete"} {
+		t.Run(method, func(t *testing.T) {
+			raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=America/New_York:20250724T090000\r\nDTEND;TZID=America/New_York:20250724T100000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+			repo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{"1:event": {ID: 1, CalendarID: 1, UID: "event", ResourceName: "event", RawICAL: raw, ETag: "original"}}}}
+			h := NewHandler(&config.Config{}, &store.Store{Calendars: &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100}}}, Events: repo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+			form := url.Values{"summary": {"Changed"}, "dtstart": {"2025-07-25T09:00"}, "dtend": {"2025-07-25T10:00"}, "timezone": {"America/Los_Angeles"}, "edit_scope": {"occurrence"}, "recurrence_id": {"2025-07-25T09:00"}, "recurrence_timezone": {"America/New_York"}, "etag": {"original"}}
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/event", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "1")
+			rctx.URLParams.Add("uid", "event")
+			req = req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100}), chi.RouteCtxKey, rctx))
+			rr := httptest.NewRecorder()
+			prop := "RECURRENCE-ID"
+			if method == "delete" {
+				h.DeleteEvent(rr, req)
+				prop = "EXDATE"
+			} else {
+				h.UpdateEvent(rr, req)
+			}
+			if rr.Code != 302 || !strings.Contains(repo.events["1:event"].RawICAL, prop+";TZID=America/New_York:20250725T090000") {
+				t.Fatalf("%d %s: %s", rr.Code, rr.Body.String(), repo.events["1:event"].RawICAL)
+			}
+		})
+	}
+}
+
+// A refused contact form names the field to change, in words written for the
+// person filling it in rather than the text of a validation error, and never
+// repeats the submitted value into the redirect URL.
+func TestContactWriteRefusalNamesWhatWasWrong(t *testing.T) {
+	const uid = "alice@calcard"
+	tests := []struct {
+		name  string
+		form  url.Values
+		flash string
+	}{
+		{
+			name:  "impossible birthday",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "birthday": {"1990-02-31"}},
+			flash: "The birthday is not a valid date.",
+		},
+		{
+			name:  "impossible year-less birthday",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "birthday": {"--02-30"}},
+			flash: "The birthday is not a valid date.",
+		},
+		{
+			name:  "control character in a name",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "first_name": {"Jo\x01hn"}},
+			flash: "The first name contains characters a contact cannot store.",
+		},
+		{
+			name:  "line break in the display name",
+			form:  url.Values{"display_name": {"Johnny\nAppleseed"}},
+			flash: "The display name contains characters a contact cannot store.",
+		},
+		{
+			name:  "invalid email",
+			form:  url.Values{"display_name": {"Johnny Appleseed"}, "email": {"johnny at example"}},
+			flash: "The email address is not valid.",
+		},
+		{
+			name:  "blank display name",
+			form:  url.Values{"display_name": {"   "}, "first_name": {"Johnny"}},
+			flash: "Enter a display name.",
+		},
+	}
+	for _, tt := range tests {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			t.Run(tt.name+"/"+method, func(t *testing.T) {
+				contactRepo := &fakeContactRepoWithUpsert{
+					fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+						"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-old", RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:Alice\r\nEND:VCARD\r\n"},
+					}},
+				}
+				handler := NewHandler(&config.Config{}, &store.Store{
+					AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{
+						1: {ID: 1, UserID: 100, Name: "Test Contacts"},
+					}},
+					Contacts: contactRepo,
+				}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+				target := "/addressbooks/1/contacts"
+				if method == http.MethodPut {
+					target += "/" + url.PathEscape(uid)
+				}
+				req := httptest.NewRequest(method, target, strings.NewReader(tt.form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				response := httptest.NewRecorder()
+				contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+				if response.Code != http.StatusFound {
+					t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusFound, response.Body.String())
+				}
+				if len(contactRepo.contacts) != 1 || contactRepo.contacts["1:"+uid].ETag != "etag-old" {
+					t.Fatalf("the refused payload was stored: %#v", contactRepo.contacts)
+				}
+				location, err := url.Parse(response.Header().Get("Location"))
+				if err != nil {
+					t.Fatalf("parse redirect: %v", err)
+				}
+				if got := location.Query().Get("error"); got != tt.flash {
+					t.Fatalf("flash error = %q, want %q", got, tt.flash)
+				}
+				for _, submitted := range tt.form {
+					if submitted[0] != "Johnny Appleseed" && strings.Contains(location.RawQuery+location.Query().Get("error"), submitted[0]) {
+						t.Fatalf("redirect %q repeats the submitted value %q", location, submitted[0])
+					}
+				}
+			})
+		}
+	}
+}
+
+// The address shape check is the form's own, and it must not stop an edit of
+// a contact whose stored address another client wrote in a shape it refuses:
+// the form sends that address back unchanged, and the person editing the name
+// cannot be asked to fix an address they did not touch.
+func TestUpdateContactKeepsAStoredEmailTheFormWouldRefuse(t *testing.T) {
+	const uid = "quoted@calcard"
+	const stored = `"john doe"@example.com`
+	newRepo := func() *fakeContactRepoWithUpsert {
+		return &fakeContactRepoWithUpsert{
+			fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+				"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-old",
+					RawVCard: "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:John\r\nitem1.EMAIL;TYPE=INTERNET:" + stored + "\r\nEND:VCARD\r\n"},
+			}},
+		}
+	}
+	submit := func(repo *fakeContactRepoWithUpsert, method, target, email string) *url.URL {
+		t.Helper()
+		handler := NewHandler(&config.Config{}, &store.Store{
+			AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Contacts"}}},
+			Contacts:     repo,
+		}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+		form := url.Values{"display_name": {"John Renamed"}, "email": {email}}
+		req := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		contactFormRouter(handler, 100).ServeHTTP(response, req)
+		location, err := url.Parse(response.Header().Get("Location"))
+		if err != nil {
+			t.Fatalf("parse redirect: %v", err)
+		}
+		return location
+	}
+
+	repo := newRepo()
+	location := submit(repo, http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), stored)
+	if got := location.Query().Get("status"); got != "contact_updated" {
+		t.Fatalf("editing a contact with its stored address redirected to %s", location)
+	}
+	if !strings.Contains(repo.contacts["1:"+uid].RawVCard, "FN:John Renamed") {
+		t.Fatalf("the edit was not stored: %q", repo.contacts["1:"+uid].RawVCard)
+	}
+
+	// A changed address, and any address on a new contact, is still checked.
+	for _, attempt := range []struct{ method, target, email string }{
+		{http.MethodPut, "/addressbooks/1/contacts/" + url.PathEscape(uid), `"jane doe"@example.com`},
+		{http.MethodPost, "/addressbooks/1/contacts", stored},
+	} {
+		repo := newRepo()
+		location := submit(repo, attempt.method, attempt.target, attempt.email)
+		if got := location.Query().Get("error"); got != "The email address is not valid." {
+			t.Fatalf("%s %s with %s: error = %q, want the address refused", attempt.method, attempt.target, attempt.email, got)
+		}
+	}
+}
+
+// A refusal is answered in words written for the person filling in the form,
+// chosen by the error's type rather than its text; anything else is this
+// server's fault, which the page reports generically and the log records in
+// full.
+func TestContactWriteFlashError(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	req := httptest.NewRequest(http.MethodPost, "/addressbooks/1/contacts", nil)
+	refusals := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "control character",
+			err:  &contacts.FieldError{Field: "lastName", Reason: "must not contain control characters"},
+			want: "The last name contains characters a contact cannot store.",
+		},
+		{
+			name: "required",
+			err:  &contacts.FieldError{Field: "displayName", Reason: "is required"},
+			want: "Enter a display name.",
+		},
+		{
+			name: "uid characters",
+			err:  &contacts.FieldError{Field: "uid", Reason: "may contain only letters, digits and - . _ ~ @ : + ="},
+			want: "The contact ID may contain only letters, digits and - . _ ~ @ : + =.",
+		},
+		{
+			name: "field nobody named",
+			err:  &contacts.FieldError{Field: "nickname", Reason: "is required"},
+			want: "The contact could not be saved because some of its details are not valid.",
+		},
+		{
+			name: "birthday from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrInvalidBirthday),
+			want: "The birthday is not a valid date.",
+		},
+		{
+			name: "uid from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrInvalidUID),
+			want: "The contact ID cannot be stored.",
+		},
+		{
+			name: "control character from the card builder",
+			err:  fmt.Errorf("%w: %w", contacts.ErrBadRequest, utils.ErrControlCharacter),
+			want: "The contact contains characters it cannot store.",
+		},
+		{
+			name: "card the editor cannot update",
+			err:  contacts.ErrCardNotEditable,
+			want: "This contact is stored in a form the editor cannot update without losing data. Edit it in a CardDAV client instead.",
+		},
+		{
+			name: "changed elsewhere",
+			err:  contacts.ErrPreconditionFailed,
+			want: "This contact was changed elsewhere since the page loaded. Reload the page to see the current version, then make your changes again.",
+		},
+		{
+			name: "unclassified refusal",
+			err:  fmt.Errorf("%w: path uid does not match payload uid", contacts.ErrBadRequest),
+			want: "The contact could not be saved because some of its details are not valid.",
+		},
+	}
+	for _, tt := range refusals {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := contactWriteFlashError(req, tt.err, "failed to create contact"); got != tt.want {
+				t.Fatalf("flash = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if logged.Len() != 0 {
+		t.Fatalf("a refused submission was logged as a server fault: %s", logged.String())
+	}
+
+	fault := errors.New("pq: connection reset by peer")
+	if got := contactWriteFlashError(req, fault, "failed to create contact"); got != "failed to create contact" {
+		t.Fatalf("flash for a server fault = %q, want the fallback", got)
+	}
+	if !strings.Contains(logged.String(), "pq: connection reset by peer") {
+		t.Fatalf("a server fault was not logged: %q", logged.String())
+	}
+}
+
+// The edit form carries the ETag of the card it was built from, so a form
+// built before another client changed the contact is refused rather than
+// writing its stale values over that change.
+func TestUpdateContactRefusesAFormBuiltFromAnOlderVersion(t *testing.T) {
+	const uid = "alice@calcard"
+	stored := "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" + uid + "\r\nFN:Alice\r\nN:;;;;\r\nTEL:+1 555 0100\r\nEND:VCARD\r\n"
+	for _, tt := range []struct {
+		name     string
+		etag     string
+		wantSave bool
+	}{
+		{name: "stale form", etag: "etag-before", wantSave: false},
+		{name: "fresh form", etag: "etag-now", wantSave: true},
+		{name: "form without an etag", etag: "", wantSave: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			contactRepo := &fakeContactRepoWithUpsert{
+				fakeContactRepo: fakeContactRepo{contacts: map[string]*store.Contact{
+					"1:" + uid: {ID: 1, AddressBookID: 1, UID: uid, ResourceName: uid, ETag: "etag-now", RawVCard: stored},
+				}},
+			}
+			handler := NewHandler(&config.Config{}, &store.Store{
+				AddressBooks: &fakeAddressBookRepo{books: map[int64]*store.AddressBook{1: {ID: 1, UserID: 100, Name: "Test Contacts"}}},
+				Contacts:     contactRepo,
+			}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			form := url.Values{"display_name": {"Alice"}, "phone": {"+1 555 0199"}, "etag": {tt.etag}}
+			req := httptest.NewRequest(http.MethodPut, "/addressbooks/1/contacts/"+url.PathEscape(uid), strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			contactFormRouter(handler, 100).ServeHTTP(response, req)
+
+			if response.Code != http.StatusFound {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			location, err := url.Parse(response.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := strings.Contains(contactRepo.contacts["1:"+uid].RawVCard, "+1 555 0199")
+			if saved != tt.wantSave {
+				t.Fatalf("saved = %v, want %v; card:\n%s", saved, tt.wantSave, contactRepo.contacts["1:"+uid].RawVCard)
+			}
+			if !tt.wantSave && !strings.Contains(location.Query().Get("error"), "changed elsewhere") {
+				t.Fatalf("stale form flash = %q", location.Query().Get("error"))
+			}
+		})
+	}
+}
+
+// The page builds the edit form from the contact list, so the list carries
+// each contact's ETag and the form posts it back.
+func TestAddressBookPageCarriesContactETags(t *testing.T) {
+	body, err := templateFS.ReadFile("templates/addressbook_view.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, want := range []string{`name="etag"`, "raw.ETag"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("addressbook_view.html lacks %q", want)
+		}
+	}
+}
+
+// The UI stores calendar data through the validator a DAV PUT applies. An
+// import keeps every event the validator accepts and skips the rest; what it
+// stores is what the validator accepted, indexed by the metadata it derived.
+func TestImportCalendarAppliesTheCalDAVValidator(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	ics := "\xef\xbb\xbfBEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:Microsoft Exchange Server 2010\r\nMETHOD:PUBLISH\r\n" +
+		"BEGIN:VEVENT\r\nUID:kept\r\nSUMMARY:Standup\r\nDTSTART;TZID=Europe/Berlin:20260105T090000\r\nDTEND;TZID=Europe/Berlin:20260105T090000\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:backwards\r\nSUMMARY:Ends before it starts\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T080000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "outlook.ics", ics)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+1+event%28s%29%3B+skipped+1+%28not+valid+or+not+events%29") {
+		t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+	}
+	kept := eventRepo.events["1:kept"]
+	if kept == nil || len(eventRepo.events) != 1 {
+		t.Fatalf("stored %v, want only the valid event", eventRepo.events)
+	}
+	if _, err := dav.ValidateCalendarObject(kept.RawICAL, nil); err != nil {
+		t.Errorf("stored data does not pass the CalDAV validator: %v\n%s", err, kept.RawICAL)
+	}
+	if kept.WriteMetadata == nil || kept.WriteMetadata.Summary == nil || *kept.WriteMetadata.Summary != "Standup" {
+		t.Errorf("stored metadata = %+v, want the validator's", kept.WriteMetadata)
+	}
+}
+
+// An export describes the calendar it came from with properties RFC 7986 and
+// producers add to its VCALENDAR -- its name, colour, description, source and
+// refresh interval, and X-WR-* extensions -- which say nothing about any one
+// event; several are RFC 5545 names a calendar object resource's VCALENDAR
+// does not admit. Each event is stored with the calendar properties that
+// describe the iCalendar it is written in, and so passes the validator.
+func TestImportCalendarLeavesTheExportedCalendarsPropertiesBehind(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	calendarProperties := []string{
+		"NAME:Team calendar", "DESCRIPTION:Shared team events", "UID:5FC53010-1267-4F8E-BC28-1D7AE55A7C99",
+		"URL:https://calendar.example.com/team.ics", "LAST-MODIFIED:20260101T000000Z", "COLOR:turquoise",
+		"REFRESH-INTERVAL;VALUE=DURATION:PT12H", "SOURCE;VALUE=URI:https://calendar.example.com/team.ics",
+		"IMAGE;VALUE=URI;DISPLAY=BADGE:https://calendar.example.com/logo.png",
+		"X-WR-CALNAME:Team calendar", "X-WR-CALDESC:Shared team events", "X-WR-TIMEZONE:America/New_York",
+		"X-PUBLISHED-TTL:PT12H",
+	}
+	ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//Team Calendar//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\n" +
+		strings.Join(calendarProperties, "\r\n") + "\r\n" +
+		"BEGIN:VEVENT\r\nUID:planning\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Planning\r\nDTSTART:20260105T150000Z\r\nDTEND:20260105T160000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:review\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Review\r\nDTSTART:20260106T150000Z\r\nDTEND:20260106T160000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "team.ics", ics)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=Imported+2+event%28s%29") || strings.Contains(location, "skipped") {
+		t.Fatalf("ImportCalendar() status = %d location = %s", w.Code, location)
+	}
+	for _, uid := range []string{"planning", "review"} {
+		stored := eventRepo.events["1:"+uid]
+		if stored == nil {
+			t.Fatalf("event %s was not stored: %v", uid, eventRepo.events)
+		}
+		if _, err := dav.ValidateCalendarObject(stored.RawICAL, nil); err != nil {
+			t.Errorf("stored %s does not pass the CalDAV validator: %v\n%s", uid, err, stored.RawICAL)
+		}
+		for _, want := range []string{"VERSION:2.0\r\n", "PRODID:-//Example//Team Calendar//EN\r\n", "CALSCALE:GREGORIAN\r\n"} {
+			if !strings.Contains(stored.RawICAL, want) {
+				t.Errorf("stored %s lacks %q:\n%s", uid, want, stored.RawICAL)
+			}
+		}
+		for _, property := range calendarProperties {
+			if strings.Contains(stored.RawICAL, property) {
+				t.Errorf("stored %s carries the exported calendar's %q:\n%s", uid, property, stored.RawICAL)
+			}
+		}
+	}
+}
+
+// A repeating event the UI creates ends on the date the user picked, and an
+// occurrence on that date is part of the series. CalDAV clients have to be able
+// to write that object back, so it passes the validator a PUT applies.
+func TestCreatedRepeatUntilEventPassesTheCalDAVValidator(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("Europe/Berlin is not available: %v", err)
+	}
+	tests := []struct {
+		name      string
+		form      url.Values
+		wantUntil string
+		lastStart time.Time
+	}{
+		{
+			name: "timed series ends after the picked day's occurrence",
+			form: url.Values{
+				"dtstart":  {"2026-01-05T09:00"},
+				"dtend":    {"2026-01-05T09:15"},
+				"timezone": {"Europe/Berlin"},
+			},
+			wantUntil: "UNTIL=20260302T225959Z",
+			lastStart: time.Date(2026, 3, 2, 9, 0, 0, 0, berlin),
+		},
+		{
+			name: "all-day series keeps the inclusive DATE",
+			form: url.Values{
+				"dtstart":  {"2026-01-05"},
+				"dtend":    {"2026-01-05"},
+				"all_day":  {"on"},
+				"timezone": {"Europe/Berlin"},
+			},
+			wantUntil: "UNTIL=20260302;",
+			lastStart: time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			form := url.Values{
+				"summary":             {"Standup"},
+				"recurrence":          {"WEEKLY"},
+				"recurrence_byday":    {"MO"},
+				"recurrence_end_type": {"on"},
+				"recurrence_until":    {"2026-03-02"},
+			}
+			for key, values := range tt.form {
+				form[key] = values
+			}
+			req := httptest.NewRequest(http.MethodPost, "/calendars/1/events", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req = withRouteID(req, "1")
+			req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+			w := httptest.NewRecorder()
+			handler.CreateEvent(w, req)
+
+			if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=event_created") {
+				t.Fatalf("CreateEvent() status = %d location = %s", w.Code, location)
+			}
+			if len(eventRepo.events) != 1 {
+				t.Fatalf("stored %d events, want 1", len(eventRepo.events))
+			}
+			for _, stored := range eventRepo.events {
+				if !strings.Contains(stored.RawICAL, tt.wantUntil) {
+					t.Fatalf("the series does not end on the picked date, want %s:\n%s", tt.wantUntil, stored.RawICAL)
+				}
+				until := rruleUntilBound(t, stored.RawICAL)
+				if until.Before(tt.lastStart) {
+					t.Errorf("UNTIL %s is before the picked day's occurrence at %s", until, tt.lastStart)
+				}
+				if _, err := dav.ValidateCalendarObject(stored.RawICAL, nil); err != nil {
+					t.Errorf("stored data does not pass the CalDAV validator: %v\n%s", err, stored.RawICAL)
+				}
+			}
+		})
+	}
+}
+
+// rruleUntilBound reads the stored series' UNTIL as the last instant an
+// occurrence may start: a UTC DATE-TIME as written, and a DATE, which RFC 5545
+// makes inclusive, as the start of that day. The rules of the VTIMEZONE the
+// event carries are not the series'.
+func rruleUntilBound(t *testing.T, raw string) time.Time {
+	t.Helper()
+	inTimezone := false
+	for _, line := range utils.UnfoldLines(raw) {
+		switch line {
+		case "BEGIN:VTIMEZONE":
+			inTimezone = true
+		case "END:VTIMEZONE":
+			inTimezone = false
+		}
+		rule, ok := strings.CutPrefix(line, "RRULE:")
+		if !ok || inTimezone {
+			continue
+		}
+		value := rruleUntil(rule)
+		for _, layout := range []string{"20060102T150405Z", "20060102"} {
+			if until, err := time.Parse(layout, value); err == nil {
+				return until
+			}
+		}
+		t.Fatalf("unreadable UNTIL %q in %s", value, line)
+	}
+	t.Fatalf("no RRULE in:\n%s", raw)
+	return time.Time{}
+}
+
+// An edit whose result the validator refuses is not stored, and the user is
+// told why in plain words: here the series keeps an override that ends before
+// it starts.
+func TestUpdateEventRefusesDataTheCalDAVValidatorRefuses(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series", RawICAL: seriesWithBackwardsOverride, ETag: "e"},
+	}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	form := url.Values{
+		"summary": {"Renamed"}, "dtstart": {"2026-01-05T09:00"}, "dtend": {"2026-01-05T10:00"}, "edit_scope": {"series"},
+		"recurrence": {"WEEKLY"}, "recurrence_end_type": {"after"}, "recurrence_count": {"4"}, "etag": {"e"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/series", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", "series")
+	req = req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100}), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	handler.UpdateEvent(w, req)
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("UpdateEvent() Location: %v", err)
+	}
+	if got, want := location.Query().Get("error"), "the event could not be saved: its calendar data is not valid iCalendar"; got != want {
+		t.Fatalf("UpdateEvent() error = %q, want %q", got, want)
+	}
+	if got := eventRepo.events["1:series"].RawICAL; got != seriesWithBackwardsOverride {
+		t.Errorf("the refused edit was stored:\n%s", got)
+	}
+}
+
+// seriesWithBackwardsOverride is a stored series the validator refuses, as data
+// a 1.1.x release wrote may be: its override ends before it starts.
+const seriesWithBackwardsOverride = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Series\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\n" +
+	"BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:20260112T090000Z\r\nDTSTART:20260112T090000Z\r\nDTEND:20260112T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+func deleteOccurrenceRequest(t *testing.T, uid string, form url.Values) *http.Request {
+	t.Helper()
+	form.Set("edit_scope", "occurrence")
+	if _, named := form["etag"]; !named {
+		form.Set("etag", seededEventETag)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/calendars/1/events/"+uid+"/delete", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "1")
+	rctx.URLParams.Add("uid", uid)
+	return req.WithContext(context.WithValue(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}), chi.RouteCtxKey, rctx))
+}
+
+// zonedSeries is a weekly series at 09:00 in New York as the validator stores
+// it, with the definition of America/New_York the server writes.
+func zonedSeries(t *testing.T) string {
+	t.Helper()
+	object, err := dav.ValidateCalendarObject("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n"+
+		"BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Series\r\n"+
+		"DTSTART;TZID=America/New_York:20260105T090000\r\nDTEND;TZID=America/New_York:20260105T100000\r\n"+
+		"RRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", nil)
+	if err != nil {
+		t.Fatalf("the zoned series should pass the validator: %v", err)
+	}
+	if !strings.Contains(object.Body, "TZID:America/New_York") {
+		t.Fatalf("the validator wrote no definition of America/New_York:\n%s", object.Body)
+	}
+	return object.Body
+}
+
+// Removing an occurrence is a write like any other: the result goes through
+// the validator, which stores the definitions of the zones it uses and the
+// metadata it derives.
+func TestDeleteOccurrenceStoresTheValidatedResult(t *testing.T) {
+	original := zonedSeries(t)
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: original, ETag: "e"},
+	}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	w := httptest.NewRecorder()
+	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
+		"recurrence_id":       {"2026-01-19T09:00"},
+		"recurrence_timezone": {"America/New_York"},
+	}))
+
+	if location := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(location, "status=occurrence_deleted") {
+		t.Fatalf("DeleteEvent() status = %d location = %s", w.Code, location)
+	}
+	stored := eventRepo.events["1:series"]
+	if !strings.Contains(stored.RawICAL, "EXDATE;TZID=America/New_York:20260119T090000\r\n") {
+		t.Fatalf("the occurrence was not removed:\n%s", stored.RawICAL)
+	}
+	if !strings.Contains(stored.RawICAL, "TZID:America/New_York") {
+		t.Errorf("the stored result lacks the definition of the zone it uses:\n%s", stored.RawICAL)
+	}
+	if _, err := dav.ValidateCalendarObject(stored.RawICAL, nil); err != nil {
+		t.Errorf("the stored result fails the validator: %v\n%s", err, stored.RawICAL)
+	}
+	if stored.ResourceName != "series.ics" || stored.ETag != utils.GenerateETag(stored.RawICAL) || stored.WriteMetadata == nil {
+		t.Errorf("stored resource name %q etag %q metadata %+v, want the existing name, the new data's etag and the validator's metadata",
+			stored.ResourceName, stored.ETag, stored.WriteMetadata)
+	}
+}
+
+// A stored series the validator refuses cannot lose an occurrence either,
+// since that would store data no CalDAV client could have written: the user is
+// told why, as an edit of it is, and what can still be done, and the series is
+// left as it is.
+func TestDeleteOccurrenceOfAStoredSeriesTheValidatorRefusesIsRefused(t *testing.T) {
+	tests := map[string]struct {
+		raw, recurrenceID, timezone string
+	}{
+		"override ending before it starts": {seriesWithBackwardsOverride, "2026-01-19T09:00", "UTC"},
+		"zoned series with a line that is not a content line": {
+			strings.Replace(zonedSeries(t), "SUMMARY:Series\r\n", "SUMMARY:Series\r\nNotes pasted without a property name\r\n", 1),
+			"2026-01-19T09:00", "America/New_York",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := dav.ValidateCalendarObject(tt.raw, nil); err == nil {
+				t.Fatal("the validator accepts the stored series, so it does not exercise a refused one")
+			}
+			calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+			eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+				"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: tt.raw, ETag: "e"},
+			}}}
+			handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+			w := httptest.NewRecorder()
+			handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
+				"recurrence_id":       {tt.recurrenceID},
+				"recurrence_timezone": {tt.timezone},
+			}))
+
+			location, err := url.Parse(w.Header().Get("Location"))
+			if err != nil {
+				t.Fatalf("DeleteEvent() Location: %v", err)
+			}
+			if got, want := location.Query().Get("error"), "the occurrence could not be deleted: its calendar data is not valid iCalendar; the whole series can still be deleted"; got != want {
+				t.Fatalf("DeleteEvent() error = %q, want %q", got, want)
+			}
+			if stored := eventRepo.events["1:series"]; stored.RawICAL != tt.raw || stored.ETag != "e" {
+				t.Errorf("the refused result was stored:\n%s", stored.RawICAL)
+			}
+		})
+	}
+}
+
+// Deleting an occurrence of a series the validator accepts may not store a
+// result it refuses: here the exclusion falls before the earliest date the
+// server accepts.
+func TestDeleteOccurrenceRefusesToBreakAValidSeries(t *testing.T) {
+	const original = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Series\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	if _, err := dav.ValidateCalendarObject(original, nil); err != nil {
+		t.Fatalf("the stored series should pass the validator: %v", err)
+	}
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+		"1:series": {ID: 1, CalendarID: 1, UID: "series", ResourceName: "series.ics", RawICAL: original, ETag: "e"},
+	}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	w := httptest.NewRecorder()
+	handler.DeleteEvent(w, deleteOccurrenceRequest(t, "series", url.Values{
+		"recurrence_id":       {"1800-01-01T00:00"},
+		"recurrence_timezone": {"UTC"},
+	}))
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("DeleteEvent() Location: %v", err)
+	}
+	if got, want := location.Query().Get("error"), "the occurrence could not be deleted: it has a date earlier than this server accepts"; got != want {
+		t.Fatalf("DeleteEvent() error = %q, want %q", got, want)
+	}
+	if got := eventRepo.events["1:series"].RawICAL; got != original {
+		t.Errorf("the refused result was stored:\n%s", got)
+	}
+}
+
+func TestInvalidEventMessageSpeaksPlainly(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"invalid data", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"valid-calendar-data"}}, "the event could not be saved: its calendar data is not valid iCalendar"},
+		{"invalid resource", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"valid-calendar-object-resource"}}, "the event could not be saved: it is not a single event with one UID, or it uses a time zone it does not define"},
+		{"unsupported component", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"supported-calendar-component"}}, "the event could not be saved: this calendar does not accept that kind of item"},
+		{"too large", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-resource-size"}}, "the event could not be saved: it is larger than this server accepts"},
+		{"too early", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"min-date-time"}}, "the event could not be saved: it has a date earlier than this server accepts"},
+		{"too late", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-date-time"}}, "the event could not be saved: it has a date later than this server accepts"},
+		{"too many instances", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-instances"}}, "the event could not be saved: it repeats more times than this server allows"},
+		{"too many attendees", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-attendees-per-instance"}}, "the event could not be saved: it has more attendees than this server allows"},
+		{"several conditions", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"max-instances", "max-date-time"}}, "the event could not be saved: it repeats more times than this server allows; it has a date later than this server accepts"},
+		{"UID too long", calobject.NewError(http.StatusForbidden, []string{"valid-calendar-object-resource"}, calobject.ErrUIDTooLong), "the event could not be saved: its UID is longer than this server accepts"},
+		{"unknown condition", &calobject.Error{Status: http.StatusForbidden, Conditions: []string{"no-uid-conflict"}}, "the event could not be saved: the server could not accept its calendar data"},
+		{"other error", errors.New("boom"), "the event could not be saved: the server could not accept its calendar data"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := invalidEventMessage("the event could not be saved", tt.err); got != tt.want {
+				t.Errorf("invalidEventMessage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A file of concatenated exports (cat a.ics b.ics) carries VERSION, PRODID and
+// each zone once per export. Every event in it imports.
+func TestImportCalendarImportsConcatenatedCalendars(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	calendar := func(name, uid string) string {
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//" + name + "//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nX-WR-CALNAME:" + name + "\r\n" +
+			"BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\nEND:STANDARD\r\n" +
+			"BEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nTZNAME:CEST\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n" +
+			"BEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:" + name + "\r\nDTSTART;TZID=Europe/Berlin:20260105T090000\r\nDTEND;TZID=Europe/Berlin:20260105T100000\r\nEND:VEVENT\r\n" +
+			"END:VCALENDAR\r\n"
+	}
+	req := newICSImportRequest(t, "/calendars/1/import", "both.ics", calendar("First", "a@example.com")+calendar("Second", "b@example.com"))
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("ImportCalendar() Location: %v", err)
+	}
+	if got := location.Query().Get("status"); w.Code != http.StatusFound || got != "Imported 2 event(s)" {
+		t.Fatalf("ImportCalendar() status = %d, flash %q error %q, want both events imported", w.Code, got, location.Query().Get("error"))
+	}
+	for _, uid := range []string{"a@example.com", "b@example.com"} {
+		stored := eventRepo.events["1:"+uid]
+		if stored == nil {
+			t.Fatalf("%s was not stored: %v", uid, eventRepo.events)
+		}
+		if _, err := dav.ValidateCalendarObject(stored.RawICAL, nil); err != nil {
+			t.Errorf("%s does not pass the CalDAV validator: %v\n%s", uid, err, stored.RawICAL)
+		}
+	}
+}
+
+// The UI writes calendar data through the validator its handler was built
+// with: an object it refuses is not stored, and the import reports it skipped.
+func TestImportCalendarWritesThroughTheHandlersValidator(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}
+	validated := 0
+	refuse := func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+		validated++
+		return nil, calobject.NewError(http.StatusForbidden, []string{"max-instances"}, nil)
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, refuse, dav.EventInstances)
+
+	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:refused@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "refused.ics", body)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	if validated != 1 {
+		t.Fatalf("validator called %d times, want once for the one event", validated)
+	}
+	if len(eventRepo.events) != 0 {
+		t.Fatalf("stored %v after the validator refused it", eventRepo.events)
+	}
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("ImportCalendar() Location: %v", err)
+	}
+	if flash := location.Query().Get("error"); !strings.Contains(flash, "skipped 1") {
+		t.Fatalf("ImportCalendar() error flash = %q, want the refused event reported skipped", flash)
+	}
+}
+
+// A sharee who can neither add events to a calendar nor change its events is
+// refused an import before the upload is read, so none of it is validated.
+func TestImportCalendarRefusesAReadOnlyShareeBeforeValidating(t *testing.T) {
+	calRepo := &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+		"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true,
+			Privileges: store.CalendarPrivileges{Read: true, ReadFreeBusy: true}},
+	}}
+	eventRepo := &countingEventRepo{fakeEventRepoWithUpsert: fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
+	validated := 0
+	validate := func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+		validated++
+		return dav.ValidateCalendarObject(raw, cal)
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, validate, dav.EventInstances)
+
+	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:one@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:two@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260106T090000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "shared.ics", body)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "reader@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("ImportCalendar() status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if validated != 0 || eventRepo.lookups != 0 {
+		t.Errorf("validated %d events and looked up %d before refusing the import", validated, eventRepo.lookups)
+	}
+	if len(eventRepo.events) != 0 {
+		t.Errorf("stored %v", eventRepo.events)
+	}
+}
+
+// A sharee whose only write access is a resource-level grant on one event
+// can import an update of that event. Each event's privilege is decided before
+// it is validated, so an event the sharee cannot write costs no validation,
+// and is counted with the events the import left out.
+func TestImportCalendarHonoursAResourceLevelGrant(t *testing.T) {
+	existing := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nDTSTAMP:20260101T000000Z\r\n" +
+		"DTSTART:20260105T090000Z\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	calRepo := &fakeCalendarRepo{accessible: map[string]*store.CalendarAccess{
+		"1:100": {Calendar: store.Calendar{ID: 1, UserID: 200, Name: "Shared"}, Shared: true,
+			Privileges: store.CalendarPrivileges{Read: true, ReadFreeBusy: true}},
+	}}
+	eventRepo := &countingEventRepo{fakeEventRepoWithUpsert: fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: map[string]*store.Event{
+		"1:evt-1": {ID: 1, CalendarID: 1, UID: "evt-1", ResourceName: "evt-1.ics", RawICAL: existing, ETag: "e"},
+	}}}}
+	aclRepo := &fakeACLRepo{entries: []store.ACLEntry{
+		{ResourcePath: "/dav/calendars/1", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "read"},
+		{ResourcePath: "/dav/calendars/1/evt-1.ics", PrincipalHref: "/dav/principals/100/", IsGrant: true, Privilege: "write-content"},
+	}}
+	validated := 0
+	validate := func(raw string, cal *store.CalendarAccess) (*calobject.Object, error) {
+		validated++
+		return dav.ValidateCalendarObject(raw, cal)
+	}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo, ACLEntries: aclRepo}, nil, validate, dav.EventInstances)
+
+	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:evt-1\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nSUMMARY:Updated\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:evt-2\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260106T090000Z\r\nSUMMARY:New\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "shared.ics", body)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "editor@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if w.Code != http.StatusFound || err != nil {
+		t.Fatalf("ImportCalendar() status = %d, location %q", w.Code, w.Header().Get("Location"))
+	}
+	if got, want := location.Query().Get("status"), "Imported 1 event(s); skipped 1 (not valid or not events)"; got != want {
+		t.Errorf("ImportCalendar() status = %q, want %q", got, want)
+	}
+	if stored := eventRepo.events["1:evt-1"]; stored == nil || !strings.Contains(stored.RawICAL, "SUMMARY:Updated") {
+		t.Errorf("evt-1 = %+v, want it updated", stored)
+	}
+	if _, ok := eventRepo.events["1:evt-2"]; ok {
+		t.Error("stored evt-2, which the sharee cannot add")
+	}
+	if validated != 1 {
+		t.Errorf("validated %d events, want only the one the sharee may write", validated)
+	}
+}
+
+// countingEventRepo counts the per-event lookups an import makes.
+type countingEventRepo struct {
+	fakeEventRepoWithUpsert
+	lookups int
+}
+
+func (f *countingEventRepo) GetByUID(ctx context.Context, calendarID int64, uid string) (*store.Event, error) {
+	f.lookups++
+	return f.fakeEventRepoWithUpsert.GetByUID(ctx, calendarID, uid)
+}
+
+// An import says how many of the file's items it left out and why, counting
+// the tasks and journal entries a calendar of events does not take, and an
+// event the validator refuses costs no database round trip.
+func TestImportCalendarCountsWhatItLeavesOut(t *testing.T) {
+	calRepo := &fakeCalendarRepo{calendars: map[int64]*store.Calendar{1: {ID: 1, UserID: 100, Name: "Work"}}}
+	eventRepo := &countingEventRepo{fakeEventRepoWithUpsert: fakeEventRepoWithUpsert{fakeEventRepo: fakeEventRepo{events: make(map[string]*store.Event)}}}
+	handler := NewHandler(&config.Config{}, &store.Store{Calendars: calRepo, Events: eventRepo}, nil, dav.ValidateCalendarObject, dav.EventInstances)
+
+	ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n" +
+		"BEGIN:VTODO\r\nUID:task\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Task\r\nEND:VTODO\r\n" +
+		"BEGIN:VJOURNAL\r\nUID:note\r\nDTSTAMP:20260101T000000Z\r\nEND:VJOURNAL\r\n" +
+		"BEGIN:VEVENT\r\nUID:kept\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:Kept\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:backwards\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T080000Z\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:" + strings.Repeat("u", store.MaxIdentifierOctets+1) + "\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nEND:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+	req := newICSImportRequest(t, "/calendars/1/import", "mixed.ics", ics)
+	req = withRouteID(req, "1")
+	req = req.WithContext(auth.WithUser(req.Context(), &store.User{ID: 100, PrimaryEmail: "owner@example.com"}))
+	w := httptest.NewRecorder()
+	handler.ImportCalendar(w, req)
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("ImportCalendar() Location: %v", err)
+	}
+	if got, want := location.Query().Get("status"), "Imported 1 event(s); skipped 4 (not valid or not events)"; got != want {
+		t.Fatalf("ImportCalendar() status = %q, want %q", got, want)
+	}
+	if len(eventRepo.events) != 1 || eventRepo.events["1:kept"] == nil {
+		t.Errorf("stored %v, want only the valid event", eventRepo.events)
+	}
+	// The one event it stores is looked up to decide the write, and again by the
+	// write the repository fallback makes; the events it leaves out cost none.
+	if eventRepo.lookups != 2 {
+		t.Errorf("ImportCalendar() looked up %d events, want only the one it stores, twice", eventRepo.lookups)
 	}
 }

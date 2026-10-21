@@ -2,199 +2,590 @@ package dav
 
 import (
 	"context"
+	"encoding/xml"
+	"errors"
+	"fmt"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	aclutil "github.com/jw6ventures/calcard/internal/acl"
 	"github.com/jw6ventures/calcard/internal/auth"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
-func (h *Handler) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response) error {
+// propDecorationMask controls which expensive DAV properties decorateDAVProp
+// computes. Each field gates a property that requires a DB query or repeated
+// privilege checks, so unrequested properties can be skipped entirely.
+type propDecorationMask struct {
+	lockDiscovery           bool
+	acl                     bool
+	currentUserPrivilegeSet bool
+	owner                   bool
+}
+
+// decorationMaskFor derives the set of expensive properties worth computing for
+// a PROPFIND request. A specific <prop> request only needs the properties it
+// names; allprop and compatibility (nil) requests compute every value.
+func decorationMaskFor(req *propfindRequest) propDecorationMask {
+	if req != nil && req.PropName != nil {
+		return propDecorationMask{}
+	}
+	if req == nil || req.Prop == nil {
+		return propDecorationMask{lockDiscovery: true, acl: true, currentUserPrivilegeSet: true, owner: true}
+	}
+	return propDecorationMask{
+		lockDiscovery:           req.Prop.LockDiscovery != nil,
+		acl:                     req.Prop.ACLProp != nil,
+		currentUserPrivilegeSet: req.Prop.CurrentUserPrivilegeSet != nil,
+		owner:                   req.Prop.Owner != nil || req.Prop.ACLProp != nil,
+	}
+}
+
+func (h *DavServer) decoratePropfindResponses(ctx context.Context, r *http.Request, user *store.User, responses []response, mask propDecorationMask) error {
+	if _, exceeded := h.capMultistatusResponses(responses); exceeded {
+		return nil
+	}
+	deadByPath, err := h.deadPropertiesForResponses(ctx, user, responses)
+	if err != nil {
+		return err
+	}
+	if (mask.acl || mask.currentUserPrivilegeSet) && len(responses) > 1 {
+		if err := h.prefetchPropfindACLEntries(ctx, user, responses); err != nil {
+			return err
+		}
+	}
+	// When lock discovery is requested across multiple responses, prefetch every
+	// relevant lock in one query so each response's lockDiscoveryForPath reads
+	// from the batch index rather than issuing its own query.
+	if mask.lockDiscovery && len(responses) > 1 {
+		batchCtx, err := h.prefetchLockBatchIndex(ctx, responses)
+		if err != nil {
+			return err
+		}
+		ctx = batchCtx
+	}
 	for i := range responses {
 		if len(responses[i].Propstat) == 0 {
 			continue
 		}
 		resourcePath := normalizeDAVHref(responses[i].Href)
+		requestPath := resourcePath
+		canonicalPath, canonicalErr := h.canonicalDAVPath(ctx, user, resourcePath)
+		if canonicalErr == nil && canonicalPath != "" {
+			resourcePath = canonicalPath
+			requestPath = requestPathForCanonical(canonicalPath)
+		}
 		for j := range responses[i].Propstat {
 			if responses[i].Propstat[j].Status != httpStatusOK {
 				continue
 			}
-			if err := h.decorateDAVProp(ctx, user, resourcePath, &responses[i].Propstat[j].Prop); err != nil {
+			if err := h.decorateDAVProp(ctx, user, resourcePath, requestPath, &responses[i].Propstat[j].Prop, mask); err != nil {
 				return err
 			}
-			if err := h.davRegistry().decoratePropfind(RequestContext{
-				Context: ctx,
-				User:    user,
-				Request: r,
-				Path:    resourcePath,
-			}, &PropfindProperties{
-				href: resourcePath,
-				prop: &responses[i].Propstat[j].Prop,
-			}); err != nil {
-				return err
+			for _, property := range deadByPath[resourcePath] {
+				responses[i].Propstat[j].Prop.setCustomXMLProperty(XMLProperty{
+					Name:  xml.Name{Space: property.NamespaceURI, Local: property.LocalName},
+					Value: rawXMLValue(property.InnerXML),
+				})
+			}
+			if r != nil {
+				if err := h.davRegistry().decoratePropfind(RequestContext{
+					Context: ctx,
+					User:    user,
+					Request: r,
+					Path:    resourcePath,
+				}, &PropfindProperties{
+					href: resourcePath,
+					prop: &responses[i].Propstat[j].Prop,
+				}); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func (h *Handler) decorateDAVProp(ctx context.Context, user *store.User, resourcePath string, p *prop) error {
+func (h *DavServer) prefetchPropfindACLEntries(ctx context.Context, user *store.User, responses []response) error {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return nil
+	}
+	canonicalSeen := make(map[string]struct{})
+	var canonicalPaths []string
+	addCanonical := func(resourcePath string) {
+		resourcePath = cleanDAVPath(resourcePath)
+		if resourcePath == "" {
+			return
+		}
+		if _, ok := canonicalSeen[resourcePath]; ok {
+			return
+		}
+		canonicalSeen[resourcePath] = struct{}{}
+		canonicalPaths = append(canonicalPaths, resourcePath)
+	}
+	for _, response := range responses {
+		resourcePath, err := h.canonicalDAVHref(ctx, user, response.Href)
+		if err != nil {
+			return err
+		}
+		addCanonical(resourcePath)
+		if target := parseDAVTarget(resourcePath); target.Valid && target.Resource {
+			addCanonical(path.Dir(resourcePath))
+		}
+	}
+
+	// Cache each resource under the key aclEntriesForResource looks it up by.
+	queryPaths := make([]string, 0, len(canonicalPaths))
+	for _, resourcePath := range canonicalPaths {
+		if !isProtectedVirtualDAVRoot(resourcePath) {
+			queryPaths = append(queryPaths, resourcePath)
+		}
+	}
+	entries, err := h.store.ACLEntries.ListByResources(ctx, queryPaths)
+	if err != nil {
+		return err
+	}
+	byPath := make(map[string][]store.ACLEntry, len(queryPaths))
+	for _, entry := range entries {
+		byPath[entry.ResourcePath] = append(byPath[entry.ResourcePath], entry)
+	}
+	cache := aclEntryCacheFromContext(ctx)
+	if cache == nil {
+		return nil
+	}
+	for _, resourcePath := range canonicalPaths {
+		resourceEntries := byPath[resourcePath]
+		aclutil.SortEntries(resourceEntries)
+		cache.put(resourcePath, resourceEntries)
+	}
+	return nil
+}
+
+func (h *DavServer) deadPropertiesForResponses(ctx context.Context, user *store.User, responses []response) (map[string][]store.DeadProperty, error) {
+	result := make(map[string][]store.DeadProperty)
+	if h == nil || h.store == nil || h.store.DeadProperties == nil {
+		return result, nil
+	}
+	seen := make(map[string]struct{})
+	paths := make([]string, 0, len(responses))
+	for _, response := range responses {
+		resourcePath := normalizeDAVHref(response.Href)
+		if !strings.HasPrefix(resourcePath, calendarPrefix+"/") && !strings.HasPrefix(resourcePath, addressBookPrefix+"/") {
+			continue
+		}
+		canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[canonicalPath]; ok {
+			continue
+		}
+		seen[canonicalPath] = struct{}{}
+		paths = append(paths, canonicalPath)
+	}
+	properties, err := h.store.DeadProperties.ListByResources(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+	for _, property := range properties {
+		key := cleanDAVPath(property.ResourcePath)
+		result[key] = append(result[key], property)
+	}
+	return result, nil
+}
+
+// decorateDAVProp fills the computed properties of the resource at the
+// canonical resourcePath, which a request names by requestPath. Checks that
+// canonicalize the path they are given take requestPath: a canonical object
+// path would lose its name's own extension to them.
+func (h *DavServer) decorateDAVProp(ctx context.Context, user *store.User, resourcePath, requestPath string, p *prop, mask propDecorationMask) error {
 	if p == nil || resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
 		return nil
 	}
 
+	// These are static or cheap to build, so always populate them.
 	p.SupportedLock = defaultSupportedLock()
 	p.SupportedPrivilegeSet = defaultSupportedPrivilegeSet()
 	p.PrincipalCollectionSet = &hrefListProp{Href: []string{"/dav/principals/"}}
-
-	lockDiscovery, err := h.lockDiscoveryForPath(ctx, resourcePath)
-	if err != nil {
-		return err
-	}
-	p.LockDiscovery = lockDiscovery
-
-	if h != nil && h.store != nil && h.store.ACLEntries != nil {
-		entries, err := h.aclEntriesForResource(ctx, resourcePath)
+	p.Group = &hrefProp{}
+	p.ACLRestrictions = &aclRestrictionsProp{NoInvert: &struct{}{}}
+	p.InheritedACLSet = &hrefListProp{}
+	inheritedACLPath := inheritedACLSourcePath(resourcePath)
+	var inheritedEntries []store.ACLEntry
+	if inheritedACLPath != "" && h != nil && h.store != nil && h.store.ACLEntries != nil {
+		var err error
+		inheritedEntries, err = h.aclEntriesForResource(ctx, inheritedACLPath)
 		if err != nil {
 			return err
 		}
-		p.ACL = buildACLPropFromEntries(entries)
+		if len(inheritedEntries) != 0 {
+			p.InheritedACLSet.Href = []string{ensureCollectionHref(inheritedACLPath)}
+		}
+	}
+	if strings.HasPrefix(cleanDAVPath(resourcePath), "/dav/principals/") {
+		p.AlternateURISet = &hrefListProp{}
+		p.GroupMembership = &hrefListProp{}
+	}
+	ownerHref := ""
+	if mask.owner && user != nil {
+		var err error
+		ownerHref, err = h.ownerPrincipalForPath(ctx, user, resourcePath)
+		if err != nil {
+			return err
+		}
+		if ownerHref != "" {
+			p.Owner = &hrefProp{Href: ownerHref}
+		}
+	}
+
+	if mask.lockDiscovery {
+		lockDiscovery, err := h.lockDiscoveryForPath(ctx, requestPath)
+		if err != nil {
+			return err
+		}
+		p.LockDiscovery = lockDiscovery
+	}
+
+	if mask.acl {
+		allowed, err := h.checkACLPrivilege(ctx, user, requestPath, "read-acl")
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			p.aclForbidden = true
+		} else {
+			var entries []store.ACLEntry
+			if h != nil && h.store != nil && h.store.ACLEntries != nil {
+				entries, err = h.aclEntriesForResource(ctx, resourcePath)
+				if err != nil {
+					return err
+				}
+			}
+			p.ACL = buildACLPropFromEntries(entries)
+			if len(inheritedEntries) != 0 {
+				inherited := buildACLPropFromEntries(inheritedEntries)
+				for i := range inherited.ACE {
+					inherited.ACE[i].Inherited = &aceInheritedResp{Href: ensureCollectionHref(inheritedACLPath)}
+				}
+				p.ACL.ACE = append(p.ACL.ACE, inherited.ACE...)
+			}
+			if ownerHref != "" {
+				p.ACL.ACE = append([]aceResp{protectedOwnerACEForPath(ctx, resourcePath, ownerHref)}, p.ACL.ACE...)
+			}
+		}
 	}
 
 	if user != nil && p.CurrentUserPrincipal == nil {
 		principalHref := h.principalURL(user)
-		p.CurrentUserPrincipal = &expandableHrefProp{Href: principalHref}
+		p.CurrentUserPrincipal = &hrefProp{Href: principalHref}
 		p.CurrentUserPrincipalURL = &hrefProp{Href: principalHref}
 	}
-	if user != nil && p.CurrentUserPrivilegeSet == nil {
-		p.CurrentUserPrivilegeSet = h.currentUserPrivilegeSetForPath(ctx, user, resourcePath)
+	if mask.currentUserPrivilegeSet && user != nil {
+		allowed, err := h.checkACLPrivilege(ctx, user, requestPath, "read-current-user-privilege-set")
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			p.CurrentUserPrivilegeSet = nil
+			p.currentUserPrivilegesForbidden = true
+		} else {
+			if h.store == nil || h.store.ACLEntries != nil || h.isResourceOwner(ctx, user, resourcePath) || p.CurrentUserPrivilegeSet == nil {
+				// CalendarPrivileges omits ACL-management privileges, so stored ACLs
+				// must still supply the complete property even when a preset exists.
+				privileges, err := h.currentUserPrivilegeSetForPath(ctx, user, requestPath)
+				if err != nil {
+					return err
+				}
+				p.CurrentUserPrivilegeSet = privileges
+			}
+		}
 	}
 
 	return nil
 }
 
-func (h *Handler) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) *currentUserPrivilegeSet {
+func inheritedACLSourcePath(resourcePath string) string {
+	cleanPath := cleanDAVPath(resourcePath)
+	if strings.HasPrefix(cleanPath, calendarPrefix+"/") {
+		collectionPath := calendarCollectionPath(cleanPath)
+		if collectionPath != cleanPath {
+			return collectionPath
+		}
+	}
+	if strings.HasPrefix(cleanPath, addressBookPrefix+"/") {
+		collectionPath := addressBookCollectionPath(cleanPath)
+		if collectionPath != cleanPath {
+			return collectionPath
+		}
+	}
+	return ""
+}
+
+func (h *DavServer) ownerPrincipalForPath(ctx context.Context, user *store.User, resourcePath string) (string, error) {
+	cleanPath := cleanDAVPath(resourcePath)
+	if strings.HasPrefix(cleanPath, "/dav/principals/") {
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/"), "/")[0]
+		if id, err := strconv.ParseInt(segment, 10, 64); err == nil {
+			return fmt.Sprintf("/dav/principals/%d/", id), nil
+		}
+	}
+	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		if h == nil || h.store == nil || h.store.Calendars == nil {
+			return h.principalURL(user), nil
+		}
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/calendars/"), "/"), "/")[0]
+		id, ok, err := h.resolveCalendarID(ctx, user, segment)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) && user != nil {
+				return h.principalURL(user), nil
+			}
+			return "", err
+		}
+		if ok {
+			calendar, err := h.getCalendar(ctx, id)
+			if err == nil {
+				return fmt.Sprintf("/dav/principals/%d/", calendar.UserID), nil
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				return "", err
+			}
+		}
+	}
+	if strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
+		if h == nil || h.store == nil || h.store.AddressBooks == nil {
+			return h.principalURL(user), nil
+		}
+		segment := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/addressbooks/"), "/"), "/")[0]
+		id, ok, err := h.resolveAddressBookID(ctx, user, segment)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) && user != nil {
+				return h.principalURL(user), nil
+			}
+			return "", err
+		}
+		if ok {
+			book, err := h.getAddressBook(ctx, id)
+			if err == nil {
+				return fmt.Sprintf("/dav/principals/%d/", book.UserID), nil
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				return "", err
+			}
+		}
+	}
+	return h.principalURL(user), nil
+}
+
+func (h *DavServer) currentUserPrivilegeSetForPath(ctx context.Context, user *store.User, resourcePath string) (*currentUserPrivilegeSet, error) {
 	if user == nil {
-		return nil
+		return nil, nil
 	}
 
-	cleanPath := normalizeDAVHref(resourcePath)
+	cleanPath := cleanDAVPath(resourcePath)
+	if h.isResourceOwner(ctx, user, cleanPath) && isGenericDAVPrivilegePath(cleanPath) {
+		return currentUserPrivilegeSetForNames(calendarCurrentPrivilegeNames), nil
+	}
 	if strings.HasPrefix(cleanPath, "/dav/calendars/") {
+		if isBirthdayCalendarPath(ctx, cleanPath) {
+			// The birthday calendar is virtual: there is no stored calendar to
+			// resolve privileges from, so its collection and objects report the
+			// read-only set their collection response advertises rather than
+			// reporting the property absent.
+			return birthdayCalendarCurrentUserPrivilegeSet(), nil
+		}
 		segment := singleCollectionSegment(cleanPath, "/dav/calendars/")
 		if segment == "" {
-			if parsedSegment, _, ok := parseCalendarResourceSegments(cleanPath); ok {
-				segment = parsedSegment
+			if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathCalendar && target.Resource {
+				segment = target.CollectionSegment
 			}
 		}
 		if segment == "" {
-			return nil
+			// The calendar home collection (/dav/calendars/) is a generic
+			// collection the property applies to: present-empty, not a 404.
+			return &currentUserPrivilegeSet{}, nil
 		}
 
 		calendarID, ok, err := h.resolveCalendarID(ctx, user, segment)
-		if err != nil || !ok {
-			return nil
+		if err != nil {
+			return nil, err
 		}
-		cal, err := h.getCalendar(ctx, calendarID)
-		if err != nil || cal == nil {
-			return nil
+		if !ok {
+			return nil, nil
 		}
+		access, err := h.loadCalendarWithAnyPrivilege(ctx, user, calendarID, cleanPath)
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if access == nil {
+			return nil, nil
+		}
+		cal := &access.Calendar
 
-		privileges := make([]privilege, 0, 7)
-		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read"); err == nil {
-			privileges = append(privileges, privilege{Read: &readPrivilege{}})
+		// Resolve the ACL state once and decide every privilege from it
+		// instead of one full path/entry resolution per privilege name.
+		pc, err := h.calendarPrivilegeContextFor(ctx, user, cal, cleanPath)
+		if err != nil {
+			return nil, err
 		}
-		if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, "read-free-busy"); err == nil {
-			privileges = append(privileges, privilege{ReadFreeBusy: &struct{}{}})
+		if pc == nil {
+			return nil, nil
 		}
-		for _, name := range []string{"write", "write-content", "write-properties", "bind", "unbind"} {
-			if err := h.requireCalendarPrivilege(ctx, user, cal, cleanPath, name); err != nil {
-				continue
-			}
-			switch name {
-			case "write":
-				privileges = append(privileges, privilege{Write: &struct{}{}})
-			case "write-content":
-				privileges = append(privileges, privilege{WriteContent: &struct{}{}})
-			case "write-properties":
-				privileges = append(privileges, privilege{WriteProperties: &struct{}{}})
-			case "bind":
-				privileges = append(privileges, privilege{Bind: &struct{}{}})
-			case "unbind":
-				privileges = append(privileges, privilege{Unbind: &struct{}{}})
+		privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
+		for _, name := range calendarCurrentPrivilegeNames {
+			if pc.reports(name) {
+				privileges = append(privileges, privilegeElementForName(name))
 			}
 		}
-		if len(privileges) == 0 {
-			return nil
-		}
-		return &currentUserPrivilegeSet{Privileges: privileges}
+		// The property applies to this resource, so it is present even when the
+		// user holds no privileges. RFC 3744 defines the content model as
+		// privilege*, so zero privileges is a present-empty 200, not a 404.
+		return &currentUserPrivilegeSet{Privileges: privileges}, nil
 	}
 
 	if !strings.HasPrefix(cleanPath, "/dav/addressbooks/") {
-		return nil
+		return h.genericCurrentUserPrivilegeSet(ctx, user, cleanPath)
 	}
 
 	segment := singleCollectionSegment(cleanPath, "/dav/addressbooks/")
 	if segment == "" {
-		if parsedSegment, _, ok := parseAddressBookResourceSegments(cleanPath); ok {
-			segment = parsedSegment
+		if target := parsedDAVTarget(ctx, cleanPath); target.Valid && target.Domain == davPathAddressBook && target.Resource {
+			segment = target.CollectionSegment
 		}
 	}
 	if segment == "" {
-		return nil
+		// The address-book home collection (/dav/addressbooks/) is a generic
+		// collection the property applies to: present-empty, not a 404.
+		return &currentUserPrivilegeSet{}, nil
 	}
 
 	bookID, ok, err := h.resolveAddressBookID(ctx, user, segment)
-	if err != nil || !ok {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
 	}
 	book, err := h.getAddressBook(ctx, bookID)
-	if err != nil || book == nil {
-		return nil
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, errForbidden) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return nil, nil
 	}
 
-	privileges := make([]privilege, 0, 6)
-	for _, name := range []string{"read", "write", "write-content", "write-properties", "bind", "unbind"} {
-		if err := h.requireAddressBookPrivilege(ctx, user, book, cleanPath, name); err != nil {
-			continue
-		}
-		switch name {
-		case "read":
-			privileges = append(privileges, privilege{Read: &readPrivilege{}})
-		case "write":
-			privileges = append(privileges, privilege{Write: &struct{}{}})
-		case "write-content":
-			privileges = append(privileges, privilege{WriteContent: &struct{}{}})
-		case "write-properties":
-			privileges = append(privileges, privilege{WriteProperties: &struct{}{}})
-		case "bind":
-			privileges = append(privileges, privilege{Bind: &struct{}{}})
-		case "unbind":
-			privileges = append(privileges, privilege{Unbind: &struct{}{}})
+	pc, err := h.addressBookPrivilegeContextFor(ctx, user, book, cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	if pc == nil {
+		return nil, nil
+	}
+	privileges := make([]privilege, 0, len(addressBookCurrentPrivilegeNames))
+	for _, name := range addressBookCurrentPrivilegeNames {
+		if pc.reports(name) {
+			privileges = append(privileges, privilegeElementForName(name))
 		}
 	}
-	if len(privileges) == 0 {
-		return nil
+	// Present even with zero privileges (privilege* content model): return a
+	// present-empty set rather than a property-level 404.
+	return &currentUserPrivilegeSet{Privileges: privileges}, nil
+}
+
+func (h *DavServer) genericCurrentUserPrivilegeSet(ctx context.Context, user *store.User, resourcePath string) (*currentUserPrivilegeSet, error) {
+	if h == nil || h.store == nil || h.store.ACLEntries == nil {
+		return &currentUserPrivilegeSet{}, nil
+	}
+	entries, err := h.aclEntriesForResource(ctx, resourcePath)
+	if err != nil {
+		return nil, err
+	}
+	principals, err := h.applicablePrincipalsForPath(ctx, user, resourcePath, entries)
+	if err != nil {
+		return nil, err
+	}
+	privileges := make([]privilege, 0, len(calendarCurrentPrivilegeNames))
+	for _, name := range calendarCurrentPrivilegeNames {
+		if aclutil.HeldThroughLayers(principals, name, entries) {
+			privileges = append(privileges, privilegeElementForName(name))
+		}
+	}
+	return &currentUserPrivilegeSet{Privileges: privileges}, nil
+}
+
+func isGenericDAVPrivilegePath(resourcePath string) bool {
+	cleanPath := path.Clean(resourcePath)
+	if cleanPath == "/dav" || cleanPath == "/dav/calendars" || cleanPath == "/dav/addressbooks" || cleanPath == "/dav/principals" {
+		return true
+	}
+	if strings.HasPrefix(cleanPath, "/dav/principals/") {
+		return len(strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, "/dav/principals/"), "/"), "/")) == 1
+	}
+	return false
+}
+
+func currentUserPrivilegeSetForNames(names []string) *currentUserPrivilegeSet {
+	privileges := make([]privilege, 0, len(names))
+	for _, name := range names {
+		privileges = append(privileges, privilegeElementForName(name))
 	}
 	return &currentUserPrivilegeSet{Privileges: privileges}
 }
 
-func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string) (*lockDiscoveryProp, error) {
+// privilegeElementForName maps a privilege name to its XML response element.
+func privilegeElementForName(name string) privilege {
+	switch name {
+	case "all":
+		return privilege{All: &struct{}{}}
+	case "read":
+		return privilege{Read: &readPrivilege{}}
+	case "read-free-busy":
+		return privilege{ReadFreeBusy: &struct{}{}}
+	case "read-acl":
+		return privilege{ReadACL: &struct{}{}}
+	case "read-current-user-privilege-set":
+		return privilege{ReadCurrentUserPrivilegeSet: &struct{}{}}
+	case "write":
+		return privilege{Write: &struct{}{}}
+	case "write-content":
+		return privilege{WriteContent: &struct{}{}}
+	case "write-properties":
+		return privilege{WriteProperties: &struct{}{}}
+	case "bind":
+		return privilege{Bind: &struct{}{}}
+	case "unbind":
+		return privilege{Unbind: &struct{}{}}
+	case "write-acl":
+		return privilege{WriteACL: &struct{}{}}
+	case "unlock":
+		return privilege{Unlock: &struct{}{}}
+	}
+	return privilege{}
+}
+
+func (h *DavServer) lockDiscoveryForPath(ctx context.Context, resourcePath string) (*lockDiscoveryProp, error) {
 	if h == nil || h.store == nil || h.store.Locks == nil {
 		return &lockDiscoveryProp{}, nil
 	}
-	if user, ok := auth.UserFromContext(ctx); ok {
-		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
-			resourcePath = canonicalPath
-		}
-	}
+	resourcePath, paths := h.lockLookupPathsForResource(ctx, resourcePath)
 
-	paths := lockLookupPaths(resourcePath)
-	locks, err := h.store.Locks.ListByResources(ctx, paths)
+	locks, err := h.locksForLookupPaths(ctx, paths)
 	if err != nil {
 		return nil, err
 	}
+
+	// Only the creator is told the token. Every other reader still sees the
+	// activelock element, so a client can tell the resource is locked and that
+	// it does not hold the lock.
+	user, _ := auth.UserFromContext(ctx)
 
 	now := time.Now()
 	activeLocks := make([]activeLock, 0, len(locks))
@@ -203,535 +594,106 @@ func (h *Handler) lockDiscoveryForPath(ctx context.Context, resourcePath string)
 		if lock.ExpiresAt.Before(now) {
 			continue
 		}
-		lockPath := normalizeDAVResourceIdentity(lock.ResourcePath)
-		if lockPath != resourcePath && lock.Depth != "infinity" {
+		if !sameLockRoot(lock.ResourcePath, resourcePath) && lock.Depth != "infinity" {
 			continue
 		}
-		activeLocks = append(activeLocks, activeLockFromStoreLock(&lock))
+		activeLocks = append(activeLocks, activeLockFromStoreLock(&lock, user != nil && lock.UserID == user.ID))
 	}
 
 	return &lockDiscoveryProp{ActiveLocks: activeLocks}, nil
 }
 
-func (h *Handler) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {
-	owned, err := h.store.AddressBooks.ListByUser(ctx, user.ID)
-	if err != nil {
-		return nil, err
+// lockLookupPathsForResource canonicalizes resourcePath (best effort) and
+// returns the canonical path together with the set of paths whose locks could
+// apply to it: the resource itself and its ancestors.
+func (h *DavServer) lockLookupPathsForResource(ctx context.Context, resourcePath string) (string, []string) {
+	if user, ok := auth.UserFromContext(ctx); ok {
+		if canonicalPath, err := h.canonicalDAVPath(ctx, user, resourcePath); err == nil && canonicalPath != "" {
+			resourcePath = canonicalPath
+		}
 	}
-	if h == nil || h.store == nil || h.store.ACLEntries == nil {
-		return owned, nil
-	}
+	return resourcePath, lockLookupPaths(resourcePath)
+}
 
-	seen := make(map[int64]struct{}, len(owned))
-	for _, book := range owned {
-		seen[book.ID] = struct{}{}
-	}
-
-	principals := []string{"DAV:all", "DAV:authenticated", h.principalURL(user)}
-	for _, principal := range principals {
-		entries, err := h.store.ACLEntries.ListByPrincipal(ctx, principal)
+// locksForLookupPaths returns the active locks for the given lookup paths,
+// served from the request's lock index for the paths it has read and read from
+// the store, then indexed, for the rest. A request without a lock index state
+// reads the store each time.
+func (h *DavServer) locksForLookupPaths(ctx context.Context, paths []string) ([]store.Lock, error) {
+	idx := lockBatchIndexFromContext(ctx)
+	if idx == nil || idx.isStale() {
+		locks, err := h.store.Locks.ListByResources(ctx, paths)
 		if err != nil {
 			return nil, err
 		}
-		for _, entry := range entries {
-			collectionPath := addressBookCollectionPath(entry.ResourcePath)
-			if collectionPath == "/dav/addressbooks" || !strings.HasPrefix(collectionPath, "/dav/addressbooks/") {
-				continue
-			}
-			granted, err := h.checkACLPrivilege(ctx, user, collectionPath, "read")
-			if err != nil {
-				return nil, err
-			}
-			if !granted {
-				continue
-			}
-
-			segment := strings.Trim(strings.TrimPrefix(collectionPath, "/dav/addressbooks/"), "/")
-			if segment == "" || strings.Contains(segment, "/") {
-				continue
-			}
-
-			bookID, err := strconv.ParseInt(segment, 10, 64)
-			if err != nil {
-				continue
-			}
-			if _, ok := seen[bookID]; ok {
-				continue
-			}
-			book, err := h.getAddressBook(ctx, bookID)
-			if err != nil {
-				if err == store.ErrNotFound {
-					continue
-				}
-				return nil, err
-			}
-			seen[bookID] = struct{}{}
-			owned = append(owned, *book)
+		if state := davRequestStateFromContext(ctx); state != nil {
+			state.setLockIndex(newLockBatchIndex(paths, locks))
 		}
+		return locks, nil
 	}
-
-	return owned, nil
+	if missing := idx.unfetched(paths); len(missing) > 0 {
+		locks, err := h.store.Locks.ListByResources(ctx, missing)
+		if err != nil {
+			return nil, err
+		}
+		idx.add(missing, locks)
+	}
+	return idx.locksForPaths(paths), nil
 }
 
-func filterGenericCollectionPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
-		return resp
+// prefetchLockBatchIndex fetches, in a single query, every lock that could
+// apply to any response in the batch and returns a context carrying the
+// resulting index. Per-response lockDiscoveryForPath calls then read from the
+// index instead of issuing a query each, collapsing a Depth: 1 N+1 to one query.
+func (h *DavServer) prefetchLockBatchIndex(ctx context.Context, responses []response) (context.Context, error) {
+	if h == nil || h.store == nil || h.store.Locks == nil {
+		return ctx, nil
 	}
-	src := resp.Propstat[0].Prop
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-	if req.Prop.DisplayName != nil {
-		okProp.DisplayName = src.DisplayName
-		okSet = true
+	seen := make(map[string]struct{})
+	var union []string
+	for i := range responses {
+		if len(responses[i].Propstat) == 0 {
+			continue
+		}
+		resourcePath := normalizeDAVHref(responses[i].Href)
+		if resourcePath == "" || !strings.HasPrefix(resourcePath, "/dav") {
+			continue
+		}
+		_, paths := h.lockLookupPathsForResource(ctx, resourcePath)
+		for _, p := range paths {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			union = append(union, p)
+		}
 	}
-	if req.Prop.ResourceType != nil {
-		okProp.ResourceType = src.ResourceType
-		okSet = true
+	if len(union) == 0 {
+		return ctx, nil
 	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		okProp.CurrentUserPrincipal = src.CurrentUserPrincipal
-		okSet = true
+	locks, err := h.store.Locks.ListByResources(ctx, union)
+	if err != nil {
+		return nil, err
 	}
-	if req.Prop.CurrentUserPrincipalURL != nil {
-		okProp.CurrentUserPrincipalURL = src.CurrentUserPrincipalURL
-		okSet = true
+	return withLockBatchIndex(ctx, newLockBatchIndex(union, locks)), nil
+}
+
+func (h *DavServer) accessibleAddressBooks(ctx context.Context, user *store.User) ([]store.AddressBook, error) {
+	if h == nil || h.store == nil || h.store.AddressBooks == nil || user == nil {
+		return nil, nil
 	}
-	if req.Prop.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
+	books, err := h.store.AddressBooks.ListAccessible(ctx, user.ID)
+	if err != nil {
+		return nil, err
 	}
-	if req.Prop.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
+	if state := davRequestStateFromContext(ctx); state != nil {
+		for i := range books {
+			state.putAddressBook(&books[i])
+		}
 	}
-	if req.Prop.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.Prop.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.Prop.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.Prop.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrivilegeSet != nil {
-		okProp.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
-	if req.Prop.GetETag != nil {
-		notFoundProp.GetETag = "getetag"
-		notFoundSet = true
-	}
-	if req.Prop.GetContentType != nil {
-		notFoundProp.GetContentType = "getcontenttype"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarData != nil {
-		notFoundProp.CalendarData = cdataString("calendar-data")
-		notFoundSet = true
-	}
-	if req.Prop.AddressData != nil {
-		notFoundProp.AddressData = cdataString("address-data")
-		notFoundSet = true
-	}
-	if req.Prop.CalendarDescription != nil {
-		notFoundProp.CalendarDescription = "calendar-description"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarTimezone != nil {
-		notFoundProp.CalendarTimezone = stringPtr("calendar-timezone")
-		notFoundSet = true
-	}
-	if req.Prop.CalendarColor != nil {
-		notFoundProp.CalendarColor = stringPtr("calendar-color")
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookDesc != nil {
-		notFoundProp.AddressBookDesc = "addressbook-description"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedAddressData != nil {
-		notFoundProp.SupportedAddressData = &supportedAddressData{}
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookMaxResourceSize != nil {
-		notFoundProp.AddressBookMaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCollationSet != nil {
-		notFoundProp.SupportedCollationSet = &supportedCollationSet{}
-		notFoundSet = true
-	}
-	if req.Prop.SyncToken != nil {
-		notFoundProp.SyncToken = "sync-token"
-		notFoundSet = true
-	}
-	if req.Prop.CTag != nil {
-		notFoundProp.CTag = "getctag"
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		notFoundProp.PrincipalURL = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarHomeSet != nil {
-		notFoundProp.CalendarHomeSet = &hrefListProp{}
-		notFoundSet = true
-	}
-	if req.Prop.AddressbookHomeSet != nil {
-		notFoundProp.AddressbookHomeSet = &hrefListProp{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalAddress != nil {
-		notFoundProp.PrincipalAddress = &hrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarComponentSet != nil {
-		notFoundProp.SupportedCalendarComponentSet = &supportedCalendarComponentSet{}
-		notFoundSet = true
-	}
-	if req.Prop.MaxResourceSize != nil {
-		notFoundProp.MaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.MinDateTime != nil {
-		notFoundProp.MinDateTime = "min-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxDateTime != nil {
-		notFoundProp.MaxDateTime = "max-date-time"
-		notFoundSet = true
-	}
-	if req.Prop.MaxInstances != nil {
-		notFoundProp.MaxInstances = "max-instances"
-		notFoundSet = true
-	}
-	if req.Prop.MaxAttendeesPerInstance != nil {
-		notFoundProp.MaxAttendeesPerInstance = "max-attendees-per-instance"
-		notFoundSet = true
-	}
-	if req.Prop.ScheduleCalendarTransp != nil {
-		notFoundProp.ScheduleCalendarTransp = &scheduleCalendarTransp{}
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCalendarData != nil {
-		notFoundProp.SupportedCalendarData = &supportedCalendarData{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarServerReadOnly != nil {
-		notFoundProp.CalendarServerReadOnly = &struct{}{}
-		notFoundSet = true
-	}
-	if req.Prop.Owner != nil {
-		notFoundProp.Owner = &hrefProp{}
-		notFoundSet = true
-	}
-	resp.Propstat = nil
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	if len(resp.Propstat) == 0 {
-		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}
-	}
-	return resp
+	return books, nil
 }
 
 func stringPtr(v string) *string {
 	return &v
-}
-
-func addRequestedCustomXMLProperties(req *propfindPropQuery, src prop, okProp *prop, okSet *bool, notFoundProp *prop, notFoundSet *bool) {
-	if req == nil {
-		return
-	}
-	for _, name := range req.CustomXML {
-		if name.Local == "" {
-			continue
-		}
-		property, ok := src.customXMLProperty(name)
-		if ok {
-			okProp.setCustomXMLProperty(property)
-			*okSet = true
-			continue
-		}
-		notFoundProp.setCustomXMLProperty(XMLProperty{Name: name})
-		*notFoundSet = true
-	}
-}
-
-func filterCalendarCollectionPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
-		return resp
-	}
-	src := resp.Propstat[0].Prop
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-	if req.Prop.DisplayName != nil {
-		okProp.DisplayName = src.DisplayName
-		okSet = true
-	}
-	if req.Prop.ResourceType != nil {
-		okProp.ResourceType = src.ResourceType
-		okSet = true
-	}
-	if req.Prop.CalendarDescription != nil {
-		okProp.CalendarDescription = src.CalendarDescription
-		okSet = true
-	}
-	if req.Prop.CalendarTimezone != nil {
-		okProp.CalendarTimezone = src.CalendarTimezone
-		okSet = true
-	}
-	if req.Prop.CalendarColor != nil {
-		if src.CalendarColor != nil {
-			okProp.CalendarColor = src.CalendarColor
-			okSet = true
-		} else {
-			notFoundProp.CalendarColor = stringPtr("calendar-color")
-			notFoundSet = true
-		}
-	}
-	if req.Prop.SyncToken != nil {
-		okProp.SyncToken = src.SyncToken
-		okSet = true
-	}
-	if req.Prop.CTag != nil {
-		okProp.CTag = src.CTag
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipal != nil {
-		okProp.CurrentUserPrincipal = src.CurrentUserPrincipal
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrincipalURL != nil {
-		okProp.CurrentUserPrincipalURL = src.CurrentUserPrincipalURL
-		okSet = true
-	}
-	if req.Prop.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
-	}
-	if req.Prop.SupportedCalendarComponentSet != nil {
-		okProp.SupportedCalendarComponentSet = src.SupportedCalendarComponentSet
-		okSet = true
-	}
-	if req.Prop.MaxResourceSize != nil {
-		okProp.MaxResourceSize = src.MaxResourceSize
-		okSet = true
-	}
-	if req.Prop.MinDateTime != nil {
-		okProp.MinDateTime = src.MinDateTime
-		okSet = true
-	}
-	if req.Prop.MaxDateTime != nil {
-		okProp.MaxDateTime = src.MaxDateTime
-		okSet = true
-	}
-	if req.Prop.MaxInstances != nil {
-		okProp.MaxInstances = src.MaxInstances
-		okSet = true
-	}
-	if req.Prop.MaxAttendeesPerInstance != nil {
-		okProp.MaxAttendeesPerInstance = src.MaxAttendeesPerInstance
-		okSet = true
-	}
-	if req.Prop.ScheduleCalendarTransp != nil {
-		okProp.ScheduleCalendarTransp = src.ScheduleCalendarTransp
-		okSet = true
-	}
-	if req.Prop.SupportedCalendarData != nil {
-		okProp.SupportedCalendarData = src.SupportedCalendarData
-		okSet = true
-	}
-	if req.Prop.CalendarServerReadOnly != nil {
-		okProp.CalendarServerReadOnly = src.CalendarServerReadOnly
-		okSet = true
-	}
-	if req.Prop.CurrentUserPrivilegeSet != nil {
-		okProp.CurrentUserPrivilegeSet = src.CurrentUserPrivilegeSet
-		okSet = true
-	}
-	if req.Prop.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
-	}
-	if req.Prop.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.Prop.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.Prop.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.Prop.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req.Prop, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
-	if req.Prop.GetETag != nil {
-		notFoundProp.GetETag = "getetag"
-		notFoundSet = true
-	}
-	if req.Prop.GetContentType != nil {
-		notFoundProp.GetContentType = "getcontenttype"
-		notFoundSet = true
-	}
-	if req.Prop.CalendarData != nil {
-		notFoundProp.CalendarData = cdataString("calendar-data")
-		notFoundSet = true
-	}
-	if req.Prop.AddressData != nil {
-		notFoundProp.AddressData = cdataString("address-data")
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookDesc != nil {
-		notFoundProp.AddressBookDesc = "addressbook-description"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedAddressData != nil {
-		notFoundProp.SupportedAddressData = &supportedAddressData{}
-		notFoundSet = true
-	}
-	if req.Prop.AddressBookMaxResourceSize != nil {
-		notFoundProp.AddressBookMaxResourceSize = "max-resource-size"
-		notFoundSet = true
-	}
-	if req.Prop.SupportedCollationSet != nil {
-		notFoundProp.SupportedCollationSet = &supportedCollationSet{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalURL != nil {
-		notFoundProp.PrincipalURL = &expandableHrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.CalendarHomeSet != nil {
-		notFoundProp.CalendarHomeSet = &hrefListProp{}
-		notFoundSet = true
-	}
-	if req.Prop.AddressbookHomeSet != nil {
-		notFoundProp.AddressbookHomeSet = &hrefListProp{}
-		notFoundSet = true
-	}
-	if req.Prop.PrincipalAddress != nil {
-		notFoundProp.PrincipalAddress = &hrefProp{}
-		notFoundSet = true
-	}
-	if req.Prop.Owner != nil {
-		notFoundProp.Owner = &hrefProp{}
-		notFoundSet = true
-	}
-	resp.Propstat = nil
-	if okSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		resp.Propstat = append(resp.Propstat, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	if len(resp.Propstat) == 0 {
-		resp.Propstat = []propstat{{Prop: prop{}, Status: httpStatusOK}}
-	}
-	return resp
-}
-
-func propstatForCalendarObjectPropfind(req *propfindPropQuery, src prop) []propstat {
-	if req == nil {
-		return []propstat{{Prop: src, Status: httpStatusOK}}
-	}
-	var okProp prop
-	var okSet bool
-	var notFoundProp prop
-	var notFoundSet bool
-	if req.GetETag != nil {
-		okProp.GetETag = src.GetETag
-		okSet = true
-	}
-	if req.GetContentType != nil {
-		okProp.GetContentType = src.GetContentType
-		okSet = true
-	}
-	if req.CalendarData != nil {
-		okProp.CalendarData = src.CalendarData
-		okSet = true
-	}
-	if req.SupportedReportSet != nil {
-		okProp.SupportedReportSet = src.SupportedReportSet
-		okSet = true
-	}
-	if req.LockDiscovery != nil {
-		okProp.LockDiscovery = src.LockDiscovery
-		okSet = true
-	}
-	if req.SupportedLock != nil {
-		okProp.SupportedLock = src.SupportedLock
-		okSet = true
-	}
-	if req.ACLProp != nil {
-		okProp.ACL = src.ACL
-		okSet = true
-	}
-	if req.SupportedPrivilegeSet != nil {
-		okProp.SupportedPrivilegeSet = src.SupportedPrivilegeSet
-		okSet = true
-	}
-	if req.PrincipalCollectionSet != nil {
-		okProp.PrincipalCollectionSet = src.PrincipalCollectionSet
-		okSet = true
-	}
-	addRequestedCustomXMLProperties(req, src, &okProp, &okSet, &notFoundProp, &notFoundSet)
-	if req.DisplayName != nil {
-		notFoundProp.DisplayName = "displayname"
-		notFoundSet = true
-	}
-
-	var stats []propstat
-	if okSet {
-		stats = append(stats, propstat{Prop: okProp, Status: httpStatusOK})
-	}
-	if notFoundSet {
-		stats = append(stats, propstat{Prop: notFoundProp, Status: httpStatusNotFound})
-	}
-	if len(stats) == 0 {
-		stats = append(stats, propstat{Prop: prop{}, Status: httpStatusOK})
-	}
-	return stats
-}
-
-func filterNonPrincipalPropfindResponse(resp response, req *propfindRequest) response {
-	if req == nil || req.Prop == nil || len(resp.Propstat) == 0 {
-		return resp
-	}
-	src := resp.Propstat[0].Prop
-	switch {
-	case src.ResourceType.Principal != nil:
-		return filterPrincipalPropfindResponse(resp, req)
-	case src.ResourceType.Calendar != nil:
-		return filterCalendarCollectionPropfindResponse(resp, req)
-	case src.ResourceType.AddressBook != nil:
-		return filterAddressBookCollectionPropfindResponse(resp, req)
-	case strings.HasSuffix(normalizeDAVHref(resp.Href), ".ics"):
-		resp.Propstat = propstatForCalendarObjectPropfind(req.Prop, src)
-		return resp
-	case strings.HasSuffix(normalizeDAVHref(resp.Href), ".vcf"):
-		return filterAddressObjectPropfindResponse(resp, req)
-	default:
-		return filterGenericCollectionPropfindResponse(resp, req)
-	}
 }

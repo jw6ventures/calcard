@@ -1,15 +1,20 @@
 package ui
 
 import (
+	"context"
 	"html/template"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/jw6ventures/calcard/internal/auth"
+	"github.com/jw6ventures/calcard/internal/calobject"
 	"github.com/jw6ventures/calcard/internal/config"
 	"github.com/jw6ventures/calcard/internal/contacts"
+	"github.com/jw6ventures/calcard/internal/events"
+	"github.com/jw6ventures/calcard/internal/ical"
 	"github.com/jw6ventures/calcard/internal/store"
 )
 
@@ -19,7 +24,18 @@ type Handler struct {
 	store       *store.Store
 	authService *auth.Service
 	contacts    *contacts.Service
-	templates   map[string]*template.Template
+	// events decides writes to and removals of events as REST and DAV do.
+	events    *events.Service
+	templates map[string]*template.Template
+	// validateCalendarObject is the validator every calendar object the UI
+	// stores must pass.
+	validateCalendarObject calobject.Validator
+	// expandEvent lists the instances of a series the calendar views show,
+	// as CalDAV expands them.
+	expandEvent calobject.Expander
+	// timezoneOnsets lists the observance rules of the VTIMEZONEs the
+	// calendar views read, or is nil for each object to list its own.
+	timezoneOnsets ical.ObservanceOnsets
 }
 
 const (
@@ -27,9 +43,27 @@ const (
 	dashboardRecentEventFetchLimit   = 25
 )
 
-// NewHandler creates a new Handler instance.
-func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service) *Handler {
-	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), templates: templates}
+// NewHandler creates a new Handler instance. validate and expand are required:
+// a Handler without validate would store calendar data a CalDAV client could
+// not have written, and one without expand would show a series on other days
+// than CalDAV clients do, so a nil validate or expand panics.
+func NewHandler(cfg *config.Config, store *store.Store, authService *auth.Service, validate calobject.Validator, expand calobject.Expander) *Handler {
+	if validate == nil {
+		panic("ui: NewHandler requires a calendar object validator")
+	}
+	if expand == nil {
+		panic("ui: NewHandler requires a recurrence expander")
+	}
+	return &Handler{cfg: cfg, store: store, authService: authService, contacts: contacts.NewService(store), events: events.NewService(store, validate),
+		templates: templates, validateCalendarObject: validate, expandEvent: expand}
+}
+
+// ShareTimezoneOnsets has the calendar views read the observance rules of
+// stored VTIMEZONEs through onsets, a listing shared with the rest of the
+// process, rather than listing every object's rules anew on every request.
+// Call it before the handler serves.
+func (h *Handler) ShareTimezoneOnsets(onsets ical.ObservanceOnsets) {
+	h.timezoneOnsets = onsets
 }
 
 // Dashboard displays the main dashboard.
@@ -200,7 +234,7 @@ func dashboardEventURL(ev store.Event) string {
 func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 
-	contacts, err := h.store.Contacts.ListWithBirthdaysByUser(r.Context(), user.ID)
+	contacts, truncated, err := h.listBoundedBirthdayContacts(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "failed to load contacts", http.StatusInternalServerError)
 		return
@@ -208,7 +242,8 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 
 	// Generate birthday events
 	var birthdayEvents []map[string]any
-	currentYear := time.Now().Year()
+	// UTC, as the generated birthday calendar judges birth years.
+	currentYear := time.Now().UTC().Year()
 
 	for _, c := range contacts {
 		if c.Birthday == nil {
@@ -220,32 +255,72 @@ func (h *Handler) ViewBirthdays(w http.ResponseWriter, r *http.Request) {
 			displayName = *c.DisplayName
 		}
 
-		// Create birthday event for current year
-		bdayThisYear := time.Date(currentYear, c.Birthday.Month(), c.Birthday.Day(), 0, 0, 0, 0, time.UTC)
-
-		// Calculate age if birth year is known (year > 1900, since older years are likely placeholders)
-		var age *int
-		if c.Birthday.Year() > 1900 {
-			a := currentYear - c.Birthday.Year()
-			age = &a
+		// The page works out the age for whichever year it shows.
+		var birthYear *int
+		if birthYearKnown(c.Birthday.Year(), currentYear) {
+			year := c.Birthday.Year()
+			birthYear = &year
 		}
 
 		birthdayEvents = append(birthdayEvents, map[string]any{
 			"ContactUID":  c.UID,
 			"DisplayName": displayName,
-			"Date":        bdayThisYear,
-			"Age":         age,
+			"BirthYear":   birthYear,
 			"Month":       int(c.Birthday.Month()),
 			"Day":         c.Birthday.Day(),
 		})
 	}
 
 	data := h.withFlash(r, map[string]any{
-		"Title":          "Birthdays",
-		"User":           user,
-		"BirthdayEvents": birthdayEvents,
+		"Title":              "Birthdays",
+		"User":               user,
+		"BirthdayEvents":     birthdayEvents,
+		"BirthdaysTruncated": truncated,
 	})
 	h.render(w, r, "birthdays.html", data)
+}
+
+// birthYearKnown reports whether a stored birthday's year is a real birth
+// year. A year-less BDAY is stored in store.NoYearBirthdayYear, and clients
+// that cannot write a year-less date use a stand-in year of their own (Apple
+// writes 1604), so only years from 1900 up to the current one yield an age.
+// The DAV birthday calendar applies the same rule.
+func birthYearKnown(year, currentYear int) bool {
+	return year >= 1900 && year <= currentYear
+}
+
+// birthdayPageRows is the fallback bound on the contacts the birthdays page
+// reads, used when no APP_DAV_MAX_REPORT_CANDIDATE_ROWS budget is configured.
+// It matches the DAV default, since the generated birthday calendar is built
+// from the same rows.
+const birthdayPageRows = 50000
+
+// listBoundedBirthdayContacts reads the contacts the birthdays page is built
+// from under the row budget the DAV birthday collection is read with. The whole
+// set is serialized into the rendered page, so an unbounded read is an
+// unbounded response. It reports whether the set was cut short: one row past
+// the budget is enough to know the page cannot show the complete set, and a
+// page showing part of it has to say so.
+func (h *Handler) listBoundedBirthdayContacts(ctx context.Context, userID int64) ([]store.Contact, bool, error) {
+	rowLimit := birthdayPageRows
+	if h.cfg != nil && h.cfg.DAV.MaxReportCandidateRows > 0 {
+		rowLimit = h.cfg.DAV.MaxReportCandidateRows
+	}
+	// A budget turned off is carried as math.MaxInt, which has no room for the
+	// extra row; asking for the budget itself then reads one row short of
+	// knowing the set is complete, at a size no collection reaches.
+	readLimit := rowLimit
+	if readLimit < math.MaxInt {
+		readLimit++
+	}
+	contacts, err := h.store.Contacts.ListWithBirthdaysByUserLimit(ctx, userID, readLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(contacts) > rowLimit {
+		return contacts[:rowLimit], true, nil
+	}
+	return contacts, false, nil
 }
 
 // Help shows a dedicated, resumable help page mirroring the first-login welcome
