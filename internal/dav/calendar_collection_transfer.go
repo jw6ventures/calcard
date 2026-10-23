@@ -203,6 +203,8 @@ func (h *DavServer) transferCalendarCollectionWithRetry(w http.ResponseWriter, r
 			http.Error(w, "resource is locked", http.StatusLocked)
 		case errors.Is(err, store.ErrConflict):
 			http.Error(w, "destination conflict", http.StatusConflict)
+		case errors.Is(err, store.ErrNotFound):
+			http.Error(w, "source calendar not found", http.StatusNotFound)
 		default:
 			h.logger().Error("CalendarCollectionTransfer", "%s calendar %d failed: %v", operation, source.ID, err)
 			http.Error(w, "failed to transfer calendar collection", http.StatusInternalServerError)

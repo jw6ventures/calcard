@@ -1018,6 +1018,26 @@ func IsDataError(err error) bool {
 	return errors.As(err, &pqErr) && (pqErr.Code.Class() == "22" || pqErr.Code.Class() == "54")
 }
 
+// IsUnavailable reports whether err shows the database could not serve the
+// request at all -- unreachable, dropping the connection, refusing another
+// client, or shutting down or starting up -- rather than failing one
+// statement. Such a failure says nothing about the request and may clear if
+// the request is retried.
+func IsUnavailable(err error) bool {
+	if isConnError(err) {
+		return true
+	}
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	switch pqErr.Code {
+	case "53300", "57P01", "57P02", "57P03":
+		return true
+	}
+	return pqErr.Code.Class() == "08"
+}
+
 // IsQueryCanceled reports whether err is PostgreSQL canceling a statement
 // (SQLSTATE 57014). lib/pq reports a query whose context ended that way rather
 // than with an error wrapping context.Canceled, but PostgreSQL raises the same

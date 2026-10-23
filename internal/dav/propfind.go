@@ -93,7 +93,9 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			writeInsufficientStorage(w)
 			return
 		}
-		status := http.StatusBadRequest
+		// The request was validated before the build began, so a failure the
+		// build does not name is the server's own.
+		status := serverFailureStatus(err)
 		if errors.Is(err, errAmbiguousCalendar) || errors.Is(err, errAmbiguousAddressBook) {
 			status = http.StatusConflict
 		}
@@ -101,7 +103,7 @@ func (h *DavServer) propfind(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 		}
 		h.logger().Error("Propfind", "failed to build responses for %s (status %d): %v", r.URL.Path, status, err)
-		http.Error(w, http.StatusText(status), status)
+		writeStatusText(w, status)
 		return
 	}
 	h.logger().Debug("Propfind", "%s returned %d responses", r.URL.Path, len(responses))

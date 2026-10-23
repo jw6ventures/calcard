@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"github.com/jw6ventures/calcard/internal/http/clientip"
 	"github.com/jw6ventures/calcard/internal/store"
 	jw6_utils "github.com/jw6ventures/jw6-go-utils"
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 )
@@ -1048,6 +1050,111 @@ func TestRequireDAVAuthDigestMarksStoreFailureStaleUnlikeAGenuineReplay(t *testi
 		if !strings.Contains(value, "stale=true") {
 			t.Fatalf("store-failure challenge = %q, want stale=true", value)
 		}
+	}
+}
+
+// A credential lookup the store could not answer says nothing about the
+// credential. Answering it with a challenge tells CalDAV and CardDAV clients
+// the password is wrong, so they re-prompt or disable the account over what
+// is only a database outage.
+func TestRequireDAVAuthAnswersCredentialLookupFailuresWithoutAChallenge(t *testing.T) {
+	const (
+		username = "user@example.com"
+		password = "app-secret"
+	)
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	tooManyClients := &pq.Error{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+	queryFailure := errors.New("pq: column \"token_hash\" does not exist")
+	invalidEncoding := &pq.Error{Code: "22021", Message: "invalid byte sequence for encoding \"UTF8\""}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	cases := []struct {
+		name           string
+		scheme         string
+		userErr        error
+		tokensErr      error
+		noUser         bool
+		noTokens       bool
+		wantStatus     int
+		wantChallenge  bool
+		wantRetryAfter bool
+	}{
+		{name: "basic user lookup refused", scheme: "Basic", userErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "basic user lookup too many clients", scheme: "Basic", userErr: tooManyClients, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "basic token lookup refused", scheme: "Basic", tokensErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "basic token lookup query failure", scheme: "Basic", tokensErr: queryFailure, wantStatus: http.StatusInternalServerError},
+		{name: "basic username the database cannot encode", scheme: "Basic", userErr: invalidEncoding, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+		{name: "digest user lookup refused", scheme: "Digest", userErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "digest user lookup too many clients", scheme: "Digest", userErr: tooManyClients, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "digest token lookup refused", scheme: "Digest", tokensErr: refused, wantStatus: http.StatusServiceUnavailable, wantRetryAfter: true},
+		{name: "digest token lookup query failure", scheme: "Digest", tokensErr: queryFailure, wantStatus: http.StatusInternalServerError},
+		{name: "digest username the database cannot encode", scheme: "Digest", userErr: invalidEncoding, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+		{name: "basic unknown user", scheme: "Basic", noUser: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+		{name: "basic user without a valid app password", scheme: "Basic", noTokens: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+		{name: "digest unknown user", scheme: "Digest", noUser: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+		{name: "digest user without a valid app password", scheme: "Digest", noTokens: true, wantStatus: http.StatusUnauthorized, wantChallenge: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &Service{cfg: testDigestAuthConfig("https://calcard.example")}
+			_, sha256HA1 := sealedTestHA1s(t, service, username, password)
+			service.store = &store.Store{
+				Users: &userRepoMock{getByEmailFn: func(_ context.Context, email string) (*store.User, error) {
+					if tc.userErr != nil {
+						return nil, tc.userErr
+					}
+					if tc.noUser {
+						return nil, nil
+					}
+					return &store.User{ID: 7, PrimaryEmail: email}, nil
+				}},
+				AppPasswords: &appPasswordRepoMock{findValidByUserFn: func(context.Context, int64) ([]store.AppPassword, error) {
+					if tc.tokensErr != nil {
+						return nil, tc.tokensErr
+					}
+					if tc.noTokens {
+						return nil, nil
+					}
+					return []store.AppPassword{{ID: 3, TokenHash: string(hash), DigestSHA256HA1: sha256HA1}}, nil
+				}},
+				DigestNonces: &digestNonceRepoMock{consumeFn: func(context.Context, int64, string, uint32, time.Time) (bool, error) {
+					return true, nil
+				}},
+			}
+			handler := service.RequireDAVAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Fatal("a request whose credentials were never checked reached the handler")
+			}))
+
+			req := davRequest(http.MethodGet, "/dav/")
+			if tc.scheme == "Basic" {
+				req.SetBasicAuth(username, password)
+			} else {
+				challengeRec := httptest.NewRecorder()
+				handler.ServeHTTP(challengeRec, davRequest(http.MethodGet, "/dav/"))
+				challenge := digestChallengeForAlgorithm(t, challengeRec.Header().Values("WWW-Authenticate"), "SHA-256")
+				req.Header.Set("Authorization", testDigestAuthorization(t, challenge, "SHA-256", username, password, http.MethodGet, "/dav/", "00000001", "cnonce"))
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if got := len(rec.Header().Values("WWW-Authenticate")) > 0; got != tc.wantChallenge {
+				t.Fatalf("challenge present = %v, want %v: %#v", got, tc.wantChallenge, rec.Header())
+			}
+			if got := rec.Header().Get("Retry-After") != ""; got != tc.wantRetryAfter {
+				t.Fatalf("Retry-After present = %v, want %v", got, tc.wantRetryAfter)
+			}
+			for _, cause := range []error{tc.userErr, tc.tokensErr} {
+				if cause != nil && strings.Contains(rec.Body.String(), cause.Error()) {
+					t.Fatalf("body %q exposes the store error", rec.Body.String())
+				}
+			}
+		})
 	}
 }
 

@@ -7,7 +7,8 @@ import (
 
 type txPool interface {
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
-	PingContext(ctx context.Context) error
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	Stats() sql.DBStats
 }
 
 // Store aggregates repositories backed by PostgreSQL.
@@ -71,10 +72,26 @@ func (s *Store) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, erro
 }
 
 // HealthCheck verifies that the underlying database is reachable.
+//
+// After the server restarts, every idle connection in the pool is dead, and a
+// check that gives up on the first one keeps an idle replica unready for one
+// probe per dead connection. database/sql retries a statement, though not a
+// ping, on another connection when the driver reports a bad one; when the dead
+// socket instead surfaces as a network error, the driver marks the connection
+// bad and the pool discards it. Each failed attempt therefore retires at least
+// one dead connection, and one more attempt than the pool holds idle
+// connections reaches a fresh one.
 func (s *Store) HealthCheck(ctx context.Context) error {
 	defer observeDB(ctx, "db.healthcheck")()
-	if err := s.pool.PingContext(ctx); err != nil {
-		queryLogger.Warn("db.healthcheck", "database ping failed, marking unready: %v", err)
+	attempts := s.pool.Stats().Idle + 1
+	var err error
+	for range attempts {
+		if _, err = s.pool.ExecContext(ctx, "SELECT 1"); err == nil || !isConnError(err) {
+			break
+		}
+	}
+	if err != nil {
+		queryLogger.Warn("db.healthcheck", "database check failed, marking unready: %v", err)
 		return err
 	}
 	return nil

@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http"
 	"strings"
+
+	"github.com/jw6ventures/calcard/internal/store"
 )
 
 const (
@@ -140,6 +142,30 @@ func (h *DavServer) multistatusBuildComplete(responses []response) bool {
 // storage and query detail a client has no business reading.
 func writeInsufficientStorage(w http.ResponseWriter) {
 	http.Error(w, http.StatusText(http.StatusInsufficientStorage), http.StatusInsufficientStorage)
+}
+
+// davRetryAfterSeconds is the Retry-After sent with a 503 while the store is
+// unavailable.
+const davRetryAfterSeconds = "5"
+
+// serverFailureStatus is the status for a request that failed for a reason of
+// the server's own: 503 while the database cannot be reached, which clients
+// retry later, and 500 otherwise.
+func serverFailureStatus(err error) int {
+	if store.IsUnavailable(err) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
+}
+
+// writeStatusText answers with status and its text alone, adding Retry-After
+// to a 503. Callers whose error carries storage or connection detail log it
+// rather than send it.
+func writeStatusText(w http.ResponseWriter, status int) {
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", davRetryAfterSeconds)
+	}
+	http.Error(w, http.StatusText(status), status)
 }
 
 func (h *DavServer) writeBoundedMultiStatus(w http.ResponseWriter, payload multistatus) {

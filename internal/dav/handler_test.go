@@ -8340,10 +8340,7 @@ func (f *fakeEventRepo) TransferCalendarObject(ctx context.Context, transfer sto
 	if err != nil {
 		return nil, err
 	}
-	if source == nil {
-		return nil, store.ErrNotFound
-	}
-	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
+	if source == nil || source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
 		return nil, store.ErrResourceStateChanged
 	}
 	destination, err := f.GetByResourceName(ctx, transfer.DestinationCalendarID, transfer.DestinationResourceName)

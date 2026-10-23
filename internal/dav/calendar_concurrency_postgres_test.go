@@ -433,3 +433,124 @@ func TestPostgresCalendarCollectionCopyRechecksAChangedACL(t *testing.T) {
 		t.Fatalf("guest holds %d calendars copied under a revoked grant", len(copies))
 	}
 }
+
+// A calendar object COPY or MOVE whose source another request removes after the
+// handler read it finds no source row in its transaction. The source is gone,
+// as RFC 4918 §9.8.5 and §9.9.4 answer it, whether it was deleted or moved away.
+func TestPostgresCalendarObjectTransferOfARemovedSourceIsNotFound(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		for _, removal := range []string{"delete", "move away"} {
+			t.Run(method+"/"+removal, func(t *testing.T) {
+				db := newDAVPostgresStore(t)
+				ctx := t.Context()
+				owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var calendars [3]*store.Calendar
+				for i, name := range []string{"Source", "Destination", "Elsewhere"} {
+					if calendars[i], err = db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: name}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				source, destination, elsewhere := calendars[0], calendars[1], calendars[2]
+				h := NewDavServer(Options{Store: db})
+				sourcePath := fmt.Sprintf("/dav/calendars/%d/raced.ics", source.ID)
+				put := httptest.NewRequest(http.MethodPut, sourcePath, strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Review//EN\r\nBEGIN:VEVENT\r\nUID:raced\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T100000Z\r\nDTEND:20260101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"))
+				put.Header.Set("Content-Type", "text/calendar")
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, put.WithContext(auth.WithUser(ctx, owner)))
+				if rr.Code != http.StatusCreated {
+					t.Fatalf("seed: %d %s", rr.Code, rr.Body.String())
+				}
+
+				repo := db.Events
+				wrapper := &eventReadMutation{EventRepository: repo}
+				wrapper.mutate = func(*store.Event) error {
+					if wrapper.calls > 1 {
+						return nil
+					}
+					if removal == "delete" {
+						return repo.DeleteByUID(ctx, source.ID, "raced")
+					}
+					return db.MoveEventAndState(ctx, source.ID, elsewhere.ID, "raced", "raced", "", "", "")
+				}
+				db.Events = wrapper
+
+				req := httptest.NewRequest(method, sourcePath, nil)
+				req.Header.Set("Destination", fmt.Sprintf("/dav/calendars/%d/raced.ics", destination.ID))
+				rr = httptest.NewRecorder()
+				h.ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, owner)))
+				if rr.Code != http.StatusNotFound {
+					t.Fatalf("%s of a source removed mid-request = %d, want 404: %s", method, rr.Code, rr.Body.String())
+				}
+				copied, err := repo.GetByResourceName(ctx, destination.ID, "raced")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if copied != nil {
+					t.Fatalf("%s wrote %q to the destination from a removed source", method, copied.ResourceName)
+				}
+			})
+		}
+	}
+}
+
+// calendarListMutation runs mutate once, right after the first member listing
+// of calendarID, which is the listing a collection transfer preflights.
+type calendarListMutation struct {
+	store.EventRepository
+	calendarID int64
+	mutate     func() error
+	done       bool
+}
+
+func (r *calendarListMutation) ListForCalendar(ctx context.Context, calendarID int64) ([]store.Event, error) {
+	events, err := r.EventRepository.ListForCalendar(ctx, calendarID)
+	if err == nil && calendarID == r.calendarID && !r.done {
+		r.done = true
+		if err := r.mutate(); err != nil {
+			return nil, err
+		}
+	}
+	return events, err
+}
+
+// A whole-collection COPY or MOVE whose source calendar another request deletes
+// after the handler preflighted it finds no source row in its transaction, and
+// answers that the source is gone.
+func TestPostgresCalendarCollectionTransferOfADeletedSourceIsNotFound(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			db := newDAVPostgresStore(t)
+			ctx := t.Context()
+			owner, err := db.Users.UpsertOAuthUser(ctx, "owner", "owner@example.test", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := db.Calendars.Create(ctx, store.Calendar{UserID: owner.ID, Name: "Source"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Events = &calendarListMutation{EventRepository: db.Events, calendarID: source.ID, mutate: func() error {
+				return db.Calendars.Delete(ctx, owner.ID, source.ID)
+			}}
+			h := NewDavServer(Options{Store: db})
+
+			req := httptest.NewRequest(method, fmt.Sprintf("/dav/calendars/%d/", source.ID), nil)
+			req.Header.Set("Destination", "/dav/calendars/raced-copy/")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req.WithContext(auth.WithUser(ctx, owner)))
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("%s of a calendar deleted mid-request = %d, want 404: %s", method, rr.Code, rr.Body.String())
+			}
+			calendars, err := db.Calendars.ListByUser(ctx, owner.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calendars) != 0 {
+				t.Fatalf("owner holds %d calendars after transferring a deleted one", len(calendars))
+			}
+		})
+	}
+}

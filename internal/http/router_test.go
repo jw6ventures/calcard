@@ -95,12 +95,15 @@ func TestNewRouterPublicEndpoints(t *testing.T) {
 		t.Fatalf("/healthz = %d %q", rec.Code, rec.Body.String())
 	}
 
-	mock.ExpectPing()
+	mock.ExpectExec("SELECT 1").WillReturnResult(sqlmock.NewResult(0, 0))
 	req = httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Fatalf("/readyz = %d %q", rec.Code, rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("/readyz did not check the database: %v", err)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/.well-known/caldav", nil)

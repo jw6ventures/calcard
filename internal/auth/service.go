@@ -216,7 +216,7 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 
 	user, err := s.store.Users.GetByEmail(ctx, username)
 	if err != nil {
-		return nil, err
+		return nil, credentialLookupError(err)
 	}
 	if user == nil {
 		return nil, errors.New("unknown user")
@@ -224,7 +224,7 @@ func (s *Service) ValidateAppPassword(ctx context.Context, username, password st
 
 	tokens, err := s.store.AppPasswords.FindValidByUser(ctx, user.ID)
 	if err != nil {
-		return nil, err
+		return nil, credentialLookupError(err)
 	}
 
 	for _, t := range tokens {
@@ -356,6 +356,10 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 		default:
 			err = errors.New("authentication required")
 		}
+		if errors.Is(err, errCredentialLookup) {
+			s.writeCredentialLookupFailure(w, r, err)
+			return
+		}
 		if err != nil || user == nil {
 			if challengeErr := s.writeDAVAuthChallenge(w, r, stale); challengeErr != nil {
 				http.Error(w, "failed to issue authentication challenge", http.StatusInternalServerError)
@@ -368,6 +372,38 @@ func (s *Service) RequireDAVAuth(next http.Handler) http.Handler {
 		ctx := WithUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// errCredentialLookup marks a DAV credential check the store could not answer,
+// which is no verdict on the credential.
+var errCredentialLookup = errors.New("credential lookup failed")
+
+// davRetryAfterSeconds is the Retry-After sent with a 503 while the store is
+// unavailable.
+const davRetryAfterSeconds = "5"
+
+// credentialLookupError classifies a store error met while checking DAV
+// credentials. A value PostgreSQL refuses, such as a username that is not
+// valid UTF-8, can name no account, so it stays a rejected credential.
+func credentialLookupError(err error) error {
+	if store.IsDataError(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errCredentialLookup, err)
+}
+
+// writeCredentialLookupFailure answers a DAV request whose credentials could
+// not be checked. It carries no challenge: DAV clients take a 401 to mean the
+// password is wrong, and re-prompt the user or disable the account over what
+// is a database outage.
+func (s *Service) writeCredentialLookupFailure(w http.ResponseWriter, r *http.Request, err error) {
+	s.logger().Error("dav_auth", "could not check credentials for %s %s: %v", r.Method, r.URL.Path, err)
+	status := http.StatusInternalServerError
+	if store.IsUnavailable(err) {
+		status = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", davRetryAfterSeconds)
+	}
+	http.Error(w, http.StatusText(status), status)
 }
 
 func (s *Service) ClearSession(w http.ResponseWriter, r *http.Request) {

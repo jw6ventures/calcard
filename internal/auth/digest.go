@@ -385,12 +385,15 @@ func (s *Service) validateDAVDigest(r *http.Request) (*store.User, bool, error) 
 	}
 
 	user, err := s.store.Users.GetByEmail(r.Context(), params["username"])
-	if err != nil || user == nil {
+	if err != nil {
+		return nil, false, credentialLookupError(err)
+	}
+	if user == nil {
 		return nil, false, errors.New("invalid digest user")
 	}
 	tokens, err := s.store.AppPasswords.FindValidByUser(r.Context(), user.ID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, credentialLookupError(err)
 	}
 	now := s.digestTime()
 	for _, token := range tokens {

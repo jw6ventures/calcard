@@ -147,10 +147,7 @@ func transferCalendarObjectTx(ctx context.Context, tx *sql.Tx, transfer Calendar
 	if err != nil {
 		return nil, err
 	}
-	if source == nil {
-		return nil, ErrNotFound
-	}
-	if source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
+	if source == nil || source.UID != transfer.SourceUID || source.ETag != transfer.ExpectedSourceETag || source.RawICAL != transfer.RawICAL {
 		return nil, ErrResourceStateChanged
 	}
 

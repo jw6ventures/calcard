@@ -117,7 +117,7 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 			writeNeedPrivileges(w, cleanPath, "write-properties")
 			return
 		}
-		status := http.StatusInternalServerError
+		status := serverFailureStatus(err)
 		switch {
 		case errors.Is(err, errInvalidPath):
 			status = http.StatusBadRequest
@@ -125,6 +125,11 @@ func (h *DavServer) proppatch(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusNotFound
 		case errors.Is(err, errAmbiguousCalendar), errors.Is(err, errAmbiguousAddressBook):
 			status = http.StatusConflict
+		}
+		if status >= http.StatusInternalServerError {
+			h.logger().Error("Proppatch", "failed to patch %s (status %d): %v", cleanPath, status, err)
+			writeStatusText(w, status)
+			return
 		}
 		http.Error(w, err.Error(), status)
 		return

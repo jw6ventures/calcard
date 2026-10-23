@@ -42,6 +42,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/calendars/{id}:
     parameters:
       - $ref: "#/components/parameters/CalendarID"
@@ -69,6 +71,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/calendars/{id}/events:
     parameters:
       - $ref: "#/components/parameters/CalendarID"
@@ -174,6 +178,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       tags:
         - Events
@@ -249,6 +255,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/calendars/{id}/events/{uid}:
     parameters:
       - $ref: "#/components/parameters/CalendarID"
@@ -280,6 +288,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     put:
       tags:
         - Events
@@ -361,6 +371,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       tags:
         - Events
@@ -423,6 +435,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks:
     get:
       tags:
@@ -444,6 +458,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks/{id}:
     parameters:
       - $ref: "#/components/parameters/AddressBookID"
@@ -469,6 +485,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks/{id}/shares:
     parameters:
       - $ref: "#/components/parameters/AddressBookID"
@@ -499,6 +517,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       tags:
         - Address Books
@@ -543,6 +563,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks/{id}/shares/{userId}:
     parameters:
       - $ref: "#/components/parameters/AddressBookID"
@@ -574,6 +596,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks/{id}/contacts:
     parameters:
       - $ref: "#/components/parameters/AddressBookID"
@@ -643,6 +667,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       tags:
         - Contacts
@@ -690,6 +716,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/addressbooks/{id}/contacts/{uid}:
     parameters:
       - $ref: "#/components/parameters/AddressBookID"
@@ -725,6 +753,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     put:
       tags:
         - Contacts
@@ -775,6 +805,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       tags:
         - Contacts
@@ -831,6 +863,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     basicAuth:
@@ -1037,6 +1071,20 @@ components:
             $ref: "#/components/schemas/ErrorText"
     InternalServerError:
       description: Unexpected server error.
+      content:
+        text/plain; charset=utf-8:
+          schema:
+            $ref: "#/components/schemas/ErrorText"
+    ServiceUnavailable:
+      description: |
+        The database could not be reached to check the request's credentials,
+        so the request was not carried out. Retry after the interval given.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+          example: 5
       content:
         text/plain; charset=utf-8:
           schema:
