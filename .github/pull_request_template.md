@@ -10,5 +10,5 @@ By submitting this pull request, you agree to the terms of the Contributor Licen
 
 **Pull requests will not be merged unless these terms have been accepted.**
 
-- [ ] I have read and agree to the CLA in `CONTRIBUTING.md`.
+- [ ] I have read and agree to the CLA in [CONTRIBUTING.md](https://github.com/jw6ventures/calcard?tab=contributing-ov-file).
 - [ ] I confirm that I have the right to submit this contribution under the CLA.
